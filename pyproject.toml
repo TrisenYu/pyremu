@@ -1,0 +1,58 @@
+[project]
+name = "pyremu"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "annotated-types==0.7.0",
+    "iniconfig==2.3.0",
+    "lief==0.17.6",
+    "loguru==0.7.3",
+    "packaging==26.2",
+    "pluggy==1.6.0",
+    "pydantic==2.13.4",
+    "pydantic-core==2.46.4",
+    "pygments==2.20.0",
+    "pytest==9.0.3",
+    "ruff==0.15.15",
+    "typing-extensions==4.15.0",
+    "typing-inspection==0.4.2",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[tool.ruff]
+indent-width = 4
+line-length = 95
+
+[tool.ruff.lint]
+select = [
+    "F",
+    "E",
+    "N",
+    "I",
+    "W",
+    "PL",
+    "PERF",
+]
+ignore=["E731"]
+
+[tool.ruff.lint.pylint]
+max-nested-blocks = 4
+
+[tool.ruff.lint.isort]
+force-single-line = false
+combine-as-imports = true
+split-on-trailing-comma = true
+
+[tool.ruff.format]
+skip-magic-trailing-comma = false
+
+[tool.pytest.ini_options]
+# setup for pytest
+pythonpath = "."
+
+
