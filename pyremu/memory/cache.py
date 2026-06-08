@@ -14,3 +14,21 @@
 对于锁机制的实现，多核是怎么保证上锁的？
 """
 
+
+TLB_SIZE: int = 256
+
+class CacheEntry:
+    def __init__(self) -> None:
+        # rwx权限位
+        self.perm = 0
+        self.level = 0
+        self.mdid = 0 # 暂时不想解释
+        self.vpn = 0
+        self.ppn = 0
+        # 有效位
+        self.valid = 0
+        # 脏位
+        self.dirty = 0
+
+
+# 定义缓存行结构和存储于其中的各种数据

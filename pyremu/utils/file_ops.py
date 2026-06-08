@@ -5,7 +5,7 @@
 from os import PathLike
 from pathlib import Path
 
-from pyremu.wrapper import seize_err_if_any
+from pyremu.utils.wrapper import seize_err_if_any
 
 
 def reloc_path(src: PathLike, *intermidate: PathLike) -> str:

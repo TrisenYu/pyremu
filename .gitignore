@@ -8,6 +8,8 @@ wheels/
 .DS_Store
 .vscode
 
+.node_modules
+
 # Virtual environments
 .venv
 .pytest_cache

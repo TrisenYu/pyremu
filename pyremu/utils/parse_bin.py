@@ -6,7 +6,7 @@
 # Last modified at 2026/06/05 星期五 15:25:00
 import lief
 
-from pyremu.wrapper import seize_err_if_any
+from pyremu.utils.wrapper import seize_err_if_any
 
 
 @seize_err_if_any()

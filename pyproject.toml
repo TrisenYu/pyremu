@@ -38,7 +38,10 @@ select = [
     "PL",
     "PERF",
 ]
-ignore=["E731"]
+ignore=[
+    "E731",
+    "PLR2004"
+]
 
 [tool.ruff.lint.pylint]
 max-nested-blocks = 4

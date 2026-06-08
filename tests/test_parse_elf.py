@@ -9,13 +9,13 @@ from typing import Optional
 
 import pytest
 
-from pyremu.file_ops import (
+from pyremu.utils.file_ops import (
     get_abs_filename_arr_from_dir,
     is_file,
     is_path_existed,
     reloc_path,
 )
-from pyremu.parse_bin import parse_bin
+from pyremu.utils.parse_bin import parse_bin
 
 # test path relocation auxilliary function
 __reloc_path = lambda x: str(Path(__file__).parent / x)
