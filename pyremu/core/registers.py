@@ -122,6 +122,13 @@ def register_gpr():
     return deepcopy(_gpr)
 
 
+def gpr_name(idx: int) -> str:
+    """返回第 idx 号 GPR 的名称 (例: x0, x10)."""
+    if 0 <= idx < len(_gpr):
+        return _gpr[idx].name
+    return f"?x{idx}"
+
+
 def register_fpr():
     """返回 32 个 FPR 的独立副本."""
     return deepcopy(_fpr)
@@ -155,7 +162,7 @@ class CsrAccess(Enum):
     dm_rw = 0b1100_11
 
 
-_csr_access_mask = 0b1111_11
+_csr_access_mask = 0b1111_10  # 清除 LSB (rw → ro)
 
 
 class CSR(Reg):
@@ -399,6 +406,85 @@ def check_csr(csr_id: int) -> tuple[bool, str]:
     if csr_id not in _csr_bank:
         return False, ""
     return True, _csr_bank[csr_id].name
+
+
+# 每个特权级可读取的 CsrAccess 值集合
+# 逻辑: 固件只能访问当前或更低特权级的 CSR; 更高特权级的 CSR 引发 IllInstr.
+_CSR_ACCESSIBLE: dict[int, frozenset[CsrAccess]] = {
+    0: frozenset({
+        CsrAccess.u_ro, CsrAccess.u_rw,
+    }),
+    1: frozenset({
+        CsrAccess.u_ro, CsrAccess.u_rw,
+        CsrAccess.s_ro, CsrAccess.s_rw,
+    }),
+    2: frozenset({
+        CsrAccess.u_ro, CsrAccess.u_rw,
+        CsrAccess.s_ro, CsrAccess.s_rw,
+        CsrAccess.h_ro, CsrAccess.h_rw,
+    }),
+    4: frozenset({
+        CsrAccess.u_ro, CsrAccess.u_rw,
+        CsrAccess.s_ro, CsrAccess.s_rw,
+        CsrAccess.h_ro, CsrAccess.h_rw,
+        CsrAccess.m_ro, CsrAccess.m_rw,
+    }),
+    8: frozenset({
+        CsrAccess.u_ro, CsrAccess.u_rw,
+        CsrAccess.s_ro, CsrAccess.s_rw,
+        CsrAccess.h_ro, CsrAccess.h_rw,
+        CsrAccess.m_ro, CsrAccess.m_rw,
+        CsrAccess.d_ro, CsrAccess.d_rw,
+        CsrAccess.ds_ro, CsrAccess.ds_rw,
+        CsrAccess.dm_ro, CsrAccess.dm_rw,
+    }),
+}
+
+# 可写入的 CsrAccess 值 (rw 权限)
+_CSR_WRITABLE: frozenset[CsrAccess] = frozenset({
+    a for a in CsrAccess if a.name.endswith("_rw")
+})
+
+
+class CsrAccessError(Exception):
+    """CSR 访问违例 — 特权级不足或写入只读寄存器."""
+
+    def __init__(self, csr_id: int, reason: str) -> None:
+        self.csr_id = csr_id
+        self.reason = reason
+        super().__init__(
+            f"CSR access violation: addr=0x{csr_id:03x}, reason={reason}"
+        )
+
+
+def check_csr_access(
+    csr_id: int,
+    mode_val: int,
+    is_write: bool,
+) -> None:
+    """检查当前特权级是否可访问指定 CSR; 违例时抛出 CsrAccessError.
+
+    *mode_val* 为 ``RiscvMode.value`` (U=0, S=1, H=2, M=4, D=8).
+    *is_write* 为 True 时额外检查 rw 权限.
+
+    Raises:
+        CsrAccessError: 特权级不足 (privilege)、写入只读 CSR (readonly) 或未知 CSR (unknown).
+    """
+    csr_id &= 0xFFF
+    if csr_id not in _csr_bank:
+        raise CsrAccessError(csr_id, "unknown")
+
+    csr = _csr_bank[csr_id]
+    access: CsrAccess = csr.access
+
+    # 检查当前特权级是否允许读取该 CSR
+    allowed = _CSR_ACCESSIBLE.get(mode_val, frozenset())
+    if access not in allowed:
+        raise CsrAccessError(csr_id, "privilege")
+
+    # 写操作额外检查 rw
+    if is_write and access not in _CSR_WRITABLE:
+        raise CsrAccessError(csr_id, "readonly")
 
 
 def register_csr():

@@ -5,6 +5,7 @@
 
 """多核模拟器集成测试: 多 hart 执行, IPI, AMO 跨 hart 竞争."""
 
+import pytest
 
 from pyremu.emulator import Emulator
 
@@ -228,3 +229,144 @@ class TestEmulatorState:
         dump = emu.mem_hexdump(0x1000, 14)
         assert "Hello, RISC-V!" in dump
         assert "1000" in dump
+
+
+class TestEmulatorStoreMemory:
+    """通过 hart 执行 store 指令写入物理内存.
+
+    验证完整的 store 路径: exec_instr → handle_st → _mem_write →
+    _translate_full → _mem_write_phy → Bus.write → RAM/L2。
+    这是对 #sw-not-writing-to-ram 的回归测试。
+    """
+
+    RAM_BASE = 0x8000_0000  # 默认 DRAM 基址
+
+    @pytest.fixture
+    def emu(self) -> Emulator:
+        return Emulator(num_harts=1)
+
+    def test_sw_in_ram_range(self, emu):
+        """SW 写入 RAM 范围内的地址, 应能通过 Bus 读回."""
+        h = emu.harts[0]
+        # sp 指向 RAM 内
+        h.gprs[2].val = self.RAM_BASE + 0x1000  # sp
+        h.gprs[1].val = 0xCAFE_BABE  # ra (x1)
+
+        # sw x1, 0(x2):  opcode=0100011 funct3=010 rs2=1 rs1=2 imm=0
+        instr = (0 << 25) | (1 << 20) | (2 << 15) | (2 << 12) | (0x23)
+        h.exec_instr(instr)
+
+        data = emu.bus.read(self.RAM_BASE + 0x1000, 4)
+        assert data == b"\xBE\xBA\xFE\xCA", (
+            f"SW 写入失败: 期望 b'\\xbe\\xba\\xfe\\xca', 实际 {data.hex()}"
+        )
+
+    def test_sw_multiple_stores(self, emu):
+        """连续 SW 写入不同偏移, 数据不互相覆盖."""
+        h = emu.harts[0]
+        base = self.RAM_BASE + 0x2000
+        h.gprs[2].val = base  # sp
+        h.gprs[8].val = 0xAAAA_BBBB  # s0
+        h.gprs[9].val = 0xCCCC_DDDD  # s1
+
+        # sw s0, 0(sp)
+        instr0 = (0 << 25) | (8 << 20) | (2 << 15) | (2 << 12) | (0x23)
+        h.exec_instr(instr0)
+        # sw s1, 4(sp)
+        instr1 = (0 << 25) | (9 << 20) | (2 << 15) | (2 << 12) | (0x23)
+        # 手动构造 imm=4: bit 7=1, bits 8-11=0, bits 25-31=0
+        instr1 = (0 << 25) | (9 << 20) | (2 << 15) | (2 << 12) | (4 << 7) | (0x23)
+        h.exec_instr(instr1)
+
+        data = emu.bus.read(base, 8)
+        assert data[:4] == b"\xBB\xBB\xAA\xAA", f"偏移 0: {data[:4].hex()}"
+        assert data[4:8] == b"\xDD\xDD\xCC\xCC", f"偏移 4: {data[4:8].hex()}"
+
+    def test_sd_doubleword_store(self, emu):
+        """SD 写入 8 字节, 验证双字 store 的 PMA."""
+        h = emu.harts[0]
+        addr = self.RAM_BASE + 0x3000
+        h.gprs[2].val = addr  # sp
+        h.gprs[1].val = 0xDEAD_BEEF_CAFE_BABE  # ra
+
+        # sd x1, 0(x2): opcode=0100011 funct3=011 rs2=1 rs1=2 imm=0
+        instr = (0 << 25) | (1 << 20) | (2 << 15) | (3 << 12) | (0x23)
+        h.exec_instr(instr)
+
+        data = emu.bus.read(addr, 8)
+        expected = (0xDEAD_BEEF_CAFE_BABE).to_bytes(8, "little")
+        assert data == expected, f"SD 写入失败: 期望 {expected.hex()}, 实际 {data.hex()}"
+
+    def test_store_at_ram_base_edge(self, emu):
+        """SW 写入 RAM 基址 (ram_base) 边界, 确保不越界."""
+        h = emu.harts[0]
+        # 恰好从 ram_base 开始
+        h.gprs[2].val = self.RAM_BASE
+        h.gprs[1].val = 0x1234_5678
+        instr = (0 << 25) | (1 << 20) | (2 << 15) | (2 << 12) | (0x23)
+        h.exec_instr(instr)
+        assert emu.bus.read(self.RAM_BASE, 4) == b"\x78\x56\x34\x12"
+
+
+# ============================================================
+#  M 扩展: 除零 / 模零行为 (RISC-V 规范: 返回 -1 或 dividend)
+# ============================================================
+
+
+class TestMDivideByZero:
+    """验证 DIV/DIVU/REM/REMU 在除数为零时的行为.
+
+    RISC-V 特权架构规定:
+    - DIV[U] 除零 → 返回 −1 (所有位为 1)
+    - REM[U] 除零 → 返回被除数 (dividend)
+    不触发异常.
+    """
+
+    @pytest.fixture
+    def emu(self) -> Emulator:
+        return Emulator(num_harts=1, ram_base=0, reset_vector=0x1000)
+
+    def _exec_rtype(self, emu, funct3: int, funct7: int, rd: int, rs1: int, rs2: int):
+        """执行一条 R-type 指令并返回目标寄存器结果."""
+        h = emu.harts[0]
+        instr = (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0b01100_11
+        h.exec_instr(instr)
+        return h.gprs[rd].val
+
+    def test_div_by_zero(self, emu):
+        """DIV x5, x10, x0 (divisor=0) → x5 = -1."""
+        emu.harts[0].gprs[10].val = 42
+        result = self._exec_rtype(emu, funct3=4, funct7=1, rd=5, rs1=10, rs2=0)
+        assert result == 0xFFFF_FFFF_FFFF_FFFF, f"应为 -1, 实际 {result:#x}"
+
+    def test_divu_by_zero(self, emu):
+        """DIVU x5, x10, x0 → x5 = -1 (all-1s)."""
+        emu.harts[0].gprs[10].val = 0x8000_0000_0000_0000
+        result = self._exec_rtype(emu, funct3=5, funct7=1, rd=5, rs1=10, rs2=0)
+        assert result == 0xFFFF_FFFF_FFFF_FFFF
+
+    def test_rem_by_zero(self, emu):
+        """REM x5, x10, x0 → x5 = x10 (dividend)."""
+        emu.harts[0].gprs[10].val = 42
+        result = self._exec_rtype(emu, funct3=6, funct7=1, rd=5, rs1=10, rs2=0)
+        assert result == 42
+
+    def test_remu_by_zero(self, emu):
+        """REMU x5, x10, x0 → x5 = x10."""
+        emu.harts[0].gprs[10].val = 0xDEAD
+        result = self._exec_rtype(emu, funct3=7, funct7=1, rd=5, rs1=10, rs2=0)
+        assert result == 0xDEAD
+
+    def test_div_normal(self, emu):
+        """DIV x5, x10, x2 (10 / 3 = 3)."""
+        emu.harts[0].gprs[10].val = 10
+        emu.harts[0].gprs[2].val = 3
+        result = self._exec_rtype(emu, funct3=4, funct7=1, rd=5, rs1=10, rs2=2)
+        assert result == 3
+
+    def test_rem_normal(self, emu):
+        """REM x5, x10, x2 (10 % 3 = 1)."""
+        emu.harts[0].gprs[10].val = 10
+        emu.harts[0].gprs[2].val = 3
+        result = self._exec_rtype(emu, funct3=6, funct7=1, rd=5, rs1=10, rs2=2)
+        assert result == 1

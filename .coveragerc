@@ -1,0 +1,16 @@
+[run]
+source = my_package
+omit = */tests/*
+
+[report]
+# 设置报告精度
+precision = 2
+ 
+# 设置报告排除的行
+exclude_lines =
+    # Don't complain about missing debug-only code:
+    if __name__ == .__main__.:
+
+[html]
+# 设置html报告的文件夹
+directory = logs

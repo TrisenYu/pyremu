@@ -89,3 +89,26 @@ def trap_is_interrupt(trap: TrapType) -> bool:
     """判断该 TrapType 是否为中断 (而非异常)."""
     code = _TRAP_CAUSE_CODE.get(trap, 0)
     return (code >> 63) & 1 == 1
+
+
+# mcause/scause 编码 → TrapType 名称逆向映射 (惰性构建)
+_CAUSE_CODE_NAME: dict[int, str] = {code: trap.name for trap, code in _TRAP_CAUSE_CODE.items()}
+
+
+def trap_cause_name(mcause_val: int) -> str:
+    """将 mcause/scause 寄存器值翻译为可读的 trap 类型名称.
+
+    Args:
+        mcause_val: mcause/scause CSR 的原始值 (含 bit-63 中断标志).
+
+    Returns:
+        TrapType 成员名 (如 "IllInstr", "MmodeTimerInterrupt"),
+        若未精确匹配则返回 ``"异常#N"`` 或 ``"中断#N"``.
+    """
+    name = _CAUSE_CODE_NAME.get(mcause_val)
+    if name is not None:
+        return name
+    is_irq = (mcause_val >> 63) & 1
+    exc_code = mcause_val & 0x7FFF_FFFF_FFFF_FFFF
+    prefix = "中断" if is_irq else "异常"
+    return f"{prefix}#{exc_code}"

@@ -25,23 +25,12 @@ import ctypes
 from enum import Enum
 
 from pyremu.core.hart import (
-    _MODE_TO_MPP,
-    _MPP_TO_MODE,
-    MSTATUS_MIE,
-    MSTATUS_MPIE,
-    MSTATUS_MPP,
-    MSTATUS_SIE,
-    MSTATUS_SPIE,
-    MSTATUS_SPP,
     HartWithRegs,
-    RiscvMode,
 )
-from pyremu.core.trap import TrapType, trap_cause_code
-from pyremu.memory.mmu import (
-    PAGE_SIZE,
-    SATP_MODE_BARE,
-    translate_va,
-)
+from pyremu.core.mem_access import MemoryAccessor
+from pyremu.core.registers import CsrAccessError
+from pyremu.core.trap import TrapType
+from pyremu.core.trap_handler import TrapHandler
 
 _sint64 = ctypes.c_int64
 _uint64 = ctypes.c_uint64
@@ -265,7 +254,7 @@ def _trunc_rem(a: int, b: int) -> int:
     return a - _trunc_div(a, b) * b
 
 
-class Hart(HartWithRegs):
+class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
     # ----------------------------------------------------------
     #  R-type ALU (opcode = Opc.op)
     # ----------------------------------------------------------
@@ -834,7 +823,7 @@ class Hart(HartWithRegs):
             elif funct12 == 0x102:  # SRET
                 self._trap_sret()
             elif funct12 == 0x105:  # WFI
-                pass  # no-op for now
+                self._handle_wfi(instr)
             elif funct12 == 0x104:  # SFENCE.VMA
                 # 刷新所有 hart 的 TLB (当前为单 hart, 故只刷新自己)
                 self.itlb.flush_all()
@@ -843,43 +832,53 @@ class Hart(HartWithRegs):
                 raise ValueError(f"unknown privileged funct12={funct12:#05x}")
 
         elif fn3 == 0b001:  # CSRRW
+            self._check_csr(csr_addr, is_write=True)
             old = self.read_csr(csr_addr)
             if rd != 0:
                 self.gprs[rd].val = old
             self.write_csr(csr_addr, self.gprs[rs1].val)
 
         elif fn3 == 0b010:  # CSRRS
+            do_write = rs1 != 0
+            self._check_csr(csr_addr, is_write=do_write)
             old = self.read_csr(csr_addr)
             if rd != 0:
                 self.gprs[rd].val = old
-            if rs1 != 0:  # x0 means read-only
+            if do_write:
                 self.write_csr(csr_addr, old | self.gprs[rs1].val)
 
         elif fn3 == 0b011:  # CSRRC
+            do_write = rs1 != 0
+            self._check_csr(csr_addr, is_write=do_write)
             old = self.read_csr(csr_addr)
             if rd != 0:
                 self.gprs[rd].val = old
-            if rs1 != 0:
+            if do_write:
                 self.write_csr(csr_addr, old & ~self.gprs[rs1].val)
 
         elif fn3 == 0b101:  # CSRRWI
+            self._check_csr(csr_addr, is_write=True)
             old = self.read_csr(csr_addr)
             if rd != 0:
                 self.gprs[rd].val = old
             self.write_csr(csr_addr, uimm)
 
         elif fn3 == 0b110:  # CSRRSI
+            do_write = uimm != 0
+            self._check_csr(csr_addr, is_write=do_write)
             old = self.read_csr(csr_addr)
             if rd != 0:
                 self.gprs[rd].val = old
-            if uimm != 0:
+            if do_write:
                 self.write_csr(csr_addr, old | uimm)
 
         elif fn3 == 0b111:  # CSRRCI
+            do_write = uimm != 0
+            self._check_csr(csr_addr, is_write=do_write)
             old = self.read_csr(csr_addr)
             if rd != 0:
                 self.gprs[rd].val = old
-            if uimm != 0:
+            if do_write:
                 self.write_csr(csr_addr, old & ~uimm)
 
         else:
@@ -898,274 +897,6 @@ class Hart(HartWithRegs):
             pass  # TODO: flush instruction cache / pipeline
         else:
             raise ValueError(f"invalid funct3={fn3:#x} for fence")
-
-    # ----------------------------------------------------------
-    #  Memory backend injection
-    # ----------------------------------------------------------
-    def set_memory_backend(
-        self,
-        read_fn,  # (addr: int, size: int) -> bytes
-        write_fn,  # (addr: int, data: bytes) -> None
-    ) -> None:
-        """注入物理内存后端。
-
-        调用此方法后, _mem_read 和 _mem_write 将使用注入的回调
-        来读写物理内存。未注入时内存访问会抛出 NotImplementedError。
-        """
-        self._mem_read_phy = read_fn
-        self._mem_write_phy = write_fn
-
-    # ----------------------------------------------------------
-    #  地址翻译 (VA → PA, 经 TLB 缓存)
-    # ----------------------------------------------------------
-    def _translate_full(
-        self,
-        va: int,
-    ) -> tuple:
-        """完整地址翻译: TLB 查找 + 页表遍历.
-
-        供 _mem_read / _mem_write 使用的内部入口.
-        Returns: (success: bool, pa: int)
-
-        MMIO 设备地址 (经 Bus.is_device_addr 判断) 不会插入 TLB,
-        因为设备寄存器读写可能有副作用, 不能被缓存.
-        """
-        mode = self.mmu_mode
-        if mode == SATP_MODE_BARE:
-            return True, va & 0xFFFF_FFFF_FFFF_FFFF
-
-        # TLB 查找
-        vpn = va >> 12
-        tlb = self.dtlb
-        hit, ppn, perm = tlb.lookup(vpn)
-        if hit:
-            offset = va & (PAGE_SIZE - 1)
-            pa = (ppn << 12 | offset) & 0xFFFF_FFFF_FFFF_FFFF
-            return True, pa
-
-        # TLB miss — 执行页表遍历
-        if self._mem_read_phy is None:
-            return False, 0
-
-        satp = self.satp_val
-        ok, pa = translate_va(va, satp, self._mem_read_phy)
-        if not ok:
-            return False, 0
-
-        # MMIO 地址不可缓存 — 跳过 TLB 插入
-        # 设备寄存器读写有副作用, 缓存会导致重复读写时绕过设备
-        if self._bus is not None and self._bus.is_device_addr(pa):
-            return True, pa
-
-        # 将翻译结果插入 TLB 缓存
-        new_vpn = va >> 12
-        new_ppn = pa >> 12
-        tlb.insert(new_vpn, new_ppn, perm=0xF, level=0)
-
-        return True, pa
-
-    # ----------------------------------------------------------
-    #  Trap 处理
-    # ----------------------------------------------------------
-
-    def _take_trap(
-        self,
-        cause: TrapType,
-        tval: int = 0,
-        is_interrupt: bool = False,
-    ) -> None:
-        """统一的 trap 入口。
-
-        当前实现仅支持 trap 到 M 模式 (不做委派).
-        保存当前上下文到 M 模式 CSR, 然后跳转到 mtvec.
-
-        Args:
-            cause: trap 类型 (TrapType 枚举).
-            tval: 关联的故障地址或附加信息.
-            is_interrupt: True 表示中断, False 表示异常.
-        """
-        # trap 发生时清除 LR/SC 预留
-        self.clear_reservation()
-
-        # 获取 cause 编码 (中断标志已嵌入)
-        code = trap_cause_code(cause)
-
-        # 保存当前 PC 到 mepc
-        self.mepc_val = self.pc
-
-        # 设置 mcause
-        self.mcause_val = code
-
-        # 设置 mtval (故障地址或附加信息)
-        self.mtval_val = tval
-
-        # 更新 mstatus:
-        #   MPIE ← MIE (保存进入 trap 前的中断使能状态)
-        #   MIE  ← 0  (进入 trap 后关全局中断)
-        #   MPP  ← 当前特权级 (编码后写入)
-        mstatus = self.mstatus_val
-        if mstatus & MSTATUS_MIE:
-            mstatus |= MSTATUS_MPIE  # MPIE ← 1
-        else:
-            mstatus &= ~MSTATUS_MPIE  # MPIE ← 0
-        mstatus &= ~MSTATUS_MIE  # MIE ← 0
-
-        # MPP ← 当前 mode
-        mpp_code = _MODE_TO_MPP.get(self.mode, 0)
-        mstatus = (mstatus & ~MSTATUS_MPP) | (mpp_code << 11)
-        self.mstatus_val = mstatus
-
-        # 切换到 M 模式
-        self.mode = RiscvMode.M
-
-        # 跳转到 mtvec 指向的 trap 处理程序
-        # mtvec 低 2 位为 MODE:
-        #   0 (Direct):   PC ← BASE
-        #   1 (Vectored): PC ← BASE + 4 * cause_code (仅对中断有效)
-        mtvec = self.csrs["mtvec"].val
-        tvec_mode = mtvec & 0x3
-        tvec_base = mtvec & ~0x3
-
-        if tvec_mode == 1 and is_interrupt:
-            # 向量模式: 仅对中断使用
-            exc_code = code & 0x7FFF_FFFF_FFFF_FFFF  # 去掉 bit 63
-            self.pc = (tvec_base + 4 * exc_code) & 0xFFFF_FFFF_FFFF_FFFF
-        else:
-            # 直接模式
-            self.pc = tvec_base & 0xFFFF_FFFF_FFFF_FFFF
-
-    def _trap_ecall(
-        self,
-    ) -> None:
-        """ECALL: 根据当前特权级选择对应的环境调用 trap."""
-        mode_map = {
-            RiscvMode.U: TrapType.EcallFromUmode,
-            RiscvMode.S: TrapType.EcallFromSmode,
-            RiscvMode.M: TrapType.EcallFromMmode,
-        }
-        cause = mode_map.get(self.mode, TrapType.EcallFromMmode)
-        self._take_trap(cause, tval=0, is_interrupt=False)
-
-    def _trap_ebreak(
-        self,
-    ) -> None:
-        """EBREAK: 断点 trap, 常用于调试."""
-        self._take_trap(TrapType.Breakpoint, tval=self.pc, is_interrupt=False)
-
-    def _trap_mret(
-        self,
-    ) -> None:
-        """MRET: 从 M 模式 trap 返回。
-
-        恢复进入 trap 前保存的特权级和中断使能状态。
-        """
-        mstatus = self.mstatus_val
-
-        # 恢复特权级: mode ← MPP
-        mpp = (mstatus & MSTATUS_MPP) >> 11
-        self.mode = _MPP_TO_MODE.get(mpp, RiscvMode.U)
-
-        # 恢复中断使能: MIE ← MPIE, 然后 MPIE ← 1
-        if mstatus & MSTATUS_MPIE:
-            mstatus |= MSTATUS_MIE
-        else:
-            mstatus &= ~MSTATUS_MIE
-        mstatus |= MSTATUS_MPIE  # MPIE ← 1
-
-        # MPP ← U (返回后 MPP 设回最低特权)
-        mstatus = (mstatus & ~MSTATUS_MPP) | (0 << 11)
-        self.mstatus_val = mstatus
-
-        # PC ← mepc
-        self.pc = self.mepc_val & 0xFFFF_FFFF_FFFF_FFFF
-
-    def _trap_sret(
-        self,
-    ) -> None:
-        """SRET: 从 S 模式 trap 返回。
-
-        恢复进入 S 模式 trap 前保存的特权级和中断使能状态。
-        """
-        mstatus = self.mstatus_val
-
-        # 恢复特权级: mode ← SPP
-        spp = (mstatus & MSTATUS_SPP) >> 8
-        self.mode = RiscvMode.U if spp == 0 else RiscvMode.S
-
-        # 恢复中断使能: SIE ← SPIE, 然后 SPIE ← 1
-        if mstatus & MSTATUS_SPIE:
-            mstatus |= MSTATUS_SIE
-        else:
-            mstatus &= ~MSTATUS_SIE
-        mstatus |= MSTATUS_SPIE  # SPIE ← 1
-
-        # SPP ← U
-        mstatus &= ~MSTATUS_SPP
-        self.mstatus_val = mstatus
-
-        # PC ← sepc
-        self.pc = self.sepc_val & 0xFFFF_FFFF_FFFF_FFFF
-
-    # ----------------------------------------------------------
-    #  Memory access (with TLB-based address translation)
-    # ----------------------------------------------------------
-    def _mem_read(
-        self,
-        addr: int,
-        size: int,
-    ) -> bytes:
-        """从虚拟地址 *addr* 读取 *size* 字节。
-
-        经过路径: VA → (TLB 查找 / 页表遍历) → PA → 物理内存后端.
-        若未注入内存后端则抛出 NotImplementedError。
-        """
-        if self._mem_read_phy is None:
-            raise NotImplementedError(
-                f"Memory read @ {addr:#018x} ({size} B): no memory backend attached"
-            )
-
-        # 地址翻译
-        ok, pa = self._translate_full(addr)
-        if not ok:
-            # 页错误 — 触发 trap
-            self._take_trap(TrapType.LdPageFault, tval=addr, is_interrupt=False)
-            # trap 返回后会重试; 这里返回全 0 作为占位
-            return b"\x00" * size
-
-        return self._mem_read_phy(pa, size)
-
-    def _mem_write(
-        self,
-        addr: int,
-        data: bytes,
-    ) -> None:
-        """向虚拟地址 *addr* 写入 *data*。
-
-        经过路径: VA → (TLB 查找 / 页表遍历) → PA → 物理内存后端.
-        若未注入内存后端则抛出 NotImplementedError。
-        """
-        if self._mem_write_phy is None:
-            raise NotImplementedError(
-                f"Memory write @ {addr:#018x} ({len(data)} B): no memory backend attached"
-            )
-
-        # 地址翻译
-        ok, pa = self._translate_full(addr)
-        if not ok:
-            # 页错误 — 触发 trap
-            self._take_trap(TrapType.StPageFault, tval=addr, is_interrupt=False)
-            return
-
-        self._mem_write_phy(pa, data)
-
-    # ----------------------------------------------------------
-    #  Compressed instructions (C-extension, RV64C)
-    # ----------------------------------------------------------
-    # 压缩指令为 16 位宽, 低 2 位 ≠ 11 (即 00/01/10) 标识.
-    # 寄存器编码使用 3-bit 压缩格式: rd' = x8 + rd'[2:0].
-    # 按象限拆分为 _c0 / _c1 / _c2 三个子函数避免嵌套过深.
-    # 浮点压缩 (FLD/FSD/FLDSP/FSDSP) 暂为桩.
-
     @staticmethod
     def _creg(n: int) -> int:
         """3-bit 压缩寄存器号 → 完整寄存器号 (x8–x15)."""
@@ -1458,61 +1189,77 @@ class Hart(HartWithRegs):
             - 4: 32-bit 标准指令, PC 未修改
             - 0: PC 已被该指令修改 (分支跳转/JAL/JALR/MRET/SRET/trap)
         """
-        # 16-bit 压缩指令
+        # 16-bit 压缩指令 — 非法编码触发 IllInstr 陷态
         if parse_compressed(instr):
-            return self.handle_compressed(instr & 0xFFFF)
+            try:
+                return self.handle_compressed(instr & 0xFFFF)
+            except (ValueError, NotImplementedError, CsrAccessError):
+                self._take_trap(
+                    TrapType.IllInstr, tval=instr, is_interrupt=False
+                )
+                return 0
 
-        # 32-bit 标准指令
+        # 32-bit 标准指令 — 所有未识别的编码一律触发非法指令陷态
         pc_changed = False
         try:
             code = Opc(parse_opcode(instr))
         except ValueError:
-            return 4
+            self._take_trap(TrapType.IllInstr, tval=instr, is_interrupt=False)
+            return 0
 
-        if code == Opc.op:
-            self.handle_alu(instr)
-        elif code == Opc.opImm:
-            self.handle_op_imm(instr)
-        elif code == Opc.op32:
-            self.handle_op32(instr)
-        elif code == Opc.ld:
-            self.handle_ld(instr)
-        elif code == Opc.st:
-            self.handle_st(instr)
-        elif code == Opc.br:
-            if self.handle_br(instr):
+        try:
+            if code == Opc.op:
+                self.handle_alu(instr)
+            elif code == Opc.opImm:
+                self.handle_op_imm(instr)
+            elif code == Opc.op32:
+                self.handle_op32(instr)
+            elif code == Opc.ld:
+                self.handle_ld(instr)
+            elif code == Opc.st:
+                self.handle_st(instr)
+            elif code == Opc.br:
+                if self.handle_br(instr):
+                    pc_changed = True
+            elif code == Opc.jalr:
+                self.handle_jalr(instr)
                 pc_changed = True
-        elif code == Opc.jalr:
-            self.handle_jalr(instr)
-            pc_changed = True
-        elif code == Opc.jal:
-            rd = parse_rd(instr)
-            imm = parse_imm_j(instr)
-            if rd != 0:
-                self.gprs[rd].val = (self.pc + 4) & 0xFFFF_FFFF_FFFF_FFFF
-            self.pc = (self.pc + imm) & 0xFFFF_FFFF_FFFF_FFFF
-            pc_changed = True
-        elif code == Opc.lui:
-            imm20 = parse_imm20_raw(instr) << 12
-            rd = parse_rd(instr)
-            if rd != 0:
-                self.gprs[rd].val = imm20 & 0xFFFF_FFFF_FFFF_FFFF
-        elif code == Opc.auipc:
-            imm20 = parse_imm20_raw(instr) << 12
-            rd = parse_rd(instr)
-            if rd != 0:
-                self.gprs[rd].val = (self.pc + imm20) & 0xFFFF_FFFF_FFFF_FFFF
-        elif code == Opc.sys:
-            saved_pc = self.pc
-            self.handle_sys(instr)
-            if self.pc != saved_pc:
+            elif code == Opc.jal:
+                rd = parse_rd(instr)
+                imm = parse_imm_j(instr)
+                if rd != 0:
+                    self.gprs[rd].val = (self.pc + 4) & 0xFFFF_FFFF_FFFF_FFFF
+                self.pc = (self.pc + imm) & 0xFFFF_FFFF_FFFF_FFFF
                 pc_changed = True
-        elif code == Opc.fence:
-            self.handle_fence(instr)
-        elif code == Opc.amo:
-            self.handle_amo(instr)
-        else:
-            raise NotImplementedError(f"opcode {code} not implemented")
+            elif code == Opc.lui:
+                imm20 = parse_imm20_raw(instr) << 12
+                rd = parse_rd(instr)
+                if rd != 0:
+                    self.gprs[rd].val = imm20 & 0xFFFF_FFFF_FFFF_FFFF
+            elif code == Opc.auipc:
+                imm20 = parse_imm20_raw(instr) << 12
+                rd = parse_rd(instr)
+                if rd != 0:
+                    self.gprs[rd].val = (self.pc + imm20) & 0xFFFF_FFFF_FFFF_FFFF
+            elif code == Opc.sys:
+                saved_pc = self.pc
+                self.handle_sys(instr)
+                if self.pc != saved_pc:
+                    pc_changed = True
+            elif code == Opc.fence:
+                self.handle_fence(instr)
+            elif code == Opc.amo:
+                self.handle_amo(instr)
+            else:
+                # 合法 opcode 但尚未实现 (如浮点 opfp)
+                self._take_trap(
+                    TrapType.IllInstr, tval=instr, is_interrupt=False
+                )
+                return 0
+        except (ValueError, NotImplementedError, CsrAccessError):
+            # 操作码合法但编码字段无效 (如非法 funct3/funct12/nzuimm=0 等)
+            self._take_trap(TrapType.IllInstr, tval=instr, is_interrupt=False)
+            return 0
 
         return 0 if pc_changed else 4
 

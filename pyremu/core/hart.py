@@ -15,8 +15,8 @@ Hart (硬件线程) 的寄存器文件定义，包含:
 from enum import Enum
 
 from pyremu.core.registers import check_csr, register_csr, register_fpr, register_gpr
-from pyremu.core.trap import TrapType
 from pyremu.memory.cache import TLB_SIZE
+from pyremu.memory.pmp import Pmp
 from pyremu.memory.tlb import TLB
 
 
@@ -73,12 +73,18 @@ class HartWithRegs:
     快捷属性访问。
     """
 
-    def __init__(self, id: int):
+    def __init__(self, id: int, pmp_entries: int = 16):
         self.id = id
         self.gprs = register_gpr()
         self.fprs = register_fpr()
         self.csrs = register_csr()
+
+        # 机器信息寄存器 — 只读, 复位时写入
         self.csrs["mhartid"].val = id
+        self.csrs["mvendorid"].val = 0  # 非商业实现
+        self.csrs["marchid"].val = 0  # 未指定架构 ID
+        self.csrs["mimpid"].val = 1  # 实现版本
+
         self.pc = 0
         self.mode = RiscvMode.M
 
@@ -86,6 +92,11 @@ class HartWithRegs:
         # MMIO 地址禁止 CPU 缓存 (读 MMIO 可能改变硬件状态)
         self.itlb = TLB(size=TLB_SIZE)
         self.dtlb = TLB(size=TLB_SIZE)
+
+        # PMP: 物理内存保护 — 条目数为运行时只读的平台约束
+        # 超范围 CSR 访问在 _check_csr 中通过 _pmp_csr_valid 触发 IllInstr
+        self._pmp_entries = pmp_entries
+        self._pmp = Pmp(self.csrs, num_entries=pmp_entries)
 
         # 物理内存后端 — 由子类或外部注入
         # 调用约定: mem_read_phy(addr: int, size: int) -> bytes
@@ -108,6 +119,14 @@ class HartWithRegs:
         # 页表遍历模式 — 由 satp CSR 的 MODE 字段决定
         # Bare=0, Sv39=8, Sv48=9, Sv57=10, Sv64=11
         self._mmu_mode = 0
+
+        # 异常/陷态追踪
+        self._halted: bool = False  # 进入不可恢复陷态后置位
+        self._consecutive_traps: int = 0  # 连续 trap 计数 (正常执行时清零)
+
+        # WFI 低功耗等待状态
+        # 当 hart 执行 WFI 且无可处理中断时置位; 中断挂起且使能时硬件唤醒
+        self._waiting: bool = False
 
     # ----------------------------------------------------------
     #  寄存器读写
@@ -289,14 +308,23 @@ class HartWithRegs:
         """satp CSR: MODE(4) | ASID(16) | PPN(44)."""
         return self.csrs["satp"].val
 
+    @satp_val.setter
+    def satp_val(self, v: int) -> None:
+        """写入 satp 时同步更新缓存的 MMU 模式."""
+        self.csrs["satp"].val = v & 0xFFFF_FFFF_FFFF_FFFF
+        self._mmu_mode = (v >> 60) & 0xF
+
     # ----------------------------------------------------------
-    #  页表遍历模式 (从 satp.MODE 解析)
+    #  页表遍历模式 (由 satp.MODE 字段驱动)
     # ----------------------------------------------------------
 
     @property
     def mmu_mode(self) -> int:
-        """返回 satp.MODE 字段 (Bare=0, Sv39=8, Sv48=9)."""
-        return self.satp_val >> 60
+        """返回当前 MMU 翻译模式 (Bare=0, Sv39=8, Sv48=9).
+
+        值由 satp_val setter 在每次写入 satp CSR 时同步更新.
+        """
+        return self._mmu_mode
 
     @property
     def satp_ppn(self) -> int:
@@ -366,59 +394,8 @@ class HartWithRegs:
         return self._reservation_addr
 
     # ----------------------------------------------------------
-    #  中断检查 (指令边界)
+    #  trap 处理 — 由 TrapHandler mixin (core/trap_handler.py) 提供
+    #  _take_trap / _trap_deliver_smode / _trap_deliver_mmode /
+    #  _trap_ecall / _trap_ebreak / _trap_mret / _trap_sret /
+    #  _handle_wfi / check_pending_interrupts
     # ----------------------------------------------------------
-
-    def check_pending_interrupts(self) -> bool:
-        """在指令边界检查是否有待处理且使能的中断。
-
-        若有, 则通过 _take_trap 注入中断并返回 True;
-        否则返回 False.
-
-        优先级: MEI > MSI > MTI > SEI > SSI > STI
-        (RISC-V Privileged Spec §3.1.9)
-        """
-        if self._interrupt_ctrl is None:
-            return False
-
-        has_pending, mip_bits, highest_src = self._interrupt_ctrl.check_interrupt(
-            self.id
-        )
-        if not has_pending:
-            return False
-
-        # 更新 mip CSR: 合并硬件中断源和软件写入的 mip 位
-        current_mip = self.mip_val
-        self.mip_val = current_mip | mip_bits
-
-        # 检查是否有 M 模式使能的中断 (mip & mie & M-mode bits)
-        mie = self.mie_val
-        m_enabled = (self.mode == RiscvMode.M) or (
-            self.mode in (RiscvMode.U, RiscvMode.S)
-        )
-        if not m_enabled:
-            # S 模式或更低: M 模式中断始终可以抢占
-            pass
-
-        # 若当前在 M 模式且 MIE=0, 不响应中断
-        if self.mode == RiscvMode.M and not self.mie:
-            return False
-
-        masked = self.mip_val & mie
-        if masked == 0:
-            return False
-
-        # 按优先级找最高优先级的使能中断
-        int_priority = [
-            (1 << 11, TrapType.MmodeExternInterrupt),  # MEI
-            (1 << 3, TrapType.MmodeSoftInterrupt),  # MSI
-            (1 << 7, TrapType.MmodeTimerInterrupt),  # MTI
-        ]
-        for mask, trap_type in int_priority:
-            if masked & mask:
-                # 中断已响应 — 清除对应的 mip 位
-                # (CLINT 中 MSIP 需软件清除, 但这里清除内部表示)
-                self._take_trap(trap_type, tval=0, is_interrupt=True)
-                return True
-
-        return False

@@ -129,6 +129,8 @@ class L2Cache(CacheBase):
     def read(self, addr: int, size: int) -> bytes:
         """从 L2 缓存读取数据。未命中则从 RAM 加载整行。
 
+        自动处理跨缓存行的读取。
+
         Args:
             addr: 物理地址.
             size: 读取字节数 (1/2/4/8).
@@ -136,20 +138,39 @@ class L2Cache(CacheBase):
         Returns:
             读取的数据 (bytes, 长度 = size).
         """
-        tag, set_index, offset = self._addr_fields(addr)
-        way_entries = self._get_set_entries(set_index)
-        self._clock += 1
+        result = bytearray()
+        cur_addr = addr
+        remaining = size
 
-        # 查找命中
-        for e in way_entries:
-            if e.valid and e.tag == tag:
+        while remaining:
+            tag, set_index, offset = self._addr_fields(cur_addr)
+            way_entries = self._get_set_entries(set_index)
+            self._clock += 1
+
+            # 当前缓存行还能读取的字节数
+            chunk_sz = min(remaining, self._line_size - offset)
+
+            hit = False
+            for e in way_entries:
+                if not e.valid or e.tag != tag:
+                    continue
                 e.last_access = self._clock
                 self._hits += 1
-                return bytes(e.data[offset : offset + size])
+                result.extend(e.data[offset : offset + chunk_sz])
+                hit = True
+                break
 
-        # 未命中 — 需要分配新行
-        self._misses += 1
-        return self._load_line_and_read(addr, size, set_index, way_entries, tag, offset)
+            if not hit:
+                self._misses += 1
+                chunk = self._load_line_and_read(
+                    cur_addr, chunk_sz, set_index, way_entries, tag, offset,
+                )
+                result.extend(chunk)
+
+            cur_addr += chunk_sz
+            remaining -= chunk_sz
+
+        return bytes(result)
 
     def _load_line_and_read(
         self,
@@ -195,29 +216,45 @@ class L2Cache(CacheBase):
     def write(self, addr: int, data: bytes) -> None:
         """向 L2 缓存写入数据。写命中时更新行并标记 M。
 
+        自动处理跨缓存行的写入: 将 data 按缓存行边界切分,
+        逐段查找/分配并写入。
+
         Args:
             addr: 物理地址.
             data: 写入数据 (bytes).
         """
-        tag, set_index, offset = self._addr_fields(addr)
-        way_entries = self._get_set_entries(set_index)
-        self._clock += 1
+        remaining = data
+        cur_addr = addr
 
-        # 查找命中
-        for e in way_entries:
-            if e.valid and e.tag == tag:
-                # 写命中: 更新数据, 转为 M 状态
-                for i, b in enumerate(data):
+        while remaining:
+            tag, set_index, offset = self._addr_fields(cur_addr)
+            way_entries = self._get_set_entries(set_index)
+            self._clock += 1
+
+            # 当前缓存行还能容纳的字节数
+            chunk_sz = min(len(remaining), self._line_size - offset)
+            chunk = remaining[:chunk_sz]
+
+            # 查找命中
+            hit = False
+            for e in way_entries:
+                if not e.valid or e.tag != tag:
+                    continue
+                for i, b in enumerate(chunk):
                     e.data[offset + i] = b
                 e.dirty = True
                 e.mesi = MESIState.MODIFIED
                 e.last_access = self._clock
                 self._hits += 1
-                return
+                hit = True
+                break
 
-        # 写未命中 — 分配新行
-        self._misses += 1
-        self._write_allocate(addr, data, way_entries, tag, offset)
+            if not hit:
+                self._misses += 1
+                self._write_allocate(cur_addr, chunk, way_entries, tag, offset)
+
+            remaining = remaining[chunk_sz:]
+            cur_addr += chunk_sz
 
     def _write_allocate(
         self,
@@ -316,3 +353,8 @@ class L2Cache(CacheBase):
     @property
     def ways(self) -> int:
         return self._ways
+
+    @property
+    def entries(self) -> "list[L2CacheLine]":
+        """返回所有 L2CacheLine 条目 (含无效条目)."""
+        return self._entries  # type: ignore[return-type]

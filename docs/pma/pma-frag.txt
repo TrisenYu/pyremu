@@ -1,0 +1,137 @@
+PMA
+
+一个完整系统中的地址空间包含了各种各样的 address region，有些是 memory，有些是 memory-mapped 的 CSR，还有些是空洞 hole；有些 memory region 不支持读 / 写 / 执行，有些不支持 subword/sublock 粒度的访问；有些不支持原子性操作；有些不支持 cache coherence 或拥有不同的 memory model。同理，memory mapped 的 CSR 在访问位宽、原子操作、read/write 访问是否有副作用等方面也各不相同。在 RISC-V 系统中，物理地址 region 的这些属性有一个专门的术语 Physical Memory Attributes (PMAs)。
+
+PMA 是硬件的固有属性，在系统运行时几乎不会变化。 和 PMP 不同，PMA 不会随着运行程序的上下文发生变化。有些 memory region 的 PMA 属性在 chip design 时就已经确定了，比如片上 ROM。另外一些在 board design 时确定，比如片外总线上挂载的是什么芯片。片外总线上可以挂载一些支持冷 / 热拔插的设备。某些设备可以在运行时支持重配置 PMA 以支持不同的用途，比如一个片上 RAM 在某个应用在中被缓存到私有 cache 中，也可以在另外一个应用中被配置为共享的 uncacheable 空间。
+
+大部分系统都要求硬件在一旦确定物理地址之后，在后续 pipeline stage 中做一些必要的 PMA 检查，因为有些特定操作并不是所有 region 都支持，或者有些操作需要获取 PMA 当前的配置值。虽然某些架构是在 virtual page 中声明 PMA，然后通过 TLB 来告诉 pipeline 这些信息，但是这个方法会将一些 platform 信息注入到 virtual layer，而且一旦某个 page table 中某个 memory region 没有被正确初始化，就会导致系统错误。另外，可用的 page size 对于设置 PMA 来说可能并不是最优选择，这会导致地址空间碎片以及浪费宝贵的 TLB entry。
+
+RISC-V 则把 PMA 分离出来，并且用一个独立的硬件 PMA checker 进行检查：
+
+    大部分情况下，每个 region 的 PMA 是在系统设计时就已经确定了的，所以可以直接在 PMA checker 中以硬连线的方式实现。
+    对于 runtime 可配置的 PMA，则可以通过一些 memory mapped CSR 对每个 region 以合适的粒度进行配置（比如片上 SRAM 可以灵活地划分为 cacheable 和 uncacheable 区域）。
+
+包括虚实地址转化引起的隐式访问在内，任何访问物理地址的行为都会触发 PMA 检查。为了帮助系统 debug，规范强烈建议：尽可能精确地捕获导致 PMA 检查失败的物理地址访问。 精确的 PMA 违例包括 instruction/load/store access-fault exception 以及虚拟内存的 page fault。实际中并不能一直捕获到精确异常，比如探测某些以访问失败作为发现机制的一部分的 legacy bus 时，从 slave device 返回的 error response 是非精确异常。
+
+为了正确地访问设备或者是控制其他硬件单元（比如 DMA）去访问 memory，PMA 对软件来说必须是可读的。因为 PMA 和硬件平台的设计紧密相关，很多 PMA 来自平台规格，所以软件可以通过访问平台信息的方式来获取 PMA 信息。某些 device，特别是 legacy bus，不支持通过探索尝试的方式获取 PMA，如果对其发起一个不支持的访问，则会返回 error response 或 timeout。通常，平台相关的 machine code 会提取这些 PMA 信息并通过某种标准表示方式将其转发给上层特权等级更低的软件。
+
+对于 platform 支持的可配置 PMA，应该提供一个接口，通过该接口向运行在 machine mode 的 driver 发送配置请求，由 driver 进行正确的配置。比如，切换某些 memory region 的 cacheability 可能会涉及到一些 platform 相关的操作，比如只能在 machine mode 下进行的 cache flush。
+
+常见的 PMA 大概包含下面几方面。
+Main memory / IO / empty
+
+对于一个 memory region 来说，最重要的属性就是它映射的是常规 main memory 还是 I/O 设备或空洞。main memory 拥有一些后文描述的属性，而 I/O 设备的属性会更广泛一些。非 main memory 的 memory，比如 device scratchpad RAM，被归类为 I/O 段。空地址段会被归类不支持任何访问的 I/O 空间。
+Supported Access Type
+
+描述 region 支持从 8bit Byte 到 long multi-word burst 之间的哪些访问位宽，以及每种访问位宽是否支持非对齐访问。
+
+Tip
+
+虽然运行在 RISC-V hart 上的软件不能直接生成对 memory 的 burst 访问，但是软件可以对 DMA 进行编程来访问 I/O 设备，所以需要知道支持哪些位宽访问。
+
+main memory 永远都支持所有 device 要求的所有 width 下的 read/write 操作，同时可以声明是否支持 instruction fetch。
+
+Tip
+
+    某些平台可能会强制要求所有 main memory 都支持 instruction fetch，而某些平台可能会禁止在某些 main memory region 进行 instruction fetch。
+    在某些 case 中，processor/device 可能支持一些其他访问位宽，但是必须兼容 main memory 支持的访问类型。
+
+I/O region 可以指定每种位宽支持的 R/W/X 组合。
+
+对于基于 page 的 virtual memory，I/O 和 memory region 可以指定支持哪些 hardware page table read/write 组合。
+
+Tip
+
+类 unix 系统通常要求所有 cacheable main memory 都支持 page table walk。
+Atomicity
+
+Atomicity PMA 描述 region 支持哪些原子指令，原子指令可以分为 LR/SC 和 AMO 两类。
+
+Tip
+
+某些平台可能强制要求 cacheable main memory 必须支持系统中所有 processor 的所有原子指令。
+AMO
+
+AMO 的支持可以分为AMONone，AMOSwap，AMOLogical，AMOArithmetic 共 4 个等级，main memory 和 I/O 可能支持部分子集或完全不支持 AMO 操作。
+
+Tip
+
+spec 推荐 I/O region 尽可能支持 AMOLogical。
+Reservability PMA
+
+对 LR/SC 访问的支持可以分为 RsrvNone，RsrvNonEventual，RsrvEventual 共 3 个等级。
+
+Tip
+
+    spec 推荐 main memory region 尽可能支持 RsrvEventual。大部分 I/O region 不支持 LR/SC 访问，因为这些访问最方便建构在 cache-coherence 方案之上，但是有些可能支持 RsrvEventual 或 RsrvNonEventual。
+    当 LR/SC 访问 RsrvNonEventual 的 memory region 时，当软件检测到无法访问时，软件应该提供备选的 fall-back 机制。
+
+Alignment
+
+支持 aligned LR/SC 和 aligned AMO 访问的 memory region 可能还支持 misaligned LR/SC 和 misaligned AMO 以某些位宽访问某些地址。如果 misaligned LR/SC 或 AMO 以某种位宽访问某个地址时触发了 address-misaligned exception，那么所有以该位宽访问该地址的 load，store，LR/SC 和 AMO 访问都应该触发 address-misaligned exception。
+
+Tip
+
+A 子集不支持非对齐的 LR/SC 和 AMO 访问。非对齐 AMO 访问由 Zam 子集提供，非对齐的 LR/SC 访问目前还没有标准化，所以非对齐的 LR/SC 访问必须触发 exception。
+
+当非对齐的 AMO 触发 address-misaligned exception 时，强制要求非对齐的 load，store 也触发 address-misaligned exception，这样就可以模拟 M-mode trap handler 中的 misaligned AMO 访问。该 handler 使用 global mutex，在 critical section 模拟该访问，以这样的方式保证原子性。当非对齐 load/store 的 handler 使用同一个 mutex 时，以该位宽访问该地址的所有访问都是 mutually atomic。
+
+对于某些非对齐访问，implementation 可以通过触发 access-fault exception 的方式表明不应该在 trap handler 中模拟该行为。当以某种位宽访问某个地址时，如果所有 misaligned AMO 和 LR/SC 都触发了 access-fault exception，那么以该位宽访问该地址的所有常规非对齐 load/store 则不要求原子性执行。
+Memory Ording PMAs
+
+为了实现 FENCE 指令和原子指令 order bit 提供的 order 功能，地址空间被分为 main memory 和 I/O 两类。
+
+一个 hart 对 main memory region 的访问不仅能被其他 hart 观测到，也会被其他能对 main memory 发起访问的 device（比如 DMA）观测到。coherent main memory 的 memory model 要么是 RVWMO 要么是 RVTSO，incoherent main memory region 的 memory model 由 implementation 决定。
+
+一个 hart 对 I/O region 的访问不仅能被其他 hart 和 bus master device 观测到，也会被目标 I/O slave device 观测到。I/O region 的访问要么是 relax order 要么是 strong order：
+
+    以 relax order 访问 I/O region，其他 hart 和 master device 观测到的行为和以 RVWMO 访问 main memory region 类似。
+    以 strong order 访问 I/O region，其他 hart 和 master device 观测到的为 program order。
+
+Coherenece and Cacheability
+
+coherenece 是针对单个物理地址而言的属性，表示某个 agent 对该地址的 write 对系统中的其他 agent 都可见。注意，不要把 coherence 和 memory consistency model 混淆，内存一致性模型规定给定某个地址的历史读写信息后，读该地址的返回值应该是什么。RISC-V 中不鼓励使用 hardware incoherent region，因为它会导致软件复杂化，性能和功耗恶化。
+
+一个地址段的 cacheability 属性不会改变软件对该地址段的 view，这些 view 不包括其他 PMA 中规定的属性（比如 main memory 和 I/O 空间的划分、访问顺序、支持的访问类型、支持的原子操作、coherence 等）。因此，cacheability 在指令集中被视为 M-mode 软件管理的 platform level setting。
+
+当一个 platform 支持对某个 memory region 配置 cacheability 时，一个和 platform 相关的 M-mode routine 负责修改配置，并在必要时 flush cache。因此，只有在 cacheability 的变换的这段时间内系统为 incoherent，这种中间的变化状态不应该对 S/U mode 可见。
+
+Tip
+
+指令集将 cache 分为了：
+
+    master private：每个 master 私有
+    master shared：位于 master 和 slave 之间，可能有多级
+    slave private：由 slave 私有，对 coherence 无影响
+
+对于不支持 cache 的 share memory region 来说，coherence 很直观，PMA 只需要表明该 region 不支持被 private 或 shared cache。
+
+对于 read-only 的 memory region 来说，coherence 也很直观，无需 coherence 机制就可以被多个 agent 安全地多次 cache。PMA 只需要表明该 region 只支持 read，不支持 write 即可。
+
+有些 read-write memory region 可能只支持一个 agent 访问，这种场景下无需 coherence 机制就可以被 master private cache。PMA 会表明该 region 可以被 cache，而且可以被 cache 在一个 shared cache 中，因为其他 agent 不会访问该 region。
+
+如果一个 agent 可以 cache 一个 read-write region，且该 region 也可以被其他 agent 访问（无论是否为 cache 或 no cache），都需要一套 cache-coherence 机制。如果没有 hardware cache coherence，则必须提供 software cohere scheme，但是通常软件实现都比较困难且存在严重的性能问题。hardware coherence scheme 通常需要更复杂的硬件，也会影响到性能，但是对软件是不可见的。
+
+对于每个支持 hardware coherence 的 region 来说，PMA 应该表明该 region 支持 coherence 且当系统中 coherence controller 有多个时，PMA 要指明该 region 使用哪个 controller。对于某些系统来说，controller 是下一级 cache，而该级 cache 的 coherence 又依赖于下下级 cache。
+
+platform 中的大部分 memory region 对软件来说都是 coherent 的，因为这些 region 的 PMA 属性都是固定的，要么 uncached，要么 read-only，要么 hardware cache-coherent，要么只能由一个 agent 访问。
+
+如果 PMA 表明该 region 不支持 cache，则对该 memory region 的访问必须由 memory 自身来满足，不能依靠任何 cache。
+Idempotency
+
+幂等性 idempotency：执行多次和一次的效果一样。
+
+    main memory region 是 idempotent。
+    I/O region 的 read/write idempotent 是分开的：read 具有幂等性，而 write 不具有。
+
+如果访问不具有幂等性，也就是说会产生潜在的副作用，那么必须避免 speculative 或 redundant 访问（因为他们都可能会导致多次访问）。
+
+Tip
+
+虽然 hardware 会对 non-idempotent region 避免 speculative 或 redundant 访问，但是还是有必要确保软件或编译优化不会对 non-idempotent region 生成投机访问。
+
+non-idempotent region 可能不支持非对齐访问。非对齐访问应该触发 access-fault exception 而不是 address-misaligned exception，以此来表明软件不应该通过拆分成多次小颗粒的访问来模拟非对齐访问，因为这种行为会引起预期之外的副作用。
+
+对于 non-idempotent region 来说，不允许 implementat 提前或投机地进行 implicit read/write，除非是以下特例。
+
+当进行非投机的 implicit read 时，允许 implementation 额外从包含本次 implicit read 地址的 NAPOT region 中读取任意长度的数据量。而且如果是 instruction fetcch，允许 implementat 额外从下一个 NAPOT region 中读取任意 byte 数据量。这些额外的读数据可以作为后续的提前或投机访问的结果。这些 NAPOT region 的大小由 implementation 决定，但是必须不超过支持的最小 page size。

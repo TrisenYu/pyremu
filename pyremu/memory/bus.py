@@ -3,14 +3,21 @@
 # SPDX-LICENSE-IDENTIFIER: GPL2.0
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 # Created at 2026/06/09 星期二
+# Last modified at 2026/06/10 星期三
 
 """
 共享总线 (Bus) — 统一的物理内存访问层。
 
 Bus 管理:
-- 物理 RAM (bytearray)
+- 物理 RAM (bytearray), 默认基址 0x8000_0000 (RISC-V 标准内存映射)
 - L2 共享缓存 (可选, 继承 CacheBase)
 - 内存映射设备 (CLINT, 未来的 IMSIC/APLIC/UART 等)
+
+PMA (Physical Memory Attributes):
+  地址空间按硬件属性分为三类区域:
+  - Main Memory  : [ram_base, ram_base + ram_size) — 可缓存、支持原子操作、全位宽访问
+  - I/O (Device) : 通过 add_device() 注册 — 不可缓存、读写可能有副作用
+  - Empty / Hole : 其余地址 — 触发 AccessFault (该行为在 Hart._mem_read/_mem_write 中实现)
 
 关键设计: 设备 MMIO 地址具有读写副作用 (读可能改变硬件状态),
 必须排除于所有缓存机制之外 — 不走 TLB 缓存, 不走 L2 缓存, 直通设备。
@@ -50,6 +57,17 @@ class Device(ABC):
         """
 
 
+class AccessFaultError(Exception):
+    """PMA 访问违例 — 地址不在任何有效区域 (非内存、非设备)."""
+
+    def __init__(self, addr: int, is_write: bool = False) -> None:
+        self.addr = addr
+        self.is_write = is_write
+        super().__init__(
+            f"PMA AccessFault: addr=0x{addr:016x} ({'write' if is_write else 'read'})"
+        )
+
+
 class Bus:
     """共享物理总线.
 
@@ -65,9 +83,12 @@ class Bus:
     def __init__(
         self,
         ram_size: int = 128 * 1024 * 1024,
+        ram_base: int = 0x8000_0000,
         l2_cache=None,  # L2Cache 实例或 None
     ) -> None:
         self._ram = bytearray(ram_size)
+        self._ram_base = ram_base
+        self._ram_end = ram_base + ram_size
         self._ram_size = ram_size
         self._l2 = l2_cache
         self._devices: dict[int, Device] = {}  # base_addr → device
@@ -95,6 +116,14 @@ class Bus:
                 return dev, addr - base
         return None, 0
 
+    # ----------------------------------------------------------
+    #  PMA 检查
+    # ----------------------------------------------------------
+
+    def is_ram_addr(self, addr: int) -> bool:
+        """判断物理地址是否属于主存 (Main Memory)."""
+        return self._ram_base <= addr < self._ram_end
+
     def is_device_addr(self, addr: int) -> bool:
         """判断物理地址是否属于 MMIO 设备区域 (不可缓存).
 
@@ -104,6 +133,23 @@ class Bus:
             if base <= addr < base + dev.size:
                 return True
         return False
+
+    def is_valid_addr(self, addr: int) -> bool:
+        """PMA 检查: 地址是否在有效物理区域 (主存或 I/O 设备).
+
+        Returns:
+            True 若地址属于 Main Memory 或已注册的 I/O Device.
+            空洞地址 (Empty/Hole) 返回 False, 上层应触发 AccessFault.
+        """
+        if self.is_ram_addr(addr):
+            return True
+        if self.is_device_addr(addr):
+            return True
+        return False
+
+    @property
+    def ram_base(self) -> int:
+        return self._ram_base
 
     @property
     def devices(self) -> dict[int, Device]:
@@ -115,18 +161,25 @@ class Bus:
     # ----------------------------------------------------------
 
     def _ram_read_direct(self, addr: int, size: int) -> bytes:
-        """直接从 RAM 读取 (绕过 L2 缓存)."""
-        if addr + size > self._ram_size:
-            # 越界访问返回 0 (模拟未映射物理地址)
+        """直接从 RAM 读取 (绕过 L2 缓存).
+
+        *addr* 超出 RAM 范围时返回全 0 (模拟未映射物理地址).
+        """
+        if not (self._ram_base <= addr and addr + size <= self._ram_end):
             return b"\x00" * size
-        return bytes(self._ram[addr : addr + size])
+        offset = addr - self._ram_base
+        return bytes(self._ram[offset : offset + size])
 
     def _ram_write_direct(self, addr: int, data: bytes) -> None:
-        """直接写入 RAM (绕过 L2 缓存)."""
-        if addr + len(data) > self._ram_size:
+        """直接写入 RAM (绕过 L2 缓存).
+
+        *addr* 超出 RAM 范围时静默丢弃 (由上层 PMA 检查保证不会发生).
+        """
+        if not (self._ram_base <= addr and addr + len(data) <= self._ram_end):
             return
+        offset = addr - self._ram_base
         for i, b in enumerate(data):
-            self._ram[addr + i] = b
+            self._ram[offset + i] = b
 
     # ----------------------------------------------------------
     #  总线读写 (外部接口 — Hart 的 _mem_read_phy / _mem_write_phy 使用)

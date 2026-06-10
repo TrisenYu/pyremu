@@ -14,3 +14,4 @@ wheels/
 .venv
 .pytest_cache
 .ruff_cache
+.coverage
