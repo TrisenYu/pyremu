@@ -35,9 +35,13 @@ from rich.table import Table
 
 from pyremu.core.decoder import parse_compressed
 from pyremu.core.hart import RiscvMode
+from pyremu.memory.l2cache import L2Cache
 from pyremu.core.registers import register_csr, register_fpr, register_gpr
 from pyremu.utils.disassem import disasm
+from pyremu.utils.str_aux import fmt_addr, fmt_hexdump
+from pyremu.utils.wrapper import seize_val_err
 from pyremu.core.trap import TrapType, trap_cause_name
+from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap
 from pyremu.emulator import Emulator
 from pyremu.env_inject import Preloader
 from pyremu.platform import PeripheralConfig, PlatformConfig
@@ -51,7 +55,6 @@ from pyremu.utils.parse_bin import FirmwareImage, parse_firmware
 @dataclass
 class HartSnapshot:
     """单条指令执行前的 hart 状态."""
-
     pc: int
     gpr_vals: list[int]
     csr_vals: dict[str, int]
@@ -63,9 +66,42 @@ class HartSnapshot:
 @dataclass
 class MemoryChange:
     """一次物理内存写入的记录 (addr, old_data)."""
-
     addr: int
     old: bytes
+
+
+class MemWriteTracker:
+    """内存写入追踪器 — 代理 hart 的 _mem_write_phy, 记录旧值供指令回滚.
+
+    在每条指令执行前实例化, 注入 hart 的写后端; 指令执行后取出 changes
+    列表供 rollback 使用, 同时恢复原始写后端.
+    """
+
+    def __init__(self, bus, orig_write):
+        self._bus = bus
+        self._orig_write = orig_write
+        self.changes: list[MemoryChange] = []
+
+    def __call__(self, addr: int, data: bytes) -> None:
+        self._record_old(addr, len(data))
+        self._orig_write(addr, data)
+
+    def _record_old(self, addr: int, size: int) -> None:
+        """Best-effort: 在覆盖前读取旧值. 读不到就跳过记录, 不阻断写入."""
+        old = self._bus.try_read(addr, size)
+        if old is not None:
+            self.changes.append(MemoryChange(addr=addr, old=old))
+
+
+@dataclass
+class StackFrame:
+    """栈回溯中的单帧."""
+
+    idx: int
+    fp: int
+    sp: int
+    ra: int
+    pc: int  # call site = ra - 4 (若 ra ≥ 4)
 
 
 # ============================================================
@@ -86,21 +122,21 @@ class Debugger:
         hart_id: int = 0,
         image: FirmwareImage | None = None,
     ) -> None:
-        self._emu = emulator
-        self._hart_id = hart_id
-        self._image = image
-        self._running = False
+        self._emu: Emulator = emulator
+        self._hart_id: int = hart_id
+        self._image: FirmwareImage | None = image
+        self._running: bool = False
 
-        self._sigint_count = 0
-        self._paused = False
-        self._terminated = False
+        self._sigint_count: int = 0
+        self._paused: bool = False
+        self._terminated: bool = False
 
         self._snapshot: HartSnapshot | None = None
         self._mem_changes: list[MemoryChange] = []
-        self._instr_count = 0
+        self._instr_count: int = 0
 
         # Rich console — 所有交互输出经此通道 (彩色, 高亮)
-        self._console = Console(highlight=True)
+        self._console: Console = Console(highlight=True)
 
         # 陷态上下文去重: 同一 mcause 值只展示一次，避免 handler 执行期间重复刷屏
         self._trap_displayed_mcause: int | None = None
@@ -108,11 +144,18 @@ class Debugger:
         # 上一条命令 (按回车重复执行)
         self._last_command: str | None = None
 
+        # disasm 重复时的自动推进地址 (指向上次输出末尾)
+        self._disasm_next_addr: int | None = None
+
+        # 最近的栈回溯帧列表 (供 frame N 选择)
+        self._stack_frames: list[StackFrame] = []
+        self._current_frame_idx: int = 0
+
         # prompt_toolkit REPL — 方向键历史, Tab 补全, 持久化历史文件
-        self._history = FileHistory(
+        self._history: FileHistory = FileHistory(
             os.path.expanduser("~/.pyremu_history")
         )
-        self._completer = self._build_completer()
+        self._completer: WordCompleter = self._build_completer()
         self._session: PromptSession[str] = PromptSession(
             history=self._history,
             completer=self._completer,
@@ -141,7 +184,7 @@ class Debugger:
             "status", "info",
             "symbols", "sym",
             "disasm",
-            "stack", "bt",
+            "stack", "bt", "frame", "f",
             # 配置 & 帮助
             "hart", "h", "help", "?",
             "q", "quit", "exit",
@@ -179,13 +222,11 @@ class Debugger:
 
     def _sigint_run(self, signum: int, frame) -> None:
         self._sigint_count += 1
-        if self._sigint_count == 1:
-            self._console.print(
-                "\n[yellow]暂停请求 — 当前指令完成后回到 REPL; 再次 Ctrl+C 强制终止[/]"
-            )
-        else:
-            self._console.print("\n[red bold]强制终止模拟循环[/]")
+        payload = "\n[yellow]暂停请求 — 当前指令完成后回到 REPL[/]"
+        if self._sigint_count != 1:
+            payload = "\n[red bold]强制终止模拟循环[/]"
             self._terminated = True
+        self._console.print(payload)
         self._paused = True
 
     def _enter_repl_mode(self) -> None:
@@ -231,19 +272,12 @@ class Debugger:
             return  # 已输出过转储信息, 静默跳过
 
         snap = self._save_snapshot()
-        self._mem_changes = []
 
         orig_write = h._mem_write_phy
+        assert orig_write is not None, "memory backend not attached"
 
-        def tracking_write(addr: int, data: bytes) -> None:
-            try:
-                old = self._emu.bus.read(addr, len(data))
-                self._mem_changes.append(MemoryChange(addr=addr, old=old))
-            except Exception:
-                pass
-            orig_write(addr, data)
-
-        h._mem_write_phy = tracking_write
+        tracker = MemWriteTracker(self._emu.bus, orig_write)
+        h._mem_write_phy = tracker
 
         try:
             pc_before = h.pc
@@ -252,7 +286,7 @@ class Debugger:
             try:
                 advance = h.exec_instr(instr)
             except NotImplementedError:
-                h._take_trap(TrapType.IllInstr, tval=instr, is_interrupt=False)
+                deliver_trap(h, TrapType.IllInstr, tval=instr, is_interrupt=False)
                 advance = 0
             # 仅在 PC 未被 exec_instr 内部修改时才自动推进
             if advance != 0 and h.pc == pc_before:
@@ -266,11 +300,21 @@ class Debugger:
                 )
                 h._halted = True
                 self._err(f"Hart {h.id} 进入不可恢复陷态, 已暂停")
-            h.check_pending_interrupts()
+
+            """
+            单条指令不可被中途打断。
+
+            CPU 只会在当前指令彻底执行完成、准备取下一条指令时，检查中断请求。
+
+            若当前是访存指令必须等待访存阶段完成（数据读回寄存器 / 数据写入内存），
+            指令才算结束，从而才会响应中断。
+            """
+            check_pending_interrupts(h)
             self._instr_count += 1
         finally:
             h._mem_write_phy = orig_write
 
+        self._mem_changes = tracker.changes
         self._snapshot = snap
 
     def rollback(self) -> None:
@@ -280,10 +324,7 @@ class Debugger:
             return
 
         for change in reversed(self._mem_changes):
-            try:
-                self._emu.bus.write(change.addr, change.old)
-            except Exception:
-                pass
+            self._emu.bus.try_write(change.addr, change.old)
 
         self._restore_snapshot(self._snapshot)
         self._snapshot = None
@@ -363,9 +404,6 @@ class Debugger:
         self._console.print(f"[dim]执行 {n} 条指令...[/]")
         self._run_loop(steps=n)
 
-    def cmd_undo(self) -> None:
-        self.rollback()
-
     def cmd_regs(self) -> None:
         h = self.hart
         tbl = Table(title=f"Hart {self._hart_id}  GPRs", border_style="blue")
@@ -390,17 +428,14 @@ class Debugger:
             return
         self._console.print(f"{r.name} ([cyan]{r.alias}[/]) = [green]{self._hex(r.val)}[/]")
 
+    @seize_val_err("无效值")
     def cmd_set(self, name: str, value: str) -> None:
         """写入 GPR: set <name> <value>."""
         r = self._find_gpr(name)
         if r is None:
             self._err(f"未知寄存器: {name}")
             return
-        try:
-            v = int(value, 0) & 0xFFFF_FFFF_FFFF_FFFF
-        except ValueError:
-            self._err(f"无效值: {value}")
-            return
+        v = int(value, 0) & 0xFFFF_FFFF_FFFF_FFFF
         old = r.val
         r.val = v
         self._console.print(
@@ -438,17 +473,14 @@ class Debugger:
             f"[cyan]{name}[/] = [green]{self._hex(csr.val)}[/] (dec: {csr.val})"
         )
 
+    @seize_val_err("无效值")
     def cmd_csrw(self, name: str, value: str) -> None:
         """写入 CSR: csrw <name> <value>."""
         h = self.hart
         if name not in h.csrs:
             self._err(f"未知 CSR: {name} (用 'csr list' 查看可用列表)")
             return
-        try:
-            v = int(value, 0) & 0xFFFF_FFFF_FFFF_FFFF
-        except ValueError:
-            self._err(f"无效值: {value}")
-            return
+        v = int(value, 0) & 0xFFFF_FFFF_FFFF_FFFF
         csr = h.csrs[name]
         old = csr.val
         csr.val = v
@@ -457,6 +489,17 @@ class Debugger:
             f"[yellow]{self._hex(old)}[/] → [green]{self._hex(v)}[/]"
         )
 
+    def _fetch_and_disasm(self, pc: int) -> tuple[str, str] | None:
+        """读取 PC 处指令字并反汇编, 返回 (raw_hex, asm); IO 失败返回 None."""
+        raw = self._emu.bus.try_read(pc, 4)
+        if raw is None:
+            return None
+        instr = int.from_bytes(raw, "little", signed=False)
+        asm = disasm(instr, pc)
+        raw_hex = " ".join(f"{b:02x}" for b in raw[:4])
+        return raw_hex, asm
+
+    @seize_val_err("无效地址")
     def cmd_pc(self, addr: str | None = None) -> None:
         """读/设 PC: pc (读取并反汇编), pc <addr> (设置).
 
@@ -465,11 +508,7 @@ class Debugger:
         """
         h = self.hart
         if addr is not None:
-            try:
-                v = int(addr, 0) & 0xFFFF_FFFF_FFFF_FFFF
-            except ValueError:
-                self._err(f"无效地址: {addr}")
-                return
+            v = int(addr, 0) & 0xFFFF_FFFF_FFFF_FFFF
             old = h.pc
             h.pc = v
             self._snapshot = None
@@ -478,14 +517,11 @@ class Debugger:
                 f"PC: [yellow]{self._hex(old)}[/] → [green]{self._hex(h.pc)}[/]"
             )
         pc = h.pc
-        try:
-            raw = self._emu.bus.read(pc, 4)
-            instr = int.from_bytes(raw, "little", signed=False)
-            asm = disasm(instr, pc)
-            raw_hex = " ".join(f"{b:02x}" for b in raw[:4])
-        except Exception:
-            raw_hex = "(无法读取)"
-            asm = "(无法解码)"
+        result = self._fetch_and_disasm(pc)
+        if result is None:
+            raw_hex, asm = "(无法读取)", "(无法解码)"
+        else:
+            raw_hex, asm = result
         lines = [
             f"PC  = [bold yellow]{self._hex(pc)}[/]",
             f"Raw = [dim]{raw_hex}[/]",
@@ -603,6 +639,7 @@ class Debugger:
             if not found:
                 self._console.print(f"  [[cyan]{name}[/]] [dim]未命中[/]")
 
+    @seize_val_err("无效 VPN")
     def cmd_tlb(self, arg: str | None = None) -> None:
         """显示或查找 TLB 条目.
 
@@ -610,15 +647,13 @@ class Debugger:
         tlb <vpn>   — 查找指定 VPN
         """
         if arg is not None:
-            try:
-                self._tlb_search(int(arg, 0))
-            except ValueError:
-                self._err(f"无效 VPN: {arg}")
+            self._tlb_search(int(arg, 0))
             return
         h = self.hart
         self._show_tlb("ITLB", h.itlb)
         self._show_tlb("DTLB", h.dtlb)
 
+    @seize_val_err("无效 VPN")
     def cmd_tlbflush(self, vpn_str: str | None = None) -> None:
         """刷新 TLB: tlbflush [vpn] (无参数 = 全部)."""
         h = self.hart
@@ -627,11 +662,7 @@ class Debugger:
             h.dtlb.flush_all()
             self._console.print("[dim]已刷新全部 ITLB + DTLB[/]")
             return
-        try:
-            vpn = int(vpn_str, 0)
-        except ValueError:
-            self._err(f"无效 VPN: {vpn_str}")
-            return
+        vpn = int(vpn_str, 0)
         h.itlb.flush(vpn)
         h.dtlb.flush(vpn)
         self._console.print(f"[dim]已刷新 ITLB + DTLB 中 VPN=0x{vpn:09x}[/]")
@@ -659,6 +690,7 @@ class Debugger:
         preview = bytes(e.data[:16]).hex(" ")
         return meta + f"  data[:16]={preview}"
 
+    @seize_val_err("set/way索引需要为整数")
     def cmd_cache(self, arg: str | None = None) -> None:
         """显示 L2 缓存状态.
 
@@ -667,7 +699,7 @@ class Debugger:
         cache <set> <way> — 指定 set/way, 含完整 64 B hexdump
         """
         l2 = self._emu.bus.l2
-        if l2 is None:
+        if not isinstance(l2, L2Cache):
             self._console.print("[dim]L2 缓存未启用[/]")
             return
 
@@ -677,20 +709,12 @@ class Debugger:
         target_set, target_way = None, None
         if arg is not None:
             parts = arg.split()
-            try:
-                target_set = int(parts[0], 0)
-            except ValueError:
-                self._err(f"无效 set 索引: {parts[0]}")
-                return
+            target_set = int(parts[0], 0)
             if not (0 <= target_set < num_sets):
                 self._err(f"set 索引超出范围 [0, {num_sets - 1}]")
                 return
             if len(parts) > 1:
-                try:
-                    target_way = int(parts[1], 0)
-                except ValueError:
-                    self._err(f"无效 way 索引: {parts[1]}")
-                    return
+                target_way = int(parts[1], 0)
                 if not (0 <= target_way < ways):
                     self._err(f"way 索引超出范围 [0, {ways - 1}]")
                     return
@@ -760,6 +784,7 @@ class Debugger:
             out.append(f"  根页表 PA = [yellow]0x{(ppn << 12):016x}[/]")
         self._console.print("\n".join(out))
 
+    @seize_val_err("addr 和 length 需为整数 (支持 0x 前缀)")
     def cmd_disasm(self, addr_str: str, length_str: str = "64") -> None:
         """反汇编指定内存区域.
 
@@ -768,21 +793,15 @@ class Debugger:
         自动识别 16-bit 压缩指令和 32-bit 标准指令边界,
         按地址递增顺序逐条输出。
         """
-        try:
-            addr = int(addr_str, 0)
-            length = int(length_str, 0)
-        except ValueError:
-            self._err("addr 和 length 需为整数 (支持 0x 前缀)")
-            return
+        addr, length = int(addr_str, 0), int(length_str, 0)
 
         if length <= 0 or length > 4096:
             self._err("length 需在 1–4096 之间")
             return
 
-        try:
-            raw = self._emu.bus.read(addr, length)
-        except Exception:
-            self._console.print_exception()
+        raw = self._emu.bus.try_read(addr, length)
+        if raw is None:
+            self._err("无法读取指定地址")
             return
 
         lines: list[str] = []
@@ -817,6 +836,9 @@ class Debugger:
             lines.append(f"  {self._hex(pc)}  {raw_hex:<12s}  {asm}")
             offset += inst_size
 
+        # 记录末尾地址, 供下次重复时自动推进
+        self._disasm_next_addr = addr + offset
+
         if not lines:
             self._console.print("[dim](空)[/]")
             return
@@ -827,18 +849,11 @@ class Debugger:
             + "\n".join(lines)
         )
 
+    @seize_val_err("addr 和 size 需为整数 (支持 0x 前缀)")
     def cmd_mem(self, addr_str: str, size_str: str = "64") -> None:
-        try:
-            addr = int(addr_str, 0)
-            size = int(size_str)
-        except ValueError:
-            self._err("addr 和 size 需为整数 (支持 0x 前缀)")
-            return
-        try:
-            dump = self._emu.mem_hexdump(addr, size)
-            self._console.print(dump)
-        except Exception:
-            self._console.print_exception()
+        addr, size = int(addr_str, 0), int(size_str, 0)
+        dump = self._emu.mem_hexdump(addr, size)
+        self._console.print(dump)
 
     def cmd_status(self) -> None:
         h = self.hart
@@ -876,99 +891,127 @@ class Debugger:
                 return name
         return None
 
-    def cmd_frame(self) -> None:
-        """显示当前栈帧和调用回溯 (backtrace).
+    # ----------------------------------------------------------
+    #  栈帧回溯辅助
+    # ----------------------------------------------------------
 
-        RISC-V 标准帧布局 (s0/fp 指向帧基):
-            fp -  8 → 保存的 ra
-            fp - 16 → 保存的 fp (上一层帧)
-        回溯沿保存的 fp 链向上遍历, 直到 fp=0 或链断裂.
+    def _try_read_frame_link(self, fp: int) -> tuple[int, int] | None:
+        """读取 fp 指向的栈帧链接 (saved_ra, saved_fp); 越界则返回 None.
+
+        RISC-V 标准栈帧布局: fp-8 存返回地址, fp-16 存调用者的 fp.
+        """
+        ra_raw = self._emu.bus.try_read(fp - 8, 8)
+        if ra_raw is None:
+            return None
+        ra = int.from_bytes(ra_raw, "little", signed=False)
+        fp_raw = self._emu.bus.try_read(fp - 16, 8)
+        if fp_raw is None:
+            return None
+        fp = int.from_bytes(fp_raw, "little", signed=False)
+        return ra, fp
+
+    def _walk_frame_chain(self) -> list[StackFrame]:
+        """沿 FP 链遍历调用栈, 返回 StackFrame 列表.
+
+        从当前 hart 的 s0/fp 出发, 按标准 RISC-V 栈帧布局
+        (fp-8 存 RA, fp-16 存 saved FP) 向上回溯.
+        遇非法指针、读内存失败或 RA=0 时截断.
         """
         h = self.hart
-        sp = h.gprs[2].val
-        ra = h.gprs[1].val
-        fp = h.gprs[8].val
-        pc = h.pc
+        frames: list[StackFrame] = []
+        current_fp: int = h.gprs[8].val  # s0/fp
+        visited: set[int] = {current_fp}
+        max_frames = 32
 
+        # 帧 #0: 当前执行点 (PC 取自 hart, SP/FP/RA 取自寄存器)
+        frames.append(StackFrame(
+            idx=0,
+            fp=current_fp,
+            sp=h.gprs[2].val,
+            ra=h.gprs[1].val,
+            pc=h.pc,
+        ))
+
+        for _ in range(max_frames):
+            if current_fp == 0:
+                break
+
+            link = self._try_read_frame_link(current_fp)
+            if link is None:
+                break  # 内存读取越界 → 截断回溯
+            saved_ra, saved_fp = link
+
+            # 合法性检查: FP 必须递增、对齐、无环
+            if saved_fp != 0:
+                if saved_fp <= current_fp or (saved_fp & 0x7) or saved_fp in visited:
+                    break
+                visited.add(saved_fp)
+
+            # RA 为 0 表示最外层 (无调用者)
+            if saved_ra == 0:
+                break
+
+            call_site = saved_ra - 4 if saved_ra >= 4 else 0
+            frames.append(StackFrame(
+                idx=len(frames),
+                fp=saved_fp,
+                sp=current_fp,  # 上一帧的 FP ≈ 本帧的 SP
+                ra=saved_ra,
+                pc=call_site,
+            ))
+            current_fp = saved_fp
+
+        return frames
+
+    @seize_val_err("无效帧号")
+    def cmd_frame(self, arg: str | None = None) -> None:
+        """栈帧回溯 — #01 起始编号, 只显示当前帧栈内存.
+
+        stack / bt   — 显示全部帧 + 当前帧的栈内存
+        frame <N>    — 切换到第 N 帧并刷新回溯 (N 为 0-indexed)
+        """
+        self._stack_frames = self._walk_frame_chain()
         syms = self._image.symbols if self._image else {}
 
         def _sym(addr: int) -> str:
             name = self._resolve_symbol(syms, addr)
             return f" [dim]<{name}>[/]" if name else ""
 
-        lines = [
-            "[bold]栈帧回溯[/]",
+        # -- 帧选择: 切换当前帧, 然后 fall through 显示回溯 --
+        if arg is not None:
+            n = int(arg, 0)  # ValueError caught by decorator
+            if not (0 <= n < len(self._stack_frames)):
+                self._err(f"帧号 {n} 超出范围 [0, {len(self._stack_frames) - 1}]")
+                return
+            self._current_frame_idx = n
+
+        # -- 回溯列表 (#01, #02 … 1-indexed, 零填充) --
+        lines: list[str] = []
+        for f in self._stack_frames:
+            tag = f"#{f.idx + 1:02d}"
+            lines.append(
+                f" {tag} pc={self._hex(f.pc)} sp={self._hex(f.sp)}"
+                f" fp={self._hex(f.fp)} ra={self._hex(f.ra)}{_sym(f.pc)}"
+            )
+
+        self._console.print("\n".join([
+            f"[bold]栈帧回溯[/] ({len(self._stack_frames)} 帧)",
             "",
-            f"  PC = [bold yellow]{self._hex(pc)}[/]{_sym(pc)}",
-            f"  SP = [cyan]{self._hex(sp)}[/]",
-            f"  FP = [cyan]{self._hex(fp)}[/]  (s0)",
-            f"  RA = [green]{self._hex(ra)}[/]  (x1){_sym(ra)}",
-        ]
+            *lines,
+        ]))
 
-        # 沿保存的 fp 链向上遍历
-        current_fp = fp
-        frame_idx = 0
-        max_frames = 32
-        fp_history: set[int] = {current_fp}  # 防环
-
-        try:
-            while current_fp != 0 and frame_idx < max_frames:
-                # fp - 8: saved ra;  fp - 16: saved previous fp
-                saved_ra_raw = self._emu.bus.read(current_fp - 8, 8)
-                saved_ra = int.from_bytes(saved_ra_raw, "little", signed=False)
-                saved_fp_raw = self._emu.bus.read(current_fp - 16, 8)
-                saved_fp = int.from_bytes(saved_fp_raw, "little", signed=False)
-
-                # 合法性检查: fp 应单调递增 (栈向下增长), 8 字节对齐, 无环
-                if saved_fp != 0:
-                    if saved_fp <= current_fp:
-                        lines.append(
-                            f"\n  [dim](回溯终止: saved_fp=0x{saved_fp:x} 不递增)[/]"
-                        )
-                        break
-                    if saved_fp & 0x7:
-                        lines.append(
-                            f"\n  [dim](回溯终止: saved_fp=0x{saved_fp:x} 未对齐)[/]"
-                        )
-                        break
-                    if saved_fp in fp_history:
-                        lines.append(
-                            f"\n  [dim](回溯终止: 检测到循环)[/]"
-                        )
-                        break
-                    fp_history.add(saved_fp)
-
-                frame_idx += 1
-                # 返回地址实际是 call 的下一条; 显示 ra-4 更直观
-                call_site = saved_ra - 4 if saved_ra >= 4 else 0
-                lines.extend([
-                    "",
-                    f"  [bold]#{frame_idx}[/] FP = {self._hex(current_fp)}",
-                    f"    saved RA = [green]{self._hex(saved_ra)}[/]{_sym(saved_ra)}",
-                    f"    call site≈ [dim]{self._hex(call_site)}[/]{_sym(call_site)}",
-                    f"    saved FP = [cyan]{self._hex(saved_fp)}[/]",
-                ])
-
-                if saved_fp == 0:
-                    lines.append("\n  [dim](回溯终止: fp=0, 已达最外层)[/]")
-                    break
-                current_fp = saved_fp
-
-        except Exception:
-            lines.append("\n  [dim](回溯终止: 内存读取失败 — 可能 sp 未初始化或越界)[/]")
-
-        # 展示栈顶附近的内存
-        try:
-            stack_data = self._emu.bus.read(sp, 64)
-            lines.extend([
-                "",
-                f"  [bold]栈顶数据 (SP = {self._hex(sp)}):[/]",
-                self._hexdump_bytes(stack_data, indent="    "),
-            ])
-        except Exception:
-            lines.append(f"\n  [dim](无法读取 sp 处内存)[/]")
-
-        self._console.print("\n".join(lines))
+        # -- 当前帧栈内存 --
+        if self._current_frame_idx < len(self._stack_frames):
+            cur = self._stack_frames[self._current_frame_idx]
+            stack_data = self._emu.bus.try_read(cur.sp, 64)
+            if stack_data is None:
+                self._console.print("\n[dim](无法读取当前帧 SP 处内存)[/]")
+            else:
+                self._console.print(
+                    "\n" + "-" * 55 + "\n"
+                    "[bold]当前栈内存[/]\n"
+                    + fmt_hexdump(stack_data, addr=cur.sp)
+                )
 
     def cmd_symbols(self, filter_str: str = "") -> None:
         """列出固件符号表, 支持可选的名称过滤."""
@@ -1036,7 +1079,7 @@ class Debugger:
             self.cmd_run(n)
             return True
         if cmd in ("undo", "rollback"):
-            self.cmd_undo()
+            self.rollback()
             return True
 
         # 寄存器
@@ -1107,8 +1150,8 @@ class Debugger:
         if cmd in ("status", "info"):
             self.cmd_status()
             return True
-        if cmd in ("stack", "bt"):
-            self.cmd_frame()
+        if cmd in ("stack", "bt", "frame", "f"):
+            self.cmd_frame(parts[1] if len(parts) > 1 else None)
             return True
 
         # 符号
@@ -1163,7 +1206,7 @@ class Debugger:
         while True:
             try:
                 raw = self._session.prompt(
-                    [("class:prompt", f"\nrvdb[{self._hart_id}] ")]
+                    [("class:prompt", f"\nrvdbg[{self._hart_id}] ")]
                 ).strip()
             except KeyboardInterrupt:
                 self._console.print()
@@ -1173,12 +1216,17 @@ class Debugger:
                 break
 
             # 空输入 = 重复上一条命令 (GDB 风格)
-            if not raw:
-                if self._last_command is not None:
-                    raw = self._last_command
-                    self._console.print(f"[dim](重复) {raw}[/]")
-                else:
-                    continue
+            if not raw and self._last_command is None:
+                continue
+            elif not raw:
+                assert self._last_command is not None
+                raw = self._last_command
+                # disasm 重复时自动推进到上次输出末尾地址
+                if raw.startswith("disasm ") and self._disasm_next_addr is not None:
+                    parts = raw.split()
+                    parts[1] = hex(self._disasm_next_addr)
+                    raw = " ".join(parts)
+                self._console.print(f"[dim](重复) {raw}[/]")
 
             parts = raw.split()
             try:
@@ -1235,7 +1283,7 @@ class Debugger:
             ]),
             _section("状态", [
                 ("status, info", "显示 hart 状态摘要"),
-                ("stack, bt", "显示栈帧回溯 (backtrace)"),
+                ("stack, bt, frame, f", "栈帧回溯; frame N 切换到第 N 帧"),
             ]),
             _section("配置", [
                 ("hart <id>", "切换活跃 hart"),

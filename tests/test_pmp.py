@@ -7,6 +7,7 @@
 
 import pytest
 
+from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
 from pyremu.memory.pmp import Pmp
@@ -272,7 +273,7 @@ class TestPmpInHart:
 
         h = Hart(id=0, pmp_entries=4)
         bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
-        h.set_memory_backend(bus.read, bus.write)
+        inject_memory_backend(h, bus.read, bus.write)
         h.bus = bus
         h.csrs["mtvec"].val = 0x80000000
         h.pc = 0x1000
@@ -306,7 +307,7 @@ class TestPmpInHart:
         """M 模式 store 不被 PMP 检查."""
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=True)
         # 直接通过 _mem_write 写入
-        hart._mem_write(0x8000_1000, b"\xAA\xBB\xCC\xDD")
+        mem_write(hart, 0x8000_1000, b"\xAA\xBB\xCC\xDD")
         # 无 trap
         assert hart.mcause_val == 0
 
@@ -316,7 +317,7 @@ class TestPmpInHart:
 
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=True)
         hart.mode = RiscvMode.U
-        hart._mem_write(0x8000_1000, b"\x11\x22")
+        mem_write(hart, 0x8000_1000, b"\x11\x22")
         assert hart.mcause_val == 0
 
     def test_umode_store_pmp_w_denied(self, hart):
@@ -325,7 +326,7 @@ class TestPmpInHart:
 
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=False)
         hart.mode = RiscvMode.U
-        hart._mem_write(0x8000_1000, b"\x11\x22")
+        mem_write(hart, 0x8000_1000, b"\x11\x22")
         assert hart.mcause_val == 7, f"应为 StAccessFault(7), 实际 {hart.mcause_val}"
 
     def test_umode_load_pmp_r_denied(self, hart):
@@ -338,7 +339,7 @@ class TestPmpInHart:
         hart._mem_write_phy(0x8000_1000, b"\xDE\xAD")
         # 清 trap 计数
         hart._consecutive_traps = 0
-        hart._mem_read(0x8000_1000, 4)
+        mem_read(hart, 0x8000_1000, 4)
         assert hart.mcause_val == 5, f"应为 LdAccessFault(5), 实际 {hart.mcause_val}"
 
 

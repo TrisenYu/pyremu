@@ -48,9 +48,11 @@ class UART(Device):
         self,
         base: int = 0x1000_0000,
         size: int = 0x1000,
+        tx_callback=None,  # (int) -> None: 每发送一个字节时调用
     ) -> None:
         self.base_addr = base
         self.size = size
+        self._tx_callback = tx_callback
 
         # 寄存器状态
         self._txctrl: int = 0  # bit0 = txen
@@ -124,6 +126,8 @@ class UART(Device):
         if offset == self.REG_TXDATA:
             val &= 0xFF
             self._tx_buf.append(val)
+            if self._tx_callback:
+                self._tx_callback(val)
             if self._txctrl & 1:  # TX 使能
                 self._ip |= self.IP_TXWM
             return

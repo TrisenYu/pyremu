@@ -211,6 +211,10 @@ class CacheBase(ABC):
         """返回当前有效条目数."""
         return sum(1 for e in self._entries if e.valid)
 
+    def __iter__(self):
+        """迭代所有有效条目 (供调试/诊断)."""
+        return iter(e for e in self._entries if e.valid)
+
     def __repr__(self) -> str:
         return (
             f"{self.name}(entries={len(self)}/{self._num_entries}, "

@@ -24,10 +24,16 @@ Usage:
     emu.run(1000)     # 执行 1000 个周期
 """
 
-from pyfdt.pyfdt import Fdt, FdtNode, FdtPropertyStrings, FdtPropertyWords
+import struct
+import sys
+from typing import Any
+
+import libfdt
 
 from pyremu.core.decoder import Hart
+from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.trap import TrapType
+from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap
 from pyremu.interrupt.clint import CLINT
 from pyremu.memory.bus import Bus
 from pyremu.memory.l2cache import L2Cache
@@ -58,7 +64,7 @@ class Emulator:
             # 兼容旧式 API: 从 kwargs 构建配置
             if kwargs:
                 periph_kw = {"clint_base": 0x0200_0000}
-                plat_kw: dict[str, object] = {"periph": PeripheralConfig(**periph_kw)}
+                plat_kw: dict[str, Any] = {"periph": PeripheralConfig(**periph_kw)}
                 for field_name in PlatformConfig.__dataclass_fields__:
                     if field_name in kwargs:
                         plat_kw[field_name] = kwargs[field_name]
@@ -92,7 +98,10 @@ class Emulator:
 
         p = config.periph
         if p.uart_base:
-            self.uart = UART(base=p.uart_base)
+            self.uart = UART(
+                base=p.uart_base,
+                tx_callback=lambda b: sys.stdout.write(chr(b)),
+            )
             self.bus.add_device(p.uart_base, self.uart)
             self._peripherals["uart"] = self.uart
         if p.spi_base:
@@ -113,7 +122,7 @@ class Emulator:
         for i in range(config.num_harts):
             h = Hart(id=i, pmp_entries=config.pmp_entries)
             h.pc = config.reset_vector
-            h.set_memory_backend(self.bus.read, self.bus.write)
+            inject_memory_backend(h, self.bus.read, self.bus.write)
             h.bus = self.bus
             h.interrupt_ctrl = self.clint
             self.harts.append(h)
@@ -137,93 +146,94 @@ class Emulator:
     def build_dtb(
         self,
     ) -> bytes:
-        """基于当前平台配置, 通过 pyfdt 构建 DTB blob.
+        """基于当前平台配置, 通过 libfdt 构建 DTB blob.
 
         固件可将此 blob 加载到 RAM 并通过 a1 寄存器接收其地址.
         """
         p = self._cfg.periph
+        sw = libfdt.FdtSw(8192)
+        sw.finish_reservemap()
 
-        fdt = Fdt()
-        root = FdtNode("")
-        fdt.add_rootnode(root)
+        # -- 根节点 --
+        sw.begin_node("")
+        sw.property_u32("#address-cells", 2)
+        sw.property_u32("#size-cells", 2)
+        sw.property_string("compatible", "pyremu,riscv64")
+        sw.property_string("model", "pyremu,rv64ima")
 
-        # 根节点属性
-        root.append(FdtPropertyWords("#address-cells", [2]))
-        root.append(FdtPropertyWords("#size-cells", [2]))
-        root.append(FdtPropertyStrings("compatible", ["pyremu,riscv64"]))
-        root.append(FdtPropertyStrings("model", ["pyremu,rv64ima"]))
-
-        # cpus
-        cpus = FdtNode("cpus")
-        cpus.append(FdtPropertyWords("#address-cells", [1]))
-        cpus.append(FdtPropertyWords("#size-cells", [0]))
-        cpus.append(FdtPropertyWords("timebase-frequency", [self._cfg.timebase_freq]))
+        # -- cpus --
+        sw.begin_node("cpus")
+        sw.property_u32("#address-cells", 1)
+        sw.property_u32("#size-cells", 0)
+        sw.property_u32("timebase-frequency", self._cfg.timebase_freq)
         for i in range(self._cfg.num_harts):
-            cpu = FdtNode(f"cpu@{i}")
-            cpu.append(FdtPropertyStrings("device_type", ["cpu"]))
-            cpu.append(FdtPropertyWords("reg", [i]))
-            cpu.append(FdtPropertyStrings("compatible", ["riscv"]))
-            cpu.append(FdtPropertyStrings("riscv,isa", [self._cfg.isa]))
-            cpu.append(FdtPropertyStrings("mmu-type", ["riscv,sv39"]))
-            cpu.append(FdtPropertyStrings("status", ["okay"]))
-            cpus.append(cpu)
-        root.append(cpus)
+            sw.begin_node(f"cpu@{i}")
+            sw.property_string("device_type", "cpu")
+            sw.property_u32("reg", i)
+            sw.property_string("compatible", "riscv")
+            sw.property_string("riscv,isa", self._cfg.isa)
+            sw.property_string("mmu-type", "riscv,sv39")
+            sw.property_string("status", "okay")
+            sw.end_node()  # cpu@i
+        sw.end_node()  # cpus
 
-        # memory
-        mem = FdtNode("memory")
-        mem.append(FdtPropertyStrings("device_type", ["memory"]))
-        mem.append(FdtPropertyWords("reg", [
-            0, self._cfg.ram_base, 0, self._cfg.ram_size,
-        ]))
-        root.append(mem)
+        # -- memory --
+        sw.begin_node("memory")
+        sw.property_string("device_type", "memory")
+        sw.property("reg", struct.pack(
+            ">IIII", 0, self._cfg.ram_base, 0, self._cfg.ram_size,
+        ))
+        sw.end_node()  # memory
 
-        # soc simple-bus
-        soc = FdtNode("soc")
-        soc.append(FdtPropertyWords("#address-cells", [2]))
-        soc.append(FdtPropertyWords("#size-cells", [2]))
-        soc.append(FdtPropertyStrings("compatible", ["simple-bus"]))
-        soc.append(FdtPropertyWords("ranges", []))  # 透传
+        # -- soc simple-bus --
+        sw.begin_node("soc")
+        sw.property_u32("#address-cells", 2)
+        sw.property_u32("#size-cells", 2)
+        sw.property_string("compatible", "simple-bus")
+        sw.property("ranges", b"")  # 透传
 
         # CLINT
         clint_base = p.clint_base
-        clint = FdtNode(f"clint@{clint_base:x}")
-        clint.append(FdtPropertyStrings("compatible", ["riscv,clint0"]))
-        clint.append(FdtPropertyWords("reg", [0, clint_base, 0, 0x10000]))
-        clint.append(FdtPropertyWords(
-            "interrupts-extended", list(range(self._cfg.num_harts)),
+        sw.begin_node(f"clint@{clint_base:x}")
+        sw.property_string("compatible", "riscv,clint0")
+        sw.property("reg", struct.pack(">IIII", 0, clint_base, 0, 0x10000))
+        sw.property("interrupts-extended", struct.pack(
+            ">" + "I" * self._cfg.num_harts, *range(self._cfg.num_harts),
         ))
-        soc.append(clint)
+        sw.end_node()  # clint
 
         # UART
         if self.uart is not None:
-            uart = FdtNode(f"serial@{p.uart_base:x}")
-            uart.append(FdtPropertyStrings("compatible", ["sifive,uart0"]))
-            uart.append(FdtPropertyWords("reg", [0, p.uart_base, 0, 0x1000]))
-            soc.append(uart)
+            sw.begin_node(f"serial@{p.uart_base:x}")
+            sw.property_string("compatible", "sifive,uart0")
+            sw.property("reg", struct.pack(">IIII", 0, p.uart_base, 0, 0x1000))
+            sw.end_node()  # serial
 
         # SPI
         if self.spi is not None:
-            spi = FdtNode(f"spi@{p.spi_base:x}")
-            spi.append(FdtPropertyStrings("compatible", ["pyremu,spi0"]))
-            spi.append(FdtPropertyWords("reg", [0, p.spi_base, 0, 0x1000]))
-            soc.append(spi)
+            sw.begin_node(f"spi@{p.spi_base:x}")
+            sw.property_string("compatible", "pyremu,spi0")
+            sw.property("reg", struct.pack(">IIII", 0, p.spi_base, 0, 0x1000))
+            sw.end_node()  # spi
 
         # I2C
         if self.i2c is not None:
-            i2c = FdtNode(f"i2c@{p.i2c_base:x}")
-            i2c.append(FdtPropertyStrings("compatible", ["pyremu,i2c0"]))
-            i2c.append(FdtPropertyWords("reg", [0, p.i2c_base, 0, 0x1000]))
-            soc.append(i2c)
+            sw.begin_node(f"i2c@{p.i2c_base:x}")
+            sw.property_string("compatible", "pyremu,i2c0")
+            sw.property("reg", struct.pack(">IIII", 0, p.i2c_base, 0, 0x1000))
+            sw.end_node()  # i2c
 
         # GPIO
         if self.gpio is not None:
-            gpio = FdtNode(f"gpio@{p.gpio_base:x}")
-            gpio.append(FdtPropertyStrings("compatible", ["pyremu,gpio0"]))
-            gpio.append(FdtPropertyWords("reg", [0, p.gpio_base, 0, 0x1000]))
-            soc.append(gpio)
+            sw.begin_node(f"gpio@{p.gpio_base:x}")
+            sw.property_string("compatible", "pyremu,gpio0")
+            sw.property("reg", struct.pack(">IIII", 0, p.gpio_base, 0, 0x1000))
+            sw.end_node()  # gpio
 
-        root.append(soc)
-        return fdt.to_dtb()
+        sw.end_node()  # soc
+        sw.end_node()  # root
+
+        return bytes(sw.as_fdt().as_bytearray())
 
     def load_dtb(
         self,
@@ -255,7 +265,7 @@ class Emulator:
 
     def load_firmware(
         self,
-        image: FirmwareImage,
+        image: FirmwareImage | None,
     ) -> None:
         """加载由 parse_firmware() 解析得到的固件镜像.
 
@@ -265,6 +275,8 @@ class Emulator:
         对于 raw binary, 若入口地址与复位向量不同,
         调用者应在解析时指定 base_addr=reset_vector.
         """
+        if image is None:
+            raise ValueError("载入了无效的内存")
         for seg in image.segments:
             self.bus.write(seg.vaddr, seg.data)
             # 若 memsz > 文件数据长度, 剩余部分零填充
@@ -318,7 +330,9 @@ class Emulator:
     # ----------------------------------------------------------
 
     def step(self) -> int:
-        """所有 hart 各执行一条指令 (round-robin).
+        """
+        非常理想的假设：所有指令和多核之间的中断调度只需要一个时钟周期来完成
+        此处凭借轮询方式，让所有 hart 各执行一条指令，然后作为当前一个周期内发生的事情
 
         每条指令执行后检查中断, 每个周期推进 CLINT 时钟.
         若 hart 进入不可恢复的陷态 (连续 trap 超过阈值),
@@ -327,14 +341,14 @@ class Emulator:
         Returns:
             本轮执行的指令数.
         """
-        executed = 0
+        all_exec_cnt = 0
         for hart in self.harts:
             if hart._halted:
                 continue
 
             # WFI 等待状态: 不取指/执行, 但仍检查中断唤醒
             if hart._waiting:
-                hart.check_pending_interrupts()
+                check_pending_interrupts(hart)
                 continue
 
             pc_before = hart.pc
@@ -345,7 +359,7 @@ class Emulator:
             try:
                 advance = hart.exec_instr(instr)
             except NotImplementedError:
-                hart._take_trap(TrapType.IllInstr, tval=instr, is_interrupt=False)
+                deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
                 advance = 0
 
             # 正常顺序执行 → 清零连续 trap 计数
@@ -359,13 +373,13 @@ class Emulator:
                 continue
 
             # 指令边界 — 检查中断
-            hart.check_pending_interrupts()
-            executed += 1
+            check_pending_interrupts(hart)
+            all_exec_cnt += 1
 
         self._cycle += 1
-        self._total_instrs += executed
+        self._total_instrs += all_exec_cnt
         self.clint.tick(1)
-        return executed
+        return all_exec_cnt
 
     def run(self, max_cycles: int) -> int:
         """执行 *max_cycles* 个周期.
@@ -401,8 +415,10 @@ class Emulator:
         return self.bus.read(addr, size)
 
     def mem_hexdump(self, addr: int, size: int) -> str:
-        """返回物理内存的十六进制 dump 字符串."""
-        data = self.bus.read(addr, size)
+        """返回物理内存的十六进制 dump 字符串; 读取失败返回提示文本."""
+        data = self.bus.try_read(addr, size)
+        if data is None:
+            return "(无法读取该地址)"
         lines = []
         for offset in range(0, len(data), 16):
             chunk = data[offset : offset + 16]

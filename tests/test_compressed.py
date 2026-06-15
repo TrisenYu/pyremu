@@ -7,6 +7,7 @@
 
 import pytest
 
+from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.decoder import Hart
 
 
@@ -107,6 +108,18 @@ class TestCompressedC1:
         assert h.gprs[1].val == 0x1002  # ra
         assert h.pc == 0x4000
 
+    def test_c_jalr_rd_eq_rs1_uses_old_value(self):
+        """C.JALR ra (rd_rs1==x1): 跳转目标应为 ra 旧值, ra←pc+2."""
+        h = Hart(id=0)
+        old_ra = 0x80004000
+        h.gprs[1].val = old_ra  # ra = 旧值
+        h.pc = 0x1000
+        # C.JALR ra: funct3=100, rd_rs1=1(x1/ra), bit12=1(JALR)
+        instr = _c2(0b100, 1, 1 << 12)
+        h.exec_instr(instr)
+        assert h.gprs[1].val == 0x1002, f"ra 应为 pc+2, 实际 0x{h.gprs[1].val:x}"
+        assert h.pc == old_ra, f"PC 应为 ra 旧值 0x{old_ra:x}, 实际 0x{h.pc:x}"
+
     def test_c_ebreak(self):
         """C.EBREAK → Breakpoint trap."""
         h = Hart(id=0)
@@ -156,7 +169,7 @@ class TestCompressedC0:
     def hart(self) -> Hart:
         h = Hart(id=0)
         ram, read_fn, write_fn = _make_ram()
-        h.set_memory_backend(read_fn, write_fn)
+        inject_memory_backend(h, read_fn, write_fn)
         h.gprs[2].val = 0x8000  # sp
         return h
 
@@ -225,7 +238,7 @@ class TestCompressedC2:
     def hart(self) -> Hart:
         h = Hart(id=0)
         ram, read_fn, write_fn = _make_ram()
-        h.set_memory_backend(read_fn, write_fn)
+        inject_memory_backend(h, read_fn, write_fn)
         h.gprs[2].val = 0x8000
         return h
 

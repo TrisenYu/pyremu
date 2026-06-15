@@ -7,6 +7,7 @@
 
 import pytest
 
+from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.decoder import Hart, Opc
 from pyremu.core.hart import (
     MSTATUS_MIE,
@@ -20,6 +21,7 @@ from pyremu.emulator import Emulator
 from pyremu.interrupt.clint import CLINT
 from pyremu.memory.bus import Bus
 from pyremu.platform import PeripheralConfig, PlatformConfig
+from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap, handle_wfi, trap_ebreak, trap_ecall, trap_mret, trap_sret
 
 # ============================================================
 #  trap_cause_code / trap_is_interrupt
@@ -108,7 +110,7 @@ class TestTakeTrap:
 
     def test_take_trap_saves_context(self, hart):
         """异常触发后 mepc/mcause/mtval/mstatus 应正确保存."""
-        hart._take_trap(TrapType.IllInstr, tval=0xDEAD, is_interrupt=False)
+        deliver_trap(hart, TrapType.IllInstr, tval=0xDEAD, is_interrupt=False)
 
         assert hart.mepc_val == 0x1000, "mepc 应保存触发异常的 PC"
         assert hart.mcause_val == 2, "mcause 应为 IllInstr 编码 2"
@@ -121,13 +123,13 @@ class TestTakeTrap:
     def test_take_trap_jumps_to_mtvec_direct(self, hart):
         """直接模式: PC 应跳转到 mtvec.BASE."""
         hart.csrs["mtvec"].val = 0xC0000000  # MODE=0 (direct)
-        hart._take_trap(TrapType.Breakpoint, is_interrupt=False)
+        deliver_trap(hart, TrapType.Breakpoint, is_interrupt=False)
         assert hart.pc == 0xC0000000, "直接模式应跳转到 mtvec BASE"
 
     def test_take_trap_jumps_to_mtvec_vectored(self, hart):
         """向量模式 + 中断: PC = BASE + 4 * code."""
         hart.csrs["mtvec"].val = 0xC0000001  # MODE=1 (vectored)
-        hart._take_trap(TrapType.SmodeTimerInterrupt, is_interrupt=True)
+        deliver_trap(hart, TrapType.SmodeTimerInterrupt, is_interrupt=True)
         # SmodeTimerInterrupt code = 5
         expected_pc = 0xC0000000 + 4 * 5
         assert hart.pc == expected_pc, (
@@ -137,13 +139,13 @@ class TestTakeTrap:
     def test_take_trap_vectored_ignored_for_exception(self, hart):
         """向量模式对异常不生效, 仍使用直接模式."""
         hart.csrs["mtvec"].val = 0xC0000001
-        hart._take_trap(TrapType.IllInstr, is_interrupt=False)
+        deliver_trap(hart, TrapType.IllInstr, is_interrupt=False)
         assert hart.pc == 0xC0000000, "异常在向量模式下仍应使用直接模式"
 
     def test_take_trap_switches_to_m_mode(self, hart):
         """trap 后应切换到 M 模式."""
         hart.mode = RiscvMode.U
-        hart._take_trap(TrapType.EcallFromUmode, is_interrupt=False)
+        deliver_trap(hart, TrapType.EcallFromUmode, is_interrupt=False)
         assert hart.mode == RiscvMode.M, "trap 后应进入 M 模式"
 
 
@@ -164,22 +166,22 @@ class TestEcallEbreak:
 
     def test_ecall_from_m_mode(self, hart):
         hart.mode = RiscvMode.M
-        hart._trap_ecall()
+        trap_ecall(hart)
         assert hart.mcause_val == 11, "M 模式 ecall → mcause=11"
         assert hart.mepc_val == 0x2000
 
     def test_ecall_from_s_mode(self, hart):
         hart.mode = RiscvMode.S
-        hart._trap_ecall()
+        trap_ecall(hart)
         assert hart.mcause_val == 9, "S 模式 ecall → mcause=9"
 
     def test_ecall_from_u_mode(self, hart):
         hart.mode = RiscvMode.U
-        hart._trap_ecall()
+        trap_ecall(hart)
         assert hart.mcause_val == 8, "U 模式 ecall → mcause=8"
 
     def test_ebreak(self, hart):
-        hart._trap_ebreak()
+        trap_ebreak(hart)
         assert hart.mcause_val == 3, "ebreak → mcause=3"
         assert hart.mtval_val == 0x2000, "mtval 应保存断点地址"
 
@@ -200,30 +202,30 @@ class TestMretSret:
         h.pc = 0x1000
         h.mode = RiscvMode.M
         h.mstatus_val = MSTATUS_MIE  # 初始 MIE=1
-        h._take_trap(TrapType.IllInstr, is_interrupt=False)
+        deliver_trap(h, TrapType.IllInstr, is_interrupt=False)
         # 现在 hart 在 trap handler 中, MPP=M, MPIE=1, MIE=0
         return h
 
     def test_mret_restores_pc_and_mode(self, hart_after_m_trap):
         h = hart_after_m_trap
         assert h.mepc_val == 0x1000
-        h._trap_mret()
+        trap_mret(h)
         assert h.pc == 0x1000, "MRET 应恢复到 mepc"
         assert h.mode == RiscvMode.M, "MPP=M 应恢复到 M 模式"
 
     def test_mret_restores_mie_from_mpie(self, hart_after_m_trap):
         h = hart_after_m_trap
-        h._trap_mret()
+        trap_mret(h)
         assert h.mie is True, "MPIE=1 → MIE 应恢复为 1"
 
     def test_mret_clears_mpp_to_u(self, hart_after_m_trap):
         h = hart_after_m_trap
-        h._trap_mret()
+        trap_mret(h)
         assert h.mpp == RiscvMode.U, "MRET 后 MPP 应重置为 U"
 
     def test_mret_preserves_mpie(self, hart_after_m_trap):
         h = hart_after_m_trap
-        h._trap_mret()
+        trap_mret(h)
         assert h.mpie is True, "MRET 后 MPIE 应为 1"
 
     @pytest.fixture
@@ -236,23 +238,23 @@ class TestMretSret:
         h.mstatus_val = MSTATUS_SIE  # SIE=1 before trap
         # 委派 S 模式 ecall: medeleg[9]=1 → trap 留在 S 模式
         h.csrs["medeleg"].val = 1 << 9
-        h._take_trap(TrapType.EcallFromSmode, tval=0, is_interrupt=False)
+        deliver_trap(h, TrapType.EcallFromSmode, tval=0, is_interrupt=False)
         return h
 
     def test_sret_restores_pc_and_mode(self, hart_after_s_trap):
         h = hart_after_s_trap
-        h._trap_sret()
+        trap_sret(h)
         assert h.pc == 0x3000, "SRET 应恢复到 sepc"
         assert h.mode == RiscvMode.S, "SPP=S → 应恢复到 S 模式"
 
     def test_sret_restores_sie_from_spie(self, hart_after_s_trap):
         h = hart_after_s_trap
-        h._trap_sret()
+        trap_sret(h)
         assert h.sie is True, "SPIE=1 → SIE 应恢复为 1"
 
     def test_sret_clears_spp_to_u(self, hart_after_s_trap):
         h = hart_after_s_trap
-        h._trap_sret()
+        trap_sret(h)
         assert h.spp == RiscvMode.U, "SRET 后 SPP 应重置为 U"
 
 
@@ -272,7 +274,7 @@ class TestTakeTrapResolution:
         h.mstatus_val = 0
         # _take_trap 由 TrapHandler mixin 提供, 不应抛 NotImplementedError
         try:
-            h._take_trap(TrapType.IllInstr, tval=0x42, is_interrupt=False)
+            deliver_trap(h, TrapType.IllInstr, tval=0x42, is_interrupt=False)
         except NotImplementedError:
             pytest.fail("Hart._take_trap 应由 TrapHandler mixin 提供实现")
         assert h.mcause_val == 2
@@ -289,7 +291,7 @@ class TestTakeTrapResolution:
         h.pc = 0x2000
 
         clint.send_ipi(0)
-        interrupted = h.check_pending_interrupts()
+        interrupted = check_pending_interrupts(h)
         assert interrupted
         # MSI: bit63=1, code=3
         assert h.mcause_val == (1 << 63) | 3
@@ -324,7 +326,7 @@ class TestTrapDelegation:
         """medeleg[8]=1: U 模式 ecall 委派到 S 模式."""
         hart.csrs["medeleg"].val = 1 << 8
         hart.mode = RiscvMode.U
-        hart._take_trap(TrapType.EcallFromUmode, tval=0, is_interrupt=False)
+        deliver_trap(hart, TrapType.EcallFromUmode, tval=0, is_interrupt=False)
 
         assert hart.pc == 0x80004000, "委派后应跳转到 stvec"
         assert hart.mode == RiscvMode.S, "应进入 S 模式"
@@ -336,7 +338,7 @@ class TestTrapDelegation:
         """即使 medeleg 已设置, M 模式下永不委派."""
         hart.csrs["medeleg"].val = 1 << 8
         hart.mode = RiscvMode.M
-        hart._take_trap(TrapType.EcallFromUmode, tval=0, is_interrupt=False)
+        deliver_trap(hart, TrapType.EcallFromUmode, tval=0, is_interrupt=False)
 
         assert hart.pc == 0x80000000, "应走 mtvec"
         assert hart.mode == RiscvMode.M
@@ -347,7 +349,7 @@ class TestTrapDelegation:
         """medeleg[2]=1: 非法指令异常委派到 S 模式."""
         hart.csrs["medeleg"].val = 1 << 2
         hart.mode = RiscvMode.U
-        hart._take_trap(TrapType.IllInstr, tval=0xBAD, is_interrupt=False)
+        deliver_trap(hart, TrapType.IllInstr, tval=0xBAD, is_interrupt=False)
 
         assert hart.pc == 0x80004000
         assert hart.mode == RiscvMode.S
@@ -360,7 +362,7 @@ class TestTrapDelegation:
         """mideleg[5]=1: 定时器中断委派到 S 模式."""
         hart.csrs["mideleg"].val = 1 << 5
         hart.mode = RiscvMode.U
-        hart._take_trap(TrapType.SmodeTimerInterrupt, tval=0, is_interrupt=True)
+        deliver_trap(hart, TrapType.SmodeTimerInterrupt, tval=0, is_interrupt=True)
 
         assert hart.pc == 0x80004000
         assert hart.mode == RiscvMode.S
@@ -373,7 +375,7 @@ class TestTrapDelegation:
     def test_mideleg_not_set_goes_to_m(self, hart):
         """mideleg=0: 中断照旧进入 M 模式."""
         hart.mode = RiscvMode.U
-        hart._take_trap(TrapType.SmodeTimerInterrupt, tval=0, is_interrupt=True)
+        deliver_trap(hart, TrapType.SmodeTimerInterrupt, tval=0, is_interrupt=True)
 
         assert hart.pc == 0x80000000
         assert hart.mode == RiscvMode.M
@@ -385,7 +387,7 @@ class TestTrapDelegation:
         """委派 trap 应将当前模式编码为 SPP."""
         hart.csrs["medeleg"].val = 1 << 8
         hart.mode = RiscvMode.U
-        hart._take_trap(TrapType.EcallFromUmode, is_interrupt=False)
+        deliver_trap(hart, TrapType.EcallFromUmode, is_interrupt=False)
         assert hart.spp == RiscvMode.U
 
     def test_delegated_trap_clears_sie_sets_spie(self, hart):
@@ -393,7 +395,7 @@ class TestTrapDelegation:
         hart.csrs["medeleg"].val = 1 << 8
         hart.mode = RiscvMode.U
         hart.mstatus_val = MSTATUS_SIE
-        hart._take_trap(TrapType.EcallFromUmode, is_interrupt=False)
+        deliver_trap(hart, TrapType.EcallFromUmode, is_interrupt=False)
 
         assert hart.sie is False, "进入 S 模式 trap 后 SIE 应为 0"
         assert hart.spie is True, "SPIE 应保存先前的 SIE=1"
@@ -403,7 +405,7 @@ class TestTrapDelegation:
         hart.csrs["medeleg"].val = 1 << 8
         hart.mode = RiscvMode.U
         hart.mstatus_val = 0  # SIE=0
-        hart._take_trap(TrapType.EcallFromUmode, is_interrupt=False)
+        deliver_trap(hart, TrapType.EcallFromUmode, is_interrupt=False)
 
         assert hart.spie is False
 
@@ -415,9 +417,9 @@ class TestTrapDelegation:
         hart.mode = RiscvMode.U
         hart.pc = 0x4000
         hart.mstatus_val = MSTATUS_SIE  # SIE=1
-        hart._take_trap(TrapType.EcallFromUmode, is_interrupt=False)
+        deliver_trap(hart, TrapType.EcallFromUmode, is_interrupt=False)
 
-        hart._trap_sret()
+        trap_sret(hart)
         assert hart.pc == 0x4000
         assert hart.mode == RiscvMode.U
         assert hart.sie is True, "SRET 应恢复 SIE"
@@ -429,7 +431,7 @@ class TestTrapDelegation:
         hart.csrs["stvec"].val = 0xC0001001
         hart.csrs["mideleg"].val = 1 << 7  # delegate MTI (code=7)
         hart.mode = RiscvMode.U
-        hart._take_trap(TrapType.MmodeTimerInterrupt, is_interrupt=True)
+        deliver_trap(hart, TrapType.MmodeTimerInterrupt, is_interrupt=True)
 
         expected = 0xC0001000 + 4 * 7
         assert hart.pc == expected, f"应为 0x{expected:x}, 实际 0x{hart.pc:x}"
@@ -439,7 +441,7 @@ class TestTrapDelegation:
         hart.csrs["stvec"].val = 0xC0001001
         hart.csrs["medeleg"].val = 1 << 8
         hart.mode = RiscvMode.U
-        hart._take_trap(TrapType.EcallFromUmode, is_interrupt=False)
+        deliver_trap(hart, TrapType.EcallFromUmode, is_interrupt=False)
 
         assert hart.pc == 0xC0001000, "异常不使用向量偏移"
 
@@ -457,7 +459,7 @@ class TestTrapDelegation:
         hart.pc = 0x2000
 
         clint.send_ipi(0)
-        interrupted = hart.check_pending_interrupts()
+        interrupted = check_pending_interrupts(hart)
         assert interrupted
         assert hart.mode == RiscvMode.S, "委派后应进入 S 模式"
         assert hart.pc == 0x80004000  # stvec
@@ -474,7 +476,7 @@ class TestTrapDelegation:
         hart.pc = 0x2000
 
         clint.send_ipi(0)
-        interrupted = hart.check_pending_interrupts()
+        interrupted = check_pending_interrupts(hart)
         assert interrupted
         assert hart.mode == RiscvMode.M, "非委派应进入 M 模式"
         assert hart.mepc_val == 0x2000
@@ -490,7 +492,7 @@ class TestTrapDelegation:
         hart.csrs["mideleg"].val = 1 << 3  # delegate MSI → S
 
         clint.send_ipi(0)
-        interrupted = hart.check_pending_interrupts()
+        interrupted = check_pending_interrupts(hart)
         # 已委派 + SIE=0 → 不应触发
         assert not interrupted, "SIE=0 应阻塞已委派中断"
 
@@ -506,7 +508,7 @@ class TestTrapDelegation:
         hart.csrs["mtvec"].val = 0x80000000
 
         clint.send_ipi(0)
-        interrupted = hart.check_pending_interrupts()
+        interrupted = check_pending_interrupts(hart)
         assert interrupted, "非委派 M 级中断应能抢占 S 模式"
         assert hart.mode == RiscvMode.M
 
@@ -525,13 +527,116 @@ class TestSfenceVma:
         h.dtlb.insert(vpn=0x300, ppn=0x400, perm=0xF)
         assert len(h.itlb) == 1 and len(h.dtlb) == 1
 
-        # 通过 exec_instr 执行 SFENCE.VMA
-        # SFENCE.VMA: imm[31:20]=0x104, func3=000, opcode=Op.sys
-        instr_val = (0x104 << 20) | Opc.sys.value
+        # SFENCE.VMA 正确编码:
+        #   funct7=0b0001001 (bits 31:25), rs2=0, rs1=0
+        #   → imm[31:20] = (0b0001001 << 5) | 0 = 0x120
+        instr_val = (0x120 << 20) | Opc.sys.value
         h.exec_instr(instr_val)
 
         assert len(h.itlb) == 0, "SFENCE.VMA 应刷新 itlb"
         assert len(h.dtlb) == 0, "SFENCE.VMA 应刷新 dtlb"
+
+    def test_sfence_vma_rejects_wrong_funct12(self):
+        """错误的 funct12 编码 (如旧的 0x104) 应触发 IllInstr (mcause=2)."""
+        from pyremu.core.trap import trap_cause_code
+
+        h = Hart(id=0)
+        # 0x104 是旧代码中错误的 funct12 — 不是合法的特权指令编码
+        instr_val = (0x104 << 20) | Opc.sys.value
+        h.exec_instr(instr_val)
+        assert h.mcause_val == 2, (
+            f"0x104 不是合法的 SFENCE.VMA 编码, 应触发 IllInstr (mcause=2),"
+            f" 实际 mc={h.mcause_val}"
+        )
+
+
+# ============================================================
+#  CSRRW rd==rs1 读写竞争 (regression)
+# ============================================================
+
+
+class TestCsrrwRdRs1:
+    """csrrw rd, csr, rs1 在 rd==rs1 时必须先读 rs1 再写 rd."""
+
+    def test_csrrw_rd_eq_rs1_preserves_new_value(self):
+        """csrrw sp, sscratch, sp 应正确交换 sp 和 sscratch."""
+        from pyremu.core.decoder import Hart
+
+        h = Hart(id=0)
+        # 用 mscratch (M-mode 可访问) 代替 sscratch 测试
+        old_sp = 0x80101000
+        old_scratch = 0x8000A000
+        h.gprs[2].val = old_sp
+        h.write_csr(0x340, old_scratch)  # mscratch = old_scratch
+
+        # 执行 csrrw sp, mscratch, sp
+        instr_val = (0x340 << 20) | (2 << 15) | (1 << 12) | (2 << 7) | Opc.sys.value
+        h.exec_instr(instr_val)
+
+        assert h.gprs[2].val == old_scratch, (
+            f"csrrw 后 sp 应为旧 mscratch 值 0x{old_scratch:08x}, "
+            f"实际 0x{h.gprs[2].val:08x}"
+        )
+        assert h.csrs["mscratch"].val == old_sp, (
+            f"csrrw 后 mscratch 应为旧 sp 值 0x{old_sp:08x}, "
+            f"实际 0x{h.csrs['mscratch'].val:08x}"
+        )
+
+    def test_csrrw_rd_neq_rs1_still_works(self):
+        """csrrw t0, mscratch, sp 在 rd!=rs1 时仍应正常工作."""
+        from pyremu.core.decoder import Hart
+
+        h = Hart(id=0)
+        old_sp = 0x80101000
+        old_scratch = 0x8000A000
+        h.gprs[2].val = old_sp
+        h.write_csr(0x340, old_scratch)
+
+        # csrrw t0, mscratch, sp  (rd=5, rs1=2)
+        instr_val = (0x340 << 20) | (2 << 15) | (1 << 12) | (5 << 7) | Opc.sys.value
+        h.exec_instr(instr_val)
+
+        assert h.gprs[5].val == old_scratch, "rd(t0) 应为旧 CSR 值"
+        assert h.csrs["mscratch"].val == old_sp, "CSR 应写入 rs1(sp) 的原始值"
+
+    def test_csrrs_rd_eq_rs1_preserves_rs1(self):
+        """csrrs t0, mscratch, t0: rd==rs1 时 SET 位应使用原始 rs1 值."""
+        from pyremu.core.decoder import Hart
+
+        h = Hart(id=0)
+        old_csr = 0x00000000
+        rs1_orig = 0x0000000F  # t0 = 0xF (要 SET 的位)
+        h.gprs[5].val = rs1_orig  # t0
+        h.write_csr(0x340, old_csr)
+
+        # csrrs t0, mscratch, t0  (rd=5, rs1=5)
+        instr_val = (0x340 << 20) | (5 << 15) | (2 << 12) | (5 << 7) | Opc.sys.value
+        h.exec_instr(instr_val)
+
+        assert h.gprs[5].val == old_csr, f"rd 应为旧 CSR 值 0, 实际 0x{h.gprs[5].val:x}"
+        assert h.csrs["mscratch"].val == rs1_orig, (
+            f"CSR 应为 old|rs1=0x{rs1_orig:x}, 实际 0x{h.csrs['mscratch'].val:x}"
+        )
+
+    def test_csrrc_rd_eq_rs1_preserves_rs1(self):
+        """csrrc t0, mscratch, t0: rd==rs1 时 CLEAR 位应使用原始 rs1 值."""
+        from pyremu.core.decoder import Hart
+
+        h = Hart(id=0)
+        old_csr = 0x000000FF
+        rs1_orig = 0x0000000F  # t0 = 0xF (要 CLEAR 的位)
+        h.gprs[5].val = rs1_orig  # t0
+        h.write_csr(0x340, old_csr)
+
+        # csrrc t0, mscratch, t0  (rd=5, rs1=5)
+        instr_val = (0x340 << 20) | (5 << 15) | (3 << 12) | (5 << 7) | Opc.sys.value
+        h.exec_instr(instr_val)
+
+        expected_csr = old_csr & ~rs1_orig  # 0xFF & ~0x0F = 0xF0
+        assert h.gprs[5].val == old_csr, f"rd 应为旧 CSR 值 0xFF, 实际 0x{h.gprs[5].val:x}"
+        assert h.csrs["mscratch"].val == expected_csr, (
+            f"CSR 应为 0x{expected_csr:x}, 实际 0x{h.csrs['mscratch'].val:x}"
+        )
 
 
 # ============================================================
@@ -741,7 +846,7 @@ class TestMemoryAccessFaults:
     def hart(self) -> Hart:
         h = Hart(id=0)
         bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
-        h.set_memory_backend(bus.read, bus.write)
+        inject_memory_backend(h, bus.read, bus.write)
         h.bus = bus
         h.csrs["mtvec"].val = 0x80000000
         h.pc = 0x1000
@@ -751,41 +856,41 @@ class TestMemoryAccessFaults:
 
     def test_lw_misaligned_traps(self, hart):
         """LW 从奇地址读取 → LdAddrMisaligned."""
-        hart._mem_read(0x80001001, 4)
+        mem_read(hart, 0x80001001, 4)
         assert hart.mcause_val == 4, f"应为 LdAddrMisaligned(4), 实际={hart.mcause_val}"
 
     def test_lh_misaligned_traps(self, hart):
         """LH 从奇地址读取 → LdAddrMisaligned."""
-        hart._mem_read(0x80001001, 2)
+        mem_read(hart, 0x80001001, 2)
         assert hart.mcause_val == 4
 
     def test_ld_misaligned_traps(self, hart):
         """LD 从非 8 字节对齐地址读取 → LdAddrMisaligned."""
-        hart._mem_read(0x80001004, 8)
+        mem_read(hart, 0x80001004, 8)
         assert hart.mcause_val == 4
 
     def test_sw_misaligned_traps(self, hart):
         """SW 到奇地址 → StAddrMisaligned."""
-        hart._mem_write(0x80001001, b"\x00\x01\x02\x03")
+        mem_write(hart, 0x80001001, b"\x00\x01\x02\x03")
         assert hart.mcause_val == 6, f"应为 StAddrMisaligned(6), 实际={hart.mcause_val}"
 
     def test_sd_misaligned_traps(self, hart):
         """SD 到非 8 字节对齐地址 → StAddrMisaligned."""
-        hart._mem_write(0x80001004, b"\x00" * 8)
+        mem_write(hart, 0x80001004, b"\x00" * 8)
         assert hart.mcause_val == 6
 
     def test_lw_aligned_succeeds(self, hart):
         """LW 从对齐地址正常读取."""
         # 先写入数据确保可读
         hart._mem_write_phy(0x80001000, b"\x01\x02\x03\x04")
-        data = hart._mem_read(0x80001000, 4)
+        data = mem_read(hart, 0x80001000, 4)
         assert data == b"\x01\x02\x03\x04"
         assert hart.mcause_val == 0
 
     def test_byte_access_always_aligned(self, hart):
         """1 字节 load/store 总是对齐."""
         hart._mem_write_phy(0x80001001, b"\x42")
-        data = hart._mem_read(0x80001001, 1)
+        data = mem_read(hart, 0x80001001, 1)
         assert data == b"\x42"
         assert hart.mcause_val == 0
 
@@ -793,14 +898,14 @@ class TestMemoryAccessFaults:
 
     def test_read_empty_hole_traps(self, hart):
         """读取空洞地址 (非 RAM、非设备) → LdAccessFault."""
-        hart._mem_read(0x0000_0000, 4)
+        mem_read(hart, 0x0000_0000, 4)
         assert hart.mcause_val == 5, (
             f"应为 LdAccessFault(5), 实际={hart.mcause_val}"
         )
 
     def test_write_empty_hole_traps(self, hart):
         """写入空洞地址 → StAccessFault."""
-        hart._mem_write(0x4000_0000, b"\xFF")
+        mem_write(hart, 0x4000_0000, b"\xFF")
         assert hart.mcause_val == 7, (
             f"应为 StAccessFault(7), 实际={hart.mcause_val}"
         )
@@ -808,7 +913,7 @@ class TestMemoryAccessFaults:
     def test_read_ram_ok_pma(self, hart):
         """RAM 范围内读不触发 PMA 错误."""
         hart._mem_write_phy(0x80000000, b"\xAA\xBB")
-        data = hart._mem_read(0x80000000, 2)
+        data = mem_read(hart, 0x80000000, 2)
         assert data == b"\xAA\xBB"
         assert hart.mcause_val == 0
 
@@ -816,7 +921,7 @@ class TestMemoryAccessFaults:
 
     def test_alignment_checked_before_translation(self, hart):
         """未对齐检测先于 MMU 翻译 (即使 PA 有效也不放过)."""
-        hart._mem_read(0x80000001, 4)  # misaligned but in RAM range
+        mem_read(hart, 0x80000001, 4)  # misaligned but in RAM range
         assert hart.mcause_val == 4, "应先触发对齐错误而非页错误或访问错误"
 
 
@@ -860,7 +965,7 @@ class TestPageFault:
         """hart 注入 bytearray 内存后端, 初始为 Bare 模式."""
         _ram, read_fn, write_fn = ram_ctx
         h = Hart(id=0)
-        h.set_memory_backend(read_fn, write_fn)
+        inject_memory_backend(h, read_fn, write_fn)
         h.csrs["mtvec"].val = 0x80000000
         h.pc = 0x1000
         return h
@@ -946,7 +1051,7 @@ class TestPageFault:
         ram, _read_fn, _write_fn = ram_ctx
         # 所有 L1 条目均为默认的 0 (V=0)
         self._enable_sv39(hart)
-        hart._mem_read(0x0, 4)
+        mem_read(hart, 0x0, 4)
         assert hart.mcause_val == 13, (
             f"应为 LdPageFault(13), 实际={hart.mcause_val}"
         )
@@ -960,7 +1065,7 @@ class TestPageFault:
             self._make_pte(v=True, ppn=self.L2_BASE >> self.PAGE_SHIFT),
         )
         self._enable_sv39(hart)
-        hart._mem_read(0x0, 4)
+        mem_read(hart, 0x0, 4)
         assert hart.mcause_val == 13, (
             f"应为 LdPageFault(13), 实际={hart.mcause_val}"
         )
@@ -980,7 +1085,7 @@ class TestPageFault:
         )
         # L3 全为 0 (V=0)
         self._enable_sv39(hart)
-        hart._mem_read(0x0, 4)
+        mem_read(hart, 0x0, 4)
         assert hart.mcause_val == 13, (
             f"应为 LdPageFault(13), 实际={hart.mcause_val}"
         )
@@ -989,7 +1094,7 @@ class TestPageFault:
         """未实现的 satp 模式 (如 Sv48=9) → LdPageFault."""
         _ram, _read_fn, _write_fn = ram_ctx
         hart.satp_val = (9 << 60) | 1  # Sv48, 未实现
-        hart._mem_read(0x0, 4)
+        mem_read(hart, 0x0, 4)
         assert hart.mcause_val == 13, (
             f"应为 LdPageFault(13), 实际={hart.mcause_val}"
         )
@@ -1001,7 +1106,7 @@ class TestPageFault:
         _ram, _read_fn, _write_fn = ram_ctx
         # 无任何页表, L1 全为 V=0
         self._enable_sv39(hart)
-        hart._mem_write(0x1000, b"\x01\x02\x03\x04")
+        mem_write(hart, 0x1000, b"\x01\x02\x03\x04")
         assert hart.mcause_val == 15, (
             f"应为 StPageFault(15), 实际={hart.mcause_val}"
         )
@@ -1016,7 +1121,7 @@ class TestPageFault:
         # 在数据页写入预期值
         val = b"\xDE\xAD\xBE\xEF"
         ram[self.DATA_PA : self.DATA_PA + 4] = val
-        data = hart._mem_read(0x0, 4)
+        data = mem_read(hart, 0x0, 4)
         assert data == val
         assert hart.mcause_val == 0, f"不应 trap, mcause={hart.mcause_val}"
 
@@ -1026,7 +1131,7 @@ class TestPageFault:
         self._setup_valid_4k(ram)
         self._enable_sv39(hart)
         val = b"\xCA\xFE\xBA\xBE"
-        hart._mem_write(0x0, val)
+        mem_write(hart, 0x0, val)
         assert hart.mcause_val == 0, f"不应 trap, mcause={hart.mcause_val}"
         # 从物理内存验证写入
         assert bytes(ram[self.DATA_PA : self.DATA_PA + 4]) == val
@@ -1040,7 +1145,7 @@ class TestPageFault:
         self._enable_sv39(hart)
         val = b"\x11\x22\x33\x44"
         ram[self.DATA_PA : self.DATA_PA + 4] = val
-        data = hart._mem_read(va, 4)
+        data = mem_read(hart, va, 4)
         assert data == val
         assert hart.mcause_val == 0
 
@@ -1053,7 +1158,7 @@ class TestPageFault:
         # VA 0x5000 直接当 PA 用
         val = b"\x42\x42\x42\x42"
         ram[0x5000 : 0x5004] = val
-        data = hart._mem_read(0x5000, 4)
+        data = mem_read(hart, 0x5000, 4)
         assert data == val
         assert hart.mcause_val == 0
 
@@ -1061,7 +1166,7 @@ class TestPageFault:
         """Bare 模式 store 也不应触发缺页异常."""
         ram, _read_fn, _write_fn = ram_ctx
         val = b"\xFF\xEE\xDD\xCC"
-        hart._mem_write(0x6000, val)
+        mem_write(hart, 0x6000, val)
         assert hart.mcause_val == 0
         assert bytes(ram[0x6000 : 0x6004]) == val
 
@@ -1073,7 +1178,7 @@ class TestPageFault:
         self._enable_sv39(hart)
         # VA 通过 Sv39 翻译, 但 L1 条目无效
         # 即使 PA 可能落在有效 RAM 范围也不应到达 PMA
-        hart._mem_read(0x80000000, 4)
+        mem_read(hart, 0x80000000, 4)
         assert hart.mcause_val == 13, (
             f"应为 LdPageFault(13), 翻译失败不应转为 LdAccessFault, 实际={hart.mcause_val}"
         )
@@ -1087,13 +1192,13 @@ class TestPageFault:
         self._enable_sv39(hart)
         # 第一次: TLB miss, 页表遍历成功
         ram[self.DATA_PA : self.DATA_PA + 4] = b"\x01\x02\x03\x04"
-        assert hart._mem_read(0x0, 4) == b"\x01\x02\x03\x04"
+        assert mem_read(hart, 0x0, 4) == b"\x01\x02\x03\x04"
         # 第二次: TLB hit
-        assert hart._mem_read(0x0, 4) == b"\x01\x02\x03\x04"
+        assert mem_read(hart, 0x0, 4) == b"\x01\x02\x03\x04"
 
         # 不同 VA → TLB miss → 无效 → PageFault
         hart._consecutive_traps = 0
-        hart._mem_read(0x1000, 4)
+        mem_read(hart, 0x1000, 4)
         assert hart.mcause_val == 13, (
             f"TLB miss 后无效 PTE 应触发 LdPageFault, 实际={hart.mcause_val}"
         )
@@ -1108,7 +1213,7 @@ class TestTimerInterrupt:
     """验证 CLINT 定时器中断 (MTI) 通过 check_pending_interrupts 正确投递.
 
     CLINT.check_interrupt() 在 mtime >= mtimecmp (且 mtimecmp > 0) 时
-    设置 mip 的 MTIP 位 (bit 7), 之后由 Hart.check_pending_interrupts()
+    设置 mip 的 MTIP 位 (bit 7), 之后由 check_pending_interrupts(Hart)
     按优先级 (MSI > MTI > ...) 和 mideleg 委派投递.
 
     覆盖场景:
@@ -1158,7 +1263,7 @@ class TestTimerInterrupt:
         self._set_mtimecmp(clint, 0, 50)
         clint.tick(100)  # mtime = 100 >= 50
 
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert taken, "应识别待处理定时器中断"
         assert hart.pc == 0x80000000, "应跳转到 mtvec"
         assert hart.mode == RiscvMode.M
@@ -1173,7 +1278,7 @@ class TestTimerInterrupt:
         self._set_mtimecmp(clint, 0, 100)
         clint.tick(50)  # mtime = 50 < 100
 
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert not taken
         assert hart.pc == 0x1000, "PC 不应变化"
         assert hart.mode == RiscvMode.M
@@ -1183,7 +1288,7 @@ class TestTimerInterrupt:
         self._set_mtimecmp(clint, 0, 0)
         clint.tick(100)  # mtime = 100 >= 0, 但 mtimecmp=0 表示禁用
 
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert not taken
 
     def test_mti_not_taken_mie_off(self, hart, clint):
@@ -1192,7 +1297,7 @@ class TestTimerInterrupt:
         clint.tick(100)
         hart.mie = False  # 关 M 模式全局中断
 
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert not taken
         assert hart.pc == 0x1000
 
@@ -1202,7 +1307,7 @@ class TestTimerInterrupt:
         clint.tick(100)
         hart.csrs["mie"].val = 0  # 清除全部中断使能
 
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert not taken
 
     # ---- 委派到 S-mode ----
@@ -1215,7 +1320,7 @@ class TestTimerInterrupt:
         hart.mode = RiscvMode.U
         hart.mstatus_val = MSTATUS_MIE | MSTATUS_SIE  # SIE 也需要使能
 
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert taken
         assert hart.pc == 0x80004000, "委派后应跳转到 stvec"
         assert hart.mode == RiscvMode.S, "应进入 S 模式"
@@ -1235,7 +1340,7 @@ class TestTimerInterrupt:
         hart.mode = RiscvMode.S
         hart.sie = False  # S-mode 全局关中断
 
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert not taken
 
     # ---- 优先级 ----
@@ -1248,7 +1353,7 @@ class TestTimerInterrupt:
         # 需同时使能 MSIE (bit 3) 和 MTIE (bit 7)
         hart.csrs["mie"].val = (1 << 3) | (1 << 7)
 
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert taken
         # MSI = cause code 3 | (1<<63)
         assert hart.mcause_val == 0x8000_0000_0000_0003, (
@@ -1264,7 +1369,7 @@ class TestTimerInterrupt:
         clint.tick(100)
 
         # 第一次中断
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert taken
         assert self._cause_is_timer(hart.mcause_val)
 
@@ -1277,7 +1382,7 @@ class TestTimerInterrupt:
         clint.tick(150)  # mtime = 250 >= 200
 
         # 第二次中断
-        taken = hart.check_pending_interrupts()
+        taken = check_pending_interrupts(hart)
         assert taken
         assert self._cause_is_timer(hart.mcause_val)
 
@@ -1394,7 +1499,7 @@ class TestWfi:
 
         # 设置总线 (满足 PMA 检查)
         bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
-        h.set_memory_backend(bus.read, bus.write)
+        inject_memory_backend(h, bus.read, bus.write)
         h.bus = bus
 
         # 设置 mtimecmp 为未来值, mtime 还未到达
@@ -1410,7 +1515,7 @@ class TestWfi:
         clint.tick(200)  # mtime = 210 >= 100
 
         # 模拟 emulator 循环: 对等待中的 hart 调用 check_pending_interrupts
-        taken = h.check_pending_interrupts()
+        taken = check_pending_interrupts(h)
         assert taken, "应识别中断并唤醒"
         assert not h._waiting, "应退出等待状态"
         assert h.pc == 0x80000000, "应跳转到 mtvec"
@@ -1431,7 +1536,7 @@ class TestWfi:
         h.interrupt_ctrl = clint
 
         bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
-        h.set_memory_backend(bus.read, bus.write)
+        inject_memory_backend(h, bus.read, bus.write)
         h.bus = bus
 
         # 执行 WFI → 等待
@@ -1442,7 +1547,7 @@ class TestWfi:
         clint.send_ipi(0)
 
         # 检查中断 → 应唤醒
-        taken = h.check_pending_interrupts()
+        taken = check_pending_interrupts(h)
         assert taken
         assert not h._waiting
         assert h.pc == 0x80000000, "应跳转到 mtvec"
@@ -1467,7 +1572,7 @@ class TestWfi:
         assert h._waiting
 
         # 无任何中断 → check 返回 False, 继续等待
-        taken = h.check_pending_interrupts()
+        taken = check_pending_interrupts(h)
         assert not taken
         assert h._waiting, "无中断应继续等待"
 
@@ -1539,7 +1644,7 @@ class TestWfi:
         h.csrs["mie"].val = 1 << 7
 
         bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
-        h.set_memory_backend(bus.read, bus.write)
+        inject_memory_backend(h, bus.read, bus.write)
         h.bus = bus
 
         # 执行 WFI → 等待
@@ -1547,7 +1652,7 @@ class TestWfi:
         assert h._waiting
 
         # 注入 ECALL trap
-        h._take_trap(TrapType.EcallFromMmode, tval=0, is_interrupt=False)
+        deliver_trap(h, TrapType.EcallFromMmode, tval=0, is_interrupt=False)
         assert not h._waiting, "trap 应清除等待状态"
         assert h.mcause_val == 11, f"应为 EcallFromMmode(11), 实际={h.mcause_val}"
 

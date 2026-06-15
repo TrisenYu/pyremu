@@ -1,0 +1,3 @@
+node_modules
+bin/riscv64/*
+bin/native-isa/*

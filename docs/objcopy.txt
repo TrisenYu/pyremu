@@ -1,0 +1,31 @@
+使用objcopy去掉与操作系统强相关的可执行文件头部信息
+
+裸机程序，其入口函数实际上在链接时指定
+
+链接描述文本用于指定哪些内存位置可以被链接器使用，哪些位置不能被链接器使用。
+从而可以把各个SECTION分配到相应的区域中，链接器会根据区域设置SECTION的地址，当其超过了该区域的size时，链接器就会发出警告或报错信息。
+
+```
+MEMORY { .sram : ORIGIN = CONFIG_SPL_TEXT_BASE,
+        LENGTH = CONFIG_SPL_MAX_SIZE }
+MEMORY { .sdram : ORIGIN = CONFIG_SPL_BSS_START_ADDR,
+        LENGTH = CONFIG_SPL_BSS_MAX_SIZE }
+```
+
+比如，上一段的链接脚本中定义了两个内存块，第一个位于SRAM中，它的起始地址由ORIGIN指定，块长度由LENGTH指定。第二个是位于SDRAM中的块，起始地址和长度也分别由其ORIGIN和LENGTH指定。
+
+
+```
+OUTPUT_FORMAT("elf64-littleaarch64", "elf64-littleaarch64", "elf64-littleaarch64")
+```
+
+OUTPUT_FORMAT指定了目标文件的格式，如这里为aarch64架构，小端的ELF格式。ELF格式会在目标文件的最开始添加一个ELF头，用于操作系统识别该文件的相关信息，但是SPL是在裸机上执行的，若含有这个头信息，CPU其实并不认识它。若不做进一步处理，链接完的程序就不能被cpu执行，故在Makefile中会有个去掉ELF头的操作
+
+通过cross compile的objcopy工具转换为u-boot-spl-nodtb.bin，我们可以看到objcopy的参数中含有-O binary，即它会将源文件转换为纯二进制文件，从而实现了将ELF头去掉的目的。
+
+riscv上电/zsbl/fsbl仅需要按照msel,即mode select引脚，
+模式选择的设置加载下一阶段的bootloader。
+
+m模式的zsbl保存在maskRom，地址为0x10000的位置，负责从gpt中加载更复杂的fsbl
+zsbl通过msel引脚的值决定从哪里寻找fsbl所在的分区
+

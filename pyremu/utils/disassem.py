@@ -20,6 +20,7 @@ from pyremu.core.decoder import (
     ldFn3,
     parse_compressed,
     parse_func3,
+    parse_func6,
     parse_func7,
     parse_imm12_se,
     parse_imm_b,
@@ -106,20 +107,22 @@ _IMM_FUNCT3_MAP: dict[int, str] = {
 def _dis_itype(instr: int) -> str:
     """I-type ALU: mnemonic rd, rs1, imm."""
     f3 = parse_func3(instr)
-    f7 = parse_func7(instr)
 
-    if f3 == 0b001:
-        if f7 != 0:
+    if f3 == 0b001:  # SLLI — funct6 (bits 31:26), bit 25 属于 shamt
+        if parse_func6(instr) != 0:
             return _UNKNOWN
         shamt = (instr >> 20) & 0x3F
         return f"slli    {_rd(instr)}, {_rs1(instr)}, {shamt}"
-    if f3 == 0b101:
+    if f3 == 0b101:  # SRLI / SRAI
         shamt = (instr >> 20) & 0x3F
-        if f7 == 0x00:
+        f6 = parse_func6(instr)
+        if f6 == 0x00:       # SRLI (funct6=0b000000)
             return f"srli    {_rd(instr)}, {_rs1(instr)}, {shamt}"
-        if f7 == 0x20:
+        if f6 == 0x10:       # SRAI (funct6=0b010000)
             return f"srai    {_rd(instr)}, {_rs1(instr)}, {shamt}"
         return _UNKNOWN
+
+    f7 = parse_func7(instr)  # 非 shift I-type 才使用 funct7
 
     mnemonic = _IMM_FUNCT3_MAP.get(f3)
     if mnemonic is None:
@@ -301,7 +304,7 @@ _PRIV_MNEMONIC: dict[int, str] = {
     0x302: "mret",
     0x102: "sret",
     0x105: "wfi",
-    0x104: "sfence.vma",
+    0x120: "sfence.vma",
 }
 
 
@@ -654,6 +657,8 @@ def disasm(
         return _dis_rtype(instr)
     if opc == Opc.opImm:
         return _dis_itype(instr)
+    if opc == Opc.opImm32:
+        return _dis_op_imm32(instr)
     if opc == Opc.op32:
         return _dis_op32(instr)
     if opc == Opc.ld:

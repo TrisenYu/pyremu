@@ -27,10 +27,21 @@ from enum import Enum
 from pyremu.core.hart import (
     HartWithRegs,
 )
-from pyremu.core.mem_access import MemoryAccessor
+from pyremu.core.mem_check_aux import (
+    mem_read,
+    mem_write,
+    validate_csr,
+)
 from pyremu.core.registers import CsrAccessError
 from pyremu.core.trap import TrapType
-from pyremu.core.trap_handler import TrapHandler
+from pyremu.core.trap_handler import (
+    deliver_trap,
+    handle_wfi,
+    trap_ebreak,
+    trap_ecall,
+    trap_mret,
+    trap_sret,
+)
 
 _sint64 = ctypes.c_int64
 _uint64 = ctypes.c_uint64
@@ -60,7 +71,8 @@ class Opc(Enum):
     ld = 0b00000_11  # 载入
     opfp = 0b00001_11  # 浮点
     fence = 0b00011_11  # 内存/执行流屏障
-    opImm = 0b00100_11  # 立即数 ALU
+    opImm = 0b00100_11  # 立即数 ALU (32-bit)
+    opImm32 = 0b00110_11  # RV64 32-bit 立即数 ALU
     auipc = 0b00101_11  # 累加 pc
     st = 0b01000_11  # 写入
     amo = 0b01011_11  # 原子
@@ -183,7 +195,7 @@ parse_func3 = lambda x: (x >> 12) & 0b0111
 parse_rs1 = lambda x: (x >> 15) & 0b1_1111
 parse_rs2 = lambda x: (x >> 20) & 0b1_1111
 parse_func7 = lambda x: (x >> 25) & 0b111_1111
-parse_func2 = lambda x: (x >> 25) & 0b11  # for SLLI/SRLI/SRAI
+parse_func6 = lambda x: (x >> 26) & 0x3F  # for SLLI/SRLI/SRAI (I-type shifts)
 
 # 立即数解析（未符号拓展）
 parse_imm12_raw = lambda x: (x >> 20) & 0xFFF  # I-type
@@ -193,8 +205,8 @@ parse_imm20_raw = lambda x: (x >> 12) & 0xF_FFFF  # U-type
 
 def parse_imm_s(instr: int) -> int:
     """S-type 12-bit immediate, sign-extended."""
-    imm = (instr >> 25) & 0x7F  # imm[11:5]
-    imm |= (instr >> 7) & 0x1F  # imm[4:0]  -- from rd field
+    imm = ((instr >> 25) & 0x7F) << 5  # imm[11:5]
+    imm |= (instr >> 7) & 0x1F          # imm[4:0]  -- from rd field
     return _sext(imm, 12)
 
 
@@ -254,7 +266,7 @@ def _trunc_rem(a: int, b: int) -> int:
     return a - _trunc_div(a, b) * b
 
 
-class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
+class Hart(HartWithRegs):
     # ----------------------------------------------------------
     #  R-type ALU (opcode = Opc.op)
     # ----------------------------------------------------------
@@ -381,7 +393,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
     def handle_op_imm(self, instr: int):
         """Execute an I-type immediate ALU instruction."""
         part1 = parse_func3(instr)
-        part7 = parse_func7(instr)  # top 7 bits for SLLI/SRLI/SRAI
+        part6 = parse_func6(instr)  # funct6 for SLLI/SRLI/SRAI
         rd = parse_rd(instr)
         rs1 = parse_rs1(instr)
         imm = parse_imm12_se(instr)  # 12-bit signed immediate
@@ -393,8 +405,8 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
             result = (v1 + imm) & 0xFFFF_FFFF_FFFF_FFFF
 
         elif part1 == 0b001:  # SLLI
-            if part7 != 0:
-                raise ValueError(f"invalid funct7={part7:#x} for SLLI")
+            if part6 != 0:
+                raise ValueError(f"invalid funct6={part6:#x} for SLLI")
             result = (v1 << shamt) & 0xFFFF_FFFF_FFFF_FFFF
 
         elif part1 == 0b010:  # SLTI
@@ -407,12 +419,12 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
             result = v1 ^ imm
 
         elif part1 == 0b101:  # SRLI / SRAI
-            if part7 == 0:
+            if part6 == 0:         # SRLI (funct6=0b000000)
                 result = (_uint64(v1).value >> shamt) & 0xFFFF_FFFF_FFFF_FFFF
-            elif part7 == 0x20:
+            elif part6 == 0x10:    # SRAI (funct6=0b010000)
                 result = _sint64(_sint64(v1).value >> shamt).value & 0xFFFF_FFFF_FFFF_FFFF
             else:
-                raise ValueError(f"invalid funct7={part7:#x} for SRLI/SRAI")
+                raise ValueError(f"invalid funct6={part6:#x} for SRLI/SRAI")
 
         elif part1 == 0b110:  # ORI
             result = v1 | imm
@@ -619,8 +631,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
     #  Load (opcode = Opc.ld)
     # ----------------------------------------------------------
     def handle_ld(self, instr: int):
-        """Execute a load instruction.
-        TODO: integrate MMU / TLB for address translation."""
+        """Execute a load instruction."""
         fn3 = parse_func3(instr)
         rd = parse_rd(instr)
         rs1 = parse_rs1(instr)
@@ -628,14 +639,22 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
 
         addr = (self.gprs[rs1].val + offset) & 0xFFFF_FFFF_FFFF_FFFF
 
-        # --- memory stub: read 8 bytes from physical address *addr* ---
-        # In a real hart this goes through the MMU / dcache.
-        mem = self._mem_read(addr, 8)
-
         try:
             f = ldFn3(fn3)
         except ValueError:
             raise ValueError(f"invalid funct3={fn3:#x} for load")
+
+        # 按实际操作宽度读取, 避免对 lb/lbu/lh/lhu/lw/lwu 产生虚假对齐故障
+        if f in (ldFn3.lb, ldFn3.lbu):
+            read_size = 1
+        elif f in (ldFn3.lh, ldFn3.lhu):
+            read_size = 2
+        elif f in (ldFn3.lw, ldFn3.lwu):
+            read_size = 4
+        else:
+            read_size = 8  # ld
+
+        mem = mem_read(self,addr, read_size)
 
         if f == ldFn3.lb:
             val = _sext(mem[0], 8)
@@ -691,7 +710,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
         else:
             raise ValueError(f"unhandled store funct3={fn3:#x}")
 
-        self._mem_write(addr, data)
+        mem_write(self,addr, data)
 
     # ----------------------------------------------------------
     #  Atomic Memory Operations (opcode = Opc.amo)
@@ -727,7 +746,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
 
         if op == AmoFunct5.LR:
             # Load-Reserved: 读取内存并设置预留
-            data_bytes = self._mem_read(addr, byte_len)
+            data_bytes = mem_read(self,addr, byte_len)
             val = int.from_bytes(data_bytes, "little", signed=False) & mask
             if rd != 0:
                 # LR.D: 64-bit 值不需要符号扩展; LR.W: 32→64 符号扩展
@@ -739,7 +758,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
             if self.reservation_valid and self.reservation_addr == addr:
                 store_val = self.gprs[rs2].val & mask
                 data = store_val.to_bytes(byte_len, "little", signed=False)
-                self._mem_write(addr, data)
+                mem_write(self,addr, data)
                 if rd != 0:
                     self.gprs[rd].val = 0  # 成功 → rd ← 0
             elif rd != 0:
@@ -748,7 +767,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
 
         else:
             # AMOxxx: 原子读-改-写
-            data_bytes = self._mem_read(addr, byte_len)
+            data_bytes = mem_read(self,addr, byte_len)
             mem_val = int.from_bytes(data_bytes, "little", signed=False) & mask
             op_val = self.gprs[rs2].val & mask
 
@@ -778,7 +797,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
                 raise ValueError(f"unhandled AMO op: {op}")
 
             data = result.to_bytes(byte_len, "little", signed=False)
-            self._mem_write(addr, data)
+            mem_write(self,addr, data)
             if rd != 0:
                 self.gprs[rd].val = (
                     _sext(mem_val, 64) if is_64bit else _sext(mem_val, 32)
@@ -815,16 +834,16 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
             # Privileged instructions: funct12 determines the operation
             funct12 = (instr >> 20) & 0xFFF
             if funct12 == 0x000:  # ECALL
-                self._trap_ecall()
+                trap_ecall(self)
             elif funct12 == 0x001:  # EBREAK
-                self._trap_ebreak()
+                trap_ebreak(self)
             elif funct12 == 0x302:  # MRET
-                self._trap_mret()
+                trap_mret(self)
             elif funct12 == 0x102:  # SRET
-                self._trap_sret()
+                trap_sret(self)
             elif funct12 == 0x105:  # WFI
-                self._handle_wfi(instr)
-            elif funct12 == 0x104:  # SFENCE.VMA
+                handle_wfi(self, instr)
+            elif funct12 == 0x120:  # SFENCE.VMA (funct7=0b0001001, rs2=0)
                 # 刷新所有 hart 的 TLB (当前为单 hart, 故只刷新自己)
                 self.itlb.flush_all()
                 self.dtlb.flush_all()
@@ -832,32 +851,35 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
                 raise ValueError(f"unknown privileged funct12={funct12:#05x}")
 
         elif fn3 == 0b001:  # CSRRW
-            self._check_csr(csr_addr, is_write=True)
-            old = self.read_csr(csr_addr)
+            validate_csr(self,csr_addr, is_write=True)
+            old_csr = self.read_csr(csr_addr)
+            new_csr = self.gprs[rs1].val     # 先读 rs1 (可能在 rd==rs1 时被覆盖)
             if rd != 0:
-                self.gprs[rd].val = old
-            self.write_csr(csr_addr, self.gprs[rs1].val)
+                self.gprs[rd].val = old_csr
+            self.write_csr(csr_addr, new_csr)
 
         elif fn3 == 0b010:  # CSRRS
             do_write = rs1 != 0
-            self._check_csr(csr_addr, is_write=do_write)
-            old = self.read_csr(csr_addr)
+            validate_csr(self,csr_addr, is_write=do_write)
+            old_csr = self.read_csr(csr_addr)
+            rs1_val = self.gprs[rs1].val  # 先读 rs1 (可能在 rd==rs1 时被覆盖)
             if rd != 0:
-                self.gprs[rd].val = old
+                self.gprs[rd].val = old_csr
             if do_write:
-                self.write_csr(csr_addr, old | self.gprs[rs1].val)
+                self.write_csr(csr_addr, old_csr | rs1_val)
 
         elif fn3 == 0b011:  # CSRRC
             do_write = rs1 != 0
-            self._check_csr(csr_addr, is_write=do_write)
-            old = self.read_csr(csr_addr)
+            validate_csr(self,csr_addr, is_write=do_write)
+            old_csr = self.read_csr(csr_addr)
+            rs1_val = self.gprs[rs1].val  # 先读 rs1 (可能在 rd==rs1 时被覆盖)
             if rd != 0:
-                self.gprs[rd].val = old
+                self.gprs[rd].val = old_csr
             if do_write:
-                self.write_csr(csr_addr, old & ~self.gprs[rs1].val)
+                self.write_csr(csr_addr, old_csr & ~rs1_val)
 
         elif fn3 == 0b101:  # CSRRWI
-            self._check_csr(csr_addr, is_write=True)
+            validate_csr(self,csr_addr, is_write=True)
             old = self.read_csr(csr_addr)
             if rd != 0:
                 self.gprs[rd].val = old
@@ -865,7 +887,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
 
         elif fn3 == 0b110:  # CSRRSI
             do_write = uimm != 0
-            self._check_csr(csr_addr, is_write=do_write)
+            validate_csr(self,csr_addr, is_write=do_write)
             old = self.read_csr(csr_addr)
             if rd != 0:
                 self.gprs[rd].val = old
@@ -874,7 +896,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
 
         elif fn3 == 0b111:  # CSRRCI
             do_write = uimm != 0
-            self._check_csr(csr_addr, is_write=do_write)
+            validate_csr(self,csr_addr, is_write=do_write)
             old = self.read_csr(csr_addr)
             if rd != 0:
                 self.gprs[rd].val = old
@@ -922,7 +944,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
                 | ((instr >> 7) & 0xF) << 6  # nzuimm[9:6] ← bits[10:7]
             )
             if nzuimm == 0:
-                self._take_trap(TrapType.IllInstr, tval=instr, is_interrupt=False)
+                deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
                 return 0
             self.gprs[rd].val = (self.gprs[2].val + nzuimm) & 0xFFFF_FFFF_FFFF_FFFF
             return 2
@@ -937,12 +959,12 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
         addr = (self.gprs[rs1].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
 
         if funct3 == 0b010:  # C.LW
-            mem = self._mem_read(addr, 4)
+            mem = mem_read(self,addr, 4)
             val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
             self.gprs[rd].val = _sext(val, 32)
 
         elif funct3 == 0b011:  # C.LD (RV64C)
-            mem = self._mem_read(addr, 8)
+            mem = mem_read(self,addr, 8)
             val = sum(mem[i] << (8 * i) for i in range(8))
             self.gprs[rd].val = val
 
@@ -950,13 +972,13 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
             rs2 = self._creg((instr >> 2) & 0x7)
             v = self.gprs[rs2].val & 0xFFFF_FFFF
             data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
-            self._mem_write(addr, data)
+            mem_write(self,addr, data)
 
         elif funct3 == 0b111:  # C.SD (RV64C)
             rs2 = self._creg((instr >> 2) & 0x7)
             v = self.gprs[rs2].val
             data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-            self._mem_write(addr, data)
+            mem_write(self,addr, data)
 
         else:
             raise NotImplementedError(f"C0 funct3={funct3:#05b} (FLD/FSD/reserved)")
@@ -1109,11 +1131,11 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
             )
             addr = (self.gprs[2].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
             if funct3 == 0b010:
-                mem = self._mem_read(addr, 4)
+                mem = mem_read(self,addr, 4)
                 val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
                 self.gprs[rd_rs1].val = _sext(val, 32)
             else:
-                mem = self._mem_read(addr, 8)
+                mem = mem_read(self,addr, 8)
                 val = sum(mem[i] << (8 * i) for i in range(8))
                 self.gprs[rd_rs1].val = val
             return 2
@@ -1124,13 +1146,16 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
             is_jalr = (instr >> 12) & 0x1
             if rd_rs1 == 0 and rs2 == 0:
                 # C.EBREAK
-                self._trap_ebreak()
+                trap_ebreak(self)
                 return 0
             elif rs2 == 0:
                 # C.JR 或 C.JALR
                 if is_jalr:
+                    target = self.gprs[rd_rs1].val  # 先读跳转目标 (rd_rs1 可能 == 1)
                     self.gprs[1].val = (self.pc + 2) & 0xFFFF_FFFF_FFFF_FFFF  # ra
-                self.pc = self.gprs[rd_rs1].val & ~1 & 0xFFFF_FFFF_FFFF_FFFF
+                else:
+                    target = self.gprs[rd_rs1].val
+                self.pc = target & ~1 & 0xFFFF_FFFF_FFFF_FFFF
                 return 0
             else:
                 # C.MV: rd = rs2
@@ -1147,7 +1172,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
             else:
                 v = self.gprs[rs2].val
                 data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-            self._mem_write(addr, data)
+            mem_write(self,addr, data)
             return 2
 
         raise NotImplementedError(f"C2 funct3={funct3:#05b} (FLDSP/FSDSP)")
@@ -1194,7 +1219,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
             try:
                 return self.handle_compressed(instr & 0xFFFF)
             except (ValueError, NotImplementedError, CsrAccessError):
-                self._take_trap(
+                deliver_trap(self, 
                     TrapType.IllInstr, tval=instr, is_interrupt=False
                 )
                 return 0
@@ -1204,7 +1229,7 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
         try:
             code = Opc(parse_opcode(instr))
         except ValueError:
-            self._take_trap(TrapType.IllInstr, tval=instr, is_interrupt=False)
+            deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
             return 0
 
         try:
@@ -1212,6 +1237,8 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
                 self.handle_alu(instr)
             elif code == Opc.opImm:
                 self.handle_op_imm(instr)
+            elif code == Opc.opImm32:
+                self.handle_op_imm32(instr)
             elif code == Opc.op32:
                 self.handle_op32(instr)
             elif code == Opc.ld:
@@ -1232,12 +1259,14 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
                 self.pc = (self.pc + imm) & 0xFFFF_FFFF_FFFF_FFFF
                 pc_changed = True
             elif code == Opc.lui:
-                imm20 = parse_imm20_raw(instr) << 12
+                # U-immediate → 32-bit value sign-extended to 64 bits (RV64)
+                imm20 = _sext(parse_imm20_raw(instr) << 12, 32)
                 rd = parse_rd(instr)
                 if rd != 0:
                     self.gprs[rd].val = imm20 & 0xFFFF_FFFF_FFFF_FFFF
             elif code == Opc.auipc:
-                imm20 = parse_imm20_raw(instr) << 12
+                # U-immediate → 32-bit offset sign-extended to 64 bits (RV64)
+                imm20 = _sext(parse_imm20_raw(instr) << 12, 32)
                 rd = parse_rd(instr)
                 if rd != 0:
                     self.gprs[rd].val = (self.pc + imm20) & 0xFFFF_FFFF_FFFF_FFFF
@@ -1252,13 +1281,13 @@ class Hart(HartWithRegs, TrapHandler, MemoryAccessor):
                 self.handle_amo(instr)
             else:
                 # 合法 opcode 但尚未实现 (如浮点 opfp)
-                self._take_trap(
+                deliver_trap(self, 
                     TrapType.IllInstr, tval=instr, is_interrupt=False
                 )
                 return 0
         except (ValueError, NotImplementedError, CsrAccessError):
             # 操作码合法但编码字段无效 (如非法 funct3/funct12/nzuimm=0 等)
-            self._take_trap(TrapType.IllInstr, tval=instr, is_interrupt=False)
+            deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
             return 0
 
         return 0 if pc_changed else 4

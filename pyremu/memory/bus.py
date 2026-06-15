@@ -220,6 +220,47 @@ class Bus:
         self._ram_write_direct(addr, data)
 
     # ----------------------------------------------------------
+    #  安全读写 (不抛异常, 供调试器等外部调用方使用)
+    # ----------------------------------------------------------
+
+    def try_read(self, addr: int, size: int) -> bytes | None:
+        """安全读取物理内存 — 失败返回 None 而非抛异常.
+
+        与 read() 的区别: 将设备/L2 的异常转换为 None 返回值,
+        调用方无需 try/except. 适用于调试器、内存 dump 等 best-effort 场景.
+
+        Args:
+            addr: 物理地址.
+            size: 读取字节数 (1/2/4/8).
+
+        Returns:
+            成功时返回 bytes, 失败 (设备异常/访问越界) 返回 None.
+        """
+        try:
+            return self.read(addr, size)
+        except Exception:
+            return None
+
+    def try_write(self, addr: int, data: bytes) -> bool:
+        """安全写入物理内存 — 返回 bool 表示成功与否.
+
+        与 write() 的区别: 将设备/L2 的异常转换为 False 返回值,
+        调用方无需 try/except. 适用于回滚、内存补丁等 best-effort 场景.
+
+        Args:
+            addr: 物理地址.
+            data: 写入数据.
+
+        Returns:
+            True 表示写入成功, False 表示失败 (设备异常/访问越界).
+        """
+        try:
+            self.write(addr, data)
+            return True
+        except Exception:
+            return False
+
+    # ----------------------------------------------------------
     #  属性
     # ----------------------------------------------------------
 

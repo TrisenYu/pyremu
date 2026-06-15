@@ -12,12 +12,20 @@ Hart (硬件线程) 的寄存器文件定义，包含:
 - mstatus 等关键 CSR 的位字段定义及快捷属性
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from pyremu.core.registers import check_csr, register_csr, register_fpr, register_gpr
 from pyremu.memory.cache import TLB_SIZE
 from pyremu.memory.pmp import Pmp
 from pyremu.memory.tlb import TLB
+
+if TYPE_CHECKING:
+    from pyremu.interrupt.controller import InterruptController
+    from pyremu.memory.bus import Bus
 
 
 class RiscvMode(Enum):
@@ -101,14 +109,14 @@ class HartWithRegs:
         # 物理内存后端 — 由子类或外部注入
         # 调用约定: mem_read_phy(addr: int, size: int) -> bytes
         #           mem_write_phy(addr: int, data: bytes) -> None
-        self._mem_read_phy = None
-        self._mem_write_phy = None
+        self._mem_read_phy: Callable[[int, int], bytes] | None = None
+        self._mem_write_phy: Callable[[int, bytes], None] | None = None
 
         # 共享总线引用 — 用于判断 MMIO 地址 (不可缓存) 和预留失效
-        self._bus = None
+        self._bus: Bus | None = None
 
         # 中断控制器引用 — 每条指令执行后在指令边界检查是否有待处理中断
-        self._interrupt_ctrl = None
+        self._interrupt_ctrl: InterruptController | None = None
 
         # LR/SC 预留 (A-extension 原子指令)
         # 执行 LR 时记录预留地址; 任何 hart 向该地址写入时清除预留;
@@ -142,7 +150,11 @@ class HartWithRegs:
         check, csr_name = check_csr(csr_id)
         if not check:
             return
-        self.csrs[csr_name].val = val
+        # satp 写入必须通过 property setter 以同步更新 _mmu_mode
+        if csr_name == "satp":
+            self.satp_val = val
+        else:
+            self.csrs[csr_name].val = val
 
     def read_gpr(self, reg_id: int) -> int:
         return self.gprs[reg_id & 0x1F].val
@@ -394,8 +406,7 @@ class HartWithRegs:
         return self._reservation_addr
 
     # ----------------------------------------------------------
-    #  trap 处理 — 由 TrapHandler mixin (core/trap_handler.py) 提供
-    #  _take_trap / _trap_deliver_smode / _trap_deliver_mmode /
-    #  _trap_ecall / _trap_ebreak / _trap_mret / _trap_sret /
-    #  _handle_wfi / check_pending_interrupts
+    #  trap 处理 — 由 core/trap_handler.py 中的独立函数提供
+    #  deliver_trap / trap_ecall / trap_ebreak / trap_mret / trap_sret /
+    #  handle_wfi / check_pending_interrupts
     # ----------------------------------------------------------

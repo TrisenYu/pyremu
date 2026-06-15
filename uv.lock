@@ -291,6 +291,12 @@ wheels = [
 ]
 
 [[package]]
+name = "pylibfdt"
+version = "1.7.2.post1"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/a2/b8/ef881f0e76af7727ca9c5e27a121db69667c69e4e91eceaafe97f3666a6c/pylibfdt-1.7.2.post1.tar.gz", hash = "sha256:08ec69755f7565dc25e4e640e0315795888d4caeb7f146de4e05bf12b03c94c8" }
+
+[[package]]
 name = "pyparsing"
 version = "3.3.2"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
@@ -319,6 +325,7 @@ dependencies = [
     { name = "pydevicetree" },
     { name = "pyfdt" },
     { name = "pygments" },
+    { name = "pylibfdt" },
     { name = "pyparsing" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -347,6 +354,7 @@ requires-dist = [
     { name = "pydevicetree", specifier = "==0.0.13" },
     { name = "pyfdt", specifier = "==0.3" },
     { name = "pygments", specifier = "==2.20.0" },
+    { name = "pylibfdt", specifier = "==1.7.2.post1" },
     { name = "pyparsing", specifier = "==3.3.2" },
     { name = "pytest", specifier = "==9.0.3" },
     { name = "pytest-cov", specifier = "==7.1.0" },

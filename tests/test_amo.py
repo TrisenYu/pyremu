@@ -7,6 +7,8 @@
 
 import pytest
 
+from pyremu.core.mem_check_aux import inject_memory_backend
+from pyremu.core.trap_handler import deliver_trap
 from pyremu.core.decoder import (
     AmoFunct5,
     AmoWidth,
@@ -46,7 +48,7 @@ class TestLRSC:
     def hart(self) -> Hart:
         h = Hart(id=0)
         ram, rf, wf = _make_ram()
-        h.set_memory_backend(rf, wf)
+        inject_memory_backend(h, rf, wf)
         return h
 
     def test_lr_sets_reservation(self, hart):
@@ -94,7 +96,7 @@ class TestLRSC:
         val = 0xFEED_FACE_CAFE_BABE & 0xFFFF_FFFF_FFFF_FFFF
         hart._mem_write_phy = lambda a, d: None  # 占位
         ram, rf, wf = _make_ram()
-        hart.set_memory_backend(rf, wf)
+        inject_memory_backend(hart, rf, wf)
         data = val.to_bytes(8, "little")
         wf(0x2000, data)
 
@@ -111,7 +113,7 @@ class TestAMOArithmetic:
     def hart(self) -> Hart:
         h = Hart(id=0)
         ram, rf, wf = _make_ram()
-        h.set_memory_backend(rf, wf)
+        inject_memory_backend(h, rf, wf)
         return h
 
     def _setup_mem_and_regs(self, hart, addr: int, mem_val: int, op_val: int, is_64: bool = True):
@@ -203,7 +205,7 @@ class TestReservationInvalidation:
         h = Hart(id=0)
         h.set_reservation(0x4000)
         assert h.reservation_valid
-        h._take_trap(
+        deliver_trap(h, 
             __import__("pyremu.core.trap", fromlist=["TrapType"]).TrapType.IllInstr,
             is_interrupt=False,
         )
