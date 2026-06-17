@@ -24,6 +24,7 @@ Usage:
     emu.run(1000)     # 执行 1000 个周期
 """
 
+import random
 import struct
 import sys
 from typing import Any
@@ -100,7 +101,7 @@ class Emulator:
         if p.uart_base:
             self.uart = UART(
                 base=p.uart_base,
-                tx_callback=lambda b: sys.stdout.write(chr(b)),
+                tx_callback=sys.stdout.write,
             )
             self.bus.add_device(p.uart_base, self.uart)
             self._peripherals["uart"] = self.uart
@@ -341,10 +342,17 @@ class Emulator:
         Returns:
             本轮执行的指令数.
         """
+        # 多 hart 时随机打乱执行顺序, 确保彩票锁等场景机会均等
+        active = [h for h in self.harts if not h._halted]
+        if len(active) > 1:
+            random.shuffle(active)
+
         all_exec_cnt = 0
-        for hart in self.harts:
-            if hart._halted:
-                continue
+        for hart in active:
+
+            # 声明当前 UART 写者 hart (多 hart 输出不交错)
+            if self.uart is not None:
+                self.uart.set_writer(hart.id)
 
             # WFI 等待状态: 不取指/执行, 但仍检查中断唤醒
             if hart._waiting:

@@ -196,6 +196,99 @@ class TestAMOArithmetic:
         self._do_amo(hart, AmoFunct5.ADD, 0x2000, mem_val=7, op_val=8,
                      expected_result=15, expected_rd=7, is_64=False)
 
+    def test_amoxor_w(self, hart):
+        self._do_amo(hart, AmoFunct5.XOR, 0x2000, mem_val=0xFF00, op_val=0x0FF0,
+                     expected_result=0xF0F0, expected_rd=0xFF00, is_64=False)
+
+    def test_amoand_w(self, hart):
+        self._do_amo(hart, AmoFunct5.AND, 0x2000, mem_val=0xFF0F, op_val=0xF0FF,
+                     expected_result=0xF00F, expected_rd=0xFF0F, is_64=False)
+
+    def test_amoor_w(self, hart):
+        self._do_amo(hart, AmoFunct5.OR, 0x2000, mem_val=0xFF00, op_val=0x00FF,
+                     expected_result=0xFFFF, expected_rd=0xFF00, is_64=False)
+
+    def test_amomin_w(self, hart):
+        """AMOMIN.W 有符号比较: mem=-5, op=10 → min=-5."""
+        self._do_amo(hart, AmoFunct5.MIN, 0x2000,
+                     mem_val=(-5) & 0xFFFF_FFFF, op_val=10,
+                     expected_result=(-5) & 0xFFFF_FFFF,
+                     expected_rd=(-5) & 0xFFFF_FFFF, is_64=False)
+
+    def test_amomax_w(self, hart):
+        """AMOMAX.W 有符号比较: mem=-5, op=10 → max=10."""
+        self._do_amo(hart, AmoFunct5.MAX, 0x2000,
+                     mem_val=(-5) & 0xFFFF_FFFF, op_val=10,
+                     expected_result=10,
+                     expected_rd=(-5) & 0xFFFF_FFFF, is_64=False)
+
+    def test_amominu_w(self, hart):
+        self._do_amo(hart, AmoFunct5.MINU, 0x2000, mem_val=5, op_val=10,
+                     expected_result=5, expected_rd=5, is_64=False)
+
+    def test_amomaxu_w(self, hart):
+        self._do_amo(hart, AmoFunct5.MAXU, 0x2000, mem_val=5, op_val=10,
+                     expected_result=10, expected_rd=5, is_64=False)
+
+    def test_amoadd_w_overflow(self, hart):
+        """AMOADD.W 溢出: 0xFFFFFFFF + 1 = 0x00000000."""
+        self._do_amo(hart, AmoFunct5.ADD, 0x2000,
+                     mem_val=0xFFFF_FFFF, op_val=1,
+                     expected_result=0x0000_0000,
+                     expected_rd=0xFFFF_FFFF, is_64=False)
+
+
+class TestAMOSignExtend:
+    """.W 变体 rd 结果应符号扩展到 64 位."""
+
+    @pytest.fixture
+    def hart(self) -> Hart:
+        h = Hart(id=0)
+        ram, rf, wf = _make_ram()
+        inject_memory_backend(h, rf, wf)
+        return h
+
+    def test_rd_sign_extend_w_negative(self, hart):
+        """.W 指令的旧内存值若为负数 (bit31=1), rd 应符号扩展到 64 位."""
+        hart.gprs[10].val = 0x2000
+        hart.gprs[12].val = 0
+        neg_val_32 = (-1) & 0xFFFF_FFFF  # 0xFFFFFFFF
+        hart._mem_write_phy(0x2000, neg_val_32.to_bytes(4, "little"))
+        instr = _make_amo_instr(AmoFunct5.ADD, AmoWidth.W, rd=15, rs1=10, rs2=12)
+        hart.exec_instr(instr)
+        # rd 应得到符号扩展的 -1 (64-bit 全 F)
+        assert hart.gprs[15].val & 0xFFFF_FFFF_FFFF_FFFF == 0xFFFF_FFFF_FFFF_FFFF, (
+            f"sign-extend: expected -1, got 0x{hart.gprs[15].val:x}"
+        )
+
+    def test_rd_sign_extend_w_positive(self, hart):
+        """.W 指令的旧内存值若为正数 (bit31=0), rd 应零扩展到 64 位."""
+        hart.gprs[10].val = 0x2000
+        hart.gprs[12].val = 0
+        hart._mem_write_phy(0x2000, (0x7FFF_FFFF).to_bytes(4, "little"))
+        instr = _make_amo_instr(AmoFunct5.SWAP, AmoWidth.W, rd=15, rs1=10, rs2=12)
+        hart.exec_instr(instr)
+        assert hart.gprs[15].val & 0xFFFF_FFFF_FFFF_FFFF == 0x7FFF_FFFF, (
+            f"no sign-extend: expected 0x7FFFFFFF, got 0x{hart.gprs[15].val:x}"
+        )
+
+    def test_rd_sign_extend_w_min_negative(self, hart):
+        """AMOMIN.W: 旧值为 INT32_MIN (0x80000000), 符号扩展应正确."""
+        hart.gprs[10].val = 0x2000
+        hart.gprs[12].val = 1  # op=1 → min(0x80000000, 1) = 0x80000000
+        min_val = 0x8000_0000
+        hart._mem_write_phy(0x2000, min_val.to_bytes(4, "little"))
+        instr = _make_amo_instr(AmoFunct5.MIN, AmoWidth.W, rd=15, rs1=10, rs2=12)
+        hart.exec_instr(instr)
+        # rd 应为符号扩展的 0xFFFFFFFF_80000000
+        assert hart.gprs[15].val & 0xFFFF_FFFF_FFFF_FFFF == 0xFFFF_FFFF_8000_0000, (
+            f"sign-extend of 0x80000000: expected 0xFFFFFFFF80000000, "
+            f"got 0x{hart.gprs[15].val:x}"
+        )
+        # 内存应保持 INT32_MIN
+        new_mem = int.from_bytes(hart._mem_read_phy(0x2000, 4), "little")
+        assert new_mem == 0x8000_0000
+
 
 class TestReservationInvalidation:
     """预留失效场景."""

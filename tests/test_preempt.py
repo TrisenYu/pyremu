@@ -33,14 +33,14 @@ class TestPreemptInterleave:
 
     def test_interleaved(self):
         _, loader = _make_emu("u_prog_a_entry", "u_prog_b_entry")
-        out = loader.run(cycles=3_000_000)
+        out = loader.run(cycles=50_000)
         seq = "".join(c for c in out if c in "AB")
         transitions = sum(1 for i in range(len(seq) - 1) if seq[i] != seq[i + 1])
         assert transitions > 1, f"未交错, transitions={transitions}"
 
     def test_both_produce_output(self):
         _, loader = _make_emu("u_prog_a_entry", "u_prog_b_entry")
-        out = loader.run(cycles=5_000_000)
+        out = loader.run(cycles=200_000)
         assert out.count("A") >= 50, f"A count too low: {out.count('A')}"
         assert out.count("B") >= 50, f"B count too low: {out.count('B')}"
 

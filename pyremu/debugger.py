@@ -33,8 +33,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from pyremu.core.decoder import parse_compressed
+from pyremu.core.decoder import Hart, parse_compressed
 from pyremu.core.hart import RiscvMode
+from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.memory.l2cache import L2Cache
 from pyremu.core.registers import register_csr, register_fpr, register_gpr
 from pyremu.utils.disassem import disasm
@@ -147,6 +148,11 @@ class Debugger:
         # disasm 重复时的自动推进地址 (指向上次输出末尾)
         self._disasm_next_addr: int | None = None
 
+        # disasm 步数持久化: 参考 PC 及累积步数, 供 Enter 重复时继续编号
+        self._disasm_ref_pc: int | None = None
+        self._disasm_base_step: int = 0
+        self._disasm_past_terminator: bool = False
+
         # 最近的栈回溯帧列表 (供 frame N 选择)
         self._stack_frames: list[StackFrame] = []
         self._current_frame_idx: int = 0
@@ -173,7 +179,7 @@ class Debugger:
         words: list[str] = [
             # 执行控制
             "s", "step", "c", "continue", "r", "run",
-            "undo", "rollback",
+            "undo", "rollback", "restart",
             # 寄存器 / CSR 操作
             "regs", "gpr", "reg", "set", "w",
             "csr", "csrw",
@@ -271,6 +277,11 @@ class Debugger:
         if h._halted:
             return  # 已输出过转储信息, 静默跳过
 
+        # WFI 等待状态: 仅检查中断唤醒, 不取指/执行
+        if h._waiting:
+            check_pending_interrupts(h)
+            return
+
         snap = self._save_snapshot()
 
         orig_write = h._mem_write_phy
@@ -332,32 +343,95 @@ class Debugger:
         self._instr_count -= 1
         self._console.print("[dim]已撤销上一条指令[/]")
 
+    def cmd_restart(self) -> None:
+        """重新运行当前加载的程序.
+
+        重置所有 hart 状态、CLINT、TLB, 重新加载固件到 RAM,
+        清除调试器快照与指令计数.
+        """
+        emu = self._emu
+        cfg = emu._cfg
+
+        # -- 重置 CLINT --
+        emu.clint._mtime = 0
+        for i in range(cfg.num_harts):
+            emu.clint._mtimecmp[i] = 0
+            emu.clint._msip[i] = 0
+
+        # -- 重建 harts (保证完全干净的初始状态) --
+        emu.harts = []
+        for i in range(cfg.num_harts):
+            h = Hart(id=i, pmp_entries=cfg.pmp_entries)
+            h.pc = cfg.reset_vector
+            inject_memory_backend(h, emu.bus.read, emu.bus.write)
+            h.bus = emu.bus
+            h.interrupt_ctrl = emu.clint
+            emu.harts.append(h)
+
+        # -- 重新加载固件 (覆写 RAM 中的程序代码) --
+        if self._image is not None:
+            emu.load_firmware(self._image)
+
+        # -- 清除调试器状态 --
+        self._snapshot = None
+        self._mem_changes = []
+        self._instr_count = 0
+        self._trap_displayed_mcause = None
+        self._disasm_next_addr = None
+        self._disasm_ref_pc = None
+        self._disasm_base_step = 0
+        self._disasm_past_terminator = False
+        self._stack_frames = []
+        self._current_frame_idx = 0
+        self._last_command = None
+
+        self._console.print(
+            f"[dim]已重启 — {cfg.num_harts} hart(s), "
+            f"PC = [yellow]{emu.harts[0].pc:#018x}[/][/]"
+        )
+
     # ==========================================================
     #  运行循环
     # ==========================================================
 
-    def _run_loop(self, steps: int | None = None) -> None:
+    def _run_loop(self, cycles: int | None = None) -> None:
+        """运行循环: 每个周期所有 hart 各执行一条指令 (round-robin).
+
+        多 hart 时通过 emu.step() 驱动全部 hart;
+        单 hart 时保持 step_one() 以支持快照/回滚.
+        """
         self._running = True
         self._paused = False
         self._terminated = False
         self._sigint_count = 0
         self._enter_run_mode()
 
+        multi = self._emu.num_harts > 1
+
         try:
             executed = 0
             while not self._terminated and not self._paused:
-                if steps is not None and executed >= steps:
+                if cycles is not None and executed >= cycles:
+                    break
+                if all(h._halted for h in self._emu.harts):
+                    self._warn("所有 Hart 已暂停")
                     break
                 if self.hart._halted:
-                    self._warn("Hart 进入不可恢复陷态, 已暂停运行")
+                    self._warn(f"Hart {self._hart_id} 进入不可恢复陷态, 已暂停运行")
                     break
-                self.step_one()
+                if multi:
+                    self._emu.step()
+                else:
+                    self.step_one()
+                self._instr_count += 1
                 executed += 1
             if self._terminated:
                 self._console.print("[dim]模拟循环已终止[/]")
         finally:
             self._running = False
             self._enter_repl_mode()
+            if self._emu.uart is not None:
+                self._emu.uart.flush_all()
 
     # ==========================================================
     #  格式化辅助
@@ -402,7 +476,7 @@ class Debugger:
 
     def cmd_run(self, n: int = 1) -> None:
         self._console.print(f"[dim]执行 {n} 条指令...[/]")
-        self._run_loop(steps=n)
+        self._run_loop(cycles=n)
 
     def cmd_regs(self) -> None:
         h = self.hart
@@ -458,20 +532,55 @@ class Debugger:
                 return r
         return None
 
-    def cmd_csr(self, name: str) -> None:
-        """读取 CSR: csr <name>."""
+    def cmd_csr(self, raw_args: str) -> None:
+        """读取 CSR.
+
+        csr <name>                  — 单个
+        csr <name1>, <name2>, ...   — 多个 (逗号分隔), 对齐显示
+        csr list                    — 列出所有可用 CSR 名称
+        """
         h = self.hart
-        if name == "list":
+
+        # "list" 子命令
+        if raw_args == "list":
             names = sorted(h.csrs.keys())
             self._console.print(f"可用 CSR: [dim]{', '.join(names)}[/]")
             return
-        if name not in h.csrs:
-            self._err(f"未知 CSR: {name} (用 'csr list' 查看可用列表)")
+
+        # 按逗号拆分, 过滤空白
+        wanted = [n.strip() for n in raw_args.split(",") if n.strip()]
+        if not wanted:
             return
-        csr = h.csrs[name]
-        self._console.print(
-            f"[cyan]{name}[/] = [green]{self._hex(csr.val)}[/] (dec: {csr.val})"
-        )
+
+        # 验证
+        for n in wanted:
+            if n in h.csrs:
+                continue
+            self._err(f"未知 CSR: {n} (用 'csr list' 查看可用列表)")
+            return
+
+        # 对齐宽度 = 最长名称
+        max_w = max(len(n) for n in wanted)
+
+        lines: list[str] = []
+        for n in wanted:
+            csr = h.csrs[n]
+            line = (
+                f"  [cyan]{n:<{max_w}}[/] = "
+                f"[green]{self._hex(csr.val)}[/]"
+                f" (dec: {csr.val})"
+            )
+            # mstatus / mstatush 附加当前特权级
+            if n == "mstatus":
+                line += f"  [dim]模式 [bold]{h.mode.name}[/][/]"
+            elif n == "mstatush":
+                line += f"  [dim]模式 [bold]{h.mode.name}[/][/]"
+            # mcause / scause 解码陷态原因
+            elif n in ("mcause", "scause"):
+                cause_str = self._trap_cause_name(csr.val)
+                line += f"  [dim]{cause_str}[/]"
+            lines.append(line)
+        self._console.print("\n".join(lines))
 
     @seize_val_err("无效值")
     def cmd_csrw(self, name: str, value: str) -> None:
@@ -523,7 +632,9 @@ class Debugger:
         else:
             raw_hex, asm = result
         lines = [
-            f"PC  = [bold yellow]{self._hex(pc)}[/]",
+            f"PC  = [bold yellow]{self._hex(pc)}[/]  "
+            f"[dim]模式 [bold cyan]{h.mode.name}[/][/]"
+            + ("  [dim]WFI等待[/]" if h._waiting else ""),
             f"Raw = [dim]{raw_hex}[/]",
             f"[bold green]  {asm}[/]",
         ]
@@ -690,13 +801,16 @@ class Debugger:
         preview = bytes(e.data[:16]).hex(" ")
         return meta + f"  data[:16]={preview}"
 
+    _DEFAULT_CACHE_LINES = 64
+
     @seize_val_err("set/way索引需要为整数")
     def cmd_cache(self, arg: str | None = None) -> None:
         """显示 L2 缓存状态.
 
-        cache             — 概览 (元数据 + 前 16 B 数据预览)
-        cache <set>       — 指定 set, 含完整 64 B hexdump
-        cache <set> <way> — 指定 set/way, 含完整 64 B hexdump
+        cache               — 概览 + 前 64 条 valid 行 (预览)
+        cache <set>         — 指定 set 全部 valid 行 + 完整 hexdump
+        cache <set> <way>   — 指定 set/way, 含完整 64 B hexdump
+        cache <start>-<end> — set 范围, 预览模式
         """
         l2 = self._emu.bus.l2
         if not isinstance(l2, L2Cache):
@@ -705,21 +819,33 @@ class Debugger:
 
         entries, ways, num_sets = l2.entries, l2.ways, l2.num_sets
 
-        # 解析 set[/way]
+        # ---- 解析参数 ----
         target_set, target_way = None, None
+        range_start, range_end = None, None  # 闭区间
+
         if arg is not None:
             parts = arg.split()
-            target_set = int(parts[0], 0)
-            if not (0 <= target_set < num_sets):
-                self._err(f"set 索引超出范围 [0, {num_sets - 1}]")
-                return
-            if len(parts) > 1:
-                target_way = int(parts[1], 0)
-                if not (0 <= target_way < ways):
-                    self._err(f"way 索引超出范围 [0, {ways - 1}]")
+            first = parts[0]
+            # 范围: <start>-<end>
+            if "-" in first and not first.startswith("-"):
+                a, _, b = first.partition("-")
+                range_start = int(a, 0)
+                range_end = int(b, 0)
+                if not (0 <= range_start <= range_end < num_sets):
+                    self._err(f"set 范围需在 [0, {num_sets - 1}] 内")
                     return
+            else:
+                target_set = int(first, 0)
+                if not (0 <= target_set < num_sets):
+                    self._err(f"set 索引超出范围 [0, {num_sets - 1}]")
+                    return
+                if len(parts) > 1:
+                    target_way = int(parts[1], 0)
+                    if not (0 <= target_way < ways):
+                        self._err(f"way 索引超出范围 [0, {ways - 1}]")
+                        return
 
-        # 统计
+        # ---- 统计 ----
         mesi_counts = Counter()
         valid_count = 0
         dirty_count = 0
@@ -743,10 +869,22 @@ class Debugger:
             )
         )
 
-        full_dump = target_set is not None
-        set_range = [target_set] if full_dump else range(num_sets)
+        # ---- 确定要扫描的 set 范围 ----
+        if range_start is not None and range_end is not None:
+            set_range = range(range_start, range_end + 1)
+            full_dump = False          # 范围模式: 紧凑预览
+            limit = None               # 不限条目数
+        elif target_set is not None:
+            set_range = [target_set]
+            full_dump = True           # 单 set 模式: 完整 hexdump
+            limit = None
+        else:
+            set_range = range(num_sets)
+            full_dump = False          # 默认模式: 紧凑预览
+            limit = self._DEFAULT_CACHE_LINES
 
-        lines = []
+        # ---- 收集行 ----
+        lines: list[str] = []
         for set_idx in set_range:
             for way_idx in range(ways):
                 if target_way is not None and way_idx != target_way:
@@ -755,11 +893,22 @@ class Debugger:
                 if not e.valid:
                     continue
                 lines.append(self._fmt_cache_line(e, set_idx, way_idx, full_dump))
+                if limit is not None and len(lines) >= limit:
+                    break
+            if limit is not None and len(lines) >= limit:
+                break
+
+        # 截断提示: 仅在设置了上限且确实有更多条目时显示
+        if limit is not None and len(lines) >= limit and valid_count > len(lines):
+            lines.append(
+                f"[dim]... 还有 {valid_count - len(lines)} 条 valid 行, "
+                f"用 'cache <start>-<end>' 查看范围[/]"
+            )
 
         if lines:
             self._console.print(header + "\n" + "\n".join(lines))
         else:
-            self._console.print(header)
+            self._console.print(header + "\n[dim](无 valid 行)[/]")
 
     # ----------------------------------------------------------
     #  satp / MMU
@@ -784,6 +933,45 @@ class Debugger:
             out.append(f"  根页表 PA = [yellow]0x{(ppn << 12):016x}[/]")
         self._console.print("\n".join(out))
 
+    @staticmethod
+    def _ctrl_flow_kind(instr: int) -> str:
+        """返回指令的控制流类型: 'term' (终止), 'branch' (条件分支), 'normal'.
+
+        仅当 *instr* 不是压缩指令时才准确; 压缩指令需先解码.
+        """
+        opcode = instr & 0x7F
+        # JAL / JALR — 无条件跳转 (含 call / j / ret / jr)
+        if opcode in (0b1101111, 0b1100111):
+            return "term"
+        # 条件分支
+        if opcode == 0b1100011:
+            return "branch"
+        # SYSTEM — 仅 ecall / ebreak / mret / sret 为终止
+        if opcode != 0b1110011:
+            return "normal"
+        funct3 = (instr >> 12) & 0x7
+        if funct3 != 0:
+            return "normal"
+        funct12 = (instr >> 20) & 0xFFF
+        if funct12 in (0x000, 0x001, 0x302, 0x102):
+            return "term"
+        return "normal"
+
+    @staticmethod
+    def _ctrl_flow_kind_compressed(instr16: int) -> str:
+        """压缩指令 (16-bit) 的控制流类型."""
+        quad = instr16 & 0x3
+        funct3 = (instr16 >> 13) & 0x7
+        if quad == 0b01:          # C1 象限
+            if funct3 in (0b001, 0b101):   # C.JAL, C.J
+                return "term"
+            if funct3 in (0b110, 0b111):   # C.BEQZ, C.BNEZ
+                return "branch"
+        elif quad == 0b10:        # C2 象限
+            if funct3 == 0b100:            # C.JR / C.JALR / C.EBREAK
+                return "term"
+        return "normal"
+
     @seize_val_err("addr 和 length 需为整数 (支持 0x 前缀)")
     def cmd_disasm(self, addr_str: str, length_str: str = "64") -> None:
         """反汇编指定内存区域.
@@ -791,7 +979,11 @@ class Debugger:
         disasm <addr> [length]  — 从 addr 开始反汇编 length 字节 (默认 64).
 
         自动识别 16-bit 压缩指令和 32-bit 标准指令边界,
-        按地址递增顺序逐条输出。
+        按地址递增顺序逐条输出。若 PC 落入范围内, 以 ``pc ->`` 标记
+        当前指令, 后续行以 ``+N`` 表示相对于 PC 的指令步数。
+        遇无条件跳转/ret/mret/sret/ecall 等控制流终止指令时
+        插入分隔线, 其后指令不再累加步数。
+        Enter 重复时自动推进地址并延续步数编号。
         """
         addr, length = int(addr_str, 0), int(length_str, 0)
 
@@ -804,50 +996,131 @@ class Debugger:
             self._err("无法读取指定地址")
             return
 
-        lines: list[str] = []
+        # ---- 判断是否为重复执行 (Enter 自动推进) ----
+        is_continue = (
+            self._disasm_ref_pc is not None
+            and addr == self._disasm_next_addr
+        )
+
+        # ---- 第一遍: 收集指令元组 (addr, raw_hex, asm, ctrl_kind) ----
+        instrs: list[tuple[int, str, str, str]] = []
         offset = 0
         max_offset = len(raw)
 
         while offset < max_offset:
-            pc = addr + offset
+            pc_addr = addr + offset
             remaining = max_offset - offset
 
-            # 至少需要 2 字节才能判断是否压缩指令
             chunk = raw[offset : offset + min(4, remaining)]
             instr = int.from_bytes(
                 chunk.ljust(4, b"\x00"), "little", signed=False
             )
 
-            # 低 2 位 ≠ 3 则为压缩指令 (16-bit)
-            if parse_compressed(instr):
-                inst_size = 2
-            else:
-                inst_size = 4
+            is_compressed = parse_compressed(instr)
+            inst_size = 2 if is_compressed else 4
 
             if remaining < inst_size:
-                # 剩余不足一条完整指令，hexdump 残部
                 leftover = raw[offset:]
                 hex_s = " ".join(f"{b:02x}" for b in leftover)
-                lines.append(f"  {self._hex(pc)}  {hex_s:<12s}  [dim](截断)[/]")
+                instrs.append((pc_addr, hex_s, "[dim](截断)[/]", "normal"))
                 break
 
-            asm = disasm(instr, pc)
+            asm = disasm(instr, pc_addr)
             raw_hex = " ".join(f"{b:02x}" for b in raw[offset:offset + inst_size])
-            lines.append(f"  {self._hex(pc)}  {raw_hex:<12s}  {asm}")
+            ctrl = (
+                self._ctrl_flow_kind_compressed(instr & 0xFFFF)
+                if is_compressed
+                else self._ctrl_flow_kind(instr)
+            )
+            instrs.append((pc_addr, raw_hex, asm, ctrl))
             offset += inst_size
 
-        # 记录末尾地址, 供下次重复时自动推进
         self._disasm_next_addr = addr + offset
 
-        if not lines:
+        if not instrs:
             self._console.print("[dim](空)[/]")
             return
 
+        # ---- 确定参照 PC 并计算 base_step ----
+        if not is_continue:
+            self._disasm_ref_pc = self.hart.pc
+            self._disasm_past_terminator = False
+
+            # 找到参照 PC 在本块内的位置
+            ref_idx: int | None = None
+            for i, (pc_addr, _, _, _) in enumerate(instrs):
+                if pc_addr == self._disasm_ref_pc:
+                    ref_idx = i
+                    break
+
+            if ref_idx is not None:
+                self._disasm_base_step = -ref_idx
+            elif addr > self._disasm_ref_pc:
+                self._disasm_base_step = self._count_instrs_between(
+                    self._disasm_ref_pc, addr
+                )
+            else:
+                self._disasm_base_step = -self._count_instrs_between(
+                    addr, self._disasm_ref_pc
+                )
+
+        # ---- 第二遍: 格式化, 含控制流感知 ----
+        ref_pc = self._disasm_ref_pc
+        base = self._disasm_base_step
+        past_term = self._disasm_past_terminator
+        next_base = base  # 累积可达指令步数
+
+        lines: list[str] = []
+        prefix_w = 5  # "pc ->" = 5 chars, 动态扩展
+
+        for i, (pc_addr, raw_hex, asm, ctrl) in enumerate(instrs):
+            step = base + i
+            at_ref = (pc_addr == ref_pc)
+
+            # 确定前缀
+            if at_ref:
+                prefix = "pc ->"
+            elif step > 0 and not past_term:
+                prefix = f"+{step}"
+                prefix_w = max(prefix_w, len(prefix))
+            else:
+                prefix = ""
+
+            lines.append(
+                f"  {prefix:<{prefix_w}}  "
+                f"{self._hex(pc_addr)}  {raw_hex:<12s}  {asm}"
+            )
+
+            # 遇终止指令: 插入分隔, 后续不再累加步数
+            if ctrl == "term" and not past_term and step >= 0:
+                past_term = True
+                lines.append(f"  {'─' * (prefix_w + 50)}")
+
+            # 更新累积步数 (仅可达指令)
+            if not past_term and step >= 0:
+                next_base = step + 1
+
+        self._disasm_base_step = next_base
+        self._disasm_past_terminator = past_term
+
         self._console.print(
             f"[bold]反汇编[/] [yellow]{self._hex(addr)}[/]"
-            f"  +{length} bytes  ({len(lines)} 条指令)\n"
+            f"  +{length} bytes  ({len(instrs)} 条指令)\n"
             + "\n".join(lines)
         )
+
+    def _count_instrs_between(self, start: int, end: int) -> int:
+        """计算从 *start* (含) 到 *end* (不含) 之间的指令条数."""
+        count = 0
+        addr = start
+        while addr < end:
+            raw = self._emu.bus.try_read(addr, 4)
+            if raw is None:
+                break
+            instr = int.from_bytes(raw, "little", signed=False)
+            addr += 2 if parse_compressed(instr) else 4
+            count += 1
+        return count
 
     @seize_val_err("addr 和 size 需为整数 (支持 0x 前缀)")
     def cmd_mem(self, addr_str: str, size_str: str = "64") -> None:
@@ -858,8 +1131,13 @@ class Debugger:
     def cmd_status(self) -> None:
         h = self.hart
         halted_note = " [red]已暂停 — 不可恢复陷态[/]" if h._halted else ""
+        instr_h = self._instr_count // 100
+        instr_rem = self._instr_count % 100
         tbl = Table(
-            title=f"Hart {self._hart_id}  指令计数: {self._instr_count}{halted_note}",
+            title=(
+                f"Hart {self._hart_id}  指令计数: {self._instr_count}"
+                f" ({instr_h}.{instr_rem:02d}h){halted_note}"
+            ),
             border_style="blue",
         )
         tbl.add_column("Field", style="cyan")
@@ -1001,17 +1279,18 @@ class Debugger:
         ]))
 
         # -- 当前帧栈内存 --
-        if self._current_frame_idx < len(self._stack_frames):
-            cur = self._stack_frames[self._current_frame_idx]
-            stack_data = self._emu.bus.try_read(cur.sp, 64)
-            if stack_data is None:
-                self._console.print("\n[dim](无法读取当前帧 SP 处内存)[/]")
-            else:
-                self._console.print(
-                    "\n" + "-" * 55 + "\n"
-                    "[bold]当前栈内存[/]\n"
-                    + fmt_hexdump(stack_data, addr=cur.sp)
-                )
+        if self._current_frame_idx >= len(self._stack_frames):
+            return
+        cur = self._stack_frames[self._current_frame_idx]
+        stack_data = self._emu.bus.try_read(cur.sp, 64)
+        if stack_data is None:
+            self._console.print("\n[dim](无法读取当前帧 SP 处内存)[/]")
+        else:
+            self._console.print(
+                "\n" + "-" * 55 + "\n"
+                "[bold]当前栈内存[/]\n"
+                + fmt_hexdump(stack_data, addr=cur.sp)
+            )
 
     def cmd_symbols(self, filter_str: str = "") -> None:
         """列出固件符号表, 支持可选的名称过滤."""
@@ -1052,6 +1331,8 @@ class Debugger:
         self._hart_id = hart_id
         self._snapshot = None
         self._mem_changes = []
+        if self._emu.uart is not None:
+            self._emu.uart.flush_all()
         self._console.print(f"[dim]切换到 Hart {hart_id}[/]")
 
     # ==========================================================
@@ -1081,6 +1362,9 @@ class Debugger:
         if cmd in ("undo", "rollback"):
             self.rollback()
             return True
+        if cmd == "restart":
+            self.cmd_restart()
+            return True
 
         # 寄存器
         if cmd in ("regs", "gpr"):
@@ -1102,9 +1386,14 @@ class Debugger:
         # CSR
         if cmd == "csr":
             if len(parts) < 2:
-                self._warn("用法: csr <name>  例: csr mstatus; csr list")
+                self._warn(
+                    "用法: csr <name>  或  csr <name1>, <name2>, ...\n"
+                    "  例: csr mstatus\n"
+                    "  例: csr mscratch, mepc, pmpcfg0, pmpaddr0\n"
+                    "  例: csr list"
+                )
             else:
-                self.cmd_csr(parts[1])
+                self.cmd_csr(" ".join(parts[1:]))
             return True
         if cmd == "csrw":
             if len(parts) < 3:
@@ -1254,13 +1543,14 @@ class Debugger:
 
         sections: list[Table] = [
             _section("执行控制", [
-                ("s, step [n]", "单步执行 n 条指令 (默认 1)"),
-                ("c, continue", "连续执行 (直到 Ctrl+C 暂停)"),
-                ("r, run [n]", "执行 n 条指令 (默认 1)"),
-                ("undo, rollback", "回滚上一条指令"),
+                ("s/step [n]", "单步执行 n 条指令 (默认 1)"),
+                ("c/continue", "连续执行 (直到 Ctrl+C 暂停)"),
+                ("r/run [n]", "执行 n 条指令 (默认 1)"),
+                ("undo/rollback", "回滚上一条指令"),
+                ("restart", "重置 hart/CLINT, 重新加载固件"),
             ]),
-            _section("寄存器 — 读", [
-                ("regs, gpr", "显示全部 GPR (x0–x31)"),
+            _section("读寄存器命令", [
+                ("regs/gpr", "显示全部 GPR (x0–x31)"),
                 ("reg <name>", "显示指定 GPR (例: reg a0, reg x10)"),
                 ("csr <name>", "显示指定 CSR (例: csr mstatus)"),
                 ("csr list", "列出所有可用 CSR 名称"),
@@ -1271,26 +1561,27 @@ class Debugger:
                 ("cache [set] [way]", "显示 L2 缓存状态及数据"),
                 ("satp", "显示 satp 解码 (MODE/ASID/PPN)"),
             ]),
-            _section("寄存器 — 写", [
-                ("set, w <name> <val>", "写入 GPR (例: set sp 0x8000)"),
+            _section("写寄存器命令", [
+                ("set/w <name> <val>", "写入 GPR (例: set sp 0x8000)"),
                 ("csrw <name> <val>", "写入 CSR (例: csrw mtvec 0x80000001)"),
                 ("pc <addr>", "设置 PC 并显示反汇编"),
             ]),
             _section("内存 & 符号", [
                 ("mem <addr> [size]", "hexdump 内存 (默认 64 字节)"),
                 ("disasm <addr> [len]", "反汇编内存区域 (默认 64 字节)"),
-                ("sym, symbols [filt]", "列出符号表 (可选过滤)"),
+                ("sym/symbols [filt]", "列出符号表 (可选过滤)"),
             ]),
             _section("状态", [
-                ("status, info", "显示 hart 状态摘要"),
-                ("stack, bt, frame, f", "栈帧回溯; frame N 切换到第 N 帧"),
+                ("status/info", "显示 hart 状态摘要"),
+                ("stack/bt", "栈帧情况"),
+                ("frame/f <N>", "切换到第 N 帧")
             ]),
             _section("配置", [
                 ("hart <id>", "切换活跃 hart"),
             ]),
             _section("其他", [
-                ("help, h, ?", "显示本帮助"),
-                ("quit, q, exit", "退出调试器"),
+                ("help/h/?", "显示本帮助"),
+                ("quit/q/exit", "退出调试器"),
             ]),
         ]
 

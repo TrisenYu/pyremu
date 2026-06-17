@@ -29,7 +29,7 @@ from pyremu.memory.bus import Device
 
 
 class UART(Device):
-    """SiFive 风格 UART 外设."""
+    """SiFive 风格 UART 外设 — 支持多 hart 行缓冲输出."""
 
     # 寄存器偏移
     REG_TXDATA = 0x00
@@ -48,7 +48,7 @@ class UART(Device):
         self,
         base: int = 0x1000_0000,
         size: int = 0x1000,
-        tx_callback=None,  # (int) -> None: 每发送一个字节时调用
+        tx_callback=None,  # (str) -> None: 每输出一行时调用 (含换行)
     ) -> None:
         self.base_addr = base
         self.size = size
@@ -64,6 +64,33 @@ class UART(Device):
         # 数据 buffer
         self._tx_buf: list[int] = []  # 已发送字节 (调试用)
         self._rx_buf: list[int] = []  # 待接收字节
+
+        # 多 hart 行缓冲: {hart_id: [bytes]}
+        self._line_bufs: dict[int, list[int]] = {}
+        self._current_writer: int | None = None
+
+    # ---- 多 hart 行缓冲 ----
+
+    def set_writer(self, hart_id: int) -> None:
+        """声明当前写者 hart (不刷新, 仅切换缓冲区)."""
+        self._current_writer = hart_id
+        if hart_id not in self._line_bufs:
+            self._line_bufs[hart_id] = []
+
+    def flush_all(self) -> None:
+        """刷新所有 hart 的未完成缓冲."""
+        for hid in list(self._line_bufs.keys()):
+            self._flush_hart(hid)
+
+    def _flush_hart(self, hart_id: int) -> None:
+        """将 hart_id 的缓冲字节拼接为行, 回调输出."""
+        buf = self._line_bufs.get(hart_id, [])
+        if not buf:
+            return
+        text = bytes(buf).decode("utf-8", errors="replace")
+        self._line_bufs[hart_id] = []
+        if self._tx_callback and text:
+            self._tx_callback(f"[hart {hart_id}] {text}")
 
     # ---- 公开方法 ----
 
@@ -126,8 +153,17 @@ class UART(Device):
         if offset == self.REG_TXDATA:
             val &= 0xFF
             self._tx_buf.append(val)
-            if self._tx_callback:
-                self._tx_callback(val)
+            # 多 hart 行缓冲: 按当前写者 hart 累积, 遇换行则刷新
+            if self._current_writer is not None:
+                hid = self._current_writer
+                if hid not in self._line_bufs:
+                    self._line_bufs[hid] = []
+                self._line_bufs[hid].append(val)
+                if val == 0x0A:  # '\n'
+                    self._flush_hart(hid)
+            elif self._tx_callback:
+                # 单 hart 兼容: 未设置写者时直接逐字节回调
+                self._tx_callback(chr(val))
             if self._txctrl & 1:  # TX 使能
                 self._ip |= self.IP_TXWM
             return

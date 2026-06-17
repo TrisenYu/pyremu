@@ -1259,3 +1259,140 @@ class TestDisasmCompressed:
         raw_hex, asm = result
         # 反汇编结果应标识为压缩指令 (low 2 bits != 3)
         assert raw_hex.startswith("01 00"), f"raw 首两字节应为压缩指令编码, 实际: {raw_hex}"
+
+
+# ============================================================
+#  L2 cache 显示命令
+# ============================================================
+
+
+class _CacheOutputCapture:
+    """捕获 Rich console 输出文本."""
+
+    def __init__(self, dbg):
+        self.lines: list[str] = []
+        self._orig = dbg._console.print
+
+        def _capture(*args, **kwargs):
+            import io
+            buf = io.StringIO()
+            dbg._console.file = buf
+            self._orig(*args, **kwargs)
+            dbg._console.file = __import__("sys").stdout
+            text = buf.getvalue()
+            self.lines.extend(text.split("\n"))
+
+        dbg._console.print = _capture
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
+def _make_dbg_with_l2(
+    num_sets=256, ways=4, line_size=64,
+) -> Debugger:
+    """构造带可配置 L2 缓存的 Debugger."""
+    from pyremu.memory.l2cache import L2Cache
+    from pyremu.platform import PlatformConfig
+
+    cfg = PlatformConfig(num_harts=1, ram_size=128 * 1024 * 1024)
+    emu = Emulator(cfg)
+    # 替换 L2 为可配置大小 (直接设 _l2 绕过只读 property)
+    l2 = L2Cache(size=num_sets * ways * line_size, line_size=line_size, ways=ways)
+    emu.bus._l2 = l2
+    l2.set_ram_backend(emu.bus._ram_read_direct, emu.bus._ram_write_direct)
+    dbg = Debugger(emulator=emu, hart_id=0)
+    return dbg
+
+
+class TestCacheDisplay:
+    """cmd_cache 输出格式测试."""
+
+    def test_no_args_shows_header(self):
+        """cache 无参数 → 显示统计概览头."""
+        dbg = _make_dbg_with_l2()
+        cap = _CacheOutputCapture(dbg)
+        dbg.cmd_cache()
+        text = cap.text()
+        assert "L2 Cache" in text
+        assert "valid" in text
+        assert "MESI" in text
+        assert "hit_rate" in text
+
+    def test_no_args_shows_up_to_64_entries(self):
+        """默认显示最多 64 条 valid 行 (预览格式: data[:16])."""
+        dbg = _make_dbg_with_l2(num_sets=128, ways=2)
+        # 预填一些数据产生 valid 行
+        for i in range(80):
+            dbg._emu.bus.l2.read(i * 64, 4)
+        cap = _CacheOutputCapture(dbg)
+        dbg.cmd_cache()
+        text = cap.text()
+        # 应有 64 条 (或实际 valid 行数) + 截断提示
+        assert "data[:16]" in text, "预览模式应含 data[:16]"
+        assert "还有" in text, "超过 64 条时应有截断提示"
+
+    def test_less_than_64_shows_all_no_truncation(self):
+        """不足 64 条 valid → 全部显示, 无截断提示."""
+        dbg = _make_dbg_with_l2(num_sets=128, ways=2)
+        for i in range(10):
+            dbg._emu.bus.l2.read(i * 64, 4)
+        cap = _CacheOutputCapture(dbg)
+        dbg.cmd_cache()
+        text = cap.text()
+        assert "还有" not in text, "不足 64 条不应有截断提示"
+
+    def test_single_set_shows_full_hexdump(self):
+        """cache <set> → 完整 64B hexdump."""
+        dbg = _make_dbg_with_l2()
+        # 读 addr 0 → 填充 set 0
+        dbg._emu.bus.l2.read(0, 8)
+        cap = _CacheOutputCapture(dbg)
+        dbg.cmd_cache("0")
+        text = cap.text()
+        assert "data[:16]" not in text, "单 set 模式应为完整 hexdump, 不应含 data[:16]"
+
+    def test_range_shows_preview_format(self):
+        """cache <start>-<end> → 范围预览模式."""
+        dbg = _make_dbg_with_l2(num_sets=128, ways=2)
+        for i in range(30):
+            dbg._emu.bus.l2.read(i * 64, 4)
+        cap = _CacheOutputCapture(dbg)
+        dbg.cmd_cache("0-4")
+        text = cap.text()
+        assert "data[:16]" in text, "范围模式应为预览格式"
+        # 不应有截断提示 (范围模式不限条目数)
+        assert "还有" not in text
+
+    def test_invalid_set_index(self):
+        """非法 set 索引 → 错误信息."""
+        dbg = _make_dbg_with_l2(num_sets=16, ways=2)
+        cap = _CacheOutputCapture(dbg)
+        dbg.cmd_cache("99")
+        text = cap.text()
+        assert "超出范围" in text or "set" in text.lower()
+
+    def test_invalid_range(self):
+        """非法范围 → 错误信息."""
+        dbg = _make_dbg_with_l2(num_sets=16, ways=2)
+        cap = _CacheOutputCapture(dbg)
+        dbg.cmd_cache("10-99")
+        text = cap.text()
+        assert "超出范围" in text or "set" in text.lower()
+
+    def test_empty_cache(self):
+        """空缓存 → 无 valid 行提示."""
+        dbg = _make_dbg_with_l2()
+        cap = _CacheOutputCapture(dbg)
+        dbg.cmd_cache()
+        text = cap.text()
+        assert "无 valid 行" in text
+
+    def test_set_with_no_valid_lines(self):
+        """指定 set 但该组无 valid 行."""
+        dbg = _make_dbg_with_l2()
+        # 不填充任何数据, 直接查某个 set
+        cap = _CacheOutputCapture(dbg)
+        dbg.cmd_cache("5")
+        text = cap.text()
+        assert "无 valid 行" in text

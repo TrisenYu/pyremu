@@ -283,6 +283,9 @@ copy_gprs_from_pcb:
 
 // ============================================================
 //  setup_sv39 — identity 映射 (代码/数据/UART + 多进程 U 栈)
+//
+//  页表层级均以 page_tables 符号的实际地址为基准计算 PPN,
+//  不再硬编码地址, 适应不同链接布局.
 // ============================================================
 setup_sv39:
     addi sp, sp, -32
@@ -292,28 +295,56 @@ setup_sv39:
 
     la   s0, page_tables
 
-    // L1[2] → L2_hi (VPN[2]=2)
-    li   t0, 0x0000000040001401
+    // s1 = PPN of page_tables (symbol address >> 12)
+    srli s1, s0, 12
+
+    // --- 构建指针 PTE 的辅助宏 (手动展开) ---
+    //   对 PPN = base + k (flag=0x01): PTE = 0x40000001 | (((base + k) & 0x1FF) << 10)
+    //   注: 当前布局下 PPN[1]=0, PPN[2]=2, 故可简化为上述公式.
+
+    // L1[2] → L2_hi (PPN = base + 1)
+    addi t0, s1, 1
+    andi t0, t0, 0x1FF
+    slli t0, t0, 10
+    li   t1, 0x40000001
+    or   t0, t0, t1
     sd   t0, 16(s0)
-    // L1[0] → L2_lo (VPN[2]=0)
-    li   t0, 0x0000000040001801
+
+    // L1[0] → L2_lo (PPN = base + 2)
+    addi t0, s1, 2
+    andi t0, t0, 0x1FF
+    slli t0, t0, 10
+    li   t1, 0x40000001
+    or   t0, t0, t1
     sd   t0, 0(s0)
 
-    // L2_hi[0] → L3_main
-    li   t0, 0x1000
-    add  s1, s0, t0
-    li   t0, 0x0000000040001c01
-    sd   t0, 0(s1)
+    // L2_hi[0] → L3_main (PPN = base + 3)
+    li   t2, 0x1000
+    add  t2, s0, t2             // t2 = &L2_hi[0] (写目标)
+    addi t0, s1, 3
+    andi t0, t0, 0x1FF
+    slli t0, t0, 10
+    li   t1, 0x40000001
+    or   t0, t0, t1
+    sd   t0, 0(t2)
 
-    // L2_lo[128] → L3_uart (VPN[1]=128, VA 0x10000000)
-    li   t0, 0x2000
-    add  s1, s0, t0
-    li   t0, 0x0000000040002001
-    sd   t0, 1024(s1)
+    // L2_lo[128] → L3_uart (PPN = base + 4)
+    li   t2, 0x2000
+    add  t2, s0, t2             // t2 = &L2_lo
+    addi t0, s1, 4
+    andi t0, t0, 0x1FF
+    slli t0, t0, 10
+    li   t1, 0x40000001
+    or   t0, t0, t1
+    sd   t0, 1024(t2)
 
-    // L2_lo[16] → L3_clint (VPN[1]=16, VA 0x02000000)
-    li   t0, 0x0000000040002401   // V=1, PPN=0x80008 (page_tables+0x5000)
-    sd   t0, 128(s1)
+    // L2_lo[16] → L3_clint (PPN = base + 5)
+    addi t0, s1, 5
+    andi t0, t0, 0x1FF
+    slli t0, t0, 10
+    li   t1, 0x40000001
+    or   t0, t0, t1
+    sd   t0, 128(t2)
 
     // L3_main: 16 页 identity (代码/数据/BSS)
     li   t0, 0x3000
@@ -369,10 +400,13 @@ setup_sv39:
     addi t1, t1, -1
     bnez t1, 1b
 
-    // satp
+    // satp: MODE=Sv39 (8), PPN 从 page_tables 运行时地址重新计算
+    // (注: s1 已被后续循环覆盖, 此处基于 s0 重新导出 PPN)
     li   t0, 8
     slli t0, t0, 60
-    li   t1, 0x80004
+    srli t1, s0, 12             // t1 = PPN of page_tables
+    li   t2, (1 << 44) - 1
+    and  t1, t1, t2
     or   t0, t0, t1
     csrw satp, t0
     sfence.vma zero, zero
