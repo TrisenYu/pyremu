@@ -106,6 +106,30 @@ class StackFrame:
 
 
 # ============================================================
+#  断点
+# ============================================================
+
+
+@dataclass
+class _Breakpoint:
+    """断点 — 地址 / 指令类型 / opcode."""
+
+    kind: str  # "addr" | "instr" | "opcode"
+    value: int  # address, funct12, or 7-bit opcode
+    desc: str  # human-readable (e.g. "0x80001000", "ecall", "opcode 0x73")
+
+
+# 可命名的指令断点 — 与 handle_sys / _PRIV_MNEMONIC 一致
+_INSTR_BP_NAMES: dict[str, int] = {
+    "ecall": 0x000,
+    "ebreak": 0x001,
+    "mret": 0x302,
+    "sret": 0x102,
+    "wfi": 0x105,
+}
+
+
+# ============================================================
 #  交互式调试器
 # ============================================================
 
@@ -153,6 +177,9 @@ class Debugger:
         self._disasm_base_step: int = 0
         self._disasm_past_terminator: bool = False
 
+        # 断点
+        self._breakpoints: list[_Breakpoint] = []
+
         # 最近的栈回溯帧列表 (供 frame N 选择)
         self._stack_frames: list[StackFrame] = []
         self._current_frame_idx: int = 0
@@ -180,6 +207,7 @@ class Debugger:
             # 执行控制
             "s", "step", "c", "continue", "r", "run",
             "undo", "rollback", "restart",
+            "b", "bp",
             # 寄存器 / CSR 操作
             "regs", "gpr", "reg", "set", "w",
             "csr", "csrw",
@@ -242,6 +270,60 @@ class Debugger:
         signal.signal(signal.SIGINT, self._sigint_run)
 
     # ==========================================================
+    #  断点检查
+    # ==========================================================
+
+    def _check_breakpoints(self, hart, pc: int, instr: int) -> bool:
+        """若当前指令/地址命中任何断点, 暂停并返回 True.
+
+        在指令执行前调用, 匹配地址/指令类型/opcode 断点.
+        命中时打印断点信息并设置 ``_paused=True``.
+        """
+        if not self._breakpoints:
+            return False
+
+        for bp in self._breakpoints:
+            hit = False
+            if bp.kind == "addr":
+                hit = (pc == bp.value)
+            elif bp.kind == "instr":
+                opcode = instr & 0x7F
+                funct3 = (instr >> 12) & 0x7
+                funct12 = (instr >> 20) & 0xFFF
+                hit = (opcode == 0x73 and funct3 == 0 and funct12 == bp.value)
+            elif bp.kind == "opcode":
+                hit = ((instr & 0x7F) == bp.value)
+
+            if not hit:
+                continue
+
+            self._console.print(
+                f"  [bold yellow]● 断点命中[/]  {bp.desc}  "
+                f"@ {self._hex(pc)}"
+            )
+            self._paused = True
+            return True
+
+        return False
+
+    def _check_multi_hart_bp(self) -> None:
+        """多 hart 执行后检查地址断点.
+
+        在 ``emu.step()`` 之后调用, 遍历所有 hart 检查 PC 是否命中
+        地址型断点. 指令/opcode 型断点在此场景不可用 (指令已执行).
+        """
+        for h in self._emu.harts:
+            for bp in self._breakpoints:
+                if bp.kind != "addr" or h.pc != bp.value:
+                    continue
+                self._console.print(
+                    f"  [bold yellow]● 断点命中[/]  {bp.desc}  "
+                    f"@ [cyan]Hart {h.id}[/]  {self._hex(h.pc)}"
+                )
+                self._paused = True
+                return
+
+    # ==========================================================
     #  快照 & 回滚
     # ==========================================================
 
@@ -294,6 +376,11 @@ class Debugger:
             pc_before = h.pc
             instr_bytes = self._emu.bus.read(h.pc, 4)
             instr = int.from_bytes(instr_bytes, "little", signed=False)
+
+            # 断点检查 — 命中时跳过执行, 直接返回 REPL
+            if self._check_breakpoints(h, pc_before, instr):
+                return
+
             try:
                 advance = h.exec_instr(instr)
             except NotImplementedError:
@@ -342,6 +429,107 @@ class Debugger:
         self._mem_changes = []
         self._instr_count -= 1
         self._console.print("[dim]已撤销上一条指令[/]")
+
+    # ==========================================================
+    #  断点命令
+    # ==========================================================
+
+    def cmd_bp_set(self, arg: str) -> None:
+        """设置断点: bp <addr> | bp ecall|ebreak|mret|sret|wfi."""
+        # 尝试解析为地址
+        try:
+            addr = int(arg, 0)
+            bp = _Breakpoint(kind="addr", value=addr, desc=self._hex(addr))
+            self._breakpoints.append(bp)
+            self._console.print(
+                f"  [green]断点 {len(self._breakpoints)}[/]  "
+                f"[yellow]{self._hex(addr)}[/]"
+            )
+            return
+        except ValueError:
+            pass
+
+        # 尝试匹配命名指令
+        name = arg.lower()
+        if name in _INSTR_BP_NAMES:
+            bp = _Breakpoint(
+                kind="instr", value=_INSTR_BP_NAMES[name], desc=name,
+            )
+            self._breakpoints.append(bp)
+            self._console.print(
+                f"  [green]断点 {len(self._breakpoints)}[/]  "
+                f"[yellow]{name}[/]"
+            )
+            return
+
+        self._err(f"无法识别的断点参数: {arg}")
+
+    @seize_val_err("opcode 需为十六进制整数 (支持 0x 前缀)")
+    def cmd_bp_opcode(self, arg: str) -> None:
+        """设置 opcode 断点: bp opcode <hex>."""
+        val = int(arg, 0) & 0x7F
+        bp = _Breakpoint(
+            kind="opcode", value=val, desc=f"opcode 0x{val:02x}",
+        )
+        self._breakpoints.append(bp)
+        self._console.print(
+            f"  [green]断点 {len(self._breakpoints)}[/]  "
+            f"[yellow]opcode 0x{val:02x}[/]"
+        )
+
+    def cmd_bp_list(self) -> None:
+        """列出所有断点."""
+        if not self._breakpoints:
+            self._console.print("  [dim](无断点)[/]")
+            return
+        tbl = Table(title="断点列表", border_style="blue")
+        tbl.add_column("#", style="cyan", justify="right")
+        tbl.add_column("类型", style="yellow")
+        tbl.add_column("值", style="green")
+        for i, bp in enumerate(self._breakpoints, 1):
+            tbl.add_row(str(i), bp.kind, bp.desc)
+        self._console.print(tbl)
+
+    @seize_val_err("断点编号需为整数")
+    def cmd_bp_delete(self, idx_str: str) -> None:
+        """删除断点: bp delete <n> (1-based)."""
+        idx = int(idx_str, 0) - 1
+        if idx < 0 or idx >= len(self._breakpoints):
+            self._err(f"断点编号超出范围: {idx_str} (当前 {len(self._breakpoints)} 个)")
+            return
+        removed = self._breakpoints.pop(idx)
+        self._console.print(
+            f"  [dim]已删除断点 [yellow]{removed.desc}[/][/]"
+        )
+
+    def cmd_bp_clear(self) -> None:
+        """清除全部断点."""
+        count = len(self._breakpoints)
+        self._breakpoints.clear()
+        self._console.print(f"  [dim]已清除 {count} 个断点[/]")
+
+    def _dispatch_bp(self, rest: list[str]) -> None:
+        """bp 命令子分发: 将无歧义的子命令名路由到对应 handler."""
+        if not rest:
+            self.cmd_bp_list()
+            return
+        sub = rest[0].lower()
+        if sub == "list":
+            self.cmd_bp_list()
+        elif sub == "delete":
+            if len(rest) > 1:
+                self.cmd_bp_delete(rest[1])
+            else:
+                self._warn("用法: bp delete <编号>")
+        elif sub == "clear":
+            self.cmd_bp_clear()
+        elif sub == "opcode":
+            if len(rest) > 1:
+                self.cmd_bp_opcode(rest[1])
+            else:
+                self._warn("用法: bp opcode <hex>")
+        else:
+            self.cmd_bp_set(rest[0])
 
     def cmd_restart(self) -> None:
         """重新运行当前加载的程序.
@@ -421,6 +609,7 @@ class Debugger:
                     break
                 if multi:
                     self._emu.step()
+                    self._check_multi_hart_bp()
                 else:
                     self.step_one()
                 self._instr_count += 1
@@ -847,8 +1036,7 @@ class Debugger:
 
         # ---- 统计 ----
         mesi_counts = Counter()
-        valid_count = 0
-        dirty_count = 0
+        valid_count, dirty_count = 0, 0
         for e in entries:
             if not e.valid:
                 continue
@@ -991,6 +1179,19 @@ class Debugger:
             self._err("length 需在 1–4096 之间")
             return
 
+        if addr < 0 or addr >= (1 << 64):
+            self._err("addr 超出 RV64 物理地址范围 [0, 2^64)")
+            return
+
+        # 非 2-字节对齐: RISC-V 指令至少 16-bit 对齐, 奇数地址解码毫无意义
+        if addr & 1:
+            orig = addr
+            addr &= ~1
+            self._warn(
+                f"addr 应为 2-字节对齐, "
+                f"已从 0x{orig:016x} 对齐到 0x{addr:016x}"
+            )
+
         raw = self._emu.bus.try_read(addr, length)
         if raw is None:
             self._err("无法读取指定地址")
@@ -1056,13 +1257,19 @@ class Debugger:
             if ref_idx is not None:
                 self._disasm_base_step = -ref_idx
             elif addr > self._disasm_ref_pc:
-                self._disasm_base_step = self._count_instrs_between(
+                step_cnt = self._count_instrs_between(
                     self._disasm_ref_pc, addr
                 )
+                self._disasm_base_step = step_cnt
+                if step_cnt >= self._MAX_INSTR_COUNT:
+                    self._disasm_past_terminator = True  # 区间过大, 禁用步数
             else:
-                self._disasm_base_step = -self._count_instrs_between(
+                step_cnt = self._count_instrs_between(
                     addr, self._disasm_ref_pc
                 )
+                self._disasm_base_step = -step_cnt
+                if step_cnt >= self._MAX_INSTR_COUNT:
+                    self._disasm_past_terminator = True
 
         # ---- 第二遍: 格式化, 含控制流感知 ----
         ref_pc = self._disasm_ref_pc
@@ -1096,8 +1303,10 @@ class Debugger:
                 past_term = True
                 lines.append(f"  {'─' * (prefix_w + 50)}")
 
-            # 更新累积步数 (仅可达指令)
-            if not past_term and step >= 0:
+            # 更新累积步数 — 正负步数均推进, 使 next_base 逐步趋近 0
+            # (此前仅 step>=0 时推进, 导致 ref_pc 之前的所有 Enter 重复
+            #  都卡在同一负基数上, 抵达 ref_pc 后也无法显示 +N.)
+            if not past_term:
                 next_base = step + 1
 
         self._disasm_base_step = next_base
@@ -1109,12 +1318,26 @@ class Debugger:
             + "\n".join(lines)
         )
 
+    _MAX_INSTR_COUNT = 100_000  # 指令条数上限, 超界视为不可达
+
     def _count_instrs_between(self, start: int, end: int) -> int:
-        """计算从 *start* (含) 到 *end* (不含) 之间的指令条数."""
+        """计算从 *start* (含) 到 *end* (不含) 之间的指令条数.
+
+        *start* 必须在 RAM 区域内 (指令仅存在于 RAM);
+        若 *start* 不在 RAM 中或区间遍历超过 _MAX_INSTR_COUNT 条,
+        返回该上限值, 调用方应将其视为不可达区间.
+        """
+        # 非 RAM 地址 (MMIO / 空洞) 不含指令, 直接返回不可达
+        bus = self._emu.bus
+        if not bus.is_ram_addr(start):
+            return self._MAX_INSTR_COUNT
+
         count = 0
         addr = start
         while addr < end:
-            raw = self._emu.bus.try_read(addr, 4)
+            if count >= self._MAX_INSTR_COUNT:
+                return count
+            raw = bus.try_read(addr, 4)
             if raw is None:
                 break
             instr = int.from_bytes(raw, "little", signed=False)
@@ -1125,6 +1348,12 @@ class Debugger:
     @seize_val_err("addr 和 size 需为整数 (支持 0x 前缀)")
     def cmd_mem(self, addr_str: str, size_str: str = "64") -> None:
         addr, size = int(addr_str, 0), int(size_str, 0)
+        if size <= 0 or size > 4096:
+            self._err("size 需在 1–4096 之间")
+            return
+        if addr < 0 or addr >= (1 << 64):
+            self._err("addr 超出 RV64 物理地址范围 [0, 2^64)")
+            return
         dump = self._emu.mem_hexdump(addr, size)
         self._console.print(dump)
 
@@ -1348,6 +1577,9 @@ class Debugger:
             return False
 
         # 执行控制
+        if cmd in ("b", "bp"):
+            self._dispatch_bp(parts[1:])
+            return True
         if cmd in ("s", "step"):
             count = int(parts[1]) if len(parts) > 1 else 1
             self.cmd_step(count)
@@ -1548,6 +1780,12 @@ class Debugger:
                 ("r/run [n]", "执行 n 条指令 (默认 1)"),
                 ("undo/rollback", "回滚上一条指令"),
                 ("restart", "重置 hart/CLINT, 重新加载固件"),
+                ("b/bp <addr>", "在指定地址设置断点"),
+                ("b/bp ecall|ebreak|mret|sret|wfi", "在指定指令类型设置断点"),
+                ("b/bp opcode <hex>", "在指定 opcode 设置断点 (如 0x73)"),
+                ("b/bp|bp list", "列出所有断点"),
+                ("bp delete <n>", "删除编号为 n 的断点"),
+                ("bp clear", "清除全部断点"),
             ]),
             _section("读寄存器命令", [
                 ("regs/gpr", "显示全部 GPR (x0–x31)"),
@@ -1611,7 +1849,7 @@ def main(args: list[str] | None = None) -> None:
         help="raw binary 的加载基址 (ELF/PE 时忽略, 默认 0x80000000)",
     )
     parser.add_argument(
-        "--reset-vector", type=lambda x: int(x, 0), default=0x10000000,
+        "--reset-vector", type=lambda x: int(x, 0), default=0x8000_0000,
         help="复位向量地址 (默认 0x10000000)",
     )
     parser.add_argument("--harts", type=int, default=1, help="hart 数量 (默认 1)")

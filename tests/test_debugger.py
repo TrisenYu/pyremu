@@ -191,15 +191,17 @@ class TestDebuggerInit:
     def test_build_completer_includes_commands_and_regs(self):
         dbg = _make_dbg()
         c = dbg._build_completer()
+        # WordCompleter.words 是 Sequence[str] | (() -> Sequence[str]) 联合类型
+        words = c.words() if callable(c.words) else c.words
         # 包含命令
         for cmd in ["step", "continue", "regs", "pc", "quit", "help"]:
-            assert cmd in c.words, f"缺少命令: {cmd}"
+            assert cmd in words, f"缺少命令: {cmd}"
         # 包含 GPR ABI 名称
         for abi in ["zero", "ra", "sp", "t0", "a0", "s0"]:
-            assert abi in c.words, f"缺少 GPR: {abi}"
+            assert abi in words, f"缺少 GPR: {abi}"
         # 包含 CSR 名称
         for csr in ["mstatus", "mtvec", "mepc", "mcause"]:
-            assert csr in c.words, f"缺少 CSR: {csr}"
+            assert csr in words, f"缺少 CSR: {csr}"
 
 
 # ============================================================
@@ -627,6 +629,14 @@ class TestCmdMem:
         dbg = _make_dbg()
         dbg.cmd_mem("0x1000", "bad")
 
+    def test_mem_negative_addr(self):
+        dbg = _make_dbg()
+        dbg.cmd_mem("-1")
+
+    def test_mem_addr_overflow(self):
+        dbg = _make_dbg()
+        dbg.cmd_mem("1234567890123456789012345789")
+
 
 class TestCmdDisasm:
     """反汇编显示."""
@@ -644,6 +654,14 @@ class TestCmdDisasm:
         dbg = _make_dbg()
         dbg.cmd_disasm("bad")
 
+    def test_disasm_negative_addr(self):
+        dbg = _make_dbg()
+        dbg.cmd_disasm("-1")
+
+    def test_disasm_addr_overflow(self):
+        dbg = _make_dbg()
+        dbg.cmd_disasm("1234567890123456789012345789")
+
     def test_disasm_sets_next_addr(self):
         dbg = _make_dbg()
         dbg._disasm_next_addr = None
@@ -653,6 +671,96 @@ class TestCmdDisasm:
     def test_disasm_zero_length(self):
         dbg = _make_dbg()
         dbg.cmd_disasm("0x1000", "0")  # 报错
+
+    def test_count_instrs_non_ram_addr_returns_limit(self):
+        """非 RAM 地址 (MMIO/空洞) 直接返回上限值, 不做遍历."""
+        dbg = _make_dbg()
+        # 0x10000000 是 UART MMIO, 不在 RAM 范围内
+        result = dbg._count_instrs_between(0x10000000, 0x10000100)
+        assert result >= dbg._MAX_INSTR_COUNT, (
+            f"非 RAM 起始地址应返回上限值, 实际 {result}"
+        )
+
+    def test_count_instrs_iteration_limit(self):
+        """超过 _MAX_INSTR_COUNT 条指令后停止遍历."""
+        dbg = _make_dbg(ram_size=0x200000)  # 2 MiB RAM
+        # RAM 范围内的大区间, 遍历因条目数超限而截断
+        ram_base = dbg._emu.bus.ram_base
+        result = dbg._count_instrs_between(ram_base, ram_base + 0x100000)
+        assert result <= dbg._MAX_INSTR_COUNT, (
+            f"指令数不应超过 {dbg._MAX_INSTR_COUNT}, 实际 {result}"
+        )
+
+    def test_disasm_far_from_ref_no_hang(self):
+        """ref_pc 与 disasm 地址相距甚远时不挂死, 且禁用步数."""
+        dbg = _make_dbg()
+        dbg._disasm_ref_pc = 0x80000000   # kernel 入口
+        dbg._disasm_past_terminator = False
+        dbg.cmd_disasm("0x10000000", "32")  # UART 地址 — 远在 ref_pc 之上
+        # 不应挂死 — 到达这里即通过
+        assert dbg._disasm_past_terminator is True, (
+            "大跨距应触发 past_terminator 禁用 +N 步数"
+        )
+
+    def test_count_instrs_empty_range(self):
+        """start >= end 时返回 0."""
+        dbg = _make_dbg()
+        assert dbg._count_instrs_between(0x80001000, 0x80001000) == 0
+        assert dbg._count_instrs_between(0x80002000, 0x80001000) == 0
+
+    def test_disasm_step_accumulates_through_negative(self):
+        """Enter 重复时负步数也累积推进, 抵达 ref_pc 后正确显示 +N."""
+        dbg = _make_dbg()
+        # 将 hart PC 设在较远处, 从 ref_pc 之前开始 disasm
+        dbg.hart.pc = 0x80001000
+        dbg._disasm_past_terminator = False
+
+        # 第一段: ref_pc 之前, 写入 4 条 nop
+        for off in range(0, 16, 4):
+            dbg._emu.bus.write(0x80000FF0 + off, b"\x13\x00\x00\x00")
+        dbg.cmd_disasm("0x80000ff0", "16")
+        step_after_first = dbg._disasm_base_step
+        # 4 条 nop 之后步数到达 ref_pc, next_base 应为 0
+        assert step_after_first <= 0, (
+            f"ref_pc 之前 base_step 应 ≤0, 实际 {step_after_first}"
+        )
+
+        # 模拟 Enter 重复: 推进到 ref_pc 所在块
+        dbg._disasm_next_addr = 0x80001000
+        dbg._emu.bus.write(0x80001000, b"\x13\x00\x00\x00" * 4)
+        dbg.cmd_disasm(hex(dbg._disasm_next_addr), "16")
+        step_after_second = dbg._disasm_base_step
+        # Enter 重复后, ref_pc 已过, 步数应为正
+        assert step_after_second > 0, (
+            f"过 ref_pc 后 base_step 应为正, 实际 {step_after_second}"
+        )
+        # past_terminator 不应被误触发
+        assert dbg._disasm_past_terminator is False, (
+            "非终止指令不应设置 past_terminator"
+        )
+
+    def test_disasm_odd_addr_auto_aligns(self):
+        """非 2-字节对齐地址自动向下对齐并警告."""
+        dbg = _make_dbg()
+        # 写入已知指令以便反汇编
+        dbg._emu.bus.write(0x80000FF0, b"\x13\x00\x00\x00" * 4)
+        # 奇数地址
+        dbg.cmd_disasm("0x80000ff1", "16")
+        # 不应挂死, 且 _disasm_next_addr 应从对齐后的地址计算
+        # (没有异常即通过)
+        assert dbg._disasm_next_addr is not None
+        # 对齐后应从 0x80000FF0 开始, next_addr ≥ 0x80000FF0 + 4*nop
+        assert dbg._disasm_next_addr >= 0x80000FF0 + 4, (
+            f"应从对齐地址开始反汇编, next_addr=0x{dbg._disasm_next_addr:x}"
+        )
+
+    def test_disasm_aligned_addr_no_warning(self):
+        """对齐地址不应触发警告."""
+        dbg = _make_dbg()
+        dbg._emu.bus.write(0x80001000, b"\x13\x00\x00\x00" * 4)
+        dbg.cmd_disasm("0x80001000", "16")
+        # 正常完成
+        assert dbg._disasm_next_addr is not None
 
 
 # ============================================================
@@ -761,6 +869,188 @@ class TestCmdHart:
 # ============================================================
 #  命令分发
 # ============================================================
+
+
+# ============================================================
+#  断点命令
+# ============================================================
+
+
+class _BpOutputCapture:
+    """捕获断点相关 Rich 输出."""
+
+    def __init__(self, dbg) -> None:
+        self._dbg = dbg
+        self.lines: list[str] = []
+
+    def __enter__(self):
+        self._dbg._console.file = self
+        return self
+
+    def write(self, s: str, **_) -> None:
+        self.lines.append(s)
+
+    def __exit__(self, *_) -> None:
+        self._dbg._console.file = sys.stderr
+
+    def text(self) -> str:
+        return "".join(self.lines)
+
+
+class TestCmdBreakpoint:
+    """断点设置、查询、命中."""
+
+    # -- 地址断点 --
+
+    def test_set_addr_bp(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("0x80000000")
+        assert len(dbg._breakpoints) == 1
+        bp = dbg._breakpoints[0]
+        assert bp.kind == "addr"
+        assert bp.value == 0x80000000
+
+    def test_addr_bp_hit_in_step_one(self):
+        dbg = _make_dbg()
+        dbg.hart.pc = 0x1000  # 此处有 NOP (来自 _make_dbg)
+        dbg.cmd_bp_set("0x1000")
+        # 断点命中应阻止执行, 且设置 _paused
+        dbg.step_one()
+        assert dbg._paused
+        # PC 不应推进 (断点在指令执行前命中)
+        assert dbg.hart.pc == 0x1000
+
+    def test_addr_bp_miss_in_step_one(self):
+        dbg = _make_dbg()
+        dbg.hart.pc = 0x1000
+        dbg.cmd_bp_set("0x80000000")  # 不匹配
+        dbg.step_one()
+        assert not dbg._paused
+        # PC 应已推进
+        assert dbg.hart.pc != 0x1000
+
+    # -- 指令断点 --
+
+    def test_set_instr_bp_ecall(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("ecall")
+        bp = dbg._breakpoints[0]
+        assert bp.kind == "instr"
+        assert bp.value == 0x000  # ECALL funct12
+
+    def test_set_instr_bp_ebreak(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("ebreak")
+        assert dbg._breakpoints[0].value == 0x001
+
+    def test_set_instr_bp_mret(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("mret")
+        assert dbg._breakpoints[0].value == 0x302
+
+    def test_instr_bp_hit_on_ecall(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("ecall")
+        # 在 PC 处写一条 ECALL (0x00000073)
+        dbg._emu.bus.write(0x1000, b"\x73\x00\x00\x00")
+        dbg.hart.pc = 0x1000
+        dbg.step_one()
+        assert dbg._paused, "ECALL 断点应命中"
+
+    def test_instr_bp_miss_on_addi(self):
+        """非 ECALL 指令不应命中 instr 断点."""
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("ecall")
+        # 0x1000 已有 NOP (addi x0, x0, 0 = 0x00000013)
+        dbg.hart.pc = 0x1000
+        dbg.step_one()
+        assert not dbg._paused, "NOP 不应命中 ECALL 断点"
+
+    # -- opcode 断点 --
+
+    def test_set_opcode_bp(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_opcode("0x73")
+        bp = dbg._breakpoints[0]
+        assert bp.kind == "opcode"
+        assert bp.value == 0x73
+
+    def test_opcode_bp_hit(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_opcode("0x73")
+        # 写一条 CSRRS (opcode=0x73, funct3=0b010)
+        # csrrw x0, cycle, x0 = (0xC00 << 20) | (0b001 << 12) | 0x73
+        instr = (0xC00 << 20) | (0b001 << 12) | 0x73
+        dbg._emu.bus.write(0x1000, instr.to_bytes(4, "little"))
+        dbg.hart.pc = 0x1000
+        dbg.step_one()
+        assert dbg._paused, "opcode 0x73 断点应命中"
+
+    # -- 列表 / 删除 / 清除 --
+
+    def test_bp_list_empty(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_list()
+        # 不抛异常即通过
+
+    def test_bp_list(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("0x80000000")
+        dbg.cmd_bp_set("ecall")
+        # 验证列表有内容
+        assert len(dbg._breakpoints) == 2
+        dbg.cmd_bp_list()  # 不抛异常
+
+    def test_bp_delete(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("0x1000")
+        dbg.cmd_bp_set("0x2000")
+        assert len(dbg._breakpoints) == 2
+        dbg.cmd_bp_delete("1")
+        assert len(dbg._breakpoints) == 1
+        assert dbg._breakpoints[0].value == 0x2000
+
+    def test_bp_delete_out_of_range(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("0x1000")
+        dbg.cmd_bp_delete("99")  # 不抛异常, 静默警告
+
+    def test_bp_clear(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("0x1000")
+        dbg.cmd_bp_set("0x2000")
+        dbg.cmd_bp_clear()
+        assert len(dbg._breakpoints) == 0
+
+    # -- 无效参数 --
+
+    def test_bp_set_invalid_string(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("not_a_thing")
+        assert len(dbg._breakpoints) == 0  # 未添加
+
+    def test_bp_opcode_invalid(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_opcode("not_hex")  # @seize_val_err 捕获
+        assert len(dbg._breakpoints) == 0
+
+    # -- 分发 --
+
+    def test_dispatch_bp_addr(self):
+        dbg = _make_dbg()
+        assert dbg._dispatch(["bp", "0x80000000"]) is True
+        assert len(dbg._breakpoints) == 1
+
+    def test_dispatch_bp_list(self):
+        dbg = _make_dbg()
+        dbg._dispatch(["bp", "0x1000"])
+        assert dbg._dispatch(["bp", "list"]) is True
+
+    def test_dispatch_bp_clear(self):
+        dbg = _make_dbg()
+        dbg.cmd_bp_set("0x1000")
+        assert dbg._dispatch(["bp", "clear"]) is True
+        assert len(dbg._breakpoints) == 0
 
 
 class TestDispatch:
@@ -1064,7 +1354,8 @@ class TestFmtCacheLine:
 
     def test_meta_only(self):
         dbg = _make_dbg()
-        l2 = dbg._emu.bus.l2
+        l2 = dbg._emu.bus._l2
+        assert l2 is not None
         # 取一个有效条目
         e = l2.entries[0]
         e.valid = True
@@ -1074,7 +1365,8 @@ class TestFmtCacheLine:
 
     def test_full_dump(self):
         dbg = _make_dbg()
-        l2 = dbg._emu.bus.l2
+        l2 = dbg._emu.bus._l2
+        assert l2 is not None
         e = l2.entries[0]
         e.valid = True
         e.tag = 0xABCDE
@@ -1322,9 +1614,11 @@ class TestCacheDisplay:
     def test_no_args_shows_up_to_64_entries(self):
         """默认显示最多 64 条 valid 行 (预览格式: data[:16])."""
         dbg = _make_dbg_with_l2(num_sets=128, ways=2)
+        l2 = dbg._emu.bus._l2
+        assert l2 is not None
         # 预填一些数据产生 valid 行
         for i in range(80):
-            dbg._emu.bus.l2.read(i * 64, 4)
+            l2.read(i * 64, 4)
         cap = _CacheOutputCapture(dbg)
         dbg.cmd_cache()
         text = cap.text()
@@ -1335,8 +1629,10 @@ class TestCacheDisplay:
     def test_less_than_64_shows_all_no_truncation(self):
         """不足 64 条 valid → 全部显示, 无截断提示."""
         dbg = _make_dbg_with_l2(num_sets=128, ways=2)
+        l2 = dbg._emu.bus._l2
+        assert l2 is not None
         for i in range(10):
-            dbg._emu.bus.l2.read(i * 64, 4)
+            l2.read(i * 64, 4)
         cap = _CacheOutputCapture(dbg)
         dbg.cmd_cache()
         text = cap.text()
@@ -1345,8 +1641,9 @@ class TestCacheDisplay:
     def test_single_set_shows_full_hexdump(self):
         """cache <set> → 完整 64B hexdump."""
         dbg = _make_dbg_with_l2()
-        # 读 addr 0 → 填充 set 0
-        dbg._emu.bus.l2.read(0, 8)
+        l2 = dbg._emu.bus._l2
+        assert l2 is not None
+        l2.read(0, 8)
         cap = _CacheOutputCapture(dbg)
         dbg.cmd_cache("0")
         text = cap.text()
@@ -1355,8 +1652,10 @@ class TestCacheDisplay:
     def test_range_shows_preview_format(self):
         """cache <start>-<end> → 范围预览模式."""
         dbg = _make_dbg_with_l2(num_sets=128, ways=2)
+        l2 = dbg._emu.bus._l2
+        assert l2 is not None
         for i in range(30):
-            dbg._emu.bus.l2.read(i * 64, 4)
+            l2.read(i * 64, 4)
         cap = _CacheOutputCapture(dbg)
         dbg.cmd_cache("0-4")
         text = cap.text()

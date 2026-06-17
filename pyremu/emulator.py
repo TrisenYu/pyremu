@@ -162,6 +162,12 @@ class Emulator:
         sw.property_string("compatible", "pyremu,riscv64")
         sw.property_string("model", "pyremu,rv64ima")
 
+        # -- chosen (指定 stdout 等运行时参数) --
+        if self.uart is not None:
+            sw.begin_node("chosen")
+            sw.property_string("stdout-path", f"/soc/serial@{p.uart_base:x}")
+            sw.end_node()  # chosen
+
         # -- cpus --
         sw.begin_node("cpus")
         sw.property_u32("#address-cells", 1)
@@ -207,6 +213,7 @@ class Emulator:
         if self.uart is not None:
             sw.begin_node(f"serial@{p.uart_base:x}")
             sw.property_string("compatible", "sifive,uart0")
+            sw.property_string("status", "okay")
             sw.property("reg", struct.pack(">IIII", 0, p.uart_base, 0, 0x1000))
             sw.end_node()  # serial
 

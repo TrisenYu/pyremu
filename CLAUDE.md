@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Pyremu is a RISC-V emulator written in Python (CPython 3.14). It models a multi-hart in-order CPU core targeting the RV64 IMA_C ISA with Zicsr, privilege levels (U/S/H/M/D), Sv39 MMU with TLB, L2 cache with MESI protocol, CLINT timer/IPI controller, basic peripherals (UART/SPI/I2C/GPIO), an FDT generator, and an interactive debugger (rvdb). The project is in active mid-stage development.
 
-**Implemented**: RV64 I (base integer), M (mul/div), A (atomics — LR/SC/AMO), C (compressed), Zicsr (CSR read/write), FENCE/FENCE.I, ECALL/EBREAK/MRET/SRET, WFI (true pipeline stop with interrupt wake-up, TW trap), SFENCE.VMA, Sv39 address translation (4 KiB pages + 2 MiB superpages), trap delegation (medeleg/mideleg) to S-mode, PMP (NAPOT/NA4/TOR, M-mode bypass, MPRV), configurable PMA (ram_base + device MMIO routing), a full RV64 disassembler (I/M/A/C/Zicsr/privileged), an interactive debugger with rich TUI + prompt_toolkit REPL (disasm, stack backtrace, multi-step, command repeat, snapshot/rollback), and a platform configuration system (dataclass-based presets + JSON/TOML/YAML deserialization).
+**Implemented**: RV64 I (base integer), M (mul/div), A (atomics — LR/SC/AMO), C (compressed), Zicsr (CSR read/write), FENCE/FENCE.I, ECALL/EBREAK/MRET/SRET, WFI (true pipeline stop with interrupt wake-up, TW trap), SFENCE.VMA, Sv39 address translation (4 KiB pages + 2 MiB superpages), trap delegation (medeleg/mideleg) to S-mode, PMP (NAPOT/NA4/TOR, M-mode bypass, MPRV), configurable PMA (ram_base + device MMIO routing), a full RV64 disassembler (I/M/A/C/Zicsr/privileged), an interactive debugger with rich TUI + prompt_toolkit REPL (disasm, stack backtrace, multi-step, command repeat, snapshot/rollback), a platform configuration system (dataclass-based presets + JSON/TOML/YAML deserialization).  **TEE 扩展**: `mdid` CSR (0x5C0, 内存域 ID), `pmpsplit` CSR (0x5C1, PMP 虚拟化预留), `mfence.did` 指令 (0x5A000073, 按域刷 TLB/L2 缓存), 缓存行自动 mdid 标记 (TLB 插入 + L2 分配/命中的 `current_mdid` 同步).
 
-**Not yet implemented**: floating-point (F/D/Zfh), AIA/IMSIC (stub), peripheral interrupt generation.
+**Not yet implemented**: floating-point (F/D/Zfh), RVV 1.0 Vector extension (opcode 0x57, ~200 条指令: vsetivli/vsetvl/vector load/store/arithmetic/permute), AIA/IMSIC (stub), peripheral interrupt generation.
 
 ## Commands
 
@@ -445,6 +445,40 @@ csrw medeleg, t0
 ## Stub modules (no implementation yet)
 
 - [interrupt/aia.py](pyremu/interrupt/aia.py) — AIA/IMSIC 高级中断控制器 (仅空壳).
+
+## Planned: RVV 1.0 Vector Extension (opcode 0x57)
+
+RISC-V "V" 向量扩展为 RV64 基础 ISA 增加 ~200 条向量指令, 操作数宽度从 8-bit 到 64-bit, 支持 LMUL (1/2/4/8) 分组、mask/tail 策略。关键 opcode: `0x57` (OP-V)。
+
+**当前状态**: 未实现。任何 V 扩展指令命中 `Opc` 枚举未覆盖的 opcode 0x57, 经 `exec_instr()` → `ValueError` → `IllInstr` 陷态。
+
+**已知影响**: `custom_opensbi_fw_payload.elf` (PLATFORM=generic 编译时启用 V 扩展) 在 `fdt_ro_probe_` 函数 (0x224bc) 使用 `vsetivli`/`vle8.v`/`vid.v` 做 FDT 字符串匹配, 触发 `IllInstr` → `_start_hang`。使用该固件时需以 `-march=rv64imac` (不带 `v`) 重编译 OpenSBI。
+
+**实现计划 (低优先级)**:
+- Phase 1: `vsetivli` / `vsetvl` / `vsetvli` — 配置向量长度, 基本 CSR (vl/vtype/vstart/vxsat/vxrm/vcsr)
+- Phase 2: 向量 load/store (`vle8.v`/`vse8.v` 等 unit-stride, 宽度 × LMUL)
+- Phase 3: 向量整数算术 (vadd/vsub/vmul/vand/vor/vxor 等, .vv/.vx/.vi)
+- Phase 4: 向量 permute (vrgather/vslide/vmerge/vid.v 等)
+- Phase 5: 向量浮点 (vfadd/vfmul 等, 需 F/D 扩展先就绪)
+
+**关键 opcode**:
+- `0x57`: OP-V (向量算术/配置)
+- `0x27`: OP-FV (向量浮点, 需 F/D)
+- `0x07`: vector load
+- `0x27`: vector store
+
+**参考**: RISC-V V 规范 1.0 (https://github.com/riscv/riscv-v-spec), RVV intrinsics in LLVM 22+.
+
+## OpenSBI firmware compatibility
+
+`tests/bins/elf/custom_opensbi_fw_payload.elf` 是一个自定义 OpenSBI build (PLATFORM=generic):
+- 入口点 0x0, 静态 PIE, 段从 0x0 展开
+- 内置 `sbi_domain` 框架 (domain 注册/启动/内存区域/PMP 隔离)
+- `.coffer_enclave_man` (0x180000, 512 KiB): enclave 管理器占位段 (全零, 未链接实际代码)
+- `.payload` (0x200000, 8 KiB): 微型测试 payload (SBI ecall 打印)
+- 需要 `ram_base=0` 加载, FDT 通过 a1 传入 (需含 `/chosen/stdout-path`)
+- **已知问题**: 固件使用 V 扩展指令 (见上节), 需用 `-march=rv64imac` 重编译
+- 启动流程: `_start` → `fw_boot_hart`(-1) → `_try_lottery`(AMOSWAP) → PIE 重定位 → BSS 零填充 → `_scratch_init` → `fw_platform_init` → `_fdt_reloc_done`(设 `_boot_status=1`) → `_start_warm` → `sbi_init()` → `_start_hang`(WFI 空闲)
 
 ## Code style
 
