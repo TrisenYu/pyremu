@@ -129,6 +129,15 @@ def gpr_name(idx: int) -> str:
     return f"?x{idx}"
 
 
+def gpr_idx_from_name(name: str) -> int | None:
+    """按名称或别名查找 GPR 索引 (例: "x10" → 10, "t0" → 5, "a0" → 10)."""
+    name = name.lower()
+    for idx, r in enumerate(_gpr):
+        if r.name == name or (r.alias and r.alias == name):
+            return idx
+    return None
+
+
 def register_fpr():
     """返回 32 个 FPR 的独立副本."""
     return deepcopy(_fpr)
@@ -307,6 +316,9 @@ _csr_bank: dict[int, CSR] = {
     0x357: _MmodeCSR(name="mireg6"),
     0x35C: _MmodeCSR(name="mtopei"),
     0x5A8: _SmodeCSR(name="scontext").add_dmode(),
+    # TEE 内存域 & PMP 虚拟化 (自定义扩展)
+    0x5C0: _MmodeCSR(name="mdid"),       # 内存域 ID — TEE 飞地/服务标识
+    0x5C1: _MmodeCSR(name="pmpsplit"),   # PMP 虚拟化辅助 (预留)
     0x600: _HmodeCSR(name="hstatus"),
     0x602: _HmodeCSR(name="hedeleg"),
     0x603: _HmodeCSR(name="hideleg"),
@@ -406,6 +418,15 @@ def check_csr(csr_id: int) -> tuple[bool, str]:
     if csr_id not in _csr_bank:
         return False, ""
     return True, _csr_bank[csr_id].name
+
+
+def csr_addr_from_name(name: str) -> int | None:
+    """按小写名称查找 CSR 地址 (例: "mtvec" → 0x305). 未找到返回 None."""
+    name = name.lower()
+    for addr, csr in _csr_bank.items():
+        if csr.name == name:
+            return addr
+    return None
 
 
 # 每个特权级可读取的 CsrAccess 值集合

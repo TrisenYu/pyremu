@@ -80,6 +80,7 @@ class L2Cache(CacheBase):
 
         # 初始化: 每路一条空行
         self._entries = [self._make_line() for _ in range(self._num_sets * ways)]
+        self._current_mdid: int = 0
 
     # ----------------------------------------------------------
     #  CacheBase 抽象方法实现
@@ -87,6 +88,14 @@ class L2Cache(CacheBase):
 
     def _make_line(self) -> L2CacheLine:
         return L2CacheLine()
+
+    @property
+    def current_mdid(self) -> int:
+        return self._current_mdid
+
+    @current_mdid.setter
+    def current_mdid(self, val: int) -> None:
+        self._current_mdid = val
 
     def _match(self, entry: CacheLineBase, key: int) -> bool:
         """key = 完整物理地址, 匹配 tag (地址高位)."""
@@ -155,6 +164,7 @@ class L2Cache(CacheBase):
                 if not e.valid or e.tag != tag:
                     continue
                 e.last_access = self._clock
+                e.mdid = self._current_mdid
                 self._hits += 1
                 result.extend(e.data[offset : offset + chunk_sz])
                 hit = True
@@ -209,6 +219,7 @@ class L2Cache(CacheBase):
         victim.valid = True
         victim.dirty = False
         victim.mesi = MESIState.EXCLUSIVE
+        victim.mdid = self._current_mdid
         victim.last_access = self._clock
 
         return bytes(victim.data[offset : offset + size])
@@ -244,6 +255,7 @@ class L2Cache(CacheBase):
                     e.data[offset + i] = b
                 e.dirty = True
                 e.mesi = MESIState.MODIFIED
+                e.mdid = self._current_mdid
                 e.last_access = self._clock
                 self._hits += 1
                 hit = True
@@ -287,6 +299,7 @@ class L2Cache(CacheBase):
         victim.data[:] = line_data
         victim.valid = True
         victim.mesi = MESIState.EXCLUSIVE
+        victim.mdid = self._current_mdid
         victim.last_access = self._clock
 
         # 现在写入数据

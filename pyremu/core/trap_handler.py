@@ -235,7 +235,11 @@ def trap_mret(
     """MRET: 从 M 模式 trap 返回.
 
     恢复进入 M 模式 trap 前保存的特权级和中断使能状态.
+    仅在 M 模式下合法; 否则触发 IllInstr.
     """
+    if hart.mode != RiscvMode.M:
+        deliver_trap(hart, TrapType.IllInstr, tval=0x30200073, is_interrupt=False)
+        return
     mstatus = hart.mstatus_val
 
     # 恢复特权级: mode ← MPP
@@ -264,7 +268,11 @@ def trap_sret(
     """SRET: 从 S 模式 trap 返回.
 
     恢复进入 S 模式 trap 前保存的特权级和中断使能状态.
+    在 S/M 模式下合法; U 模式下触发 IllInstr.
     """
+    if hart.mode == RiscvMode.U:
+        deliver_trap(hart, TrapType.IllInstr, tval=0x10200073, is_interrupt=False)
+        return
     mstatus = hart.mstatus_val
 
     # 恢复特权级: mode ← SPP

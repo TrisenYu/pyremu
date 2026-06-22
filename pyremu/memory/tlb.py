@@ -103,6 +103,7 @@ class TLB(CacheBase):
         ppn: int,
         perm: int,
         level: int = 0,
+        mdid: int = 0,
     ) -> None:
         """将一条映射插入 TLB.
 
@@ -113,6 +114,7 @@ class TLB(CacheBase):
             ppn: 物理页号.
             perm: 权限位 (R|W|X|U 的组合).
             level: 页表级数 (0=4 KiB, 1=2 MiB, 2=1 GiB).
+            mdid: 内存域 ID (来自 hart.mdid, 供 mfence.did 按域刷新).
         """
         self._clock += 1
 
@@ -123,6 +125,7 @@ class TLB(CacheBase):
                 e.ppn = ppn
                 e.perm = perm
                 e.level = level
+                e.mdid = mdid
                 e.last_access = self._clock
                 return
 
@@ -137,6 +140,7 @@ class TLB(CacheBase):
         victim.ppn = ppn
         victim.perm = perm
         victim.level = level
+        victim.mdid = mdid
         victim.valid = True
         victim.dirty = False
         victim.last_access = self._clock

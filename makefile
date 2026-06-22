@@ -13,14 +13,14 @@ test:
 phony += test
 
 cov-test:
-	pytest --cov=. --cov-report=term
+	pytest --cov=. --cov-report=term --full-trace
 phony += cov-test
 
 opt-cc=/opt/custom-llvm/bin/clang
 opt-src-dir=$(pwd)/tests/src/
 opt-bin-dir=$(pwd)/tests/bins/
 custom-build:
-	$(opt-cc) -c -O2 -o 
+	$(opt-cc) -c -O2 -o
 phony += custom-build
 
 .PHONY: $(phony)

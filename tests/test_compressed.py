@@ -225,6 +225,58 @@ class TestCompressedC0:
         val = int.from_bytes(hart._mem_read_phy(0x8008, 8), "little")
         assert val == 0xDEAD_BEEF
 
+    # -- 大偏移量测试 (uimm[7:6] ≠ 0, 验证 C.LD/C.SD 立即数布局) --
+
+    def test_c_sd_large_offset(self, hart):
+        """C.SD x14, 144(x12) — uimm[7:6]=2, 偏移 ≠ 8*n 时验证位布局."""
+        hart.gprs[12].val = 0x8000
+        hart.gprs[14].val = 0xDEAD_BEEF_CAFE
+        # offset=144 → uimm_field=18 → uimm[5:3]=2, uimm[7:6]=2
+        # C.SD: funct3=111, rs1_creg=4(x12), rs2_creg=6(x14)
+        instr = (0b111 << 13) | (2 << 10) | (4 << 7) | (2 << 5) | (6 << 2)
+        hart.exec_instr(instr)
+        val = int.from_bytes(hart._mem_read_phy(0x8000 + 144, 8), "little")
+        assert val == 0xDEAD_BEEF_CAFE, (
+            f"偏移 144 的 C.SD: 期望 0xDEAD_BEEF_CAFE, 得到 0x{val:016x}"
+        )
+
+    def test_c_ld_large_offset(self, hart):
+        """C.LD x14, 144(x12) — uimm[7:6]=2, 验证与 C.SD 相同位布局."""
+        test_val = 0xFEED_CACE_BABE
+        hart._mem_write_phy(0x8000 + 144, test_val.to_bytes(8, "little"))
+        hart.gprs[12].val = 0x8000
+        # C.LD: funct3=011, rs1_creg=4(x12), rd_creg=6(x14)
+        instr = (0b011 << 13) | (2 << 10) | (4 << 7) | (2 << 5) | (6 << 2)
+        hart.exec_instr(instr)
+        assert hart.gprs[14].val == test_val, (
+            f"偏移 144 的 C.LD: 期望 0x{test_val:016x}, 得到 0x{hart.gprs[14].val:016x}"
+        )
+
+    def test_c_sd_vs_c_sw_bit_layout(self, hart):
+        """C.SD 与 C.SW 的同 bit pattern 应解码为不同偏移 (验证布局分立)."""
+        hart.gprs[10].val = 0x8000
+        # C.SD: funct3=111, offset=200, rs1_creg=2(x10), rs2_creg=4(x12)
+        # uimm_field=25 → uimm[5:3]=1, uimm[7:6]=3
+        hart.gprs[12].val = 0xAAAA
+        instr_sd = (0b111 << 13) | (1 << 10) | (2 << 7) | (3 << 5) | (4 << 2)
+        hart.exec_instr(instr_sd)
+        val_at_200 = int.from_bytes(hart._mem_read_phy(0x8000 + 200, 8), "little")
+        assert val_at_200 == 0xAAAA, f"C.SD 应在偏移 200, 实际写了偏移 {200 if val_at_200 == 0xAAAA else '?'}"
+
+        # C.SW: 相同 scatter, funct3=110 — 应计算出不同偏移 (uimm[2] 非零)
+        hart.gprs[12].val = 0xBBBB
+        instr_sw = (0b110 << 13) | (1 << 10) | (2 << 7) | (3 << 5) | (4 << 2)
+        hart.exec_instr(instr_sw)
+        # C.SW: uimm = instr[6]<<6 | instr[12:10]<<3 | instr[5]<<2
+        # = 1<<6 | 1<<3 | 1<<2 = 64 + 8 + 4 = 76
+        val_at_76 = int.from_bytes(hart._mem_read_phy(0x8000 + 76, 4), "little") & 0xFFFF_FFFF
+        assert val_at_76 == 0xBBBB, (
+            f"C.SW 与 C.SD 应有不同偏移: C.SW→76, 实际写了偏移 ?"
+        )
+        # 确认 C.SD 的偏移 200 处没有被 C.SW 覆写
+        val_still = int.from_bytes(hart._mem_read_phy(0x8000 + 200, 8), "little")
+        assert val_still == 0xAAAA, "C.SW 不应覆写 C.SD 的偏移 200 位置"
+
 
 # ============================================================
 #  C2 象限测试 — SP-relative load/store
@@ -246,9 +298,9 @@ class TestCompressedC2:
         """C.LWSP x10, 8 → 从 sp+8 加载 32-bit."""
         test_val = 0x12345678
         hart._mem_write_phy(0x8008, test_val.to_bytes(4, "little"))
-        # uimm=8: [5]=0, [4:2]=010, [7:6]=00
-        scatter = (0 << 12) | (2 << 2) | (0 << 7)
-        instr = _c2(0b010, 10, scatter)
+        # C.LWSP: funct3=010, uimm=8, rd=10
+        # bit[12]=0(uimm[5]), bits[6:5]=00(uimm[7:6]), bits[4:2]=010(uimm[4:2])
+        instr = (0b010 << 13) | (0 << 12) | (10 << 7) | (0b010 << 2) | 0b10
         hart.exec_instr(instr)
         assert hart.gprs[10].val == test_val
 
@@ -256,17 +308,19 @@ class TestCompressedC2:
         """C.LDSP x10, 8 → 从 sp+8 加载 64-bit."""
         test_val = 0xFEED_FACE
         hart._mem_write_phy(0x8008, test_val.to_bytes(8, "little"))
-        scatter = (0 << 12) | (2 << 2)
-        instr = _c2(0b011, 10, scatter)
+        # C.LDSP: funct3=011, uimm=8, rd=10
+        # uimm=8: imm[5]=0, imm[4:3]=01, imm[8:6]=000
+        # bit[12]=0, bits[6:5]=01, bits[4:2]=000
+        instr = (0b011 << 13) | (0 << 12) | (10 << 7) | (0b01 << 5) | (0b000 << 2) | 0b10
         hart.exec_instr(instr)
         assert hart.gprs[10].val == test_val
 
     def test_c_swsp(self, hart):
         """C.SWSP x5, 4 → 向 sp+4 存储 32-bit."""
         hart.gprs[5].val = 0xBEEF
-        # uimm[5:2]=1→4, rs2=x5
-        scatter = (1 << 9) | (5 << 2)
-        instr = (0b110 << 13) | scatter | 0b10
+        # C.SWSP: funct3=110, uimm=4, rs2=x5
+        # bit[15:13]=110, bits[12:9]=0001(uimm[5:2]), bits[8:7]=00(uimm[7:6])
+        instr = (0b110 << 13) | (1 << 9) | (5 << 2) | 0b10
         hart.exec_instr(instr)
         val = int.from_bytes(hart._mem_read_phy(0x8004, 4), "little")
         assert val == 0xBEEF
@@ -274,8 +328,188 @@ class TestCompressedC2:
     def test_c_sdsp(self, hart):
         """C.SDSP x5, 8 → 向 sp+8 存储 64-bit."""
         hart.gprs[5].val = 0xDEAD_BEEF
-        scatter = (2 << 9) | (5 << 2)  # uimm=8
-        instr = (0b111 << 13) | scatter | 0b10
+        # C.SDSP: funct3=111, uimm=8, rs2=x5
+        # uimm=8: imm[5:3]=001, imm[8:6]=000
+        # bits[12:10]=001, bits[9:7]=000, bits[6:2]=00101(rs2=5)
+        instr = (0b111 << 13) | (1 << 10) | (5 << 2) | 0b10
         hart.exec_instr(instr)
         val = int.from_bytes(hart._mem_read_phy(0x8008, 8), "little")
         assert val == 0xDEAD_BEEF
+
+    # -- 大偏移量测试 (验证 C.LWSP/C.LDSP/C.SDSP 立即数布局分立) --
+
+    def test_c_lwsp_large_offset(self, hart):
+        """C.LWSP x10, 40(sp) — uimm[5]=1 验证 imm[5] 位位置."""
+        test_val = 0x12345678
+        hart._mem_write_phy(0x8000 + 40, test_val.to_bytes(4, "little"))
+        # C.LWSP: funct3=010, uimm=40, rd=10
+        # bit[15:13]=010, bit[12]=1(uimm[5]), bits[11:7]=01010,
+        # bits[6:5]=00(uimm[7:6]), bits[4:2]=010(uimm[4:2])
+        instr = (0b010 << 13) | (1 << 12) | (10 << 7) | (0b010 << 2) | 0b10
+        hart.exec_instr(instr)
+        assert hart.gprs[10].val == test_val, (
+            f"偏移 40 的 C.LWSP: 期望 0x{test_val:08x}, 得到 0x{hart.gprs[10].val:08x}"
+        )
+
+    def test_c_ldsp_large_offset(self, hart):
+        """C.LDSP x10, 40(sp) — uimm[5]=1, uimm[4:3]=01 验证布局."""
+        test_val = 0xFEED_FACE_CAFE
+        hart._mem_write_phy(0x8000 + 40, test_val.to_bytes(8, "little"))
+        # C.LDSP: funct3=011, uimm=40, rd=10
+        # bit[15:13]=011, bit[12]=1(uimm[5]), bits[11:7]=01010,
+        # bits[6:5]=01(uimm[4:3]), bits[4:2]=000(uimm[8:6])
+        instr = (0b011 << 13) | (1 << 12) | (10 << 7) | (0b01 << 5) | 0b10
+        hart.exec_instr(instr)
+        assert hart.gprs[10].val == test_val, (
+            f"偏移 40 的 C.LDSP: 期望 0x{test_val:016x}, 得到 0x{hart.gprs[10].val:016x}"
+        )
+
+    def test_c_sdsp_large_offset(self, hart):
+        """C.SDSP x10, 40(sp) — uimm[8:6]=000, uimm[5:3]=101 验证布局."""
+        hart.gprs[10].val = 0xDEAD_BEEF_BABE
+        # C.SDSP: funct3=111, uimm=40, rs2=10
+        # bit[15:13]=111, bits[12:10]=101(uimm[5:3]),
+        # bits[9:7]=000(uimm[8:6]), bits[6:2]=01010(rs2)
+        instr = (0b111 << 13) | (5 << 10) | (10 << 2) | 0b10
+        hart.exec_instr(instr)
+        val = int.from_bytes(hart._mem_read_phy(0x8000 + 40, 8), "little")
+        assert val == 0xDEAD_BEEF_BABE, (
+            f"偏移 40 的 C.SDSP: 期望 0xDEAD_BEEF_BABE, 得到 0x{val:016x}"
+        )
+
+    def test_c_lwsp_vs_c_ldsp_bit_layout(self, hart):
+        """C.LWSP 与 C.LDSP 同 bit pattern 应解码为不同偏移."""
+        test_val_lw = 0x42
+        hart._mem_write_phy(0x8000 + 40, test_val_lw.to_bytes(4, "little"))
+        # C.LWSP: 偏移 40 的编码 (见 test_c_lwsp_large_offset)
+        instr_lwsp = (0b010 << 13) | (1 << 12) | (10 << 7) | (0b010 << 2) | 0b10
+        hart.exec_instr(instr_lwsp)
+        assert hart.gprs[10].val == 0x42, "C.LWSP 偏移 40 应读取正确值"
+
+        # 用 C.LDSP 的 bit pattern 构造与 C.LWSP 相同 raw 位但不同 funct3
+        # C.LDSP funct3=011, 同 offset=40 的编码
+        test_val_ld = 0xDEAD_BEEF
+        hart._mem_write_phy(0x8000 + 40, test_val_ld.to_bytes(8, "little"))
+        instr_ldsp = (0b011 << 13) | (1 << 12) | (10 << 7) | (0b01 << 5) | 0b10
+        hart.exec_instr(instr_ldsp)
+        assert hart.gprs[10].val == test_val_ld, (
+            f"C.LDSP 偏移 40: 期望 0x{test_val_ld:x}, 得到 0x{hart.gprs[10].val:x}"
+        )
+
+    # -- C.ADD (回归: 曾被误当 C.MV 执行) --
+
+    def test_c_add(self, hart):
+        """C.ADD x5, x6 → x5 += x6 (非 x5 = x6)."""
+        hart.gprs[5].val = 0x804E0
+        hart.gprs[6].val = 0x80000000
+        # C.ADD: C2 象限 (bit1:0=10), funct3=4, bit12=1, rd_rs1=x5, rs2=x6
+        instr = (0b100 << 13) | (1 << 12) | (5 << 7) | (6 << 2) | 0b10
+        hart.exec_instr(instr)
+        expected = (0x804E0 + 0x80000000) & 0xFFFF_FFFF_FFFF_FFFF
+        assert hart.gprs[5].val == expected, (
+            f"C.ADD: {hart.gprs[5].val:#x} != {expected:#x} (expected x5 += x6)"
+        )
+
+    def test_c_add_preserves_upper_bits(self, hart):
+        """C.ADD 结果应规范化到 64 位."""
+        hart.gprs[5].val = 0xFFFFFFFFD0000000
+        hart.gprs[6].val = 0xD0000
+        instr = (0b100 << 13) | (1 << 12) | (5 << 7) | (6 << 2) | 0b10
+        hart.exec_instr(instr)
+        expected = (0xFFFFFFFFD0000000 + 0xD0000) & 0xFFFF_FFFF_FFFF_FFFF
+        assert hart.gprs[5].val == expected
+
+    # -- C.SUB (RV64C, 回归: sf=0b11 未实现) --
+
+    def test_c_sub(self, hart):
+        """C.SUB x15, x14 → x15 -= x14 (sf=3 variant)."""
+        hart.gprs[15].val = 0x804E0
+        hart.gprs[14].val = 0x3E8
+        # C.SUB: C1, funct3=4, bit12=0, bits[11:10]=11, bits[6:5]=00
+        # rd/rs1=x15 (3-bit=7), rs2=x14 (3-bit=6)
+        instr = (0b100 << 13) | (0b11 << 10) | (7 << 7) | (0b00 << 5) | (6 << 2) | 0b01
+        hart.exec_instr(instr)
+        expected = (0x804E0 - 0x3E8) & 0xFFFF_FFFF_FFFF_FFFF
+        assert hart.gprs[15].val == expected, (
+            f"C.SUB: {hart.gprs[15].val:#x} != {expected:#x}"
+        )
+
+    def test_c_or(self, hart):
+        """C.OR x15, x14 → x15 |= x14 (RV64C sf=3, bits[6:5]=10)."""
+        hart.gprs[15].val = 0xF0
+        hart.gprs[14].val = 0x0F
+        # C.OR: C1, funct3=4, bit12=0, bits[11:10]=11, bits[6:5]=10
+        instr = (0b100 << 13) | (0b11 << 10) | (7 << 7) | (0b10 << 5) | (6 << 2) | 0b01
+        hart.exec_instr(instr)
+        expected = (0xF0 | 0x0F) & 0xFFFF_FFFF_FFFF_FFFF
+        assert hart.gprs[15].val == expected
+
+    def test_c_srli_64bit_shift(self, hart):
+        """C.SRLI x15, 7 — RV64 移位, shamt[5] 在 bit12 而非 bit7."""
+        hart.gprs[15].val = 0x8000000000140000
+        # C.SRLI: C1, funct3=4, sf=bits[11:10]=00, bit12=0
+        # shamt[4:0] = bits[6:2] = 7, shamt[5] = bit12 = 0
+        instr = (0b100 << 13) | (0b00 << 10) | (7 << 7) | (0b00111 << 2) | 0b01
+        hart.exec_instr(instr)
+        # 64-bit shift: 0x8000000000140000 >> 7 = 0x0100000000002800
+        expected = 0x8000000000140000 >> 7
+        assert hart.gprs[15].val == expected, (
+            f"期望 0x{expected:016x}, 实际 0x{hart.gprs[15].val:016x}"
+        )
+
+    def test_c_srli_shamt_bit7_is_ignored(self, hart):
+        """C.SRLI: bit7 不参与 shamt 计算, shamt[5] 由 bit12 提供."""
+        hart.gprs[15].val = 0x8000000000140000
+        # 构造一条 bit7=1 但 bit12=0 的 C.SRLI: shamt 应 = bits[6:2] = 7
+        # (旧 bug: 使用 bit7 作为 shamt[5] 会得到 shamt=7|32=39)
+        instr = (0b100 << 13) | (0b00 << 10) | (7 << 7) | (1 << 7) | (0b00111 << 2) | 0b01
+        hart.exec_instr(instr)
+        # 正确: 0x8000000000140000 >> 7 = 0x0100000000002800
+        expected = 0x8000000000140000 >> 7
+        assert hart.gprs[15].val == expected, (
+            f"bit7 被错误当作 shamt[5]: 期望 0x{expected:016x}, 实际 0x{hart.gprs[15].val:016x}"
+        )
+
+    def test_c_andi_sf2_encoding(self, hart):
+        """C.ANDI x15, 1 — sf=2 (bits[11:10]=10), 非 sf=1."""
+        hart.gprs[15].val = 0x0100000000002800
+        # C.ANDI: C1, funct3=4, bits[12:10]=010 (sf=2)
+        # imm[4:0] = bits[6:2] = 1
+        instr = (0b100 << 13) | (0b010 << 10) | (7 << 7) | (0b00001 << 2) | 0b01
+        hart.exec_instr(instr)
+        # 0x0100000000002800 & 1 = 0
+        assert hart.gprs[15].val == 0, (
+            f"C.ANDI sf=2 编码错误: 期望 0, 实际 0x{hart.gprs[15].val:x}"
+        )
+
+    def test_c_srli_then_c_andi_chain(self, hart):
+        """组合 srli+andi 提取 misa H-bit: 完整模拟 _start_warm 的检测逻辑."""
+        # 模拟 misa = 0x8000000000140000 (H-bit=0)
+        hart.gprs[15].val = 0x8000000000140000
+        # C.SRLI x15, 7
+        instr_srli = (0b100 << 13) | (0b00 << 10) | (7 << 7) | (0b00111 << 2) | 0b01
+        hart.exec_instr(instr_srli)
+        # 验证移位结果
+        assert hart.gprs[15].val == 0x0100000000002800, "C.SRLI 64-bit 移位错误"
+        # C.ANDI x15, 1
+        instr_andi = (0b100 << 13) | (0b010 << 10) | (7 << 7) | (0b00001 << 2) | 0b01
+        hart.exec_instr(instr_andi)
+        # H-bit=0 → 结果应为 0
+        assert hart.gprs[15].val == 0, (
+            f"misa H-bit 检测失败: 期望 0, 实际 0x{hart.gprs[15].val:x}"
+        )
+
+    def test_c_srli_then_c_andi_h_ext_present(self, hart):
+        """misa H-bit=1 场景: srli+andi 正确提取置位的 H 位."""
+        # 模拟 misa bit7=1 (H 扩展存在)
+        hart.gprs[15].val = 0x8000000000140080  # bit7=1
+        # C.SRLI x15, 7
+        instr_srli = (0b100 << 13) | (0b00 << 10) | (7 << 7) | (0b00111 << 2) | 0b01
+        hart.exec_instr(instr_srli)
+        # C.ANDI x15, 1
+        instr_andi = (0b100 << 13) | (0b010 << 10) | (7 << 7) | (0b00001 << 2) | 0b01
+        hart.exec_instr(instr_andi)
+        # H-bit=1 → 结果应为 1
+        assert hart.gprs[15].val == 1, (
+            f"H-bit=1 检测失败: 期望 1, 实际 {hart.gprs[15].val}"
+        )

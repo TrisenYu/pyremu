@@ -12,6 +12,12 @@ shellcode 来源:
 
 注入后 Emulator 将从 shellcode 入口开始执行, shellcode 负责
 设置环境并跳转到目标程序入口。
+
+默认内存布局 (以 ram_base=0x80000000 + ram_size=128 MiB 为例):
+
+  OpenSBI:   0x80000000 - 0x8003ebb0  (PIE 搬迁后, ~251 KiB)
+  DTB:       0x87ff0000 - 0x87ff046c  (ram_base + ram_size - 64KiB)
+  Preload:   0x87fe0000 - 0x87fe008c  (ram_base + ram_size - 128KiB)
 """
 
 from pathlib import Path
@@ -29,8 +35,8 @@ class Preloader:
         emu.harts[0].pc = entry
     """
 
-    # 默认注入位置: RAM 顶端往下 64 KiB
-    DEFAULT_ADDR_OFFSET = 0x10000
+    # 默认注入位置: RAM 顶端往下 128 KiB (避免和 DTB @ RAM-64K 撞地址)
+    DEFAULT_ADDR_OFFSET = 0x20000
 
     def __init__(
         self,
@@ -53,7 +59,10 @@ class Preloader:
             shellcode 在 RAM 中的起始地址 (即入口地址).
         """
         if addr is None:
-            addr = (self._emu.bus.ram_size - self.DEFAULT_ADDR_OFFSET) & ~0xF
+            addr = (
+                self._emu.bus.ram_base + self._emu.bus.ram_size
+                - self.DEFAULT_ADDR_OFFSET
+            ) & ~0xF
 
         self._emu.bus.write(addr, code)
         return addr

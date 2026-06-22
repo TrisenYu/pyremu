@@ -27,6 +27,8 @@ Usage:
 import random
 import struct
 import sys
+import threading
+from pathlib import Path
 from typing import Any
 
 import libfdt
@@ -76,6 +78,9 @@ class Emulator:
         self._cycle = 0
         self._total_instrs = 0
 
+        # WFI 唤醒事件 — 全部 hart 等待时用于阻塞而非轮询
+        self._wake_event = threading.Event()
+
         ram_size = config.ram_size
         ram_base = config.ram_base
 
@@ -122,11 +127,15 @@ class Emulator:
         self.harts: list[Hart] = []
         for i in range(config.num_harts):
             h = Hart(id=i, pmp_entries=config.pmp_entries)
-            h.pc = config.reset_vector
+            h.pc = config.prog_cnt
             inject_memory_backend(h, self.bus.read, self.bus.write)
             h.bus = self.bus
             h.interrupt_ctrl = self.clint
             self.harts.append(h)
+
+        # 互引用: 每个 hart 持有全 hart 列表, 供 mfence.did 等广播操作
+        for h in self.harts:
+            h.all_harts = self.harts
 
     # ----------------------------------------------------------
     #  平台
@@ -173,6 +182,7 @@ class Emulator:
         sw.property_u32("#address-cells", 1)
         sw.property_u32("#size-cells", 0)
         sw.property_u32("timebase-frequency", self._cfg.timebase_freq)
+        cpu_phandles: list[int] = []
         for i in range(self._cfg.num_harts):
             sw.begin_node(f"cpu@{i}")
             sw.property_string("device_type", "cpu")
@@ -181,6 +191,15 @@ class Emulator:
             sw.property_string("riscv,isa", self._cfg.isa)
             sw.property_string("mmu-type", "riscv,sv39")
             sw.property_string("status", "okay")
+            # 中断控制器子节点 (供 CLINT interrupts-extended 引用)
+            sw.begin_node("interrupt-controller")
+            sw.property_string("compatible", "riscv,cpu-intc")
+            sw.property_u32("#interrupt-cells", 1)
+            sw.property_string("interrupt-controller", "")
+            phandle = i + 1
+            sw.property_u32("phandle", phandle)
+            cpu_phandles.append(phandle)
+            sw.end_node()  # interrupt-controller
             sw.end_node()  # cpu@i
         sw.end_node()  # cpus
 
@@ -204,8 +223,12 @@ class Emulator:
         sw.begin_node(f"clint@{clint_base:x}")
         sw.property_string("compatible", "riscv,clint0")
         sw.property("reg", struct.pack(">IIII", 0, clint_base, 0, 0x10000))
+        # interrupts-extended: 每个 hart 两条中断 <&cpu_intc 3 &cpu_intc 7>
+        ie_cells: list[int] = []
+        for ph in cpu_phandles:
+            ie_cells.extend([ph, 3, ph, 7])  # M-SW-IRQ=3, M-TIMER-IRQ=7
         sw.property("interrupts-extended", struct.pack(
-            ">" + "I" * self._cfg.num_harts, *range(self._cfg.num_harts),
+            ">" + "I" * len(ie_cells), *ie_cells,
         ))
         sw.end_node()  # clint
 
@@ -252,6 +275,31 @@ class Emulator:
         遵循 RISC-V 引导约定: firmware 入口时 a1 指向设备树 blob.
         """
         dtb = self.build_dtb()
+        self.load_dtb_blob(addr, dtb)
+
+    def load_dtb_file(
+        self,
+        path: str,
+        addr: int | None = None,
+    ) -> None:
+        """加载预编译的 DTB 文件到 RAM, 并将地址写入所有 hart 的 a1.
+
+        *addr* 为 None 时自动放在 RAM 顶端 − 64 KiB.
+        """
+        if addr is None:
+            addr = self._cfg.ram_base + self._cfg.ram_size - 0x10000
+        dtb = Path(path).read_bytes()
+        self.load_dtb_blob(addr, dtb)
+
+    def load_dtb_blob(
+        self,
+        addr: int,
+        dtb: bytes,
+    ) -> None:
+        """将 *dtb* 写入 RAM 的 *addr*, 并设所有 hart 的 a1.
+
+        供 load_dtb / load_dtb_file 共用.
+        """
         self.load_code(addr, dtb)
         for hart in self.harts:
             hart.write_gpr(11, addr)
@@ -274,27 +322,30 @@ class Emulator:
     def load_firmware(
         self,
         image: FirmwareImage | None,
+        load_offset: int = 0,
     ) -> None:
         """加载由 parse_firmware() 解析得到的固件镜像.
 
         将镜像的所有内存段写入物理 RAM, 并将所有 hart
-        的 PC 设置为镜像的入口地址.
+        的 PC 设置为镜像的入口地址 (均加 *load_offset*).
 
-        对于 raw binary, 若入口地址与复位向量不同,
-        调用者应在解析时指定 base_addr=reset_vector.
+        *load_offset* 用于 PIE 固件搬迁: 当 ELF 段链接地址为 0x0
+        但 RAM 从 0x80000000 开始时, 传入 load_offset=ram_base
+        即可将各段上移.
         """
         if image is None:
             raise ValueError("载入了无效的内存")
         for seg in image.segments:
-            self.bus.write(seg.vaddr, seg.data)
+            vaddr = seg.vaddr + load_offset
+            self.bus.write(vaddr, seg.data)
             # 若 memsz > 文件数据长度, 剩余部分零填充
             if seg.memsz > len(seg.data):
                 zero_pad = seg.memsz - len(seg.data)
-                self.bus.write(seg.vaddr + len(seg.data), b"\x00" * zero_pad)
+                self.bus.write(vaddr + len(seg.data), b"\x00" * zero_pad)
 
         # 将所有 hart 的 PC 设置为入口地址
         for hart in self.harts:
-            hart.pc = image.entry_point
+            hart.pc = image.entry_point + load_offset
 
     # ----------------------------------------------------------
     #  执行
@@ -334,6 +385,49 @@ class Emulator:
         return "\n".join(lines)
 
     # ----------------------------------------------------------
+    #  WFI 等待优化
+    # ----------------------------------------------------------
+
+    _WFI_MAX_SLEEP = 0.05       # 单次最大睡眠 50ms, 保证 Ctrl+C 响应
+    _WFI_TICK_US   = 1.0        # 1 tick ≈ 1 µs (1 MHz 等效)
+
+    def _wfi_ticks_until_wake(self, active_harts: list) -> int | None:
+        """返回最早定时器中断剩余的 tick 数; 无活跃定时器时返回 None."""
+        now = self.clint._mtime
+        best = None
+        for h in active_harts:
+            cmp = self.clint._mtimecmp[h.id]
+            if not (cmp > 0 and cmp > now):
+                continue
+            rem = cmp - now
+            if best is None or rem < best:
+                best = rem
+        return best
+
+    def _wfi_sleep_if_idle(self, active: list, waiting_count: int) -> None:
+        """当全部 hart 处于 WFI 时阻塞等待, 避免 CPU 100%% 轮询.
+
+        计算最近定时器到期时间并睡眠对应时长; 无定时器时睡眠固定短间隔.
+        ``_wake_event`` 可被外部中断源 (IPI / debugger) 显式触发.
+        """
+        if waiting_count < len(active) or waiting_count == 0:
+            return
+
+        remaining = self._wfi_ticks_until_wake(active)
+        if remaining is not None and remaining > 0:
+            sleep_sec = min(remaining * self._WFI_TICK_US * 1e-6, self._WFI_MAX_SLEEP)
+        else:
+            sleep_sec = self._WFI_MAX_SLEEP
+
+        # 阻塞等待唤醒或超时; Ctrl+C (SIGINT) 通过 CPython 信号机制中断 wait
+        self._wake_event.wait(timeout=sleep_sec)
+        self._wake_event.clear()
+
+        # 推进 mtime 以反映睡眠期间经过的 tick 数
+        elapsed = max(1, int(sleep_sec / (self._WFI_TICK_US * 1e-6)))
+        self.clint.tick(elapsed - 1)  # -1 因为 step() 末尾还会 tick(1)
+
+    # ----------------------------------------------------------
     #  执行
     # ----------------------------------------------------------
 
@@ -355,15 +449,23 @@ class Emulator:
             random.shuffle(active)
 
         all_exec_cnt = 0
+        wfi_waiting = 0
         for hart in active:
 
             # 声明当前 UART 写者 hart (多 hart 输出不交错)
             if self.uart is not None:
                 self.uart.set_writer(hart.id)
 
+            # 设置 L2 缓存的当前域标记, 分配/命中行时自动打上 hart 的 mdid
+            if self.bus._l2 is not None:
+                self.bus._l2.current_mdid = hart.mdid_val
+
             # WFI 等待状态: 不取指/执行, 但仍检查中断唤醒
             if hart._waiting:
                 check_pending_interrupts(hart)
+                # deliver_trap 会清除 _waiting; 若仍为 True 说明无待处理中断
+                if hart._waiting:
+                    wfi_waiting += 1
                 continue
 
             pc_before = hart.pc
@@ -394,6 +496,10 @@ class Emulator:
         self._cycle += 1
         self._total_instrs += all_exec_cnt
         self.clint.tick(1)
+
+        # WFI 优化: 全部未 halted 的 hart 处于 WFI 等待时, 阻塞而非轮询
+        self._wfi_sleep_if_idle(active, wfi_waiting)
+
         return all_exec_cnt
 
     def run(self, max_cycles: int) -> int:
@@ -459,5 +565,5 @@ class Emulator:
         return self._total_instrs
 
     @property
-    def reset_vector(self) -> int:
-        return self._cfg.reset_vector
+    def prog_cnt(self) -> int:
+        return self._cfg.prog_cnt

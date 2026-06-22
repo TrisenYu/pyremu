@@ -136,10 +136,10 @@ def _translate_addr(
     if bus is not None and bus.is_device_addr(pa):
         return True, pa
 
-    # 将翻译结果插入 TLB 缓存
+    # 将翻译结果插入 TLB 缓存 (标记当前 hart 的 mdid, 供 mfence.did 按域刷新)
     new_vpn = va >> 12
     new_ppn = pa >> 12
-    tlb.insert(new_vpn, new_ppn, perm=0xF, level=0)
+    tlb.insert(new_vpn, new_ppn, perm=0xF, level=0, mdid=hart.mdid_val)
 
     return True, pa
 

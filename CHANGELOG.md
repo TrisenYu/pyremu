@@ -4,6 +4,78 @@
 
 ---
 
+## 2026-06-19
+
+### `_sext()` 返回负 Python int 导致 BEQ/BNE 误判 (decoder + disassembler)
+
+**根因**: `_sext(val, bits)` 对符号位为 1 的值返回负 Python int (如 `-805306368`
+代表 `0xFFFFFFFFD0000000`). Python 的任意精度整数在位运算 (`|`, `&`, `^`) 中表现
+为无限个前导 `1`, 与通过 `LUI`+`ADDI` 等路径产生的正 64-bit 值 (如
+`18446744072905162477` 代表同一比特模式) 在 `==` 比较下不相等.
+
+硬件中两值均为 `0xFFFFFFFFD00DFEED`, 但 emulator 中 Python `a5 == a6` 为 `False`,
+导致 `BNE a5, a6` 误分支.
+
+**症状**: `custom_opensbi_fw_payload.elf` 在 `fw_platform_init` → `fdt_ro_probe_` 中,
+magic 值 `0xD00DFEED` 通过 SLLIW 拼装 (产生负 int) 与 LUI+ADDI 构建的预期值
+(产生正 64-bit int) 比较, `BNE` 误判为不等, 固件进入 `0x1F9D4` WFI 死循环.
+
+**修复**:
+- [decoder.py:54-62](pyremu/core/decoder.py#L54-L62): `_sext()` 对 `bits≤64` 归一化
+  到 `[0, 2^64)` 无符号范围, 确保任意路径构建的同值 bit pattern 在 Python `==` 下相等.
+- [disassem.py:41-46](pyremu/utils/disassem.py#L41-L46): `_fmt_imm()` 检测 bit 63
+  置位时还原为有符号显示 (如 `0xFF…F0` → `-16`).
+
+**新增测试** (`tests/test_emulator.py`):
+- `TestRegValueCanonicalization.test_slliw_produces_64bit_canonical`
+- `TestRegValueCanonicalization.test_slliw_and_lui_produce_equal_values`
+- `TestRegValueCanonicalization.test_beq_with_values_from_different_paths`
+- `TestRegValueCanonicalization.test_bne_with_values_from_different_paths`
+
+**影响范围**: 所有 32-bit 操作 (SLLIW / ADDIW / SRLIW / SRAIW / OP32 等) 写入
+GPR 的值现在均为规范化 64-bit 表示, 消除了此前位运算与 `==`/`!=` 比较的不一致.
+
+---
+
+### Debugger: 设备树默认自动生成 (`--fdt` 默认启用)
+
+**背景**: `custom_opensbi_fw_payload.elf` 为 PLATFORM=generic 编译, 无嵌入式 DTB
+(二进制内搜索不到 `d00dfeed` magic), 完全依赖 `a1` 寄存器接收外部设备树.
+此前 `--fdt` 默认关闭, 用户不传参时 a1=0, `fw_platform_init` 读地址 0 的 magic
+不匹配 → 返回 `FDT_ERR_BADMAGIC` → `0x1F9D4` WFI 死循环 (正确行为但体验差).
+
+**修改**:
+- [debugger.py:2156-2163](pyremu/debugger.py#L2156-L2163): `--fdt` 默认值由 `None` 改为 `-1` (auto),
+  新增 `--no-fdt` 标志用于显式禁用.
+- [debugger.py:2242-2250](pyremu/debugger.py#L2242-L2250): 在 `--no-fdt` 未设置时自动生成 DTB
+  并写入 `ram_base + ram_size - 64 KiB`, 通过 `load_dtb()` 将地址传入所有 hart 的 a1.
+
+**影响**: OpenSBI / Linux kernel 等依赖设备树的固件开箱即用, 无需手动传 `--fdt`.
+裸金属程序 (不关心设备树) 可通过 `--no-fdt` 保持旧行为.
+
+---
+
+### Debugger: 反汇编/栈回溯增加段名与符号注释
+
+[debugger.py:1667-1676](pyremu/debugger.py#L1667-L1676) — 新增 `_find_segment(addr)` 方法,
+利用 `FirmwareSegment.name` (已由 `parse_bin.py` 从 ELF section headers 提取).
+
+反汇编输出每行末尾追加 `; <symbol>  .text` 类注释:
+- 符号名 (黄色高亮, 来自 `FirmwareImage.symbols`)
+- 段名 (灰色, 连续同段时仅首次显示)
+
+栈回溯 (`stack` / `bt`) 每帧 PC 后同样追加段名+符号注释.
+
+---
+
+### Debugger: `_exec` 助手中的 PC 推进条件修正
+
+测试辅助 `_exec()` 此前仅在 `hart.pc == 0x8000_0000` (初始值) 时推进 PC,
+导致在非初始 PC 上执行非分支指令时 PC 不推进. 改为检查 `hart.pc == saved_pc`
+(指令执行前后未变化才推进), 修正了 BNE 测试的假失败.
+
+---
+
 ## 2026-06-14
 
 ### C.JALR rd_rs1==ra 读写竞争 (decoder)

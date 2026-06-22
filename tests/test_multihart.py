@@ -19,6 +19,7 @@ def multi_hart_emu():
     cfg.num_harts = 2
     emu = Emulator(cfg)
     kernel = parse_firmware("tests/bins/elf/kernel.elf")
+    assert kernel is not None, "kernel.elf 解析失败"
     emu.load_firmware(kernel)
     return emu
 

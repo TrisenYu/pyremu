@@ -7,8 +7,8 @@
 
 import pytest
 
-from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.decoder import Hart, Opc
+from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.hart import (
     MSTATUS_MIE,
     MSTATUS_SIE,
@@ -513,6 +513,104 @@ class TestTrapDelegation:
         assert hart.mode == RiscvMode.M
 
 
+class TestUmodePrivilegedInstructionTraps:
+    """U 模式执行特权指令/CSR → 陷态, medeleg 委派到 S 模式."""
+
+    @pytest.fixture
+    def h(self) -> Hart:
+        bus = Bus(ram_size=0x10000, ram_base=0x80000000)
+        hart = Hart(id=0)
+        inject_memory_backend(hart, bus.read, bus.write)
+        hart.bus = bus
+        hart.pc = 0x80000000
+        hart.csrs["mtvec"].val = 0x80001000
+        hart.csrs["stvec"].val = 0x80002000
+        hart.mstatus_val = MSTATUS_MIE
+        return hart
+
+    # -- helpers --
+
+    @staticmethod
+    def _ecall() -> int:
+        return 0x73  # ecall
+
+    @staticmethod
+    def _csrrw(rd: int, csr: int, rs1: int) -> int:
+        return (csr << 20) | (rs1 << 15) | (0b001 << 12) | (rd << 7) | 0b1110011
+
+    @staticmethod
+    def _wfi() -> int:
+        return 0x10500073
+
+    # -- U → S delegation of ECALL --
+
+    def test_u_ecall_delegated_to_s(self, h):
+        """U 模式 ecall → medeleg 委派 → S 模式 trap."""
+        h.csrs["medeleg"].val = 1 << 8
+        h.mode = RiscvMode.U
+        h.exec_instr(self._ecall())
+        assert h.mode == RiscvMode.S
+        assert h.pc == 0x80002000, f"应跳转 stvec, 实际 PC={h.pc:#x}"
+        assert h.scause_val == 8, f"scause 应为 8, 实际 {h.scause_val:#x}"
+
+    def test_u_ecall_no_delegation_stays_m(self, h):
+        """未委派: U 模式 ecall → M 模式 trap."""
+        h.mode = RiscvMode.U
+        h.exec_instr(self._ecall())
+        assert h.mode == RiscvMode.M
+        assert h.pc == 0x80001000
+
+    # -- U → S delegation of CSR access --
+
+    def test_u_csr_read_mstatus_traps(self, h):
+        """U 模式读 mstatus (M-mode CSR) → IllInstr → 委派到 S."""
+        h.csrs["medeleg"].val = 1 << 2  # 委派 IllInstr
+        h.mode = RiscvMode.U
+        instr = self._csrrw(5, 0x300, 0)  # csrrw t0, mstatus, x0
+        h.exec_instr(instr)
+        assert h.scause_val == 2, f"IllInstr=2, 实际 scause={h.scause_val:#x}"
+        assert h.mode == RiscvMode.S
+
+    def test_u_csr_write_satp_traps(self, h):
+        """U 模式写 satp (S-mode CSR) → 也应陷态 (U 模式不能直接写 S CSR)."""
+        h.csrs["medeleg"].val = 1 << 2
+        h.mode = RiscvMode.U
+        instr = self._csrrw(0, 0x180, 5)  # csrrw x0, satp, t0
+        h.exec_instr(instr)
+        assert h.scause_val == 2
+        assert h.mode == RiscvMode.S
+
+    # -- U → S delegation of WFI (mstatus.TW) --
+
+    def test_u_wfi_with_tw_traps(self, h):
+        """mstatus.TW=1 + U 模式 WFI → IllInstr → 委派到 S."""
+        h.csrs["medeleg"].val = 1 << 2
+        h.mode = RiscvMode.U
+        h.mstatus_val = MSTATUS_TW  # TW=1
+        h.exec_instr(self._wfi())
+        assert h.scause_val == 2
+        assert h.mode == RiscvMode.S
+
+    # -- U → S delegation of MRET --
+
+    def test_u_mret_traps(self, h):
+        """U 模式 mret → IllInstr (U 模式不可执行 mret)."""
+        h.csrs["medeleg"].val = 1 << 2
+        h.mode = RiscvMode.U
+        h.exec_instr(0x30200073)  # mret
+        assert h.scause_val == 2, f"应为 IllInstr, scause={h.scause_val:#x}"
+        assert h.mode == RiscvMode.S
+
+    # -- 未委派时进入 M 模式 --
+
+    def test_u_ill_instr_no_delegation_stays_m(self, h):
+        """medeleg=0: U 模式 mret → M 模式 trap."""
+        h.mode = RiscvMode.U
+        h.exec_instr(0x30200073)  # mret
+        assert h.mode == RiscvMode.M
+        assert h.pc == 0x80001000, f"应跳转 mtvec, PC={h.pc:#x}"
+
+
 # ============================================================
 #  SFENCE.VMA (TLB flush via handle_sys)
 # ============================================================
@@ -538,7 +636,6 @@ class TestSfenceVma:
 
     def test_sfence_vma_rejects_wrong_funct12(self):
         """错误的 funct12 编码 (如旧的 0x104) 应触发 IllInstr (mcause=2)."""
-        from pyremu.core.trap import trap_cause_code
 
         h = Hart(id=0)
         # 0x104 是旧代码中错误的 funct12 — 不是合法的特权指令编码
@@ -560,7 +657,6 @@ class TestCsrrwRdRs1:
 
     def test_csrrw_rd_eq_rs1_preserves_new_value(self):
         """csrrw sp, sscratch, sp 应正确交换 sp 和 sscratch."""
-        from pyremu.core.decoder import Hart
 
         h = Hart(id=0)
         # 用 mscratch (M-mode 可访问) 代替 sscratch 测试
@@ -584,7 +680,6 @@ class TestCsrrwRdRs1:
 
     def test_csrrw_rd_neq_rs1_still_works(self):
         """csrrw t0, mscratch, sp 在 rd!=rs1 时仍应正常工作."""
-        from pyremu.core.decoder import Hart
 
         h = Hart(id=0)
         old_sp = 0x80101000
@@ -601,7 +696,6 @@ class TestCsrrwRdRs1:
 
     def test_csrrs_rd_eq_rs1_preserves_rs1(self):
         """csrrs t0, mscratch, t0: rd==rs1 时 SET 位应使用原始 rs1 值."""
-        from pyremu.core.decoder import Hart
 
         h = Hart(id=0)
         old_csr = 0x00000000
@@ -620,7 +714,6 @@ class TestCsrrwRdRs1:
 
     def test_csrrc_rd_eq_rs1_preserves_rs1(self):
         """csrrc t0, mscratch, t0: rd==rs1 时 CLEAR 位应使用原始 rs1 值."""
-        from pyremu.core.decoder import Hart
 
         h = Hart(id=0)
         old_csr = 0x000000FF

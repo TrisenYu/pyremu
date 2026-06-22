@@ -52,9 +52,19 @@ _uint64 = ctypes.c_uint64
 
 
 def _sext(val: int, bits: int) -> int:
-    """Sign-extend *val* from *bits* width to a Python int (64-bit semantics)."""
+    """Sign-extend *val* from *bits* width to a canonical 64-bit unsigned Python int.
+
+    Python's arbitrary-precision integers behave differently from finite-width
+    hardware in bitwise operations (|, &, ^, <<, >>) when values are negative.
+    Canonicalizing to [0, 2^64) ensures consistent behaviour regardless of
+    whether the value was built via sign-extend, zero-extend, or arithmetic.
+    """
     sign_bit = 1 << (bits - 1)
-    return (val & (sign_bit - 1)) - (val & sign_bit)
+    result = (val & (sign_bit - 1)) - (val & sign_bit)
+    # Normalize to 64-bit unsigned representation for consistent bitwise semantics.
+    if bits <= 64:
+        result &= (1 << 64) - 1
+    return result
 
 
 # ============================================================
@@ -847,6 +857,17 @@ class Hart(HartWithRegs):
                 # 刷新所有 hart 的 TLB (当前为单 hart, 故只刷新自己)
                 self.itlb.flush_all()
                 self.dtlb.flush_all()
+            elif funct12 == 0x5A0:  # MFENCE.DID — 按内存域刷新全部 hart TLB + L2
+                # 读取当前 hart 的 mdid, 广播刷新所有 hart 中匹配的条目
+                mdid_val = self.csrs["mdid"].val
+                for h in (self._all_harts or [self]):
+                    h.itlb.flush_by_mdid(mdid_val)
+                    h.dtlb.flush_by_mdid(mdid_val)
+                # 刷新共享 L2 缓存中匹配的条目
+                if self._bus is not None:
+                    l2 = getattr(self._bus, "_l2", None)
+                    if l2 is not None:
+                        l2.flush_by_mdid(mdid_val)
             else:
                 raise ValueError(f"unknown privileged funct12={funct12:#05x}")
 
@@ -949,36 +970,42 @@ class Hart(HartWithRegs):
             self.gprs[rd].val = (self.gprs[2].val + nzuimm) & 0xFFFF_FFFF_FFFF_FFFF
             return 2
 
-        # C.LW/C.LD/C.SW/C.SD 共用 uimm 解码
         rs1 = self._creg((instr >> 7) & 0x7)
-        uimm = (
-            ((instr >> 5) & 0x1) << 2
-            | ((instr >> 10) & 0x7) << 3
-            | ((instr >> 6) & 0x1) << 6
-        )
-        addr = (self.gprs[rs1].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
 
-        if funct3 == 0b010:  # C.LW
-            mem = mem_read(self,addr, 4)
-            val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
-            self.gprs[rd].val = _sext(val, 32)
+        # C.LW / C.SW: uimm = {instr[6], instr[12:10], instr[5]} (4-byte aligned)
+        if funct3 in (0b010, 0b110):
+            uimm = (
+                ((instr >> 5) & 0x1) << 2
+                | ((instr >> 10) & 0x7) << 3
+                | ((instr >> 6) & 0x1) << 6
+            )
+            addr = (self.gprs[rs1].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            if funct3 == 0b010:  # C.LW
+                mem = mem_read(self, addr, 4)
+                val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
+                self.gprs[rd].val = _sext(val, 32)
+            else:  # C.SW
+                rs2 = self._creg((instr >> 2) & 0x7)
+                v = self.gprs[rs2].val & 0xFFFF_FFFF
+                data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
+                mem_write(self, addr, data)
 
-        elif funct3 == 0b011:  # C.LD (RV64C)
-            mem = mem_read(self,addr, 8)
-            val = sum(mem[i] << (8 * i) for i in range(8))
-            self.gprs[rd].val = val
-
-        elif funct3 == 0b110:  # C.SW
-            rs2 = self._creg((instr >> 2) & 0x7)
-            v = self.gprs[rs2].val & 0xFFFF_FFFF
-            data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
-            mem_write(self,addr, data)
-
-        elif funct3 == 0b111:  # C.SD (RV64C)
-            rs2 = self._creg((instr >> 2) & 0x7)
-            v = self.gprs[rs2].val
-            data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-            mem_write(self,addr, data)
+        # C.LD / C.SD (RV64C): uimm = {instr[6:5], instr[12:10]} (8-byte aligned)
+        elif funct3 in (0b011, 0b111):
+            uimm = (
+                ((instr >> 5) & 0b11) << 6
+                | ((instr >> 10) & 0b111) << 3
+            )
+            addr = (self.gprs[rs1].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            if funct3 == 0b011:  # C.LD
+                mem = mem_read(self, addr, 8)
+                val = sum(mem[i] << (8 * i) for i in range(8))
+                self.gprs[rd].val = val
+            else:  # C.SD
+                rs2 = self._creg((instr >> 2) & 0x7)
+                v = self.gprs[rs2].val
+                data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
+                mem_write(self, addr, data)
 
         else:
             raise NotImplementedError(f"C0 funct3={funct3:#05b} (FLD/FSD/reserved)")
@@ -1072,22 +1099,27 @@ class Hart(HartWithRegs):
         self,
         instr: int,
     ) -> int:
-        """C1 ALU: C.SRLI/C.SRAI (sub_fn=00), C.ANDI (01), C.SUB/XOR/OR/AND (10)."""
+        """C1 ALU: C.SRLI/C.SRAI (sf=0), C.ANDI (sf=2), C.SUB/XOR/OR/AND (sf=3)."""
         sf = (instr >> 10) & 0x3
         rd_rs1 = self._creg((instr >> 7) & 0x7)
-        shamt = ((instr >> 2) & 0x1F) | (((instr >> 7) & 0x1) << 5)
+        # RV64: shamt[5] 在 bit 12; bits[6:2] = shamt[4:0]
+        shamt = ((instr >> 2) & 0x1F) | (((instr >> 12) & 0x1) << 5)
         v1 = self.gprs[rd_rs1].val
 
         if sf == 0b00:
+            # C.SRLI (bit12=0) / C.SRAI (bit12=1)
             if (instr >> 12) & 0x1:
                 v1 = _sint64(_sint64(v1).value >> shamt).value & 0xFFFF_FFFF_FFFF_FFFF
             else:
                 v1 = (_uint64(v1).value >> shamt) & 0xFFFF_FFFF_FFFF_FFFF
             self.gprs[rd_rs1].val = v1
-        elif sf == 0b01:
-            imm = _sext(((instr >> 2) & 0x1F) | (((instr >> 7) & 0x1) << 5), 6)
-            self.gprs[rd_rs1].val = (v1 & imm) & 0xFFFF_FFFF_FFFF_FFFF
         elif sf == 0b10:
+            # C.ANDI — imm[5:0] = {bit12, bits[6:2]}
+            imm = _sext(((instr >> 2) & 0x1F) | (((instr >> 12) & 0x1) << 5), 6)
+            self.gprs[rd_rs1].val = (v1 & imm) & 0xFFFF_FFFF_FFFF_FFFF
+        elif sf in (0b01, 0b11):
+            # C.SUB / C.XOR / C.OR / C.AND  (sf=0b11 RV32 regs, sf=0b01 RV64 regs)
+            #   bit_6_5: 00=SUB, 01=XOR, 10=OR, 11=AND
             rs2 = self._creg((instr >> 2) & 0x7)
             v2 = self.gprs[rs2].val
             bit_6_5 = (instr >> 5) & 0x3
@@ -1122,22 +1154,30 @@ class Hart(HartWithRegs):
             ) & 0xFFFF_FFFF_FFFF_FFFF
             return 2
 
-        if funct3 in (0b010, 0b011):
+        # C.LWSP: uimm = {instr[6:5], instr[12], instr[4:2]} (4-byte aligned)
+        # C.LDSP: uimm = {instr[4:2], instr[12], instr[6:5]} (8-byte aligned)
+        if funct3 == 0b010:  # C.LWSP
             uimm = (
-                ((instr >> 2) & 0x1) << 2
-                | ((instr >> 3) & 0x7) << 3
-                | ((instr >> 6) & 0x1) << 6
+                ((instr >> 5) & 0b11) << 6
                 | ((instr >> 12) & 0x1) << 5
+                | ((instr >> 2) & 0b111) << 2
             )
             addr = (self.gprs[2].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
-            if funct3 == 0b010:
-                mem = mem_read(self,addr, 4)
-                val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
-                self.gprs[rd_rs1].val = _sext(val, 32)
-            else:
-                mem = mem_read(self,addr, 8)
-                val = sum(mem[i] << (8 * i) for i in range(8))
-                self.gprs[rd_rs1].val = val
+            mem = mem_read(self, addr, 4)
+            val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
+            self.gprs[rd_rs1].val = _sext(val, 32)
+            return 2
+
+        if funct3 == 0b011:  # C.LDSP (RV64C)
+            uimm = (
+                ((instr >> 2) & 0b111) << 6
+                | ((instr >> 12) & 0x1) << 5
+                | ((instr >> 5) & 0b11) << 3
+            )
+            addr = (self.gprs[2].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            mem = mem_read(self, addr, 8)
+            val = sum(mem[i] << (8 * i) for i in range(8))
+            self.gprs[rd_rs1].val = val
             return 2
 
         if funct3 == 0b100:
@@ -1158,21 +1198,31 @@ class Hart(HartWithRegs):
                 self.pc = target & ~1 & 0xFFFF_FFFF_FFFF_FFFF
                 return 0
             else:
-                # C.MV: rd = rs2
-                self.gprs[rd_rs1].val = self.gprs[rs2].val
+                if is_jalr:
+                    # C.ADD (bit12=1, rs2≠0): rd += rs2
+                    result = self.gprs[rd_rs1].val + self.gprs[rs2].val
+                    self.gprs[rd_rs1].val = result & 0xFFFF_FFFF_FFFF_FFFF
+                else:
+                    # C.MV (bit12=0, rs2≠0): rd = rs2
+                    self.gprs[rd_rs1].val = self.gprs[rs2].val
                 return 2
 
-        if funct3 in (0b110, 0b111):
-            # uimm[5:2] 在 bits[12:9], uimm[7:6] 在 bits[8:7]
+        # C.SWSP: uimm = {instr[8:7], instr[12:9]} (4-byte aligned)
+        # C.SDSP: uimm = {instr[9:7], instr[12:10]} (8-byte aligned)
+        if funct3 == 0b110:  # C.SWSP
             uimm = ((instr >> 9) & 0xF) << 2 | ((instr >> 7) & 0x3) << 6
             addr = (self.gprs[2].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
-            if funct3 == 0b110:
-                v = self.gprs[rs2].val & 0xFFFF_FFFF
-                data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
-            else:
-                v = self.gprs[rs2].val
-                data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-            mem_write(self,addr, data)
+            v = self.gprs[rs2].val & 0xFFFF_FFFF
+            data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
+            mem_write(self, addr, data)
+            return 2
+
+        if funct3 == 0b111:  # C.SDSP (RV64C)
+            uimm = ((instr >> 7) & 0x7) << 6 | ((instr >> 10) & 0x7) << 3
+            addr = (self.gprs[2].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            v = self.gprs[rs2].val
+            data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
+            mem_write(self, addr, data)
             return 2
 
         raise NotImplementedError(f"C2 funct3={funct3:#05b} (FLDSP/FSDSP)")

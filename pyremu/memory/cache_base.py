@@ -45,6 +45,7 @@ class CacheLineBase:
     valid: bool = False
     dirty: bool = False
     last_access: int = 0  # 全局时钟值, LRU 替换时比较
+    mdid: int = 0  # 内存域 ID (供 TEE 飞地隔离, mfence.did 按域刷新)
 
 
 class CacheBase(ABC):
@@ -193,6 +194,22 @@ class CacheBase(ABC):
             entry.valid = False
             entry.tag = 0
             entry.dirty = False
+
+    def flush_by_mdid(self, mdid: int) -> int:
+        """按内存域 ID 刷新缓存条目 — 抗侧信道.
+
+        遍历全部条目, 将 mdid 匹配的有效条目回写并失效.
+        返回被刷新的条目数.
+        """
+        count = 0
+        for entry in self._entries:
+            if entry.valid and entry.mdid == mdid:
+                self._on_evict(entry)
+                entry.valid = False
+                entry.tag = 0
+                entry.dirty = False
+                count += 1
+        return count
 
     # ----------------------------------------------------------
     #  统计

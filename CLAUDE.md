@@ -13,7 +13,7 @@ Pyremu is a RISC-V emulator written in Python (CPython 3.14). It models a multi-
 ## Commands
 
 ```bash
-# Run all tests (523 tests, 12 suites)
+# Run all tests (673 tests, 14 suites)
 # in project directory.
 make test
 
@@ -231,6 +231,11 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 
 **设计原则**: Emulator 是纯执行引擎 (无 I/O), Debugger 负责所有用户界面和状态呈现.
 
+**符号与段注释**: 反汇编输出和栈回溯自动附加符号名 (来自 ELF `.symtab`/`.dynsym`) 和
+段名 (来自 ELF section headers, 如 `.text`, `.rodata`, `.data`). 符号以黄色高亮, 段名以
+灰色显示于对应行末 `; <sym>  .text` 注释中. `_find_segment(addr)` 按地址查找所属段,
+`_resolve_symbol(syms, addr)` 查找符号名.
+
 **Tab 补全**: 动态从 `register_gpr()` / `register_fpr()` / `register_csr()` 提取名称, 加命令名综合构建 `WordCompleter`.
 
 **主要命令**:
@@ -314,7 +319,7 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 
 ## Testing
 
-523 tests across 12 files, all passing:
+673 tests across 14 files, all passing:
 
 | File | Cases | 覆盖内容 |
 |------|-------|---------|
@@ -326,13 +331,28 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 | test_amo.py | 17 | LR/SC/AMOSWAP/AMOADD/AMOXOR/AMOAND/AMOOR/AMOMIN/AMOMAX/AMOMINU/AMOMAXU (.W/.D) |
 | test_compressed.py | 19 | C0/C1/C2 全部已实现压缩指令, 含非法编码陷态 |
 | test_disasm.py | 59 | 所有指令格式反汇编 (R/I/S/B/U/J + CSR + priv + AMO + compressed) |
-| test_emulator.py | 51 | 多 hart 执行循环, 固件加载, 内存 dump, PC 推进, store 指令写入 RAM, AUIPC sign-extend 回归, M→S 模式切换, PMP 配置, WFI 低功耗等待, UART 输出, 汇编反汇编集成 |
+| test_emulator.py | 55 | 多 hart 执行循环, 固件加载, 内存 dump, PC 推进, store 指令写入 RAM, AUIPC sign-extend 回归, M→S 模式切换, PMP 配置, WFI 低功耗等待, UART 输出, 汇编反汇编集成, GPR 值规范化回归 |
 | test_bus.py | 14 | 总线读写, 设备注册与路由, PMA 检查 (RAM 范围, 设备检测, 空洞地址), try_read/try_write |
 | test_clint.py | 12 | mtime 递增, mtimecmp 定时器中断, MSIP 软件中断 |
 | test_cache_base.py | 10 | CacheBase/CacheLineBase 抽象接口 |
 | test_l2cache.py | 10 | L2Cache MESI 状态转换, 读写分配, 回写 |
+| test_mdid.py | 28 | mdid/mfence.did TEE 扩展: CSR 读写, TLB/L2 按域刷新 |
+| test_debugger.py | 220 | 调试器 REPL 命令分发, 反汇编, 断点 (addr/instr/opcode), PC 校验, 栈回溯, 符号表, info/status |
 
 ## Important design notes
+
+### GPR 值的 64-bit 规范化与 Python 位运算陷阱
+
+Python 的任意精度整数在位运算 (`|`, `&`, `^`) 中表现不同于有限位宽硬件:
+负 Python int (如 `-805306368`) 在位运算中携带无限个前导 `1`, 而 64-bit 掩码
+后的正 int (如 `0xFFFFFFFFD0000000`) 仅保留低 64 位, 两者 `==` 不相等—
+即使它们代表同一硬件 bit pattern.
+
+**当前策略**: `_sext(val, bits)` 对 `bits≤64` 归一化返回值为 `[0, 2^64)` 范围内的
+无符号 Python int. 所有 RISC-V 立即数和 32-bit 操作的结果写入 GPR 前均经过此规范化.
+使用 `_sint64()` / `_uint64()` ctypes 包装器进行有符号/无符号比较时传入规范化值同样正确.
+
+**相关修复**: [CHANGELOG.md](CHANGELOG.md) — 2026-06-19 `_sext()` 规范化 + BEQ/BNE 误判.
 
 ### CSR 写入与 property setter 副作用
 
@@ -438,9 +458,11 @@ csrw medeleg, t0
 ## Changelog
 
 关键 bug 修复记录在 [CHANGELOG.md](CHANGELOG.md) 中, 包含:
+- `_sext()` 返回负 Python int 导致 BEQ/BNE 误判 — 规范化到 `[0, 2^64)`
 - SFENCE.VMA funct12 编码错误 (0x104 → 0x120)
 - `csrw satp` 绕过 `_mmu_mode` 更新
 - TLB 不可迭代 (缺少 `__iter__`)
+- C.JALR / CSRRW 等 rd==rs1 读写竞争
 
 ## Stub modules (no implementation yet)
 
@@ -452,7 +474,7 @@ RISC-V "V" 向量扩展为 RV64 基础 ISA 增加 ~200 条向量指令, 操作�
 
 **当前状态**: 未实现。任何 V 扩展指令命中 `Opc` 枚举未覆盖的 opcode 0x57, 经 `exec_instr()` → `ValueError` → `IllInstr` 陷态。
 
-**已知影响**: `custom_opensbi_fw_payload.elf` (PLATFORM=generic 编译时启用 V 扩展) 在 `fdt_ro_probe_` 函数 (0x224bc) 使用 `vsetivli`/`vle8.v`/`vid.v` 做 FDT 字符串匹配, 触发 `IllInstr` → `_start_hang`。使用该固件时需以 `-march=rv64imac` (不带 `v`) 重编译 OpenSBI。
+**已知影响**: 本仓库中的 `custom_opensbi_fw_payload.elf` 已以 `-march=rv64imac` (不带 `v`) 重编译, 不再触发此问题. 直接从上游编译的 PLATFORM=generic 固件若启用 V 扩展仍需 `-march=rv64imac`.
 
 **实现计划 (低优先级)**:
 - Phase 1: `vsetivli` / `vsetvl` / `vsetvli` — 配置向量长度, 基本 CSR (vl/vtype/vstart/vxsat/vxrm/vcsr)
@@ -477,8 +499,8 @@ RISC-V "V" 向量扩展为 RV64 基础 ISA 增加 ~200 条向量指令, 操作�
 - `.coffer_enclave_man` (0x180000, 512 KiB): enclave 管理器占位段 (全零, 未链接实际代码)
 - `.payload` (0x200000, 8 KiB): 微型测试 payload (SBI ecall 打印)
 - 需要 `ram_base=0` 加载, FDT 通过 a1 传入 (需含 `/chosen/stdout-path`)
-- **已知问题**: 固件使用 V 扩展指令 (见上节), 需用 `-march=rv64imac` 重编译
-- 启动流程: `_start` → `fw_boot_hart`(-1) → `_try_lottery`(AMOSWAP) → PIE 重定位 → BSS 零填充 → `_scratch_init` → `fw_platform_init` → `_fdt_reloc_done`(设 `_boot_status=1`) → `_start_warm` → `sbi_init()` → `_start_hang`(WFI 空闲)
+- **已修复**: V 扩展指令已通过 `-march=rv64imac` 重编译移除; `_sext` 规范化 bug 修复后固件可成功通过 `fw_platform_init` 到达 `_start_hang`
+- 启动流程: `_start` → `fw_boot_hart`(-1) → `_try_lottery`(AMOSWAP) → PIE 重定位 → BSS 零填充 (约 800 KB, ~300K 指令) → `_scratch_init` → `fw_platform_init` (FDT 解析 `/cpus`, `/chosen`, 遍历子节点) → `_fdt_reloc_done`(设 `_boot_status=1`) → `_start_warm` → `sbi_init()` → `_start_hang`(WFI 空闲)
 
 ## Code style
 

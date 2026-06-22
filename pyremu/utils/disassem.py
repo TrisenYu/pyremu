@@ -39,7 +39,11 @@ _UNKNOWN = "<unknown opcode>"
 
 
 def _fmt_imm(val: int) -> str:
-    """格式化指令立即数: 有符号十进制."""
+    """格式化指令立即数: 有符号十进制 (处理 64-bit 规范化值)."""
+    # _sext 规范化后, 负立即数以 64-bit 无符号形式传入.
+    # 若 bit 63 置位则还原为有符号显示 (例如 0xFF…F0 → -16).
+    if val >= (1 << 63):
+        val = val - (1 << 64)
     return str(val)
 
 
@@ -305,6 +309,7 @@ _PRIV_MNEMONIC: dict[int, str] = {
     0x102: "sret",
     0x105: "wfi",
     0x120: "sfence.vma",
+    0x5A0: "mfence.did",
 }
 
 
@@ -600,20 +605,18 @@ def _dis_compressed(
             return f"c.add   {rd_name_q2}, {rs2_name}"
 
         if funct3 == 0b110:  # C.SWSP
-            # offset = {inst[6:5], inst[12], inst[4:2], 00} (同 C.LWSP)
+            # offset = {inst[8:7], inst[12:9], 00}  (4-byte aligned)
             uimm = (
-                ((c16 >> 5) & 0b11) << 6
-                | ((c16 >> 12) & 1) << 5
-                | ((c16 >> 2) & 0b111) << 2
+                ((c16 >> 7) & 0b11) << 6
+                | ((c16 >> 9) & 0b1111) << 2
             )
             return f"c.swsp  {rs2_name}, {uimm}(sp)"
 
         if funct3 == 0b111:  # C.SDSP (RV64)
-            # offset = {inst[4:2], inst[12], inst[6:5], 000} (同 C.LDSP)
+            # offset = {inst[9:7], inst[12:10], 000}  (8-byte aligned)
             uimm = (
-                ((c16 >> 2) & 0b111) << 6
-                | ((c16 >> 12) & 1) << 5
-                | ((c16 >> 5) & 0b11) << 3
+                ((c16 >> 7) & 0b111) << 6
+                | ((c16 >> 10) & 0b111) << 3
             )
             return f"c.sdsp  {rs2_name}, {uimm}(sp)"
 
