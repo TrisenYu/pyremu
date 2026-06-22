@@ -16,10 +16,10 @@
     PE:  MZ (0x4D 0x5A)
     其他: 视为 raw binary
 """
-from copy import deepcopy
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
+
 import lief
 
 from pyremu.utils.wrapper import seize_err_if_any
@@ -134,12 +134,12 @@ def _parse_elf(
 
     # 提取已定义的具名符号 (函数/变量名 → 地址)
     symbols: dict[str, int] = {}
-    
+
     for exp in binary.symtab_symbols:
         tmp = str(exp.name)
         if len(tmp) > 0:
             symbols[tmp] = exp.value
-            
+
     for exp in binary.dynamic_symbols:
         tmp = str(exp.name)
         if len(tmp) > 0:
@@ -192,7 +192,7 @@ def _parse_pe(
 
     # 提取导出符号 (函数/变量名 → 地址)
     symbols: dict[str, int] = {}
-    
+
     for exp in binary.get_export().entries:
         tmp = str(exp.name)
         if len(tmp) > 0:

@@ -7,13 +7,13 @@
 
 import pytest
 
-from pyremu.core.mem_check_aux import inject_memory_backend
-from pyremu.core.trap_handler import deliver_trap
 from pyremu.core.decoder import (
     AmoFunct5,
     AmoWidth,
     Hart,
 )
+from pyremu.core.mem_check_aux import inject_memory_backend
+from pyremu.core.trap_handler import deliver_trap
 
 
 def _make_amo_instr(op: AmoFunct5, width: AmoWidth, rd: int, rs1: int, rs2: int) -> int:
@@ -116,7 +116,9 @@ class TestAMOArithmetic:
         inject_memory_backend(h, rf, wf)
         return h
 
-    def _setup_mem_and_regs(self, hart, addr: int, mem_val: int, op_val: int, is_64: bool = True):
+    def _setup_mem_and_regs(
+        self, hart, addr: int, mem_val: int, op_val: int, is_64: bool = True
+    ):
         """准备内存和寄存器."""
         width = AmoWidth.D if is_64 else AmoWidth.W
         byte_len = 8 if is_64 else 4
@@ -127,8 +129,10 @@ class TestAMOArithmetic:
         hart._mem_write_phy(addr, data)
         return width, mask
 
-    def _do_amo(self, hart, op: AmoFunct5, addr: int, mem_val: int, op_val: int, expected_result: int,
-                expected_rd: int, is_64: bool = True):
+    def _do_amo(
+        self, hart, op: AmoFunct5, addr: int, mem_val: int, op_val: int,
+        expected_result: int, expected_rd: int, is_64: bool = True,
+    ):
         width, mask = self._setup_mem_and_regs(hart, addr, mem_val, op_val, is_64)
         instr = _make_amo_instr(op, width, rd=15, rs1=10, rs2=12)
         hart.exec_instr(instr)
@@ -298,7 +302,7 @@ class TestReservationInvalidation:
         h = Hart(id=0)
         h.set_reservation(0x4000)
         assert h.reservation_valid
-        deliver_trap(h, 
+        deliver_trap(h,
             __import__("pyremu.core.trap", fromlist=["TrapType"]).TrapType.IllInstr,
             is_interrupt=False,
         )

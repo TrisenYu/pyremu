@@ -7,21 +7,27 @@
 
 import pytest
 
-from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.decoder import Hart, Opc
 from pyremu.core.hart import (
     MSTATUS_MIE,
     MSTATUS_SIE,
     MSTATUS_TW,
-    HartWithRegs,
     RiscvMode,
 )
+from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.trap import TrapType, trap_cause_code, trap_is_interrupt
+from pyremu.core.trap_handler import (
+    check_pending_interrupts,
+    deliver_trap,
+    trap_ebreak,
+    trap_ecall,
+    trap_mret,
+    trap_sret,
+)
 from pyremu.emulator import Emulator
 from pyremu.interrupt.clint import CLINT
 from pyremu.memory.bus import Bus
 from pyremu.platform import PeripheralConfig, PlatformConfig
-from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap, handle_wfi, trap_ebreak, trap_ecall, trap_mret, trap_sret
 
 # ============================================================
 #  trap_cause_code / trap_is_interrupt
@@ -538,7 +544,6 @@ class TestSfenceVma:
 
     def test_sfence_vma_rejects_wrong_funct12(self):
         """错误的 funct12 编码 (如旧的 0x104) 应触发 IllInstr (mcause=2)."""
-        from pyremu.core.trap import trap_cause_code
 
         h = Hart(id=0)
         # 0x104 是旧代码中错误的 funct12 — 不是合法的特权指令编码

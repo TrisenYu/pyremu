@@ -20,6 +20,7 @@ def _make_emu(*procs: str):
         pytest.skip(f"{KERNEL_ELF} 不存在, 先运行 make -C tests/src-env build-multi")
 
     kernel = parse_firmware(str(KERNEL_ELF))
+    assert kernel is not None, f"{KERNEL_ELF} 解析失败"
     emu = Emulator(PlatformConfig.qemu_virt())
     emu.load_firmware(kernel)
     loader = MultiProgramLoader(emu, kernel)

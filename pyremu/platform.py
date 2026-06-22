@@ -55,7 +55,7 @@ class PlatformConfig:
         num_harts: hart 数量 (1–8).
         ram_size: 物理 RAM 大小 (字节).
         ram_base: 物理 RAM 起始地址.
-        reset_vector: 上电复位入口地址.
+        prog_cnt: 程序计数器 — 上电复位入口地址.
         l2_size: L2 缓存大小 (字节).
         isa: RISC-V ISA 字符串 (例: ``'rv64ima'``).
         timebase_freq: mtime 计数器频率 (Hz).
@@ -65,7 +65,7 @@ class PlatformConfig:
     num_harts: int = 1
     ram_size: int = 128 * 1024 * 1024  # 128 MiB
     ram_base: int = 0x8000_0000
-    reset_vector: int = 0x8000_0000
+    prog_cnt: int = 0x8000_0000
     l2_size: int = 256 * 1024  # 256 KiB
 
     isa: str = "rv64ima"
@@ -178,7 +178,7 @@ class PlatformConfig:
         return cls(
             num_harts=1,
             ram_base=0x0000_0000,
-            reset_vector=0x0000_0000,
+            prog_cnt=0x0000_0000,
             periph=PeripheralConfig(
                 uart_base=0x1000_0000,
                 spi_base=0,

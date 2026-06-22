@@ -52,7 +52,10 @@ select = [
 ]
 ignore=[
     "E731",
-    "PLR2004"
+    "PLR2004", "PLR0911", "PLR0912", "PLR0913", "PLR0915",
+    "PLR1714", "PLR1730", "PLC0415", "PERF401",
+    "N801", "N806", "N815", "N816",
+    "E501"
 ]
 
 [tool.ruff.lint.pylint]

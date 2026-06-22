@@ -181,7 +181,6 @@ class Pmp:
 
     def _read_cfg(self, idx: int) -> int:
         """读取第 *idx* 个 PMP 条目的 8-bit 配置."""
-        cfg_idx = idx // 4  # 每个 pmpcfg 存 4 个条目 (RV32), 或 8 个 (RV64)
         # RV64: 仅偶数编号的 pmpcfg 有效 (存储 8 条目)
         # 简化: 统一用 RV64 模型 — 按 8 条目编组
         cfg_reg = (idx // 8) * 2  # pmpcfg0, pmpcfg2, pmpcfg4, ...

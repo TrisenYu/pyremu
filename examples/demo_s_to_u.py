@@ -77,7 +77,7 @@ def demo_well_behaved(emu: Emulator, fw) -> None:
                     f"    {tag} pc=0x{f.pc:08x} fp=0x{f.fp:08x}"
                     f" ra=0x{f.ra:08x}"
                 )
-            print(f"    fib(3) → fib(4) → fib(5) 调用链可见 ✓")
+            print("    fib(3) → fib(4) → fib(5) 调用链可见 ✓")
 
         # 完成后退出
         if uart.tx_data().count(b"Enter") >= 2:

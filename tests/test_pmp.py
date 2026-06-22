@@ -7,11 +7,10 @@
 
 import pytest
 
-from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
+from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.memory.pmp import Pmp
-
 
 # ============================================================
 #  NAPOT 编解码
@@ -313,7 +312,6 @@ class TestPmpInHart:
 
     def test_umode_store_pmp_rw_ok(self, hart):
         """U 模式, PMP 允许 RW → store 成功."""
-        from pyremu.memory.pmp import PMP_A_NAPOT, PMP_R, PMP_W
 
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=True)
         hart.mode = RiscvMode.U
@@ -322,7 +320,6 @@ class TestPmpInHart:
 
     def test_umode_store_pmp_w_denied(self, hart):
         """U 模式, PMP W=0 → StAccessFault."""
-        from pyremu.memory.pmp import PMP_A_NAPOT, PMP_R
 
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=False)
         hart.mode = RiscvMode.U
@@ -331,7 +328,6 @@ class TestPmpInHart:
 
     def test_umode_load_pmp_r_denied(self, hart):
         """U 模式, PMP R=0 → LdAccessFault."""
-        from pyremu.memory.pmp import PMP_A_NAPOT, PMP_W
 
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=False, w=True)
         hart.mode = RiscvMode.U
@@ -344,4 +340,4 @@ class TestPmpInHart:
 
 
 # 复用 pmp.py 的常量
-from pyremu.memory.pmp import PMP_A_NAPOT, PMP_A_TOR, PMP_R, PMP_W, PMP_X  # noqa: E402
+from pyremu.memory.pmp import PMP_A_NAPOT, PMP_R, PMP_W  # noqa: E402

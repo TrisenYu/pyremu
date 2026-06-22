@@ -7,8 +7,11 @@
 
 import pytest
 
-from pyremu.emulator import Emulator
+from pyremu.core.decoder import Hart
+from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.trap_handler import check_pending_interrupts
+from pyremu.emulator import Emulator
+from pyremu.memory.bus import Bus
 
 
 class TestEmulatorInit:
@@ -19,7 +22,7 @@ class TestEmulatorInit:
         emu = Emulator(num_harts=1)
         assert emu.num_harts == 1
         assert len(emu.harts) == 1
-        assert emu.harts[0].pc == emu.reset_vector
+        assert emu.harts[0].pc == emu.prog_cnt
 
     def test_four_harts(self):
         """4 hart 初始化."""
@@ -28,14 +31,14 @@ class TestEmulatorInit:
         assert len(emu.harts) == 4
         for i, h in enumerate(emu.harts):
             assert h.id == i
-            assert h.pc == emu.reset_vector
+            assert h.pc == emu.prog_cnt
 
     def test_eight_harts(self):
         """8 hart 初始化, 每个 hart 有独立寄存器和相同复位向量."""
         emu = Emulator(num_harts=8)
         assert emu.num_harts == 8
         for h in emu.harts:
-            assert h.pc == emu.reset_vector
+            assert h.pc == emu.prog_cnt
             assert h.gprs[0].val == 0  # x0 始终为 0
             assert h.mode.name == "M"  # 复位后为 M 模式
 
@@ -62,7 +65,7 @@ class TestEmulatorExecution:
 
     def test_step_executes_all_harts(self):
         """step() 每个 hart 执行一条指令."""
-        emu = Emulator(num_harts=4, reset_vector=0x1000)
+        emu = Emulator(num_harts=4, prog_cnt=0x1000)
         # 载入 NOP 指令 (ADDI x0, x0, 0 = 0x00000013)
         emu.load_code(0x1000, b"\x13\x00\x00\x00")
         initial_pc = emu.harts[0].pc
@@ -74,7 +77,7 @@ class TestEmulatorExecution:
 
     def test_pc_advances_per_step(self):
         """每条 ADDI x0,x0,0 后 PC 推进 4 字节."""
-        emu = Emulator(num_harts=1, reset_vector=0x1000)
+        emu = Emulator(num_harts=1, prog_cnt=0x1000)
         # 载入多条 NOP 保证有足够的指令
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
         assert emu.harts[0].pc == 0x1000
@@ -85,7 +88,7 @@ class TestEmulatorExecution:
 
     def test_hart_gpr_write_independent(self):
         """hart 间寄存器独立: hart 0 写 x5, 不影响 hart 1 的 x5."""
-        emu = Emulator(num_harts=4, reset_vector=0x1000)
+        emu = Emulator(num_harts=4, prog_cnt=0x1000)
         # ADDI x5, x10, 0 → x5 = x10 (每条 hart 的 x10 不同)
         # Instr: imm[11:0]=0, rs1=x10, funct3=000, rd=x5, op=0010011
         instr = (0 << 20) | (10 << 15) | (5 << 7) | 0b0010011
@@ -101,13 +104,43 @@ class TestEmulatorExecution:
         assert emu.harts[2].gprs[5].val == 200
         assert emu.harts[3].gprs[5].val == 300
 
+    def test_read_gpr_by_name(self):
+        """Hart.read_gpr_by_name 按名称/别名查找 GPR."""
+        emu = Emulator()
+        h = emu.harts[0]
+        h.write_gpr(10, 0x1234_5678_9ABC)
+        # 按 x 编号
+        assert h.read_gpr_by_name("x10") == 0x1234_5678_9ABC
+        # 按 ABI 别名
+        assert h.read_gpr_by_name("a0") == 0x1234_5678_9ABC
+        # zero 永远为 0
+        assert h.read_gpr_by_name("zero") == 0
+        assert h.read_gpr_by_name("x0") == 0
+        # 不存在 → 0
+        assert h.read_gpr_by_name("nonexistent") == 0
+
+    def test_read_csr_by_name(self):
+        """Hart.read_csr_by_name 按名称查找 CSR."""
+        emu = Emulator()
+        h = emu.harts[0]
+        # mtvec 默认值 0
+        assert h.read_csr_by_name("mtvec") == 0
+        # 写 CSR 后读取
+        h.csrs["mtvec"].val = 0x378
+        assert h.read_csr_by_name("mtvec") == 0x378
+        # mstatus
+        h.csrs["mstatus"].val = 0x1800
+        assert h.read_csr_by_name("mstatus") == 0x1800
+        # 不存在 → 0
+        assert h.read_csr_by_name("nonexistent") == 0
+
 
 class TestEmulatorIPI:
     """多 hart 间 IPI (核间中断)."""
 
     def test_ipi_pending_detection(self):
         """CLINT send_ipi → hart 检测到待处理 MSIP."""
-        emu = Emulator(num_harts=4, reset_vector=0x1000)
+        emu = Emulator(num_harts=4, prog_cnt=0x1000)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
 
         # 开启 hart 1 的中断
@@ -124,7 +157,7 @@ class TestEmulatorIPI:
 
     def test_ipi_diverges_hart_pc(self):
         """IPI 导致目标 hart 跳转到 mtvec, 与其他 hart 的 PC 不同."""
-        emu = Emulator(num_harts=4, reset_vector=0x1000)
+        emu = Emulator(num_harts=4, prog_cnt=0x1000)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
 
         # 所有 hart 相同的初始 PC
@@ -151,16 +184,16 @@ class TestEmulatorIPI:
 
     def test_ipi_causes_trap_context_save(self):
         """IPI trap 应正确保存上下文."""
-        emu = Emulator(num_harts=4, reset_vector=0x1000)
+        emu = Emulator(num_harts=4, prog_cnt=0x1000)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
 
         h = emu.harts[2]
         h.mie = True
         h.csrs["mie"].val = 1 << 3
         h.csrs["mtvec"].val = 0x80000000
-        saved_pc = h.pc  # 0x1000
 
         emu.clint.send_ipi(2)
+        saved_pc = h.pc
         emu.step()
 
         # 中断在指令边界触发, mepc 保存下一条指令的 PC
@@ -179,7 +212,7 @@ class TestEmulatorAMOCompetition:
 
     def test_lr_sc_competition(self):
         """hart 0 做 LR, hart 1 写同地址, hart 0 的 SC 应失败."""
-        emu = Emulator(num_harts=2, reset_vector=0x1000)
+        emu = Emulator(num_harts=2, prog_cnt=0x1000)
 
         # hart 0: LR.D x5, (x10) → SC.D x5, x6, (x10)
         # 先载入代码片段...
@@ -201,7 +234,7 @@ class TestEmulatorAMOCompetition:
 
     def test_memory_shared_between_harts(self):
         """两个 hart 通过共享内存通信."""
-        emu = Emulator(num_harts=2, reset_vector=0x1000)
+        emu = Emulator(num_harts=2, prog_cnt=0x1000)
 
         # hart 0 写内存
         emu.bus.write(0x5000, b"\xCA\xFE\xBA\xBE\x00\x00\x00\x00")
@@ -216,7 +249,7 @@ class TestEmulatorState:
 
     def test_dump_hart_regs(self):
         """dump_hart_regs 导出关键状态."""
-        emu = Emulator(num_harts=2, reset_vector=0x80000000)
+        emu = Emulator(num_harts=2, prog_cnt=0x80000000)
         regs = emu.dump_hart_regs(0)
         assert regs["hart_id"] == 0
         assert regs["pc"] == 0x80000000
@@ -325,7 +358,7 @@ class TestMDivideByZero:
 
     @pytest.fixture
     def emu(self) -> Emulator:
-        return Emulator(num_harts=1, ram_base=0, reset_vector=0x1000)
+        return Emulator(num_harts=1, ram_base=0, prog_cnt=0x1000)
 
     def _exec_rtype(self, emu, funct3: int, funct7: int, rd: int, rs1: int, rs2: int):
         """执行一条 R-type 指令并返回目标寄存器结果."""
@@ -535,10 +568,6 @@ class TestITypeShifts:
 
     @pytest.fixture
     def h(self):
-        from pyremu.core.decoder import Hart
-        from pyremu.core.mem_check_aux import inject_memory_backend
-        from pyremu.memory.bus import Bus
-
         bus = Bus(ram_size=0x10000, ram_base=0x80000000)
         hart = Hart(id=0)
         inject_memory_backend(hart, bus.read, bus.write)
@@ -651,3 +680,301 @@ class TestITypeShifts:
         advance = h.exec_instr(bad)
         assert advance == 0
         assert h.mcause_val != 0
+
+
+class TestRegValueCanonicalization:
+    """回归: 不同指令路径产生的相同 64-bit 值必须在 Python 中 == 相等.
+
+    SLLIW 通过 _sext 返回负 Python int 时, 与 LUI+ADDI 产生的正 64-bit 值
+    在 Python == 比较中不相等, 导致 BEQ/BNE 误判. 此测试验证修复.
+    """
+
+    @pytest.fixture
+    def h(self):
+        bus = Bus(ram_size=0x10000, ram_base=0x80000000)
+        hart = Hart(id=0)
+        inject_memory_backend(hart, bus.read, bus.write)
+        hart.bus = bus
+        hart.pc = 0x80000000
+        return hart
+
+    # -- helpers --
+
+    @staticmethod
+    def _addi(rd, rs1, imm12):
+        return (imm12 << 20) | (rs1 << 15) | (0b000 << 12) | (rd << 7) | 0b0010011
+
+    @staticmethod
+    def _slliw(rd, rs1, shamt):
+        """slliw rd, rs1, shamt — RV64 32-bit word shift left."""
+        return (
+            (0b0000000 << 25)      # funct7
+            | (shamt << 20)         # 5-bit shamt
+            | (rs1 << 15)
+            | (0b001 << 12)         # funct3
+            | (rd << 7)
+            | 0b0011011             # opcode OP-IMM32
+        )
+
+    @staticmethod
+    def _slli(rd, rs1, shamt):
+        return (
+            (0b000000 << 26) | (shamt << 20) | (rs1 << 15)
+            | (0b001 << 12) | (rd << 7) | 0b0010011
+        )
+
+    @staticmethod
+    def _or(rd, rs1, rs2):
+        return (rs2 << 20) | (rs1 << 15) | (0b110 << 12) | (rd << 7) | 0b0110011
+
+    @staticmethod
+    def _lui(rd, imm20):
+        return (imm20 << 12) | (rd << 7) | 0b0110111
+
+    @staticmethod
+    def _beq(rs1, rs2, offset_imm):
+        """beq rs1, rs2, offset — B-type."""
+        # B-type immediate encoding
+        imm = offset_imm & 0x1FFF  # 13-bit signed
+        b_imm = (
+            ((imm >> 12) & 1) << 31
+            | ((imm >> 5) & 0x3F) << 25
+            | (rs2 << 20) | (rs1 << 15)
+            | (0b000 << 12)
+            | ((imm >> 1) & 0xF) << 8
+            | ((imm >> 11) & 1) << 7
+            | 0b1100011
+        )
+        return b_imm
+
+    @staticmethod
+    def _bne(rs1, rs2, offset_imm):
+        imm = offset_imm & 0x1FFF
+        b_imm = (
+            ((imm >> 12) & 1) << 31
+            | ((imm >> 5) & 0x3F) << 25
+            | (rs2 << 20) | (rs1 << 15)
+            | (0b001 << 12)
+            | ((imm >> 1) & 0xF) << 8
+            | ((imm >> 11) & 1) << 7
+            | 0b1100011
+        )
+        return b_imm
+
+    def _exec(self, hart, instr):
+        """Execute one instruction and advance PC if the handler didn't."""
+        saved_pc = hart.pc
+        advance = hart.exec_instr(instr)
+        # If handler returned an advance (not 0), increment PC.
+        # The handler may have already changed PC (branches/jumps); if so,
+        # advance is 0 and we don't touch PC.
+        if advance != 0 and hart.pc == saved_pc:
+            hart.pc = (saved_pc + advance) & 0xFFFF_FFFF_FFFF_FFFF
+
+    # -- tests --
+
+    def test_slliw_produces_64bit_canonical(self, h):
+        """SLLIW 结果应为规范化的 64-bit 无符号值, 不是负 Python int."""
+        # 模拟固件中 slliw a1, a1, 24 的操作 (a1 = 0xd0)
+        h.gprs[11].val = 0xD0
+        self._exec(h, self._slliw(11, 11, 24))
+        result = h.gprs[11].val
+        # 硬件上应为 0xFFFFFFFFD0000000 (64-bit unsigned)
+        assert result == 0xFFFFFFFFD0000000, (
+            f"slliw result: {result:#018x}, expected 0xffffffffd0000000"
+        )
+        # 关键回归: 结果必须是规范化的 64-bit 值 (非负 Python int)
+        assert result >= 0, f"slliw produced negative value: {result}"
+        assert result < (1 << 64), f"slliw produced overflow: {result}"
+
+    def test_slliw_and_lui_produce_equal_values(self, h):
+        """通过 SLLIW+OR 组合和 LUI+ADDI 构建相同值, 必须 == 相等."""
+        # 路径 1: 模拟固件中构造 0xFFFFFFFFD00DFEED 的 SLLIW 路径
+        h.gprs[11].val = 0xD0
+        self._exec(h, self._slliw(11, 11, 24))           # a1 = 0xFFFFFFFFD0000000
+        h.gprs[12].val = 0x0D
+        self._exec(h, self._slli(12, 12, 16))             # a2 = 0x0D0000
+        self._exec(h, self._or(13, 12, 11))               # a3 = a2 | a1 = 0xFFFFFFFFD00D0000
+        h.gprs[14].val = 0xFE
+        self._exec(h, self._slli(14, 14, 8))              # a4 = 0xFE00
+        self._exec(h, self._addi(14, 14, 0xED))           # a4 = 0xFEED (a4 = a4 + 0xED)
+        self._exec(h, self._or(15, 13, 14))               # a5 = 0xFFFFFFFFD00DFEED
+        via_slliw = h.gprs[15].val
+
+        # 路径 2: 通过 LUI+ADDI 构建同一值
+        self._exec(h, self._lui(16, 0xD00E0))             # a6 = 0xFFFFFFFFD00E0000
+        self._exec(h, self._addi(16, 16, -0x113))         # a6 = 0xFFFFFFFFD00DFEED
+        via_lui = h.gprs[16].val
+
+        assert via_slliw == via_lui, (
+            f"via SLLIW: {via_slliw:#018x}, via LUI: {via_lui:#018x}"
+        )
+
+    def test_beq_with_values_from_different_paths(self, h):
+        """BEQ 应正确判定不同路径构建的相等值."""
+        # 构建 0xFFFFFFFFD00DFEED 通过 SLLIW 路径
+        h.gprs[11].val = 0xD0
+        self._exec(h, self._slliw(11, 11, 24))
+        h.gprs[12].val = 0x0D
+        self._exec(h, self._slli(12, 12, 16))
+        self._exec(h, self._or(13, 12, 11))
+        h.gprs[14].val = 0xFE
+        self._exec(h, self._slli(14, 14, 8))
+        self._exec(h, self._addi(14, 14, 0xED))
+        self._exec(h, self._or(15, 13, 14))
+
+        # 构建相同值通过 LUI 路径
+        self._exec(h, self._lui(16, 0xD00E0))
+        self._exec(h, self._addi(16, 16, -0x113))
+
+        # BEQ x15, x16, +8 (跳过下一条, 即 success)
+        h.pc = 0x80000100
+        self._exec(h, self._beq(15, 16, 8))
+        # 分支应被采用 (相等), PC 跳转 +8
+        assert h.pc == 0x80000108, (
+            f"BEQ should be taken for equal values, PC={h.pc:#x}"
+        )
+
+    def test_bne_with_values_from_different_paths(self, h):
+        """BNE 应正确判定不同路径构建的相等值 (不应分支)."""
+        # 构建同一值两次 (通过不同路径)
+        h.gprs[11].val = 0xD0
+        self._exec(h, self._slliw(11, 11, 24))
+        h.gprs[12].val = 0x0D
+        self._exec(h, self._slli(12, 12, 16))
+        self._exec(h, self._or(13, 12, 11))
+        h.gprs[14].val = 0xFE
+        self._exec(h, self._slli(14, 14, 8))
+        self._exec(h, self._addi(14, 14, 0xED))
+        self._exec(h, self._or(15, 13, 14))
+
+        self._exec(h, self._lui(16, 0xD00E0))
+        self._exec(h, self._addi(16, 16, -0x113))
+
+        # 验证值相等
+        assert h.gprs[15].val == h.gprs[16].val
+
+        # BNE x15, x16, +8 — 值相等, 不应分支
+        h.pc = 0x80000200
+        self._exec(h, self._bne(15, 16, 8))
+        assert h.pc == 0x80000204, (
+            f"BNE should NOT be taken for equal values, PC={h.pc:#x}"
+        )
+
+
+class TestUartFlush:
+    """UART 行缓冲: 多 hart 输出按 \\n 分列刷新, flush_all 强制刷新."""
+
+    @staticmethod
+    def _sb(rs1: int, rs2: int, imm: int) -> int:
+        """构造 SB (store byte) 指令."""
+        imm12 = imm & 0xFFF
+        return (
+            ((imm12 >> 5) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (0b000 << 12)
+            | ((imm12 & 0x1F) << 7)
+            | 0b0100011
+        )
+
+    @staticmethod
+    def _lui(rd: int, imm20: int) -> int:
+        """构造 LUI 指令."""
+        return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | 0b0110111
+
+    def test_newline_triggers_immediate_flush(self):
+        """写 \\n 时 _write_reg 立即触发刷新, 不依赖外部 flush_all."""
+        emu = Emulator(num_harts=1, ram_size=128 * 1024 * 1024)
+        captured: list[str] = []
+
+        def cap(text: str) -> None:
+            captured.append(text)
+
+        assert emu.uart is not None
+        emu.uart._tx_callback = cap
+        hart = emu.harts[0]
+
+        # x11 = '\n' (0x0A)
+        hart.gprs[11].val = 0x0A
+        hart.pc = 0x80000000
+        code = (
+            self._lui(10, 0x10000).to_bytes(4, "little")
+            + self._sb(10, 11, 0).to_bytes(4, "little")
+        )
+        emu.bus.write(0x80000000, code)
+
+        emu.step()  # LUI
+        emu.step()  # SB — 写入 '\n'
+
+        # \n 在 _write_reg 中触发即时刷新
+        assert len(captured) >= 1, (
+            f"写 \\n 应产生输出, 实际捕获: {captured}"
+        )
+
+    def test_data_stays_buffered_until_newline_or_flush(self):
+        """写非 \\n 字符时数据留在行缓冲中, 直到 \\n 或 flush_all 才输出."""
+        emu = Emulator(num_harts=1, ram_size=128 * 1024 * 1024)
+        assert emu.uart is not None
+        captured: list[str] = []
+
+        def cap(text: str) -> None:
+            captured.append(text)
+
+        emu.uart._tx_callback = cap
+        hart = emu.harts[0]
+
+        uart_base = 0x10000000
+        code_addr = 0x80000000
+        lui_imm = (uart_base >> 12) & 0xFFFFF
+        code = (
+            self._lui(10, lui_imm).to_bytes(4, "little")
+            + self._sb(10, 11, 0).to_bytes(4, "little")
+        )
+        emu.bus.write(code_addr, code)
+        hart.gprs[11].val = 0x41  # 'A'
+        hart.pc = code_addr
+
+        emu.step()  # LUI
+        emu.step()  # SB — 写入 'A' 到 UART, 无 \n 不刷新
+
+        # emu.step() 设置了 writer, 'A' 被行缓冲, 不应立即输出
+        assert len(captured) == 0, (
+            f"无 \\n 时不应立即输出, 实际: {captured}"
+        )
+
+        # flush_all 强制刷新, 'A' 应被输出
+        emu.uart.flush_all()
+        assert len(captured) > 0, (
+            f"flush_all 后应有输出, 实际: {captured}"
+        )
+        assert "A" in "".join(captured), (
+            f"应输出 'A', 实际: {captured}"
+        )
+
+    def test_flush_all_clears_all_hart_buffers(self):
+        """flush_all() 应清空所有 hart 的行缓冲并产生输出."""
+        emu = Emulator(num_harts=2, ram_size=128 * 1024 * 1024)
+        assert emu.uart is not None
+        captured: list[str] = []
+
+        def cap(text: str) -> None:
+            captured.append(text)
+
+        emu.uart._tx_callback = cap
+
+        # 模拟两个 hart 各自写入无 \\n 的字符
+        emu.uart.set_writer(0)
+        emu.bus.write(0x10000000, b"X")
+        emu.uart.set_writer(1)
+        emu.bus.write(0x10000000, b"Y")
+
+        assert len(emu.uart._line_bufs.get(0, [])) == 1
+        assert len(emu.uart._line_bufs.get(1, [])) == 1
+
+        emu.uart.flush_all()
+        assert len(emu.uart._line_bufs.get(0, [])) == 0
+        assert len(emu.uart._line_bufs.get(1, [])) == 0
+        assert len(captured) >= 2, (
+            f"应输出两个 hart 的内容, 实际: {captured}"
+        )

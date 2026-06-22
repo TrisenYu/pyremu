@@ -15,23 +15,22 @@ RISC-V RV64 反汇编器.
 from pyremu.core.decoder import (
     AmoFunct5,
     AmoWidth,
+    BrFunct3,
     Opc,
-    brFn3,
-    ldFn3,
+    StFunct3,
     parse_compressed,
     parse_func3,
     parse_func6,
     parse_func7,
     parse_imm12_se,
+    parse_imm20_raw,
     parse_imm_b,
     parse_imm_j,
     parse_imm_s,
-    parse_imm20_raw,
     parse_opcode,
     parse_rd,
     parse_rs1,
     parse_rs2,
-    stFn3,
 )
 from pyremu.core.registers import check_csr, gpr_name
 
@@ -39,7 +38,11 @@ _UNKNOWN = "<unknown opcode>"
 
 
 def _fmt_imm(val: int) -> str:
-    """格式化指令立即数: 有符号十进制."""
+    """格式化指令立即数: 有符号十进制 (处理 64-bit 规范化值)."""
+    # _sext 规范化后, 负立即数以 64-bit 无符号形式传入.
+    # 若 bit 63 置位则还原为有符号显示 (例如 0xFF…F0 → -16).
+    if val >= (1 << 63):
+        val = val - (1 << 64)
     return str(val)
 
 
@@ -91,7 +94,7 @@ def _dis_rtype(instr: int) -> str:
 
 
 # ============================================================
-#  I-type ALU (opImm)
+#  I-type ALU (OP_IMM)
 # ============================================================
 
 _IMM_FUNCT3_MAP: dict[int, str] = {
@@ -122,7 +125,6 @@ def _dis_itype(instr: int) -> str:
             return f"srai    {_rd(instr)}, {_rs1(instr)}, {shamt}"
         return _UNKNOWN
 
-    f7 = parse_func7(instr)  # 非 shift I-type 才使用 funct7
 
     mnemonic = _IMM_FUNCT3_MAP.get(f3)
     if mnemonic is None:
@@ -207,7 +209,7 @@ def _dis_store(instr: int) -> str:
     """Store: mnemonic rs2, offset(rs1)."""
     f3 = parse_func3(instr)
     try:
-        mnemonic = stFn3(f3).name
+        mnemonic = StFunct3(f3).name
     except ValueError:
         return _UNKNOWN
     offset = parse_imm_s(instr)
@@ -222,7 +224,7 @@ def _dis_branch(instr: int, pc: int) -> str:
     """Branch: mnemonic rs1, rs2, target_addr."""
     f3 = parse_func3(instr)
     try:
-        mnemonic = brFn3(f3).name
+        mnemonic = BrFunct3(f3).name
     except ValueError:
         return _UNKNOWN
     offset = parse_imm_b(instr)
@@ -305,6 +307,7 @@ _PRIV_MNEMONIC: dict[int, str] = {
     0x102: "sret",
     0x105: "wfi",
     0x120: "sfence.vma",
+    0x5A0: "mfence.did",
 }
 
 
@@ -600,20 +603,18 @@ def _dis_compressed(
             return f"c.add   {rd_name_q2}, {rs2_name}"
 
         if funct3 == 0b110:  # C.SWSP
-            # offset = {inst[6:5], inst[12], inst[4:2], 00} (同 C.LWSP)
+            # offset = {inst[8:7], inst[12:9], 00}  (4-byte aligned)
             uimm = (
-                ((c16 >> 5) & 0b11) << 6
-                | ((c16 >> 12) & 1) << 5
-                | ((c16 >> 2) & 0b111) << 2
+                ((c16 >> 7) & 0b11) << 6
+                | ((c16 >> 9) & 0b1111) << 2
             )
             return f"c.swsp  {rs2_name}, {uimm}(sp)"
 
         if funct3 == 0b111:  # C.SDSP (RV64)
-            # offset = {inst[4:2], inst[12], inst[6:5], 000} (同 C.LDSP)
+            # offset = {inst[9:7], inst[12:10], 000}  (8-byte aligned)
             uimm = (
-                ((c16 >> 2) & 0b111) << 6
-                | ((c16 >> 12) & 1) << 5
-                | ((c16 >> 5) & 0b11) << 3
+                ((c16 >> 7) & 0b111) << 6
+                | ((c16 >> 10) & 0b111) << 3
             )
             return f"c.sdsp  {rs2_name}, {uimm}(sp)"
 
@@ -648,16 +649,16 @@ def disasm(
     try:
         opc = Opc(parse_opcode(instr))
     except ValueError:
-        # opImm32 (0b00110_11) 不在 Opc enum 中, 单独处理
+        # OP_IMM32 (0b00110_11) 不在 Opc enum 中, 单独处理
         if parse_opcode(instr) == 0b00110_11:
             return _dis_op_imm32(instr)
         return _UNKNOWN
 
     if opc == Opc.op:
         return _dis_rtype(instr)
-    if opc == Opc.opImm:
+    if opc == Opc.OP_IMM:
         return _dis_itype(instr)
-    if opc == Opc.opImm32:
+    if opc == Opc.OP_IMM32:
         return _dis_op_imm32(instr)
     if opc == Opc.op32:
         return _dis_op32(instr)

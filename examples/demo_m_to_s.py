@@ -49,7 +49,7 @@ def main() -> None:
     print("\n=== S 模式执行: UART 输出 ===  (UART TX → stdout)")
     emu.run(2000)
 
-    print(f"\n  最终状态:")
+    print("\n  最终状态:")
     print(f"  Mode = {h.mode.name}")
     print(f"  Waiting (WFI) = {h._waiting}")
     print(f"  Cycles = {emu.cycle}")

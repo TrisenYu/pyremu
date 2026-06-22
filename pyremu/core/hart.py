@@ -18,7 +18,14 @@ from collections.abc import Callable
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from pyremu.core.registers import check_csr, register_csr, register_fpr, register_gpr
+from pyremu.core.registers import (
+    check_csr,
+    csr_addr_from_name,
+    gpr_idx_from_name,
+    register_csr,
+    register_fpr,
+    register_gpr,
+)
 from pyremu.memory.cache import TLB_SIZE
 from pyremu.memory.pmp import Pmp
 from pyremu.memory.tlb import TLB
@@ -115,6 +122,9 @@ class HartWithRegs:
         # 共享总线引用 — 用于判断 MMIO 地址 (不可缓存) 和预留失效
         self._bus: Bus | None = None
 
+        # 全 hart 引用 — 用于 mfence.did 等需要广播到所有 hart 的操作
+        self._all_harts: list[HartWithRegs] | None = None
+
         # 中断控制器引用 — 每条指令执行后在指令边界检查是否有待处理中断
         self._interrupt_ctrl: InterruptController | None = None
 
@@ -167,6 +177,20 @@ class HartWithRegs:
 
     def write_fpr(self, reg_id: int, val: float):
         self.fprs[reg_id & 0x1F].val = val
+
+    def read_gpr_by_name(self, name: str) -> int:
+        """按名称读取 GPR (例: x12, t0, a0, sp, zero). 未找到返回 0."""
+        idx = gpr_idx_from_name(name)
+        if idx is None:
+            return 0
+        return self.read_gpr(idx)
+
+    def read_csr_by_name(self, name: str) -> int:
+        """按名称读取 CSR (例: mtvec, mstatus, mepc, misa). 未找到返回 0."""
+        addr = csr_addr_from_name(name)
+        if addr is None:
+            return 0
+        return self.read_csr(addr)
 
     # ----------------------------------------------------------
     #  mstatus 字段快捷属性 (直接读写 CSR 中的 mstatus 值)
@@ -364,6 +388,17 @@ class HartWithRegs:
     @interrupt_ctrl.setter
     def interrupt_ctrl(self, ctrl):
         self._interrupt_ctrl = ctrl
+
+    @property
+    def all_harts(self):
+        """所有 hart 的引用 (用于广播操作, 如 mfence.did)."""
+        return self._all_harts
+
+    @all_harts.setter
+    def all_harts(self, harts):
+        self._all_harts = harts
+
+    # ----------------------------------------------------------
 
     # ----------------------------------------------------------
     #  mip 快捷属性 (中断挂起位)

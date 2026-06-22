@@ -5,7 +5,6 @@
 
 """反汇编器测试: 覆盖 RV64 I + M + Zicsr + AMO 各指令格式."""
 
-import pytest
 
 from pyremu.utils.disassem import disasm
 
@@ -453,3 +452,100 @@ class TestEdgeCases:
     def test_unknown_opcode(self):
         # opcode 0b1100111 实际上是 JALR... 用个不存在的 opcode
         assert disasm(0xFFFFFFFF, 0) == "<unknown opcode>"
+
+
+class TestCompressedLargeOffset:
+    """压缩指令大偏移量反汇编 — 验证立即数布局正确解码."""
+
+    # -- C0 quadrant: C.SD / C.LD (uimm[7:6] ≠ 0 时才与 C.SW/C.LW 有差异) --
+
+    def test_c_sd_large_offset_144(self):
+        """C.SD x14, 144(x12): uimm[7:6]=2, uimm[5:3]=2 → offset=144."""
+        instr = (0b111 << 13) | (2 << 10) | (4 << 7) | (2 << 5) | (6 << 2)
+        result = disasm(instr, 0x80001000)
+        assert result.startswith("c.sd"), f"期望 C.SD, 得到: {result}"
+        assert "144" in result, f"期望偏移 144, 得到: {result}"
+        assert "x14" in result and "x12" in result, f"期望 x14,x12, 得到: {result}"
+
+    def test_c_ld_large_offset_144(self):
+        """C.LD x14, 144(x12): uimm[7:6]=2, uimm[5:3]=2 → offset=144."""
+        instr = (0b011 << 13) | (2 << 10) | (4 << 7) | (2 << 5) | (6 << 2)
+        result = disasm(instr, 0x80001000)
+        assert result.startswith("c.ld"), f"期望 C.LD, 得到: {result}"
+        assert "144" in result, f"期望偏移 144, 得到: {result}"
+
+    def test_c_sd_offset_200_regression(self):
+        """回归: 用户发现的 0xE6F0 应反汇编为 c.sd x12, 200(x13)."""
+        instr = 0xE6F0  # f0 e6 in memory
+        result = disasm(instr, 0x8003E5B0)
+        assert "c.sd" in result, f"期望 C.SD, 得到: {result}"
+        assert "200" in result, f"期望偏移 200, 得到: {result}"
+        assert "x12" in result and "x13" in result, (
+            f"期望 x12,x13, 得到: {result}"
+        )
+
+    def test_c_sd_vs_c_sw_different_offset(self):
+        """C.SD 与 C.SW 同 scatter 应反汇编为不同偏移 (布局分立)."""
+        # C.SD: offset=200, rs1_creg=2(x10), rs2_creg=4(x12)
+        instr_sd = (0b111 << 13) | (1 << 10) | (2 << 7) | (3 << 5) | (4 << 2)
+        result_sd = disasm(instr_sd, 0x80000000)
+        assert "200" in result_sd, f"C.SD 期望偏移 200, 得到: {result_sd}"
+
+        # C.SW: 相同 scatter 但 funct3=110
+        instr_sw = (0b110 << 13) | (1 << 10) | (2 << 7) | (3 << 5) | (4 << 2)
+        result_sw = disasm(instr_sw, 0x80000000)
+        assert "76" in result_sw, (
+            f"C.SW 与 C.SD 同 bit pattern 应得不同偏移: 期望 76, 得到: {result_sw}"
+        )
+
+    # -- C2 quadrant: SP-relative --
+
+    def test_c_lwsp_offset_40(self):
+        """C.LWSP x10, 40(sp)."""
+        instr = (0b010 << 13) | (1 << 12) | (10 << 7) | (0b010 << 2) | 0b10
+        result = disasm(instr, 0x80000000)
+        assert result.startswith("c.lwsp"), f"期望 C.LWSP, 得到: {result}"
+        assert "40" in result and "sp" in result, f"期望偏移 40(sp), 得到: {result}"
+
+    def test_c_ldsp_offset_40(self):
+        """C.LDSP x10, 40(sp)."""
+        instr = (0b011 << 13) | (1 << 12) | (10 << 7) | (0b01 << 5) | 0b10
+        result = disasm(instr, 0x80000000)
+        assert result.startswith("c.ldsp"), f"期望 C.LDSP, 得到: {result}"
+        assert "40" in result, f"期望偏移 40, 得到: {result}"
+
+    def test_c_swsp_offset_40(self):
+        """C.SWSP x10, 40(sp)."""
+        instr = (0b110 << 13) | (10 << 9) | (10 << 2) | 0b10
+        result = disasm(instr, 0x80000000)
+        assert result.startswith("c.swsp"), f"期望 C.SWSP, 得到: {result}"
+        assert "40" in result, f"期望偏移 40, 得到: {result}"
+
+    def test_c_sdsp_offset_40(self):
+        """C.SDSP x10, 40(sp)."""
+        instr = (0b111 << 13) | (5 << 10) | (10 << 2) | 0b10
+        result = disasm(instr, 0x80000000)
+        assert result.startswith("c.sdsp"), f"期望 C.SDSP, 得到: {result}"
+        assert "40" in result, f"期望偏移 40, 得到: {result}"
+
+    def test_c_swsp_vs_c_sdsp_bit_layout(self):
+        """C.SWSP 与 C.SDSP 同 bit pattern 应反汇编为不同偏移."""
+        # C.SWSP 偏移 40: bits[12:9]=1010, bits[8:7]=00
+        instr_swsp = (0b110 << 13) | (10 << 9) | (10 << 2) | 0b10
+        result_swsp = disasm(instr_swsp, 0x80000000)
+        assert "40" in result_swsp, f"C.SWSP 期望偏移 40, 得到: {result_swsp}"
+
+        # 相同 raw 位但 funct3 改为 C.SDSP(111): bits[12:10]=101, bits[9:7]=000
+        # C.SWSP60: {bits[7:6],bits[12:9]}→0<<6|15<<2=60
+        # same bits as C.SDSP: {bits[9:7],bits[12:10]}→4<<6|7<<3=312
+        instr_swsp_60 = (0b110 << 13) | (15 << 9) | (5 << 2) | 0b10
+        instr_sdsp_same = (0b111 << 13) | (7 << 10) | (4 << 7) | (5 << 2) | 0b10
+        result_60 = disasm(instr_swsp_60, 0)
+        result_sdsp_diff = disasm(instr_sdsp_same, 0)
+        assert "60" in result_60, f"C.SWSP 期望偏移 60, 得到: {result_60}"
+        assert "60" not in result_sdsp_diff, (
+            f"C.SDSP 不应得偏移 60 (布局不同), 得到: {result_sdsp_diff}"
+        )
+        assert "312" in result_sdsp_diff, (
+            f"C.SDSP 期望偏移 312, 得到: {result_sdsp_diff}"
+        )

@@ -52,9 +52,19 @@ _uint64 = ctypes.c_uint64
 
 
 def _sext(val: int, bits: int) -> int:
-    """Sign-extend *val* from *bits* width to a Python int (64-bit semantics)."""
+    """Sign-extend *val* from *bits* width to a canonical 64-bit unsigned Python int.
+
+    Python's arbitrary-precision integers behave differently from finite-width
+    hardware in bitwise operations (|, &, ^, <<, >>) when values are negative.
+    Canonicalizing to [0, 2^64) ensures consistent behaviour regardless of
+    whether the value was built via sign-extend, zero-extend, or arithmetic.
+    """
     sign_bit = 1 << (bits - 1)
-    return (val & (sign_bit - 1)) - (val & sign_bit)
+    result = (val & (sign_bit - 1)) - (val & sign_bit)
+    # Normalize to 64-bit unsigned representation for consistent bitwise semantics.
+    if bits <= 64:
+        result &= (1 << 64) - 1
+    return result
 
 
 # ============================================================
@@ -71,8 +81,8 @@ class Opc(Enum):
     ld = 0b00000_11  # 载入
     opfp = 0b00001_11  # 浮点
     fence = 0b00011_11  # 内存/执行流屏障
-    opImm = 0b00100_11  # 立即数 ALU (32-bit)
-    opImm32 = 0b00110_11  # RV64 32-bit 立即数 ALU
+    OP_IMM = 0b00100_11  # 立即数 ALU (32-bit)
+    OP_IMM32 = 0b00110_11  # RV64 32-bit 立即数 ALU
     auipc = 0b00101_11  # 累加 pc
     st = 0b01000_11  # 写入
     amo = 0b01011_11  # 原子
@@ -89,8 +99,8 @@ class Opc(Enum):
 #  Funct3 / Funct7 enumerations
 # ============================================================
 
-aluOp = Enum(
-    "aluOp",
+ALU_OP = Enum(
+    "ALU_OP",
     (
         "add",
         "sub",
@@ -115,8 +125,8 @@ aluOp = Enum(
     ),
 )
 
-sysOp = Enum(
-    "sysOp",
+SYS_OP = Enum(
+    "SYS_OP",
     (
         "ecall",
         "ebreak",
@@ -134,7 +144,7 @@ sysOp = Enum(
 )
 
 
-class brFn3(Enum):
+class BrFunct3(Enum):
     beq = 0b000
     bne = 0b001
     blt = 0b100
@@ -143,7 +153,7 @@ class brFn3(Enum):
     bgeu = 0b111
 
 
-class ldFn3(Enum):
+class LdFunct3(Enum):
     lb = 0b000
     lh = 0b001
     lw = 0b010
@@ -153,14 +163,14 @@ class ldFn3(Enum):
     lwu = 0b110
 
 
-class stFn3(Enum):
+class StFunct3(Enum):
     sb = 0b000
     sh = 0b001
     sw = 0b010
     sd = 0b011
 
 
-class sysFn12(Enum):
+class SysFunct12(Enum):
     ecall = 0
     ebreak = 1
 
@@ -388,7 +398,7 @@ class Hart(HartWithRegs):
             self.gprs[rd].val = result
 
     # ----------------------------------------------------------
-    #  I-type ALU (opcode = Opc.opImm)
+    #  I-type ALU (opcode = Opc.OP_IMM)
     # ----------------------------------------------------------
     def handle_op_imm(self, instr: int):
         """Execute an I-type immediate ALU instruction."""
@@ -433,7 +443,7 @@ class Hart(HartWithRegs):
             result = v1 & imm
 
         else:
-            raise ValueError(f"invalid funct3={part1:#x} for opImm")
+            raise ValueError(f"invalid funct3={part1:#x} for OP_IMM")
 
         if rd != 0:
             self.gprs[rd].val = result
@@ -552,7 +562,7 @@ class Hart(HartWithRegs):
             self.gprs[rd].val = result
 
     # ----------------------------------------------------------
-    #  I-type immediate word operations (opcode = Opc.opImm32)
+    #  I-type immediate word operations (opcode = Opc.OP_IMM32)
     # ----------------------------------------------------------
     def handle_op_imm32(self, instr: int):
         """Execute an I-type 32-bit word immediate ALU instruction (ADDIW, SLLIW, etc.)."""
@@ -585,7 +595,7 @@ class Hart(HartWithRegs):
             result = _sext(result, 32)
 
         else:
-            raise ValueError(f"invalid funct3={part1:#x} for opImm32")
+            raise ValueError(f"invalid funct3={part1:#x} for OP_IMM32")
 
         if rd != 0:
             self.gprs[rd].val = result
@@ -606,21 +616,21 @@ class Hart(HartWithRegs):
 
         taken = False
         try:
-            f = brFn3(fn3)
+            f = BrFunct3(fn3)
         except ValueError:
             return False
 
-        if f == brFn3.beq:
+        if f == BrFunct3.beq:
             taken = v1 == v2
-        elif f == brFn3.bne:
+        elif f == BrFunct3.bne:
             taken = v1 != v2
-        elif f == brFn3.blt:
+        elif f == BrFunct3.blt:
             taken = _sint64(v1).value < _sint64(v2).value
-        elif f == brFn3.bge:
+        elif f == BrFunct3.bge:
             taken = _sint64(v1).value >= _sint64(v2).value
-        elif f == brFn3.bltu:
+        elif f == BrFunct3.bltu:
             taken = _uint64(v1).value < _uint64(v2).value
-        elif f == brFn3.bgeu:
+        elif f == BrFunct3.bgeu:
             taken = _uint64(v1).value >= _uint64(v2).value
 
         if taken:
@@ -640,37 +650,37 @@ class Hart(HartWithRegs):
         addr = (self.gprs[rs1].val + offset) & 0xFFFF_FFFF_FFFF_FFFF
 
         try:
-            f = ldFn3(fn3)
+            f = LdFunct3(fn3)
         except ValueError:
             raise ValueError(f"invalid funct3={fn3:#x} for load")
 
         # 按实际操作宽度读取, 避免对 lb/lbu/lh/lhu/lw/lwu 产生虚假对齐故障
-        if f in (ldFn3.lb, ldFn3.lbu):
+        if f in (LdFunct3.lb, LdFunct3.lbu):
             read_size = 1
-        elif f in (ldFn3.lh, ldFn3.lhu):
+        elif f in (LdFunct3.lh, LdFunct3.lhu):
             read_size = 2
-        elif f in (ldFn3.lw, ldFn3.lwu):
+        elif f in (LdFunct3.lw, LdFunct3.lwu):
             read_size = 4
         else:
             read_size = 8  # ld
 
         mem = mem_read(self,addr, read_size)
 
-        if f == ldFn3.lb:
+        if f == LdFunct3.lb:
             val = _sext(mem[0], 8)
-        elif f == ldFn3.lh:
+        elif f == LdFunct3.lh:
             val = _sext(mem[0] | (mem[1] << 8), 16)
-        elif f == ldFn3.lw:
+        elif f == LdFunct3.lw:
             val = _sext(mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24), 32)
-        elif f == ldFn3.ld:
+        elif f == LdFunct3.ld:
             val = 0
             for i in range(8):
                 val |= mem[i] << (8 * i)
-        elif f == ldFn3.lbu:
+        elif f == LdFunct3.lbu:
             val = mem[0]
-        elif f == ldFn3.lhu:
+        elif f == LdFunct3.lhu:
             val = mem[0] | (mem[1] << 8)
-        elif f == ldFn3.lwu:
+        elif f == LdFunct3.lwu:
             val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
         else:
             raise ValueError(f"unhandled load funct3={fn3:#x}")
@@ -693,19 +703,19 @@ class Hart(HartWithRegs):
         val = self.gprs[rs2].val
 
         try:
-            f = stFn3(fn3)
+            f = StFunct3(fn3)
         except ValueError:
             raise ValueError(f"invalid funct3={fn3:#x} for store")
 
-        if f == stFn3.sb:
+        if f == StFunct3.sb:
             data = bytes([val & 0xFF])
-        elif f == stFn3.sh:
+        elif f == StFunct3.sh:
             data = bytes([val & 0xFF, (val >> 8) & 0xFF])
-        elif f == stFn3.sw:
+        elif f == StFunct3.sw:
             data = bytes(
                 [val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF, (val >> 24) & 0xFF]
             )
-        elif f == stFn3.sd:
+        elif f == StFunct3.sd:
             data = bytes([(val >> (8 * i)) & 0xFF for i in range(8)])
         else:
             raise ValueError(f"unhandled store funct3={fn3:#x}")
@@ -949,36 +959,42 @@ class Hart(HartWithRegs):
             self.gprs[rd].val = (self.gprs[2].val + nzuimm) & 0xFFFF_FFFF_FFFF_FFFF
             return 2
 
-        # C.LW/C.LD/C.SW/C.SD 共用 uimm 解码
         rs1 = self._creg((instr >> 7) & 0x7)
-        uimm = (
-            ((instr >> 5) & 0x1) << 2
-            | ((instr >> 10) & 0x7) << 3
-            | ((instr >> 6) & 0x1) << 6
-        )
-        addr = (self.gprs[rs1].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
 
-        if funct3 == 0b010:  # C.LW
-            mem = mem_read(self,addr, 4)
-            val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
-            self.gprs[rd].val = _sext(val, 32)
+        # C.LW / C.SW: uimm = {instr[6], instr[12:10], instr[5]} (4-byte aligned)
+        if funct3 in (0b010, 0b110):
+            uimm = (
+                ((instr >> 5) & 0x1) << 2
+                | ((instr >> 10) & 0x7) << 3
+                | ((instr >> 6) & 0x1) << 6
+            )
+            addr = (self.gprs[rs1].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            if funct3 == 0b010:  # C.LW
+                mem = mem_read(self, addr, 4)
+                val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
+                self.gprs[rd].val = _sext(val, 32)
+            else:  # C.SW
+                rs2 = self._creg((instr >> 2) & 0x7)
+                v = self.gprs[rs2].val & 0xFFFF_FFFF
+                data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
+                mem_write(self, addr, data)
 
-        elif funct3 == 0b011:  # C.LD (RV64C)
-            mem = mem_read(self,addr, 8)
-            val = sum(mem[i] << (8 * i) for i in range(8))
-            self.gprs[rd].val = val
-
-        elif funct3 == 0b110:  # C.SW
-            rs2 = self._creg((instr >> 2) & 0x7)
-            v = self.gprs[rs2].val & 0xFFFF_FFFF
-            data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
-            mem_write(self,addr, data)
-
-        elif funct3 == 0b111:  # C.SD (RV64C)
-            rs2 = self._creg((instr >> 2) & 0x7)
-            v = self.gprs[rs2].val
-            data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-            mem_write(self,addr, data)
+        # C.LD / C.SD (RV64C): uimm = {instr[6:5], instr[12:10]} (8-byte aligned)
+        elif funct3 in (0b011, 0b111):
+            uimm = (
+                ((instr >> 5) & 0b11) << 6
+                | ((instr >> 10) & 0b111) << 3
+            )
+            addr = (self.gprs[rs1].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            if funct3 == 0b011:  # C.LD
+                mem = mem_read(self, addr, 8)
+                val = sum(mem[i] << (8 * i) for i in range(8))
+                self.gprs[rd].val = val
+            else:  # C.SD
+                rs2 = self._creg((instr >> 2) & 0x7)
+                v = self.gprs[rs2].val
+                data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
+                mem_write(self, addr, data)
 
         else:
             raise NotImplementedError(f"C0 funct3={funct3:#05b} (FLD/FSD/reserved)")
@@ -1072,22 +1088,27 @@ class Hart(HartWithRegs):
         self,
         instr: int,
     ) -> int:
-        """C1 ALU: C.SRLI/C.SRAI (sub_fn=00), C.ANDI (01), C.SUB/XOR/OR/AND (10)."""
+        """C1 ALU: C.SRLI/C.SRAI (sf=0), C.ANDI (sf=2), C.SUB/XOR/OR/AND (sf=3)."""
         sf = (instr >> 10) & 0x3
         rd_rs1 = self._creg((instr >> 7) & 0x7)
-        shamt = ((instr >> 2) & 0x1F) | (((instr >> 7) & 0x1) << 5)
+        # RV64: shamt[5] 在 bit 12; bits[6:2] = shamt[4:0]
+        shamt = ((instr >> 2) & 0x1F) | (((instr >> 12) & 0x1) << 5)
         v1 = self.gprs[rd_rs1].val
 
         if sf == 0b00:
+            # C.SRLI (bit12=0) / C.SRAI (bit12=1)
             if (instr >> 12) & 0x1:
                 v1 = _sint64(_sint64(v1).value >> shamt).value & 0xFFFF_FFFF_FFFF_FFFF
             else:
                 v1 = (_uint64(v1).value >> shamt) & 0xFFFF_FFFF_FFFF_FFFF
             self.gprs[rd_rs1].val = v1
-        elif sf == 0b01:
-            imm = _sext(((instr >> 2) & 0x1F) | (((instr >> 7) & 0x1) << 5), 6)
-            self.gprs[rd_rs1].val = (v1 & imm) & 0xFFFF_FFFF_FFFF_FFFF
         elif sf == 0b10:
+            # C.ANDI — imm[5:0] = {bit12, bits[6:2]}
+            imm = _sext(((instr >> 2) & 0x1F) | (((instr >> 12) & 0x1) << 5), 6)
+            self.gprs[rd_rs1].val = (v1 & imm) & 0xFFFF_FFFF_FFFF_FFFF
+        elif sf in (0b01, 0b11):
+            # C.SUB / C.XOR / C.OR / C.AND  (sf=0b11 RV32 regs, sf=0b01 RV64 regs)
+            #   bit_6_5: 00=SUB, 01=XOR, 10=OR, 11=AND
             rs2 = self._creg((instr >> 2) & 0x7)
             v2 = self.gprs[rs2].val
             bit_6_5 = (instr >> 5) & 0x3
@@ -1122,22 +1143,30 @@ class Hart(HartWithRegs):
             ) & 0xFFFF_FFFF_FFFF_FFFF
             return 2
 
-        if funct3 in (0b010, 0b011):
+        # C.LWSP: uimm = {instr[6:5], instr[12], instr[4:2]} (4-byte aligned)
+        # C.LDSP: uimm = {instr[4:2], instr[12], instr[6:5]} (8-byte aligned)
+        if funct3 == 0b010:  # C.LWSP
             uimm = (
-                ((instr >> 2) & 0x1) << 2
-                | ((instr >> 3) & 0x7) << 3
-                | ((instr >> 6) & 0x1) << 6
+                ((instr >> 5) & 0b11) << 6
                 | ((instr >> 12) & 0x1) << 5
+                | ((instr >> 2) & 0b111) << 2
             )
             addr = (self.gprs[2].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
-            if funct3 == 0b010:
-                mem = mem_read(self,addr, 4)
-                val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
-                self.gprs[rd_rs1].val = _sext(val, 32)
-            else:
-                mem = mem_read(self,addr, 8)
-                val = sum(mem[i] << (8 * i) for i in range(8))
-                self.gprs[rd_rs1].val = val
+            mem = mem_read(self, addr, 4)
+            val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
+            self.gprs[rd_rs1].val = _sext(val, 32)
+            return 2
+
+        if funct3 == 0b011:  # C.LDSP (RV64C)
+            uimm = (
+                ((instr >> 2) & 0b111) << 6
+                | ((instr >> 12) & 0x1) << 5
+                | ((instr >> 5) & 0b11) << 3
+            )
+            addr = (self.gprs[2].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            mem = mem_read(self, addr, 8)
+            val = sum(mem[i] << (8 * i) for i in range(8))
+            self.gprs[rd_rs1].val = val
             return 2
 
         if funct3 == 0b100:
@@ -1158,21 +1187,31 @@ class Hart(HartWithRegs):
                 self.pc = target & ~1 & 0xFFFF_FFFF_FFFF_FFFF
                 return 0
             else:
-                # C.MV: rd = rs2
-                self.gprs[rd_rs1].val = self.gprs[rs2].val
+                if is_jalr:
+                    # C.ADD (bit12=1, rs2≠0): rd += rs2
+                    result = self.gprs[rd_rs1].val + self.gprs[rs2].val
+                    self.gprs[rd_rs1].val = result & 0xFFFF_FFFF_FFFF_FFFF
+                else:
+                    # C.MV (bit12=0, rs2≠0): rd = rs2
+                    self.gprs[rd_rs1].val = self.gprs[rs2].val
                 return 2
 
-        if funct3 in (0b110, 0b111):
-            # uimm[5:2] 在 bits[12:9], uimm[7:6] 在 bits[8:7]
+        # C.SWSP: uimm = {instr[8:7], instr[12:9]} (4-byte aligned)
+        # C.SDSP: uimm = {instr[9:7], instr[12:10]} (8-byte aligned)
+        if funct3 == 0b110:  # C.SWSP
             uimm = ((instr >> 9) & 0xF) << 2 | ((instr >> 7) & 0x3) << 6
             addr = (self.gprs[2].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
-            if funct3 == 0b110:
-                v = self.gprs[rs2].val & 0xFFFF_FFFF
-                data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
-            else:
-                v = self.gprs[rs2].val
-                data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-            mem_write(self,addr, data)
+            v = self.gprs[rs2].val & 0xFFFF_FFFF
+            data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
+            mem_write(self, addr, data)
+            return 2
+
+        if funct3 == 0b111:  # C.SDSP (RV64C)
+            uimm = ((instr >> 7) & 0x7) << 6 | ((instr >> 10) & 0x7) << 3
+            addr = (self.gprs[2].val + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            v = self.gprs[rs2].val
+            data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
+            mem_write(self, addr, data)
             return 2
 
         raise NotImplementedError(f"C2 funct3={funct3:#05b} (FLDSP/FSDSP)")
@@ -1219,7 +1258,7 @@ class Hart(HartWithRegs):
             try:
                 return self.handle_compressed(instr & 0xFFFF)
             except (ValueError, NotImplementedError, CsrAccessError):
-                deliver_trap(self, 
+                deliver_trap(self,
                     TrapType.IllInstr, tval=instr, is_interrupt=False
                 )
                 return 0
@@ -1235,9 +1274,9 @@ class Hart(HartWithRegs):
         try:
             if code == Opc.op:
                 self.handle_alu(instr)
-            elif code == Opc.opImm:
+            elif code == Opc.OP_IMM:
                 self.handle_op_imm(instr)
-            elif code == Opc.opImm32:
+            elif code == Opc.OP_IMM32:
                 self.handle_op_imm32(instr)
             elif code == Opc.op32:
                 self.handle_op32(instr)
@@ -1281,7 +1320,7 @@ class Hart(HartWithRegs):
                 self.handle_amo(instr)
             else:
                 # 合法 opcode 但尚未实现 (如浮点 opfp)
-                deliver_trap(self, 
+                deliver_trap(self,
                     TrapType.IllInstr, tval=instr, is_interrupt=False
                 )
                 return 0
