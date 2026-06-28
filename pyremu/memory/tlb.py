@@ -77,7 +77,7 @@ class TLB(CacheBase):
     # ----------------------------------------------------------
 
     def lookup(self, vpn: int) -> tuple:
-        """在 TLB 中查找 vpn.
+        """在 TLB 中查找 vpn.  O(1) 快速路径 via _tag_to_idx dict.
 
         Args:
             vpn: 虚拟页号.
@@ -87,14 +87,10 @@ class TLB(CacheBase):
             hit=True 表示命中, ppn 和 perm 为缓存的值.
             hit=False 表示未命中, ppn 和 perm 均为 0.
         """
-        self._clock += 1
-        for entry in self._entries:
+        entry = self._find_by_tag(vpn)
+        if entry is not None:
             e: TLBLine = entry  # type: ignore
-            if e.valid and e.tag == vpn:
-                e.last_access = self._clock
-                self._hits += 1
-                return True, e.ppn, e.perm
-        self._misses += 1
+            return True, e.ppn, e.perm
         return False, 0, 0
 
     def insert(
@@ -105,7 +101,7 @@ class TLB(CacheBase):
         level: int = 0,
         mdid: int = 0,
     ) -> None:
-        """将一条映射插入 TLB.
+        """将一条映射插入 TLB.  O(1) 查重 via _tag_to_idx dict.
 
         若 vpn 已存在则原地更新; 否则按 FIFO/LRU 逐出旧条目.
 
@@ -118,9 +114,10 @@ class TLB(CacheBase):
         """
         self._clock += 1
 
-        # 查重 — 原地更新
-        for entry in self._entries:
-            e: TLBLine = entry  # type: ignore
+        # 查重 — 原地更新 (O(1))
+        existing_idx = self._tag_to_idx.get(vpn)
+        if existing_idx is not None:
+            e: TLBLine = self._entries[existing_idx]  # type: ignore
             if e.valid and e.tag == vpn:
                 e.ppn = ppn
                 e.perm = perm
@@ -133,6 +130,7 @@ class TLB(CacheBase):
         idx = self._pick_victim()
         victim: TLBLine = self._entries[idx]  # type: ignore
         if victim.valid:
+            self._tag_to_idx.pop(victim.tag, None)
             self._on_evict(victim)
 
         # 写入新条目
@@ -144,9 +142,10 @@ class TLB(CacheBase):
         victim.valid = True
         victim.dirty = False
         victim.last_access = self._clock
+        self._tag_to_idx[vpn] = idx
 
     def flush(self, vpn: int = 0, asid: int = 0) -> None:
-        """刷新 TLB.
+        """刷新 TLB.  单 VPN 刷新为 O(1) via _tag_to_idx.
 
         Args:
             vpn: 若为 0 则刷新全部; 否则仅刷新匹配该 VPN 的条目.
@@ -156,8 +155,9 @@ class TLB(CacheBase):
             self.flush_all()
             return
 
-        for entry in self._entries:
-            e: TLBLine = entry  # type: ignore
+        idx = self._tag_to_idx.pop(vpn, None)
+        if idx is not None:
+            e: TLBLine = self._entries[idx]  # type: ignore
             if e.valid and e.tag == vpn:
                 e.valid = False
                 e.tag = 0

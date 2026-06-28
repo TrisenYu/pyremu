@@ -1,0 +1,4 @@
+/target
+/src/config_gen.rs
+*.bin
+link.ld

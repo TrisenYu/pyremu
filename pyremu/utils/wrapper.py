@@ -20,11 +20,7 @@ def seize_err_if_any(logger_enable: bool = True):
                 if not logger_enable:
                     return None
                 dump_stk = format_exc()
-                print(
-                    f"an exception was detected: {e}\n" +
-                    "current trace stack\n" +
-                    dump_stk
-                )
+                print(f"an exception was detected: {e}\n" + "current trace stack\n" + dump_stk)
             return None
 
         return wrapper
@@ -43,9 +39,9 @@ def die_if_err(fn):
         except Exception as e:
             dump_stk = format_exc()
             print(
-                f"an exception was detected: {e}\n" +
-                "dumping current trace stack\n" +
-                dump_stk
+                f"an exception was detected: {e}\n"
+                + "dumping current trace stack\n"
+                + dump_stk
             )
             sys.exit(1)
 

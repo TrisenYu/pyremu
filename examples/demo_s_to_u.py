@@ -59,11 +59,7 @@ def demo_well_behaved(emu: Emulator, fw) -> None:
             prev_mode = h.mode
 
         # 在 fib(3) 的 prologue 后检查栈帧
-        if (
-            not fib3_checked
-            and pc_before == fib_addr
-            and h.gprs[10].val == 3
-        ):
+        if not fib3_checked and pc_before == fib_addr and h.gprs[10] == 3:
             # 执行完 prologue
             for _ in range(5):
                 emu.step()
@@ -73,10 +69,7 @@ def demo_well_behaved(emu: Emulator, fw) -> None:
             print(f"    栈帧回溯 ({len(frames)} 帧):")
             for f in frames:
                 tag = f"#{f.idx + 1:02d}"
-                print(
-                    f"    {tag} pc=0x{f.pc:08x} fp=0x{f.fp:08x}"
-                    f" ra=0x{f.ra:08x}"
-                )
+                print(f"    {tag} pc=0x{f.pc:08x} fp=0x{f.fp:08x} ra=0x{f.ra:08x}")
             print(f"    fib(3) → fib(4) → fib(5) 调用链可见 ✓")
 
         # 完成后退出
@@ -117,9 +110,7 @@ def demo_pathological(emu: Emulator, fw) -> None:
     # Run until S-mode catches the fault
     for _ in range(3000):
         emu.step()
-        if "Process terminated" in uart.tx_data().decode(
-            "latin-1", errors="replace"
-        ):
+        if "Process terminated" in uart.tx_data().decode("latin-1", errors="replace"):
             break
 
     out = uart.tx_data().decode("latin-1", errors="replace")

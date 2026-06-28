@@ -44,9 +44,9 @@ class TestBusRAM:
 
     def test_read_write_ram(self, bus):
         """基本读写."""
-        bus.write(0x1000, b"\xDE\xAD\xBE\xEF")
+        bus.write(0x1000, b"\xde\xad\xbe\xef")
         data = bus.read(0x1000, 4)
-        assert data == b"\xDE\xAD\xBE\xEF"
+        assert data == b"\xde\xad\xbe\xef"
 
     def test_read_partial(self, bus):
         """部分字节读取."""
@@ -115,8 +115,8 @@ class TestBusPMA:
     def test_ram_read_write_in_range(self, bus):
         """RAM 范围内的读写正常工作."""
         addr = self.RAM_BASE + 0x1000
-        bus.write(addr, b"\xDE\xAD\xC0\xDE")
-        assert bus.read(addr, 4) == b"\xDE\xAD\xC0\xDE"
+        bus.write(addr, b"\xde\xad\xc0\xde")
+        assert bus.read(addr, 4) == b"\xde\xad\xc0\xde"
 
     def test_ram_read_write_at_base(self, bus):
         """RAM 基址 (ram_base) 本身可读写."""
@@ -163,10 +163,10 @@ class TestBusPMA:
     def test_ram_base_zero(self):
         """ram_base=0 的配置: RAM 覆盖 [0, ram_size), 兼容嵌入式布局."""
         bus = Bus(ram_size=64 * 1024, ram_base=0)
-        bus.write(0, b"\xAA")
-        assert bus.read(0, 1) == b"\xAA"
-        bus.write(0xFFFF, b"\xBB")
-        assert bus.read(0xFFFF, 1) == b"\xBB"
+        bus.write(0, b"\xaa")
+        assert bus.read(0, 1) == b"\xaa"
+        bus.write(0xFFFF, b"\xbb")
+        assert bus.read(0xFFFF, 1) == b"\xbb"
         # 超出范围
         assert bus.read(0x10000, 1) == b"\x00"
 
@@ -183,3 +183,57 @@ class TestBusPMA:
         assert bus.read(0x4000_0000, 1) == b"\x77"
         # 空洞
         assert not bus.is_valid_addr(0x2000_0000)
+
+
+class TestDeviceNarrowRead:
+    """设备寄存器窄宽度读取: 1/2 字节 load 不应溢出."""
+
+    def test_byte_read_from_high_bit_reg(self):
+        """UART RXFIFO_EMPTY (bit31=1) 在 lb (size=1) 读取时仅返回低字节."""
+        from pyremu.peripheral.uart import UART
+
+        u = UART(base=0x1000_0000)
+        # RXDATA (offset=4) 在 RX 空时返回 RXFIFO_EMPTY = 1<<31
+        val4 = u.read(4, 4)  # 4 字节读 — 应成功
+        assert len(val4) == 4
+        assert int.from_bytes(val4, "little", signed=False) == (1 << 31)
+
+        val1 = u.read(4, 1)  # 1 字节读 — bit31 被截断, 返回 0x00
+        assert len(val1) == 1
+        assert val1 == b"\x00"
+
+    def test_halfword_read_from_high_bit_reg(self):
+        """2 字节读也应截断高位."""
+        from pyremu.peripheral.uart import UART
+
+        u = UART(base=0x1000_0000)
+        val2 = u.read(4, 2)  # 2 字节读
+        assert len(val2) == 2
+        assert val2 == b"\x00\x00"  # bit31 在字节 3, 被截去
+
+    def test_spi_byte_read_truncates(self):
+        """SPI 设备窄读也正确截断."""
+        from pyremu.peripheral.spi import SPI
+
+        s = SPI(base=0x1000_1000)
+        val1 = s.read(0, 1)  # CTRL 寄存器, 初始为 0
+        assert len(val1) == 1
+        assert val1 == b"\x00"
+
+    def test_i2c_byte_read_truncates(self):
+        """I2C 设备窄读也正确截断."""
+        from pyremu.peripheral.i2c import I2C
+
+        i2c = I2C(base=0x1000_2000)
+        val1 = i2c.read(0, 1)
+        assert len(val1) == 1
+        assert val1 == b"\x00"
+
+    def test_gpio_byte_read_truncates(self):
+        """GPIO 设备窄读也正确截断."""
+        from pyremu.peripheral.gpio import GPIO
+
+        g = GPIO(base=0x1000_3000)
+        val1 = g.read(0, 1)
+        assert len(val1) == 1
+        assert val1 == b"\x00"

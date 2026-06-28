@@ -28,6 +28,7 @@ import random
 import struct
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ import libfdt
 
 from pyremu.core.decoder import Hart
 from pyremu.core.mem_check_aux import inject_memory_backend
+from pyremu.core.registers import gpr_alias, gpr_name
 from pyremu.core.trap import TrapType
 from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap
 from pyremu.interrupt.clint import CLINT
@@ -52,6 +54,18 @@ class Emulator:
     提供 step / run 执行循环及状态检查辅助方法.
     """
 
+    @staticmethod
+    def _build_default_config(**kwargs: int) -> PlatformConfig:
+        """从旧式 API 的 **kwargs 构建 PlatformConfig; 无参数时用 qemu_virt 预设."""
+        if kwargs:
+            periph_kw = {"clint_base": 0x0200_0000}
+            plat_kw: dict[str, Any] = {"periph": PeripheralConfig(**periph_kw)}
+            for field_name in PlatformConfig.__dataclass_fields__:
+                if field_name in kwargs:
+                    plat_kw[field_name] = kwargs[field_name]
+            return PlatformConfig(**plat_kw)
+        return PlatformConfig.qemu_virt()
+
     def __init__(
         self,
         config: PlatformConfig | None = None,
@@ -64,16 +78,7 @@ class Emulator:
         *config* 传入时忽略 **kwargs.
         """
         if config is None:
-            # 兼容旧式 API: 从 kwargs 构建配置
-            if kwargs:
-                periph_kw = {"clint_base": 0x0200_0000}
-                plat_kw: dict[str, Any] = {"periph": PeripheralConfig(**periph_kw)}
-                for field_name in PlatformConfig.__dataclass_fields__:
-                    if field_name in kwargs:
-                        plat_kw[field_name] = kwargs[field_name]
-                config = PlatformConfig(**plat_kw)
-            else:
-                config = PlatformConfig.qemu_virt()
+            config = self._build_default_config(**kwargs)
         self._cfg = config
         self._cycle = 0
         self._total_instrs = 0
@@ -206,9 +211,16 @@ class Emulator:
         # -- memory --
         sw.begin_node("memory")
         sw.property_string("device_type", "memory")
-        sw.property("reg", struct.pack(
-            ">IIII", 0, self._cfg.ram_base, 0, self._cfg.ram_size,
-        ))
+        sw.property(
+            "reg",
+            struct.pack(
+                ">IIII",
+                0,
+                self._cfg.ram_base,
+                0,
+                self._cfg.ram_size,
+            ),
+        )
         sw.end_node()  # memory
 
         # -- soc simple-bus --
@@ -227,9 +239,13 @@ class Emulator:
         ie_cells: list[int] = []
         for ph in cpu_phandles:
             ie_cells.extend([ph, 3, ph, 7])  # M-SW-IRQ=3, M-TIMER-IRQ=7
-        sw.property("interrupts-extended", struct.pack(
-            ">" + "I" * len(ie_cells), *ie_cells,
-        ))
+        sw.property(
+            "interrupts-extended",
+            struct.pack(
+                ">" + "I" * len(ie_cells),
+                *ie_cells,
+            ),
+        )
         sw.end_node()  # clint
 
         # UART
@@ -343,6 +359,22 @@ class Emulator:
                 zero_pad = seg.memsz - len(seg.data)
                 self.bus.write(vaddr + len(seg.data), b"\x00" * zero_pad)
 
+        # 若 load_offset ≠ 0, 开放 VMA 影子映射:
+        # 固件链接在低地址 (VMA), 但 RAM 在高地址.
+        # S-mode mret 用 VMA 作为目标地址, 需要 VMA 也能访问同一 RAM.
+        # 注意: bus.write 走 L2 缓存, 需同时写入 VMA 让缓存感知;
+        # 否则 VMA 地址 L2 miss → RAM direct read → 影子区读到的仍是 0.
+        if load_offset != 0 and image.segments:
+            for seg in image.segments:
+                self.bus.write(seg.vaddr, seg.data)
+                if seg.memsz <= len(seg.data):
+                    continue
+                zero_pad = seg.memsz - len(seg.data)
+                self.bus.write(seg.vaddr + len(seg.data), b"\x00" * zero_pad)
+            vma_min = min(seg.vaddr for seg in image.segments)
+            vma_max = max(seg.vaddr + seg.memsz for seg in image.segments)
+            self.bus.set_ram_shadow(vma_min, vma_max - vma_min)
+
         # 将所有 hart 的 PC 设置为入口地址
         for hart in self.harts:
             hart.pc = image.entry_point + load_offset
@@ -375,11 +407,15 @@ class Emulator:
             sep + " GPRs",
         ]
         for i in range(16):
-            lo = hart.gprs[i]
-            hi = hart.gprs[i + 16]
+            lo_val = hart.gprs[i]
+            hi_val = hart.gprs[i + 16]
+            lo_name = gpr_name(i)
+            lo_alias = gpr_alias(i)
+            hi_name = gpr_name(i + 16)
+            hi_alias = gpr_alias(i + 16)
             lines.append(
-                f"  {lo.name:<3} {lo.alias:<5} = {self._hex(lo.val)}  "
-                f"{hi.name:<3} {hi.alias:<5} = {self._hex(hi.val)}"
+                f"  {lo_name:<3} {lo_alias:<5} = {self._hex(lo_val)}  "
+                f"{hi_name:<3} {hi_alias:<5} = {self._hex(hi_val)}"
             )
         lines.append(sep)
         return "\n".join(lines)
@@ -388,8 +424,8 @@ class Emulator:
     #  WFI 等待优化
     # ----------------------------------------------------------
 
-    _WFI_MAX_SLEEP = 0.05       # 单次最大睡眠 50ms, 保证 Ctrl+C 响应
-    _WFI_TICK_US   = 1.0        # 1 tick ≈ 1 µs (1 MHz 等效)
+    _WFI_MAX_SLEEP = 0.05  # 单次最大睡眠 50ms, 保证 Ctrl+C 响应
+    _WFI_TICK_US = 1.0  # 1 tick ≈ 1 µs (1 MHz 等效)
 
     def _wfi_ticks_until_wake(self, active_harts: list) -> int | None:
         """返回最早定时器中断剩余的 tick 数; 无活跃定时器时返回 None."""
@@ -405,7 +441,7 @@ class Emulator:
         return best
 
     def _wfi_sleep_if_idle(self, active: list, waiting_count: int) -> None:
-        """当全部 hart 处于 WFI 时阻塞等待, 避免 CPU 100%% 轮询.
+        """当全部 hart 处于 WFI 时阻塞等待, 避免 CPU 100% 轮询.
 
         计算最近定时器到期时间并睡眠对应时长; 无定时器时睡眠固定短间隔.
         ``_wake_event`` 可被外部中断源 (IPI / debugger) 显式触发.
@@ -451,7 +487,6 @@ class Emulator:
         all_exec_cnt = 0
         wfi_waiting = 0
         for hart in active:
-
             # 声明当前 UART 写者 hart (多 hart 输出不交错)
             if self.uart is not None:
                 self.uart.set_writer(hart.id)
@@ -502,14 +537,67 @@ class Emulator:
 
         return all_exec_cnt
 
-    def run(self, max_cycles: int) -> int:
+    class TimeoutError(RuntimeError):
+        """执行超时, 可能是死循环."""
+
+        def __init__(
+            self,
+            timeout_sec: float,
+            cycles: int,
+            pc: int | None = None,
+        ) -> None:
+            self.timeout_sec = timeout_sec
+            self.cycles = cycles
+            self.pc = pc
+            msg = (
+                f"模拟器超时 ({timeout_sec:.0f}s), "
+                f"已执行 {cycles} 周期"
+            )
+            if pc is not None:
+                msg += f", 最后 PC={pc:#018x}"
+            super().__init__(msg)
+
+    def run(
+        self,
+        max_cycles: int,
+        *,
+        timeout: float = 1800.0,
+        yield_every: int = 10000,
+        yield_sleep: float = 0.001,
+    ) -> int:
         """执行 *max_cycles* 个周期.
+
+        每 *yield_every* 个周期后 sleep *yield_sleep* 秒,
+        降低宿主机 CPU 占用. 设为 0 禁用节流 (100% CPU).
+
+        Args:
+            max_cycles: 最大周期数.
+            timeout: 墙钟超时秒数, 默认 1800 (30 分钟).
+                     设为 0 禁用超时检查.
+            yield_every: 每隔多少个周期让出 CPU, 默认 10000.
+                         0 = 不限速 (跑满 CPU).
+            yield_sleep: 每次让出休眠秒数, 默认 0.001 (1ms).
 
         Returns:
             实际执行的周期数.
+
+        Raises:
+            TimeoutError: 当 *timeout* 秒数被超过.
         """
-        for _ in range(max_cycles):
-            self.step()
+        deadline = time.monotonic() + timeout if timeout > 0 else None
+        do_yield = yield_every > 0
+        # 超时检查合并到 yield 检查点, 避免每周期 syscall
+        i = 0
+        while i < max_cycles:
+            chunk = min(yield_every, max_cycles - i) if do_yield else max_cycles - i
+            for _ in range(chunk):
+                self.step()
+            i += chunk
+            # 批量后让出 CPU + 检查超时
+            if do_yield:
+                time.sleep(yield_sleep)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise self.TimeoutError(timeout, i, self.harts[0].pc if self.harts else None)
         return self._cycle
 
     # ----------------------------------------------------------
@@ -528,18 +616,16 @@ class Emulator:
             "mcause": hex(h.mcause_val),
             "mtval": hex(h.mtval_val),
             "mie": h.mie,
-            "gprs": {f"x{i}": hex(h.gprs[i].val) for i in range(32)},
+            "gprs": {f"x{i}": hex(h.gprs[i]) for i in range(32)},
         }
 
     def dump_memory(self, addr: int, size: int) -> bytes:
         """读取物理内存的 *size* 字节."""
         return self.bus.read(addr, size)
 
-    def mem_hexdump(self, addr: int, size: int) -> str:
-        """返回物理内存的十六进制 dump 字符串; 读取失败返回提示文本."""
-        data = self.bus.try_read(addr, size)
-        if data is None:
-            return "(无法读取该地址)"
+    @staticmethod
+    def _fmt_hexdump(addr: int, data: bytes) -> str:
+        """将字节数据格式化为 hexdump 字符串 (供调试器复用)."""
         lines = []
         for offset in range(0, len(data), 16):
             chunk = data[offset : offset + 16]
@@ -547,6 +633,13 @@ class Emulator:
             ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
             lines.append(f"{addr + offset:016x}  {hex_part:<48s}  |{ascii_part}|")
         return "\n".join(lines)
+
+    def mem_hexdump(self, addr: int, size: int) -> str:
+        """返回物理内存的十六进制 dump 字符串; 读取失败返回提示文本."""
+        data = self.bus.try_read(addr, size)
+        if data is None:
+            return "(无法读取该地址)"
+        return self._fmt_hexdump(addr, data)
 
     # ----------------------------------------------------------
     #  属性

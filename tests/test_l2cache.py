@@ -65,9 +65,9 @@ class TestL2CacheBasic:
     def test_write_updates_cache_and_marks_modified(self, l2):
         """写命中更新数据并转 M 状态."""
         l2.read(0x1000, 8)  # 加载到 E 状态
-        l2.write(0x1000, b"\xFF\xEE\xDD\xCC")
+        l2.write(0x1000, b"\xff\xee\xdd\xcc")
         data = l2.read(0x1000, 8)
-        assert data[:4] == b"\xFF\xEE\xDD\xCC"
+        assert data[:4] == b"\xff\xee\xdd\xcc"
         # 检查后 4 字节仍为 RAM 原始值
         assert data[4:8] == b"\x05\x06\x07\x08"
 
@@ -81,14 +81,14 @@ class TestL2CacheBasic:
         tiny_l2.set_ram_backend(rf, wf)
 
         # 写 0x1000 的行 (进入 M)
-        tiny_l2.write(0x1000, b"\xAA" * 8)
+        tiny_l2.write(0x1000, b"\xaa" * 8)
         # 访问 0x2000 (不同 set), 逐出 0x1000 的行
         tiny_l2.read(0x2000, 8)
 
         # 检查 RAM 中 0x1000 被回写
         assert wf is not None
         ram_data = rf(0x1000, 8)
-        assert ram_data == b"\xAA" * 8
+        assert ram_data == b"\xaa" * 8
 
 
 class TestMESIState:
@@ -125,7 +125,7 @@ class TestMESIState:
     def test_invalidate(self, l2):
         """invalidate 使行失效, M 状态回写 RAM."""
         l2.read(0x1000, 8)
-        l2.write(0x1000, b"\xBB" * 8)
+        l2.write(0x1000, b"\xbb" * 8)
         l2.invalidate(0x1000)
         assert len(l2) == 0
 

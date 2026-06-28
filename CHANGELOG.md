@@ -4,6 +4,47 @@
 
 ---
 
+## 2026-06-28
+
+### ZSBL `coldboot_done` 硬编码地址失效 — 固件重编译后自旋死等 (zsbl_fsbl_stub.S)
+
+**根因**: ZSBL 向 `coldboot_done` 写入 1 以跳过 OpenSBI 的 hart lottery (AMOSWAP).
+该地址以 `li t0, 0x800842F8` 硬编码在汇编中. 固件重编译后 (FPU 代码加入 BSS),
+`coldboot_done` 符号从 `0x442F8` 移动到 `0x842F8`, 硬编码的旧地址仍为 `0x800442F8`,
+写入无效位置. `init_warmboot` 读取正确的 `0x800842F8` 时永远为 0,
+在 `div a0, a0, zero` + `lbu` + `beqz` 自旋中死循环.
+
+**症状**: `make emu` 启动后无 OpenSBI logo 输出, hart 在 `0x8000E670`
+(`init_warmboot+0x30`) 处自旋数百万周期不前进. `fw_platform_init` 可正常通过
+(设备树参数正确时), 但 `sbi_init` → `init_coldboot` → `init_warmboot` 卡死.
+
+**修复**:
+- [zsbl_fsbl_stub.S](tests/src-env/zsbl_fsbl_stub.S): 硬编码地址改为预处理器宏
+  `COLD_BOOT_DONE_ADDR` 与 `RAM_BASE`, 由 makefile 通过 `-D` 传入
+- [makefile](tests/src-env/makefile): 新增 `llvm-readelf -s` 自动提取固件 ELF
+  中 `coldboot_done` / `coldboot_lottery` 符号偏移, 经 Python 计算物理地址
+  (`RAM_BASE + vaddr`) 后作为 `-D` 标志传入汇编器. 类似
+  `rust_smode_entry/config.mk` 的配置化方式, 固件重编译后无需手动更新地址
+- [makefile](makefile): `emu` 目标添加完整依赖链:
+  `build-fw` → 拷贝固件到 `tests/` → `$(zsbl_fsbl)` (自动提取符号重建) → 启动调试器
+
+**设计原则**: 硬编码跨二进制地址不可靠. 构建系统应从固件符号表自动提取,
+通过 `-D` 预处理器宏注入汇编器, 消除手工维护.
+
+### 固件移除未使用的 FPU 扩展 (`f`/`d`)
+
+**背景**: pyremu 模拟器未实现 F/D 浮点扩展. 此前 `-march=rv64imafdc_ztee` 使
+`__riscv_flen` 被定义, `riscv_hardfp.S` 中 `get_f64_reg` / `put_f64_reg` 等
+32×2 条 FPU 指令被编译进固件. 虽因 `MSTATUS_FS` 守卫未被调用,
+但增大了 `.text` 体积, 且 `march` 包含 `f`/`d` 易导致编译器在
+memset/memcpy 等函数中生成 FPU 访存指令 (`fsd`/`fld`).
+
+**修改**: [Makefile:415](third-party/custom-opensbi/Makefile#L415):
+`-march=rv64imafdc_ztee` → `-march=rv64imac_ztee`.
+ABI 保持 `lp64` (soft-float), 编译器不再生成任何 FPU 指令.
+
+---
+
 ## 2026-06-19
 
 ### `_sext()` 返回负 Python int 导致 BEQ/BNE 误判 (decoder + disassembler)

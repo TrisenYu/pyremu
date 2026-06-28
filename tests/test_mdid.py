@@ -99,9 +99,7 @@ class TestMfenceDid:
         h.pc = 0x80000000
         trap_before = h.mcause_val
         h.exec_instr(_MFENCE_DID)
-        assert h.mcause_val == trap_before, (
-            f"mfence.did 不应触发 trap, mcause={h.mcause_val}"
-        )
+        assert h.mcause_val == trap_before, f"mfence.did 不应触发 trap, mcause={h.mcause_val}"
 
     def test_invalid_funct12_traps(self):
         """funct12 非法编码应触发 IllInstr (funct3=000, 未注册的 funct12)."""
@@ -202,9 +200,7 @@ class TestMfenceDid:
         assert remaining_mdid >= 1, f"mdid=0 的 L2 条目应保留, 实际剩余 {remaining_mdid}"
         # 验证 mdid=0 的仍在
         still_valid = [e for e in l2.entries if e.valid]
-        assert all(e.mdid == 0 for e in still_valid), (
-            "所有剩余条目的 mdid 应为 0"
-        )
+        assert all(e.mdid == 0 for e in still_valid), "所有剩余条目的 mdid 应为 0"
 
     # -- 广播: 多 hart --
 

@@ -11,6 +11,7 @@ import pytest
 
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
+from pyremu.core.registers import gpr_alias
 from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.debugger import (
     Debugger,
@@ -18,10 +19,11 @@ from pyremu.debugger import (
     MemWriteTracker,
     MemoryChange,
     StackFrame,
-    MAX_INSTR_COUNT
+    MAX_INSTR_COUNT,
 )
 from pyremu.emulator import Emulator
 from pyremu.memory.bus import Bus
+from pyremu.memory.mmu import PTE as MmuPte
 from pyremu.utils.parse_bin import FirmwareImage, FirmwareSegment
 
 
@@ -128,7 +130,7 @@ class TestMemWriteTracker:
     def test_tracks_write_and_records_old(self):
         bus = Bus(ram_size=0x10000, ram_base=0x80000000)
         # 预先写入已知数据
-        bus.write(0x80000000, b"\xAA\xBB\xCC\xDD\xEE\xFF\x00\x11")
+        bus.write(0x80000000, b"\xaa\xbb\xcc\xdd\xee\xff\x00\x11")
 
         calls = []
 
@@ -145,7 +147,7 @@ class TestMemWriteTracker:
         # 记录了旧值
         assert len(tracker.changes) == 1
         assert tracker.changes[0].addr == 0x80000000
-        assert tracker.changes[0].old == b"\xAA\xBB\xCC\xDD"
+        assert tracker.changes[0].old == b"\xaa\xbb\xcc\xdd"
 
     def test_multiple_writes_accumulate(self):
         bus = Bus(ram_size=0x10000, ram_base=0x80000000)
@@ -219,7 +221,7 @@ class TestSnapshotRollback:
         dbg = _make_dbg()
         h = dbg.hart
         h.pc = 0x80000000
-        h.gprs[10].val = 0xDEAD
+        h.gprs[10] = 0xDEAD
         h.mode = RiscvMode.M
 
         snap = dbg._save_snapshot()
@@ -233,8 +235,8 @@ class TestSnapshotRollback:
 
         # 设置初始状态
         h.pc = 0x80000000
-        h.gprs[5].val = 0xABCD
-        h.gprs[10].val = 0x1234
+        h.gprs[5] = 0xABCD
+        h.gprs[10] = 0x1234
         h.csrs["mstatus"].val = 0x1800
         h.mode = RiscvMode.S
 
@@ -242,15 +244,15 @@ class TestSnapshotRollback:
 
         # 修改状态
         h.pc = 0x90000000
-        h.gprs[5].val = 0xFFFF
-        h.gprs[10].val = 0xDEAD
+        h.gprs[5] = 0xFFFF
+        h.gprs[10] = 0xDEAD
         h.csrs["mstatus"].val = 0x0
         h.mode = RiscvMode.M
 
         dbg._restore_snapshot(snap)
         assert h.pc == 0x80000000
-        assert h.gprs[5].val == 0xABCD
-        assert h.gprs[10].val == 0x1234
+        assert h.gprs[5] == 0xABCD
+        assert h.gprs[10] == 0x1234
         assert h.csrs["mstatus"].val == 0x1800
         assert h.mode == RiscvMode.S
 
@@ -273,12 +275,12 @@ class TestSnapshotRollback:
         h = dbg.hart
 
         # 在 RAM 中预写数据
-        dbg._emu.bus.write(0x80000000, b"\xCA\xFE\xBA\xBE\x00\x00\x00\x00")
+        dbg._emu.bus.write(0x80000000, b"\xca\xfe\xba\xbe\x00\x00\x00\x00")
 
         # 执行一条 SW 指令: sw x10, 0(x2)
         h.pc = 0x1000
-        h.gprs[2].val = 0x80000000  # sp
-        h.gprs[10].val = 0x12345678  # a0 = value to store
+        h.gprs[2] = 0x80000000  # sp
+        h.gprs[10] = 0x12345678  # a0 = value to store
         # SD x10, 0(x2): funct3=011, opcode=0100011
         instr = (0 << 25) | (10 << 20) | (2 << 15) | (3 << 12) | (2 << 7) | 0x23
         # 需要将指令写入 PC 处
@@ -291,7 +293,7 @@ class TestSnapshotRollback:
         dbg.rollback()
         # 验证内存恢复
         data_restored = dbg._emu.bus.read(0x80000000, 4)
-        assert data_restored == b"\xCA\xFE\xBA\xBE", (
+        assert data_restored == b"\xca\xfe\xba\xbe", (
             f"回滚应恢复旧数据, 实际: {data_restored.hex()}"
         )
 
@@ -371,27 +373,33 @@ class TestStepOne:
 class TestDebuggerHelpers:
     """辅助方法."""
 
-    @pytest.mark.parametrize("v, expected", [
-        (0, "0x0000000000000000"),
-        (0xDEADBEEF, "0x00000000deadbeef"),
-        (0xFFFFFFFFFFFFFFFF, "0xffffffffffffffff"),
-        (-1, "0xffffffffffffffff"),  # 负值被掩码为 64-bit
-    ])
+    @pytest.mark.parametrize(
+        "v, expected",
+        [
+            (0, "0x0000000000000000"),
+            (0xDEADBEEF, "0x00000000deadbeef"),
+            (0xFFFFFFFFFFFFFFFF, "0xffffffffffffffff"),
+            (-1, "0xffffffffffffffff"),  # 负值被掩码为 64-bit
+        ],
+    )
     def test_hex(self, v, expected):
         assert Debugger._hex(v) == expected
 
-    @pytest.mark.parametrize("n, expected", [
-        (0, "0 B"),
-        (512, "512 B"),
-        (1024, "1.0 KB"),
-        (1536, "1.5 KB"),
-        (1048576, "1.0 MB"),
-        (1073741824, "1.0 GB"),
-        (1099511627776, "1.0 TB"),
-        (1125899906842624, "1.0 PB"),
-        # 超出最大单位: 落到 EB, 不退回 B
-        (2**70 * 12, "12288.0 EB"),  # 12 ZB → 最远单位 EB
-    ])
+    @pytest.mark.parametrize(
+        "n, expected",
+        [
+            (0, "0 B"),
+            (512, "512 B"),
+            (1024, "1.0 KB"),
+            (1536, "1.5 KB"),
+            (1048576, "1.0 MB"),
+            (1073741824, "1.0 GB"),
+            (1099511627776, "1.0 TB"),
+            (1125899906842624, "1.0 PB"),
+            # 超出最大单位: 落到 EB, 不退回 B
+            (2**70 * 12, "12288.0 EB"),  # 12 ZB → 最远单位 EB
+        ],
+    )
     def test_fmt_size(self, n, expected):
         assert Debugger._fmt_size(n) == expected
 
@@ -443,8 +451,12 @@ class TestCmdPc:
     def test_set_pc_clears_snapshot(self):
         dbg = _make_dbg()
         dbg._snapshot = HartSnapshot(
-            pc=0x1000, gpr_vals=[0] * 32, csr_vals={}, mode=3,
-            reservation_valid=False, reservation_addr=0,
+            pc=0x1000,
+            gpr_vals=[0] * 32,
+            csr_vals={},
+            mode=3,
+            reservation_valid=False,
+            reservation_addr=0,
         )
         dbg.cmd_pc("0x2000")
         assert dbg._snapshot is None
@@ -481,12 +493,12 @@ class TestCmdRegs:
 
     def test_regs_shows_all_gprs(self):
         dbg = _make_dbg()
-        dbg.hart.gprs[10].val = 0xCAFE
+        dbg.hart.gprs[10] = 0xCAFE
         dbg.cmd_regs()  # 应不抛异常
 
     def test_reg_shows_one(self):
         dbg = _make_dbg()
-        dbg.hart.gprs[10].val = 0xDEADBEEF
+        dbg.hart.gprs[10] = 0xDEADBEEF
         dbg.cmd_reg("a0")
 
     def test_reg_unknown(self):
@@ -495,18 +507,18 @@ class TestCmdRegs:
 
     def test_reg_by_xn(self):
         dbg = _make_dbg()
-        dbg.hart.gprs[5].val = 0x5555
+        dbg.hart.gprs[5] = 0x5555
         dbg.cmd_reg("x5")
 
     def test_set_writes_gpr(self):
         dbg = _make_dbg()
         dbg.cmd_set("a0", "0xCAFE")
-        assert dbg.hart.gprs[10].val == 0xCAFE
+        assert dbg.hart.gprs[10] == 0xCAFE
 
     def test_set_by_xn(self):
         dbg = _make_dbg()
         dbg.cmd_set("x5", "42")
-        assert dbg.hart.gprs[5].val == 42
+        assert dbg.hart.gprs[5] == 42
 
     def test_set_unknown_reg(self):
         dbg = _make_dbg()
@@ -518,20 +530,20 @@ class TestCmdRegs:
 
     def test_find_gpr_alias(self):
         dbg = _make_dbg()
-        r = dbg._find_gpr("sp")
-        assert r is not None
-        assert r.alias == "sp"
+        idx = dbg._find_gpr("sp")
+        assert idx is not None
+        assert gpr_alias(idx) == "sp"
 
     def test_find_gpr_xn(self):
         dbg = _make_dbg()
-        r = dbg._find_gpr("x2")
-        assert r is not None
-        assert r.alias == "sp"
+        idx = dbg._find_gpr("x2")
+        assert idx is not None
+        assert gpr_alias(idx) == "sp"
 
     def test_find_gpr_unknown(self):
         dbg = _make_dbg()
-        r = dbg._find_gpr("nonexistent")
-        assert r is None
+        idx = dbg._find_gpr("nonexistent")
+        assert idx is None
 
 
 # ============================================================
@@ -742,9 +754,7 @@ class TestCmdDisasm:
         dbg = _make_dbg()
         # 0x10000000 是 UART MMIO, 不在 RAM 范围内
         result = dbg._count_instrs_between(0x10000000, 0x10000100)
-        assert result >= MAX_INSTR_COUNT, (
-            f"非 RAM 起始地址应返回上限值, 实际 {result}"
-        )
+        assert result >= MAX_INSTR_COUNT, f"非 RAM 起始地址应返回上限值, 实际 {result}"
 
     def test_count_instrs_iteration_limit(self):
         """超过 _MAX_INSTR_COUNT 条指令后停止遍历."""
@@ -752,20 +762,16 @@ class TestCmdDisasm:
         # RAM 范围内的大区间, 遍历因条目数超限而截断
         ram_base = dbg._emu.bus.ram_base
         result = dbg._count_instrs_between(ram_base, ram_base + 0x100000)
-        assert result <= MAX_INSTR_COUNT, (
-            f"指令数不应超过 {MAX_INSTR_COUNT}, 实际 {result}"
-        )
+        assert result <= MAX_INSTR_COUNT, f"指令数不应超过 {MAX_INSTR_COUNT}, 实际 {result}"
 
     def test_disasm_far_from_ref_no_hang(self):
         """ref_pc 与 disasm 地址相距甚远时不挂死, 且禁用步数."""
         dbg = _make_dbg()
-        dbg._disasm_ref_pc = 0x80000000   # kernel 入口
+        dbg._disasm_ref_pc = 0x80000000  # kernel 入口
         dbg._disasm_past_terminator = False
         dbg.cmd_disasm("0x10000000", "32")  # UART 地址 — 远在 ref_pc 之上
         # 不应挂死 — 到达这里即通过
-        assert dbg._disasm_past_terminator is True, (
-            "大跨距应触发 past_terminator 禁用 +N 步数"
-        )
+        assert dbg._disasm_past_terminator is True, "大跨距应触发 past_terminator 禁用 +N 步数"
 
     def test_count_instrs_empty_range(self):
         """start >= end 时返回 0."""
@@ -786,9 +792,7 @@ class TestCmdDisasm:
         dbg.cmd_disasm("0x80000ff0", "16")
         step_after_first = dbg._disasm_base_step
         # 4 条 nop 之后步数到达 ref_pc, next_base 应为 0
-        assert step_after_first <= 0, (
-            f"ref_pc 之前 base_step 应 ≤0, 实际 {step_after_first}"
-        )
+        assert step_after_first <= 0, f"ref_pc 之前 base_step 应 ≤0, 实际 {step_after_first}"
 
         # 模拟 Enter 重复: 推进到 ref_pc 所在块
         dbg._disasm_next_addr = 0x80001000
@@ -800,9 +804,7 @@ class TestCmdDisasm:
             f"过 ref_pc 后 base_step 应为正, 实际 {step_after_second}"
         )
         # past_terminator 不应被误触发
-        assert dbg._disasm_past_terminator is False, (
-            "非终止指令不应设置 past_terminator"
-        )
+        assert dbg._disasm_past_terminator is False, "非终止指令不应设置 past_terminator"
 
     def test_disasm_odd_addr_auto_aligns(self):
         """非 2-字节对齐地址自动向下对齐并警告."""
@@ -826,6 +828,78 @@ class TestCmdDisasm:
         dbg.cmd_disasm("0x80001000", "16")
         # 正常完成
         assert dbg._disasm_next_addr is not None
+
+    def test_disasm_with_mmu_enabled(self):
+        """MMU 使能后 disasm 能正确翻译 VA→PA 并显示指令."""
+        dbg = _make_dbg(ram_size=0x200000)
+        hart = dbg.hart
+        bus = dbg._emu.bus
+        PAGE_SHIFT = 12
+
+        # 在 PA 0x80010000 写入两条已知指令: NOP + ADDI a0,a0,1
+        target_pa = 0x80010000
+        code = (
+            b"\x13\x00\x00\x00"  # nop
+            b"\x13\x05\x15\x00"  # addi a0, a0, 1
+        )
+        bus.write(target_pa, code)
+
+        # 构建简易 Sv39 页表: L1→L2→L3→叶, 映射 VA 0x1000→target_pa
+        L1_BASE = 0x80000000
+        L2_BASE = 0x80001000
+        L3_BASE = 0x80002000
+        target_va = 0x1000
+        vpn2 = (target_va >> 30) & 0x1FF
+        vpn1 = (target_va >> 21) & 0x1FF
+        vpn0 = (target_va >> 12) & 0x1FF
+
+        def _write_pte(pa, ppn, **flags):
+            pte = MmuPte()
+            pte.ppn = ppn & 0xF_FFFF_FFFF
+            if flags.get("v"):
+                pte.v = True
+            if flags.get("r"):
+                pte.r = True
+            if flags.get("w"):
+                pte.w = True
+            if flags.get("x"):
+                pte.x = True
+            bus.write(pa, pte.to_int().to_bytes(8, "little"))
+
+        _write_pte(L1_BASE + vpn2 * 8, L2_BASE >> PAGE_SHIFT, v=True)
+        _write_pte(L2_BASE + vpn1 * 8, L3_BASE >> PAGE_SHIFT, v=True)
+        _write_pte(
+            L3_BASE + vpn0 * 8, target_pa >> PAGE_SHIFT,
+            v=True, r=True, w=True, x=True,
+        )
+
+        # 启用 Sv39 MMU
+        hart.satp_val = (8 << 60) | (L1_BASE >> PAGE_SHIFT)
+
+        # 清空 TLB (保持与硬件一致)
+        hart.dtlb.flush_all()
+        hart.itlb.flush_all()
+
+        # disasm 虚拟地址 — 依赖 _try_read_va 的 VA→PA 翻译
+        dbg.cmd_disasm("0x1000", "8")
+
+        # 验证下一条地址已正确设置
+        # 两条 4 字节指令 (NOP + ADDI), 共 8 字节, next_addr 应在末尾
+        assert dbg._disasm_next_addr is not None
+        assert dbg._disasm_next_addr == target_va + 8, (
+            f"disasm MMU: next_addr=0x{dbg._disasm_next_addr:x}, "
+            f"期望 0x{target_va + 8:x}"
+        )
+
+    def test_disasm_mmu_bare_falls_back_to_physical(self):
+        """Bare 模式下 disasm 直接使用物理地址 (无翻译)."""
+        dbg = _make_dbg()
+        # 在 PA 0x1000 处写两条指令
+        dbg._emu.bus.write(0x1000, b"\x13\x00\x00\x00\x13\x05\x15\x00")
+        dbg.hart.satp_val = 0  # Bare
+        dbg.cmd_disasm("0x1000", "8")
+        # 两条 4 字节指令, next_addr 应在 0x1000 + 8
+        assert dbg._disasm_next_addr == 0x1000 + 8
 
 
 # ============================================================
@@ -870,11 +944,11 @@ class TestCmdSymbols:
     def test_resolve_symbol_closest_predecessor(self):
         """最近前驱符号匹配: PC 在函数中间时返回所在函数名."""
         dbg = _make_dbg()
-        syms = {"_start": 0x1000, "main": 0x2000, "init_warmboot": 0xe000}
-        assert dbg._resolve_symbol(syms, 0x2004) == "main"        # 中间
-        assert dbg._resolve_symbol(syms, 0x2000) == "main"        # 精确
-        assert dbg._resolve_symbol(syms, 0x100c) == "_start"      # 中间
-        assert dbg._resolve_symbol(syms, 0xe670) == "init_warmboot"  # 中间
+        syms = {"_start": 0x1000, "main": 0x2000, "init_warmboot": 0xE000}
+        assert dbg._resolve_symbol(syms, 0x2004) == "main"  # 中间
+        assert dbg._resolve_symbol(syms, 0x2000) == "main"  # 精确
+        assert dbg._resolve_symbol(syms, 0x100C) == "_start"  # 中间
+        assert dbg._resolve_symbol(syms, 0xE670) == "init_warmboot"  # 中间
 
     def test_resolve_symbol_far_away_returns_none(self):
         """距离 > 64 KiB 视为不在任何函数内."""
@@ -888,24 +962,25 @@ class TestCmdSymbols:
         """调用方已减去 _load_offset, 传入链接时地址能正确匹配."""
         dbg = _make_dbg()
         dbg._load_offset = 0x80000000
-        syms = {"fdt_next_tag": 0x21d58}
+        syms = {"fdt_next_tag": 0x21D58}
         # _fn_name 传运行时 PC, 内部减去 _load_offset
-        runtime_pc = 0x80021ec4  # fdt_next_tag 内部
+        runtime_pc = 0x80021EC4  # fdt_next_tag 内部
         name = dbg._resolve_symbol(syms, runtime_pc - dbg._load_offset)
         assert name == "fdt_next_tag"
 
     def test_find_segment_with_pie_offset(self):
         """_find_segment 传入链接时地址 (已减 _load_offset) 匹配段."""
         image = FirmwareImage(
-            entry_point=0x0, format="elf",
-            segments=[FirmwareSegment(vaddr=0x0, data=b"", memsz=0x3ebb0, name=".text")],
+            entry_point=0x0,
+            format="elf",
+            segments=[FirmwareSegment(vaddr=0x0, data=b"", memsz=0x3EBB0, name=".text")],
             symbols={},
         )
         dbg = _make_dbg()
         dbg._image = image
         dbg._load_offset = 0x80000000
         # 运行时地址 0x80021ec4, 减 _load_offset 后 = 0x21ec4 在 .text 范围内
-        seg = dbg._find_segment(0x21ec4)
+        seg = dbg._find_segment(0x21EC4)
         assert seg is not None
         assert seg.name == ".text"
 
@@ -971,8 +1046,12 @@ class TestCmdHart:
         emu.load_code(0x1000, b"\x13\x00\x00\x00")
         dbg = Debugger(emulator=emu, hart_id=0)
         dbg._snapshot = HartSnapshot(
-            pc=0x1000, gpr_vals=[0] * 32, csr_vals={}, mode=3,
-            reservation_valid=False, reservation_addr=0,
+            pc=0x1000,
+            gpr_vals=[0] * 32,
+            csr_vals={},
+            mode=3,
+            reservation_valid=False,
+            reservation_addr=0,
         )
         dbg.cmd_hart(1)
         assert dbg._snapshot is None
@@ -1044,13 +1123,16 @@ class TestCmdBreakpoint:
 
     # -- 指令断点 --
 
-    @pytest.mark.parametrize("name, funct12", [
-        ("ecall", 0x000),
-        ("ebreak", 0x001),
-        ("mret", 0x302),
-        ("sret", 0x102),
-        ("wfi", 0x105),
-    ])
+    @pytest.mark.parametrize(
+        "name, funct12",
+        [
+            ("ecall", 0x000),
+            ("ebreak", 0x001),
+            ("mret", 0x302),
+            ("sret", 0x102),
+            ("wfi", 0x105),
+        ],
+    )
     def test_set_instr_bp_named(self, name, funct12):
         dbg = _make_dbg()
         dbg.cmd_bp_set(name)
@@ -1134,21 +1216,27 @@ class TestCmdBreakpoint:
 
     # -- 无效参数 --
 
-    @pytest.mark.parametrize("arg", [
-        "not_a_thing",  # 非数字非指令名
-        "-1",           # 负地址
-    ])
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "not_a_thing",  # 非数字非指令名
+            "-1",  # 负地址
+        ],
+    )
     def test_bp_set_invalid(self, arg):
         dbg = _make_dbg()
         dbg.cmd_bp_set(arg)
         assert len(dbg._breakpoints) == 0
 
-    @pytest.mark.parametrize("arg", [
-        "not_hex",  # @seize_val_err 捕获
-        "-1",       # 负值超出 7-bit
-        "0x80",     # 超出 7-bit 范围
-        "0x55",     # 不是已知 RV64 opcode
-    ])
+    @pytest.mark.parametrize(
+        "arg",
+        [
+            "not_hex",  # @seize_val_err 捕获
+            "-1",  # 负值超出 7-bit
+            "0x80",  # 超出 7-bit 范围
+            "0x55",  # 不是已知 RV64 opcode
+        ],
+    )
     def test_bp_opcode_invalid(self, arg):
         dbg = _make_dbg()
         dbg.cmd_bp_opcode(arg)
@@ -1278,13 +1366,16 @@ class TestCmdBreakpoint:
         hit = dbg._check_breakpoints(dbg.hart, 0x1000, 0x00000013)
         assert not hit
 
-    @pytest.mark.parametrize("op,val,expect_hit", [
-        ("==", 0, True),
-        ("!=", 1, True),
-        ("!=", 0, False),
-        (">", -1, True),   # 0 > -1 (signed)
-        ("<", 1, True),    # 0 < 1
-    ])
+    @pytest.mark.parametrize(
+        "op,val,expect_hit",
+        [
+            ("==", 0, True),
+            ("!=", 1, True),
+            ("!=", 0, False),
+            (">", -1, True),  # 0 > -1 (signed)
+            ("<", 1, True),  # 0 < 1
+        ],
+    )
     def test_cond_bp_operators(self, op, val, expect_hit):
         """条件断点运算符: == != < > — 用 a0 (x10) 验证."""
         dbg = _make_dbg()
@@ -1352,12 +1443,16 @@ class TestCmdBreakpoint:
 
 class TestDispatch:
     """REPL 命令分发."""
-    @pytest.mark.parametrize("v, expected", [
-        ("q", False),
-        ("quit", False),
-        ("exit", False),
-        ("e", True),  # 未知命令, 返回 True 保持 REPL 运行
-    ])
+
+    @pytest.mark.parametrize(
+        "v, expected",
+        [
+            ("q", False),
+            ("quit", False),
+            ("exit", False),
+            ("e", True),  # 未知命令, 返回 True 保持 REPL 运行
+        ],
+    )
     def test_quit_returns_false(self, v, expected: bool):
         dbg = _make_dbg()
         assert dbg._dispatch([v]) is expected
@@ -1377,31 +1472,38 @@ class TestDispatch:
         # 只放 1 条指令, continue 执行完即刻暂停
         assert dbg._dispatch(["c"]) is True
 
-    @pytest.mark.parametrize("parts", [
-        ["r", "2"],
-        ["s", "-1"],                # 负计数被拒绝, 不崩溃
-        ["r", "-1"],                # 同上
-        ["undo"],
-        ["regs"], ["gpr"],
-        ["reg", "a0"],
-        ["reg"],                    # 缺参数, 警告
-        ["set", "a0", "0x42"],
-        ["set", "a0"],              # 缺参数, 警告
-        ["csr", "mstatus"],
-        ["csrw", "mstatus", "0x100"],
-        ["pc"],
-        ["mode"],
-        ["mstatus"],
-        ["tlb"],
-        ["tlbflush"],
-        ["cache"],
-        ["satp"],
-        ["mem", "0x1000"],
-        ["mem"],                    # 缺参数, 警告
-        ["disasm", "0x1000"],
-        ["status"], ["info"],
-        ["stack"], ["bt"], ["frame"],
-    ])
+    @pytest.mark.parametrize(
+        "parts",
+        [
+            ["r", "2"],
+            ["s", "-1"],  # 负计数被拒绝, 不崩溃
+            ["r", "-1"],  # 同上
+            ["undo"],
+            ["regs"],
+            ["gpr"],
+            ["reg", "a0"],
+            ["reg"],  # 缺参数, 警告
+            ["set", "a0", "0x42"],
+            ["set", "a0"],  # 缺参数, 警告
+            ["csr", "mstatus"],
+            ["csrw", "mstatus", "0x100"],
+            ["pc"],
+            ["mode"],
+            ["mstatus"],
+            ["tlb"],
+            ["tlbflush"],
+            ["cache"],
+            ["satp"],
+            ["mem", "0x1000"],
+            ["mem"],  # 缺参数, 警告
+            ["disasm", "0x1000"],
+            ["status"],
+            ["info"],
+            ["stack"],
+            ["bt"],
+            ["frame"],
+        ],
+    )
     def test_dispatch_returns_true(self, parts):
         dbg = _make_dbg()
         assert dbg._dispatch(parts) is True
@@ -1409,6 +1511,45 @@ class TestDispatch:
     def test_sym_dispatches(self):
         dbg = _make_dbg()
         dbg._image = _make_image()
+        assert dbg._dispatch(["sym"]) is True
+
+    def test_sym_no_args_shows_grouped_counts(self):
+        """sym (无参数) 按首字符分组显示各前缀的符号数量."""
+        dbg = _make_dbg()
+        dbg._image = _make_image()
+        # _make_image 提供: _start, main, uart_puts
+        assert dbg._dispatch(["sym"]) is True
+
+    def test_sym_prefix_lists_matching_symbols(self):
+        """sym <prefix> 列出以前缀开头的符号, 按地址升序."""
+        dbg = _make_dbg()
+        dbg._image = _make_image()
+        assert dbg._dispatch(["sym", "m"]) is True  # 匹配 main
+
+    def test_sym_prefix_underscore(self):
+        """sym _ 匹配以下划线开头的符号."""
+        dbg = _make_dbg()
+        dbg._image = _make_image()
+        assert dbg._dispatch(["sym", "_"]) is True  # 匹配 _start
+
+    def test_sym_prefix_no_match(self):
+        """sym <prefix> 无匹配时不报错."""
+        dbg = _make_dbg()
+        dbg._image = _make_image()
+        assert dbg._dispatch(["sym", "zzz"]) is True  # 无匹配
+
+    def test_sym_empty_symbols(self):
+        """空符号表不应崩溃."""
+        dbg = _make_dbg()
+        dbg._image = FirmwareImage(
+            format="elf", entry_point=0x1000, segments=[], symbols={}
+        )
+        assert dbg._dispatch(["sym"]) is True
+
+    def test_sym_no_image(self):
+        """无 ELF 镜像时显示警告, 不崩溃."""
+        dbg = _make_dbg()
+        assert dbg._image is None
         assert dbg._dispatch(["sym"]) is True
 
     def test_hart_dispatches(self):
@@ -1430,7 +1571,7 @@ class TestDispatch:
     def test_w_alias_for_set(self):
         dbg = _make_dbg()
         assert dbg._dispatch(["w", "a0", "99"]) is True
-        assert dbg.hart.gprs[10].val == 99
+        assert dbg.hart.gprs[10] == 99
 
 
 # ============================================================
@@ -1444,7 +1585,7 @@ class TestStackWalk:
     def test_single_frame_when_fp_zero(self):
         dbg = _make_dbg()
         h = dbg.hart
-        h.gprs[8].val = 0  # fp = 0
+        h.gprs[8] = 0  # fp = 0
         frames = dbg._walk_frame_chain()
         assert len(frames) == 1
         assert frames[0].idx == 0
@@ -1460,8 +1601,8 @@ class TestStackWalk:
         h = dbg.hart
 
         # 帧 #0 (当前): sp=0x80001000, fp=0x80001080
-        h.gprs[2].val = 0x80001000  # sp
-        h.gprs[8].val = 0x80001080  # fp
+        h.gprs[2] = 0x80001000  # sp
+        h.gprs[8] = 0x80001080  # fp
 
         bus = dbg._emu.bus
         # 帧 #1 链接 (fp=0x80001080): RA→call_site_A, saved_fp→F1
@@ -1493,7 +1634,7 @@ class TestStackWalk:
         """FP 链成环 → 截断回溯."""
         dbg = _make_dbg()
         h = dbg.hart
-        h.gprs[8].val = 0x80001000  # fp
+        h.gprs[8] = 0x80001000  # fp
         bus = dbg._emu.bus
         # saved_fp 指向自身 → 环
         bus.write(0x80001000 - 16, (0x80001000).to_bytes(8, "little"))
@@ -1505,14 +1646,14 @@ class TestStackWalk:
 
     def test_cmd_frame_shows_backtrace(self):
         dbg = _make_dbg()
-        dbg.hart.gprs[8].val = 0
+        dbg.hart.gprs[8] = 0
         dbg.cmd_frame()  # 单帧
 
     def test_cmd_frame_with_valid_fp(self):
         dbg = _make_dbg()
         h = dbg.hart
-        h.gprs[2].val = 0x80001000
-        h.gprs[8].val = 0x80001080
+        h.gprs[2] = 0x80001000
+        h.gprs[8] = 0x80001080
         bus = dbg._emu.bus
         bus.write(0x80001080 - 16, (0x80001100).to_bytes(8, "little"))
         bus.write(0x80001080 - 8, (0x80000400).to_bytes(8, "little"))
@@ -1523,7 +1664,7 @@ class TestStackWalk:
     def test_cmd_frame_switch(self):
         dbg = _make_dbg()
         h = dbg.hart
-        h.gprs[8].val = 0x80001080
+        h.gprs[8] = 0x80001080
         bus = dbg._emu.bus
         bus.write(0x80001080 - 16, (0x80001100).to_bytes(8, "little"))
         bus.write(0x80001080 - 8, (0x80000400).to_bytes(8, "little"))
@@ -1534,7 +1675,7 @@ class TestStackWalk:
 
     def test_cmd_frame_out_of_range(self):
         dbg = _make_dbg()
-        dbg.hart.gprs[8].val = 0
+        dbg.hart.gprs[8] = 0
         dbg.cmd_frame("99")  # 超出范围
 
 
@@ -1569,7 +1710,7 @@ class TestHexdumpBytes:
     """hexdump 静态辅助."""
 
     def test_hexdump_short(self):
-        data = b"\x48\x65\x6C\x6C\x6F"
+        data = b"\x48\x65\x6c\x6c\x6f"
         result = Debugger._hexdump_bytes(data)
         assert "48 65 6c 6c 6f" in result.lower()
         assert "|Hello|" in result
@@ -1701,20 +1842,20 @@ class TestDebuggerIntegration:
         emu = _make_emu(num_harts=2)
         nops = b"\x13\x00\x00\x00" * 4
         emu.load_code(0x1000, nops)
-        emu.harts[0].gprs[10].val = 0xAAAA
-        emu.harts[1].gprs[10].val = 0xBBBB
+        emu.harts[0].gprs[10] = 0xAAAA
+        emu.harts[1].gprs[10] = 0xBBBB
 
         dbg = Debugger(emulator=emu, hart_id=0)
-        assert dbg.hart.gprs[10].val == 0xAAAA
+        assert dbg.hart.gprs[10] == 0xAAAA
 
         dbg.cmd_hart(1)
-        assert dbg.hart.gprs[10].val == 0xBBBB
+        assert dbg.hart.gprs[10] == 0xBBBB
 
     def test_consecutive_trap_halt_and_status(self):
         """连续 trap → halted, status 显示状态."""
         dbg = _make_dbg()
         # 全部无效指令
-        bad = b"\x7F\x00\x00\x00" * 5
+        bad = b"\x7f\x00\x00\x00" * 5
         dbg._emu.load_code(0x1000, bad)
 
         for _ in range(5):
@@ -1754,7 +1895,7 @@ class TestDebuggerIntegration:
         dbg = _make_dbg()
         # 值超出 64 位范围
         dbg.cmd_set("a0", "0x1FFFFFFFFFFFFFFFF")  # 65 位
-        assert dbg.hart.gprs[10].val == 0xFFFFFFFFFFFFFFFF
+        assert dbg.hart.gprs[10] == 0xFFFFFFFFFFFFFFFF
 
     def test_last_command_repeat_mechanism(self):
         """空输入重复上一条命令 (通过 _dispatch 间接覆盖)."""
@@ -1808,6 +1949,7 @@ class _CacheOutputCapture:
 
         def _capture(*args, **kwargs):
             import io
+
             buf = io.StringIO()
             dbg._console.file = buf
             self._orig(*args, **kwargs)
@@ -1822,7 +1964,9 @@ class _CacheOutputCapture:
 
 
 def _make_dbg_with_l2(
-    num_sets=256, ways=4, line_size=64,
+    num_sets=256,
+    ways=4,
+    line_size=64,
 ) -> Debugger:
     """构造带可配置 L2 缓存的 Debugger."""
     from pyremu.memory.l2cache import L2Cache

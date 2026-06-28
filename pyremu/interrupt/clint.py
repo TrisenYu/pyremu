@@ -29,6 +29,18 @@ from pyremu.memory.bus import Device
 CLINT_BASE = 0x0200_0000
 CLINT_SIZE = 0xC000  # 48 KiB
 
+# 中断优先级 → mip 位掩码 (按优先级从高到低排列).
+# 预计算为 (mask, IntSource) 元组, 避免每条指令在 check_interrupt 中
+# 遍历 IntSource Enum 并做 dict 查找 (profile 显示 6M Enum.__hash__/s).
+_INT_PRIORITY: list[tuple[int, IntSource]] = [
+    (1 << 11, IntSource.MEI),  # MEIP
+    (1 << 3,  IntSource.MSI),  # MSIP
+    (1 << 7,  IntSource.MTI),  # MTIP
+    (1 << 9,  IntSource.SEI),  # SEIP
+    (1 << 1,  IntSource.SSI),  # SSIP
+    (1 << 5,  IntSource.STI),  # STIP
+]
+
 # 寄存器偏移
 MSIP_OFFSET = 0x0000
 MTIMECMP_OFFSET = 0x4000
@@ -77,10 +89,14 @@ class CLINT(InterruptController, Device):
         if self._mtime >= self._mtimecmp[hart_id] and self._mtimecmp[hart_id] > 0:
             mip |= INT_SOURCE_MIP_MASK[IntSource.MTI]
 
-        # 按优先级找最高优先级的待处理中断
+        # 按优先级找最高优先级的待处理中断.
+        # 用预计算元组替代 Enum 迭代 + dict 查找, 避免每条指令:
+        #   - Enum.__iter__ 调用 (1M/s)
+        #   - Enum.__hash__ 调用 (6M/s)
+        #   - dict.__getitem__ 开销
         highest = None
-        for src in IntSource:
-            if mip & INT_SOURCE_MIP_MASK[src]:
+        for mask, src in _INT_PRIORITY:
+            if mip & mask:
                 highest = src
                 break
 

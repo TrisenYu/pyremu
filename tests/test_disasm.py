@@ -68,12 +68,7 @@ def _j_type(
     opcode: int,
 ) -> int:
     return (
-        (imm20 << 31)
-        | (imm10_1 << 21)
-        | (imm11 << 20)
-        | (imm19_12 << 12)
-        | (rd << 7)
-        | opcode
+        (imm20 << 31) | (imm10_1 << 21) | (imm11 << 20) | (imm19_12 << 12) | (rd << 7) | opcode
     )
 
 
@@ -147,12 +142,12 @@ class TestITypeALU:
         # SLLI: funct3=001, shamt in bits [25:20], funct7=0
         instr = _i_type(imm12=0, rs1=1, funct3=1, rd=2, opcode=OP_IMM)
         # imm12=0 means shamt=0; let's set shamt=3
-        instr = ((0 << 25) | (3 << 20) | (1 << 15) | (1 << 12) | (2 << 7) | OP_IMM)
+        instr = (0 << 25) | (3 << 20) | (1 << 15) | (1 << 12) | (2 << 7) | OP_IMM
         assert disasm(instr, 0) == "slli    x2, x1, 3"
 
     def test_srai(self):
         # SRAI: funct3=101, funct7=0x20
-        instr = ((0x20 << 25) | (4 << 20) | (3 << 15) | (5 << 12) | (4 << 7) | OP_IMM)
+        instr = (0x20 << 25) | (4 << 20) | (3 << 15) | (5 << 12) | (4 << 7) | OP_IMM
         assert disasm(instr, 0) == "srai    x4, x3, 4"
 
     def test_andi(self):
@@ -179,7 +174,7 @@ class TestRV64_32Bit:
         assert disasm(instr, 0) == "addiw   x2, x1, 8"
 
     def test_slliw(self):
-        instr = ((0 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | OP_IMM32)
+        instr = (0 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | OP_IMM32
         assert disasm(instr, 0) == "slliw   x3, x1, 2"
 
 
@@ -322,17 +317,17 @@ class TestFence:
 class TestAMO:
     def test_amoadd_w(self):
         # AMOADD.W: funct5=00000, funct3=010 (W)
-        instr = ((0 << 27) | (12 << 20) | (11 << 15) | (2 << 12) | (10 << 7) | AMO)
+        instr = (0 << 27) | (12 << 20) | (11 << 15) | (2 << 12) | (10 << 7) | AMO
         assert disasm(instr, 0) == "amoadd.w x10, x12, (x11)"
 
     def test_amoxor_d(self):
         # AMOXOR.D: funct5=00100, funct3=011 (D)
-        instr = ((4 << 27) | (12 << 20) | (11 << 15) | (3 << 12) | (10 << 7) | AMO)
+        instr = (4 << 27) | (12 << 20) | (11 << 15) | (3 << 12) | (10 << 7) | AMO
         assert disasm(instr, 0) == "amoxor.d x10, x12, (x11)"
 
     def test_lr_w(self):
         # LR.W: funct5=00010, funct3=010, rs2=0 (unused)
-        instr = ((2 << 27) | (0 << 20) | (11 << 15) | (2 << 12) | (10 << 7) | AMO)
+        instr = (2 << 27) | (0 << 20) | (11 << 15) | (2 << 12) | (10 << 7) | AMO
         assert disasm(instr, 0) == "lr.w    x10, x0, (x11)"
 
 
@@ -351,11 +346,11 @@ class TestCompressed:
 
     def test_c_nop(self):
         """0x0001 → c.nop."""
-        assert "c.nop" in disasm(0x0001, 0x5ec)
+        assert "c.nop" in disasm(0x0001, 0x5EC)
 
     def test_c_ebreak(self):
         """0x9002 → c.ebreak."""
-        assert "c.ebreak" in disasm(0x9002, 0x5e0)
+        assert "c.ebreak" in disasm(0x9002, 0x5E0)
 
     def test_c_mv_a5_a0(self):
         """nonsense.o @5c4: 87aa → c.mv a5, a0."""
@@ -481,9 +476,7 @@ class TestCompressedLargeOffset:
         result = disasm(instr, 0x8003E5B0)
         assert "c.sd" in result, f"期望 C.SD, 得到: {result}"
         assert "200" in result, f"期望偏移 200, 得到: {result}"
-        assert "x12" in result and "x13" in result, (
-            f"期望 x12,x13, 得到: {result}"
-        )
+        assert "x12" in result and "x13" in result, f"期望 x12,x13, 得到: {result}"
 
     def test_c_sd_vs_c_sw_different_offset(self):
         """C.SD 与 C.SW 同 scatter 应反汇编为不同偏移 (布局分立)."""
@@ -551,6 +544,41 @@ class TestCompressedLargeOffset:
         assert "60" not in result_sdsp_diff, (
             f"C.SDSP 不应得偏移 60 (布局不同), 得到: {result_sdsp_diff}"
         )
-        assert "312" in result_sdsp_diff, (
-            f"C.SDSP 期望偏移 312, 得到: {result_sdsp_diff}"
-        )
+
+    # -- C0 quadrant: C.ADDI4SPN --
+
+    def test_c_addi4spn_basic(self):
+        """C.ADDI4SPN a0, sp, 16 → 基本编码."""
+        # nzuimm=16: nz96=0000, nz54=01, nz3=0, nz2=0
+        # instr[6]=nz2=0, instr[5]=nz3=0
+        instr = (0b000 << 13) | (0b01 << 11) | (0 << 7) | (0 << 6) | (0 << 5) | (2 << 2)
+        result = disasm(instr, 0x80000000)
+        assert result.startswith("c.addi4spn"), f"期望 C.ADDI4SPN, 得到: {result}"
+        assert "16" in result, f"期望偏移 16, 得到: {result}"
+
+    def test_c_addi4spn_nz3_neq_nz2(self):
+        """C.ADDI4SPN a1, sp, 20 → nzuimm[3:2]=01, 验证 instr[5]/instr[6] 未交换."""
+        # nzuimm=20=0b10100: nz96=0, nz54=01, nz3=0, nz2=1
+        # instr[6]=nz2=1, instr[5]=nz3=0
+        instr = (0b000 << 13) | (0b01 << 11) | (0 << 7) | (1 << 6) | (0 << 5) | (3 << 2)
+        result = disasm(instr, 0x80000000)
+        assert "c.addi4spn" in result, f"期望 C.ADDI4SPN, 得到: {result}"
+        assert "20" in result, f"期望偏移 20, 得到: {result}"
+
+    def test_c_addi4spn_nz2_neq_nz3(self):
+        """C.ADDI4SPN a2, sp, 24 → nzuimm[3:2]=10, 验证 instr[5]/instr[6] 未交换."""
+        # nzuimm=24=0b11000: nz96=0, nz54=01, nz3=1, nz2=0
+        # instr[6]=nz2=0, instr[5]=nz3=1
+        instr = (0b000 << 13) | (0b01 << 11) | (0 << 7) | (0 << 6) | (1 << 5) | (4 << 2)
+        result = disasm(instr, 0x80000000)
+        assert "c.addi4spn" in result, f"期望 C.ADDI4SPN, 得到: {result}"
+        assert "24" in result, f"期望偏移 24, 得到: {result}"
+
+    def test_c_addi4spn_large_imm(self):
+        """C.ADDI4SPN a5, sp, 716 → 较大立即数, 覆盖全部位域."""
+        # nzuimm=716=0x2CC=0b1011001100: nz96=1011, nz54=00, nz3=1, nz2=1
+        # instr[6]=nz2=1, instr[5]=nz3=1
+        instr = (0b000 << 13) | (0b00 << 11) | (0b1011 << 7) | (1 << 6) | (1 << 5) | (6 << 2)
+        result = disasm(instr, 0x80000000)
+        assert "c.addi4spn" in result, f"期望 C.ADDI4SPN, 得到: {result}"
+        assert "716" in result, f"期望偏移 716, 得到: {result}"

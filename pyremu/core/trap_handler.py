@@ -19,8 +19,10 @@ Public functions:
 """
 
 from __future__ import annotations
-
+import os
 from typing import TYPE_CHECKING
+
+from loguru import logger
 
 from pyremu.core.hart import (
     MSTATUS_MIE,
@@ -33,10 +35,26 @@ from pyremu.core.hart import (
     RiscvMode,
 )
 from pyremu.core.trap import TrapType, trap_cause_code
-
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
 
+_TRACE_TRAPS = os.environ.get("PYREMU_TRACE_TRAPS", "") == "1"
+
+# 中断优先级列表 (按优先级从高到低排列).
+# 预计算为模块级常量, 避免 check_pending_interrupts 每条指令分配一次 (节省 1M list + 6M tuple/s).
+_INT_PRIORITY: list[tuple[int, TrapType]] = [
+    (1 << 11, TrapType.MmodeExternInterrupt),  # MEI
+    (1 << 3, TrapType.MmodeSoftInterrupt),  # MSI
+    (1 << 7, TrapType.MmodeTimerInterrupt),  # MTI
+    (1 << 9, TrapType.SmodeExternInterrupt),  # SEI
+    (1 << 1, TrapType.SmodeSoftInterrupt),  # SSI
+    (1 << 5, TrapType.SmodeTimerInterrupt),  # STI
+]
+
+# RiscvMode 枚举值预计算, 避免每条指令访问 .value property
+_MODE_M = RiscvMode.M.value
+_MODE_S = RiscvMode.S.value
+_MODE_U = RiscvMode.U.value
 
 # ============================================================
 #  Trap 处理
@@ -88,6 +106,15 @@ def deliver_trap(
             delegate = bool(hart.csrs["mideleg"].val & (1 << exc_code))
         else:
             delegate = bool(hart.csrs["medeleg"].val & (1 << exc_code))
+
+    if _TRACE_TRAPS:
+        _target = "S" if delegate else "M"
+        _ctx = (
+            f"[trap:{hart.id}] {hart.mode.name}→{_target}: {cause.name} "
+            f"tval={tval:#018x} pc={hart.pc:#018x} "
+            f"exc_code={exc_code} mstatus={hart.mstatus_val:#018x}"
+        )
+        logger.debug(_ctx)
 
     if delegate:
         _trap_deliver_smode(hart, code, exc_code, tval, is_interrupt)
@@ -143,10 +170,7 @@ def _trap_deliver_smode(
         hart.pc = tvec_base
     else:
         # vectored: 所有异常跳转 BASE, 中断跳转 BASE + 4 * exc_code
-        hart.pc = (
-            tvec_base if not is_interrupt
-            else (tvec_base + 4 * exc_code)
-        )
+        hart.pc = tvec_base if not is_interrupt else (tvec_base + 4 * exc_code)
 
 
 # ---- M 模式 trap 投递 ----
@@ -196,10 +220,7 @@ def _trap_deliver_mmode(
     if tvec_mode == 0:
         hart.pc = tvec_base
     else:
-        hart.pc = (
-            tvec_base if not is_interrupt
-            else (tvec_base + 4 * exc_code)
-        )
+        hart.pc = tvec_base if not is_interrupt else (tvec_base + 4 * exc_code)
 
 
 # ============================================================
@@ -371,24 +392,17 @@ def check_pending_interrupts(
     if masked == 0:
         return False
 
-    # S 模式全局中断使能 (用于已委派的中断)
+    # S 模式全局中断使能 (用于已委派的中断).
+    # 用预计算 mode int 替代 .value property 访问.
+    mode_int = hart.mode.value
     mideleg = hart.csrs["mideleg"].val
-    s_mode_global = (
-        hart.mode.value < RiscvMode.S.value
-        or (hart.mode == RiscvMode.S and hart.sie)
+    s_mode_global = mode_int < _MODE_S or (
+        hart.mode == RiscvMode.S and hart.sie
     )
 
-    # 按优先级找最高优先级的使能中断
-    # 完整优先级: MEI(11) > MSI(3) > MTI(7) > SEI(9) > SSI(1) > STI(5)
-    int_priority = [
-        (1 << 11, TrapType.MmodeExternInterrupt),  # MEI
-        (1 << 3, TrapType.MmodeSoftInterrupt),  # MSI
-        (1 << 7, TrapType.MmodeTimerInterrupt),  # MTI
-        (1 << 9, TrapType.SmodeExternInterrupt),  # SEI
-        (1 << 1, TrapType.SmodeSoftInterrupt),  # SSI
-        (1 << 5, TrapType.SmodeTimerInterrupt),  # STI
-    ]
-    for mask, trap_type in int_priority:
+    # 按优先级找最高优先级的使能中断.
+    # 使用模块级预计算常量, 避免每条指令分配 list + 6 tuple.
+    for mask, trap_type in _INT_PRIORITY:
         if not (masked & mask):
             continue
         # 已委派到 S 的中断: 需检查 S 模式全局使能
@@ -468,9 +482,8 @@ def check_pending_interrupts_nested_enabled(
         return False
 
     mideleg = hart.csrs["mideleg"].val
-    s_mode_global = (
-        hart.mode.value < RiscvMode.S.value
-        or (hart.mode == RiscvMode.S and hart.sie)
+    s_mode_global = hart.mode.value < RiscvMode.S.value or (
+        hart.mode == RiscvMode.S and hart.sie
     )
 
     int_priority = [
@@ -487,7 +500,10 @@ def check_pending_interrupts_nested_enabled(
         if (mideleg & mask) and not s_mode_global:
             continue
         deliver_trap_nested_enabled(
-            hart, trap_type, tval=0, is_interrupt=True,
+            hart,
+            trap_type,
+            tval=0,
+            is_interrupt=True,
         )
         return True
 

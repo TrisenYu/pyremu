@@ -21,11 +21,47 @@ from typing import TYPE_CHECKING
 from pyremu.core.registers import (
     check_csr,
     csr_addr_from_name,
+    gpr_alias,
     gpr_idx_from_name,
+    gpr_name,
     register_csr,
     register_fpr,
     register_gpr,
 )
+
+
+class GprFile:
+    """GPR 寄存器文件 — 32 个 64-bit 整数, x0 硬连线为 0.
+
+    替代 pydantic ``list[Reg]`` 作为指令执行热路径上的寄存器后端,
+    消除每条指令 ~150ns 的 pydantic 模型验证开销.
+
+    用法与 ``list[int]`` 一致: ``gprs[10]`` 读, ``gprs[10] = v`` 写.
+    x0 (索引 0) 写入被静默丢弃, 读取恒返回 0.
+    """
+
+    __slots__ = ("_r",)
+
+    def __init__(self) -> None:
+        self._r = [0] * 32
+
+    def __getitem__(self, idx: int) -> int:
+        return self._r[idx & 0x1F]
+
+    def __setitem__(self, idx: int, val: int) -> None:
+        i = idx & 0x1F
+        if i != 0:
+            self._r[i] = val & 0xFFFF_FFFF_FFFF_FFFF
+
+    def __iter__(self):
+        return iter(self._r)
+
+    def __len__(self) -> int:
+        return 32
+
+    def as_list(self) -> list[int]:
+        """返回底层 32 元素的副本, 供快照等外部使用."""
+        return self._r.copy()
 from pyremu.memory.cache import TLB_SIZE
 from pyremu.memory.pmp import Pmp
 from pyremu.memory.tlb import TLB
@@ -38,15 +74,15 @@ if TYPE_CHECKING:
 class RiscvMode(Enum):
     """RISC-V 特权级模式。
 
-    使用位编码 (1 << N) 以便将来做权限掩码比较:
+    数值按标准 RISC-V 特权级编码:
         U=0 (用户), S=1 (监管), H=2 ( hypervisor ),
-        M=4 (机器), D=8 (调试).
+        M=3 (机器), D=8 (调试).
     """
 
     U = 0
     S = 1
     H = 2
-    M = 4
+    M = 3
     D = 8
 
 
@@ -88,9 +124,9 @@ class HartWithRegs:
     快捷属性访问。
     """
 
-    def __init__(self, id: int, pmp_entries: int = 16):
+    def __init__(self, id: int, pmp_entries: int = 64):
         self.id = id
-        self.gprs = register_gpr()
+        self.gprs = GprFile()
         self.fprs = register_fpr()
         self.csrs = register_csr()
 
@@ -142,6 +178,9 @@ class HartWithRegs:
         self._halted: bool = False  # 进入不可恢复陷态后置位
         self._consecutive_traps: int = 0  # 连续 trap 计数 (正常执行时清零)
 
+        # mdid 缓存 — 避免每周期通过 pydantic dict 读取 (热路径, ~1M 次/基准测试)
+        self._mdid_val: int = 0
+
         # WFI 低功耗等待状态
         # 当 hart 执行 WFI 且无可处理中断时置位; 中断挂起且使能时硬件唤醒
         self._waiting: bool = False
@@ -160,17 +199,19 @@ class HartWithRegs:
         check, csr_name = check_csr(csr_id)
         if not check:
             return
-        # satp 写入必须通过 property setter 以同步更新 _mmu_mode
+        # 有副作用的 CSR 必须通过 property setter 写入以同步缓存
         if csr_name == "satp":
             self.satp_val = val
+        elif csr_name == "mdid":
+            self.mdid_val = val
         else:
             self.csrs[csr_name].val = val
 
     def read_gpr(self, reg_id: int) -> int:
-        return self.gprs[reg_id & 0x1F].val
+        return self.gprs[reg_id & 0x1F]
 
     def write_gpr(self, reg_id: int, val: int):
-        self.gprs[reg_id & 0x1F].val = val
+        self.gprs[reg_id & 0x1F] = val
 
     def read_fpr(self, reg_id: int) -> float:
         return self.fprs[reg_id & 0x1F].val
@@ -404,12 +445,14 @@ class HartWithRegs:
 
     @property
     def mdid_val(self) -> int:
-        """读取 mdid CSR (内存域 ID)."""
-        return self.csrs["mdid"].val
+        """读取 mdid CSR (内存域 ID) — 缓存避免每周期 pydantic dict 查找."""
+        return self._mdid_val
 
     @mdid_val.setter
     def mdid_val(self, v: int):
-        self.csrs["mdid"].val = v & 0xFFFF_FFFF_FFFF_FFFF
+        val = v & 0xFFFF_FFFF_FFFF_FFFF
+        self._mdid_val = val
+        self.csrs["mdid"].val = val
 
     # ----------------------------------------------------------
     #  mip 快捷属性 (中断挂起位)

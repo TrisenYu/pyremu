@@ -93,6 +93,15 @@ class Bus:
         self._l2 = l2_cache
         self._devices: dict[int, Device] = {}  # base_addr → device
 
+        # VMA 影子映射: 固件链接在低地址但 RAM 在高地址时,
+        # 自动将 [shadow_base, shadow_base+shadow_size) 别名到 RAM 起始处.
+        self._shadow_base: int | None = None
+        self._shadow_size: int = 0
+
+        # 设备查找缓存 — 按基址排序的 (base, end, device) 列表, 用于二分查找.
+        # add_device 后置 None, 首次 _find_device 时重建.
+        self._device_cache: list[tuple[int, int, Device]] | None = None
+
         # 若 L2 缓存存在, 注入 RAM 后端回调 (L2 只缓存 RAM, 不缓存设备)
         if self._l2 is not None:
             self._l2.set_ram_backend(
@@ -108,11 +117,33 @@ class Bus:
         """注册一个内存映射设备."""
         device.base_addr = base_addr
         self._devices[base_addr] = device
+        self._device_cache = None  # 下次 _find_device 时重建
 
     def _find_device(self, addr: int) -> tuple[Device | None, int]:
-        """查找地址对应的设备及设备内偏移."""
-        for base, dev in self._devices.items():
-            if base <= addr < base + dev.size:
+        """二分查找地址对应的设备及设备内偏移.
+
+        将 O(n) 线性扫描替换为 O(log n) 二分查找.
+        缓存按基址排序的 (base, end, device) 列表, 仅在 add_device 后重建.
+        """
+        if self._device_cache is None:
+            self._device_cache = sorted(
+                (base, base + dev.size, dev)
+                for base, dev in self._devices.items()
+            )
+        cache = self._device_cache
+
+        # bisect_right — 找到第一个 base > addr 的位置
+        lo, hi = 0, len(cache)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if cache[mid][0] <= addr:
+                lo = mid + 1
+            else:
+                hi = mid
+        idx = lo - 1
+        if idx >= 0:
+            base, end, dev = cache[idx]
+            if addr < end:
                 return dev, addr - base
         return None, 0
 
@@ -120,9 +151,22 @@ class Bus:
     #  PMA 检查
     # ----------------------------------------------------------
 
+    def set_ram_shadow(self, base: int, size: int) -> None:
+        """将 [base, base+size) 别名到 RAM 起始处.
+
+        用于固件 VMA ≠ PA 的场景: 固件链接在低地址但 RAM 在高地址,
+        load_offset 搬迁后, VMA 范围仍需要能访问同一物理 RAM.
+        """
+        self._shadow_base = base
+        self._shadow_size = size
+
     def is_ram_addr(self, addr: int) -> bool:
         """判断物理地址是否属于主存 (Main Memory)."""
-        return self._ram_base <= addr < self._ram_end
+        if self._ram_base <= addr < self._ram_end:
+            return True
+        if self._shadow_base is not None:
+            return self._shadow_base <= addr < self._shadow_base + self._shadow_size
+        return False
 
     def is_device_addr(self, addr: int) -> bool:
         """判断物理地址是否属于 MMIO 设备区域 (不可缓存).
@@ -160,26 +204,34 @@ class Bus:
     #  RAM 直接访问 (绕过 L2, 供 L2 回退和调试使用)
     # ----------------------------------------------------------
 
+    def _ram_offset(self, addr: int, size: int) -> int | None:
+        """将地址映射到 RAM 偏移量; 不在任何 RAM 范围则返回 None."""
+        if self._ram_base <= addr and addr + size <= self._ram_end:
+            return addr - self._ram_base
+        if self._shadow_base is not None:
+            if self._shadow_base <= addr and addr + size <= self._shadow_base + self._shadow_size:
+                return addr - self._shadow_base
+        return None
+
     def _ram_read_direct(self, addr: int, size: int) -> bytes:
         """直接从 RAM 读取 (绕过 L2 缓存).
 
         *addr* 超出 RAM 范围时返回全 0 (模拟未映射物理地址).
         """
-        if not (self._ram_base <= addr and addr + size <= self._ram_end):
+        off = self._ram_offset(addr, size)
+        if off is None:
             return b"\x00" * size
-        offset = addr - self._ram_base
-        return bytes(self._ram[offset : offset + size])
+        return bytes(self._ram[off : off + size])
 
     def _ram_write_direct(self, addr: int, data: bytes) -> None:
         """直接写入 RAM (绕过 L2 缓存).
 
         *addr* 超出 RAM 范围时静默丢弃 (由上层 PMA 检查保证不会发生).
         """
-        if not (self._ram_base <= addr and addr + len(data) <= self._ram_end):
+        off = self._ram_offset(addr, len(data))
+        if off is None:
             return
-        offset = addr - self._ram_base
-        for i, b in enumerate(data):
-            self._ram[offset + i] = b
+        self._ram[off : off + len(data)] = data
 
     # ----------------------------------------------------------
     #  总线读写 (外部接口 — Hart 的 _mem_read_phy / _mem_write_phy 使用)

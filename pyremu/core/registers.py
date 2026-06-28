@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 class Reg(BaseModel):
     """通用整数寄存器."""
+
     name: str
     alias: str = ""
     restricts: list = []
@@ -34,6 +35,7 @@ class Reg(BaseModel):
 
 class FPR(BaseModel):
     """浮点寄存器."""
+
     name: str
     alias: str = ""
     restricts: list = []
@@ -129,6 +131,13 @@ def gpr_name(idx: int) -> str:
     return f"?x{idx}"
 
 
+def gpr_alias(idx: int) -> str:
+    """返回第 idx 号 GPR 的 ABI 别名 (例: zero, a0, sp)."""
+    if 0 <= idx < len(_gpr):
+        return _gpr[idx].alias
+    return ""
+
+
 def gpr_idx_from_name(name: str) -> int | None:
     """按名称或别名查找 GPR 索引 (例: "x10" → 10, "t0" → 5, "a0" → 10)."""
     name = name.lower()
@@ -176,6 +185,7 @@ _csr_access_mask = 0b1111_10  # 清除 LSB (rw → ro)
 
 class CSR(Reg):
     """控制和状态寄存器."""
+
     access: CsrAccess
     xlen: int = 64
 
@@ -220,10 +230,10 @@ _csr_bank: dict[int, CSR] = {
     # 向量扩展 CSR
     0x008: _UmodeCSR(name="vstart").strip_w(),
     0x009: _UmodeCSR(name="vxsat").strip_w(),
-    0x00a: _UmodeCSR(name="vxrm").strip_w(),
+    0x00A: _UmodeCSR(name="vxrm").strip_w(),
     0x00F: _UmodeCSR(name="vcsr").strip_w(),
     # Supervisor 模式 CSR
-    0x100: _SmodeCSR(name="sstaus"),
+    0x100: _SmodeCSR(name="sstatus"),
     0x104: _SmodeCSR(name="sie"),
     0x105: _SmodeCSR(name="stvec"),
     0x106: _SmodeCSR(name="scounteren", xlen=32),
@@ -317,8 +327,8 @@ _csr_bank: dict[int, CSR] = {
     0x35C: _MmodeCSR(name="mtopei"),
     0x5A8: _SmodeCSR(name="scontext").add_dmode(),
     # TEE 内存域 & PMP 虚拟化 (自定义扩展)
-    0x5C0: _MmodeCSR(name="mdid"),       # 内存域 ID — TEE 飞地/服务标识
-    0x5C1: _MmodeCSR(name="pmpsplit"),   # PMP 虚拟化辅助 (预留)
+    0x5C0: _MmodeCSR(name="mdid"),  # 内存域 ID — TEE 飞地/服务标识
+    0x5C1: _MmodeCSR(name="pmpsplit"),  # PMP 虚拟化辅助 (预留)
     0x600: _HmodeCSR(name="hstatus"),
     0x602: _HmodeCSR(name="hedeleg"),
     0x603: _HmodeCSR(name="hideleg"),
@@ -328,18 +338,18 @@ _csr_bank: dict[int, CSR] = {
     0x607: _HmodeCSR(name="hgeie"),
     0x608: _HmodeCSR(name="hvien"),
     0x609: _HmodeCSR(name="hvictl"),
-    0x60a: _HmodeCSR(name="henvcfg"),
+    0x60A: _HmodeCSR(name="henvcfg"),
     0x612: _HmodeCSR(name="hedelegh", xlen=32),
     0x613: _HmodeCSR(name="hidelegh", xlen=32),
     0x615: _HmodeCSR(name="htimedeltah", xlen=32),
     0x618: _HmodeCSR(name="hvienh", xlen=32),
-    0x61a: _HmodeCSR(name="henvcfgh", xlen=32),
+    0x61A: _HmodeCSR(name="henvcfgh", xlen=32),
     0x643: _HmodeCSR(name="htval"),
     0x644: _HmodeCSR(name="hip"),
     0x645: _HmodeCSR(name="hvip", xlen=64),
     0x646: _HmodeCSR(name="hviprio1", xlen=64),
     0x647: _HmodeCSR(name="hviprio2", xlen=64),
-    0x64a: _HmodeCSR(name="htinst"),
+    0x64A: _HmodeCSR(name="htinst"),
     0x64D: _HmodeCSR(name="htimecmp"),
     0x64E: _HmodeCSR(name="hctrctl"),
     0x655: _HmodeCSR(name="hviph", xlen=32),
@@ -357,10 +367,10 @@ _csr_bank: dict[int, CSR] = {
     0x7A4: _DMmodeCSR(name="tinfo").strip_w(),
     0x7A5: _DMmodeCSR(name="tcontrol"),
     0x7A8: _MmodeCSR(name="mcontext"),
-    0x7b0: _DmodeCSR(name="dcsr"),
-    0x7b1: _DmodeCSR(name="dpc"),
-    0x7b2: _DmodeCSR(name="dscratch0"),
-    0x7b3: _DmodeCSR(name="dscratch1"),
+    0x7B0: _DmodeCSR(name="dcsr"),
+    0x7B1: _DmodeCSR(name="dpc"),
+    0x7B2: _DmodeCSR(name="dscratch0"),
+    0x7B3: _DmodeCSR(name="dscratch1"),
     # 计数器
     0xB00: _MmodeCSR(name="mcycle", xlen=64),
     0xB02: _MmodeCSR(name="minstret", xlen=64),
@@ -432,39 +442,66 @@ def csr_addr_from_name(name: str) -> int | None:
 # 每个特权级可读取的 CsrAccess 值集合
 # 逻辑: 固件只能访问当前或更低特权级的 CSR; 更高特权级的 CSR 引发 IllInstr.
 _CSR_ACCESSIBLE: dict[int, frozenset[CsrAccess]] = {
-    0: frozenset({
-        CsrAccess.u_ro, CsrAccess.u_rw,
-    }),
-    1: frozenset({
-        CsrAccess.u_ro, CsrAccess.u_rw,
-        CsrAccess.s_ro, CsrAccess.s_rw,
-    }),
-    2: frozenset({
-        CsrAccess.u_ro, CsrAccess.u_rw,
-        CsrAccess.s_ro, CsrAccess.s_rw,
-        CsrAccess.h_ro, CsrAccess.h_rw,
-    }),
-    4: frozenset({
-        CsrAccess.u_ro, CsrAccess.u_rw,
-        CsrAccess.s_ro, CsrAccess.s_rw,
-        CsrAccess.h_ro, CsrAccess.h_rw,
-        CsrAccess.m_ro, CsrAccess.m_rw,
-    }),
-    8: frozenset({
-        CsrAccess.u_ro, CsrAccess.u_rw,
-        CsrAccess.s_ro, CsrAccess.s_rw,
-        CsrAccess.h_ro, CsrAccess.h_rw,
-        CsrAccess.m_ro, CsrAccess.m_rw,
-        CsrAccess.d_ro, CsrAccess.d_rw,
-        CsrAccess.ds_ro, CsrAccess.ds_rw,
-        CsrAccess.dm_ro, CsrAccess.dm_rw,
-    }),
+    0: frozenset(
+        {
+            CsrAccess.u_ro,
+            CsrAccess.u_rw,
+        }
+    ),
+    1: frozenset(
+        {
+            CsrAccess.u_ro,
+            CsrAccess.u_rw,
+            CsrAccess.s_ro,
+            CsrAccess.s_rw,
+        }
+    ),
+    2: frozenset(
+        {
+            CsrAccess.u_ro,
+            CsrAccess.u_rw,
+            CsrAccess.s_ro,
+            CsrAccess.s_rw,
+            CsrAccess.h_ro,
+            CsrAccess.h_rw,
+        }
+    ),
+    3: frozenset(
+        {
+            CsrAccess.u_ro,
+            CsrAccess.u_rw,
+            CsrAccess.s_ro,
+            CsrAccess.s_rw,
+            CsrAccess.h_ro,
+            CsrAccess.h_rw,
+            CsrAccess.m_ro,
+            CsrAccess.m_rw,
+        }
+    ),
+    8: frozenset(
+        {
+            CsrAccess.u_ro,
+            CsrAccess.u_rw,
+            CsrAccess.s_ro,
+            CsrAccess.s_rw,
+            CsrAccess.h_ro,
+            CsrAccess.h_rw,
+            CsrAccess.m_ro,
+            CsrAccess.m_rw,
+            CsrAccess.d_ro,
+            CsrAccess.d_rw,
+            CsrAccess.ds_ro,
+            CsrAccess.ds_rw,
+            CsrAccess.dm_ro,
+            CsrAccess.dm_rw,
+        }
+    ),
 }
 
 # 可写入的 CsrAccess 值 (rw 权限)
-_CSR_WRITABLE: frozenset[CsrAccess] = frozenset({
-    a for a in CsrAccess if a.name.endswith("_rw")
-})
+_CSR_WRITABLE: frozenset[CsrAccess] = frozenset(
+    {a for a in CsrAccess if a.name.endswith("_rw")}
+)
 
 
 class CsrAccessError(Exception):
@@ -473,9 +510,7 @@ class CsrAccessError(Exception):
     def __init__(self, csr_id: int, reason: str) -> None:
         self.csr_id = csr_id
         self.reason = reason
-        super().__init__(
-            f"CSR access violation: addr=0x{csr_id:03x}, reason={reason}"
-        )
+        super().__init__(f"CSR access violation: addr=0x{csr_id:03x}, reason={reason}")
 
 
 def check_csr_access(
@@ -485,7 +520,7 @@ def check_csr_access(
 ) -> None:
     """检查当前特权级是否可访问指定 CSR; 违例时抛出 CsrAccessError.
 
-    *mode_val* 为 ``RiscvMode.value`` (U=0, S=1, H=2, M=4, D=8).
+    *mode_val* 为 ``RiscvMode.value`` (U=0, S=1, H=2, M=3, D=8).
     *is_write* 为 True 时额外检查 rw 权限.
 
     Raises:

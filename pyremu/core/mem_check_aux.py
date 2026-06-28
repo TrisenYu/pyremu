@@ -96,11 +96,11 @@ def validate_csr(
 # ============================================================
 
 
-def _translate_addr(
+def translate_addr(
     hart: HartWithRegs,
     va: int,
 ) -> tuple[bool, int]:
-    """完整地址翻译: TLB 查找 + 页表遍历. 供 mem_read / mem_write 内部使用.
+    """完整地址翻译: TLB 查找 + 页表遍历. 供 mem_read / mem_write 和调试器使用.
 
     MMIO 设备地址 (经 Bus.is_device_addr 判断) 不会插入 TLB,
     因为设备寄存器读写可能有副作用, 不能被缓存.
@@ -174,7 +174,7 @@ def mem_read(
         return b"\x00" * size
 
     # 地址翻译
-    ok, pa = _translate_addr(hart, addr)
+    ok, pa = translate_addr(hart, addr)
     if not ok:
         deliver_trap(hart, TrapType.LdPageFault, tval=addr, is_interrupt=False)
         return b"\x00" * size
@@ -221,7 +221,7 @@ def mem_write(
         return
 
     # 地址翻译
-    ok, pa = _translate_addr(hart, addr)
+    ok, pa = translate_addr(hart, addr)
     if not ok:
         deliver_trap(hart, TrapType.StPageFault, tval=addr, is_interrupt=False)
         return

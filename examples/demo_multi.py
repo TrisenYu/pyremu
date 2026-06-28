@@ -34,7 +34,7 @@ def main() -> None:
 
     loader = MultiProgramLoader(emu, kernel)
     loader.add_process("u_nqueen_entry")  # pid 0 — n-queen first
-    loader.add_process("u_fib_entry")     # pid 1 — fib second
+    loader.add_process("u_fib_entry")  # pid 1 — fib second
 
     print("=" * 55)
     print("  Multi-Program Scheduler Demo")

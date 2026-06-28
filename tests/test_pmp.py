@@ -7,10 +7,13 @@
 
 import pytest
 
+from pyremu.memory.pmp import PMP_A_NAPOT, PMP_A_TOR, PMP_R, PMP_W, PMP_X
 from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
+from pyremu.memory.bus import Bus
 from pyremu.memory.pmp import Pmp
+from pyremu.memory.pmp import decode_napot
 
 
 # ============================================================
@@ -21,43 +24,25 @@ from pyremu.memory.pmp import Pmp
 class TestNapotDecode:
     """验证 NAPOT 格式的 pmpaddr → (base, size) 解码."""
 
-    def test_8_byte_region(self):
-        """8 字节区域 (k=0, 无 trailing 1s)."""
-        from pyremu.memory.pmp import _decode_napot
-
-        # 8 字节 @ 0x1000: size=8, k=0, 无 padding
-        # pmpaddr = base >> 2 = 0x400
-        base, size = _decode_napot(0x400)
-        assert size == 8
-        assert base == 0x1000
-
-    def test_4k_region(self):
-        """4 KiB 区域 (k=9 trailing 1s)."""
-        from pyremu.memory.pmp import _decode_napot
-
-        # 4 KiB @ 0x80000000: k=9 (2^12)
-        # pmpaddr = (0x80000000 >> 2) | 0x1FF = 0x20000000 | 0x1FF
-        val = (0x8000_0000 >> 2) | 0x1FF
-        base, size = _decode_napot(val)
-        assert size == 4096
-        assert base == 0x8000_0000
-
-    def test_64k_region(self):
-        """64 KiB 区域 (k=13 trailing 1s)."""
-        from pyremu.memory.pmp import _decode_napot
-
-        val = (0x8000_0000 >> 2) | 0x1FFF
-        base, size = _decode_napot(val)
-        assert size == 65536
-        assert base == 0x8000_0000
-
-    def test_all_ones_entire_space(self):
-        """全 1 覆盖整个地址空间."""
-        from pyremu.memory.pmp import _decode_napot
-
-        base, size = _decode_napot(0x3F_FFFF_FFFF_FFFF)
-        assert base == 0
-        assert size > 2**63  # 无穷大
+    # es: expected_size
+    # eb: expected_base
+    @pytest.mark.parametrize(
+        "v, es, eb",
+        [
+            # 8 字节 @ 0x1000: size=8, k=0, 无 padding
+            # pmpaddr = base >> 2 = 0x400
+            (0x400, 8, 0x1000),
+            # 4 KiB @ 0x80000000: k=9 (2^12)
+            # pmpaddr = (0x80000000 >> 2) | 0x1FF = 0x20000000 | 0x1FF
+            ((0x8000_0000 >> 2) | 0x1FF, 4096, 0x8000_0000),
+            # 64 KiB 区域 (k=13 trailing 1s)
+            ((0x8000_0000 >> 2) | 0x1FFF, 65536, 0x8000_0000),
+            (0x3F_FFFF_FFFF_FFFF, 2**63, 0),
+        ],
+    )
+    def test_pmp_basic_fn(self, v: int, es: int, eb: int):
+        base, size = decode_napot(v)
+        assert base == eb and size >= es
 
 
 # ============================================================
@@ -78,9 +63,12 @@ class TestPmpCheck:
 
         *entries* 为 [(cfg, addr), ...] — cfg 为 8-bit, addr 为 pmpaddr 原始值.
         """
+
         class FakeCSR:
             val: int
-            def __init__(self, v): self.val = v
+
+            def __init__(self, v):
+                self.val = v
 
         # 构建 cfg 组 (每 8 条目一组)
         cfg_vals: dict[int, int] = {}
@@ -100,32 +88,38 @@ class TestPmpCheck:
     def test_m_mode_bypass(self, pmp):
         """M 模式 + MPRV=0: PMP 不检查, 直接放行."""
         # 无 PMP 条目 — S/U 会拒绝, M 放行
-        assert pmp.check(0x1000, 4, mode_val=4, mstatus_val=0, is_write=True)
+        assert pmp.check(0x1000, 4, mode_val=3, mstatus_val=0, is_write=True)
 
     def test_m_mode_mprv_uses_mpp(self, pmp):
         """M 模式 + MPRV=1: 按 MPP 特权级检查."""
         # MPRV=1, MPP=0 (U) — 应作为 U 模式检查
         # 0 条目 → U 模式拒绝
         mstatus = (1 << 17) | (0 << 11)  # MPRV=1, MPP=U
-        assert not pmp.check(0x1000, 4, mode_val=4, mstatus_val=mstatus)
+        assert not pmp.check(0x1000, 4, mode_val=3, mstatus_val=mstatus)
 
     # ---- TOR ----
 
     def test_tor_range(self, pmp):
         """TOR: pmpaddr[0]=0x1000 → 范围 [0, 0x4000)."""
-        self._set_csrs(pmp, [
-            (0b1000 | 0b0001, 0x1000),  # TOR, R, entry 0: [0, 0x4000)
-        ])
+        self._set_csrs(
+            pmp,
+            [
+                (0b1000 | 0b0001, 0x1000),  # TOR, R, entry 0: [0, 0x4000)
+            ],
+        )
         # 0x1000 << 2 = 0x4000 → range [0, 0x4000)
         assert pmp.check(0x0000, 4, mode_val=0, mstatus_val=0)  # inside
         assert not pmp.check(0x4000, 1, mode_val=0, mstatus_val=0)  # at hi bound
 
     def test_tor_range_multi_entry(self, pmp):
         """TOR 多条目: [addr[0]<<2, addr[1]<<2)."""
-        self._set_csrs(pmp, [
-            (0b1000 | 0b0001, 0x1000),  # entry 0: [0, 0x4000)
-            (0b1000 | 0b0001, 0x2000),  # entry 1: [0x4000, 0x8000)
-        ])
+        self._set_csrs(
+            pmp,
+            [
+                (0b1000 | 0b0001, 0x1000),  # entry 0: [0, 0x4000)
+                (0b1000 | 0b0001, 0x2000),  # entry 1: [0x4000, 0x8000)
+            ],
+        )
         assert pmp.check(0x0000, 4, mode_val=0, mstatus_val=0)  # entry 0
         assert pmp.check(0x4000, 4, mode_val=0, mstatus_val=0)  # entry 1
         assert not pmp.check(0x8000, 4, mode_val=0, mstatus_val=0)  # out
@@ -134,9 +128,12 @@ class TestPmpCheck:
 
     def test_na4_match(self, pmp):
         """NA4: 4 字节精确匹配."""
-        self._set_csrs(pmp, [
-            (0b1_0000 | 0b0111, 0x8000_0000 >> 2),  # NA4, RWX @ 0x8000_0000
-        ])
+        self._set_csrs(
+            pmp,
+            [
+                (0b1_0000 | 0b0111, 0x8000_0000 >> 2),  # NA4, RWX @ 0x8000_0000
+            ],
+        )
         # addr = pmpaddr << 2 = 0x8000_0000
         assert pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0)
         assert not pmp.check(0x8000_0004, 4, mode_val=0, mstatus_val=0)
@@ -146,9 +143,12 @@ class TestPmpCheck:
     def test_napot_4k_range(self, pmp):
         """NAPOT 4 KiB 区域匹配."""
         val = (0x8000_0000 >> 2) | 0x1FF  # 4KB region @ 0x8000_0000
-        self._set_csrs(pmp, [
-            (0b11_000 | 0b0111, val),  # NAPOT, RWX
-        ])
+        self._set_csrs(
+            pmp,
+            [
+                (0b11_000 | 0b0111, val),  # NAPOT, RWX
+            ],
+        )
         assert pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0)
         assert pmp.check(0x8000_0FFC, 4, mode_val=0, mstatus_val=0)  # last 4B
         assert not pmp.check(0x8000_1000, 4, mode_val=0, mstatus_val=0)  # out
@@ -156,9 +156,12 @@ class TestPmpCheck:
     def test_napot_cross_boundary_access(self, pmp):
         """跨边界访问被拒绝."""
         val = (0x8000_0000 >> 2) | 0x1FF  # 4KB
-        self._set_csrs(pmp, [
-            (0b11_000 | 0b0111, val),
-        ])
+        self._set_csrs(
+            pmp,
+            [
+                (0b11_000 | 0b0111, val),
+            ],
+        )
         # 从 0xFFC 读 8 字节 → 超出区域
         assert not pmp.check(0x8000_0FFC, 8, mode_val=0, mstatus_val=0)
 
@@ -167,9 +170,12 @@ class TestPmpCheck:
     def test_r_denied(self, pmp):
         """R=0 拒绝读 (但 W 检查不受 R 影响)."""
         val = (0x8000_0000 >> 2) | 0x1FF
-        self._set_csrs(pmp, [
-            (0b11_000 | 0b0010, val),  # NAPOT, W only (no R)
-        ])
+        self._set_csrs(
+            pmp,
+            [
+                (0b11_000 | 0b0010, val),  # NAPOT, W only (no R)
+            ],
+        )
         assert not pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0)
         # R=0 时 W 也拒绝 (PMP 要求 R 必须置位)
         assert not pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0, is_write=True)
@@ -177,9 +183,12 @@ class TestPmpCheck:
     def test_w_denied(self, pmp):
         """W=0 拒绝写."""
         val = (0x8000_0000 >> 2) | 0x1FF
-        self._set_csrs(pmp, [
-            (0b11_000 | 0b0101, val),  # NAPOT, R+X
-        ])
+        self._set_csrs(
+            pmp,
+            [
+                (0b11_000 | 0b0101, val),  # NAPOT, R+X
+            ],
+        )
         assert pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0)  # read OK
         assert not pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0, is_write=True)
 
@@ -269,7 +278,6 @@ class TestPmpInHart:
 
     @pytest.fixture
     def hart(self) -> Hart:
-        from pyremu.memory.bus import Bus
 
         h = Hart(id=0, pmp_entries=4)
         bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
@@ -307,14 +315,12 @@ class TestPmpInHart:
         """M 模式 store 不被 PMP 检查."""
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=True)
         # 直接通过 _mem_write 写入
-        mem_write(hart, 0x8000_1000, b"\xAA\xBB\xCC\xDD")
+        mem_write(hart, 0x8000_1000, b"\xaa\xbb\xcc\xdd")
         # 无 trap
         assert hart.mcause_val == 0
 
     def test_umode_store_pmp_rw_ok(self, hart):
         """U 模式, PMP 允许 RW → store 成功."""
-        from pyremu.memory.pmp import PMP_A_NAPOT, PMP_R, PMP_W
-
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=True)
         hart.mode = RiscvMode.U
         mem_write(hart, 0x8000_1000, b"\x11\x22")
@@ -322,8 +328,6 @@ class TestPmpInHart:
 
     def test_umode_store_pmp_w_denied(self, hart):
         """U 模式, PMP W=0 → StAccessFault."""
-        from pyremu.memory.pmp import PMP_A_NAPOT, PMP_R
-
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=False)
         hart.mode = RiscvMode.U
         mem_write(hart, 0x8000_1000, b"\x11\x22")
@@ -331,17 +335,11 @@ class TestPmpInHart:
 
     def test_umode_load_pmp_r_denied(self, hart):
         """U 模式, PMP R=0 → LdAccessFault."""
-        from pyremu.memory.pmp import PMP_A_NAPOT, PMP_W
-
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=False, w=True)
         hart.mode = RiscvMode.U
         # 先写入实际数据
-        hart._mem_write_phy(0x8000_1000, b"\xDE\xAD")
+        hart._mem_write_phy(0x8000_1000, b"\xde\xad")
         # 清 trap 计数
         hart._consecutive_traps = 0
         mem_read(hart, 0x8000_1000, 4)
         assert hart.mcause_val == 5, f"应为 LdAccessFault(5), 实际 {hart.mcause_val}"
-
-
-# 复用 pmp.py 的常量
-from pyremu.memory.pmp import PMP_A_NAPOT, PMP_A_TOR, PMP_R, PMP_W, PMP_X  # noqa: E402

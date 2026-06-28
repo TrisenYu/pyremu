@@ -60,8 +60,7 @@ class Preloader:
         """
         if addr is None:
             addr = (
-                self._emu.bus.ram_base + self._emu.bus.ram_size
-                - self.DEFAULT_ADDR_OFFSET
+                self._emu.bus.ram_base + self._emu.bus.ram_size - self.DEFAULT_ADDR_OFFSET
             ) & ~0xF
 
         self._emu.bus.write(addr, code)

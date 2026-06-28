@@ -231,14 +231,10 @@ class TestPTECheckPerm:
 
     def test_write_denied_without_w(self, user_pte):
         user_pte.w = False
-        assert not user_pte.check_perm(
-            want_r=True, want_w=True, want_x=False, is_user=False
-        )
+        assert not user_pte.check_perm(want_r=True, want_w=True, want_x=False, is_user=False)
 
     def test_execute_denied_without_x(self, user_pte):
-        assert not user_pte.check_perm(
-            want_r=False, want_w=False, want_x=True, is_user=False
-        )
+        assert not user_pte.check_perm(want_r=False, want_w=False, want_x=True, is_user=False)
 
     def test_invalid_pte_denies_all(self):
         pte = PTE()  # v=0

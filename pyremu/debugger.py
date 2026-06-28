@@ -17,10 +17,9 @@
 """
 
 import argparse
-import os
 import signal
-import struct
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,11 +35,26 @@ from rich.table import Table
 
 from pyremu.core.decoder import Hart, Opc, parse_compressed
 from pyremu.core.hart import RiscvMode
-from pyremu.core.mem_check_aux import inject_memory_backend
+from pyremu.core.mem_check_aux import inject_memory_backend, translate_addr
+from pyremu.memory.mmu import sv39_walk
 from pyremu.memory.l2cache import L2Cache
+from pyremu.memory.pmp import (
+    PMP_A_MASK,
+    PMP_A_NAPOT,
+    PMP_A_NA4,
+    PMP_A_OFF,
+    PMP_A_TOR,
+    PMP_L,
+    PMP_R,
+    PMP_W,
+    PMP_X,
+    decode_napot,
+)
 from pyremu.core.registers import (
     csr_addr_from_name,
+    gpr_alias,
     gpr_idx_from_name,
+    gpr_name,
     register_csr,
     register_fpr,
     register_gpr,
@@ -63,6 +77,7 @@ from pyremu.utils.parse_bin import FirmwareImage, FirmwareSegment, parse_firmwar
 @dataclass
 class HartSnapshot:
     """单条指令执行前的 hart 状态."""
+
     pc: int
     gpr_vals: list[int]
     csr_vals: dict[str, int]
@@ -74,6 +89,7 @@ class HartSnapshot:
 @dataclass
 class MemoryChange:
     """一次物理内存写入的记录 (addr, old_data)."""
+
     addr: int
     old: bytes
 
@@ -110,6 +126,8 @@ class StackFrame:
     sp: int
     ra: int
     pc: int  # call site = ra - 4 (若 ra ≥ 4)
+    note: str = ""  # 非空表示特殊帧 (如 "U→S trap", "S→M ecall")
+    mode: str = ""  # "M" / "S" / "U" — 用于颜色渲染
 
 
 # ============================================================
@@ -124,10 +142,10 @@ class _Breakpoint:
     kind: str  # "addr" | "instr" | "opcode" | "cond"
     value: int  # address, funct12, opcode, or 0 for cond
     desc: str  # human-readable
-    cond_type: str = ""        # "" | "reg" | "csr"
-    cond_reg: str = ""         # 寄存器名
-    cond_op: str = "=="        # 比较运算符
-    cond_val: int = 0          # 期望值
+    cond_type: str = ""  # "" | "reg" | "csr"
+    cond_reg: str = ""  # 寄存器名
+    cond_op: str = "=="  # 比较运算符
+    cond_val: int = 0  # 期望值
 
 
 # 可命名的指令断点 — 与 handle_sys / _PRIV_MNEMONIC 一致
@@ -149,12 +167,12 @@ _KNOWN_OPCODES: frozenset[int] = frozenset(o.value for o in Opc)
 _SIZE_UNITS: tuple[tuple[str, int], ...] = (
     # ("YB", 1<<80),
     # ("ZB", 1<<70),
-    ("EB", 1<<60),
-    ("PB", 1<<50),
-    ("TB", 1<<40),
-    ("GB", 1<<30),
-    ("MB", 1<<20),
-    ("KB", 1<<10),
+    ("EB", 1 << 60),
+    ("PB", 1 << 50),
+    ("TB", 1 << 40),
+    ("GB", 1 << 30),
+    ("MB", 1 << 20),
+    ("KB", 1 << 10),
 )
 
 MAX_INSTR_COUNT = 100_000  # 指令条数上限, 超界视为不可达
@@ -211,27 +229,33 @@ class Debugger:
 
         # 断点
         self._breakpoints: list[_Breakpoint] = []
-        self._bp_mode: str = "sync"       # "sync"=全停, "async"=仅当前 hart
+        self._bp_mode: str = "sync"  # "sync"=全停, "async"=仅当前 hart
         self._hart_paused: set[int] = set()  # async 模式下被暂停的 hart
         self._bp_hit_this_run: set[tuple[str, int]] = set()
         self._prev_instr_csr_addr: int = -1  # 上一条指令的 CSR 地址 (供 CSR 条件后检)
+
+        # 写监控 (watch): 追踪对特定内存地址的写入
+        self._watch_ranges: list[tuple[int, int]] = []  # [(start, end), ...]
+        self._watch_hit: tuple[int, int, int, bytes] | None = None  # (pc, addr, size, data)
+        self._watch_installed: bool = False
 
         # 最近的栈回溯帧列表 (供 frame N 选择)
         self._stack_frames: list[StackFrame] = []
         self._current_frame_idx: int = 0
 
         # prompt_toolkit REPL — 方向键历史, Tab 补全, 持久化历史文件
-        self._history: FileHistory = FileHistory(
-            os.path.expanduser("~/.pyremu_history")
-        )
+        self._history: FileHistory = FileHistory(str(Path.home() / ".pyremu_history"))
+        self._trim_history(max_entries=10000)
         self._completer: WordCompleter = self._build_completer()
         self._session: PromptSession[str] = PromptSession(
             history=self._history,
             completer=self._completer,
-            style=Style.from_dict({
-                "prompt": "#00aa00 bold",
-                "": "#cccccc",
-            }),
+            style=Style.from_dict(
+                {
+                    "prompt": "#00aa00 bold",
+                    "": "#cccccc",
+                }
+            ),
         )
 
     # ==========================================================
@@ -241,23 +265,52 @@ class Debugger:
     def _build_completer(self) -> WordCompleter:
         words: list[str] = [
             # 执行控制
-            "s", "step", "c", "continue", "r", "run",
-            "undo", "rollback", "restart",
-            "b", "bp",
+            "s",
+            "step",
+            "c",
+            "continue",
+            "r",
+            "run",
+            "undo",
+            "rollback",
+            "restart",
+            "b",
+            "bp",
             # 寄存器 / CSR 操作
-            "regs", "gpr", "reg", "set", "w",
-            "csr", "csrw",
+            "regs",
+            "gpr",
+            "reg",
+            "set",
+            "w",
+            "csr",
+            "csrw",
             # 状态 / 内存
-            "pc", "mode", "mstatus",
-            "tlb", "tlbflush", "cache", "satp",
+            "pc",
+            "mode",
+            "mstatus",
+            "tlb",
+            "tlbflush",
+            "cache",
+            "satp",
             "mem",
-            "status", "info",
-            "symbols", "sym",
+            "status",
+            "info",
+            "symbols",
+            "sym",
             "disasm",
-            "stack", "bt", "frame", "f",
+            "stack",
+            "bt",
+            "frame",
+            "f",
+            "show-pmp",
             # 配置 & 帮助
-            "hart", "h", "help", "?",
-            "q", "quit", "exit",
+            "hart",
+            "h",
+            "help",
+            "?",
+            "q",
+            "quit",
+            "exit",
         ]
         # GPR 名称 (x0–x31 + ABI alias)
         for r in register_gpr():
@@ -276,6 +329,25 @@ class Debugger:
         return WordCompleter(words, ignore_case=True, sentence=True)
 
     # ==========================================================
+    #  历史文件裁剪 — 防止 ~/.pyremu_history 无限增长
+    # ==========================================================
+
+    @staticmethod
+    def _trim_history(max_entries: int = 10000) -> None:
+        """若历史文件超过 *max_entries* 行, 仅保留最近一半."""
+        hist_path = Path.home() / ".pyremu_history"
+        if not hist_path.is_file():
+            return
+        try:
+            lines = hist_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if len(lines) <= max_entries:
+                return
+            keep = max_entries // 2
+            hist_path.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+        except OSError:
+            pass  # 文件被锁或权限不足时静默跳过
+
+    # ==========================================================
     #  hart 访问
     # ==========================================================
 
@@ -287,10 +359,10 @@ class Debugger:
     #  信号处理
     # ==========================================================
 
-    def _sigint_repl(self, signum: int, frame) -> None:
+    def _sigint_repl(self, _signum: int, _frame) -> None:
         raise KeyboardInterrupt
 
-    def _sigint_run(self, signum: int, frame) -> None:
+    def _sigint_run(self, _signum: int, _frame) -> None:
         self._sigint_count += 1
         payload = "\n[yellow]暂停请求 — 当前指令完成后回到 REPL[/]"
         if self._sigint_count != 1:
@@ -393,18 +465,18 @@ class Debugger:
                 # 快速预过滤: 仅涉及目标寄存器/CSR 的指令才评估条件
                 hit = self._instr_may_affect_cond(instr, bp)
             elif bp.kind == "addr":
-                hit = (pc == bp.value)
+                hit = pc == bp.value
             elif bp.kind == "instr":
                 opcode = instr & 0x7F
                 funct3 = (instr >> 12) & 0x7
                 funct12 = (instr >> 20) & 0xFFF
-                hit = (opcode == 0x73 and funct3 == 0 and funct12 == bp.value)
+                hit = opcode == 0x73 and funct3 == 0 and funct12 == bp.value
             elif bp.kind == "opcode":
                 # opcode 断点仅适用 32-bit 标准指令: 压缩指令的
                 # instr & 0x7F 不能可靠得出象限值, 跳过
                 if parse_compressed(instr):
                     continue
-                hit = ((instr & 0x7F) == bp.value)
+                hit = (instr & 0x7F) == bp.value
 
             if not hit:
                 continue
@@ -441,7 +513,7 @@ class Debugger:
             for bp in self._breakpoints:
                 hit = False
                 if bp.kind == "addr":
-                    hit = (h.pc == bp.value)
+                    hit = h.pc == bp.value
                 elif bp.kind == "cond":
                     # 多 hart 模式下没有单条 instr 参数, 预过滤器放行
                     hit = True
@@ -455,9 +527,9 @@ class Debugger:
                         opcode = instr & 0x7F
                         funct3 = (instr >> 12) & 0x7
                         funct12 = (instr >> 20) & 0xFFF
-                        hit = (opcode == 0x73 and funct3 == 0 and funct12 == bp.value)
+                        hit = opcode == 0x73 and funct3 == 0 and funct12 == bp.value
                     elif not parse_compressed(instr):
-                        hit = ((instr & 0x7F) == bp.value)
+                        hit = (instr & 0x7F) == bp.value
                 if not hit or not self._eval_bp_condition(h, bp):
                     continue
                 bp_key = (bp.kind, h.pc) if bp.kind == "addr" else (bp.kind, bp.value)
@@ -475,7 +547,7 @@ class Debugger:
         h = self.hart
         return HartSnapshot(
             pc=h.pc,
-            gpr_vals=[r.val for r in h.gprs],
+            gpr_vals=list(h.gprs),
             csr_vals={name: csr.val for name, csr in h.csrs.items()},
             mode=h.mode.value,
             reservation_valid=h.reservation_valid,
@@ -486,10 +558,11 @@ class Debugger:
         h = self.hart
         h.pc = snap.pc
         for i, val in enumerate(snap.gpr_vals):
-            h.gprs[i].val = val
+            h.gprs[i] = val
         for name, val in snap.csr_vals.items():
-            if name in h.csrs:
-                h.csrs[name].val = val
+            if name not in h.csrs:
+                continue
+            h.csrs[name].val = val
         h.mode = RiscvMode(snap.mode)
         if snap.reservation_valid:
             h.set_reservation(snap.reservation_addr)
@@ -518,8 +591,10 @@ class Debugger:
 
         try:
             pc_before = h.pc
-            instr_bytes = self._emu.bus.read(h.pc, 4)
-            instr = int.from_bytes(instr_bytes, "little", signed=False)
+            instr = int.from_bytes(
+                self._emu.bus.read(h.pc, 4),
+                "little", signed=False
+            )
 
             # 断点检查 — 命中时停止 (同一 continue 内已命中过的地址会被跳过)
             if self._check_breakpoints(h, pc_before, instr):
@@ -558,6 +633,23 @@ class Debugger:
 
         self._mem_changes = tracker.changes
         self._snapshot = snap
+
+        # 写监控检查 — 命中时暂停并报告
+        if not self._watch_ranges:
+            return
+        for change in tracker.changes:
+            a, sz = change.addr, len(change.old)
+            for ws, we in self._watch_ranges:
+                if not (max(a, ws) < min(a + sz, we)):
+                    continue
+                self._watch_hit = (h.pc, a, sz, change.old)
+                self._paused = True
+                self._console.print(
+                    f"  [red] (@) 写监控命中[/] pc={self._hex(h.pc)}"
+                    f"  写入 0x{self._hex(a)} ({sz}B)"
+                    f"  旧值={change.old[:16].hex()}"
+                )
+                return
 
     def rollback(self) -> None:
         """回滚最近一条指令的影响."""
@@ -620,13 +712,17 @@ class Debugger:
         # 1) 符号名
         if self._try_set_symbol_bp(rest):
             # 补充条件到最后一个断点
-            if cond_type:
-                self._breakpoints[-1].cond_type = cond_type
-                self._breakpoints[-1].cond_reg = cond_reg
-                self._breakpoints[-1].cond_op = cond_op
-                self._breakpoints[-1].cond_val = cond_val
-                self._breakpoints[-1].desc += f" if {cond_type} {cond_reg}{cond_op}0x{cond_val:x}"
-                self._console.print(f"    条件: {cond_type} {cond_reg} {cond_op} 0x{cond_val:x}")
+            if not cond_type:
+                return
+            self._breakpoints[-1].cond_type = cond_type
+            self._breakpoints[-1].cond_reg = cond_reg
+            self._breakpoints[-1].cond_op = cond_op
+            self._breakpoints[-1].cond_val = cond_val
+            self._breakpoints[-1].desc += f" if {cond_type} {cond_reg}{cond_op}" + \
+                f"0x{cond_val:x}"
+            self._console.print(
+                f"    条件: {cond_type} {cond_reg} {cond_op} 0x{cond_val:x}"
+            )
             return
 
         # 2) 地址 (pc / 寄存器名 / 十六进制)
@@ -639,13 +735,22 @@ class Debugger:
             if cond_type:
                 desc += f" if {cond_type} {cond_reg}{cond_op}0x{cond_val:x}"
                 label = "条件断点"
-            bp = _Breakpoint(kind="addr", value=addr, desc=desc,
-                             cond_type=cond_type, cond_reg=cond_reg,
-                             cond_op=cond_op, cond_val=cond_val)
+            bp = _Breakpoint(
+                kind="addr",
+                value=addr, desc=desc,
+                cond_type=cond_type,
+                cond_reg=cond_reg,
+                cond_op=cond_op,
+                cond_val=cond_val,
+            )
             self._breakpoints.append(bp)
             asm_info = self._fetch_and_disasm(addr)
             asm_str = f"  {asm_info[1]}" if asm_info else ""
-            cond_str = f" [bold yellow]if[/] {cond_type} {cond_reg} {cond_op} [yellow]0x{cond_val:x}[/]" if cond_type else ""
+            cond_str = (
+                f" [bold yellow]if[/] {cond_type} {cond_reg} {cond_op} [yellow]0x{cond_val:x}[/]"
+                if cond_type
+                else ""
+            )
             self._console.print(
                 f"  [green]{label} {len(self._breakpoints)}[/]{cond_str}  "
                 f"[yellow]{self._hex(addr)}[/]"
@@ -657,12 +762,13 @@ class Debugger:
         name = rest.lower()
         if name in _INSTR_BP_NAMES:
             bp = _Breakpoint(
-                kind="instr", value=_INSTR_BP_NAMES[name], desc=name,
+                kind="instr",
+                value=_INSTR_BP_NAMES[name],
+                desc=name,
             )
             self._breakpoints.append(bp)
             self._console.print(
-                f"  [green]断点 {len(self._breakpoints)}[/]  "
-                f"[yellow]{name}[/]"
+                f"  [green]断点 {len(self._breakpoints)}[/]  [yellow]{name}[/]"
             )
             return
 
@@ -680,12 +786,12 @@ class Debugger:
             self._err(f"opcode 0x{val:02x} 不是已知的 RV64 opcode, 拒绝设置断点")
             return
         bp = _Breakpoint(
-            kind="opcode", value=val, desc=f"opcode 0x{val:02x}",
+            kind="opcode", value=val,
+            desc=f"opcode 0x{val:02x}",
         )
         self._breakpoints.append(bp)
         self._console.print(
-            f"  [green]断点 {len(self._breakpoints)}[/]  "
-            f"[yellow]opcode 0x{val:02x}[/]"
+            f"  [green]断点 {len(self._breakpoints)}[/]  [yellow]opcode 0x{val:02x}[/]"
         )
 
     def cmd_bp_list(self) -> None:
@@ -709,9 +815,7 @@ class Debugger:
             self._err(f"断点编号超出范围: {idx_str} (当前 {len(self._breakpoints)} 个)")
             return
         removed = self._breakpoints.pop(idx)
-        self._console.print(
-            f"  [dim]已删除断点 [yellow]{removed.desc}[/][/]"
-        )
+        self._console.print(f"  [dim]已删除断点 [yellow]{removed.desc}[/][/]")
 
     def cmd_bp_clear(self) -> None:
         """清除全部断点."""
@@ -740,35 +844,36 @@ class Debugger:
         sub = rest[0].lower()
         if sub == "mode":
             self.cmd_bp_mode(rest[1] if len(rest) > 1 else None)
-        elif sub == "list":
-            self.cmd_bp_list()
         elif sub == "delete":
             if len(rest) > 1:
                 self.cmd_bp_delete(rest[1])
-            else:
-                self._warn("用法: bp delete <编号>")
+                return
+            self._warn("用法: bp delete <编号>")
         elif sub == "clear":
             self.cmd_bp_clear()
         elif sub == "if":
             # 纯条件断点: bp if reg/csr <name> <op> <val>
-            if len(rest) >= 4 and rest[1] in ("reg", "csr"):
-                ct, cr, co = rest[1], rest[2], rest[3] if len(rest) > 3 else "=="
-                cv = int(rest[4], 0) if len(rest) > 4 else 0
-                desc = f"if {ct} {cr}{co}0x{cv:x}"
-                bp = _Breakpoint(kind="cond", value=0, desc=desc,
-                                 cond_type=ct, cond_reg=cr, cond_op=co, cond_val=cv)
-                self._breakpoints.append(bp)
-                self._console.print(
-                    f"  [green]条件断点 {len(self._breakpoints)}[/]  "
-                    f"[bold yellow]if[/] {ct} {cr} {co} [yellow]0x{cv:x}[/]"
-                )
-            else:
+            if not (len(rest) >= 4 and rest[1] in ("reg", "csr")):
                 self._warn("用法: bp if reg/csr <name> <op> <val>")
+                return
+            ct, cr, co = rest[1], rest[2], rest[3] if len(rest) > 3 else "=="
+            cv = int(rest[4], 0) if len(rest) > 4 else 0
+            desc = f"if {ct} {cr}{co}0x{cv:x}"
+            bp = _Breakpoint(
+                kind="cond", value=0,
+                desc=desc, cond_type=ct, cond_reg=cr,
+                cond_op=co, cond_val=cv,
+            )
+            self._breakpoints.append(bp)
+            self._console.print(
+                f"  [green]条件断点 {len(self._breakpoints)}[/]  "
+                f"[bold yellow]if[/] {ct} {cr} {co} [yellow]0x{cv:x}[/]"
+            )
         elif sub == "opcode":
-            if len(rest) > 1:
-                self.cmd_bp_opcode(rest[1])
-            else:
+            if len(rest) <= 1:
                 self._warn("用法: bp opcode <hex>")
+                return
+            self.cmd_bp_opcode(rest[1])
         else:
             self.cmd_bp_set(" ".join(rest))
 
@@ -812,11 +917,8 @@ class Debugger:
         # -- 重新注入 preload --
         if self._preload_path is not None:
             from pyremu.env_inject import Preloader
+
             preload_entry = Preloader(emu).inject_file(self._preload_path)
-            # BSS patch: blt → j <after_bss> (0x94, 4 字节对齐)
-            j_imm = (0x98 - 0x94) >> 1
-            j_blt = ((j_imm >> 19) & 1) << 31 | (j_imm & 0x3FF) << 21 | ((j_imm >> 10) & 1) << 20 | ((j_imm >> 11) & 0xFF) << 12 | 0x6f
-            emu.bus.write(cfg.ram_base + 0x94, struct.pack("<I", j_blt))
             # misa U-bit + fdt_get_address DTB 副本
             for h in emu.harts:
                 h.csrs["misa"].val = (2 << 62) | (1 << 18) | (1 << 20)  # MXL=RV64 + S + U
@@ -850,11 +952,22 @@ class Debugger:
     #  运行循环
     # ==========================================================
 
-    def _run_loop(self, cycles: int | None = None) -> None:
+    _DEFAULT_TIMEOUT = 3600.0  # 默认超时 1 小时
+
+    def _run_loop(
+        self,
+        cycles: int | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> None:
         """运行循环: 每个周期所有 hart 各执行一条指令 (round-robin).
 
         多 hart 时通过 emu.step() 驱动全部 hart;
         单 hart 时保持 step_one() 以支持快照/回滚.
+
+        Args:
+            cycles: 最大周期数, None 表示无限.
+            timeout: 墙钟超时秒数, 默认 3600 (1 小时). 设为 0 禁用.
         """
         self._running = True
         self._paused = False
@@ -862,39 +975,61 @@ class Debugger:
         self._sigint_count = 0
         self._enter_run_mode()
 
+        if timeout is None:
+            timeout = self._DEFAULT_TIMEOUT
+        deadline = time.monotonic() + timeout if timeout > 0 else None
+
         multi = self._emu.num_harts > 1
 
-        try:
-            executed = 0
-            while not self._terminated and not self._paused:
-                if cycles is not None and executed >= cycles:
-                    break
-                if all(h._halted for h in self._emu.harts):
-                    self._warn("所有 Hart 已暂停")
-                    break
-                if self.hart._halted:
-                    self._show_trap_context(self.hart)
-                    break
-                # async 模式: 当前 hart 被断点暂停时回到 REPL
-                if self._bp_mode == "async" and self._hart_id in self._hart_paused:
-                    self._console.print(
-                        f"  [dim]Hart {self._hart_id} 断点暂停, 回到 REPL[/]"
-                    )
-                    break
+        # 节流: 每 N 条指令后短睡, 降低 CPU 占用
+        _YIELD_EVERY = 5000
+        _YIELD_SLEEP = 0.002
+        _instr_start = self._instr_count
+
+        while not self._terminated and not self._paused:
+            if cycles is not None and (self._instr_count - _instr_start) >= cycles:
+                break
+            if all(h._halted for h in self._emu.harts):
+                self._warn("所有 Hart 已暂停")
+                break
+            if self.hart._halted:
+                self._show_trap_context(self.hart)
+                break
+            # async 模式: 当前 hart 被断点暂停时回到 REPL
+            if self._bp_mode == "async" and self._hart_id in self._hart_paused:
+                self._console.print(f"  [dim]Hart {self._hart_id} 断点暂停, 回到 REPL[/]")
+                break
+            # 超时检查: 墙钟时间超过限制时终止并转储状态
+            if deadline is not None and time.monotonic() >= deadline:
+                self._warn(f"运行超时 ({timeout:.0f}s), 强制停止")
+                self._show_trap_context(self.hart)
+                break
+
+            try:
                 if multi:
                     self._emu.step()
                     self._check_multi_hart_bp()
                 else:
                     self.step_one()
-                self._instr_count += 1
-                executed += 1
-            if self._terminated:
-                self._console.print("[dim]模拟循环已终止[/]")
-        finally:
-            self._running = False
-            self._enter_repl_mode()
-            if self._emu.uart is not None:
-                self._emu.uart.flush_all()
+            except Exception:
+                logger.opt(exception=True).error("step 执行异常")
+                self._err("指令执行异常, 运行中止")
+                self._terminated = True
+                break
+
+            self._instr_count += 1
+
+            # 周期性地让出 CPU 时间片, 避免 100% 占用
+            if self._instr_count % _YIELD_EVERY == 0:
+                time.sleep(_YIELD_SLEEP)
+
+        if self._terminated:
+            self._console.print("[dim]模拟循环已终止[/]")
+
+        self._running = False
+        self._enter_repl_mode()
+        if self._emu.uart is not None:
+            self._emu.uart.flush_all()
 
     # ==========================================================
     #  格式化辅助
@@ -911,6 +1046,21 @@ class Debugger:
             if n >= threshold:
                 return f"{n / threshold:.1f} {name}"
         return f"{n} B"
+
+    @staticmethod
+    def _fmt_instr_count(n: int) -> str:
+        """将指令数格式化为 human-readable: B(十亿) / M(百万) / K(千).
+
+        精度等比例保持: K 保留 3 位小数 (0.001K=1条),
+        M 保留 6 位小数 (0.000001M=1条), B 保留 6 位小数.
+        """
+        if n < 1000:
+            return str(n)
+        if n < 1_000_000:
+            return f"{n / 1000:.3f}K"
+        if n < 1_000_000_000:
+            return f"{n / 1_000_000:.6f}M"
+        return f"{n / 1_000_000_000:.7f}B"
 
     @staticmethod
     def _trap_cause_name(mcause_val: int) -> str:
@@ -977,6 +1127,26 @@ class Debugger:
         self._console.print(f"[dim]执行 {n} 条指令...[/]")
         self._run_loop(cycles=n)
 
+    def cmd_watch(self, addr_str: str = "", size_str: str = "8") -> None:
+        """设置写监控: watch <addr> [size] — 关闭: watch off.
+
+        当 CPU 写入被监控地址范围时自动暂停并报告写入者 PC.
+        """
+        if not addr_str or addr_str in ("off", "none", "clear"):
+            self._watch_ranges.clear()
+            self._watch_hit = None
+            self._console.print("[dim]写监控已关闭[/]")
+            return
+        addr = self._resolve_addr(addr_str)
+        if addr is None:
+            self._err(f"无法解析地址: {addr_str}")
+            return
+        size = int(size_str, 0)
+        self._watch_ranges.append((addr, addr + size))
+        self._console.print(
+            f"  [green]● 写监控[/] 0x{self._hex(addr)}–0x{self._hex(addr + size)}"
+        )
+
     def cmd_regs(self) -> None:
         h = self.hart
         tbl = Table(title=f"Hart {self._hart_id}  GPRs", border_style="blue")
@@ -985,91 +1155,132 @@ class Debugger:
         tbl.add_column("Reg", style="cyan", no_wrap=True)
         tbl.add_column("Value", style="green")
         for i in range(16):
-            lo = h.gprs[i]
-            hi = h.gprs[i + 16]
+            lo_name = gpr_name(i)
+            lo_alias = gpr_alias(i)
+            lo_val = h.gprs[i]
+            hi_name = gpr_name(i + 16)
+            hi_alias = gpr_alias(i + 16)
+            hi_val = h.gprs[i + 16]
             tbl.add_row(
-                f"{lo.name} ({lo.alias})", self._hex(lo.val),
-                f"{hi.name} ({hi.alias})", self._hex(hi.val),
+                f"{lo_name} ({lo_alias})",
+                self._hex(lo_val),
+                f"{hi_name} ({hi_alias})",
+                self._hex(hi_val),
             )
         self._console.print(tbl)
 
     def cmd_reg(self, raw_args: str) -> None:
         """读取 GPR: reg <name>  或  reg <n1>, <n2>, ... (逗号分隔多寄存器)."""
+        h = self.hart
         wanted = [n.strip() for n in raw_args.split(",") if n.strip()]
         if not wanted:
             return
 
         # 验证
-        regs = []
+        idxs = []
         for n in wanted:
-            r = self._find_gpr(n)
-            if r is None:
+            idx = self._find_gpr(n)
+            if idx is None:
                 self._err(f"未知寄存器: {n}")
                 return
-            regs.append(r)
+            idxs.append(idx)
 
         # 对齐: 名称宽度 + 别名宽度
-        max_w = max(len(r.name) for r in regs)
-        max_a = max(len(r.alias) for r in regs)
+        max_w = max(len(gpr_name(idx)) for idx in idxs)
+        max_a = max(len(gpr_alias(idx)) for idx in idxs)
 
         lines = []
-        for r in regs:
+        for idx in idxs:
             lines.append(
-                f"  [cyan]{r.name:<{max_w}}[/] "
-                f"([dim]{r.alias:<{max_a}}[/]) = "
-                f"[green]{self._hex(r.val)}[/]"
+                f"  [cyan]{gpr_name(idx):<{max_w}}[/] "
+                f"([dim]{gpr_alias(idx):<{max_a}}[/]) = "
+                f"[green]{self._hex(h.gprs[idx])}[/]"
             )
         self._console.print("\n".join(lines))
 
     @seize_val_err("无效值")
     def cmd_set(self, name: str, value: str) -> None:
         """写入 GPR: set <name> <value>."""
-        r = self._find_gpr(name)
-        if r is None:
+        h = self.hart
+        idx = self._find_gpr(name)
+        if idx is None:
             self._err(f"未知寄存器: {name}")
             return
         v = int(value, 0) & 0xFFFF_FFFF_FFFF_FFFF
-        old = r.val
-        r.val = v
+        old = h.gprs[idx]
+        h.gprs[idx] = v
         self._console.print(
-            f"{r.name} ([cyan]{r.alias}[/]): "
+            f"{gpr_name(idx)} ([cyan]{gpr_alias(idx)}[/]): "
             f"[yellow]{self._hex(old)}[/] → [green]{self._hex(v)}[/]"
         )
 
     def _resolve_addr(self, arg: str) -> int | None:
-        """将字符串解析为地址: pc / 寄存器名 / 数值.
+        """将字符串解析为地址: pc / 寄存器名 / CSR 名 / 数值.
 
         Returns:
             解析出的 64-bit 地址, 或 None (无法解析 / 寄存器不存在).
         """
         if arg.lower() == "pc":
             return self.hart.pc
-        # 尝试寄存器名
-        r = self._find_gpr(arg)
-        if r is not None:
-            return r.val & 0xFFFF_FFFF_FFFF_FFFF
+        # 尝试 GPR 名
+        idx = self._find_gpr(arg)
+        if idx is not None:
+            return self.hart.gprs[idx] & 0xFFFF_FFFF_FFFF_FFFF
+        # 尝试 CSR 名 (mepc, sepc, stval, mtval 等)
+        v = self._read_csr_by_name(arg)
+        if v != 0 or csr_addr_from_name(arg) is not None:
+            return v
         # 尝试数值
         try:
             v = int(arg, 0)
-            if v < 0 or v >= (1 << 64):
-                return None
-            return v
         except ValueError:
             return None
+        if v < 0 or v >= (1 << 64):
+            return None
+        return v
 
-    def _find_gpr(self, name: str):
-        """按 xN 或 ABI 名查找 GPR."""
-        h = self.hart
+
+    def _try_read_va(self, va: int, size: int) -> bytes | None:
+        """从虚拟地址读取内存 (自动 VA→PA 翻译).
+
+        当 satp 启用 MMU 时, 逐页翻译 VA 后读取物理 RAM;
+        Bare 模式下直接作为物理地址读取.
+        """
+        if size <= 0 or size > 4096:
+            return None
+        hart = self.hart
+        # Bare 模式 — 直接物理读取
+        if hart.mmu_mode == 0:
+            return self._emu.bus.try_read(va, size)
+        # MMU 使能 — 逐页翻译
+        result = bytearray()
+        remain = size
+        cur = va
+        while remain > 0:
+            page_off = cur & 0xFFF
+            chunk = min(remain, 0x1000 - page_off)
+            ok, pa = translate_addr(hart, cur)
+            if not ok:
+                return None
+            data = self._emu.bus.try_read(pa, chunk)
+            if data is None:
+                return None
+            result.extend(data)
+            cur += chunk
+            remain -= chunk
+        return bytes(result)
+
+    @seize_val_err("无效的gpr索引值")
+    def _find_gpr(self, name: str) -> int | None:
+        """按 xN 或 ABI 名查找 GPR 索引 (0-31)."""
         if name.startswith("x"):
-            try:
-                idx = int(name[1:])
-                if 0 <= idx <= 31:
-                    return h.gprs[idx]
-            except ValueError:
-                pass
-        for r in h.gprs:
-            if r.alias.lower() == name.lower():
-                return r
+            idx = int(name[1:])
+            if 0 <= idx <= 31:
+                return idx
+        # 按 ABI 名查找
+        for i in range(32):
+            if gpr_alias(i).lower() == name.lower():
+                return i
         return None
 
     def cmd_csr(self, raw_args: str) -> None:
@@ -1105,20 +1316,19 @@ class Debugger:
         lines: list[str] = []
         for n in wanted:
             csr = h.csrs[n]
-            line = (
-                f"  [cyan]{n:<{max_w}}[/] = "
-                f"[green]{self._hex(csr.val)}[/]"
-                f" (dec: {csr.val})"
-            )
+            line = f"  [cyan]{n:<{max_w}}[/] = [green]{self._hex(csr.val)}[/] (dec: {csr.val})"
             # mstatus / mstatush 附加当前特权级
             if n == "mstatus":
                 line += f"  [dim]模式 [bold]{h.mode.name}[/][/]"
             elif n == "mstatush":
                 line += f"  [dim]模式 [bold]{h.mode.name}[/][/]"
-            # mcause / scause 解码陷态原因
+            # mcause / scause 解码陷态原因 (0 = 无异常)
             elif n in ("mcause", "scause"):
-                cause_str = self._trap_cause_name(csr.val)
-                line += f"  [dim]{cause_str}[/]"
+                if csr.val == 0:
+                    line += "  [dim](无)[/]"
+                else:
+                    cause_str = self._trap_cause_name(csr.val)
+                    line += f"  [dim]{cause_str}[/]"
             lines.append(line)
         self._console.print("\n".join(lines))
 
@@ -1134,8 +1344,7 @@ class Debugger:
         old = csr.val
         csr.val = v
         self._console.print(
-            f"[cyan]{name}[/]: "
-            f"[yellow]{self._hex(old)}[/] → [green]{self._hex(v)}[/]"
+            f"[cyan]{name}[/]: [yellow]{self._hex(old)}[/] → [green]{self._hex(v)}[/]"
         )
 
     def _fetch_and_disasm(self, pc: int) -> tuple[str, str] | None:
@@ -1154,25 +1363,20 @@ class Debugger:
         Bare 模式: v 是物理地址, 检查是否在有效 RAM/设备范围.
         Sv39 模式: v 是虚拟地址, 检查 bits[63:39] 是否等于 bit 38.
         """
-        mode = h.mmu_mode
-        if mode == 0:  # Bare — 物理地址
-            bus = h._bus
-            if bus is not None and not bus.is_valid_addr(v):
-                self._warn(
-                    f"Bare 模式下 PC 0x{v:016x} 不在有效物理地址范围 "
-                    f"[0x{bus.ram_base:x}, 0x{bus._ram_end:x}) 或已注册设备区域"
-                )
-        elif mode == 8:  # Sv39 — 虚拟地址
+        if h.mmu_mode == 0 and h._bus is not None and not h._bus.is_valid_addr(v):  # Bare — 物理地址
+            self._warn(
+                f"Bare 模式下 PC 0x{v:016x} 不在有效物理地址范围 "
+                f"[0x{h._bus.ram_base:x}, 0x{h._bus._ram_end:x}) 或已注册设备区域"
+            )
+        elif h.mmu_mode == 8:  # Sv39 — 虚拟地址
             sign_bit = (v >> 38) & 1
-            if sign_bit:
-                expected = 0xFFFFFFFFC0000000 | (v & 0x3FFFFFFFFF)
-            else:
-                expected = v & 0x3FFFFFFFFF
-            if v != expected:
-                self._warn(
-                    f"Sv39 模式下 VA 0x{v:016x} bits[63:39] 不等于 bit 38 — "
-                    f"此地址在页表遍历时将触发缺页异常"
-                )
+            expected = 0xFFFFFFFFC0000000 | (v & 0x3FFFFFFFFF) if sign_bit else v & 0x3FFFFFFFFF
+            if v == expected:
+                return
+            self._warn(
+                f"Sv39 模式下 VA 0x{v:016x} bits[63:39] 不等于 bit 38 — "
+                f"此地址在页表遍历时将触发缺页异常"
+            )
 
     @seize_val_err("无效地址")
     def cmd_pc(self, addr: str | None = None) -> None:
@@ -1202,35 +1406,95 @@ class Debugger:
             )
         pc = h.pc
         result = self._fetch_and_disasm(pc)
-        if result is None:
-            raw_hex, asm = "(无法读取)", "(无法解码)"
-        else:
+        raw_hex, asm = "(无法读取)", "(无法解码)"
+        if result is not None:
             raw_hex, asm = result
-        lines = [
+        self._console.print(
             f"PC  = [bold yellow]{self._hex(pc)}[/]  "
             f"[dim]模式 [bold cyan]{h.mode.name}[/][/]"
-            + ("  [dim]WFI等待[/]" if h._waiting else ""),
-            f"Raw = [dim]{raw_hex}[/]",
-            f"[bold green]  {asm}[/]",
-        ]
+            + ("  [dim]WFI等待[/]" if h._waiting else "")
+            + f"\nRaw = [dim]{raw_hex}[/]"
+            + f"\n[bold green]  {asm}[/]"
+        )
+
         # 仅在 mcause 刚发生变化时展示陷态上下文 (避免 handler 执行期间重复刷屏)
         mcause = h.mcause_val
-        if mcause != 0 and mcause != self._trap_displayed_mcause:
-            self._trap_displayed_mcause = mcause
-            kind = "中断" if (mcause >> 63) & 1 else "异常"
-            cause_str = self._trap_cause_name(mcause)
-            lines.extend([
-                "",
-                f"[bold red]▸ Trap 上下文 ({kind}):[/]",
-                f"  mcause = {self._hex(mcause)} ([cyan]{cause_str}[/])",
-                f"  mepc   = {self._hex(h.mepc_val)}",
-                f"  mtval  = {self._hex(h.mtval_val)}",
-                f"  mstatus= {self._hex(h.mstatus_val)}"
-                f"  (MIE={(h.mstatus_val >> 3) & 1}, MPP={(h.mstatus_val >> 11) & 3})",
-            ])
-        elif mcause == 0:
+        if mcause == 0:
             self._trap_displayed_mcause = None
-        self._console.print("\n".join(lines))
+            return
+        if mcause == self._trap_displayed_mcause:
+            return
+        self._trap_displayed_mcause = mcause
+
+        is_intr = (mcause >> 63) & 1
+        _mstatus = h.mstatus_val
+        _mcause_name = self._trap_cause_name(mcause)
+        _scause = h.csrs["scause"].val
+        _sstatus = h.csrs["sstatus"].val
+        _hex = self._hex
+
+        # 按活跃模式设定列样式: 活跃侧正常, 非活跃侧 dim
+        if h.mode == RiscvMode.M or h.mode == RiscvMode.D:  # M / D 模式 — M 侧亮, S 侧 dim
+            m_style, s_style = "bold cyan", "dim"
+            stale_note = ""
+        elif h.mode.value == 1:  # S 模式 — S 侧亮, M 侧 dim
+            m_style, s_style = "dim", "bold cyan"
+            # 若当前 S 模式没有活跃 trap (scause==0), 则 M 侧值来自旧 trap
+            stale_note = (
+                "" if _scause != 0
+                else " [dim](M-mode 陈旧)[/]"
+            )
+        else:  # U 模式
+            m_style, s_style = "cyan", "cyan"
+            stale_note = " [dim](陈旧)[/]"
+
+        tbl = Table(
+            title=(
+                f"Hart {self._hart_id}  Trap 上下文"
+                f" ({'中断' if is_intr else '异常'}){stale_note}"
+            ),
+            border_style="red",
+            show_header=True,
+        )
+        tbl.add_column("M-mode", style=m_style, justify="left")
+        tbl.add_column("S-mode", style=s_style, justify="left")
+
+        tbl.add_row(
+            f"mcause  = {_hex(mcause)}",
+            f"scause  = {_hex(_scause)}",
+        )
+        tbl.add_row(
+            f"mepc    = {_hex(h.mepc_val)}",
+            f"sepc    = {_hex(h.csrs['sepc'].val)}",
+        )
+        tbl.add_row(
+            f"mtval   = {_hex(h.mtval_val)}",
+            f"stval   = {_hex(h.csrs['stval'].val)}",
+        )
+        tbl.add_row(
+            f"mstatus = {_hex(_mstatus)}",
+            f"sstatus = {_hex(_sstatus)}",
+        )
+        self._console.print(tbl)
+
+        # 注解行: cause 名称 + 关键 status 位
+        m_anno = (
+            f"[cyan]{_mcause_name}[/]  "
+            f"MIE={(_mstatus >> 3) & 1} MPP={(_mstatus >> 11) & 3}"
+        )
+        s_anno = ""
+        if _scause != 0:
+            _scause_name = self._trap_cause_name(_scause)
+            s_anno = (
+                f"[cyan]{_scause_name}[/]  "
+                f"SIE={(_sstatus >> 1) & 1} SPP={(_sstatus >> 8) & 1}"
+            )
+        elif _sstatus != 0:
+            s_anno = (
+                f"SIE={(_sstatus >> 1) & 1} "
+                f"SPP={(_sstatus >> 8) & 1}"
+            )
+        self._console.print(f"  {m_anno}    {s_anno}")
 
     def cmd_mode(self) -> None:
         h = self.hart
@@ -1240,17 +1504,26 @@ class Debugger:
         h = self.hart
         v = h.mstatus_val
         fields = [
-            ("MIE", (v >> 3) & 1), ("MPIE", (v >> 7) & 1),
-            ("MPP", (v >> 11) & 0b11), ("SIE", (v >> 1) & 1),
-            ("SPIE", (v >> 5) & 1), ("SPP", (v >> 8) & 1),
-            ("MPRV", (v >> 17) & 1), ("SUM", (v >> 18) & 1),
-            ("MXR", (v >> 19) & 1), ("TVM", (v >> 20) & 1),
-            ("TW", (v >> 21) & 1), ("TSR", (v >> 22) & 1),
-            ("FS", (v >> 13) & 0b11), ("SD", (v >> 63) & 1),
+            ("MIE", (v >> 3) & 1),
+            ("MPIE", (v >> 7) & 1),
+            ("MPP", (v >> 11) & 0b11),
+            ("SIE", (v >> 1) & 1),
+            ("SPIE", (v >> 5) & 1),
+            ("SPP", (v >> 8) & 1),
+            ("MPRV", (v >> 17) & 1),
+            ("SUM", (v >> 18) & 1),
+            ("MXR", (v >> 19) & 1),
+            ("TVM", (v >> 20) & 1),
+            ("TW", (v >> 21) & 1),
+            ("TSR", (v >> 22) & 1),
+            ("FS", (v >> 13) & 0b11),
+            ("SD", (v >> 63) & 1),
         ]
-        tbl = Table(title=f"mstatus = {self._hex(v)}", border_style="magenta")
+        tbl = Table(title="mstatus 内部字段情况", border_style="magenta")
         tbl.add_column("Field", style="cyan")
         tbl.add_column("Value", style="green")
+        tbl.add_row("Hex", self._hex(v))
+        tbl.add_section()
         for fname, fval in fields:
             tbl.add_row(fname, str(fval))
         self._console.print(tbl)
@@ -1383,7 +1656,6 @@ class Debugger:
 
     _DEFAULT_CACHE_LINES = 64
 
-    @seize_val_err("set/way索引需要为整数")
     @seize_val_err("set/way 索引需为整数")
     def cmd_cache(self, arg: str | None = None) -> None:
         """显示 L2 缓存状态.
@@ -1409,10 +1681,8 @@ class Debugger:
             first = parts[0]
             # 范围: <start>-<end>
             if "-" in first and not first.startswith("-"):
-                a, _, b = first.partition("-")
-                range_start = int(a, 0)
-                range_end = int(b, 0)
-                if not (0 <= range_start <= range_end < num_sets):
+                st, _, ed = first.partition("-")
+                if not (0 <= int(st, 0) <= int(ed, 0) < num_sets):
                     self._err(f"set 范围需在 [0, {num_sets - 1}] 内")
                     return
             else:
@@ -1443,7 +1713,8 @@ class Debugger:
             f"{ways}-way × {num_sets} sets, "
             f"line={l2.line_size} B, "
             f"hit_rate={l2.hit_rate:.3f}\n"
-            "MESI: " + " ".join(
+            "MESI: "
+            + " ".join(
                 f"{s}={mesi_counts.get(s, 0)}"
                 for s in ("MODIFIED", "EXCLUSIVE", "SHARED", "INVALID")
             )
@@ -1452,15 +1723,15 @@ class Debugger:
         # ---- 确定要扫描的 set 范围 ----
         if range_start is not None and range_end is not None:
             set_range = range(range_start, range_end + 1)
-            full_dump = False          # 范围模式: 紧凑预览
-            limit = None               # 不限条目数
+            full_dump = False  # 范围模式: 紧凑预览
+            limit = None  # 不限条目数
         elif target_set is not None:
             set_range = [target_set]
-            full_dump = True           # 单 set 模式: 完整 hexdump
+            full_dump = True  # 单 set 模式: 完整 hexdump
             limit = None
         else:
             set_range = range(num_sets)
-            full_dump = False          # 默认模式: 紧凑预览
+            full_dump = False  # 默认模式: 紧凑预览
             limit = self._DEFAULT_CACHE_LINES
 
         # ---- 收集行 ----
@@ -1489,6 +1760,110 @@ class Debugger:
             self._console.print(header + "\n" + "\n".join(lines))
         else:
             self._console.print(header + "\n[dim](无 valid 行)[/]")
+
+    # ----------------------------------------------------------
+    #  PMP 保护范围
+    # ----------------------------------------------------------
+
+    @staticmethod
+    def _decode_pmp_cfg_byte(cfg_val: int, entry_idx: int) -> int:
+        """从 RV64 pmpcfgN 值中提取第 *entry_idx* 个条目的 8-bit 配置."""
+        shift = (entry_idx & 0x7) * 8
+        return (cfg_val >> shift) & 0xFF
+
+    def cmd_pmp(self) -> None:
+        """显示所有 PMP 条目的保护地址范围与权限 (含原始寄存器值)."""
+        h = self.hart
+        num = h._pmp.num_entries if h._pmp is not None else 0
+
+        if num == 0:
+            self._console.print("[dim]PMP 未配置 (num_entries=0)[/]")
+            return
+
+        mode_names = {
+            PMP_A_OFF: "OFF",
+            PMP_A_TOR: "TOR",
+            PMP_A_NA4: "NA4",
+            PMP_A_NAPOT: "NAPOT",
+        }
+
+        tbl = Table(
+            title=f"Hart {self._hart_id}  PMP 条目 ({num} total)",
+            border_style="blue",
+        )
+        tbl.add_column("#", style="cyan", justify="right")
+        tbl.add_column("L", style="magenta", width=2)
+        tbl.add_column("R", style="green", width=2)
+        tbl.add_column("W", style="yellow", width=2)
+        tbl.add_column("X", style="red", width=2)
+        tbl.add_column("Mode", style="cyan", width=6)
+        tbl.add_column("Base", style="green")
+        tbl.add_column("End", style="yellow")
+        tbl.add_column("Size")
+        tbl.add_column("pmpaddr", style="dim yellow")
+        tbl.add_column("cfg", style="dim cyan", width=5)
+
+        active_count = 0
+
+        for i in range(num):
+            # RV64: pmpcfg0 存条目 0-7, pmpcfg2 存 8-15, ...
+            cfg_reg_idx = (i // 8) * 2
+            reg_name = f"pmpcfg{cfg_reg_idx}"
+            cfg_val = h.csrs[reg_name].val if reg_name in h.csrs else 0
+            cfg = self._decode_pmp_cfg_byte(cfg_val, i)
+
+            a_mode = cfg & PMP_A_MASK
+            addr_name = f"pmpaddr{i}"
+            addr_field = (
+                h.csrs[addr_name].val if addr_name in h.csrs else 0
+            ) & 0xFFFF_FFFF_FFFF_FFFF
+
+            # 解码地址范围
+            if a_mode == PMP_A_OFF:
+                base, size = 0, 0
+            elif a_mode == PMP_A_TOR:
+                prev = (
+                    h.csrs[f"pmpaddr{i - 1}"].val if i > 0 and f"pmpaddr{i - 1}" in h.csrs else 0
+                ) & 0xFFFF_FFFF_FFFF_FFFF
+                lo = 0 if i == 0 else (prev << 2)
+                hi = addr_field << 2
+                base, size = lo, (hi - lo) & 0xFFFF_FFFF_FFFF_FFFF
+            elif a_mode == PMP_A_NA4:
+                base = addr_field << 2
+                size = 4
+            elif a_mode == PMP_A_NAPOT:
+                base, size = decode_napot(addr_field)
+            else:
+                base, size = 0, 0
+
+            l = "l" if cfg & PMP_L else "-"
+            r = "r" if cfg & PMP_R else "-"
+            w = "w" if cfg & PMP_W else "-"
+            x = "x" if cfg & PMP_X else "-"
+            mode = mode_names.get(a_mode, f"?{a_mode >> 3}?")
+            addr_s = f"0x{addr_field:016x}"
+            cfg_s = f"0x{cfg:02x}"
+
+            if a_mode == PMP_A_OFF:
+                base_s, end_s, size_s = "-", "-", "-"
+            else:
+                active_count += 1
+                base_s = f"0x{base:016x}"
+                if size > 0:
+                    end = (base + size) & 0xFFFF_FFFF_FFFF_FFFF
+                    end_s = f"0x{end:016x}"
+                    size_s = self._fmt_size(size)
+                else:
+                    end_s = "0x0000000000000000"
+                    size_s = "-"
+
+            tbl.add_row(
+                str(i), l, r, w, x, mode, base_s, end_s, size_s, addr_s, cfg_s,
+            )
+
+        self._console.print(tbl)
+        if active_count == 0:
+            self._console.print("  [dim]所有条目均未激活 (OFF)[/]")
 
     # ----------------------------------------------------------
     #  satp / MMU
@@ -1542,21 +1917,21 @@ class Debugger:
         """压缩指令 (16-bit) 的控制流类型."""
         quad = instr16 & 0x3
         funct3 = (instr16 >> 13) & 0x7
-        if quad == 0b01:          # C1 象限
-            if funct3 in (0b001, 0b101):   # C.JAL, C.J
+        if quad == 0b01:  # C1 象限
+            if funct3 in (0b001, 0b101):  # C.JAL, C.J
                 return "term"
-            if funct3 in (0b110, 0b111):   # C.BEQZ, C.BNEZ
+            if funct3 in (0b110, 0b111):  # C.BEQZ, C.BNEZ
                 return "branch"
-        elif quad == 0b10:        # C2 象限
-            if funct3 == 0b100:            # C.JR / C.JALR / C.EBREAK
+        elif quad == 0b10:  # C2 象限
+            if funct3 == 0b100:  # C.JR / C.JALR / C.EBREAK
                 return "term"
         return "normal"
 
     @seize_val_err("addr 和 length 需为整数 (支持 0x 前缀)")
-    def cmd_disasm(self, addr_str: str, length_str: str = "64") -> None:
+    def cmd_disasm(self, addr_str: str, length_str: str = "32") -> None:
         """反汇编指定内存区域.
 
-        disasm <addr> [length]  — 从 addr 开始反汇编 length 字节 (默认 64).
+        disasm <addr> [length]  — 从 addr 开始反汇编 length 字节 (默认 32).
 
         自动识别 16-bit 压缩指令和 32-bit 标准指令边界,
         按地址递增顺序逐条输出。若 PC 落入范围内, 以 ``pc ->`` 标记
@@ -1578,7 +1953,7 @@ class Debugger:
             return
 
         if length <= 0 or length > 4096:
-            self._err("length 需在 1–4096 之间")
+            self._err("length 需在 1-4096 之间")
             return
 
         if not self._check_rv64_addr(addr):
@@ -1588,21 +1963,15 @@ class Debugger:
         if addr & 1:
             orig = addr
             addr &= ~1
-            self._warn(
-                f"addr 至少应为 2-字节对齐, "
-                f"已从 0x{orig:016x} 对齐到 0x{addr:016x}"
-            )
+            self._warn(f"addr 至少应为 2-字节对齐, 已从 0x{orig:016x} 对齐到 0x{addr:016x}")
 
-        raw = self._emu.bus.try_read(addr, length)
+        raw = self._try_read_va(addr, length)
         if raw is None:
             self._err("无法读取指定地址")
             return
 
         # ---- 判断是否为重复执行 (Enter 自动推进) ----
-        is_continue = (
-            self._disasm_ref_pc is not None
-            and addr == self._disasm_next_addr
-        )
+        is_continue = self._disasm_ref_pc is not None and addr == self._disasm_next_addr
 
         # ---- 第一遍: 收集指令元组 (addr, raw_hex, asm, ctrl_kind) ----
         instrs: list[tuple[int, str, str, str]] = []
@@ -1614,9 +1983,7 @@ class Debugger:
             remaining = max_offset - offset
 
             chunk = raw[offset : offset + min(4, remaining)]
-            instr = int.from_bytes(
-                chunk.ljust(4, b"\x00"), "little", signed=False
-            )
+            instr = int.from_bytes(chunk.ljust(4, b"\x00"), "little", signed=False)
 
             is_compressed = parse_compressed(instr)
             inst_size = 2 if is_compressed else 4
@@ -1625,16 +1992,15 @@ class Debugger:
                 # 尝试从内存多读几个字节以补全指令, 避免在窗口边界截断
                 extra = self._emu.bus.try_read(pc_addr + offset, inst_size)
                 if extra is not None:
-                    raw = raw[:offset] + extra + raw[offset + len(extra):]
+                    raw = raw[:offset] + extra + raw[offset + len(extra) :]
                     remaining = inst_size
                 else:
-                    leftover = raw[offset:]
-                    hex_s = " ".join(f"{b:02x}" for b in leftover)
+                    hex_s = " ".join(f"{b:02x}" for b in raw[offset:])
                     instrs.append((pc_addr, hex_s, "[dim](截断)[/]", "normal"))
                     break
 
             asm = disasm(instr, pc_addr)
-            raw_hex = " ".join(f"{b:02x}" for b in raw[offset:offset + inst_size])
+            raw_hex = " ".join(f"{b:02x}" for b in raw[offset : offset + inst_size])
             ctrl = (
                 self._ctrl_flow_kind_compressed(instr & 0xFFFF)
                 if is_compressed
@@ -1664,16 +2030,12 @@ class Debugger:
             if ref_idx is not None:
                 self._disasm_base_step = -ref_idx
             elif addr > self._disasm_ref_pc:
-                step_cnt = self._count_instrs_between(
-                    self._disasm_ref_pc, addr
-                )
+                step_cnt = self._count_instrs_between(self._disasm_ref_pc, addr)
                 self._disasm_base_step = step_cnt
                 if step_cnt >= MAX_INSTR_COUNT:
                     self._disasm_past_terminator = True  # 区间过大, 禁用步数
             else:
-                step_cnt = self._count_instrs_between(
-                    addr, self._disasm_ref_pc
-                )
+                step_cnt = self._count_instrs_between(addr, self._disasm_ref_pc)
                 self._disasm_base_step = -step_cnt
                 if step_cnt >= MAX_INSTR_COUNT:
                     self._disasm_past_terminator = True
@@ -1693,7 +2055,7 @@ class Debugger:
 
         for i, (pc_addr, raw_hex, asm, ctrl) in enumerate(instrs):
             step = base + i
-            at_ref = (pc_addr == ref_pc)
+            at_ref = pc_addr == ref_pc
 
             # 确定前缀
             if at_ref:
@@ -1709,14 +2071,16 @@ class Debugger:
             sym_name = self._resolve_symbol(syms, link_addr)
             seg = self._find_segment(link_addr)
             seg_name = seg.name if seg and seg.name else ""
-            scope = f"<[dim]{seg_name}[/]:[yellow]{sym_name}[/]>" if (seg_name and sym_name) else ""
+            scope = (
+                f"<[dim]{seg_name}[/]:[yellow]{sym_name}[/]>"
+                if (seg_name and sym_name) else ""
+            )
             if scope and scope != last_scope:
                 last_scope = scope
                 lines.append(f"  {scope}")
 
             lines.append(
-                f"  {prefix:<{prefix_w}}  "
-                f"{self._hex(pc_addr)}  {raw_hex:<12s}  {asm}"
+                f"  {prefix:<{prefix_w}}  {self._hex(pc_addr)}  {raw_hex:<12s}  {asm}"
             )
 
             # 遇终止指令: 插入分隔, 后续不再累加步数
@@ -1736,11 +2100,8 @@ class Debugger:
 
         self._console.print(
             f"[bold]反汇编[/] [yellow]{self._hex(addr)}[/]"
-            f"  +{length} bytes  ({len(instrs)} 条指令)\n"
-            + "\n".join(lines)
+            f"  +{length} bytes  ({len(instrs)} 条指令)\n" + "\n".join(lines)
         )
-
-
 
     def _count_instrs_between(self, start: int, end: int) -> int:
         """计算从 *start* (含) 到 *end* (不含) 之间的指令条数.
@@ -1779,25 +2140,78 @@ class Debugger:
             return
         if not self._check_rv64_addr(addr):
             return
-        dump = self._emu.mem_hexdump(addr, size)
-        self._console.print(dump)
+        data = self._try_read_va(addr, size)
+        if data is None:
+            self._err("无法读取指定地址")
+            return
+
+        # MMU 使能时显示 VA→PA 翻译及页表权限
+        if self.hart.mmu_mode != 0:
+            self._show_va_mapping_header(addr, size)
+
+        self._console.print(self._emu._fmt_hexdump(addr, data))
+
+    def _show_va_mapping_header(self, va: int, size: int) -> None:
+        """显示 VA→PA 翻译及各页的 PTE 权限位.
+
+        对 [va, va+size) 所跨越的每个 4 KiB 页, 查找 TLB 获取
+        物理页号与权限 (r/w/x/u), 输出一行摘要.
+        """
+        h = self.hart
+        page_cnt = ((va & 0xFFF) + size + 0xFFF) >> 12
+        lines: list[str] = []
+
+        for pi in range(page_cnt):
+            page_va = (va & ~0xFFF) + (pi << 12)
+            vpn = page_va >> 12
+
+            # 优先查 DTLB (已缓存), 否则走 Sv39 页表遍历
+            hit, ppn, perm = h.dtlb.lookup(vpn)
+            if not hit:
+                if h._mem_read_phy is None:
+                    lines.append(
+                        f"  [red]VA 0x{page_va:016x}  内存后端未挂载[/]"
+                    )
+                    continue
+
+                root_ppn = h.satp_val & ((1 << 44) - 1)
+                ok, ppn, perm, _ = sv39_walk(
+                    root_ppn, page_va, h._mem_read_phy
+                )
+                if not ok:
+                    lines.append(
+                        f"  [red]VA 0x{page_va:016x}  缺页 (无法翻译)[/]"
+                    )
+                    continue
+
+            pa = ppn << 12
+            r = "r" if perm & 1 else "-"
+            w = "w" if perm & 2 else "-"
+            x = "x" if perm & 4 else "-"
+            u = "u" if perm & 8 else "s"
+
+            lines.append(
+                f"  VA 0x{page_va:016x} → PA 0x{pa:016x}  [{r}{w}{x}{u}]"
+            )
+
+        self._console.print("\n".join(lines))
 
     def cmd_status(self, hart_id_str: str | None = None) -> None:
         """显示 hart 状态. 无参数时显示全部 hart 概览, 带参数时显示指定 hart 详情."""
-        if hart_id_str is not None:
-            try:
-                hid = int(hart_id_str, 0)
-            except ValueError:
-                self._err(f"无效 hart ID: {hart_id_str}")
-                return
-            if hid < 0 or hid >= self._emu.num_harts:
-                self._err(f"hart ID 超出范围: 0–{self._emu.num_harts - 1}")
-                return
-            self._show_hart_detail(hid)
+        if hart_id_str is None:
+            # 无参数: 全部 hart 概览
+            self._show_hart_overview()
             return
-
-        # 无参数: 全部 hart 概览
-        self._show_hart_overview()
+        try:
+            hid = int(hart_id_str, 0)
+        except ValueError:
+            self._err(f"无效 hart ID: {hart_id_str}")
+            return
+        if hid < 0 or hid >= self._emu.num_harts:
+            self._err(f"hart ID 超出范围: 0–{self._emu.num_harts - 1}")
+            return
+        self._show_hart_detail(hid)
+        return
 
     def _show_hart_overview(self) -> None:
         """终端对齐的全部 hart 概览表."""
@@ -1817,31 +2231,30 @@ class Debugger:
         tbl.add_column("Instr", justify="right")
 
         for h in harts:
-            mark = "●" if h.id == active_hart else " "
+            mark = "*" if h.id == active_hart else " "
             if h._halted:
                 state = "[red]halted[/]"
             elif h._waiting:
                 state = "[dim]waiting[/]"
             else:
                 state = "[green]running[/]"
-            instr_h = self._instr_count // 100 if h.id == active_hart else 0
-            instr_rem = self._instr_count % 100 if h.id == active_hart else 0
+            instr_fmt = self._fmt_instr_count(self._instr_count) if h.id == active_hart else "0"
             tbl.add_row(
-                mark, str(h.id), self._hex(h.pc), h.mode.name, state,
-                f"{instr_h}.{instr_rem:02d}h",
+                mark,
+                str(h.id),
+                self._hex(h.pc),
+                h.mode.name,
+                state,
+                instr_fmt,
             )
         self._console.print(tbl)
 
     def _show_hart_detail(self, hart_id: int) -> None:
         h = self._emu.harts[hart_id]
         halted_note = " [red]已暂停 — 不可恢复陷态[/]" if h._halted else ""
-        instr_h = self._instr_count // 100 if hart_id == self._hart_id else 0
-        instr_rem = self._instr_count % 100 if hart_id == self._hart_id else 0
+        instr_fmt = self._fmt_instr_count(self._instr_count) if hart_id == self._hart_id else "0"
         tbl = Table(
-            title=(
-                f"Hart {hart_id}  指令计数: {instr_h}.{instr_rem:02d}h"
-                f"{halted_note}"
-            ),
+            title=(f"Hart {hart_id}  指令计数: {instr_fmt}{halted_note}"),
             border_style="blue",
         )
         tbl.add_column("Field", style="cyan")
@@ -1868,16 +2281,12 @@ class Debugger:
     def _read_gpr_by_name(self, name: str) -> int:
         """按名称读取 GPR (例: x12, t0, a0, sp)."""
         idx = gpr_idx_from_name(name)
-        if idx is None:
-            return 0
-        return self.hart.read_gpr(idx)
+        return 0 if idx is None else self.hart.read_gpr(idx)
 
     def _read_csr_by_name(self, name: str) -> int:
         """按名称读取 CSR (例: mtvec, mstatus, mepc)."""
         addr = csr_addr_from_name(name)
-        if addr is None:
-            return 0
-        return self.hart.read_csr(addr)
+        return 0 if addr is None else self.hart.read_csr(addr)
 
     @staticmethod
     def _resolve_symbol(symbols: dict[str, int], addr: int) -> str | None:
@@ -1898,12 +2307,24 @@ class Debugger:
         return best_name if best_dist <= 0x10000 else None
 
     def _find_segment(self, addr: int) -> "FirmwareSegment | None":
-        """返回包含 *addr* 的固件段, 若不在任何段内则返回 None."""
+        """返回包含 *addr* 的固件段.
+
+        精确匹配优先; 若地址落在段间空隙, 返回距离最近的前驱段
+        (仅当距离 ≤ 段自身 memsz 时, 防止距离过远仍错误关联).
+        """
         if self._image is None:
             return None
         for seg in self._image.segments:
             if seg.vaddr <= addr < seg.vaddr + seg.memsz:
                 return seg
+        # 地址落在所有段外 — 找最近的前驱段 (1 MiB 内)
+        best_seg, best_dist = None, 0xFFFF_FFFF_FFFF_FFFF
+        for seg in self._image.segments:
+            end = seg.vaddr + seg.memsz
+            if end <= addr and (addr - end) < best_dist:
+                best_dist, best_seg = addr - end, seg
+        if best_seg is not None and best_dist <= 0x100000:
+            return best_seg
         return None
 
     # ----------------------------------------------------------
@@ -1914,69 +2335,245 @@ class Debugger:
         """读取 fp 指向的栈帧链接 (saved_ra, saved_fp); 越界则返回 None.
 
         RISC-V 标准栈帧布局: fp-8 存返回地址, fp-16 存调用者的 fp.
+        当 MMU 使能时 fp 为虚拟地址, 自动翻译后读取物理内存.
         """
-        ra_raw = self._emu.bus.try_read(fp - 8, 8)
+        ra_raw = self._try_read_va(fp - 8, 8)
         if ra_raw is None:
             return None
         ra = int.from_bytes(ra_raw, "little", signed=False)
-        fp_raw = self._emu.bus.try_read(fp - 16, 8)
+        fp_raw = self._try_read_va(fp - 16, 8)
         if fp_raw is None:
             return None
         fp = int.from_bytes(fp_raw, "little", signed=False)
         return ra, fp
+
+    # 特权级 → Rich 颜色
+    _MODE_COLORS = {"M": "red", "S": "cyan", "U": "green", "H": "yellow", "D": "magenta"}
+
+    def _parse_trap_save_offsets(self, tvec: int, max_instrs: int = 20) -> tuple[int, int] | None:
+        """解析 trap 入口代码, 提取 RA/FP 相对 trap SP 的保存偏移.
+
+        从 *tvec* (mtvec/stvec) 开始反汇编, 找第一条保存 RA (x1)
+        和第一条保存 FP (x8/s0) 到栈的指令。若找不到则返回 None。
+        只认 RV64: ``sd x1, IMM(sp)`` / ``sd x8, IMM(sp)``.
+        """
+        raw = self._emu.bus.try_read(tvec, max_instrs * 4)
+        if raw is None:
+            return None
+        ra_off: int | None = None
+        fp_off: int | None = None
+        pos = 0
+        while pos + 4 <= len(raw) and (ra_off is None or fp_off is None):
+            instr = int.from_bytes(raw[pos:pos + 4], "little", signed=False)
+            # 只处理 32-bit 标准指令 (低 2 位 = 0b11)
+            if (instr & 0x3) != 3:
+                pos += 4
+                continue
+            opcode = instr & 0x7F
+            rd = (instr >> 7) & 0x1F
+            rs1 = (instr >> 15) & 0x1F
+            funct3 = (instr >> 12) & 0x7
+            if not (opcode == 0b0100011 and funct3 == 0b011 and rs1 == 2):  # SD
+                pos += 4
+                continue
+            imm = ((instr >> 25) << 5) | ((instr >> 7) & 0x1F)
+            imm = (imm << 52) >> 52  # sign-extend 12-bit
+            if rd == 1 and ra_off is None:   # x1 = ra
+                ra_off = imm
+            elif rd == 8 and fp_off is None:  # x8 = s0/fp
+                fp_off = imm
+            pos += 4
+
+        if ra_off is None:
+            return None
+        return ra_off, (fp_off if fp_off is not None else 0)
 
     def _walk_frame_chain(self) -> list[StackFrame]:
         """沿 FP 链遍历调用栈, 返回 StackFrame 列表.
 
         从当前 hart 的 s0/fp 出发, 按标准 RISC-V 栈帧布局
         (fp-8 存 RA, fp-16 存 saved FP) 向上回溯.
-        遇非法指针、读内存失败或 RA=0 时截断.
+        FP 链走完后解析 trap 入口代码获取寄存器保存偏移,
+        在栈上定位被中断上下文并跨特权级继续回溯.
+        每帧标记所属特权级, 供颜色渲染.
         """
         h = self.hart
-        frames: list[StackFrame] = []
-        current_fp: int = h.gprs[8].val  # s0/fp
+        current_fp: int = h.gprs[8]  # s0/fp
         visited: set[int] = {current_fp}
-        max_frames = 32
+        cur_mode = h.mode.name  # "M" / "S" / "U" / ...
+        # 帧 #0: 当前执行点
+        frames: list[StackFrame] = [StackFrame(
+            idx=0, fp=current_fp, sp=h.gprs[2], ra=h.gprs[1],
+            pc=h.pc, mode=cur_mode,
+        )]
 
-        # 帧 #0: 当前执行点 (PC 取自 hart, SP/FP/RA 取自寄存器)
-        frames.append(StackFrame(
-            idx=0,
-            fp=current_fp,
-            sp=h.gprs[2].val,
-            ra=h.gprs[1].val,
-            pc=h.pc,
-        ))
-
-        for _ in range(max_frames):
+        while True:
             if current_fp == 0:
                 break
-
             link = self._try_read_frame_link(current_fp)
             if link is None:
-                break  # 内存读取越界 → 截断回溯
+                break
             saved_ra, saved_fp = link
-
-            # 合法性检查: FP 必须递增、对齐、无环
             if saved_fp != 0:
                 if saved_fp <= current_fp or (saved_fp & 0x7) or saved_fp in visited:
                     break
                 visited.add(saved_fp)
-
-            # RA 为 0 表示最外层 (无调用者)
             if saved_ra == 0:
                 break
-
             call_site = saved_ra - 4 if saved_ra >= 4 else 0
             frames.append(StackFrame(
-                idx=len(frames),
-                fp=saved_fp,
-                sp=current_fp,  # 上一帧的 FP ≈ 本帧的 SP
-                ra=saved_ra,
-                pc=call_site,
+                idx=len(frames), fp=saved_fp, sp=current_fp,
+                ra=saved_ra, pc=call_site, mode=cur_mode,
             ))
             current_fp = saved_fp
 
+        # -- 跨特权级回溯 --
+        self._walk_prev_mode_frames(frames, cur_mode, visited)
         return frames
+
+    def _walk_prev_mode_frames(
+        self,
+        frames: list[StackFrame],
+        cur_mode: str,
+        visited: set[int],
+    ) -> None:
+        """尝试解析 trap 入口, 定位被中断上下文并继续回溯低特权级 FP 链."""
+        h = self.hart
+        mode_val = h.mode.value
+
+        # 获取 tvec 和 trapped PC
+        if h.mode == RiscvMode.M:
+            tvec = h.mtvec_val
+            trapped_pc = h.mepc_val
+            prev_mode = h.mpp
+        elif h.mode == RiscvMode.S:
+            tvec = h.stvec_val
+            trapped_pc = h.sepc_val
+            prev_mode = h.spp
+        else:
+            return
+
+        if trapped_pc == 0 or prev_mode.value >= mode_val or tvec == 0:
+            return
+
+        prev_name = prev_mode.name
+
+        # 1) 解析 trap 入口 → 获取 RA/FP 保存偏移
+        # 当前实现仅识别 ``sd x1/x8, IMM(sp)`` 模式, 对以下场景会降级到仅显示 pc:
+        #  - 用非 sp 寄存器做存数基址 (如 OpenSBI csrrw tp, mscratch 切换到异常栈)
+        #  - 压缩指令 C.SDSP 保存 (只处理了 32-bit SD)
+        #  - sp 经大量代数运算后存入非常规位置 (极端情况需 SMT 求解, 不追踪)
+        # 降级时边界帧只含 trapped PC, 缺少 sp/fp/ra, 低特权级 FP 链不可见.
+        offsets = self._parse_trap_save_offsets(tvec)
+        if offsets is None:
+            frames.append(StackFrame(
+                idx=len(frames), fp=0, sp=0, ra=0,
+                pc=trapped_pc,
+                note=f"↓ trap from {prev_name}-mode",
+                mode=prev_name,
+            ))
+            return
+        ra_off, fp_off = offsets
+
+        # 2) 在栈上扫描 trapped_pc (mepc/sepc) 定位保存上下文
+        # 从最后一帧 FP 向上方扫 4 KiB
+        last_fp = frames[-1].fp if frames else h.gprs[2]
+        search_base = min(last_fp, frames[-1].sp if frames else h.gprs[2]) & ~0x7
+        raw = self._emu.bus.try_read(search_base, 4096)
+        if raw is None:
+            return
+        import struct as _struct
+        mepc_bytes = _struct.pack("<Q", trapped_pc)
+        trap_sp: int | None = None
+        pos = len(raw) - 8
+        while pos >= 0:
+            if raw[pos:pos + 8] != mepc_bytes:
+                pos -= 8
+                continue
+            # 我们在 raw 中找到 trapped_pc; 需要确定它在 trap 帧中的偏移
+            # trapped_pc 通常是在 ra 等 GPR 之后保存的 CSR 字段
+            # 验证: 若 ra_off 指向的地址内容看起来像代码地址, 则认为匹配
+            candidate_base = search_base + pos
+            # 尝试不同的 "mepc 在帧中偏移" 假设:
+            # 常见情况: mepc 在 GPR 之后, GPR 共 32 个 → mepc 偏移 = 32*8 = 256
+            for mepc_guess in (256, 0, 128, 64, 192):
+                trial_sp = candidate_base - mepc_guess
+                ra_addr = trial_sp + ra_off
+                ra_raw = self._emu.bus.try_read(ra_addr, 8)
+                if ra_raw is None:
+                    continue
+                ra_val = int.from_bytes(ra_raw, "little", signed=False)
+                # 保存的 RA 应该指向有效代码
+                if not self._emu.bus.is_valid_addr(ra_val):
+                    continue
+                # 进一步验证: x0 位置应为 0 (若存在)
+                zero_raw = self._emu.bus.try_read(trial_sp, 8)
+                if zero_raw is None:
+                    continue
+                zero_val = int.from_bytes(zero_raw, "little", signed=False)
+                if zero_val != 0:
+                    continue
+                trap_sp = trial_sp
+                break
+            if trap_sp is not None:
+                break
+            pos -= 8
+
+        # 3) 读取被保存的 RA, FP, SP
+        saved_ra: int | None = None
+        saved_fp: int | None = None
+        saved_sp: int | None = None
+        if trap_sp is not None:
+            ra_raw = self._emu.bus.try_read(trap_sp + ra_off, 8)
+            if ra_raw:
+                saved_ra = int.from_bytes(ra_raw, "little", signed=False)
+            if fp_off:
+                fp_raw = self._emu.bus.try_read(trap_sp + fp_off, 8)
+                if fp_raw:
+                    saved_fp = int.from_bytes(fp_raw, "little", signed=False)
+            # SP 通常在 x2 位置 (ra_off 附近, 偏移差 8)
+            sp_off = ra_off + 8  # ra=x1 之后是 sp=x2
+            sp_raw = self._emu.bus.try_read(trap_sp + sp_off, 8)
+            if sp_raw:
+                saved_sp = int.from_bytes(sp_raw, "little", signed=False)
+
+        # 4) 注入边界帧
+        call_site = trapped_pc - 4 if trapped_pc >= 4 else 0
+        frames.append(StackFrame(
+            idx=len(frames),
+            fp=saved_fp or 0,
+            sp=saved_sp or 0,
+            ra=saved_ra or 0,
+            pc=call_site,
+            note=f"↓ trap from {prev_name}-mode",
+            mode=prev_name,
+        ))
+
+        # 5) 继续走低特权级 FP 链
+        if not (saved_fp and saved_fp != 0 and saved_fp not in visited):
+            return
+        visited.add(saved_fp)
+        current_fp = saved_fp
+        pm_str = prev_name
+        for _ in range(64):
+            if current_fp == 0:
+                break
+            link = self._try_read_frame_link(current_fp)
+            if link is None:
+                break
+            next_ra, next_fp = link
+            if next_fp != 0:
+                if next_fp <= current_fp or (next_fp & 0x7) or next_fp in visited:
+                    break
+                visited.add(next_fp)
+            if next_ra == 0:
+                break
+            call_site = next_ra - 4 if next_ra >= 4 else 0
+            frames.append(StackFrame(
+                idx=len(frames), fp=next_fp, sp=current_fp,
+                ra=next_ra, pc=call_site, mode=pm_str,
+            ))
+            current_fp = next_fp
 
     @seize_val_err("无效帧号")
     def cmd_frame(self, arg: str | None = None) -> None:
@@ -2007,21 +2604,42 @@ class Debugger:
         tbl.add_column("regs", style="dim")
         for f in self._stack_frames:
             tag = f"#{f.idx + 1:02d}"
+            color = self._MODE_COLORS.get(f.mode, "")
+            mode_tag = f"[{color}]{f.mode}[/]" if color else ""
+            if f.note:
+                # 跨特权级边界帧: 显示 trapped PC + 边界标记
+                fn = _fn_name(f.pc)
+                seg = self._find_segment(f.pc - self._load_offset)
+                seg_name = seg.name if seg and seg.name else ""
+                where = ""
+                if seg_name and fn:
+                    where = f"[dim]{seg_name}[/]:[{color}]{fn}[/]"
+                elif fn:
+                    where = f"[{color}]{fn}[/]"
+                elif seg_name:
+                    where = f"[dim]{seg_name}[/]"
+                regs = (
+                    f"pc={self._hex(f.pc)}  "
+                    f"[bold magenta]{f.note}[/]"
+                )
+                tbl.add_row(f"{tag} {mode_tag}", where, regs)
+                continue
             fn = _fn_name(f.pc)
             seg = self._find_segment(f.pc - self._load_offset)
             seg_name = seg.name if seg and seg.name else ""
             where = ""
             if seg_name and fn:
-                where = f"[dim]{seg_name}[/]:[yellow]{fn}[/]"
+                where = f"[dim]{seg_name}[/]:[{color}]{fn}[/]"
             elif fn:
-                where = f"[yellow]{fn}[/]"
+                where = f"[{color}]{fn}[/]"
             elif seg_name:
-                where = f"[dim]{seg_name}[/]:"
+                where = f"[dim]{seg_name}[/]"
             regs = (
                 f"pc={self._hex(f.pc)}  sp={self._hex(f.sp)}  "
                 f"fp={self._hex(f.fp)}  ra={self._hex(f.ra)}"
             )
-            tbl.add_row(tag, where, regs)
+            tbl.add_row(f"{tag} {mode_tag}", where, regs)
+
 
         self._console.print(
             f"[bold]执行栈帧[/] (深度 {len(self._stack_frames)})",
@@ -2035,12 +2653,20 @@ class Debugger:
         stack_data = self._emu.bus.try_read(cur.sp, 64)
         payload = "\n[dim](无法读取当前帧 SP 处内存)[/]"
         if stack_data is not None:
-            payload = "\n" + ("-" * 55) + "\n[bold]当前栈内存[/]\n" + \
-                fmt_hexdump(stack_data, addr=cur.sp)
+            payload = (
+                "\n"
+                + ("-" * 100)
+                + "\n[bold]当前栈内存[/]\n"
+                + fmt_hexdump(stack_data, addr=cur.sp)
+            )
         self._console.print(payload)
 
     def cmd_symbols(self, filter_str: str = "") -> None:
-        """列出固件符号表, 支持可选的名称过滤."""
+        """列出固件符号表.
+
+        无参数时按首字符分组显示各前缀的符号数量;
+        带参数时列出以 *filter_str* 为前缀的全部符号, 按地址升序.
+        """
         if self._image is None:
             self._warn("无可用的符号表 (非 ELF 文件)")
             return
@@ -2050,19 +2676,56 @@ class Debugger:
             self._console.print("[dim](符号表为空)[/]")
             return
 
+        if not filter_str:
+            # ---- 无参数: 按首字符分组统计 ----
+            groups: dict[str, int] = {}
+            for name in syms:
+                key = name[0] if name else "?"
+                groups[key] = groups.get(key, 0) + 1
+
+            # 字典序排序: 字母先 (a-z), 再数字, 再下划线, 再点, 最后其他
+            def _group_order(key: str) -> tuple[int, str]:
+                c = key.lower()
+                if "a" <= c <= "z":
+                    return (0, c)
+                if "0" <= c <= "9":
+                    return (1, c)
+                if c == "_":
+                    return (2, c)
+                if c == ".":
+                    return (3, c)
+                return (4, c)
+
+            sorted_keys = sorted(groups.keys(), key=_group_order)
+
+            tbl = Table(
+                title=f"符号分组 ({len(syms)} 项, {len(sorted_keys)} 组)",
+                border_style="blue",
+            )
+            tbl.add_column("Prefix", style="cyan")
+            tbl.add_column("Count", style="yellow", justify="right")
+            for key in sorted_keys:
+                tbl.add_row(f"{key}?", str(groups[key]))
+            self._console.print(tbl)
+            self._console.print(
+                "[dim]输入 sym <prefix> 查看具体符号 (如 sym a, sym f, sym _)[/]"
+            )
+            return
+
+        # ---- 带参数: 按前缀匹配, 按地址升序列出 ----
         entries = [
             (name, addr)
             for name, addr in syms.items()
-            if filter_str.lower() in name.lower()
+            if name.lower().startswith(filter_str.lower())
         ]
         entries.sort(key=lambda x: x[1])
 
         if not entries:
-            self._console.print(f"[dim]无匹配符号: '{filter_str}'[/]")
+            self._console.print(f"[dim]无以前缀 '{filter_str}' 开头的符号[/]")
             return
 
         tbl = Table(
-            title=f"符号表 ({len(entries)}/{len(syms)} 项)",
+            title=f"符号: '{filter_str}' ({len(entries)} 项)",
             border_style="blue",
         )
         tbl.add_column("Address", style="yellow")
@@ -2104,6 +2767,11 @@ class Debugger:
             return True
         if cmd in ("c", "continue"):
             self.cmd_continue()
+            return True
+        if cmd == "watch":
+            addr = parts[1] if len(parts) > 1 else ""
+            size = parts[2] if len(parts) > 2 else "8"
+            self.cmd_watch(addr, size)
             return True
         if cmd in ("r", "run"):
             n = int(parts[1]) if len(parts) > 1 else 1
@@ -2174,6 +2842,9 @@ class Debugger:
         if cmd == "satp":
             self.cmd_satp()
             return True
+        if cmd == "show-pmp":
+            self.cmd_pmp()
+            return True
         if cmd == "mem":
             if len(parts) < 2:
                 self._warn("用法: mem <addr> [size]  例: mem 0x80000000 64")
@@ -2184,7 +2855,7 @@ class Debugger:
             if len(parts) < 2:
                 self._warn("用法: disasm <addr> [length]  例: disasm 0x80000000 64")
             else:
-                self.cmd_disasm(parts[1], parts[2] if len(parts) > 2 else "64")
+                self.cmd_disasm(parts[1], parts[2] if len(parts) > 2 else "32")
             return True
         if cmd in ("status", "info"):
             self.cmd_status(parts[1] if len(parts) > 1 else None)
@@ -2302,7 +2973,7 @@ class Debugger:
                 ("b/bp <addr>", "在指定地址设置断点"),
                 ("b/bp ecall|ebreak|mret|sret|wfi", "在指定指令类型设置断点"),
                 ("b/bp opcode <hex>", "在指定 opcode 设置断点 (如 0x73)"),
-                ("b/bp|bp list", "列出所有断点"),
+                ("b/bp", "列出所有断点"),
                 ("bp delete <n>", "删除编号为 n 的断点"),
                 ("bp clear", "清除全部断点"),
             ]),
@@ -2317,6 +2988,7 @@ class Debugger:
                 ("tlb [vpn]", "显示 ITLB / DTLB, 或查找指定 VPN"),
                 ("cache [set] [way]", "显示 L2 缓存状态及数据"),
                 ("satp", "显示 satp 解码 (MODE/ASID/PPN)"),
+                ("show-pmp", "显示全部 PMP 条目的保护范围与权限"),
             ]),
             _section("写寄存器命令", [
                 ("set/w <name> <val>", "写入 GPR (例: set sp 0x8000)"),
@@ -2325,17 +2997,15 @@ class Debugger:
             ]),
             _section("内存/符号", [
                 ("mem <addr> [size]", "hexdump 内存 (默认 64 字节)"),
-                ("disasm <addr> [len]", "反汇编内存区域 (默认 64 字节)"),
+                ("disasm <addr> [len]", "反汇编内存区域 (默认 32 字节)"),
                 ("sym/symbols [filt]", "列出符号表 (可选过滤)"),
             ]),
             _section("状态", [
                 ("status/info [hart]", "全部 hart 概览, 或指定 hart 详情"),
                 ("stack/bt", "栈帧情况"),
-                ("frame/f <N>", "切换到第 N 帧")
+                ("frame/f <N>", "切换到第 N 帧"),
             ]),
-            _section("配置", [
-                ("hart <id>", "切换活跃 hart"),
-            ]),
+            _section("配置", [("hart <id>", "切换活跃 hart")]),
             _section("其他", [
                 ("help/h/?", "显示本帮助"),
                 ("quit/q/exit", "退出调试器"),
@@ -2357,57 +3027,69 @@ def main(args: list[str] | None = None) -> None:
         description="RISC-V Interactive Debugger (rvdb)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  %(prog)s firmware.bin\n"
-               "  %(prog)s firmware.elf --entry-symbol main\n"
-               "  %(prog)s app.elf --preload crt0.bin --entry-symbol main\n"
-               "  %(prog)s firmware.bin --harts 4 --ram 256M",
+        "  %(prog)s firmware.bin\n"
+        "  %(prog)s firmware.elf --entry-symbol main\n"
+        "  %(prog)s app.elf --preload crt0.bin --entry-symbol main\n"
+        "  %(prog)s firmware.bin --harts 4 --ram 256M",
     )
     parser.add_argument("firmware", help="固件文件路径 (ELF / PE / raw binary)")
     parser.add_argument(
-        "--base-addr", type=lambda x: int(x, 0), default=0x80000000,
+        "--base-addr",
+        type=lambda x: int(x, 0), default=0x80000000,
         help="raw binary 的加载基址 (ELF/PE 时忽略, 默认 0x80000000)",
     )
     parser.add_argument(
-        "--prog-cnt", type=lambda x: int(x, 0), default=None,
+        "--prog-cnt",
+        type=lambda x: int(x, 0), default=None,
         help="程序计数器 (Program Counter) — 每个 hart 的开始执行地址 (默认使用固件入口 + 搬迁偏移)",
     )
     parser.add_argument(
-        "--ram-base", type=lambda x: int(x, 0), default=0x8000_0000,
+        "--ram-base",
+        type=lambda x: int(x, 0), default=0x8000_0000,
         help="物理内存基址 (默认 0x80000000, 加载低地址固件时需设为 0x0)",
     )
     parser.add_argument(
-        "--fdt", type=lambda x: int(x, 0) if x is not None else None,
+        "--fdt",
+        type=lambda x: int(x, 0) if x is not None else None,
         default=-1, nargs="?", const=-1,
         help="设备树加载地址 (默认自动放在 RAM 顶端 −64 KiB, 接参数则放在指定地址)",
     )
     parser.add_argument(
-        "--fdt-file", type=str, default=None, metavar="PATH[:ADDR]",
+        "--fdt-file",
+        type=str, default=None,
+        metavar="PATH[:ADDR]",
         help="加载预编译 DTB 文件 (可选 :地址), 例: --fdt-file pyremu_virt.dtb:0x7f0000",
     )
     parser.add_argument(
-        "--no-fdt", action="store_true", default=False,
+        "--no-fdt",
+        action="store_true", default=False,
         help="禁用设备树 (--fdt 和 --fdt-file 均被忽略)",
     )
     parser.add_argument("--harts", type=int, default=1, help="hart 数量 (默认 1)")
     parser.add_argument(
-        "--ram", type=str, default="128M",
+        "--ram",
+        type=str, default="128M",
         help="RAM 大小 (支持 K/M/G 后缀, 默认 128M)",
     )
     parser.add_argument(
-        "--log-level", type=str, default="INFO",
+        "--log-level",
+        type=str, default="INFO",
         choices=["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
         help="日志级别 (默认 INFO)",
     )
     parser.add_argument(
-        "--preload", type=str, default=None,
+        "--preload",
+        type=str, default=None,
         help="预加载 shellcode 文件路径 (裸 RISC-V 机器码), 在目标程序之前执行",
     )
     parser.add_argument(
-        "--preload-addr", type=lambda x: int(x, 0), default=None,
+        "--preload-addr",
+        type=lambda x: int(x, 0), default=None,
         help="预加载 shellcode 的加载地址 (默认 = RAM 顶端 − 64 KiB)",
     )
     parser.add_argument(
-        "--entry-symbol", type=str, default=None,
+        "--entry-symbol",
+        type=str, default=None,
         help="目标程序入口符号名 (如 'main'), 将其地址写入 a0 供 preload 使用",
     )
 
@@ -2447,13 +3129,12 @@ def main(args: list[str] | None = None) -> None:
         sys.exit(1)
 
     logger.info(
-        f"格式={image.format}, 入口=0x{image.entry_point:x}, "
-        f"段数={len(image.segments)}"
+        f"格式={image.format}, 入口=0x{image.entry_point:x}, 段数={len(image.segments)}"
     )
     for seg in image.segments:
         logger.info(
             f"  [{seg.name}] vaddr=0x{seg.vaddr:016x}  "
-            f"size={Debugger._fmt_size(len(seg.data)):<8s}  memsz={Debugger._fmt_size(seg.memsz)}"
+            f"size={Debugger._fmt_size(len(seg.data)):<8s} mem size={Debugger._fmt_size(seg.memsz)}"
         )
 
     # PIE 固件搬迁: 若所有段 vaddr 均 < ram_base, 整体偏移 ram_base
@@ -2494,8 +3175,8 @@ def main(args: list[str] | None = None) -> None:
             parts = ns.fdt_file.rsplit(":", 1)
             file_path = parts[0]
             custom_addr = int(parts[1], 0) if len(parts) > 1 else None
-            fdt_addr = custom_addr if custom_addr is not None else (
-                ns.ram_base + ram_size - 0x10000
+            fdt_addr = (
+                custom_addr if custom_addr is not None else (ns.ram_base + ram_size - 0x10000)
             )
             emu.load_dtb_file(file_path, addr=fdt_addr)
         elif ns.fdt is not None:
@@ -2511,16 +3192,12 @@ def main(args: list[str] | None = None) -> None:
     if ns.preload is not None:
         preloader = Preloader(emu)
         preload_entry = preloader.inject_file(ns.preload, addr=ns.preload_addr)
-        logger.info(
-            f"已注入预加载 shellcode: {ns.preload} → 0x{preload_entry:x}"
-        )
-        # preload 场景: 缩 OpenSBI BSS 零填充循环为一轮 (固件 BSS 已由 load_firmware 零填)
-        j_imm = (0x98 - 0x94) >> 1
-        j_blt = ((j_imm >> 19) & 1) << 31 | (j_imm & 0x3FF) << 21 | ((j_imm >> 10) & 1) << 20 | ((j_imm >> 11) & 0xFF) << 12 | 0x6f
-        emu.bus.write(ns.ram_base + 0x94, struct.pack("<I", j_blt))
+        logger.info(f"已注入预加载 shellcode: {ns.preload} → 0x{preload_entry:x}")
         # misa 需设 U-bit (bit20), sbi_init 冷启动依赖
         for h in emu.harts:
-            h.csrs["misa"].val = (2 << 62) | (1 << 18) | (1 << 20)  # MXL=RV64 + U-bit; h.csrs["mscratch"].val = ns.ram_base + ram_size - 0x100000
+            h.csrs["misa"].val = (
+                (2 << 62) | (1 << 18) | (1 << 20)
+            )  # MXL=RV64 + U-bit; h.csrs["mscratch"].val = ns.ram_base + ram_size - 0x100000
         # fw_next_arg1 返回 ram_base + 0x2200000, fdt_get_address() 也读这里
         # 在 fdt_get_address 期望的地址放一份 DTB 副本
         if fdt_addr is not None:
@@ -2552,7 +3229,6 @@ def main(args: list[str] | None = None) -> None:
     dbg._load_offset = load_offset
     dbg._preload_path = ns.preload
     dbg.repl()
-
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,134 @@
+//! 全局 EnclaveContext —— 替代 ref-emod 中分散在 8+ 个 .c 文件里的 ~30 个 file-static 全局变量。
+//! 启动阶段一次写入，此后任意读取。
+
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+
+use crate::constants::PAGE_SIZE;
+use crate::paging::Pte;
+
+// ---------------------------------------------------------------
+//  PoolDesc
+// ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+pub struct PoolDesc {
+    pub offset: u64,
+    pub size: u64,
+    pub used_pages: u64,
+}
+
+impl PoolDesc {
+    pub const fn empty() -> Self {
+        Self {
+            offset: 0,
+            size: 0,
+            used_pages: 0,
+        }
+    }
+
+    pub fn avail_bytes(&self) -> u64 {
+        self.size.saturating_sub(self.used_pages * PAGE_SIZE)
+    }
+}
+
+// ---------------------------------------------------------------
+//  SharedBuf
+// ---------------------------------------------------------------
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct SharedBuf {
+    pub pa: u64,
+    pub va: u64,
+}
+
+// ---------------------------------------------------------------
+//  EnclaveContext
+// ---------------------------------------------------------------
+
+#[repr(align(4096))]
+pub struct EnclaveContext {
+    /// 页表根（512 项，必须 4 KiB 对齐）。
+    pub page_table_root: [Pte; 512],
+    /// 飞地管理器物理起始地址。
+    pub manager_pa_start: u64,
+    /// 加载偏移: 运行时 PA − 链接时基址 (LINK_BASE).
+    pub load_offset: u64,
+    /// 下一个飞地模块的加载 VA。
+    #[allow(dead_code)]
+    pub enclave_module_load_va: u64,
+    /// U-mode 堆顶。
+    pub umode_heap_top: u64,
+    pub umode_pool: PoolDesc,
+    pub smode_pool: PoolDesc,
+    #[allow(dead_code)]
+    pub shared_buffer: Option<SharedBuf>,
+    pub umode_pool_pa_aligned: u64,
+}
+
+// ---------------------------------------------------------------
+//  OnceCell —— 单次写入，多次读取
+// ---------------------------------------------------------------
+
+struct OnceCell<T> {
+    value: UnsafeCell<MaybeUninit<T>>,
+    ready: UnsafeCell<bool>,
+}
+
+unsafe impl<T> Sync for OnceCell<T> {}
+
+impl<T> OnceCell<T> {
+    const fn new() -> Self {
+        Self {
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+            ready: UnsafeCell::new(false),
+        }
+    }
+
+    fn set(&self, val: T) {
+        let ready = unsafe { &mut *self.ready.get() };
+        if *ready {
+            panic!("EnclaveContext::set called twice");
+        }
+        unsafe { (*self.value.get()).write(val) };
+        *ready = true;
+    }
+
+    fn get(&self) -> &T {
+        assert!(
+            *unsafe { &*self.ready.get() },
+            "EnclaveContext not initialised"
+        );
+        unsafe { (*self.value.get()).assume_init_ref() }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn get_mut(&self) -> &mut T {
+        assert!(
+            *unsafe { &*self.ready.get() },
+            "EnclaveContext not initialised"
+        );
+        unsafe { (*self.value.get()).assume_init_mut() }
+    }
+}
+
+static CTX: OnceCell<EnclaveContext> = OnceCell::new();
+
+// ---------------------------------------------------------------
+//  Public API
+// ---------------------------------------------------------------
+
+pub fn init_context(ctx: EnclaveContext) {
+    CTX.set(ctx);
+}
+
+#[inline]
+pub fn ctx() -> &'static EnclaveContext {
+    CTX.get()
+}
+
+#[inline]
+pub fn ctx_mut() -> &'static mut EnclaveContext {
+    CTX.get_mut()
+}

@@ -140,7 +140,7 @@ _F7_ADD = 0x00
 CSR_MTVEC = 0x305
 CSR_MSTATUS = 0x300
 CSR_MEPC = 0x341
-CSR_MHARTID = 0xf14
+CSR_MHARTID = 0xF14
 
 # mstatus bits
 MSTATUS_MPP_MASK = 0b11 << 11
@@ -222,9 +222,7 @@ def csr_write(csr_addr: int, rs: int) -> AsmSnippet:
         rs: 源寄存器 (0–31).
     """
     return AsmSnippet(
-        words=[
-            ((csr_addr & 0xFFF) << 20) | (rs << 15) | (0b001 << 12) | (_ZERO << 7) | _SYS
-        ],
+        words=[((csr_addr & 0xFFF) << 20) | (rs << 15) | (0b001 << 12) | (_ZERO << 7) | _SYS],
         desc=f"csrrw x0, 0x{csr_addr:03x}, x{rs}",
     )
 
@@ -269,28 +267,42 @@ def switch_to_umode(entry_addr: int, sp_addr: int = 0) -> list[AsmSnippet]:
 
     # 设置 mstatus.MPP = U (清除 MPP 位)
     snippets.append(imm64(_T0, MSTATUS_MPP_MASK))
-    snippets.append(AsmSnippet(
-        words=[
-            ((CSR_MSTATUS & 0xFFF) << 20) | (_T0 << 15) | (0b011 << 12) | (_ZERO << 7) | _SYS
-        ],
-        desc="csrrc x0, mstatus, t0  # 清除 MPP",
-    ))
-    snippets.append(AsmSnippet(
-        words=[
-            ((CSR_MSTATUS & 0xFFF) << 20) | (_ZERO << 15) | (0b010 << 12) | (_ZERO << 7) | _SYS
-        ],
-        desc="csrrs x0, mstatus, x0  # MPP = 0 (U)",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[
+                ((CSR_MSTATUS & 0xFFF) << 20)
+                | (_T0 << 15)
+                | (0b011 << 12)
+                | (_ZERO << 7)
+                | _SYS
+            ],
+            desc="csrrc x0, mstatus, t0  # 清除 MPP",
+        )
+    )
+    snippets.append(
+        AsmSnippet(
+            words=[
+                ((CSR_MSTATUS & 0xFFF) << 20)
+                | (_ZERO << 15)
+                | (0b010 << 12)
+                | (_ZERO << 7)
+                | _SYS
+            ],
+            desc="csrrs x0, mstatus, x0  # MPP = 0 (U)",
+        )
+    )
 
     # 设置 sp (如果需要)
     if sp_addr != 0:
         snippets.append(set_sp(sp_addr))
 
     # mret → 切换到 U 模式, pc = mepc
-    snippets.append(AsmSnippet(
-        words=[0x30200073],  # mret
-        desc="mret",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[0x30200073],  # mret
+            desc="mret",
+        )
+    )
 
     return snippets
 
@@ -335,10 +347,12 @@ def hosted_bootstrap(
 
     # 跳转到入口: jalr zero, t0, 0  → t0 = entry_addr
     snippets.append(imm64(_T0, entry_addr))
-    snippets.append(AsmSnippet(
-        words=[_i_type(0, _T0, _F3_JALR, _ZERO, _JALR)],
-        desc=f"jalr zero, 0(t0)  # jump to 0x{entry_addr:x}",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[_i_type(0, _T0, _F3_JALR, _ZERO, _JALR)],
+            desc=f"jalr zero, 0(t0)  # jump to 0x{entry_addr:x}",
+        )
+    )
 
     return snippets
 
@@ -369,29 +383,39 @@ def zsbl_stub(
     dtb_from_zsbl = 0x10000 - zsbl_pc  # DTB @ preload+64K
     dtb_hi = (dtb_from_zsbl + 0x800) >> 12
     dtb_lo = dtb_from_zsbl - (dtb_hi << 12)
-    snippets.append(AsmSnippet(
-        words=[_u_type(dtb_hi, _A1, _AUIPC)],
-        desc=f"auipc a1, {dtb_hi}  # load DTB addr (PC+0x10000)",
-    ))
-    snippets.append(AsmSnippet(
-        words=[_i_type(dtb_lo, _A1, _F3_ADDI, _A1, _OP_IMM)],
-        desc=f"addi a1, a1, {dtb_lo:#x}",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[_u_type(dtb_hi, _A1, _AUIPC)],
+            desc=f"auipc a1, {dtb_hi}  # load DTB addr (PC+0x10000)",
+        )
+    )
+    snippets.append(
+        AsmSnippet(
+            words=[_i_type(dtb_lo, _A1, _F3_ADDI, _A1, _OP_IMM)],
+            desc=f"addi a1, a1, {dtb_lo:#x}",
+        )
+    )
     # PC 相对跳转进 FSBL
     hi = (fsbl_pc_offset + 0x800) >> 12
     lo = fsbl_pc_offset - (hi << 12)
-    snippets.append(AsmSnippet(
-        words=[_u_type(hi, _T0, _AUIPC)],
-        desc=f"auipc t0, {hi}",
-    ))
-    snippets.append(AsmSnippet(
-        words=[_i_type(lo, _T0, _F3_ADDI, _T0, _OP_IMM)],
-        desc=f"addi t0, t0, {lo:#x}",
-    ))
-    snippets.append(AsmSnippet(
-        words=[_i_type(0, _T0, _F3_JALR, _ZERO, _JALR)],
-        desc="jalr zero, 0(t0)  # jump to FSBL",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[_u_type(hi, _T0, _AUIPC)],
+            desc=f"auipc t0, {hi}",
+        )
+    )
+    snippets.append(
+        AsmSnippet(
+            words=[_i_type(lo, _T0, _F3_ADDI, _T0, _OP_IMM)],
+            desc=f"addi t0, t0, {lo:#x}",
+        )
+    )
+    snippets.append(
+        AsmSnippet(
+            words=[_i_type(0, _T0, _F3_JALR, _ZERO, _JALR)],
+            desc="jalr zero, 0(t0)  # jump to FSBL",
+        )
+    )
 
     return snippets
 
@@ -429,55 +453,81 @@ def fsbl_stub(
     # boot hart: 置冷启动标志 = 1
     snippets.append(imm64(_T0, coldboot_flag_addr))
     snippets.append(imm64(_T1, 1))
-    snippets.append(AsmSnippet(
-        words=[_s_type(_T0, _T1, _F3_SW, 0)],
-        desc=f"sw  x{_T1}, 0(x{_T0})   # 置冷启动标志",
-    ))
-    snippets.append(AsmSnippet(
-        words=[0x0ff0000f],
-        desc="fence w,w",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[_s_type(_T0, _T1, _F3_SW, 0)],
+            desc=f"sw  x{_T1}, 0(x{_T0})   # 置冷启动标志",
+        )
+    )
+    snippets.append(
+        AsmSnippet(
+            words=[0x0FF0000F],
+            desc="fence w,w",
+        )
+    )
 
     # 设 mtvec = opensbi_addr (FSBL 用 unimp trap 跳转)
     snippets.extend(set_mtvec(opensbi_addr))
 
     # a0 = mhartid, a1 = DTB (PC 相对: DTB @ preload_start + 0x10000)
-    snippets.append(AsmSnippet(
-        words=[((CSR_MHARTID & 0xFFF) << 20) | (_ZERO << 15) | (0b010 << 12) | (_A0 << 7) | _SYS],
-        desc="csrrs a0, mhartid, x0",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[
+                ((CSR_MHARTID & 0xFFF) << 20)
+                | (_ZERO << 15)
+                | (0b010 << 12)
+                | (_A0 << 7)
+                | _SYS
+            ],
+            desc="csrrs a0, mhartid, x0",
+        )
+    )
     # DTB = FSBL_PC + dtb_pc_offset (由调用方计算, = 0x10000 - fsbl_offset_in_preload)
     dtb_hi = (dtb_pc_offset + 0x800) >> 12
     dtb_lo = dtb_pc_offset - (dtb_hi << 12)
-    snippets.append(AsmSnippet(
-        words=[_u_type(dtb_hi, _A1, _AUIPC)],
-        desc=f"auipc a1, {dtb_hi}  # DTB addr",
-    ))
-    snippets.append(AsmSnippet(
-        words=[_i_type(dtb_lo, _A1, _F3_ADDI, _A1, _OP_IMM)],
-        desc=f"addi a1, a1, {dtb_lo:#x}",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[_u_type(dtb_hi, _A1, _AUIPC)],
+            desc=f"auipc a1, {dtb_hi}  # DTB addr",
+        )
+    )
+    snippets.append(
+        AsmSnippet(
+            words=[_i_type(dtb_lo, _A1, _F3_ADDI, _A1, _OP_IMM)],
+            desc=f"addi a1, a1, {dtb_lo:#x}",
+        )
+    )
 
     # 可选: patch sbi_init → 无条件冷启动 (next_mode 保持 S-mode)
     if cold_boot:
         # sbi_init @ opensbi+0xe0d0: beq a0,a1,warm → j cold_boot
         # 不改 fw_next_mode, 不影响 Domain0 Next Mode
-        sb_addr = opensbi_addr + 0xe0d0
-        j_imm = (0xe0d8 - 0xe0d0) >> 1  # =4
-        j_cold = ((j_imm >> 19) & 1) << 31 | (j_imm & 0x3FF) << 21 | ((j_imm >> 10) & 1) << 20 | ((j_imm >> 11) & 0xFF) << 12 | 0x6f
+        sb_addr = opensbi_addr + 0xE0D0
+        j_imm = (0xE0D8 - 0xE0D0) >> 1  # =4
+        j_cold = (
+            ((j_imm >> 19) & 1) << 31
+            | (j_imm & 0x3FF) << 21
+            | ((j_imm >> 10) & 1) << 20
+            | ((j_imm >> 11) & 0xFF) << 12
+            | 0x6F
+        )
         snippets.append(imm64(_T0, sb_addr))
         snippets.append(imm64(_T1, j_cold))
-        snippets.append(AsmSnippet(
-            words=[_s_type(_T0, _T1, 0b010, 0)],  # sw
-            desc="sw  j-cold-boot @ sbi_init+0xe0d0",
-        ))
+        snippets.append(
+            AsmSnippet(
+                words=[_s_type(_T0, _T1, 0b010, 0)],  # sw
+                desc="sw  j-cold-boot @ sbi_init+0xe0d0",
+            )
+        )
     # (BSS 循环和 fw_next_mode 已由 debugger bus.write 处理)
 
     # unimp → trap → mtvec → OpenSBI
-    snippets.append(AsmSnippet(
-        words=[0x00000000],
-        desc="unimp  # trap → mtvec → OpenSBI",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[0x00000000],
+            desc="unimp  # trap → mtvec → OpenSBI",
+        )
+    )
 
     return snippets
 
@@ -506,17 +556,23 @@ def opensbi_coldboot_stub(
     snippets: list[AsmSnippet] = []
     snippets.append(imm64(_T0, flag_addr))
     snippets.append(imm64(_T1, 1))
-    snippets.append(AsmSnippet(
-        words=[_s_type(_T0, _T1, _F3_SW, 0)],
-        desc=f"sw  x{_T1}, 0(x{_T0})   # 置冷启动标志",
-    ))
-    snippets.append(AsmSnippet(
-        words=[0x0ff0000f],  # fence w,w
-        desc="fence w,w",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[_s_type(_T0, _T1, _F3_SW, 0)],
+            desc=f"sw  x{_T1}, 0(x{_T0})   # 置冷启动标志",
+        )
+    )
+    snippets.append(
+        AsmSnippet(
+            words=[0x0FF0000F],  # fence w,w
+            desc="fence w,w",
+        )
+    )
     snippets.append(imm64(_T0, entry_addr))
-    snippets.append(AsmSnippet(
-        words=[_i_type(0, _T0, _F3_JALR, _ZERO, _JALR)],
-        desc=f"jalr zero, 0(t0)  # jump to OpenSBI @ 0x{entry_addr:x}",
-    ))
+    snippets.append(
+        AsmSnippet(
+            words=[_i_type(0, _T0, _F3_JALR, _ZERO, _JALR)],
+            desc=f"jalr zero, 0(t0)  # jump to OpenSBI @ 0x{entry_addr:x}",
+        )
+    )
     return snippets

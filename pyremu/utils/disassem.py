@@ -56,6 +56,7 @@ def _fmt_addr(val: int) -> str:
 #  字段提取辅助
 # ============================================================
 
+
 def _rd(instr: int) -> str:
     return gpr_name(parse_rd(instr))
 
@@ -120,9 +121,9 @@ def _dis_itype(instr: int) -> str:
     if f3 == 0b101:  # SRLI / SRAI
         shamt = (instr >> 20) & 0x3F
         f6 = parse_func6(instr)
-        if f6 == 0x00:       # SRLI (funct6=0b000000)
+        if f6 == 0x00:  # SRLI (funct6=0b000000)
             return f"srli    {_rd(instr)}, {_rs1(instr)}, {shamt}"
-        if f6 == 0x10:       # SRAI (funct6=0b010000)
+        if f6 == 0x10:  # SRAI (funct6=0b010000)
             return f"srai    {_rd(instr)}, {_rs1(instr)}, {shamt}"
         return _UNKNOWN
 
@@ -222,6 +223,7 @@ def _dis_store(instr: int) -> str:
 #  Branch
 # ============================================================
 
+
 def _dis_branch(instr: int, pc: int) -> str:
     """Branch: mnemonic rs1, rs2, target_addr."""
     f3 = parse_func3(instr)
@@ -237,6 +239,7 @@ def _dis_branch(instr: int, pc: int) -> str:
 # ============================================================
 #  JAL / JALR
 # ============================================================
+
 
 def _dis_jal(instr: int, pc: int) -> str:
     """JAL: mnemonic rd, target_addr."""
@@ -254,6 +257,7 @@ def _dis_jalr(instr: int) -> str:
 # ============================================================
 #  LUI / AUIPC
 # ============================================================
+
 
 def _dis_lui(instr: int) -> str:
     # LUI 的 20-bit 立即数为地址高位常量 (实际值 = imm << 12), 用 hex 更直观
@@ -326,6 +330,7 @@ def _dis_priv(instr: int) -> str:
 #  FENCE
 # ============================================================
 
+
 def _dis_fence(instr: int) -> str:
     f3 = parse_func3(instr)
     if f3 == 0b000:
@@ -338,6 +343,7 @@ def _dis_fence(instr: int) -> str:
 # ============================================================
 #  AMO
 # ============================================================
+
 
 def _dis_amo(instr: int) -> str:
     funct5_val = (instr >> 27) & 0x1F
@@ -389,46 +395,35 @@ def _dis_compressed(
         rs1_p = _c_x8(c16 >> 7)
 
         if funct3 == 0b000:  # C.ADDI4SPN
+            # nzuimm[5:4] = instr[12:11], nzuimm[9:6] = instr[10:7],
+            # nzuimm[2]    = instr[6],    nzuimm[3]    = instr[5]
+            # 基址寄存器固定为 sp (x2), bits[9:7] 属于立即数而非 rs1' 字段.
             uimm = (
-                ((c16 >> 7) & 0x0F) << 6
-                | ((c16 >> 11) & 0x03) << 4
-                | ((c16 >> 6) & 1) << 3
-                | ((c16 >> 5) & 1) << 2
+                ((c16 >> 7) & 0x0F) << 6   # instr[10:7] → nzuimm[9:6]
+                | ((c16 >> 11) & 0x03) << 4  # instr[12:11] → nzuimm[5:4]
+                | ((c16 >> 5) & 1) << 3      # instr[5] → nzuimm[3]
+                | ((c16 >> 6) & 1) << 2      # instr[6] → nzuimm[2]
             )
             if uimm == 0:
                 return f"c.?    0x{c16:04x}  # C.ADDI4SPN nzuimm=0 (reserved)"
-            return f"c.addi4spn {rd_p}, {rs1_p}, {uimm}"
+            return f"c.addi4spn {rd_p}, sp, {uimm}"
 
         if funct3 == 0b010:  # C.LW
-            uimm = (
-                ((c16 >> 5) & 1) << 6
-                | ((c16 >> 10) & 0b111) << 3
-                | ((c16 >> 6) & 1) << 2
-            )
+            uimm = ((c16 >> 5) & 1) << 6 | ((c16 >> 10) & 0b111) << 3 | ((c16 >> 6) & 1) << 2
             return f"c.lw    {rd_p}, {uimm}({rs1_p})"
 
         if funct3 == 0b011:  # C.LD (RV64)
-            uimm = (
-                ((c16 >> 5) & 0b11) << 6
-                | ((c16 >> 10) & 0b111) << 3
-            )
+            uimm = ((c16 >> 5) & 0b11) << 6 | ((c16 >> 10) & 0b111) << 3
             return f"c.ld    {rd_p}, {uimm}({rs1_p})"
 
         if funct3 == 0b110:  # C.SW
             rs2_p = _c_x8(c16 >> 2)
-            uimm = (
-                ((c16 >> 5) & 1) << 6
-                | ((c16 >> 10) & 0b111) << 3
-                | ((c16 >> 6) & 1) << 2
-            )
+            uimm = ((c16 >> 5) & 1) << 6 | ((c16 >> 10) & 0b111) << 3 | ((c16 >> 6) & 1) << 2
             return f"c.sw    {rs2_p}, {uimm}({rs1_p})"
 
         if funct3 == 0b111:  # C.SD (RV64)
             rs2_p = _c_x8(c16 >> 2)
-            uimm = (
-                ((c16 >> 5) & 0b11) << 6
-                | ((c16 >> 10) & 0b111) << 3
-            )
+            uimm = ((c16 >> 5) & 0b11) << 6 | ((c16 >> 10) & 0b111) << 3
             return f"c.sd    {rs2_p}, {uimm}({rs1_p})"
 
         return f"c.?    0x{c16:04x}"
@@ -476,10 +471,7 @@ def _dis_compressed(
                     nzimm |= ~((1 << 10) - 1)
                 return f"c.addi16sp {nzimm}"
             # C.LUI
-            nzuimm = (
-                ((c16 >> 12) & 1) << 17
-                | ((c16 >> 2) & 0x1F) << 12
-            )
+            nzuimm = ((c16 >> 12) & 1) << 17 | ((c16 >> 2) & 0x1F) << 12
             # sext from bit 17
             if nzuimm & (1 << 17):
                 nzuimm = nzuimm - (1 << 18)
@@ -570,9 +562,7 @@ def _dis_compressed(
         if funct3 == 0b010:  # C.LWSP
             # offset = {inst[6:5], inst[12], inst[4:2], 00} (4 字节对齐)
             uimm = (
-                ((c16 >> 5) & 0b11) << 6
-                | ((c16 >> 12) & 1) << 5
-                | ((c16 >> 2) & 0b111) << 2
+                ((c16 >> 5) & 0b11) << 6 | ((c16 >> 12) & 1) << 5 | ((c16 >> 2) & 0b111) << 2
             )
             if rd_q2 == 0:
                 return f"c.?    0x{c16:04x}  # C.LWSP rd=0 (reserved)"
@@ -581,9 +571,7 @@ def _dis_compressed(
         if funct3 == 0b011:  # C.LDSP (RV64)
             # offset = {inst[4:2], inst[12], inst[6:5], 000} (8 字节对齐)
             uimm = (
-                ((c16 >> 2) & 0b111) << 6
-                | ((c16 >> 12) & 1) << 5
-                | ((c16 >> 5) & 0b11) << 3
+                ((c16 >> 2) & 0b111) << 6 | ((c16 >> 12) & 1) << 5 | ((c16 >> 5) & 0b11) << 3
             )
             if rd_q2 == 0:
                 return f"c.?    0x{c16:04x}  # C.LDSP rd=0 (reserved)"
@@ -606,18 +594,12 @@ def _dis_compressed(
 
         if funct3 == 0b110:  # C.SWSP
             # offset = {inst[8:7], inst[12:9], 00}  (4-byte aligned)
-            uimm = (
-                ((c16 >> 7) & 0b11) << 6
-                | ((c16 >> 9) & 0b1111) << 2
-            )
+            uimm = ((c16 >> 7) & 0b11) << 6 | ((c16 >> 9) & 0b1111) << 2
             return f"c.swsp  {rs2_name}, {uimm}(sp)"
 
         if funct3 == 0b111:  # C.SDSP (RV64)
             # offset = {inst[9:7], inst[12:10], 000}  (8-byte aligned)
-            uimm = (
-                ((c16 >> 7) & 0b111) << 6
-                | ((c16 >> 10) & 0b111) << 3
-            )
+            uimm = ((c16 >> 7) & 0b111) << 6 | ((c16 >> 10) & 0b111) << 3
             return f"c.sdsp  {rs2_name}, {uimm}(sp)"
 
         return f"c.?    0x{c16:04x}"

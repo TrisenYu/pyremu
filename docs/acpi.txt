@@ -1,0 +1,70 @@
+设备树（DT）与高级配置与电源接口（ACPI）配置表，
+通常从二者择一用于向操作系统传递硬件相关信息。部分硬件信息仅在启动阶段可用，
+且必须在操作系统、引导加载程序解析固件数据表之前尽早完成传递。
+RISC-V 架构下的启动硬件线程 ID（boot hartid）就是典型示例。
+在非 UEFI 架构系统中，该值通常通过寄存器a0以内核启动参数形式传递；
+但 UEFI 系统必须遵循 UEFI 应用调用规范，因此无法借助a0寄存器完成传递。
+
+现有方案会在基于设备树（DT）的系统中通过设备树/chosen节点承载该信息，
+但这套方案无法适配基于 ACPI 的系统。
+
+因此，需要设计一套 UEFI 协议，统一兼容 DT 架构与 ACPI 架构两类系统。
+这套面向 RISC-V 平台的 UEFI 协议，
+可在启动早期向引导加载程序或操作系统提供硬件基础信息。
+EDK2、U-Boot 等固件需在 RISC-V UEFI 平台上实现该协议。
+引导加载程序一般会在调用ExitBootServices()之前调用此协议，
+再将获取到的硬件信息转交操作系统。
+本规范定义的RISCV_EFI_BOOT_PROTOCOL协议版本号为0x00010000，
+后续所有版本迭代均需保证向下兼容。
+若新版规范无法维持向下兼容性，则必须重新定义一套全局唯一标识符（GUID）。
+
+3.1  GUID
+```
+#define RISCV_EFI_BOOT_PROTOCOL_GUID \
+	{ 0xccd15fec, 0x6f73, 0x4eec,    \
+	{ 0x83, 0x95, 0x3e, 0x69, 0xe4, 0xb9, 0x40, 0xbf } }
+```
+
+3.2. Revision Number
+```
+#define RISCV_EFI_BOOT_PROTOCOL_REVISION 0x00010000
+#define RISCV_EFI_BOOT_PROTOCOL_LATEST_VERSION \
+	RISCV_EFI_BOOT_PROTOCOL_REVISION
+```
+
+3.3. 协议接口结构
+```
+typedef struct _RISCV_EFI_BOOT_PROTOCOL {
+	UINT64 Revision;
+	EFI_GET_BOOT_HARTID GetBootHartId;
+} RISCV_EFI_BOOT_PROTOCOL;
+```
+
+该接口用于获取启动处理器的硬件线程 ID（hartid）。
+```
+typedef EFI_STATUS
+(EFIAPI *EFI_GET_BOOT_HARTID) (
+    IN RISCV_EFI_BOOT_PROTOCOL *This,
+    OUT UINTN *BootHartId
+);
+```
+
+参数说明
+表 1 GetBootHartId 入参说明
+————————————————————
+参数	说明
+————————————————————
+This	协议实例指针
+BootHartId	输出指针，用于存放启动处理器硬件线程 ID 的变量地址
+————————————————————
+
+
+返回状态码
+表 2 GetBootHartId 返回值说明
+————————————————————
+返回值	说明
+————————————————————
+EFI_SUCCESS	成功返回启动硬件线程 ID
+EFI_INVALID_PARAMETER	This 为空指针，或未指向合法的 RISCV_EFI_BOOT_PROTOCOL 协议实现实例
+EFI_INVALID_PARAMETER	BootHartId 为空指针
+————————————————————
