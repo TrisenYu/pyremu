@@ -14,8 +14,7 @@ linker = "/opt/custom-llvm/bin/ld.lld"
 rustflags = [
     "-C", "link-arg=-Tlink.ld",
     "-C", "link-arg=--relax",
-    "-C", "link-arg=--pie",
     "-C", "relocation-model=pie",
-    "-C", "target-feature=+m,+a,+c",
-    "-C", "llvm-args=-mattr=+ztee",
+    "-C", "target-feature=+m,+a,+c,+relax,-f,-d",
+    "-C", "llvm-args=-mattr=+ztee,+relax,-f,-d",
 ]

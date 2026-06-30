@@ -221,11 +221,9 @@ class L2Cache(CacheBase):
     ) -> bytes:
         """未命中时: 选择 victim → 逐出 → 从 RAM 加载整行 → 返回数据."""
         # 选择 victim (同组内的 LRU)
-        victim_idx = self._pick_victim_in_set(way_entries)
-        if victim_idx < 0:
-            # 全部有效但不应发生; 回退到第一个
-            victim_idx = 0
+        # 全部有效但不应发生; 回退到第一个
 
+        victim_idx = max(0, self._pick_victim_in_set(way_entries))
         victim = way_entries[victim_idx]
 
         # 逐出旧行 (M 状态回写)
@@ -235,10 +233,9 @@ class L2Cache(CacheBase):
 
         # 从 RAM 加载整行
         line_addr = (addr >> self._line_shift) << self._line_shift
+        line_data = b"\x00" * self._line_size
         if self._ram_read:
             line_data = self._ram_read(line_addr, self._line_size)
-        else:
-            line_data = b"\x00" * self._line_size
 
         # 写入新行
         victim.tag = tag
@@ -332,7 +329,6 @@ class L2Cache(CacheBase):
         """写未命中时分配新行 (write-allocate 策略)."""
         victim_idx = self._pick_victim_in_set(way_entries)
         victim_idx = max(victim_idx, 0)
-
         victim = way_entries[victim_idx]
 
         # 逐出旧行
@@ -343,10 +339,9 @@ class L2Cache(CacheBase):
 
         # 从 RAM 加载整行 (或清零)
         line_addr = (addr >> self._line_shift) << self._line_shift
+        line_data = b"\x00" * self._line_size
         if self._ram_read:
             line_data = self._ram_read(line_addr, self._line_size)
-        else:
-            line_data = b"\x00" * self._line_size
 
         victim.tag = tag
         victim.data[:] = line_data
@@ -371,9 +366,10 @@ class L2Cache(CacheBase):
         oldest_idx = 0
         oldest_time = way_entries[0].last_access
         for i, e in enumerate(way_entries):
-            if e.last_access < oldest_time:
-                oldest_time = e.last_access
-                oldest_idx = i
+            if e.last_access >= oldest_time:
+                continue
+            oldest_time = e.last_access
+            oldest_idx = i
         return oldest_idx
 
     # ----------------------------------------------------------
@@ -393,14 +389,15 @@ class L2Cache(CacheBase):
         tag, set_index, _offset = self._addr_fields(addr)
         way_entries = self._get_set_entries(set_index)
         for e in way_entries:
-            if e.valid and e.tag == tag:
+            if not e.valid or e.tag != tag:
+                continue
                 # M 状态需回写
-                if e.mesi == MESIState.MODIFIED and self._ram_write:
-                    pa = e.tag << self._line_shift
-                    self._ram_write(pa, bytes(e.data))
-                e.valid = False
-                e.mesi = MESIState.INVALID
-                return
+            if e.mesi == MESIState.MODIFIED and self._ram_write:
+                pa = e.tag << self._line_shift
+                self._ram_write(pa, bytes(e.data))
+            e.valid = False
+            e.mesi = MESIState.INVALID
+            return
 
     def set_ram_backend(self, read_fn, write_fn) -> None:
         """注入 RAM 后端回调 (Bus 初始化时调用)."""

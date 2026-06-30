@@ -4,21 +4,23 @@
 
 """mdid CSR + mfence.did 指令测试 — TEE 飞地隔离与抗侧信道刷新."""
 
-import pytest
 
 from pyremu.core.decoder import Hart
-from pyremu.core.hart import HartWithRegs, RiscvMode
+from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend, mem_read
-from pyremu.core.registers import CsrAccessError
 from pyremu.core.trap import TrapType, trap_cause_code
 from pyremu.emulator import Emulator
 from pyremu.memory.tlb import TLB, TLBLine
 from pyremu.platform import PlatformConfig
 
-
 # ============================================================
 #  mdid / pmpsplit CSR 寄存器
 # ============================================================
+PAGE_SHIFT = 12
+L1_BASE = 0x1000
+L2_BASE = 0x2000
+L3_BASE = 0x3000
+DATA_PA = 0x100000
 
 
 class TestMdidCSR:
@@ -175,7 +177,6 @@ class TestMfenceDid:
         """mfence.did 同时刷新 L2 缓存中匹配 mdid 的条目."""
         emu = Emulator(PlatformConfig.qemu_virt())
         h = emu.harts[0]
-
         # 通过 bus 写入数据, 触发 L2 缓存分配
         addr_a = 0x80001000
         addr_b = 0x80002000
@@ -186,6 +187,7 @@ class TestMfenceDid:
 
         # 手动标记 L2 条目: 第一个 mdid=1, 第二个 mdid=0
         l2 = emu.bus._l2
+        assert l2 is not None
         entries = [e for e in l2.entries if e.valid]
         assert len(entries) >= 2, f"应有至少 2 条 L2 有效条目, 实际 {len(entries)}"
         entries[0].mdid = 1
@@ -273,11 +275,6 @@ class TestTLBAutoMdid:
 
     def test_translate_addr_tags_tlb_with_hart_mdid(self):
         """Sv39 翻译时, TLB 条目自动标记为当前 hart.mdid."""
-        PAGE_SHIFT = 12
-        L1_BASE = 0x1000
-        L2_BASE = 0x2000
-        L3_BASE = 0x3000
-        DATA_PA = 0x100000
 
         ram = bytearray(2 * 1024 * 1024)
 
@@ -313,14 +310,15 @@ class TestTLBAutoMdid:
             if x:
                 val |= 8
             val |= (ppn & 0x3FF) << 10
-            val |= ((ppn >> 9) & 0x1FF) << 20
-            val |= ((ppn >> 18) & 0x1FFFFFFF) << 29
+            val |= ((ppn >> 10) & 0x1FF) << 20
+            val |= ((ppn >> 19) & 0x1FFFFFFF) << 29
             return val
 
         write_pte(L1_BASE, vpn2, make_pte(v=True, ppn=L2_BASE >> PAGE_SHIFT))
         write_pte(L2_BASE, vpn1, make_pte(v=True, ppn=L3_BASE >> PAGE_SHIFT))
         write_pte(L3_BASE, vpn0, make_pte(v=True, r=True, w=True, x=True, ppn=target_ppn))
 
+        h.mode = RiscvMode.S  # MMU 翻译仅在 S/U 模式生效
         h.satp_val = (8 << 60) | (L1_BASE >> PAGE_SHIFT)  # Sv39
 
         # 触发地址翻译 → TLB 插入
@@ -452,8 +450,8 @@ class TestL2AutoMdid:
     def test_l2_read_hit_updates_mdid(self):
         """读命中时 L2 条目 mdid 更新为当前 hart 的 mdid."""
         emu = Emulator(PlatformConfig.qemu_virt())
-        h = emu.harts[0]
         l2 = emu.bus._l2
+        assert l2 is not None
         addr = 0x80001000
 
         # hart mdid=1 写数据 → L2 分配, mdid=1
@@ -474,8 +472,8 @@ class TestL2AutoMdid:
     def test_l2_write_hit_updates_mdid(self):
         """写命中时 L2 条目 mdid 更新为当前 hart 的 mdid."""
         emu = Emulator(PlatformConfig.qemu_virt())
-        h = emu.harts[0]
         l2 = emu.bus._l2
+        assert l2 is not None
         addr = 0x80001000
 
         l2.current_mdid = 1
@@ -495,6 +493,7 @@ class TestL2AutoMdid:
         emu = Emulator(PlatformConfig.qemu_virt())
         h = emu.harts[0]
         l2 = emu.bus._l2
+        assert l2 is not None
         addr_a = 0x80001000
         addr_b = 0x80002000
 
@@ -531,7 +530,7 @@ class TestL2AutoMdid:
         l2 = emu.bus._l2
 
         h.mdid_val = 0x77
-
+        assert l2 is not None
         # 写一条 nop 到 PC, 然后 step()
         addr = 0x80000000
         emu.bus.write(addr, b"\x13\x00\x00\x00")  # nop (addi x0, x0, 0)

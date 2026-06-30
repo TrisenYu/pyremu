@@ -7,8 +7,8 @@
 
 import pytest
 
-from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.decoder import Hart
+from pyremu.core.mem_check_aux import inject_memory_backend
 
 
 def _make_ram():
@@ -424,7 +424,7 @@ class TestCompressedC0:
         # C.SW: uimm = instr[6]<<6 | instr[12:10]<<3 | instr[5]<<2
         # = 1<<6 | 1<<3 | 1<<2 = 64 + 8 + 4 = 76
         val_at_76 = int.from_bytes(hart._mem_read_phy(0x8000 + 76, 4), "little") & 0xFFFF_FFFF
-        assert val_at_76 == 0xBBBB, f"C.SW 与 C.SD 应有不同偏移: C.SW→76, 实际写了偏移 ?"
+        assert val_at_76 == 0xBBBB, "C.SW 与 C.SD 应有不同偏移: C.SW→76, 实际写了偏移 ?"
         # 确认 C.SD 的偏移 200 处没有被 C.SW 覆写
         val_still = int.from_bytes(hart._mem_read_phy(0x8000 + 200, 8), "little")
         assert val_still == 0xAAAA, "C.SW 不应覆写 C.SD 的偏移 200 位置"
@@ -661,3 +661,266 @@ class TestCompressedC2:
         hart.exec_instr(instr_andi)
         # H-bit=1 → 结果应为 1
         assert hart.gprs[15] == 1, f"H-bit=1 检测失败: 期望 1, 实际 {hart.gprs[15]}"
+
+
+# ============================================================
+#  FDT 探测场景测试 — 覆盖 fdt_driver_init_by_offset 中的
+#  关键压缩指令序列和循环终止逻辑
+#
+#  背景: rv64imafdc 在此函数中卡死, rv64g 正常.
+#  寄存器差异: callee-saved 分配不同 (s1 vs s3 缓存 FDT),
+#  但函数参数 (a0/a1/a2) 语义一致. 需验证:
+#    1. C.ADDI16SP 栈帧分配 → 保存/恢复 callee-saved
+#    2. C.JALR 间接调用 (strnlen / memcmp) → 参数无损
+#    3. while-loop 终止条件 → 各边界情况
+#    4. strnlen / memcmp 逐字节结果 → 与 march 无关
+# ============================================================
+
+
+class TestFdtProbeScenario:
+    """rv64imafdc 在 fdt_driver_init_by_offset 中的指令序列验证.
+
+    入口: c.addi16sp sp, -112 (2 字节) vs rv64g 的 addi sp, sp, -112 (4 字节).
+    内部间接调用 (strnlen / memcmp) 使用 C.MV + C.JALR 组合.
+    """
+
+    # -- 栈帧完整性 -------------------------------------------------------
+
+    def test_c_addi16sp_prologue_save_restore_ra(self):
+        """C.ADDI16SP 分配栈帧 → sd ra → ld ra → sp 复原."""
+        ram, read_fn, write_fn = _make_ram()
+        h = Hart(id=0)
+        inject_memory_backend(h, read_fn, write_fn)
+        sp_top = 0x1000  # 在 2 MiB RAM 内
+        h.gprs[2] = sp_top
+        h.gprs[1] = 0xCAFE  # ra
+
+        # C.ADDI16SP sp, -112
+        # 编码 per RISC-V spec: nzimm[9:4] = nzimm[9]=bit12, nzimm[8:7]=bits[4:3],
+        #   nzimm[6]=bit5, nzimm[5]=bit2, nzimm[4]=bit6
+        # nzimm=-7 (0b111001 6-bit signed): bit12=1,bits[4:3]=0b11,bit5=0,bit2=0,bit6=1
+        addi16sp = _c1(0b011, 2, (1 << 12) | (0b11 << 3) | (0 << 5) | (0 << 2) | (1 << 6))
+        h.exec_instr(addi16sp)
+        assert h.gprs[2] == sp_top - 112, f"sp 偏移错误: {h.gprs[2]:#x}"
+
+        # sd ra, 104(sp) — 手工 STORE 指令
+        h.exec_instr(_make_sd(1, 2, 104))
+        base = sp_top - 112
+        saved = int.from_bytes(bytes(ram[base + 104 : base + 112]), "little", signed=False)
+        assert saved == 0xCAFE, f"ra 未保存: {saved:#x}"
+
+        # ld ra, 104(sp) — 手工 LOAD 指令
+        h.gprs[1] = 0
+        h.exec_instr(_make_ld(1, 2, 104))
+        assert h.gprs[1] == 0xCAFE, "ra 恢复失败"
+
+    def test_c_addi16sp_multi_callee_save(self):
+        """模拟 imafdc: s3 缓存 FDT 指针, 完整栈帧保存/恢复."""
+        ram, read_fn, write_fn = _make_ram()
+        h = Hart(id=0)
+        inject_memory_backend(h, read_fn, write_fn)
+        sp_top = 0x1000  # 在 2 MiB RAM 内
+        h.gprs[2] = sp_top
+        h.gprs[8] = 0xABCD0000   # s0
+        h.gprs[9] = 0x0          # s1 (imafdc 为 0)
+        h.gprs[19] = 0x87FF0000  # s3 = FDT (imafdc 用 s3 而非 s1)
+
+        # C.ADDI16SP sp, -112
+        addi16sp = _c1(0b011, 2, (1 << 12) | (0b11 << 3) | (0 << 5) | (0 << 2) | (1 << 6))
+        h.exec_instr(addi16sp)
+
+        # 保存 s0, s1, s3
+        h.exec_instr(_make_sd(8, 2, 0))
+        h.exec_instr(_make_sd(9, 2, 8))
+        h.exec_instr(_make_sd(19, 2, 24))
+
+        # 破坏后恢复
+        h.gprs[8] = h.gprs[9] = h.gprs[19] = 0xDEAD
+        h.exec_instr(_make_ld(8, 2, 0))
+        h.exec_instr(_make_ld(9, 2, 8))
+        h.exec_instr(_make_ld(19, 2, 24))
+
+        assert h.gprs[8] == 0xABCD0000, f"s0: {h.gprs[8]:#x}"
+        assert h.gprs[9] == 0x0, f"s1: {h.gprs[9]:#x}"
+        assert h.gprs[19] == 0x87FF0000, f"s3(FDT): {h.gprs[19]:#x}"
+
+    # -- C.JALR 间接调用链 -------------------------------------------------
+
+    def test_c_jalr_sets_ra_and_jumps(self):
+        """C.JALR t0: ra = pc+2, pc = t0, 调用者参数不受影响."""
+        h = Hart(id=0)
+        h.gprs[10] = 0x87FF0000  # a0
+        h.gprs[11] = 15          # a1
+        h.gprs[12] = 0x80042EE0  # a2
+        h.gprs[5] = 0x80020000   # t0 = target
+        h.pc = 0x80019800
+
+        h.exec_instr(_c2(0b100, 5, 1 << 12))  # C.JALR t0
+
+        assert h.gprs[1] == 0x80019802, f"ra: {h.gprs[1]:#x}"
+        assert h.pc == 0x80020000
+        assert h.gprs[10] == 0x87FF0000, "a0 被破坏"
+        assert h.gprs[11] == 15, "a1 被破坏"
+        assert h.gprs[12] == 0x80042EE0, "a2 被破坏"
+
+    def test_c_mv_then_c_jalr_call_chain(self):
+        """C.MV 设置参数 → C.JALR: 模拟 strnlen(compat_str, prop_len)."""
+        h = Hart(id=0)
+        h.gprs[19] = 0x87FF0000  # s3 = compat_str
+        h.gprs[21] = 14          # s5 = prop_len
+        h.gprs[6] = 0x80020000   # t1 = strnlen target
+        h.pc = 0x800198FC
+
+        # c.mv a0, s3; c.mv a1, s5; c.jalr t1
+        h.exec_instr(_c2(0b100, 10, 19 << 2))
+        assert h.gprs[10] == 0x87FF0000
+
+        h.exec_instr(_c2(0b100, 11, 21 << 2))
+        assert h.gprs[11] == 14
+
+        h.exec_instr(_c2(0b100, 6, 1 << 12))
+        assert h.gprs[1] == 0x800198FE
+        assert h.pc == 0x80020000
+
+
+# ============================================================
+#  LD/SD 构造辅助 (供上面测试使用)
+# ============================================================
+
+def _make_sd(rs2: int, rs1: int, offset: int) -> int:
+    """构造 SD 指令: rs2 → [rs1 + offset].
+
+    S-type 位布局: imm[11:5]@31:25, rs2@24:20, rs1@19:15, funct3@14:12,
+                   imm[4:0]@11:7, opcode@6:0.
+    """
+    return (
+        0b0100011                           # STORE opcode
+        | (0b011 << 12)                     # funct3 = sd
+        | ((offset & 0x1F) << 7)           # imm[4:0] @ 11:7
+        | (rs1 << 15)                      # rs1 (base) @ 19:15
+        | (rs2 << 20)                      # rs2 (source) @ 24:20
+        | (((offset >> 5) & 0x7F) << 25)   # imm[11:5] @ 31:25
+    )
+
+
+def _make_ld(rd: int, rs1: int, offset: int) -> int:
+    """构造 LD 指令: rd ← [rs1 + offset].
+
+    I-type 位布局: imm[11:0]@31:20, rs1@19:15, funct3@14:12,
+                   rd@11:7, opcode@6:0.
+    """
+    return (
+        0b0000011                           # LOAD opcode
+        | (0b011 << 12)                     # funct3 = ld
+        | (rd << 7)                         # rd @ 11:7
+        | (rs1 << 15)                       # rs1 (base) @ 19:15
+        | (((offset & 0xFFF) << 20))        # imm[11:0] @ 31:20
+    )
+
+
+# ============================================================
+#  FDT while 循环终止逻辑 — 纯算法 (与 march 无关)
+# ============================================================
+
+
+class TestFdtWhileLoop:
+    """验证 while ((compat_len = strnlen(s, n) + 1) <= n) 的逐次消耗.
+
+    每次迭代消耗 compat_len 字节 (字符串 + 1 个 NUL).
+    当 compat_len > prop_len 时退出.
+    """
+
+    @staticmethod
+    def _strnlen(s: bytes, maxlen: int) -> int:
+        n = 0
+        while n < maxlen and n < len(s) and s[n] != 0:
+            n += 1
+        return n
+
+    def _run_while(self, compat: bytes, prop_len: int) -> int:
+        s, n, it = compat, prop_len, 0
+        while True:
+            cl = self._strnlen(s, n) + 1
+            if cl > n:
+                break
+            it += 1
+            s = s[cl:]
+            n -= cl
+        return it
+
+    def test_single_string_exact_prop_len(self):
+        """prop_len 恰好等于数据长度 (str + NUL) → 1 次迭代后退出."""
+        # "pyremu,riscv64" = 14 chars + NUL = 15 bytes
+        assert self._run_while(b"pyremu,riscv64\x00", 15) == 1
+
+    def test_prop_len_zero_immediate_exit(self):
+        assert self._run_while(b"", 0) == 0
+
+    def test_multi_string_two_iterations(self):
+        # "ns16550" (7+1) + "snps,xuart" (10+1) = 19
+        assert self._run_while(b"ns16550\x00snps\x00", 13) == 2
+
+    def test_prop_len_too_short_no_null(self):
+        """prop_len 小于首字符串长度且无 NUL → strnlen 返回 maxlen → 退出."""
+        # "pyremu,riscv64" = 14 chars, prop_len=8 不包含 NUL
+        # strnlen 返回 8, compat_len=9 > 8 → 退出 (0 次迭代)
+        assert self._run_while(b"pyremu,riscv64\x00", 8) == 0
+
+    def test_boundary_compat_len_equals_prop_len(self):
+        # strnlen("abc\0", 4) = 3, compat_len = 4 <= 4 → 进入
+        assert self._run_while(b"abc\x00", 4) == 1
+        # strnlen("abc\0", 3) = 3, compat_len = 4 > 3 → 退出
+        assert self._run_while(b"abc\x00", 3) == 0
+
+    def test_two_strings_different_lengths(self):
+        """两个不等长兼容字符串: 正确消耗所有字节后退出."""
+        compat = b"ns16550\x00snps,xuart\x00"  # 8 + 11 = 19 bytes
+        assert self._run_while(compat, 19) == 2
+
+
+# ============================================================
+#  sbi_strnlen / sbi_memcmp — 与 march 无关的逐字节实现
+# ============================================================
+
+
+class TestFdtStringFunctions:
+    """strnlen / memcmp 逐字节实现的算法正确性."""
+
+    @staticmethod
+    def _strnlen(s: bytes, maxlen: int) -> int:
+        n = 0
+        while n < maxlen and n < len(s) and s[n] != 0:
+            n += 1
+        return n
+
+    @staticmethod
+    def _memcmp(a: bytes, b: bytes, n: int) -> int:
+        for i in range(n):
+            if i >= len(a) or i >= len(b):
+                return -(i >= len(a)) or 1
+            if a[i] != b[i]:
+                return 1 if a[i] > b[i] else -1
+        return 0
+
+    def test_strnlen_bounded(self):
+        data = b"hello\x00world"
+        assert self._strnlen(data, 3) == 3
+        assert self._strnlen(data, 6) == 5  # null at index 5
+        assert self._strnlen(data, 100) == 5
+
+    def test_memcmp_same(self):
+        assert self._memcmp(b"compatible", b"compatible", 10) == 0
+
+    def test_memcmp_differ(self):
+        assert self._memcmp(b"thead,c910", b"thead,c906", 11) != 0
+
+    def test_memcmp_matches_python(self):
+        cases = [
+            (b"compatible", b"compatible", 10),
+            (b"pyremu,riscv64", b"pyremu,riscv", 12),
+            (b"\x00\x01", b"\x00\x02", 2),
+        ]
+        for a, b, n in cases:
+            py_eq = a[:n] == b[:n]
+            our_eq = self._memcmp(a, b, n) == 0
+            assert py_eq == our_eq, f"memcmp({a!r}, {b!r}, {n})"

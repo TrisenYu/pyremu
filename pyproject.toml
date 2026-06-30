@@ -49,6 +49,7 @@ select = [
     "W",
     "PL",
     "PERF",
+	"PLC0415",
 ]
 ignore=[
     "E731",

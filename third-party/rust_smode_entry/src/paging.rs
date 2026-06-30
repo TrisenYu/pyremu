@@ -82,16 +82,19 @@ unsafe fn pte_ptr(pa: u64) -> *mut Pte {
 
 /// 定位给定 VA 在指定 Sv39 层级的叶子 PTE。
 /// `alloc=true` 时缺失的中间页表从 S-mode page pool 分配。
+///
+/// 遍历顺序与硬件页表 walker 一致 (标准 Sv39):
+///   root[VPN[2]] → L2[VPN[1]] → L3[VPN[0]]
+/// `get_vpn(va, i)` 的 `i` 是**页表层级**: 0=根表(GIGA), 1=中表(MEGA), 2=叶表(PAGE).
 fn get_leaf_pte(vaddr: u64, level: u8, alloc: bool) -> &'static mut Pte {
-    let root_pa = context::ctx().page_table_root.as_ptr() as u64;
+    let root_pa = context::root_pa();
     let mut table = unsafe { pte_ptr(root_pa) };
 
-    // 从 GIGA 向下遍历到比目标高一级
-    for i in (0..=2).rev() {
-        if i <= level {
-            continue; // 已到目标层级，退出后命中目标
-        }
-
+    // 遍历中间层级: 从根表 (0) 到目标层级的前一级.
+    // level=0 (GIGA): 无中间层级, 直接在根表命中.
+    // level=1 (MEGA): 遍历根表 (i=0), 在 L2 命中.
+    // level=2 (PAGE): 遍历根表 (i=0) + L2 (i=1), 在 L3 命中.
+    for i in 0..level {
         let pte = unsafe { &mut *table.add(get_vpn(vaddr, i)) };
 
         if pte.0 & (PTE_V as u64) == 0 {
@@ -99,6 +102,10 @@ fn get_leaf_pte(vaddr: u64, level: u8, alloc: bool) -> &'static mut Pte {
                 hang::hang_with_msg("get_leaf_pte: missing intermediate table\n");
             }
             let next_pa = memory::alloc_smode_page(1);
+            // 新分配的页表页必须清零, 否则残留数据可能被误判为超级页
+            unsafe {
+                core::ptr::write_bytes(pte_ptr(next_pa) as *mut u8, 0, PAGE_SIZE as usize);
+            }
             pte.set_ppn(next_pa >> PAGE_SHIFT);
             pte.0 |= PTE_V as u64;
             table = unsafe { pte_ptr(next_pa) };
@@ -160,7 +167,7 @@ fn walk_page_table(va: u64) -> WalkResult {
         ((va & 0x00_001F_F000) >> 12) as usize,
     ];
 
-    let root_pa = context::ctx().page_table_root.as_ptr() as u64;
+    let root_pa = context::root_pa();
     let mut table = unsafe { pte_ptr(root_pa) };
 
     for i in 0..3 {
@@ -206,13 +213,24 @@ pub fn get_pa(va: u64) -> Option<u64> {
 //  初始化
 // ---------------------------------------------------------------
 
-/// 为 MMU 启用的瞬间建立恒等映射 (PA=VA)。
+/// 为 MMU 启用的瞬间建立双重映射 (PA=VA + PA+OFFSET→PA)。
 ///
 /// `csrw satp` 后 PC 仍在低物理地址，必须有一条 PA→PA 的映射
 /// 让 CPU 能继续取指，直到代码通过高 VA 访问 trampoline。
+///
+/// 同时建立 LINEAR_MAP_OFFSET 映射，供 `pte_ptr()` 在 MMU 使能后
+/// 通过 PA+OFFSET 访问页表结构体 (根表 + 中间表均在池 PA 范围内).
 pub fn identity_map_trampoline(pa: u64) {
     let base = crate::memory::chunk_2m_down(pa);
+    // 代码执行: identity VA=PA
     map_page(base, base, PTE_R | PTE_W | PTE_X, LEVEL_MEGA);
+    // 页表访问: VA = PA + LINEAR_MAP_OFFSET (pte_ptr 使用)
+    map_page(
+        base.wrapping_add(LINEAR_MAP_OFFSET),
+        base,
+        PTE_R | PTE_W,
+        LEVEL_MEGA,
+    );
 }
 
 /// 构建 satp 值（Sv39 模式，ASID=0）。

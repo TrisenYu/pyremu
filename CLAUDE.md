@@ -416,9 +416,9 @@ s_trap_handler:
 ```python
 def make_pte(flags, ppn):
     val = flags
-    val |= (ppn & 0x3FF) << 10          # PPN0 → bits[19:10]
-    val |= ((ppn >> 9) & 0x1FF) << 20   # PPN1 → bits[28:20]
-    val |= ((ppn >> 18) & 0x1FFFFFFF) << 29  # PPN2 → bits[55:29]
+    val |= (ppn & 0x3FF) << 10           # PPN[9:0]  → bits[19:10]
+    val |= ((ppn >> 10) & 0x1FF) << 20   # PPN[18:10] → bits[28:20]
+    val |= ((ppn >> 19) & 0x1FFFFFFF) << 29  # PPN[43:19] → bits[53:29]
     return val
 ```
 

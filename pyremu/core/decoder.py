@@ -260,6 +260,10 @@ def parse_func6(x: int) -> int:
     """ for SLLI/SRLI/SRAI (I-type shifts) """
     return (x >> 26) & 0x3F
 
+def parse_func12(x: int) -> int:
+    """I-type funct12 (bits[31:20]) — CSR / ECALL / EBREAK / etc."""
+    return (x >> 20) & 0xFFF
+
 # 立即数解析
 def parse_imm12_raw(x: int) -> int:
     """I-type"""
@@ -297,6 +301,49 @@ def parse_imm_j(instr: int) -> int:
 def parse_compressed(instr: int) -> bool:
     return (instr & 0x3) != 3
 # 可能会有指令别名，不过那是反编译器关心的事情
+
+
+def decode_c_sdsp(half: int) -> tuple[int, int] | None:
+    """If *half* is ``c.sdsp rs2, uimm(sp)``, return ``(rs2, uimm)``; else None.
+
+    C.SDSP encoding (C2 quadrant, RV64 only):
+        bits[1:0]   = 10
+        bits[4:2]   = rs2 (x8--x15 in standard, but we also accept x1)
+        bits[6:5]   = uimm[5:3] lower bits
+        bits[12:10] = uimm[5:3]
+        bits[9:7]   = uimm[8:6]
+        bits[15:13] = 111 (funct3)
+    The uimm is assembled from {bits[9:7], bits[12:10]} << 3, i.e. 8-byte aligned.
+    """
+    if (half & 0xE003) != 0xE002:  # bits[15:13]=111, bits[1:0]=10
+        return None
+    rs2 = (half >> 2) & 0x1F
+    uimm = ((half >> 7) & 0x7) << 6   # bits[9:7]  → uimm[8:6]
+    uimm |= ((half >> 10) & 0x7) << 3  # bits[12:10] → uimm[5:3]
+    return rs2, uimm
+
+
+def decode_sd_sp(instr: int) -> tuple[int, int] | None:
+    """If *instr* is ``sd rs2, imm(sp)``, return ``(rs2, imm)``; else None.
+
+    S-type encoding:
+        opcode (bits[6:0])   = 0b0100011 (STORE)
+        funct3 (bits[14:12]) = 0b011     (SD / doubleword store)
+        rs1    (bits[19:15]) = 2         (sp)
+        rs2    (bits[24:20]) = source register
+        imm[4:0]  at bits[11:7], imm[11:5] at bits[31:25]
+    """
+    if (instr & 0x7F) != 0b0100011:
+        return None
+    if ((instr >> 12) & 0x7) != 0b011:  # funct3 = SD
+        return None
+    if ((instr >> 15) & 0x1F) != 2:     # rs1 = sp
+        return None
+    rs2 = (instr >> 20) & 0x1F
+    imm = ((instr >> 25) << 5) | ((instr >> 7) & 0x1F)
+    imm = (imm << 52) >> 52  # sign-extend 12-bit
+    return rs2, imm
+
 
 # https://lhtin.github.io/01world/app/riscv-isa/?xlen=32
 # https://msyksphinz-self.github.io/riscv-isadoc/
@@ -607,15 +654,14 @@ class Hart(HartWithRegs):
             else:
                 raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=110")
 
-        else: # ANDW / REMUW
-            if part2 == 0:
-                result = (v1 & v2) & 0xFFFF_FFFF
-                result = _sext32(result)
-            elif part2 == 1:
-                result = _trunc_rem(v1, v2)  # unsigned 32-bit
-                result = _sext32(result & 0xFFFF_FFFF)
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=111")
+        elif part2 == 0:
+            result = (v1 & v2) & 0xFFFF_FFFF
+            result = _sext32(result)
+        elif part2 == 1:
+            result = _trunc_rem(v1, v2)  # unsigned 32-bit
+            result = _sext32(result & 0xFFFF_FFFF)
+        else:
+            raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=111")
 
         if rd != 0:
             self.gprs[rd] = result
@@ -914,10 +960,16 @@ class Hart(HartWithRegs):
                 trap_sret(self)
             elif funct12 == 0x105:  # WFI
                 handle_wfi(self, instr)
-            elif funct12 == 0x120:  # SFENCE.VMA (funct7=0b0001001, rs2=0)
-                # 刷新所有 hart 的 TLB (当前为单 hart, 故只刷新自己)
-                self.itlb.flush_all()
-                self.dtlb.flush_all()
+            elif funct12 == 0x120 or (0x121 <= funct12 <= 0x13F):
+                # SFENCE.VMA: funct7=0b0001001, funct12 = 0x120 | rs2.
+                # RISC-V spec: rs1=x0 时刷新全部 TLB; rs1≠x0 时仅刷新该 VA 对应条目.
+                if rs1 == 0:
+                    self.itlb.flush_all()
+                    self.dtlb.flush_all()
+                else:
+                    vpn = self.gprs[rs1] >> 12
+                    self.itlb.flush(vpn)
+                    self.dtlb.flush(vpn)
             elif funct12 == 0x5A0:  # MFENCE.DID — 按内存域刷新全部 hart TLB + L2
                 # 读取当前 hart 的 mdid, 广播刷新所有 hart 中匹配的条目
                 mdid_val = self.mdid_val
@@ -1071,12 +1123,12 @@ class Hart(HartWithRegs):
 
         rs1 = self._creg((instr >> 7) & 0x7)
 
-        # C.LW / C.SW: uimm = {instr[6], instr[12:10], instr[5]} (4-byte aligned)
+        # C.LW / C.SW: uimm = {instr[5], instr[12:10], instr[6]} (4-byte aligned)
         if funct3 in (0b010, 0b110):
             uimm = (
-                ((instr >> 5) & 0x1) << 2
-                | ((instr >> 10) & 0x7) << 3
-                | ((instr >> 6) & 0x1) << 6
+                ((instr >> 6) & 0x1) << 2     # instr[6] → uimm[2]
+                | ((instr >> 10) & 0x7) << 3  # instr[12:10] → uimm[5:3]
+                | ((instr >> 5) & 0x1) << 6   # instr[5] → uimm[6]
             )
             addr = (self.gprs[rs1] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
             if funct3 == 0b010:  # C.LW
@@ -1207,39 +1259,61 @@ class Hart(HartWithRegs):
         self,
         instr: int,
     ) -> int:
-        """C1 ALU: C.SRLI/C.SRAI (sf=0), C.ANDI (sf=2), C.SUB/XOR/OR/AND (sf=3)."""
+        """C1 ALU (funct3=100).  RISC-V spec:
+        sf=00 → C.SRLI  (shamt = {bit12, bits[6:2]}, 1-63 for RV64C)
+        sf=01 → C.SRAI  (shamt = {bit12, bits[6:2]}, 1-63 for RV64C)
+        sf=10 → C.ANDI (imm[5]=bit12, imm[4:0]=bits[6:2])
+        sf=11 bit12=0 → C.SUB/C.XOR/C.OR/C.AND (bits[6:5]: 00=SUB,01=XOR,10=OR,11=AND)
+        sf=11 bit12=1 → C.SUBW/C.ADDW (bits[6:5]: 00=SUBW, 01=ADDW)
+        """
         sf = (instr >> 10) & 0x3
         rd_rs1 = self._creg((instr >> 7) & 0x7)
-        # RV64: shamt[5] 在 bit 12; bits[6:2] = shamt[4:0]
-        shamt = ((instr >> 2) & 0x1F) | (((instr >> 12) & 0x1) << 5)
+        bit12 = (instr >> 12) & 0x1
+        bits_6_2 = (instr >> 2) & 0x1F
         v1 = self.gprs[rd_rs1]
 
         if sf == 0b00:
-            # C.SRLI (bit12=0) / C.SRAI (bit12=1)
-            if (instr >> 12) & 0x1:
-                v1 = _sint64(_sint64(v1).value >> shamt).value & 0xFFFF_FFFF_FFFF_FFFF
-            else:
-                v1 = (_uint64(v1).value >> shamt) & 0xFFFF_FFFF_FFFF_FFFF
+            # C.SRLI: shamt = {bit12, bits[6:2]} (1-63 for RV64C)
+            shamt = (bit12 << 5) | bits_6_2
+            v1 = (_uint64(v1).value >> shamt) & 0xFFFF_FFFF_FFFF_FFFF
+            self.gprs[rd_rs1] = v1
+        elif sf == 0b01:
+            # C.SRAI: shamt = {bit12, bits[6:2]} (1-63 for RV64C)
+            shamt = (bit12 << 5) | bits_6_2
+            v1 = _sint64(_sint64(v1).value >> shamt).value & 0xFFFF_FFFF_FFFF_FFFF
             self.gprs[rd_rs1] = v1
         elif sf == 0b10:
             # C.ANDI — imm[5:0] = {bit12, bits[6:2]}
-            imm = _sext(((instr >> 2) & 0x1F) | (((instr >> 12) & 0x1) << 5), 6)
+            imm = _sext((bit12 << 5) | bits_6_2, 6)
             self.gprs[rd_rs1] = (v1 & imm) & 0xFFFF_FFFF_FFFF_FFFF
-        elif sf in (0b01, 0b11):
-            # C.SUB / C.XOR / C.OR / C.AND  (sf=0b11 RV32 regs, sf=0b01 RV64 regs)
-            #   bit_6_5: 00=SUB, 01=XOR, 10=OR, 11=AND
+        elif sf == 0b11:
             rs2 = self._creg((instr >> 2) & 0x7)
             v2 = self.gprs[rs2]
             bit_6_5 = (instr >> 5) & 0x3
-            if bit_6_5 == 0b00:
-                r = (v1 - v2) & 0xFFFF_FFFF_FFFF_FFFF
+            if bit12 == 0:
+                # C.SUB / C.XOR / C.OR / C.AND
+                #   bit[6:5]: 00=SUB, 01=XOR, 10=OR, 11=AND
+                if bit_6_5 == 0b00:
+                    r = (v1 - v2) & 0xFFFF_FFFF_FFFF_FFFF
+                elif bit_6_5 == 0b01:
+                    r = v1 ^ v2
+                elif bit_6_5 == 0b10:
+                    r = v1 | v2
+                else:
+                    r = v1 & v2
+                self.gprs[rd_rs1] = r
+            # C.SUBW / C.ADDW (RV64C only)
+            #   bit[6:5]: 00=SUBW, 01=ADDW
+            elif bit_6_5 == 0b00:
+                r = (v1 - v2) & 0xFFFF_FFFF
+                self.gprs[rd_rs1] = _sext32(r)
             elif bit_6_5 == 0b01:
-                r = v1 ^ v2
-            elif bit_6_5 == 0b10:
-                r = v1 | v2
+                r = (v1 + v2) & 0xFFFF_FFFF
+                self.gprs[rd_rs1] = _sext32(r)
             else:
-                r = v1 & v2
-            self.gprs[rd_rs1] = r
+                raise NotImplementedError(
+                    f"C.SUBW/C.ADDW reserved bit[6:5]={bit_6_5:#03b}"
+                )
         else:
             raise NotImplementedError(f"C1 ALU sub_fn={sf:#03b}")
         return 2

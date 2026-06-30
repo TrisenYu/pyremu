@@ -17,16 +17,15 @@ from pyremu.core.decoder import (
     AmoWidth,
     Opc,
     brFn3,
-    ldFn3,
     parse_compressed,
     parse_func3,
     parse_func6,
     parse_func7,
     parse_imm12_se,
+    parse_imm20_raw,
     parse_imm_b,
     parse_imm_j,
     parse_imm_s,
-    parse_imm20_raw,
     parse_opcode,
     parse_rd,
     parse_rs1,
@@ -446,30 +445,22 @@ def _dis_compressed(
         if funct3 == 0b010:  # C.LI
             return f"c.li    {rd_name}, {imm6_se}"
 
-        if funct3 == 0b011:  # C.LUI / C.ADDI16SP
-            if rd_name == "sp":  # C.ADDI16SP
+        if funct3 == 0b011:  # C.LUI (rd≠{0,2}) / C.ADDI16SP (rd=2)
+            rd_raw = (c16 >> 7) & 0x1F
+            if rd_raw == 2:  # C.ADDI16SP
+                # nzimm[9:4] encoding per RISC-V spec:
+                #   nzimm[4]=bit6, nzimm[5]=bit2, nzimm[6]=bit5,
+                #   nzimm[8:7]=bits[4:3], nzimm[9]=bit12
                 nzimm = (
-                    ((c16 >> 12) & 1) << 9
-                    | ((c16 >> 3) & 1) << 4
-                    | ((c16 >> 5) & 1) << 6
-                    | ((c16 >> 2) & 1) << 5
-                    | ((c16 >> 6) & 1) << 3
+                    ((c16 >> 12) & 1) << 9       # nzimm[9]
+                    | ((c16 >> 3) & 0b11) << 7   # nzimm[8:7]
+                    | ((c16 >> 5) & 1) << 6      # nzimm[6]
+                    | ((c16 >> 2) & 1) << 5      # nzimm[5]
+                    | ((c16 >> 6) & 1) << 4      # nzimm[4]
                 )
-                # bit[8:7] from bits[11:10], adjust
-                nzimm |= ((c16 >> 10) & 0b11) << 7
-                # fix overlap: rebuild properly
-                nzimm = (
-                    ((c16 >> 12) & 1) << 9
-                    | ((c16 >> 10) & 0b11) << 7
-                    | ((c16 >> 5) & 1) << 6
-                    | ((c16 >> 6) & 1) << 4
-                    | ((c16 >> 3) & 1) << 5
-                    | ((c16 >> 2) & 1) << 3
-                )
-                # sext to get sign
                 if nzimm & (1 << 9):
                     nzimm |= ~((1 << 10) - 1)
-                return f"c.addi16sp {nzimm}"
+                return f"c.addi16sp sp, {nzimm}"
             # C.LUI
             nzuimm = ((c16 >> 12) & 1) << 17 | ((c16 >> 2) & 0x1F) << 12
             # sext from bit 17
@@ -577,7 +568,7 @@ def _dis_compressed(
                 return f"c.?    0x{c16:04x}  # C.LDSP rd=0 (reserved)"
             return f"c.ldsp  {rd_name_q2}, {uimm}(sp)"
 
-        if funct3 == 0b100:  # C.JR / C.MV / C.EBREAK / C.ADD
+        if funct3 == 0b100:  # C.JR / C.JALR / C.MV / C.EBREAK / C.ADD
             # C.EBREAK: rd=0, rs2=0 (both bit12=0 and bit12=1 are common)
             if rs2_q2 == 0 and rd_q2 == 0:
                 return "c.ebreak"
@@ -587,10 +578,12 @@ def _dis_compressed(
                 if rs2_q2 != 0 and rd_q2 != 0:
                     return f"c.mv    {rd_name_q2}, {rs2_name}"
                 return f"c.?    0x{c16:04x}"
-            # b12 == 1: C.ADD (rd ≠ 0, rs2 ≠ 0)
-            if rs2_q2 == 0 or rd_q2 == 0:
-                return f"c.?    0x{c16:04x}"
-            return f"c.add   {rd_name_q2}, {rs2_name}"
+            # b12 == 1
+            if rs2_q2 == 0 and rd_q2 != 0:
+                return f"c.jalr  {rd_name_q2}"
+            if rs2_q2 != 0 and rd_q2 != 0:
+                return f"c.add   {rd_name_q2}, {rs2_name}"
+            return f"c.?    0x{c16:04x}"
 
         if funct3 == 0b110:  # C.SWSP
             # offset = {inst[8:7], inst[12:9], 00}  (4-byte aligned)

@@ -37,12 +37,26 @@ build-rust: $(RUST_SMODE_BIN)
 phony += build-rust
 
 # ---- 固件构建 ----
-# distclean + 全量编译 custom-opensbi (generic 平台, 跳过 BSS 清零)
-# 依赖 Rust S-mode runtime 先编译完成
-# 作为真实 target (非 PHONY), 当 Rust 二进制更新或产物缺失时自动触发
-$(FW_BUILD_DIR)/fw_payload.elf: $(RUST_SMODE_BIN)
-	$(MAKE) -C $(FW_SRC_DIR) distclean
-	$(MAKE) -C $(FW_SRC_DIR) PLATFORM=generic FW_SKIP_BSS_ZERO=1 FW_PAYLOAD=y -j$$(nproc)
+# 全量编译 custom-opensbi (generic 平台, 跳过 BSS 清零).
+# 依赖:
+#   - Rust S-mode runtime (嵌入 .coffer_enclave_man 段)
+#   - custom-opensbi 自身全部源码 (firmware/lib/include/platform/Kconfig/scripts)
+# 当任一依赖更新或产物缺失时自动触发 distclean + 全量重编译.
+FW_SRC_DEPS := $(FW_SRC_DIR)/Makefile
+FW_SRC_DEPS += $(shell find $(FW_SRC_DIR)/firmware $(FW_SRC_DIR)/lib -type f 2>/dev/null)
+FW_SRC_DEPS += $(shell find $(FW_SRC_DIR)/include $(FW_SRC_DIR)/platform -type f 2>/dev/null)
+FW_SRC_DEPS += $(shell find $(FW_SRC_DIR)/Kconfig $(FW_SRC_DIR)/scripts -type f 2>/dev/null)
+
+# 参数覆盖 custom-opensbi 默认值, 确保确定性构建
+FW_MAKE_FLAGS := PLATFORM=generic
+FW_MAKE_FLAGS += PLATFORM_RISCV_XLEN=64
+FW_MAKE_FLAGS += PLATFORM_RISCV_ABI=lp64
+FW_MAKE_FLAGS += FW_SKIP_BSS_ZERO=1
+FW_MAKE_FLAGS += FW_PAYLOAD=y
+
+$(FW_BUILD_DIR)/fw_payload.elf: $(RUST_SMODE_BIN) $(FW_SRC_DEPS)
+	$(MAKE) -C $(FW_SRC_DIR) distclean $(FW_MAKE_FLAGS)
+	$(MAKE) -C $(FW_SRC_DIR) $(FW_MAKE_FLAGS) -j$$(nproc)
 
 # 便捷别名: 显式请求固件重新编译 (distclean + 全量)
 build-fw: $(FW_BUILD_DIR)/fw_payload.elf

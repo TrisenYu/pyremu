@@ -7,6 +7,7 @@
 import struct
 
 import pytest
+
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import parse_firmware

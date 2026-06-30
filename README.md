@@ -1,10 +1,16 @@
 # Pyremu — RISC-V 64 位模拟器
 
-Pyremu 是一个用 Python (CPython 3.14) 编写的 **RISC-V 指令集模拟器**，面向
-操作系统内核开发、TEE 可信执行环境原型验证、固件调试等场景。
+|缩略 |含义       |
+|:--:|:--------:|
+|Py  | python   |
+|r   | riscv    |
+|emu | emulator |
 
-模拟多 hart 顺序双发射 CPU，支持 RV64 **IMAC** 指令扩展、特权级 (U/S/H/M/D)、
-Sv39 虚拟内存、L2 缓存 MESI 一致性协议、CLINT 时钟/核间中断，以及交互式调试器 (rvdb)。
+Pyremu 是一个用 Python (CPython 3.14) 编写的本地 **RISC-V 指令集模拟器与交互式调试器**，
+面向固件调试、TEE开发、操作系统调试等场景
+
+模拟多 hart，支持 RV64 **IMAC** 指令扩展、特权级 (U/S/H/M/D)、
+Sv39 虚拟内存、L2 缓存 MESI 一致性协议、CLINT 时钟/核间中断。
 
 ## 快速上手
 
@@ -12,8 +18,14 @@ Sv39 虚拟内存、L2 缓存 MESI 一致性协议、CLINT 时钟/核间中断�
 # 运行全部测试
 make test
 
-# 以交互式调试器加载固件
-python -m pyremu.debugger tests/bins/elf/custom_opensbi_fw_payload.elf
+
+# 加载零阶段加载器作为上电初始化代码，
+# 设置内存基址为0x8000_0000
+# 同时以交互式调试器加载固件
+python -m pyremu.debugger \
+--ram-base=0x80000000     \
+--preload tests/bins/firm-bin/zsbl_fsbl_stub_cold_asm.bin \
+tests/bins/elf/custom_opensbi_fw_payload.elf
 
 # 纯 Python API 示例
 python examples/demo_emulator.py
@@ -30,7 +42,6 @@ python examples/demo_emulator.py
 | **缓存** | 共享 L2 缓存, MESI 一致性协议, 按 hart 的 mdid 域标记 |
 | **中断** | CLINT (mtime 定时器 + MSIP 软件中断), 委派 (medeleg/mideleg) |
 | **外设** | UART (16550 风格), SPI, I2C, GPIO |
-| **TEE 扩展** | `mdid`/`pmpsplit` CSR, `mfence.did` 指令, 缓存行自动域标记 |
 | **平台** | FDT 设备树生成, PlatformConfig 预设 (qemu_virt / sifive_u54) |
 
 ## 交互式调试器 (rvdb)
@@ -60,7 +71,7 @@ pyremu/
   interrupt/            # CLINT, 中断控制器抽象
   utils/                # 反汇编器, FDT 生成, ELF 解析
   env_inject/           # 预加载 shellcode 注入
-tests/                  # 834 条测试 (14 套件)
+tests/                  # 1130 条测试 (15 套件)
 examples/               # 编程式使用示例
 third-party/            # 第三方固件 & S-mode 运行时
 ```
@@ -83,7 +94,6 @@ third-party/            # 第三方固件 & S-mode 运行时
 | `test_l2cache.py` (10) | L2 缓存 MESI 状态转换 |
 | `test_bus.py` (14) | 总线读写, 设备路由, PMA |
 | `test_clint.py` (12) | 定时器与软件中断 |
-| `test_mdid.py` (28) | TEE mdid/mfence.did 扩展 |
 | `test_parse_elf.py` (14) | ELF/PE/raw 格式解析 |
 
 运行: `make test` 或 `uv run pytest tests/`
@@ -91,11 +101,10 @@ third-party/            # 第三方固件 & S-mode 运行时
 ## 第三方代码
 
 - `third-party/rust_smode_entry/` — Rust 编写的 S-mode TEE 管理器，以 PIE 位置无关方式编译链接，由 M-mode 加载到动态分配的物理内存中运行
-- `third-party/freedom-u540-c000-bootloader/` — SiFive Freedom U540 启动加载器参考实现
-
 ## 开发命令
 
 ```bash
+make cov-test                     # 带覆盖率的测试
 uv run pytest tests/              # 全部测试
 uv run pytest tests/test_trap.py  # 单个套件
 uv run ruff check .               # 代码风格

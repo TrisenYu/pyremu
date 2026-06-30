@@ -58,7 +58,7 @@ class Device(ABC):
 
 
 class AccessFaultError(Exception):
-    """PMA 访问违例 — 地址不在任何有效区域 (非内存、非设备)."""
+    """PMA 访问违规 地址不在任何有效区域 (非内存、非设备)."""
 
     def __init__(self, addr: int, is_write: bool = False) -> None:
         self.addr = addr
@@ -288,10 +288,13 @@ class Bus:
         Returns:
             成功时返回 bytes, 失败 (设备异常/访问越界) 返回 None.
         """
-        try:
-            return self.read(addr, size)
-        except Exception:
+        return self.read(addr, size)
+
+    def read_u64(self, addr: int) -> int | None:
+        ret = self.try_read(addr, 8)
+        if ret is None:
             return None
+        return int.from_bytes(ret, 'little')
 
     def try_write(self, addr: int, data: bytes) -> bool:
         """安全写入物理内存 — 返回 bool 表示成功与否.

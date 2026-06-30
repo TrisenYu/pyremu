@@ -182,3 +182,11 @@ class TLB(CacheBase):
     def size(self) -> int:
         """返回 TLB 容量 (总槽位数)."""
         return self._num_entries
+
+def decode_tlb_perm(perm: int) -> str:
+    """TLB 权限位 → 可读字符串: 0b1111 → 'RWXU'."""
+    r = "R" if perm & 1 else "-"
+    w = "W" if perm & 2 else "-"
+    x = "X" if perm & 4 else "-"
+    u = "U" if perm & 8 else "S"
+    return f"{r}{w}{x}{u}"

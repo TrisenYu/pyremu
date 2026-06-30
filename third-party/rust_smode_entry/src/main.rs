@@ -20,8 +20,6 @@ mod uart;
 use core::panic::PanicInfo;
 
 use crate::constants::*;
-use crate::context::EnclaveContext;
-use crate::paging::Pte;
 
 unsafe extern "C" {
     static _end: u8;
@@ -61,21 +59,11 @@ pub unsafe extern "C" fn rust_main_before_mmu(
 ) {
     uart::uart_init();
     println!("[enclave] before MMU: id={enclave_id} pa=0x{man_pa_start:x} size=0x{man_size:x}\n");
-    let end_pa_raw = &raw const _end as u64;
-    let load_offset = man_pa_start.wrapping_sub(LINK_BASE);
-    let end_pa = end_pa_raw.wrapping_add(load_offset);
+    // _end 符号已由 entry.s 中的 PIE 重定位调整至运行时地址 (base_pa + link_addr),
+    // 无需再加 load_offset, 否则会 double-count base_pa.
+    let end_pa = &raw const _end as u64;
 
-    context::init_context(EnclaveContext {
-        page_table_root: [Pte::empty(); 512],
-        manager_pa_start: man_pa_start,
-        load_offset,
-        enclave_module_load_va: ENCLAVE_MODULE_LOAD_VA_INIT,
-        umode_heap_top: 0,
-        smode_pool: context::PoolDesc::empty(),
-        umode_pool: context::PoolDesc::empty(),
-        shared_buffer: None,
-        umode_pool_pa_aligned: 0,
-    });
+	context::init_context(man_pa_start, ENCLAVE_MODULE_LOAD_VA_INIT);
 
     let pool_offset = end_pa - man_pa_start;
     let pool_size = memory::page_down(memory::chunk_2m_up(end_pa) - end_pa);
@@ -85,7 +73,7 @@ pub unsafe extern "C" fn rust_main_before_mmu(
     paging::setup_linear_map();
     paging::identity_map_trampoline(man_pa_start);
 
-    let root_pa = context::ctx().page_table_root.as_ptr() as u64;
+    let root_pa = context::root_pa();
     let satp_val = paging::init_satp(root_pa);
     let smode_sp = unsafe { memory::alloc_smode_stack() };
     let va_offset = ENCLAVE_MAN_VA_START.wrapping_sub(man_pa_start);

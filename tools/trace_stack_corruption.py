@@ -12,9 +12,9 @@ _PROJ = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJ))
 
 from pyremu.emulator import Emulator
+from pyremu.env_inject.preload import Preloader
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import parse_firmware
-from pyremu.env_inject.preload import Preloader
 
 
 def main():
@@ -34,6 +34,7 @@ def main():
 
     fw_path = _PROJ / "tests/bins/elf/custom_opensbi_fw_payload.elf"
     image = parse_firmware(str(fw_path))
+    assert image is not None
     min_vaddr = min(seg.vaddr for seg in image.segments)
     load_offset = ram_base if min_vaddr < ram_base else 0
     emu.load_firmware(image, load_offset=load_offset)
@@ -46,11 +47,11 @@ def main():
     hart = emu.harts[0]
 
     # Key firmware addresses (physical)
-    PC_SW_LENP = ram_base + 0x187C4
-    PC_FDT_DRIVER_INIT = ram_base + 0x1983E
-    PC_LW_PROPLEN_1 = ram_base + 0x1989C
-    PC_LW_PROPLEN_2 = ram_base + 0x198AA
-    PC_SW_PROPLEN = ram_base + 0x198FA
+    pc_sw_lenp = ram_base + 0x187C4
+    pc_dft_driver_init = ram_base + 0x1983E
+    pc_lw_proplen1 = ram_base + 0x1989C
+    pc_lw_proplen2 = ram_base + 0x198AA
+    pc_sw_proplen = ram_base + 0x198FA
 
     state = {
         "fdt_driver_init_count": 0,
@@ -61,11 +62,32 @@ def main():
     }
 
     original_exec = hart.exec_instr
+    def to_be_test(self):
+        s0 = self.gprs[8]
+        proplen_addr = (s0 - 0x6C) & 0xFFFF_FFFF_FFFF_FFFF
+        data = emu.bus.try_read(proplen_addr, 4)
+        proplen = -1
+        if data is not None:
+            proplen = int.from_bytes(data, "little")
+        print(
+            f"\n[cycle {emu._cycle}] LOOP GUARD: " +
+            f"proplen=0x{proplen:08x} ({proplen})  s0=0x{s0:016x}" +
+            "  Stack frame [s0-0x80, s0]:"
+        )
+        for off in range(0, 0x80, 8):
+            addr = (s0 - 0x80 + off) & 0xFFFF_FFFF_FFFF_FFFF
+            d = emu.bus.try_read(addr, 8)
+            if d is None:
+                continue
+            v = int.from_bytes(d, "little")
+            m = " <-- proplen" if addr == proplen_addr else ""
+            print(f"    0x{addr:016x}: 0x{v:016x}{m}")
+        state["running"] = False
 
     def traced_exec(self, instr):
         pc = self.pc
 
-        if pc == PC_SW_LENP:
+        if pc == pc_sw_lenp:
             val = self.gprs[11]
             addr = self.gprs[18]
             state["last_sw_lenp_val"] = val
@@ -73,47 +95,29 @@ def main():
             if state["fdt_driver_init_count"] > 0:
                 print(f"[c={emu._cycle:5d}] SW *lenp: *0x{addr:016x} = 0x{val:08x} ({val:>12d})")
 
-        if pc == PC_FDT_DRIVER_INIT:
+        if pc == pc_dft_driver_init:
             state["fdt_driver_init_count"] += 1
 
-        if pc == PC_LW_PROPLEN_1:
+        if pc == pc_lw_proplen1:
             s0 = self.gprs[8]
             proplen_addr = (s0 - 0x6C) & 0xFFFF_FFFF_FFFF_FFFF
             data = emu.bus.try_read(proplen_addr, 4)
+            proplen = -1
             if data is not None:
                 proplen = int.from_bytes(data, "little")
-            else:
-                proplen = -1
             print(f"[c={emu._cycle:5d}] LW proplen(@0x1989C): s0=0x{s0:016x}  "
                   f"*0x{proplen_addr:016x} = 0x{proplen:08x} ({proplen})  "
                   f"call=#{state['fdt_driver_init_count']}")
 
-        if pc == PC_LW_PROPLEN_2:
+        if pc == pc_lw_proplen2:
             state["loop_guard"] += 1
             if state["loop_guard"] > 300:
-                s0 = self.gprs[8]
-                proplen_addr = (s0 - 0x6C) & 0xFFFF_FFFF_FFFF_FFFF
-                data = emu.bus.try_read(proplen_addr, 4)
-                if data is not None:
-                    proplen = int.from_bytes(data, "little")
-                else:
-                    proplen = -1
-                print(f"\n[cycle {emu._cycle}] LOOP GUARD: "
-                      f"proplen=0x{proplen:08x} ({proplen})  s0=0x{s0:016x}")
-                print(f"  Stack frame [s0-0x80, s0]:")
-                for off in range(0, 0x80, 8):
-                    addr = (s0 - 0x80 + off) & 0xFFFF_FFFF_FFFF_FFFF
-                    d = emu.bus.try_read(addr, 8)
-                    if d is not None:
-                        v = int.from_bytes(d, "little")
-                        m = " <-- proplen" if addr == proplen_addr else ""
-                        print(f"    0x{addr:016x}: 0x{v:016x}{m}")
-                state["running"] = False
+                to_be_test(self)
 
-        elif pc not in (PC_LW_PROPLEN_2,):
+        elif pc not in (pc_lw_proplen2,):
             state["loop_guard"] = 0
 
-        if pc == PC_SW_PROPLEN:
+        if pc == pc_sw_proplen:
             val = self.gprs[11]
             s0 = self.gprs[8]
             proplen_addr = (s0 - 0x6C) & 0xFFFF_FFFF_FFFF_FFFF
@@ -141,3 +145,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

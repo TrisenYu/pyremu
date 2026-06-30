@@ -99,6 +99,46 @@ _start:
     addi  sp, sp, %pcrel_lo(.L0_tmp_stack)
     # ---- 为 BootInfo 分配栈空间 (3 × u64 = 24 字节, 对齐到 32) ----
     addi sp, sp, -32
+
+    # ---- 应用 R_RISCV_RELATIVE 重定位 (PIE) ----
+    # s1 = base_pa (运行时加载地址), link base = 0.
+    # _rela_dyn_start / _rela_dyn_end 由链接脚本定义,
+    # 包含 20 个 R_RISCV_RELATIVE (type=3) 条目.
+.L0_reloc_s:
+    auipc t0, %pcrel_hi(_rela_dyn_start)
+    addi  t0, t0, %pcrel_lo(.L0_reloc_s)
+    # auipc+addi 已通过 PC 相对寻址得到运行时地址 (PC 含 base_pa),
+    # 无需再加 s1, 否则会 double-count base_pa.
+.L0_reloc_e:
+    auipc t1, %pcrel_hi(_rela_dyn_end)
+    addi  t1, t1, %pcrel_lo(.L0_reloc_e)
+    beq   t0, t1, .L_reloc_done
+.L_reloc_loop:
+    ld    t2, 0(t0)                # r_offset
+    ld    t3, 16(t0)               # r_addend (跳过 8 字节 r_info)
+    add   t2, s1, t2               # 目标地址 = base_pa + r_offset
+    add   t3, s1, t3               # 重定位值 = base_pa + r_addend
+    sd    t3, 0(t2)                # *(base_pa + r_offset) = base_pa + r_addend
+    addi  t0, t0, 24               # sizeof(Elf64_Rela) = 24
+    bltu  t0, t1, .L_reloc_loop
+.L_reloc_done:
+
+    # ---- BSS 清零 (MMU 使能前) ----
+    # PIE 重定位后, _bss_start / _bss_end 的地址为运行时 PA.
+    # EnclaveContext (含 page_table_root) 位于 BSS 内, 必须初始化为零.
+.L0_bss_s:
+    auipc t0, %pcrel_hi(_bss_start)
+    addi  t0, t0, %pcrel_lo(.L0_bss_s)
+.L0_bss_e:
+    auipc t1, %pcrel_hi(_bss_end)
+    addi  t1, t1, %pcrel_lo(.L0_bss_e)
+    beq   t0, t1, .L_bss_done
+.L_bss_loop:
+    sd    zero, 0(t0)
+    addi  t0, t0, 8
+    bltu  t0, t1, .L_bss_loop
+.L_bss_done:
+
     # ---- 设置 rust_main_before_mmu 参数 ----
     # fn(out: *mut BootInfo, enclave_id: u64, base_pa: u64, payload_size: u64)
     mv   a0, sp                 # a0 = &BootInfo (out 指针)
@@ -216,5 +256,5 @@ trap_vector:
 .section ".bss"
 .globl tmp_stack
 tmp_stack:
-    .zero 0x1000
+    .zero 0x4000
 tmp_stack_top:

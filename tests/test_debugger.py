@@ -4,32 +4,34 @@
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """调试器 (rvdb) 测试: 状态快照, 指令回滚, 命令方法, REPL 分发."""
-
+import io
 import sys
 
 import pytest
 
-from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
 from pyremu.core.registers import gpr_alias
-from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.debugger import (
+    MAX_INSTR_COUNT,
     Debugger,
     HartSnapshot,
-    MemWriteTracker,
     MemoryChange,
+    MemWriteTracker,
     StackFrame,
-    MAX_INSTR_COUNT,
 )
 from pyremu.emulator import Emulator
 from pyremu.memory.bus import Bus
 from pyremu.memory.mmu import PTE as MmuPte
+from pyremu.memory.pmp import PMP_A_TOR, PMP_R, PMP_W, PMP_X
 from pyremu.utils.parse_bin import FirmwareImage, FirmwareSegment
-
 
 # ============================================================
 #  辅助
 # ============================================================
+L1_BASE = 0x80000000
+L2_BASE = 0x80001000
+L3_BASE = 0x80002000
+target_va = 0x1000
 
 
 def _make_emu(num_harts=1, ram_base=None, ram_size=None, prog_cnt=0x1000):
@@ -789,7 +791,7 @@ class TestCmdDisasm:
         # 第一段: ref_pc 之前, 写入 4 条 nop
         for off in range(0, 16, 4):
             dbg._emu.bus.write(0x80000FF0 + off, b"\x13\x00\x00\x00")
-        dbg.cmd_disasm("0x80000ff0", "16")
+        dbg.cmd_disasm("0x80000ff0", "4")
         step_after_first = dbg._disasm_base_step
         # 4 条 nop 之后步数到达 ref_pc, next_base 应为 0
         assert step_after_first <= 0, f"ref_pc 之前 base_step 应 ≤0, 实际 {step_after_first}"
@@ -797,7 +799,7 @@ class TestCmdDisasm:
         # 模拟 Enter 重复: 推进到 ref_pc 所在块
         dbg._disasm_next_addr = 0x80001000
         dbg._emu.bus.write(0x80001000, b"\x13\x00\x00\x00" * 4)
-        dbg.cmd_disasm(hex(dbg._disasm_next_addr), "16")
+        dbg.cmd_disasm(hex(dbg._disasm_next_addr), "4")
         step_after_second = dbg._disasm_base_step
         # Enter 重复后, ref_pc 已过, 步数应为正
         assert step_after_second > 0, (
@@ -845,10 +847,6 @@ class TestCmdDisasm:
         bus.write(target_pa, code)
 
         # 构建简易 Sv39 页表: L1→L2→L3→叶, 映射 VA 0x1000→target_pa
-        L1_BASE = 0x80000000
-        L2_BASE = 0x80001000
-        L3_BASE = 0x80002000
-        target_va = 0x1000
         vpn2 = (target_va >> 30) & 0x1FF
         vpn1 = (target_va >> 21) & 0x1FF
         vpn0 = (target_va >> 12) & 0x1FF
@@ -873,6 +871,8 @@ class TestCmdDisasm:
             v=True, r=True, w=True, x=True,
         )
 
+        # 切换到 S 模式 (M 模式始终 Bare, 不翻译)
+        hart.mode = RiscvMode.S
         # 启用 Sv39 MMU
         hart.satp_val = (8 << 60) | (L1_BASE >> PAGE_SHIFT)
 
@@ -881,7 +881,7 @@ class TestCmdDisasm:
         hart.itlb.flush_all()
 
         # disasm 虚拟地址 — 依赖 _try_read_va 的 VA→PA 翻译
-        dbg.cmd_disasm("0x1000", "8")
+        dbg.cmd_disasm("0x1000", "2")
 
         # 验证下一条地址已正确设置
         # 两条 4 字节指令 (NOP + ADDI), 共 8 字节, next_addr 应在末尾
@@ -897,7 +897,7 @@ class TestCmdDisasm:
         # 在 PA 0x1000 处写两条指令
         dbg._emu.bus.write(0x1000, b"\x13\x00\x00\x00\x13\x05\x15\x00")
         dbg.hart.satp_val = 0  # Bare
-        dbg.cmd_disasm("0x1000", "8")
+        dbg.cmd_disasm("0x1000", "2")
         # 两条 4 字节指令, next_addr 应在 0x1000 + 8
         assert dbg._disasm_next_addr == 0x1000 + 8
 
@@ -1687,12 +1687,6 @@ class TestStackWalk:
 class TestTlbDecodeHelpers:
     """TLB 静态辅助函数."""
 
-    def test_decode_perm_full(self):
-        assert Debugger._decode_perm(0xF) == "RWXU"
-        assert Debugger._decode_perm(0b0111) == "RWXS"
-        assert Debugger._decode_perm(0b0101) == "R-XS"
-        assert Debugger._decode_perm(0) == "---S"
-
     def test_tlb_page_size(self):
         assert Debugger._tlb_page_size(0) == "4K"
         assert Debugger._tlb_page_size(1) == "2M"
@@ -1782,7 +1776,7 @@ class TestFetchAndDisasm:
         result = dbg._fetch_and_disasm(0xFFFF0000)
         assert result is not None
         raw_hex, asm = result
-        assert "00 00 00 00" in raw_hex
+        assert raw_hex == "0000"
 
 
 # ============================================================
@@ -1921,8 +1915,8 @@ class TestDisasmCompressed:
     def test_compressed_detected(self):
         """压缩指令 (低 2 位 ≠ 3) 应被正确识别.
 
-        _fetch_and_disasm 总是读取 4 字节; raw_hex 固定显示 4 字节,
-        但反汇编结果正确识别 16-bit 指令.
+        _fetch_and_disasm 总是读取 4 字节; raw_hex 显示指令十六进制值,
+        压缩指令 4 位/32-bit 8 位, 带 [dim] 灰色标记.
         """
         dbg = _make_dbg()
         # C.NOP = 0x0001 (16-bit 压缩指令)
@@ -1931,8 +1925,40 @@ class TestDisasmCompressed:
         result = dbg._fetch_and_disasm(0x1000)
         assert result is not None
         raw_hex, asm = result
-        # 反汇编结果应标识为压缩指令 (low 2 bits != 3)
-        assert raw_hex.startswith("01 00"), f"raw 首两字节应为压缩指令编码, 实际: {raw_hex}"
+        # 反汇编结果: 压缩指令显示 4 位十六进制指令值
+        assert raw_hex == "0001", f"压缩指令 hex 应为 0001, 实际: {raw_hex}"
+
+    def test_compressed_raw_hex_masked_to_16bit(self):
+        """压缩指令 raw_hex 应掩码到低 16 位, 不混入后续指令字节.
+
+        当 4 字节读取包含压缩指令 + 后续指令字节时,
+        raw_hex 应只显示压缩指令的 2 字节 (4 hex digits).
+        例如 c.addi16sp (0x7159) 后跟 c.sdsp (0xf486),
+        4 字节为 0xf4867159, raw_hex 应为 "7159" 而非 "f4867159".
+        """
+        dbg = _make_dbg()
+        # C.ADDI16SP sp, -112 编码 0x7159 后跟 C.SDSP x1, 104(sp) 编码 0xf486
+        # 4 字节 little-endian: 59 71 86 f4 → int = 0xf4867159
+        code = b"\x59\x71\x86\xf4"
+        dbg._emu.load_code(0x1000, code)
+        result = dbg._fetch_and_disasm(0x1000)
+        assert result is not None
+        raw_hex, asm = result
+        assert len(raw_hex) == 4, f"压缩指令 hex 应为 4 位, 实际 {len(raw_hex)} 位: {raw_hex}"
+        assert raw_hex == "7159", f"应为 7159 (仅 C.ADDI16SP), 实际: {raw_hex}"
+        assert "c.addi16sp" in asm.lower(), f"应为 C.ADDI16SP, 实际: {asm}"
+
+    def test_32bit_raw_hex_unmasked_8_digits(self):
+        """32-bit 指令 raw_hex 应显示完整 8 位十六进制."""
+        dbg = _make_dbg()
+        # ADDI x2, x2, -112 (32-bit) = 0xf9010113
+        code = b"\x13\x01\x01\xf9"
+        dbg._emu.load_code(0x1000, code)
+        result = dbg._fetch_and_disasm(0x1000)
+        assert result is not None
+        raw_hex, asm = result
+        assert len(raw_hex) == 8, f"32-bit 指令 hex 应为 8 位, 实际 {len(raw_hex)} 位: {raw_hex}"
+        assert raw_hex == "f9010113", f"应为 f9010113, 实际: {raw_hex}"
 
 
 # ============================================================
@@ -1948,7 +1974,6 @@ class _CacheOutputCapture:
         self._orig = dbg._console.print
 
         def _capture(*args, **kwargs):
-            import io
 
             buf = io.StringIO()
             dbg._console.file = buf
@@ -2080,3 +2105,513 @@ class TestCacheDisplay:
         dbg.cmd_cache("5")
         text = cap.text()
         assert "无 valid 行" in text
+
+
+# ============================================================
+#  _parse_trap_save_offsets — c.sdsp / sd 等价测试
+# ============================================================
+
+
+class TestParseTrapSaveOffsets:
+    """测试 _parse_trap_save_offsets 对 c.sdsp 指令的识别.
+
+    使用等价压缩/未压缩指令, 验证两者产生相同的 RA/FP 偏移.
+    """
+
+    @staticmethod
+    def _encode_sd(rs2: int, rs1: int, imm: int) -> int:
+        imm_4_0 = imm & 0x1F
+        imm_11_5 = (imm >> 5) & 0x7F
+        return (imm_11_5 << 25) | (rs2 << 20) | (rs1 << 15) | (0x3 << 12) | (imm_4_0 << 7) | 0x23
+
+    @staticmethod
+    def _encode_c_sdsp(rs2: int, uimm: int) -> int:
+        assert uimm % 8 == 0 and uimm < 512
+        uimm5_3 = (uimm >> 3) & 0x7
+        uimm8_6 = (uimm >> 6) & 0x7
+        return (0x7 << 13) | (uimm5_3 << 10) | (uimm8_6 << 7) | (rs2 << 2) | 0x2
+
+    @staticmethod
+    def _make_dbg_with_tvec(raw_bytes: bytes):
+        emu = Emulator(num_harts=1, ram_size=0x10000)
+        tvec = 0x1000
+        emu.load_code(tvec, raw_bytes)
+        return Debugger(emulator=emu, hart_id=0), tvec
+
+    # ---- c.sdsp 测试 ----
+
+    def test_c_sdsp_ra_only(self):
+        """c.sdsp x1, 8(sp) → (8, 0)"""
+        code = self._encode_c_sdsp(1, 8).to_bytes(2, "little")
+        dbg, tvec = self._make_dbg_with_tvec(code)
+        result = dbg._parse_trap_save_offsets(tvec)
+        assert result == (8, 0), f"expected (8, 0), got {result}"
+
+    def test_c_sdsp_fp_only_returns_none(self):
+        """仅保存 fp 无 ra → None"""
+        code = self._encode_c_sdsp(8, 64).to_bytes(2, "little")
+        dbg, tvec = self._make_dbg_with_tvec(code)
+        result = dbg._parse_trap_save_offsets(tvec)
+        assert result is None, f"fp-only should return None, got {result}"
+
+    def test_c_sdsp_both_ra_and_fp(self):
+        """c.sdsp x1,8(sp) + c.sdsp x8,64(sp) → (8, 64)"""
+        code = (
+            self._encode_c_sdsp(1, 8).to_bytes(2, "little")
+            + self._encode_c_sdsp(8, 64).to_bytes(2, "little")
+        )
+        dbg, tvec = self._make_dbg_with_tvec(code)
+        result = dbg._parse_trap_save_offsets(tvec)
+        assert result == (8, 64), f"expected (8, 64), got {result}"
+
+    def test_c_sdsp_fp_first_then_ra(self):
+        """先保存 fp 后 ra 的顺序也应正确识别"""
+        code = (
+            self._encode_c_sdsp(8, 64).to_bytes(2, "little")
+            + self._encode_c_sdsp(1, 8).to_bytes(2, "little")
+        )
+        dbg, tvec = self._make_dbg_with_tvec(code)
+        result = dbg._parse_trap_save_offsets(tvec)
+        assert result == (8, 64), f"expected (8, 64), got {result}"
+
+    # ---- 32-bit sd 测试 ----
+
+    def test_sd_ra_only(self):
+        """sd x1, 8(sp) → (8, 0)"""
+        code = self._encode_sd(1, 2, 8).to_bytes(4, "little")
+        dbg, tvec = self._make_dbg_with_tvec(code)
+        result = dbg._parse_trap_save_offsets(tvec)
+        assert result == (8, 0), f"expected (8, 0), got {result}"
+
+    def test_sd_fp_only_returns_none(self):
+        """sd x8, 64(sp) 但无 ra → None"""
+        code = self._encode_sd(8, 2, 64).to_bytes(4, "little")
+        dbg, tvec = self._make_dbg_with_tvec(code)
+        result = dbg._parse_trap_save_offsets(tvec)
+        assert result is None, f"fp-only should return None, got {result}"
+
+    def test_sd_both_ra_and_fp(self):
+        """sd x1,8(sp) + sd x8,64(sp) → (8, 64)"""
+        code = (
+            self._encode_sd(1, 2, 8).to_bytes(4, "little")
+            + self._encode_sd(8, 2, 64).to_bytes(4, "little")
+        )
+        dbg, tvec = self._make_dbg_with_tvec(code)
+        result = dbg._parse_trap_save_offsets(tvec)
+        assert result == (8, 64), f"expected (8, 64), got {result}"
+
+    # ---- 等价性: 压缩 vs 未压缩 ----
+
+    def test_equivalent_ra_offset(self):
+        """c.sdsp 和 sd 对 ra 产生相同偏移"""
+        c_code = self._encode_c_sdsp(1, 8).to_bytes(2, "little")
+        sd_code = self._encode_sd(1, 2, 8).to_bytes(4, "little")
+
+        dbg_c, tv_c = self._make_dbg_with_tvec(c_code)
+        dbg_sd, tv_sd = self._make_dbg_with_tvec(sd_code)
+
+        assert dbg_c._parse_trap_save_offsets(tv_c) == dbg_sd._parse_trap_save_offsets(tv_sd)
+
+    def test_equivalent_fp_offset(self):
+        """c.sdsp 和 sd 对 fp 产生相同偏移 (需同时有 ra)"""
+        c_code = (
+            self._encode_c_sdsp(1, 8).to_bytes(2, "little")
+            + self._encode_c_sdsp(8, 64).to_bytes(2, "little")
+        )
+        sd_code = (
+            self._encode_sd(1, 2, 8).to_bytes(4, "little")
+            + self._encode_sd(8, 2, 64).to_bytes(4, "little")
+        )
+
+        dbg_c, tv_c = self._make_dbg_with_tvec(c_code)
+        dbg_sd, tv_sd = self._make_dbg_with_tvec(sd_code)
+
+        assert dbg_c._parse_trap_save_offsets(tv_c) == dbg_sd._parse_trap_save_offsets(tv_sd)
+
+    # ---- 边界 ----
+
+    def test_empty_tvec_returns_none(self):
+        """空 trap entry → None"""
+        dbg, tvec = self._make_dbg_with_tvec(b"\x00\x00\x00\x00")
+        result = dbg._parse_trap_save_offsets(tvec)
+        assert result is None, f"empty entry should return None, got {result}"
+
+    def test_max_instrs_bound(self):
+        """max_instrs 限制查找范围"""
+        c_ra = self._encode_c_sdsp(1, 8).to_bytes(2, "little")
+        # 填充足够多的 NOP 使 c.sdsp 位于 max_instrs 范围外
+        padding = b"\x01\x00" * 10  # c.nop × 10
+        code = padding + c_ra
+        dbg, tvec = self._make_dbg_with_tvec(code)
+        # max_instrs=5, 每条压缩指令 2 字节, 最多读 10 字节
+        # padding 10×2=20 字节, ra 在第 20 字节之后 → 找不到
+        result = dbg._parse_trap_save_offsets(tvec, max_instrs=5)
+        assert result is None, f"ra beyond max_instrs should return None, got {result}"
+
+
+# ============================================================
+#  _fmt_instr_count — 指令数 human-readable
+# ============================================================
+
+
+class TestFmtInstrCount:
+    """_fmt_instr_count 格式化."""
+
+    def test_small(self):
+        assert Debugger._fmt_instr_count(0) == "0"
+        assert Debugger._fmt_instr_count(999) == "999"
+
+    def test_k(self):
+        assert Debugger._fmt_instr_count(1000) == "1.000K"
+        assert Debugger._fmt_instr_count(500000) == "500.000K"
+        assert Debugger._fmt_instr_count(999999) == "999.999K"
+
+    def test_m(self):
+        assert Debugger._fmt_instr_count(1_000_000) == "1.000000M"
+        assert Debugger._fmt_instr_count(500_000_000) == "500.000000M"
+
+    def test_b(self):
+        assert Debugger._fmt_instr_count(1_000_000_000) == "1.0000000B"
+
+
+# ============================================================
+#  _colorize_asm — 汇编语法着色
+# ============================================================
+
+
+class TestColorizeAsm:
+    """_colorize_asm 着色."""
+
+    def test_unknown_sentinel_escaped(self):
+        """<unknown 开头的指令不做 Rich 标记, 原样返回."""
+        result = Debugger._colorize_asm("<unknown>")
+        # unknown sentinel 不做着色, 原样返回
+        assert result == "<unknown>"
+        assert "[green]" not in result
+        assert "[yellow]" not in result
+
+    def test_branch_is_green(self):
+        """分支指令标记为绿色."""
+        result = Debugger._colorize_asm("beq     x10,x11,0x1000")
+        assert "[green]" in result
+
+    def test_jump_is_green(self):
+        """跳转指令标记为绿色."""
+        result = Debugger._colorize_asm("jal     ra,0x80000000")
+        assert "[green]" in result
+
+    def test_fence_is_yellow(self):
+        """fence/AMO 指令标记为黄色."""
+        result = Debugger._colorize_asm("fence   iorw,iorw")
+        assert "[yellow]" in result
+
+    def test_amo_is_yellow(self):
+        """AMO/LR/SC 指令标记为黄色."""
+        result = Debugger._colorize_asm("lr.d    x5,(x6)")
+        assert "[yellow]" in result
+
+    def test_normal_is_plain(self):
+        """普通指令不着色助记符."""
+        result = Debugger._colorize_asm("addi    x5,x6,42")
+        assert "[green]" not in result
+        assert "[yellow]" not in result
+
+    def test_immediate_colored_magenta(self):
+        """立即数标记为品红."""
+        result = Debugger._colorize_asm("addi    x5,x6,0x1000")
+        assert "[magenta]0x1000[/]" in result
+
+    def test_register_not_colored(self):
+        """寄存器名不应被品红着色."""
+        result = Debugger._colorize_asm("addi    x5,x6,42")
+        # x5, x6 不应被着色
+        assert "[magenta]x5[/]" not in result
+        assert "[magenta]x6[/]" not in result
+
+    def test_no_operands(self):
+        """无操作数指令仅着色助记符."""
+        result = Debugger._colorize_asm("ecall   ")
+        assert "ecall" in result
+
+
+# ============================================================
+#  _ctrl_flow_kind / _ctrl_flow_kind_compressed
+# ============================================================
+
+
+class TestCtrlFlowKind:
+    """控制流分类."""
+
+    # -- 32-bit 指令 --
+
+    def test_jal_is_term(self):
+        """JAL 为无条件终止."""
+        # jal zero, 16
+        instr = (16 << 21) | (0 << 12) | (0 << 7) | 0b1101111
+        assert Debugger._ctrl_flow_kind(instr) == "term"
+
+    def test_jalr_is_term(self):
+        """JALR 为无条件终止."""
+        instr = (0 << 20) | (1 << 15) | (0b000 << 12) | (0 << 7) | 0b1100111
+        assert Debugger._ctrl_flow_kind(instr) == "term"
+
+    def test_beq_is_branch(self):
+        """BEQ 为条件分支."""
+        # beq x0, x0, 8
+        instr = (0 << 25) | (0 << 20) | (0 << 15) | (0b000 << 12) | (1 << 7) | 0b1100011
+        assert Debugger._ctrl_flow_kind(instr) == "branch"
+
+    def test_ecall_is_term(self):
+        """ECALL 为终止."""
+        instr = 0x00000073  # ecall
+        assert Debugger._ctrl_flow_kind(instr) == "term"
+
+    def test_ebreak_is_term(self):
+        """EBREAK 为终止."""
+        instr = 0x00100073  # ebreak
+        assert Debugger._ctrl_flow_kind(instr) == "term"
+
+    def test_mret_is_term(self):
+        """MRET 为终止."""
+        instr = 0x30200073  # mret
+        assert Debugger._ctrl_flow_kind(instr) == "term"
+
+    def test_sret_is_term(self):
+        """SRET 为终止."""
+        instr = 0x10200073  # sret
+        assert Debugger._ctrl_flow_kind(instr) == "term"
+
+    def test_addi_is_normal(self):
+        """ADDI 为普通指令."""
+        instr = (0 << 20) | (0 << 15) | (0b000 << 12) | (5 << 7) | 0b0010011
+        assert Debugger._ctrl_flow_kind(instr) == "normal"
+
+    # -- 压缩指令 --
+
+    def test_c_jal_is_term(self):
+        """C.JAL 为终止."""
+        # funct3=001, quad=01, rd=ra
+        instr16 = (0b001 << 13) | (1 << 7) | 0b01
+        assert Debugger._ctrl_flow_kind_compressed(instr16) == "term"
+
+    def test_c_j_is_term(self):
+        """C.J 为终止."""
+        instr16 = (0b101 << 13) | 0b01
+        assert Debugger._ctrl_flow_kind_compressed(instr16) == "term"
+
+    def test_c_beqz_is_branch(self):
+        """C.BEQZ 为条件分支."""
+        instr16 = (0b110 << 13) | 0b01
+        assert Debugger._ctrl_flow_kind_compressed(instr16) == "branch"
+
+    def test_c_bnez_is_branch(self):
+        """C.BNEZ 为条件分支."""
+        instr16 = (0b111 << 13) | 0b01
+        assert Debugger._ctrl_flow_kind_compressed(instr16) == "branch"
+
+    def test_c_jr_is_term(self):
+        """C.JR 为终止."""
+        # funct3=100, quad=10, rs1≠0
+        instr16 = (0b100 << 13) | (1 << 7) | 0b10  # c.jr ra
+        assert Debugger._ctrl_flow_kind_compressed(instr16) == "term"
+
+    def test_c_addi_is_normal(self):
+        """C.ADDI 为普通指令."""
+        instr16 = (0b000 << 13) | (1 << 7) | 0b01
+        assert Debugger._ctrl_flow_kind_compressed(instr16) == "normal"
+
+
+# ============================================================
+#  _ip_bits — 中断位定义表
+# ============================================================
+
+
+class TestIpBits:
+    """_ip_bits 静态方法."""
+
+    def test_returns_correct_count(self):
+        bits = Debugger._ip_bits()
+        assert len(bits) == 9
+
+    def test_all_bit_numbers_unique(self):
+        bits = Debugger._ip_bits()
+        bit_nums = {b[1] for b in bits}
+        assert len(bit_nums) == 9
+
+    def test_msip_at_bit3(self):
+        bits = Debugger._ip_bits()
+        msip = next(b for b in bits if b[0] == "MSIP")
+        assert msip[1] == 3
+
+
+# ============================================================
+#  CSR detail commands (mcause, scause, mtvec, stvec, mip, mie, sip, sie, medeleg, mideleg)
+# ============================================================
+
+
+class TestCsrDetailCommands:
+    """CSR 详情显示命令."""
+
+    @pytest.fixture
+    def dbg(self):
+        return _make_dbg()
+
+    def test_cmd_mcause_runs(self, dbg):
+        """cmd_mcause 不抛异常."""
+        dbg.hart.csrs["mcause"].val = 0x8000_0000_0000_0003  # MSI
+        dbg.cmd_mcause()  # 不应抛异常
+
+    def test_cmd_scause_runs(self, dbg):
+        """cmd_scause 不抛异常."""
+        dbg.hart.csrs["scause"].val = 8  # ECALL from U
+        dbg.cmd_scause()
+
+    def test_cmd_mtvec_runs(self, dbg):
+        """cmd_mtvec 不抛异常."""
+        dbg.hart.csrs["mtvec"].val = 0x80000000  # direct mode
+        dbg.cmd_mtvec()
+
+    def test_cmd_stvec_runs(self, dbg):
+        """cmd_stvec 不抛异常."""
+        dbg.hart.csrs["stvec"].val = 0x80000001  # vectored mode
+        dbg.cmd_stvec()
+
+    def test_cmd_mip_runs(self, dbg):
+        """cmd_mip 不抛异常."""
+        dbg.hart.csrs["mip"].val = 1 << 7  # MTIP
+        dbg.cmd_mip()
+
+    def test_cmd_mie_runs(self, dbg):
+        """cmd_mie 不抛异常."""
+        dbg.hart.csrs["mie"].val = 1 << 3  # MSIE
+        dbg.cmd_mie()
+
+    def test_cmd_sip_runs(self, dbg):
+        """cmd_sip 不抛异常."""
+        dbg.hart.csrs["sip"].val = 1 << 5  # STIP
+        dbg.cmd_sip()
+
+    def test_cmd_sie_runs(self, dbg):
+        """cmd_sie 不抛异常."""
+        dbg.hart.csrs["sie"].val = 1 << 5  # STIE
+        dbg.cmd_sie()
+
+    def test_cmd_medeleg_runs(self, dbg):
+        """cmd_medeleg 不抛异常."""
+        dbg.hart.csrs["medeleg"].val = 1 << 8  # delegate ECALL-U
+        dbg.cmd_medeleg()
+
+    def test_cmd_mideleg_runs(self, dbg):
+        """cmd_mideleg 不抛异常."""
+        dbg.hart.csrs["mideleg"].val = 1 << 5  # delegate STI
+        dbg.cmd_mideleg()
+
+
+# ============================================================
+#  cmd_pmp — PMP 条目显示
+# ============================================================
+
+
+class TestCmdPmp:
+    """cmd_pmp PMP 条目显示."""
+
+    def test_no_pmp_entries(self):
+        """PMP 未配置时显示提示."""
+        dbg = _make_dbg()
+        dbg.cmd_pmp()  # 不应抛异常
+
+    def test_pmp_with_entries(self):
+        """PMP 有配置条目时正常显示."""
+        dbg = _make_dbg()
+        h = dbg.hart
+        # 配置一条 TOR entry
+        pmp = h._pmp
+        if pmp is not None:
+            # pmpcfg0: entry 0 = TOR, R/W/X
+            h.csrs["pmpcfg0"].val = PMP_A_TOR | PMP_R | PMP_W | PMP_X
+            h.csrs["pmpaddr0"].val = 0x20000000 >> 2  # TOR hi bound
+            dbg.cmd_pmp()  # 不应抛异常
+
+
+# ============================================================
+#  cmd_pt — Sv39 页表遍历显示
+# ============================================================
+
+
+class TestCmdPt:
+    """cmd_pt 页表遍历显示."""
+
+    def test_pt_bare_mode(self):
+        """Bare 模式下 pt 显示相应信息."""
+        dbg = _make_dbg()
+        dbg.hart.csrs["satp"].val = 0  # Bare mode
+        # 在 Bare 模式下 sv39_walk 会失败, cmd_pt 应妥善处理
+        dbg.cmd_pt("0x1000")  # 不应抛异常
+
+    def test_pt_with_table(self):
+        """Sv39 模式下 pt 遍历显示."""
+        dbg = _make_dbg()
+        h = dbg.hart
+        # 构建三级页表 (identity map 0x1000 → 0x80001000)
+        from pyremu.memory.mmu import PTE as MmuPte
+
+        # 写入 L1 (根页表) → L2
+        l2_pte = MmuPte()
+        l2_pte.v = True
+        l2_pte.ppn = L2_BASE >> 12  # 软件 PPN
+        dbg._emu.bus.write(L1_BASE, l2_pte.to_int().to_bytes(8, "little"))
+
+        # 写入 L2 → L3 (4 KiB page)
+        l3_pte = MmuPte()
+        l3_pte.v = True
+        l3_pte.ppn = L3_BASE >> 12
+        dbg._emu.bus.write(L2_BASE, l3_pte.to_int().to_bytes(8, "little"))
+
+        # 写入 L3 → 目标页 (R/W/X)
+        leaf = MmuPte()
+        leaf.v = True
+        leaf.r = True
+        leaf.w = True
+        leaf.x = True
+        leaf.ppn = 0x80001  # → PA 0x80001000
+        dbg._emu.bus.write(L3_BASE, leaf.to_int().to_bytes(8, "little"))
+
+        # 设置 satp
+        h.csrs["satp"].val = (8 << 60) | (L1_BASE >> 12)
+        dbg.cmd_pt("0x1000")  # 不应抛异常
+
+
+# ============================================================
+#  _resolve_boundary_frame / privilege boundary
+# ============================================================
+
+
+class TestPrivilegeBoundary:
+    """特权级边界帧解析."""
+
+    def test_resolve_mmode_frame(self):
+        """_resolve_boundary_frame 对 M 模式返回 M."""
+        dbg = _make_dbg()
+        boundary = dbg._resolve_boundary_frame(0x80000000, "M")
+        assert boundary is not None
+        assert boundary[0] == "M"  # (label, boundary_mode)
+
+    def test_is_valid_mmode_code_true(self):
+        """M 模式代码段判断 (需要 _image 中 .text 段名)."""
+        dbg = _make_dbg()
+        # 注入 image 使 _is_valid_mmode_code 能检查段名
+        img = _make_image()
+        img.segments = [
+            FirmwareSegment(
+                vaddr=0x80000000, memsz=0x10000,
+                data=b"\x00" * 0x10000, name=".text",
+            )
+        ]
+        dbg._image = img
+        assert dbg._is_valid_mmode_code(0x80000000) is True
+
+    def test_is_valid_mmode_code_false(self):
+        """非 M 模式代码段判断."""
+        dbg = _make_dbg()
+        # 任意地址不在 RAM 内
+        assert dbg._is_valid_mmode_code(0x1000) is False

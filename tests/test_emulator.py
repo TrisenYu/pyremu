@@ -45,7 +45,7 @@ class TestEmulatorExecution:
 
     def test_step_executes_all_harts(self):
         """step() 每个 hart 执行一条指令."""
-        emu = Emulator(num_harts=4, prog_cnt=0x1000)
+        emu = Emulator(num_harts=4, prog_cnt=0x1000, ram_base=0)
         # 载入 NOP 指令 (ADDI x0, x0, 0 = 0x00000013)
         emu.load_code(0x1000, b"\x13\x00\x00\x00")
         initial_pc = emu.harts[0].pc
@@ -57,7 +57,7 @@ class TestEmulatorExecution:
 
     def test_pc_advances_per_step(self):
         """每条 ADDI x0,x0,0 后 PC 推进 4 字节."""
-        emu = Emulator(num_harts=1, prog_cnt=0x1000)
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
         # 载入多条 NOP 保证有足够的指令
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
         assert emu.harts[0].pc == 0x1000
@@ -68,7 +68,7 @@ class TestEmulatorExecution:
 
     def test_hart_gpr_write_independent(self):
         """hart 间寄存器独立: hart 0 写 x5, 不影响 hart 1 的 x5."""
-        emu = Emulator(num_harts=4, prog_cnt=0x1000)
+        emu = Emulator(num_harts=4, prog_cnt=0x1000, ram_base=0)
         # ADDI x5, x10, 0 → x5 = x10 (每条 hart 的 x10 不同)
         # Instr: imm[11:0]=0, rs1=x10, funct3=000, rd=x5, op=0010011
         instr = (0 << 20) | (10 << 15) | (5 << 7) | 0b0010011
@@ -128,7 +128,7 @@ class TestEmulatorIPI:
     # fmt: on
     def test_ipi_pending_detection(self, num_harts: int):
         """CLINT send_ipi -> 多个目标 hart 同时检测到待处理 MSIP."""
-        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000)
+        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000, ram_base=0)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
 
         targets = self._ipi_targets(num_harts)
@@ -160,7 +160,7 @@ class TestEmulatorIPI:
     # fmt: on
     def test_ipi_diverges_hart_pc(self, num_harts: int):
         """多目标 hart 收到 IPI 后跳转 mtvec; 未开启中断的 hart 正常推进 PC."""
-        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000)
+        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000, ram_base=0)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
 
         for h in emu.harts:
@@ -201,7 +201,7 @@ class TestEmulatorIPI:
     # fmt: on
     def test_ipi_causes_trap_context_save(self, num_harts: int):
         """多 target 同时收 IPI, 每个 hart 的 mepc/mcause/MIE 独立正确."""
-        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000)
+        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000, ram_base=0)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
 
         targets = self._ipi_targets(num_harts)
@@ -245,7 +245,7 @@ class TestEmulatorAMOCompetition:
     # fmt: on
     def test_lr_sc_competition(self, num_harts: int):
         """多个 hart 各做 LR 于不同地址; 某一 hart 写回时仅清除相关预留."""
-        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000)
+        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000, ram_base=0)
 
         # 每个 target hart 预留不同地址
         addrs = {tid: 0x2000 + tid * 16 for tid in range(1, min(num_harts, 4))}
@@ -276,7 +276,7 @@ class TestEmulatorAMOCompetition:
     # fmt: on
     def test_memory_shared_between_harts(self, num_harts: int):
         """所有 hart 通过共享内存通信: 任一 hart 写, 其余 hart 均可读."""
-        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000)
+        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000, ram_base=0)
 
         val = b"\xca\xfe\xba\xbe\x00\x00\x00\x00"
         emu.bus.write(0x5000, val)
@@ -291,7 +291,7 @@ class TestEmulatorAMOCompetition:
     @pytest.mark.parametrize("num_harts", [2, 8, 9, 10, 12, 16])
     def test_amo_add_across_harts(self, num_harts: int):
         """AMOADD.W: 多个 hart 对同一地址原子累加, 验证结果一致性."""
-        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000)
+        emu = Emulator(num_harts=num_harts, prog_cnt=0x1000, ram_base=0)
 
         addr = 0x4000
         initial = (0).to_bytes(4, "little")
@@ -1123,7 +1123,6 @@ class TestRegValueCanonicalization:
         self._exec(h, self._addi(16, 16, -0x113))
 
         # BEQ x15, x16, +8 (跳过下一条, 即 success)
-        saved_pc = h.pc
         h.pc = 0x80000100
         self._exec(h, self._beq(15, 16, 8))
         # 分支应被采用 (相等), PC 跳转 +8
@@ -1258,3 +1257,205 @@ class TestUartFlush:
         assert len(emu.uart._line_bufs.get(0, [])) == 0
         assert len(emu.uart._line_bufs.get(1, [])) == 0
         assert len(captured) >= 2, f"应输出两个 hart 的内容, 实际: {captured}"
+
+
+# ============================================================
+#  step() 边界用例: 已停止 hart, 连续 trap, 非法指令
+# ============================================================
+
+
+class TestStepEdgeCases:
+    """step() 的边界行为."""
+
+    def test_halted_hart_is_skipped(self):
+        """已停止的 hart 在 step() 中被跳过."""
+        emu = Emulator(num_harts=2, prog_cnt=0x1000, ram_base=0)
+        emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
+        emu.harts[0]._halted = True
+        executed = emu.step()
+        # 仅 hart 1 执行了
+        assert executed == 1
+        assert emu.harts[0].pc == 0x1000  # 跳过的 hart PC 未变
+        assert emu.harts[1].pc == 0x1004  # 正常执行的 hart PC+4
+
+    def test_consecutive_traps_halt_hart(self):
+        """连续 3 次以上 trap 导致 hart 永久停止."""
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
+        # 写入非法指令 (全零)
+        emu.load_code(0x1000, b"\x00\x00\x00\x00" * 10)
+        h = emu.harts[0]
+        # 执行多步触发连续 trap
+        for _ in range(5):
+            emu.step()
+        assert h._halted, "连续 trap 后 hart 应被停止"
+        # 此后 step() 跳过该 hart
+        executed = emu.step()
+        assert executed == 0, "已停止的 hart 不应再执行"
+
+    def test_not_implemented_error_delivers_ill_instr(self):
+        """未实现的操作码触发 IllInstr 陷态, hart 不崩溃."""
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
+        # 构造一个未实现的自定义 opcode (bits[1:0]=11 保证 32-bit 编码)
+        bad_instr = 0x7F | (10 << 7) | (10 << 15) | (10 << 20)
+        emu.load_code(0x1000, bad_instr.to_bytes(4, "little"))
+        h = emu.harts[0]
+        h.csrs["mtvec"].val = 0x80000000  # 设置 trap handler
+        emu.step()
+        # 应投递 IllInstr 后跳转到 mtvec
+        assert h.pc == 0x80000000
+        assert (h.mcause_val & 0x7FFF_FFFF_FFFF_FFFF) == 2  # IllInstr
+
+
+# ============================================================
+#  load_firmware 边界
+# ============================================================
+
+
+class TestLoadFirmware:
+    """load_firmware 边界用例."""
+
+    def test_none_image_raises_valueerror(self):
+        """image=None 时抛出 ValueError."""
+        emu = Emulator()
+        with pytest.raises(ValueError, match="无效"):
+            emu.load_firmware(None)
+
+
+# ============================================================
+#  run() 超时
+# ============================================================
+
+
+class TestRunTimeout:
+    """run() 的超时."""
+
+    def test_timeout_raises_timeouterror(self):
+        """非零 timeout 超时时抛出 TimeoutError."""
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
+        emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10000)
+        with pytest.raises(emu.TimeoutError) as exc_info:
+            emu.run(max_cycles=10**9, timeout=0.001, yield_every=1000)
+        err = exc_info.value
+        assert "超时" in str(err)
+
+    def test_run_returns_int(self):
+        """run() 返回执行的周期数 (int)."""
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
+        emu.load_code(0x1000, b"\x13\x00\x00\x00" * 5)
+        cycles = emu.run(max_cycles=5, timeout=0)
+        assert isinstance(cycles, int)
+        assert cycles >= 5
+
+    def test_yield_every_zero_runs_full(self):
+        """yield_every=0 时 run() 不限速执行全部周期."""
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
+        emu.load_code(0x1000, b"\x13\x00\x00\x00" * 5)
+        cycles = emu.run(max_cycles=5, timeout=0, yield_every=0)
+        assert cycles >= 5
+
+
+# ============================================================
+#  属性与状态
+# ============================================================
+
+
+class TestEmulatorProperties:
+    """Emulator 的属性和状态."""
+
+    def test_peripherals_dict(self):
+        """peripherals 属性返回外设字典 (CLINT 为独立设备不在 dict 中)."""
+        emu = Emulator()
+        periph = emu.peripherals
+        assert "uart" in periph
+        assert "spi" in periph
+        assert "i2c" in periph
+        assert "gpio" in periph
+
+    def test_cycle_and_total_instructions(self):
+        """cycle 和 total_instructions 初始为 0, step() 后增长."""
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
+        emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
+        assert emu.cycle == 0
+        assert emu.total_instructions == 0
+        emu.step()
+        assert emu.cycle >= 1
+        assert emu.total_instructions == 1
+        emu.step()
+        assert emu.total_instructions == 2
+
+
+# ============================================================
+#  SPI / I2C / GPIO 外设初始化 — 默认 qemu_virt 配置
+# ============================================================
+
+
+class TestPeripheralInit:
+    """SPI / I2C / GPIO 外设均已在默认配置中注册到总线."""
+
+    def test_spi_registered_on_bus(self):
+        """SPI 设备在总线默认地址 0x10001000."""
+        emu = Emulator()
+        assert emu.spi is not None
+        assert emu.bus.is_device_addr(0x10001000)
+
+    def test_i2c_registered_on_bus(self):
+        """I2C 设备在总线默认地址 0x10002000."""
+        emu = Emulator()
+        assert emu.i2c is not None
+        assert emu.bus.is_device_addr(0x10002000)
+
+    def test_gpio_registered_on_bus(self):
+        """GPIO 设备在总线默认地址 0x10003000."""
+        emu = Emulator()
+        assert emu.gpio is not None
+        assert emu.bus.is_device_addr(0x10003000)
+
+
+# ============================================================
+#  build_dtb / load_dtb
+# ============================================================
+
+
+class TestDeviceTree:
+    """设备树生成与加载."""
+
+    def test_build_dtb_returns_valid_dtb(self):
+        """build_dtb 返回非空 DTB blob."""
+        emu = Emulator()
+        dtb = emu.build_dtb()
+        assert len(dtb) > 0
+        # DTB 应以 FDT magic 开头 (0xD00DFEED big-endian)
+        magic = int.from_bytes(dtb[:4], "big")
+        assert magic == 0xD00DFEED, f"DTB magic 错误: 0x{magic:08x}"
+
+    def test_build_dtb_contains_memory_node(self):
+        """build_dtb DTB 包含 memory 节点信息."""
+        emu = Emulator()
+        dtb = emu.build_dtb()
+        # DTB 应包含 "memory" 字符串 (节点名)
+        assert b"memory" in dtb, "DTB 应包含 memory 节点"
+
+    def test_load_dtb_blob_sets_a1(self):
+        """load_dtb_blob 写入 DTB 并设置所有 hart 的 a1."""
+        emu = Emulator(num_harts=2, ram_size=128 * 1024 * 1024)
+        dtb = emu.build_dtb()
+        addr = 0x87FF0000
+        emu.load_dtb_blob(addr, dtb)
+        # 验证写入
+        readback = emu.bus.read(addr, len(dtb))
+        assert readback == dtb
+        # 验证所有 hart 的 a1 已设置
+        for h in emu.harts:
+            assert h.gprs[11] == addr
+
+    def test_load_dtb_generates_and_loads(self):
+        """load_dtb 生成并加载 DTB, a1 指向该地址."""
+        emu = Emulator(num_harts=1, ram_size=128 * 1024 * 1024)
+        addr = 0x87FF0000
+        emu.load_dtb(addr)
+        # 验证 a1
+        assert emu.harts[0].gprs[11] == addr
+        # 验证 DTB 可读
+        magic_bytes = emu.bus.read(addr, 4)
+        magic = int.from_bytes(magic_bytes, "big")
+        assert magic == 0xD00DFEED

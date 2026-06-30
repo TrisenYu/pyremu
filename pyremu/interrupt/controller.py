@@ -67,6 +67,7 @@ class InterruptController(ABC):
             - mip_value: 当前 mip CSR 应读取的值 (各中断挂起位)
             - highest_source: 优先级最高的待处理中断源 (用于向量模式)
         """
+        pass
 
     @abstractmethod
     def send_ipi(self, target_hart_id: int) -> None:
@@ -75,6 +76,7 @@ class InterruptController(ABC):
         Args:
             target_hart_id: 目标 hart 编号.
         """
+        pass
 
     @abstractmethod
     def clear_ipi(self, hart_id: int) -> None:
@@ -83,11 +85,14 @@ class InterruptController(ABC):
         Args:
             hart_id: hart 编号.
         """
+        pass
 
     @abstractmethod
     def get_mtime(self) -> int:
         """获取全局单调时钟计数值 (mtime)."""
+        pass
 
     @abstractmethod
     def tick(self, cycles: int = 1) -> None:
         """推进全局时钟 *cycles* 个周期 (用于定时器中断)."""
+        pass

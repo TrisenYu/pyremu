@@ -1162,10 +1162,11 @@ class TestPageFault:
             val |= 1 << 3
         if u:
             val |= 1 << 4
-        # PPN 拆分: PPN0[19:10], PPN1[28:20], PPN2[53:29]
+        # PPN 拆分 (RISC-V 标准连续编码): PPN[9:0]→bits[19:10],
+        # PPN[18:10]→bits[28:20], PPN[43:19]→bits[53:29].
         val |= (ppn & 0x3FF) << 10
-        val |= ((ppn >> 9) & 0x1FF) << 20
-        val |= ((ppn >> 18) & 0x1FFFFFFF) << 29
+        val |= ((ppn >> 10) & 0x1FF) << 20
+        val |= ((ppn >> 19) & 0x1FFFFFFF) << 29
         return val
 
     def _setup_valid_4k(
@@ -1209,7 +1210,15 @@ class TestPageFault:
         )
 
     def _enable_sv39(self, hart: "Hart", root_ppn: int = 1):
-        """将 hart 切换到 Sv39 模式."""
+        """将 hart 切换到 S 模式并启用 Sv39 (MMU 翻译仅在 S/U 模式生效).
+
+        同时配置 PMP NAPOT 开放全部地址空间, 否则 S 模式下无 PMP 条目时
+        PMP 默认拒绝所有访问.
+        """
+        hart.mode = RiscvMode.S
+        # PMP: 1 条 NAPOT 规则覆盖全部地址空间 R+W+X
+        hart.csrs["pmpcfg0"].val = 0x1F  # NAPOT, R+W+X
+        hart.csrs["pmpaddr0"].val = 0x003F_FFFF_FFFF_FFFF
         hart.satp_val = (self.SATP_MODE_SV39 << 60) | root_ppn
 
     # ---- LdPageFault ----
@@ -1261,6 +1270,7 @@ class TestPageFault:
     def test_ld_page_fault_unsupported_mode(self, hart, ram_ctx):
         """未实现的 satp 模式 (如 Sv48=9) → LdPageFault."""
         _ram, _read_fn, _write_fn = ram_ctx
+        hart.mode = RiscvMode.S  # MMU 翻译仅在 S/U 模式生效
         hart.satp_val = (9 << 60) | 1  # Sv48, 未实现
         mem_read(hart, 0x0, 4)
         assert hart.mcause_val == 13, f"应为 LdPageFault(13), 实际={hart.mcause_val}"
@@ -2135,8 +2145,8 @@ class TestStackOverflowSmode:
         if u:
             val |= 1 << 4
         val |= (ppn & 0x3FF) << 10
-        val |= ((ppn >> 9) & 0x1FF) << 20
-        val |= ((ppn >> 18) & 0x1FFFFFFF) << 29
+        val |= ((ppn >> 10) & 0x1FF) << 20
+        val |= ((ppn >> 19) & 0x1FFFFFFF) << 29
         return val
 
     def _setup_sv39_stack_only(self, ram: bytearray):
@@ -2242,6 +2252,10 @@ class TestStackOverflowSmode:
         self._prep_smode(hart, ram)
 
         for i in range(5):
+            # 每次写前 restore S-mode: deliver_trap 会切到 M 模式,
+            # M 模式使用 Bare 翻译 (无视 satp), 后续 guard page 写不再 page fault.
+            hart.mode = RiscvMode.S
+            hart.pc = 0x1000  # 虚设 S-mode PC, 避免空指针检查问题
             mem_write(hart, self.GUARD_VA, b"\x00" * 4)
             assert hart._consecutive_traps == i + 1, (
                 f"guard page trap #{i+1}: consecutive_traps should be {i+1}"

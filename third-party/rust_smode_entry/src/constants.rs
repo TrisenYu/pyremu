@@ -48,6 +48,7 @@ pub const ENCLAVE_CALL_SHUTDOWN: u64 = 403;
 pub const ENCLAVE_CALL_MEM_ALLOC: u64 = 500;
 pub const ENCLAVE_CALL_GET_ID: u64 = 407;
 pub const ENCLAVE_CALL_GET_HARTID: u64 = 408;
+pub const ENCLAVE_CALL_GET_AVAILABLE_MEM: u64 = 409;
 pub const ENCLAVE_CALL_UNMATCHED_ACC_FAULT: u64 = 506;
 
 // ---------------------------------------------------------------

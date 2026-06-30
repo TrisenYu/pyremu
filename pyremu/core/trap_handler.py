@@ -19,6 +19,7 @@ Public functions:
 """
 
 from __future__ import annotations
+
 import os
 from typing import TYPE_CHECKING
 
@@ -35,13 +36,15 @@ from pyremu.core.hart import (
     RiscvMode,
 )
 from pyremu.core.trap import TrapType, trap_cause_code
+
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
 
 _TRACE_TRAPS = os.environ.get("PYREMU_TRACE_TRAPS", "") == "1"
 
 # 中断优先级列表 (按优先级从高到低排列).
-# 预计算为模块级常量, 避免 check_pending_interrupts 每条指令分配一次 (节省 1M list + 6M tuple/s).
+# 预计算为模块级常量, 避免 check_pending_interrupts
+# 每条指令分配一次 (节省 1M list + 6M tuple/s).
 _INT_PRIORITY: list[tuple[int, TrapType]] = [
     (1 << 11, TrapType.MmodeExternInterrupt),  # MEI
     (1 << 3, TrapType.MmodeSoftInterrupt),  # MSI
@@ -88,8 +91,13 @@ def deliver_trap(
     # trap 发生时清除 LR/SC 预留
     hart.clear_reservation()
 
+    # 记录是否从 WFI 唤醒 (用于排除中断 handler 的指令计数)
+    was_wfi = hart._waiting
+
     # 任何 trap 都会唤醒 WFI 等待中的 hart
     hart._waiting = False
+    if was_wfi:
+        hart._wfi_woken = True
 
     # 连续 trap 计数 (正常执行指令时由 Emulator.step 清零)
     hart._consecutive_traps += 1
@@ -282,6 +290,9 @@ def trap_mret(
     # PC ← mepc
     hart.pc = hart.mepc_val & 0xFFFF_FFFF_FFFF_FFFF
 
+    # 从 trap 返回 → 清除 WFI 唤醒标记, 后续指令正常计数
+    hart._wfi_woken = False
+
 
 def trap_sret(
     hart: HartWithRegs,
@@ -313,6 +324,9 @@ def trap_sret(
 
     # PC ← sepc
     hart.pc = hart.sepc_val & 0xFFFF_FFFF_FFFF_FFFF
+
+    # 从 trap 返回 → 清除 WFI 唤醒标记, 后续指令正常计数
+    hart._wfi_woken = False
 
 
 # ============================================================
@@ -347,8 +361,9 @@ def handle_wfi(
     if hart.mip_val & hart.mie_val:
         return  # 正常返回, 调用方会将 PC+4
 
-    # 无可处理中断 → 进入等待状态
+    # 无可处理中断 → 进入等待状态, 重置唤醒标记
     hart._waiting = True
+    hart._wfi_woken = False
 
 
 # ============================================================
@@ -431,7 +446,10 @@ def deliver_trap_nested_enabled(
     因为嵌套中断是预期中的正常行为, 不应触发连续 trap 保护机制.
     """
     hart.clear_reservation()
+    was_wfi = hart._waiting
     hart._waiting = False
+    if was_wfi:
+        hart._wfi_woken = True
 
     # 嵌套中断不递增连续 trap 计数 (允许正常的多层嵌套)
     if not is_interrupt:

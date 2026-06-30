@@ -60,6 +60,14 @@ pub fn enclave_call_mem_alloc(chunk_nums: u64) -> (u64, u64) {
     unsafe { ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_MEM_ALLOC, 0, chunk_nums, 0) }
 }
 
+/// Query remaining pool capacity from M-mode.
+/// Returns `(free_total, max_contiguous)` in units of 2 MiB partitions.
+#[inline]
+#[allow(dead_code)]
+pub fn enclave_call_get_available_mem() -> (u64, u64) {
+    unsafe { ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_GET_AVAILABLE_MEM, 0, 0, 0) }
+}
+
 /// Get the current enclave ID.
 #[inline]
 #[allow(dead_code)]

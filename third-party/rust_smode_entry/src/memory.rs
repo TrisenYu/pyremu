@@ -76,13 +76,12 @@ pub fn umode_pool_avail() -> u64 { context::ctx().umode_pool.avail_bytes() }
 // ---------------------------------------------------------------
 
 /// 用链接器符号将 enclave-man 自身各段映射到 VA 空间。
-/// 链接器符号值为链接时地址 (如 0x1000-based), 需加上 `load_offset`
-/// 转换为运行时物理地址。
+/// 链接器符号已由 entry.s 中的 PIE 重定位调整至运行时地址,
+/// 无需再加 load_offset, 否则会 double-count base_pa.
 pub fn map_sections() {
     let ctx = context::ctx();
     let start_pa = ctx.manager_pa_start;
     let va_ofs = ENCLAVE_MAN_VA_START.wrapping_sub(start_pa);
-    let lo = ctx.load_offset;
 
     unsafe extern "C" {
         static _text_start: u8;
@@ -98,24 +97,24 @@ pub fn map_sections() {
     // 逐个映射各段，避免 Rust 2024 下 macro token pasting 的限制
     unsafe {
         map_one_section(
-            (&raw const _text_start as u64).wrapping_add(lo),
-            (&raw const _text_end as u64).wrapping_add(lo),
-            start_pa, va_ofs, PTE_X,
+            &raw const _text_start as u64,
+            &raw const _text_end as u64,
+            va_ofs, PTE_X,
         );
         map_one_section(
-            (&raw const _rodata_start as u64).wrapping_add(lo),
-            (&raw const _rodata_end as u64).wrapping_add(lo),
-            start_pa, va_ofs, PTE_R,
+            &raw const _rodata_start as u64,
+            &raw const _rodata_end as u64,
+            va_ofs, PTE_R,
         );
         map_one_section(
-            (&raw const _data_start as u64).wrapping_add(lo),
-            (&raw const _data_end as u64).wrapping_add(lo),
-            start_pa, va_ofs, PTE_R | PTE_W,
+            &raw const _data_start as u64,
+            &raw const _data_end as u64,
+            va_ofs, PTE_R | PTE_W,
         );
         map_one_section(
-            (&raw const _bss_start as u64).wrapping_add(lo),
-            (&raw const _bss_end as u64).wrapping_add(lo),
-            start_pa, va_ofs, PTE_R | PTE_W,
+            &raw const _bss_start as u64,
+            &raw const _bss_end as u64,
+            va_ofs, PTE_R | PTE_W,
         );
     }
 }
@@ -124,14 +123,18 @@ pub fn map_sections() {
 unsafe fn map_one_section(
     sec_start: u64,
     sec_end: u64,
-    start_pa: u64,
     va_offset: u64,
     flags: u8,
 ) {
     if sec_start >= sec_end { return; }
-    let ofs = sec_start.wrapping_sub(start_pa);
     let size = sec_end.wrapping_sub(sec_start);
-    let va = ofs.wrapping_add(va_offset);
+    // VA = PA + va_offset (sec_start 是 PIE 重定位后的运行时 PA)
+    let va = sec_start.wrapping_add(va_offset);
+    // DEBUG: trace first page
+    let vpn2 = (va >> 30) & 0x1FF;
+    crate::println!(
+        "[map_sec] pa=0x{sec_start:x} va=0x{va:x} vpn2=0x{vpn2:x} flags=0x{flags:x}\n"
+    );
     for i in 0..(page_up(size) >> PAGE_SHIFT) {
         paging::map_page(
             va + i * PAGE_SIZE,
@@ -146,6 +149,16 @@ pub fn map_smode_page_pool(pool_ofs: u64, pool_size: u64) {
     let ctx = context::ctx();
     let start_pa = ctx.manager_pa_start + pool_ofs;
     let va_ofs = ENCLAVE_MAN_VA_START.wrapping_sub(ctx.manager_pa_start);
+
+    // DEBUG: trace first page mapping
+    if pool_size > 0 {
+        let first_pa = start_pa;
+        let first_va = first_pa.wrapping_add(va_ofs);
+        let vpn2 = (first_va >> 30) & 0x1FF;
+        crate::println!(
+            "[map_pool] pa=0x{first_pa:x} va=0x{first_va:x} vpn2=0x{vpn2:x}\n"
+        );
+    }
 
     for i in 0..(pool_size >> PAGE_SHIFT) {
         let pa = start_pa + i * PAGE_SIZE;

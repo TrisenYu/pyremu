@@ -17,10 +17,10 @@
     其他: 视为 raw binary
 """
 
-from copy import deepcopy
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
+
 import lief
 
 from pyremu.utils.wrapper import seize_err_if_any

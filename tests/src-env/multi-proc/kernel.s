@@ -299,22 +299,22 @@ setup_sv39:
     srli s1, s0, 12
 
     // --- 构建指针 PTE 的辅助宏 (手动展开) ---
-    //   对 PPN = base + k (flag=0x01): PTE = 0x40000001 | (((base + k) & 0x1FF) << 10)
-    //   注: 当前布局下 PPN[1]=0, PPN[2]=2, 故可简化为上述公式.
+    //   RISC-V 标准连续编码: PTE = 0x20000001 | (((base + k) & 0x3FF) << 10)
+    //   注: 当前布局下 PPN[1]=0, PPN[2]=1, 故可简化为上述公式.
 
     // L1[2] → L2_hi (PPN = base + 1)
     addi t0, s1, 1
-    andi t0, t0, 0x1FF
+    andi t0, t0, 0x3FF
     slli t0, t0, 10
-    li   t1, 0x40000001
+    li   t1, 0x20000001
     or   t0, t0, t1
     sd   t0, 16(s0)
 
     // L1[0] → L2_lo (PPN = base + 2)
     addi t0, s1, 2
-    andi t0, t0, 0x1FF
+    andi t0, t0, 0x3FF
     slli t0, t0, 10
-    li   t1, 0x40000001
+    li   t1, 0x20000001
     or   t0, t0, t1
     sd   t0, 0(s0)
 
@@ -322,9 +322,9 @@ setup_sv39:
     li   t2, 0x1000
     add  t2, s0, t2             // t2 = &L2_hi[0] (写目标)
     addi t0, s1, 3
-    andi t0, t0, 0x1FF
+    andi t0, t0, 0x3FF
     slli t0, t0, 10
-    li   t1, 0x40000001
+    li   t1, 0x20000001
     or   t0, t0, t1
     sd   t0, 0(t2)
 
@@ -332,24 +332,24 @@ setup_sv39:
     li   t2, 0x2000
     add  t2, s0, t2             // t2 = &L2_lo
     addi t0, s1, 4
-    andi t0, t0, 0x1FF
+    andi t0, t0, 0x3FF
     slli t0, t0, 10
-    li   t1, 0x40000001
+    li   t1, 0x20000001
     or   t0, t0, t1
     sd   t0, 1024(t2)
 
     // L2_lo[16] → L3_clint (PPN = base + 5)
     addi t0, s1, 5
-    andi t0, t0, 0x1FF
+    andi t0, t0, 0x3FF
     slli t0, t0, 10
-    li   t1, 0x40000001
+    li   t1, 0x20000001
     or   t0, t0, t1
     sd   t0, 128(t2)
 
     // L3_main: 16 页 identity (代码/数据/BSS)
     li   t0, 0x3000
     add  s1, s0, t0
-    li   t0, 0x000000004000001f
+    li   t0, 0x000000002000001f
     li   t1, 16
 1:
     sd   t0, 0(s1)
@@ -368,7 +368,7 @@ setup_sv39:
     li   t3, MAX_PROCS         // 循环计数
 
     // 栈 PTE 基: PPN = STACK_BASE_U >> 12 = 0x80100, 每进程 +2
-    li   t0, 0x0000000040040017  // PPN=0x80100, R+W+U
+    li   t0, 0x0000000020040017  // PPN=0x80100, R+W+U
     li   t4, 0x100             // 第一个 L3 索引 (VA 0x80100000 的 VPN[0])
     slli t4, t4, 3             // 索引 → 字节偏移 (×8)
     add  s1, s1, t4            // s1 = &L3_main[0x100]
@@ -384,13 +384,13 @@ setup_sv39:
     // L3_uart[0]
     li   t0, 0x4000
     add  s1, s0, t0
-    li   t0, 0x0000000008000017
+    li   t0, 0x0000000004000017
     sd   t0, 0(s1)
 
     // L3_clint: 16 页 identity 映射 (CLINT @ 0x02000000, 64 KiB)
     li   t0, 0x5000
     add  s1, s0, t0
-    li   t0, 0x0000000001000017  // PPN=0x02000, R+W+U
+    li   t0, 0x0000000000800017  // PPN=0x02000, R+W+U
     li   t1, 16
 1:
     sd   t0, 0(s1)

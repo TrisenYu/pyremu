@@ -5,7 +5,6 @@
 
 """反汇编器测试: 覆盖 RV64 I + M + Zicsr + AMO 各指令格式."""
 
-import pytest
 
 from pyremu.utils.disassem import disasm
 
@@ -430,6 +429,40 @@ class TestCompressed:
         result = disasm(0x251787AA, 0x5C4)
         assert result.startswith("c.mv")
         assert "x15" in result and "x10" in result
+
+    def test_c_addi16sp_positive(self):
+        """C.ADDI16SP sp += 112 — 编码 nzimm[9:4]=7 (0b000111)."""
+        # bit12=0, bits[4:3]=00, bit5=1, bit2=1, bit6=1
+        # [15:13]=011, [12]=0, [11:7]=00010, [6]=1, [5]=1, [4]=0, [3]=0, [2]=1, [1:0]=01
+        # → 0x6165
+        result = disasm(0x6165, 0x8001_981E)
+        assert result.startswith("c.addi16sp")
+        assert "112" in result or "sp" in result
+
+    def test_c_addi16sp_negative(self):
+        """C.ADDI16SP sp -= 112 — 编码 nzimm[9:4]=-7 (0b111001)."""
+        # bit12=1, bits[4:3]=11, bit5=0, bit2=0, bit6=1
+        # [15:13]=011, [12]=1, [11:7]=00010, [6]=1, [5]=0, [4]=1, [3]=1, [2]=0, [1:0]=01
+        # → 0x7159
+        result = disasm(0x7159, 0x8001_981E)
+        assert result.startswith("c.addi16sp")
+        assert "-" in result
+
+    def test_c_jalr(self):
+        """C.JALR x11 — funct3=100, bit12=1, rs1=x11, rs2=0."""
+        # [15:13]=100, [12]=1, [11:7]=01011, [6:2]=00000, [1:0]=10
+        # → 0x9582
+        result = disasm(0x9582, 0x8001_9902)
+        assert result.startswith("c.jalr")
+        assert "x11" in result
+
+    def test_c_jalr_ra(self):
+        """C.JALR ra — funct3=100, bit12=1, rs1=x1, rs2=0."""
+        # [15:13]=100, [12]=1, [11:7]=00001, [6:2]=00000, [1:0]=10
+        # → 0x9082
+        result = disasm(0x9082, 0x8001_9902)
+        assert result.startswith("c.jalr")
+        assert "x1" in result
 
 
 class TestEdgeCases:

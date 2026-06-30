@@ -21,13 +21,17 @@ from typing import TYPE_CHECKING
 from pyremu.core.registers import (
     check_csr,
     csr_addr_from_name,
-    gpr_alias,
     gpr_idx_from_name,
-    gpr_name,
     register_csr,
     register_fpr,
-    register_gpr,
 )
+from pyremu.memory.cache import TLB_SIZE
+from pyremu.memory.pmp import Pmp
+from pyremu.memory.tlb import TLB
+
+if TYPE_CHECKING:
+    from pyremu.interrupt.controller import InterruptController
+    from pyremu.memory.bus import Bus
 
 
 class GprFile:
@@ -62,13 +66,6 @@ class GprFile:
     def as_list(self) -> list[int]:
         """返回底层 32 元素的副本, 供快照等外部使用."""
         return self._r.copy()
-from pyremu.memory.cache import TLB_SIZE
-from pyremu.memory.pmp import Pmp
-from pyremu.memory.tlb import TLB
-
-if TYPE_CHECKING:
-    from pyremu.interrupt.controller import InterruptController
-    from pyremu.memory.bus import Bus
 
 
 class RiscvMode(Enum):
@@ -184,6 +181,11 @@ class HartWithRegs:
         # WFI 低功耗等待状态
         # 当 hart 执行 WFI 且无可处理中断时置位; 中断挂起且使能时硬件唤醒
         self._waiting: bool = False
+
+        # WFI 唤醒标记 — 从 WFI 被中断唤醒后置位, mret/sret 或重新进入 WFI 时清零.
+        # 此期间的指令 (中断 handler + 返回路径) 不计入 _total_instrs,
+        # 以保证指令计数器反映的是固件实际执行的非中断上下文指令.
+        self._wfi_woken: bool = False
 
     # ----------------------------------------------------------
     #  寄存器读写

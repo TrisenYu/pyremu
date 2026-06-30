@@ -35,7 +35,7 @@ from typing import Any
 import libfdt
 
 from pyremu.core.decoder import Hart
-from pyremu.core.mem_check_aux import inject_memory_backend
+from pyremu.core.mem_check_aux import check_instruction_fetch, inject_memory_backend
 from pyremu.core.registers import gpr_alias, gpr_name
 from pyremu.core.trap import TrapType
 from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap
@@ -505,7 +505,12 @@ class Emulator:
 
             pc_before = hart.pc
 
-            instr_bytes = self.bus.read(hart.pc, 4)
+            # 取指校验: VA→PA (itlb 翻译) + PMP execute check
+            ok, fetch_pa = check_instruction_fetch(hart, hart.pc)
+            if not ok:
+                # trap 已在 check_instruction_fetch 内部投递
+                continue
+            instr_bytes = self.bus.read(fetch_pa, 4)
             instr = int.from_bytes(instr_bytes, "little", signed=False)
 
             try:
@@ -526,7 +531,11 @@ class Emulator:
 
             # 指令边界 — 检查中断
             check_pending_interrupts(hart)
-            all_exec_cnt += 1
+
+            # WFI 唤醒路径 (中断 handler → mret → 回到正常流) 不计入指令数,
+            # 以保证 _total_instrs 反映固件实际执行的非中断上下文指令.
+            if not hart._wfi_woken:
+                all_exec_cnt += 1
 
         self._cycle += 1
         self._total_instrs += all_exec_cnt

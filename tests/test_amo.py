@@ -7,13 +7,13 @@
 
 import pytest
 
-from pyremu.core.mem_check_aux import inject_memory_backend
-from pyremu.core.trap_handler import deliver_trap
 from pyremu.core.decoder import (
     AmoFunct5,
     AmoWidth,
     Hart,
 )
+from pyremu.core.mem_check_aux import inject_memory_backend
+from pyremu.core.trap_handler import deliver_trap
 
 
 def _make_amo_instr(op: AmoFunct5, width: AmoWidth, rd: int, rs1: int, rs2: int) -> int:

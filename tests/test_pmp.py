@@ -7,14 +7,16 @@
 
 import pytest
 
-from pyremu.memory.pmp import PMP_A_NAPOT, PMP_A_TOR, PMP_R, PMP_W, PMP_X
-from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
+from pyremu.core.mem_check_aux import (
+    check_instruction_fetch,
+    inject_memory_backend,
+    mem_read,
+    mem_write,
+)
 from pyremu.memory.bus import Bus
-from pyremu.memory.pmp import Pmp
-from pyremu.memory.pmp import decode_napot
-
+from pyremu.memory.pmp import PMP_A_NAPOT, PMP_R, PMP_W, PMP_X, Pmp, decode_napot
 
 # ============================================================
 #  NAPOT 编解码
@@ -343,3 +345,83 @@ class TestPmpInHart:
         hart._consecutive_traps = 0
         mem_read(hart, 0x8000_1000, 4)
         assert hart.mcause_val == 5, f"应为 LdAccessFault(5), 实际 {hart.mcause_val}"
+
+
+# ============================================================
+#  check_instruction_fetch — 取指路径的 PMP 检查
+# ============================================================
+
+
+class TestInstrFetchPmp:
+    """验证 check_instruction_fetch() 对取指路径施加 PMP execute 检查."""
+
+    @pytest.fixture
+    def hart(self) -> Hart:
+        h = Hart(id=0, pmp_entries=4)
+        bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
+        inject_memory_backend(h, bus.read, bus.write)
+        h.bus = bus
+        h.csrs["mtvec"].val = 0x8000_0000
+        h.pc = 0x8000_1000
+        return h
+
+    def _setup_napot(self, hart: Hart, base: int, size_log2: int,
+                     r: bool = True, w: bool = True, x: bool = True):
+        """配置 NAPOT PMP 条目 0."""
+        k = size_log2 - 3
+        mask = (1 << k) - 1
+        val = (base >> 2) | mask
+
+        cfg = PMP_A_NAPOT
+        if r:
+            cfg |= PMP_R
+        if w:
+            cfg |= PMP_W
+        if x:
+            cfg |= PMP_X
+
+        hart.csrs["pmpaddr0"].val = val
+        hart.csrs["pmpcfg0"].val = cfg
+
+    def test_bare_fetch_x_ok(self, hart):
+        """Bare 模式, PMP X=1 → 取指通过."""
+        self._setup_napot(hart, 0x8000_1000, 12, r=True, w=False, x=True)
+        hart.mode = RiscvMode.S
+        ok, pa = check_instruction_fetch(hart, 0x8000_1000)
+        assert ok
+        assert pa == 0x8000_1000
+
+    def test_bare_fetch_x_denied(self, hart):
+        """Bare 模式, PMP X=0 → InstrAccessFault."""
+        self._setup_napot(hart, 0x8000_1000, 12, r=True, w=True, x=False)
+        hart.mode = RiscvMode.S
+        ok, pa = check_instruction_fetch(hart, 0x8000_1000)
+        assert not ok
+        assert hart.mcause_val == 1, (
+            f"应为 InstrAccessFault(1), 实际 {hart.mcause_val}"
+        )
+
+    def test_bare_fetch_no_match_s_mode(self, hart):
+        """S 模式无匹配 PMP 条目 → InstrAccessFault."""
+        # 所有条目 OFF → S 模式取指被拒
+        hart.mode = RiscvMode.S
+        ok, pa = check_instruction_fetch(hart, 0x8000_1000)
+        assert not ok
+        assert hart.mcause_val == 1
+
+    def test_mmode_bypass_fetch(self, hart):
+        """M 模式取指 (MPRV=0) 不受 PMP 限制."""
+        self._setup_napot(hart, 0x8000_1000, 12, r=True, w=True, x=False)
+        hart.mode = RiscvMode.M
+        # M 模式 MPRV=0 → PMP 自动放行
+        ok, pa = check_instruction_fetch(hart, 0x8000_1000)
+        assert ok
+        assert pa == 0x8000_1000
+
+    def test_fetch_pma_invalid_addr(self, hart):
+        """取指地址不在有效内存范围 → InstrAccessFault."""
+        hart.mode = RiscvMode.M
+        # M 模式 PMP 放行, 但 PMA 检查拒绝 (无效地址)
+        ok, pa = check_instruction_fetch(hart, 0xDEAD_BEEF)
+        assert not ok
+        assert hart.mcause_val == 1
