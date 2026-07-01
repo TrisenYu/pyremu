@@ -20,7 +20,7 @@ SiFive 风格 UART (NS16550A 兼容子集).
 TX: 固件写入的字节存入 _tx_buf 列表 (调试时可检查);
     若 TXCTRL.txen=1 则 IP.txwm 置位.
 RX: 可通过 preload() 预填入数据; RXDATA 读取返回队首字节;
-    RX buffer 为空时返回 0.
+    RX buffer 为空时返回 UART_RXFIFO_EMPTY (bit31=1), 与 SiFive 硬件一致.
 
 中断线: 当前版本不生成硬件中断 (待接入 interrupt controller).
 """
@@ -43,6 +43,9 @@ class UART(Device):
     # IP 位
     IP_TXWM = 1 << 0  # TX 完成 (写 TXDATA 后自动置位)
     IP_RXWM = 1 << 1  # RX 可用 (preload 后自动置位)
+
+    # RXDATA 状态位 (SiFive 硬件兼容)
+    UART_RXFIFO_EMPTY = 1 << 31  # RX FIFO 空标志 (bit31=1 表示无数据)
 
     def __init__(
         self,
@@ -115,7 +118,8 @@ class UART(Device):
         size: int,
     ) -> bytes:
         val = self._read_reg(offset)
-        return val.to_bytes(size, "little", signed=False)
+        mask = (1 << (size * 8)) - 1
+        return (val & mask).to_bytes(size, "little", signed=False)
 
     def write(
         self,
@@ -129,12 +133,12 @@ class UART(Device):
 
     def _read_reg(self, offset: int) -> int:
         if offset == self.REG_RXDATA:
-            if self._rx_buf:
-                b = self._rx_buf.pop(0)
-                if not self._rx_buf:
-                    self._ip &= ~self.IP_RXWM
-                return b
-            return 0
+            if not self._rx_buf:
+                return self.UART_RXFIFO_EMPTY
+            b = self._rx_buf.pop(0)
+            if not self._rx_buf:
+                self._ip &= ~self.IP_RXWM
+            return b
         if offset == self.REG_TXDATA:
             return 0  # TXDATA 只写
         if offset == self.REG_TXCTRL:

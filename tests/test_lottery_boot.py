@@ -16,6 +16,7 @@ from pyremu.utils.parse_bin import FirmwareImage, parse_firmware
 #  模块级固件缓存 — 避免每个测试重复解析 ELF
 # ------------------------------------------------------------
 
+
 @functools.cache
 def _cached_firmware(path: str) -> FirmwareImage | None:
     return parse_firmware(path)
@@ -30,6 +31,26 @@ _LOTTERY_CYCLES = 1000
 #  输出捕获
 # ------------------------------------------------------------
 
+# ------------------------------------------------------------
+#  模块级固件缓存 — 避免每个测试重复解析 ELF
+# ------------------------------------------------------------
+
+
+@functools.cache
+def _cached_firmware(path: str) -> FirmwareImage | None:
+    return parse_firmware(path)
+
+
+_LOTTERY_ELF = "tests/bins/elf/lottery_boot.elf"
+# 固件在 1000 周期内即可完成彩票启动并输出全部关键行
+_LOTTERY_CYCLES = 1000
+
+
+# ------------------------------------------------------------
+#  输出捕获
+# ------------------------------------------------------------
+
+
 class _Capture:
     """捕获 UART 输出行的简单回调."""
 
@@ -43,6 +64,7 @@ class _Capture:
 # ------------------------------------------------------------
 #  辅助
 # ------------------------------------------------------------
+
 
 def _run_lottery(emu: Emulator, cycles: int = _LOTTERY_CYCLES) -> list[str]:
     """运行彩票启动固件, 返回 UART 输出的行列表."""
@@ -66,6 +88,7 @@ def _make_emu(num_harts: int = 4) -> Emulator:
 #  Fixtures
 # ------------------------------------------------------------
 
+
 @pytest.fixture(scope="class")
 def emu_4h() -> Emulator:
     """4 hart 模拟器 — 类级别复用."""
@@ -82,6 +105,7 @@ def lottery_lines_4h(emu_4h: Emulator) -> list[str]:
 #  TestUartLineBuffering
 # ------------------------------------------------------------
 
+
 class TestUartLineBuffering:
     """多 hart UART 行缓冲 — 输出不交错且带 hart 标签."""
 
@@ -89,16 +113,12 @@ class TestUartLineBuffering:
         """每条输出行应以 '[hart N]' 开头."""
         assert len(lottery_lines_4h) > 0, "应有输出"
         for line in lottery_lines_4h:
-            assert line.startswith("[hart "), (
-                f"行应以 '[hart N]' 开头, 得到: {line!r}"
-            )
+            assert line.startswith("[hart "), f"行应以 '[hart N]' 开头, 得到: {line!r}"
 
     def test_no_interleaving_within_line(self, lottery_lines_4h: list[str]):
         """单行内不应包含来自其他 hart 的片段 (无交错)."""
         for line in lottery_lines_4h:
-            assert line.count("[hart ") == 1, (
-                f"行内出现多个 hart 标签 (交错): {line!r}"
-            )
+            assert line.count("[hart ") == 1, f"行内出现多个 hart 标签 (交错): {line!r}"
 
     def test_all_harts_produce_output(self, lottery_lines_4h: list[str]):
         """所有 4 个 hart 都应有输出."""
@@ -113,6 +133,7 @@ class TestUartLineBuffering:
 # ------------------------------------------------------------
 #  TestLotteryBoot
 # ------------------------------------------------------------
+
 
 class TestLotteryBoot:
     """OpenSBI 风格彩票启动 — 一个冷启动, 其余热启动."""
@@ -144,9 +165,10 @@ class TestLotteryBoot:
     def test_cold_hart_runs_before_others(self, lottery_lines_4h: list[str]):
         """冷启动 hart 的 running 应出现在其他 hart 的 warm 之前或同时."""
         cold_line = next(ln for ln in lottery_lines_4h if "cold boot" in ln)
-        cold_hart = int(cold_line[6:cold_line.index("]")])
+        cold_hart = int(cold_line[6 : cold_line.index("]")])
         cold_run_idx = next(
-            i for i, ln in enumerate(lottery_lines_4h)
+            i
+            for i, ln in enumerate(lottery_lines_4h)
             if "running" in ln and ln.startswith(f"[hart {cold_hart}]")
         )
         assert cold_run_idx is not None

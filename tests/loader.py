@@ -43,13 +43,13 @@ from pyremu.utils.parse_bin import FirmwareImage
 
 # PCB 字段偏移 (与 kernel.s 保持一致 — 含对齐 padding)
 PCB_STATE_OFF = 0
-PCB_ENTRY_OFF = 8     # +4B padding for 8B-alignment
+PCB_ENTRY_OFF = 8  # +4B padding for 8B-alignment
 PCB_STACK_OFF = 16
 PCB_SEPC_OFF = 24
 PCB_SP_OFF = 32
 PCB_EXIT_OFF = 40
-PCB_GPR_OFF = 48       # GPR save area (x1-x31)
-PCB_SIZE = 296        # 48 + 31*8 (GPR save area)
+PCB_GPR_OFF = 48  # GPR save area (x1-x31)
+PCB_SIZE = 296  # 48 + 31*8 (GPR save area)
 
 # 进程状态
 PS_EMPTY = 0
@@ -107,9 +107,7 @@ class MultiProgramLoader:
         # 查找入口地址
         entry_pc = self._image.symbols.get(entry_symbol)
         if entry_pc is None:
-            raise KeyError(
-                f"未找到符号 '{entry_symbol}' — 确保用户程序已链接到内核 ELF"
-            )
+            raise KeyError(f"未找到符号 '{entry_symbol}' — 确保用户程序已链接到内核 ELF")
 
         # 分配 U 栈: STACK_BASE_U + pid * 2 * PAGE_SIZE 为栈页基址.
         #   栈页上方 = 保护页 (未映射), 栈页 = 实际可用页.
@@ -139,14 +137,17 @@ class MultiProgramLoader:
         """运行模拟 *cycles* 个周期, 返回 UART 输出.
 
         若提供 *uart_input*, 预加载到 UART RX buffer.
+        分批调用 Emulator.run() 以便在 hart halted 时提前退出.
         """
         if uart_input:
             self._uart.preload(uart_input)
 
-        for _ in range(cycles):
-            self._emu.step()
-            if self._hart._halted:
-                break
+        BATCH = 10000
+        remaining = cycles
+        while remaining > 0 and not self._hart._halted:
+            chunk = min(BATCH, remaining)
+            self._emu.run(chunk, timeout=0)
+            remaining -= chunk
 
         return self._uart.tx_data().decode("latin-1", errors="replace")
 

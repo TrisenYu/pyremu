@@ -177,18 +177,23 @@ class PTE:
 
     @property
     def ppn(self) -> int:
-        """组合 PPN[2:0] 为完整的 44 位物理页号."""
-        return (self.ppn2 << 18) | (self.ppn1 << 9) | self.ppn0
+        """组合 PPN[2:0] 为完整的 44 位物理页号.
+
+        RISC-V Sv39 编码: PTE[53:10] = PPN[43:0] (44-bit contiguous).
+        PPN[2]=PTE[53:29], PPN[1]=PTE[28:20], PPN[0]=PTE[19:10].
+        复原: (PPN[2] << 19) | (PPN[1] << 10) | PPN[0].
+        """
+        return (self.ppn2 << 19) | (self.ppn1 << 10) | self.ppn0
 
     @ppn.setter
     def ppn(self, val: int):
-        """将 44 位物理页号拆分写入 PPN 字段."""
+        """将 44 位物理页号拆分写入 PPN 字段 (RISC-V 标准连续编码)."""
         val &= PTE_PPN_MASK
         self.raw = (
             (self.raw & ~(PTE_PPN0 | PTE_PPN1 | PTE_PPN2))
             | ((val & 0x3FF) << 10)
-            | (((val >> 9) & 0x1FF) << 20)
-            | (((val >> 18) & 0x1FFFFFFF) << 29)
+            | (((val >> 10) & 0x1FF) << 20)
+            | (((val >> 19) & 0x1FFFFFFF) << 29)
         )
 
     # -- 叶节点判断 --
@@ -315,7 +320,9 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
         # PTE 的 PPN[0] 字段 (10 bits) 不参与大页映射,
         # 由 VA 的 vpn[0] (9 bits) 替代 PPN 的低 9 位
         ppn = pte.ppn
-        ppn = (ppn & ~0x3FF) | vpn[2]
+        # 清除 PPN 低 10 位 (bits[9:0]), 替换为 VA 的 vpn[0] (9 bits).
+        # Python ~0x3FF 产生负无穷精度整数, 必须显式截断到 64-bit.
+        ppn = (ppn & 0xFFFF_FFFF_FFFF_FC00) | vpn[2]
         return True, ppn, _pte_perm_flags(pte), 2 * 1024 * 1024
 
     # 三级页表 (4 KiB 普通页)
@@ -371,3 +378,85 @@ def translate_va(va: int, satp_val: int, mem_read_phy: Callable[[int, int], byte
 
     # Sv48 等其他模式暂未实现
     return False, 0
+
+
+# ============================================================
+#  PTE 标志位 → 可读字符串
+# ============================================================
+
+# Sv39 PTE 标志位掩码
+PTE_V = 1 << 0
+PTE_R = 1 << 1
+PTE_W = 1 << 2
+PTE_X = 1 << 3
+PTE_U = 1 << 4
+PTE_G = 1 << 5
+PTE_A = 1 << 6
+PTE_D = 1 << 7
+
+_FLAG_NAMES: list[tuple[int, str, bool]] = [
+    # (mask, name, leaf_only) — leaf_only=True 仅对叶子 PTE 显示
+    (PTE_V, "V", False),
+    (PTE_R, "R", True),
+    (PTE_W, "W", True),
+    (PTE_X, "X", True),
+    (PTE_U, "U", True),
+    (PTE_G, "G", True),
+    (PTE_A, "A", True),
+    (PTE_D, "D", True),
+]
+
+
+def pte_flags_str(pte_val: int, *, is_leaf: bool = False) -> str:
+    """将 Sv39 PTE 值渲染为权限标志字符串 (纯文本, 无 Rich 标记).
+
+    Args:
+        pte_val: 8 字节 PTE 的整数值.
+        is_leaf: True 时额外标出叶子页特有标志位 (R/W/X/U/G/A/D).
+
+    Returns:
+        以空格分隔的标志名, 如 ``"V R W X A D"``. 无效时返回 ``"-"``.
+    """
+    parts: list[str] = []
+    for mask, name, leaf_only in _FLAG_NAMES:
+        if leaf_only and not is_leaf:
+            continue
+        if pte_val & mask:
+            parts.append(name)
+    return " ".join(parts) if parts else "-"
+
+
+def sv39_decompose_va(va: int) -> tuple[int, int, int, int]:
+    """将 39 位虚拟地址分解为 (vpn2, vpn1, vpn0, page_offset).
+
+    可用于调试器页表遍历展示.
+    """
+    vpn2 = (va >> 30) & 0x1FF
+    vpn1 = (va >> 21) & 0x1FF
+    vpn0 = (va >> 12) & 0x1FF
+    offset = va & 0xFFF
+    return vpn2, vpn1, vpn0, offset
+
+
+# ============================================================
+#  satp / VA 辅助
+# ============================================================
+
+
+def satp_root_ppn(satp_val: int) -> int:
+    """从 satp CSR 值中提取根页表物理页号 (44-bit PPN)."""
+    return satp_val & ((1 << 44) - 1)
+
+
+def sv39_canonical_va(va: int) -> int | None:
+    """验证 Sv39 虚拟地址的规范形式.
+
+    RISC-V Sv39 要求 VA[63:39] 全部等于 VA[38] (符号扩展).
+    若 *va* 满足此要求, 返回规范形式; 否则返回 None.
+    """
+    sign_bit = (va >> 38) & 1
+    if sign_bit:
+        canonical = va | 0xFFFFFF80_00000000  # 高 25 位补 1
+    else:
+        canonical = va & 0x7F_FFFFFFFF  # 高 25 位清零
+    return canonical if va == canonical else None

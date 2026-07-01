@@ -25,8 +25,8 @@
 #include <stdint.h>
 
 /* ---- 计数器索引 ---- */
-#define PMU_MCYCLE 0
-#define PMU_MINSTRET 2
+#define PMU_MCYCLE		0
+#define PMU_MINSTRET	2
 #define PMU_HPMCOUNTER3 3
 #define PMU_HPMCOUNTER4 4
 #define PMU_HPMCOUNTER5 5
@@ -86,21 +86,21 @@ struct pmu_result {
  *   // 测量空调用开销 (baseline)
  *   struct pmu_result r = PMU_MEASURE({});
  */
-#define PMU_MEASURE(stmt)                                                                \
-	({                                                                                   \
-		struct pmu_result __ret = {0};                                                   \
-		pmu_start();                                                                     \
-		__ret.st_cycle = pmu_read(PMU_MCYCLE);                                           \
-		__ret.st_instr = pmu_read(PMU_MINSTRET);                                         \
-                                                                                         \
-		stmt;                                                                            \
-                                                                                         \
-		__ret.ed_cycle = pmu_read(PMU_MCYCLE);                                           \
-		__ret.ed_instr = pmu_read(PMU_MINSTRET);                                         \
-		pmu_stop();                                                                      \
-		__ret.delta_cycle = __ret.ed_cycle - __ret.st_cycle;                             \
-		__ret.delta_instr = __ret.ed_instr - __ret.st_instr;                             \
-		__ret;                                                                           \
+#define PMU_MEASURE(stmt)                                    \
+	({                                                       \
+		struct pmu_result __ret = {0};                       \
+		pmu_start();                                         \
+		__ret.st_cycle = pmu_read(PMU_MCYCLE);               \
+		__ret.st_instr = pmu_read(PMU_MINSTRET);             \
+                                                             \
+		stmt;                                                \
+                                                             \
+		__ret.ed_cycle = pmu_read(PMU_MCYCLE);               \
+		__ret.ed_instr = pmu_read(PMU_MINSTRET);             \
+		pmu_stop();                                          \
+		__ret.delta_cycle = __ret.ed_cycle - __ret.st_cycle; \
+		__ret.delta_instr = __ret.ed_instr - __ret.st_instr; \
+		__ret;                                               \
 	})
 
 #endif /* BENCH_GAUGE_PMU_H */

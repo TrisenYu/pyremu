@@ -1,9 +1,9 @@
 Language: Cpp
 
 AlignConsecutiveAssignments: true
-AlignEscapedNewlines: Right          # 宏换行 \ 对齐
+AlignEscapedNewlines: Left           # 宏换行 \ 对齐 (Left 避免尾随空格跨版本差异)
 AlignTrailingComments: true
-
+AlignConsecutiveMacros: Consecutive
 AllowShortFunctionsOnASingleLine: Empty
 AllowShortBlocksOnASingleLine: false
 AlignAfterOpenBracket: AlwaysBreak

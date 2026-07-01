@@ -25,16 +25,16 @@ typedef struct {
 } norx32_ctx;
 
 /* Domain separation constants */
-#define DOMAIN_HEADER 0x01
+#define DOMAIN_HEADER  0x01
 #define DOMAIN_PAYLOAD 0x02
 #define DOMAIN_TRAILER 0x04
-#define DOMAIN_TAG 0x08
+#define DOMAIN_TAG	   0x08
 
 #define WORD_BYTES 4
-#define WORD_BITS 32
-#define ROUNDS 4
-#define DEGREE 1
-#define TAG_BITS 128
+#define WORD_BITS  32
+#define ROUNDS	   4
+#define DEGREE	   1
+#define TAG_BITS   128
 #define RATE_BYTES 48
 #define RATE_WORDS 12
 
@@ -148,14 +148,14 @@ void cf_blockwise_accumulate(
 
 static void permute(norx32_ctx *restrict ctx) {
 	/* This is one quarter of G; the function H plus xor/rotate. */
-#define P(u, v, w, rr)                                                                   \
-	(u) = ((u) ^ (v)) ^ (((u) & (v)) << 1);                                              \
+#define P(u, v, w, rr)                      \
+	(u) = ((u) ^ (v)) ^ (((u) & (v)) << 1); \
 	(w) = rotr32((u) ^ (w), rr);
 
-#define G(s, a, b, c, d)                                                                 \
-	P(s[a], s[b], s[d], 8)                                                               \
-	P(s[c], s[d], s[b], 11)                                                              \
-	P(s[a], s[b], s[d], 16)                                                              \
+#define G(s, a, b, c, d)    \
+	P(s[a], s[b], s[d], 8)  \
+	P(s[c], s[d], s[b], 11) \
+	P(s[a], s[b], s[d], 16) \
 	P(s[c], s[d], s[b], 31)
 
 	for (int i = 0; i < ROUNDS; i++) {

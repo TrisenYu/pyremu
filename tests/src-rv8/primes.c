@@ -8,8 +8,8 @@ int main() {
 	int limit		   = 33333333;
 	size_t primes_size = ((limit >> 6) + 1) * sizeof(uint64_t);
 	uint64_t *primes   = (uint64_t *)malloc(primes_size);
-#define test(p) (primes[p >> 6] & 1 << (p & 0x3f))
-#define set(p) (primes[p >> 6] |= 1 << (p & 0x3f))
+#define test(p)		(primes[p >> 6] & 1 << (p & 0x3f))
+#define set(p)		(primes[p >> 6] |= 1 << (p & 0x3f))
 #define is_prime(p) !test(p)
 	int64_t p = 2, sqrt_limit = (int64_t)sqrt(limit);
 	while (p <= limit >> 1) {

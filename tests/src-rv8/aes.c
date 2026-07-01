@@ -58,14 +58,14 @@ extern const u32 rcon[10];
 extern const u8 Td4s[256];
 extern const u8 rcons[10];
 
-#define TE0(i) Te0[((i) >> 24) & 0xff]
-#define TE1(i) Te1[((i) >> 16) & 0xff]
-#define TE2(i) Te2[((i) >> 8) & 0xff]
-#define TE3(i) Te3[(i) & 0xff]
-#define TE41(i) (Te4[((i) >> 24) & 0xff] & 0xff000000)
-#define TE42(i) (Te4[((i) >> 16) & 0xff] & 0x00ff0000)
-#define TE43(i) (Te4[((i) >> 8) & 0xff] & 0x0000ff00)
-#define TE44(i) (Te4[(i) & 0xff] & 0x000000ff)
+#define TE0(i)	 Te0[((i) >> 24) & 0xff]
+#define TE1(i)	 Te1[((i) >> 16) & 0xff]
+#define TE2(i)	 Te2[((i) >> 8) & 0xff]
+#define TE3(i)	 Te3[(i) & 0xff]
+#define TE41(i)	 (Te4[((i) >> 24) & 0xff] & 0xff000000)
+#define TE42(i)	 (Te4[((i) >> 16) & 0xff] & 0x00ff0000)
+#define TE43(i)	 (Te4[((i) >> 8) & 0xff] & 0x0000ff00)
+#define TE44(i)	 (Te4[(i) & 0xff] & 0x000000ff)
 #define TE421(i) (Te4[((i) >> 16) & 0xff] & 0xff000000)
 #define TE432(i) (Te4[((i) >> 8) & 0xff] & 0x00ff0000)
 #define TE443(i) (Te4[(i) & 0xff] & 0x0000ff00)
@@ -74,32 +74,32 @@ extern const u8 rcons[10];
 #define TE422(i) (Te4[((i) >> 16) & 0xff] & 0x00ff0000)
 #define TE433(i) (Te4[((i) >> 8) & 0xff] & 0x0000ff00)
 #define TE444(i) (Te4[(i) & 0xff] & 0x000000ff)
-#define TE4(i) (Te4[(i)] & 0x000000ff)
-#define TD0(i) Td0[((i) >> 24) & 0xff]
-#define TD1(i) Td1[((i) >> 16) & 0xff]
-#define TD2(i) Td2[((i) >> 8) & 0xff]
-#define TD3(i) Td3[(i) & 0xff]
-#define TD41(i) (Td4[((i) >> 24) & 0xff] & 0xff000000)
-#define TD42(i) (Td4[((i) >> 16) & 0xff] & 0x00ff0000)
-#define TD43(i) (Td4[((i) >> 8) & 0xff] & 0x0000ff00)
-#define TD44(i) (Td4[(i) & 0xff] & 0x000000ff)
-#define TD0_(i) Td0[(i) & 0xff]
-#define TD1_(i) Td1[(i) & 0xff]
-#define TD2_(i) Td2[(i) & 0xff]
-#define TD3_(i) Td3[(i) & 0xff]
-#define RCON(i) rcon[(i)]
+#define TE4(i)	 (Te4[(i)] & 0x000000ff)
+#define TD0(i)	 Td0[((i) >> 24) & 0xff]
+#define TD1(i)	 Td1[((i) >> 16) & 0xff]
+#define TD2(i)	 Td2[((i) >> 8) & 0xff]
+#define TD3(i)	 Td3[(i) & 0xff]
+#define TD41(i)	 (Td4[((i) >> 24) & 0xff] & 0xff000000)
+#define TD42(i)	 (Td4[((i) >> 16) & 0xff] & 0x00ff0000)
+#define TD43(i)	 (Td4[((i) >> 8) & 0xff] & 0x0000ff00)
+#define TD44(i)	 (Td4[(i) & 0xff] & 0x000000ff)
+#define TD0_(i)	 Td0[(i) & 0xff]
+#define TD1_(i)	 Td1[(i) & 0xff]
+#define TD2_(i)	 Td2[(i) & 0xff]
+#define TD3_(i)	 Td3[(i) & 0xff]
+#define RCON(i)	 rcon[(i)]
 
-#define GETU32(pt)                                                                       \
+#define GETU32(pt) \
 	(((u32)(pt)[0] << 24) ^ ((u32)(pt)[1] << 16) ^ ((u32)(pt)[2] << 8) ^ ((u32)(pt)[3]))
-#define PUTU32(ct, st)                                                                   \
-	{                                                                                    \
-		(ct)[0] = (u8)((st) >> 24);                                                      \
-		(ct)[1] = (u8)((st) >> 16);                                                      \
-		(ct)[2] = (u8)((st) >> 8);                                                       \
-		(ct)[3] = (u8)(st);                                                              \
+#define PUTU32(ct, st)              \
+	{                               \
+		(ct)[0] = (u8)((st) >> 24); \
+		(ct)[1] = (u8)((st) >> 16); \
+		(ct)[2] = (u8)((st) >> 8);  \
+		(ct)[3] = (u8)(st);         \
 	}
 
-#define AES_PRIV_SIZE (4 * 4 * 15 + 4)
+#define AES_PRIV_SIZE	(4 * 4 * 15 + 4)
 #define AES_PRIV_NR_POS (4 * 15)
 
 const u32 Te0[256] = {
@@ -653,10 +653,10 @@ void aes_rijndael_encrypt(const u32 rk[], int Nr, const u8 pt[16], u8 ct[16]) {
 	s2 = GETU32(pt + 8) ^ rk[2];
 	s3 = GETU32(pt + 12) ^ rk[3];
 
-#define ROUND(i, d, s)                                                                   \
-	d##0 = TE0(s##0) ^ TE1(s##1) ^ TE2(s##2) ^ TE3(s##3) ^ rk[4 * i];                    \
-	d##1 = TE0(s##1) ^ TE1(s##2) ^ TE2(s##3) ^ TE3(s##0) ^ rk[4 * i + 1];                \
-	d##2 = TE0(s##2) ^ TE1(s##3) ^ TE2(s##0) ^ TE3(s##1) ^ rk[4 * i + 2];                \
+#define ROUND(i, d, s)                                                    \
+	d##0 = TE0(s##0) ^ TE1(s##1) ^ TE2(s##2) ^ TE3(s##3) ^ rk[4 * i];     \
+	d##1 = TE0(s##1) ^ TE1(s##2) ^ TE2(s##3) ^ TE3(s##0) ^ rk[4 * i + 1]; \
+	d##2 = TE0(s##2) ^ TE1(s##3) ^ TE2(s##0) ^ TE3(s##1) ^ rk[4 * i + 2]; \
 	d##3 = TE0(s##3) ^ TE1(s##0) ^ TE2(s##1) ^ TE3(s##2) ^ rk[4 * i + 3]
 
 #ifdef AES_FULL_UNROLL
@@ -769,10 +769,10 @@ void aes_rijndael_decrypt(const u32 rk[], int Nr, const u8 ct[16], u8 pt[16]) {
 	s2 = GETU32(ct + 8) ^ rk[2];
 	s3 = GETU32(ct + 12) ^ rk[3];
 
-#define ROUND(i, d, s)                                                                   \
-	d##0 = TD0(s##0) ^ TD1(s##3) ^ TD2(s##2) ^ TD3(s##1) ^ rk[4 * i];                    \
-	d##1 = TD0(s##1) ^ TD1(s##0) ^ TD2(s##3) ^ TD3(s##2) ^ rk[4 * i + 1];                \
-	d##2 = TD0(s##2) ^ TD1(s##1) ^ TD2(s##0) ^ TD3(s##3) ^ rk[4 * i + 2];                \
+#define ROUND(i, d, s)                                                    \
+	d##0 = TD0(s##0) ^ TD1(s##3) ^ TD2(s##2) ^ TD3(s##1) ^ rk[4 * i];     \
+	d##1 = TD0(s##1) ^ TD1(s##0) ^ TD2(s##3) ^ TD3(s##2) ^ rk[4 * i + 1]; \
+	d##2 = TD0(s##2) ^ TD1(s##1) ^ TD2(s##0) ^ TD3(s##3) ^ rk[4 * i + 2]; \
 	d##3 = TD0(s##3) ^ TD1(s##2) ^ TD2(s##1) ^ TD3(s##0) ^ rk[4 * i + 3]
 
 #ifdef AES_FULL_UNROLL

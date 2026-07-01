@@ -169,29 +169,29 @@ setup_sv39:
     la   s0, page_tables       // s0 = L1
 
     // -- L1[2] → L2_hi (VPN[2]=2, VA 0x8000_0000–0xBFFF_FFFF) --
-    li   t0, 0x0000000040001001  // V=1, PPN=0x80004 (page_tables+0x1000)
+    li   t0, 0x0000000020001001  // V=1, PPN=0x80004 (page_tables+0x1000)
     sd   t0, 16(s0)            // L1[2] = L1 + 16
 
     // -- L1[0] → L2_lo (VPN[2]=0, VA 0x0000_0000–0x3FFF_FFFF) --
-    li   t0, 0x0000000040001401  // V=1, PPN=0x80005 (page_tables+0x2000)
+    li   t0, 0x0000000020001401  // V=1, PPN=0x80005 (page_tables+0x2000)
     sd   t0, 0(s0)             // L1[0] = L1 + 0
 
     // -- L2_hi[0] → L3_main --
     li   t0, 0x1000
     add  s1, s0, t0            // s1 = L2_hi (+1 page)
-    li   t0, 0x0000000040001801  // V=1, PPN=0x80006 (page_tables+0x3000)
+    li   t0, 0x0000000020001801  // V=1, PPN=0x80006 (page_tables+0x3000)
     sd   t0, 0(s1)
 
     // -- L2_lo[128] → L3_uart (VPN[1]=128, VA 0x1000_0000) --
     li   t0, 0x2000
     add  s2, s0, t0            // s2 = L2_lo (+2 pages)
-    li   t0, 0x0000000040001c01  // V=1, PPN=0x80007 (page_tables+0x4000)
+    li   t0, 0x0000000020001c01  // V=1, PPN=0x80007 (page_tables+0x4000)
     sd   t0, 1024(s2)          // L2_lo[128] = L2_lo + 128×8
 
     // -- L3_main: 16 页 identity 映射 (循环) --
     li   t0, 0x3000
     add  s1, s0, t0            // s1 = L3_main (+3 pages)
-    li   t0, 0x000000004000001f  // 第 0 页 PTE (R+W+X+U, PPN=0x80000)
+    li   t0, 0x000000002000001f  // 第 0 页 PTE (R+W+X+U, PPN=0x80000)
     li   t1, 16                // 16 页
 1:
     sd   t0, 0(s1)
@@ -204,7 +204,7 @@ setup_sv39:
     // -- L3_main[256] U 模式栈 (PPN=0x80100, R+W+U) --
     li   t0, 0x3000
     add  s1, s0, t0            // s1 = L3_main base (+3 pages)
-    li   t0, 0x0000000040040017
+    li   t0, 0x0000000020040017
     li   t2, 2048
     add  t2, s1, t2
     sd   t0, 0(t2)             // L3_main[256] = L3_main + 256×8
@@ -212,7 +212,7 @@ setup_sv39:
     // -- L3_uart[0] UART (PPN=0x10000, R+W+U) --
     li   t0, 0x4000
     add  s1, s0, t0            // s1 = L3_uart (+4 pages)
-    li   t0, 0x0000000008000017
+    li   t0, 0x0000000004000017
     sd   t0, 0(s1)
 
     // 启用 Sv39

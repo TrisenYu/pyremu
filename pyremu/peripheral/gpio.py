@@ -50,11 +50,12 @@ class GPIO(Device):
 
     def set_pin(self, pin: int, high: bool) -> None:
         """设置外部引脚电平 (模拟外部设备驱动)."""
-        if 0 <= pin < self._pin_count:
-            if high:
-                self._input_val |= (1 << pin)
-            else:
-                self._input_val &= ~(1 << pin)
+        if not (0 <= pin < self._pin_count):
+            return
+        if high:
+            self._input_val |= 1 << pin
+        else:
+            self._input_val &= ~(1 << pin)
 
     def get_pin_output(self, pin: int) -> bool:
         """读取指定引脚的输出值."""
@@ -84,7 +85,8 @@ class GPIO(Device):
         size: int,
     ) -> bytes:
         val = self._read_reg(offset)
-        return val.to_bytes(size, "little", signed=False)
+        mask = (1 << (size * 8)) - 1
+        return (val & mask).to_bytes(size, "little", signed=False)
 
     def write(
         self,

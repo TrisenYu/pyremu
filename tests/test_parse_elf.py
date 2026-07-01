@@ -170,7 +170,9 @@ class TestParseElf:
                 # .bss 段 filesz=0, memsz>0 — data 为空是合法的
                 assert seg.memsz >= len(seg.data)
                 if len(seg.data) == 0:
-                    assert seg.memsz > 0, f"memsz=0 且 data 为空的段无意义, vaddr=0x{seg.vaddr:x}"
+                    assert seg.memsz > 0, (
+                        f"memsz=0 且 data 为空的段无意义, vaddr=0x{seg.vaddr:x}"
+                    )
 
     def test_parse_elf_linked_executable_has_segments(self, elf_paths):
         """链接过的可执行文件应包含 LOAD 段."""
@@ -181,12 +183,8 @@ class TestParseElf:
             if len(img.segments) > 0:
                 has_linked = True
                 # 入口地址应落在某个段内
-                code_addrs = {(seg.vaddr, seg.vaddr + seg.memsz)
-                              for seg in img.segments}
-                assert any(
-                    start <= img.entry_point < end
-                    for start, end in code_addrs
-                ), (
+                code_addrs = {(seg.vaddr, seg.vaddr + seg.memsz) for seg in img.segments}
+                assert any(start <= img.entry_point < end for start, end in code_addrs), (
                     f"{Path(p).name}: entry 0x{img.entry_point:x} "
                     f"不在任何段内, 段范围: {code_addrs}"
                 )

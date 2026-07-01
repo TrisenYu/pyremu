@@ -25,7 +25,6 @@ def fmt_hexdump(data: bytes, addr: int = 0, *, columns: int = 16) -> str:
         hex_part = " ".join(f"{b:02x}" for b in chunk)
         ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         lines.append(
-            f"  {fmt_addr(addr + offset)}  "
-            f"{hex_part:<{columns * 3 - 1}s}  |{ascii_part}|"
+            f"  {fmt_addr(addr + offset)}  {hex_part:<{columns * 3 - 1}s}  |{ascii_part}|"
         )
     return "\n".join(lines)

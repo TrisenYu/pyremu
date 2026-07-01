@@ -16,6 +16,7 @@
     PE:  MZ (0x4D 0x5A)
     其他: 视为 raw binary
 """
+
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path

@@ -30,6 +30,7 @@ from typing import Optional
 
 class ReplacementPolicy(Enum):
     """缓存替换策略."""
+
     FIFO = "fifo"
     LRU = "lru"
 
@@ -77,6 +78,7 @@ class CacheBase(ABC):
         self._fifo_ptr: int = 0  # FIFO 写入指针
         self._hits: int = 0
         self._misses: int = 0
+        self._tag_to_idx: dict[int, int] = {}  # O(1) tag→index 快速查找
 
     # ----------------------------------------------------------
     #  子类必须实现的抽象方法
@@ -98,13 +100,20 @@ class CacheBase(ABC):
     # ----------------------------------------------------------
 
     def _find_index(self, key) -> int:
-        """按 key 查找条目, 返回索引; 未命中返回 -1. 命中时更新 last_access."""
+        """按 key 查找条目, 返回索引; 未命中返回 -1. 命中时更新 last_access.
+
+        O(1) 快速路径: _tag_to_idx dict 避免 O(n) 线性扫描.
+        """
         self._clock += 1
-        for i, entry in enumerate(self._entries):
+        idx = self._tag_to_idx.get(key)
+        if idx is not None:
+            entry = self._entries[idx]
             if entry.valid and self._match(entry, key):
                 entry.last_access = self._clock
                 self._hits += 1
-                return i
+                return idx
+            # 脏条目 (不应发生): 逐出时未清理 dict, 容错清理
+            del self._tag_to_idx[key]
         self._misses += 1
         return -1
 
@@ -148,7 +157,7 @@ class CacheBase(ABC):
         Returns:
             分配的 CacheLineBase 条目 (子类应填充自定义字段).
         """
-        # 查重 — 原地更新
+        # 查重 — 原地更新 (O(1) via _tag_to_idx)
         idx = self._find_index(tag)
         if idx >= 0:
             return self._entries[idx]
@@ -157,11 +166,13 @@ class CacheBase(ABC):
         idx = self._pick_victim()
         victim = self._entries[idx]
         if victim.valid:
+            self._tag_to_idx.pop(victim.tag, None)  # 清理旧 tag→index 映射
             self._on_evict(victim)
         victim.valid = False
         victim.dirty = False
         victim.tag = tag
         victim.last_access = self._clock
+        self._tag_to_idx[tag] = idx  # 注册新映射
         return victim
 
     # ----------------------------------------------------------
@@ -178,7 +189,9 @@ class CacheBase(ABC):
             self.flush_all()
             return
 
-        for entry in self._entries:
+        idx = self._tag_to_idx.pop(tag, None)
+        if idx is not None:
+            entry = self._entries[idx]
             if entry.valid and self._match(entry, tag):
                 self._on_evict(entry)
                 entry.valid = False
@@ -193,6 +206,7 @@ class CacheBase(ABC):
             entry.valid = False
             entry.tag = 0
             entry.dirty = False
+        self._tag_to_idx.clear()
 
     # ----------------------------------------------------------
     #  统计

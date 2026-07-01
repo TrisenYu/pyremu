@@ -58,7 +58,8 @@ class SPI(Device):
         size: int,
     ) -> bytes:
         val = self._read_reg(offset)
-        return val.to_bytes(size, "little", signed=False)
+        mask = (1 << (size * 8)) - 1
+        return (val & mask).to_bytes(size, "little", signed=False)
 
     def write(
         self,

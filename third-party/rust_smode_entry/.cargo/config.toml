@@ -1,0 +1,21 @@
+# ================================================================
+#  riscv64imac 而非 riscv64gc: 飞地管理器本身无需浮点运算,
+#  且测评模拟器尚未实现 F/D 扩展及压缩浮点指令 (c.fldsp/c.fsdsp).
+#  -f,-d 从 target-feature 和 llvm-args 两侧同时禁用浮点,
+#  防止 LLVM 用 FP 寄存器做临时暂存 (spill/fill).
+#  后续若需在 S-mode 运行浮点负载, 应先实现 FPU 模拟再放宽此处.
+# ================================================================
+
+[build]
+target = "riscv64imac-unknown-none-elf"
+
+[target.riscv64imac-unknown-none-elf]
+linker = "/opt/custom-llvm/bin/ld.lld"
+rustflags = [
+    "-C", "link-arg=-Tlink.ld",
+    "-C", "link-arg=--relax",
+    "-C", "link-arg=--pie",
+    "-C", "relocation-model=pie",
+    "-C", "target-feature=+m,+a,+c",
+    "-C", "llvm-args=-mattr=+ztee",
+]

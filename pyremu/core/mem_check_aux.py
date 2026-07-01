@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from pyremu.core.hart import RiscvMode
 from pyremu.core.registers import CsrAccessError, check_csr_access
 from pyremu.core.trap import TrapType
 from pyremu.core.trap_handler import deliver_trap
@@ -96,11 +97,11 @@ def validate_csr(
 # ============================================================
 
 
-def _translate_addr(
+def translate_addr(
     hart: HartWithRegs,
     va: int,
 ) -> tuple[bool, int]:
-    """完整地址翻译: TLB 查找 + 页表遍历. 供 mem_read / mem_write 内部使用.
+    """完整地址翻译: TLB 查找 + 页表遍历. 供 mem_read / mem_write 和调试器使用.
 
     MMIO 设备地址 (经 Bus.is_device_addr 判断) 不会插入 TLB,
     因为设备寄存器读写可能有副作用, 不能被缓存.
@@ -109,8 +110,23 @@ def _translate_addr(
         (success, pa) — success=False 表示翻译失败.
     """
     mode = hart.mmu_mode
+    # RISC-V 规范: M 模式始终使用 Bare 翻译, 无视 satp.MODE.
+    #
+    # 例外 — MPRV (mstatus bit 17): 置位时 M-mode loads/stores 按 MPP
+    # 所指示的特权级进行地址翻译和 PMP 检查. 这是 sbi_unpriv 系列 API
+    # (sbi_get_insn 等) 能够读取 S/U-mode 虚拟地址的基础.
     if mode == SATP_MODE_BARE:
         return True, va & 0xFFFF_FFFF_FFFF_FFFF
+
+    if hart.mode == RiscvMode.M:
+        mprv = (hart.mstatus_val >> 17) & 1
+        if not mprv:
+            return True, va & 0xFFFF_FFFF_FFFF_FFFF
+        # MPRV=1: 取 MPP 作为有效特权级. 若 MPP=M 则仍走 Bare.
+        mpp = (hart.mstatus_val >> 11) & 0x3
+        if mpp == RiscvMode.M.value:
+            return True, va & 0xFFFF_FFFF_FFFF_FFFF
+        # MPP 为 S 或 U 模式 — 继续走 MMU 翻译 + PMP 检查
 
     # TLB 查找
     vpn = va >> 12
@@ -174,7 +190,7 @@ def mem_read(
         return b"\x00" * size
 
     # 地址翻译
-    ok, pa = _translate_addr(hart, addr)
+    ok, pa = translate_addr(hart, addr)
     if not ok:
         deliver_trap(hart, TrapType.LdPageFault, tval=addr, is_interrupt=False)
         return b"\x00" * size
@@ -221,7 +237,7 @@ def mem_write(
         return
 
     # 地址翻译
-    ok, pa = _translate_addr(hart, addr)
+    ok, pa = translate_addr(hart, addr)
     if not ok:
         deliver_trap(hart, TrapType.StPageFault, tval=addr, is_interrupt=False)
         return
@@ -239,3 +255,69 @@ def mem_write(
         return
 
     hart._mem_write_phy(pa, data)
+
+
+# ============================================================
+#  取指校验 (VA → PA via itlb → PMP execute check)
+# ============================================================
+
+
+def check_instruction_fetch(
+    hart: HartWithRegs,
+    va: int,
+) -> tuple[bool, int]:
+    """校验从虚拟地址 *va* 取指的合法性, 返回 (ok, pa).
+
+    路径: VA → PA (itlb 或页表遍历) → PMP (is_execute=True).
+
+    可能触发的陷态:
+    - InstrPageFault: 页表翻译失败 (非 Bare 模式)
+    - InstrAccessFault: PMP 拒绝取指 (X=0 或未匹配)
+
+    调用方在 ok=True 时使用返回的 pa 读取指令字节.
+    """
+    mode = hart.mmu_mode
+    # RISC-V 规范: M 模式取指始终走物理地址 (MPRV 不影响取指)
+    if mode == SATP_MODE_BARE or hart.mode == RiscvMode.M:
+        pa = va & 0xFFFF_FFFF_FFFF_FFFF
+    else:
+        # itlb 查找
+        vpn = va >> 12
+        tlb: TLB = hart.itlb
+        hit, ppn, perm = tlb.lookup(vpn)
+        if hit:
+            offset = va & (PAGE_SIZE - 1)
+            pa = (ppn << 12 | offset) & 0xFFFF_FFFF_FFFF_FFFF
+        else:
+            # itlb miss → 页表遍历
+            if hart._mem_read_phy is None:
+                deliver_trap(hart, TrapType.InstrPageFault, tval=va, is_interrupt=False)
+                return False, 0
+
+            satp = hart.satp_val
+            ok, pa = translate_va(va, satp, hart._mem_read_phy)
+            if not ok:
+                deliver_trap(hart, TrapType.InstrPageFault, tval=va, is_interrupt=False)
+                return False, 0
+
+            # 将翻译结果插入 itlb
+            new_vpn = va >> 12
+            new_ppn = pa >> 12
+            # 跳过 MMIO 地址的缓存 (与 dtlb 策略一致)
+            bus: Bus | None = hart._bus
+            if bus is None or not bus.is_device_addr(pa):
+                tlb.insert(new_vpn, new_ppn, perm=0xF, level=0)
+
+    # PMP 检查 — 所有模式均需通过, is_execute=True
+    pmp: Pmp = hart._pmp
+    if not pmp.check(pa, 4, hart.mode.value, hart.mstatus_val, is_execute=True):
+        deliver_trap(hart, TrapType.InstrAccessFault, tval=va, is_interrupt=False)
+        return False, 0
+
+    # PMA 检查
+    bus: Bus | None = hart._bus
+    if bus is not None and not bus.is_valid_addr(pa):
+        deliver_trap(hart, TrapType.InstrAccessFault, tval=va, is_interrupt=False)
+        return False, 0
+
+    return True, pa

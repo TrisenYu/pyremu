@@ -7,7 +7,7 @@ wheels/
 *.egg-info
 .DS_Store
 .vscode
-
+*.prof
 .node_modules
 
 # Virtual environments
@@ -17,3 +17,4 @@ wheels/
 .coverage
 .claude
 third-party/*
+!third-party/rust_smode_entry/

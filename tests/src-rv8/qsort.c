@@ -40,21 +40,21 @@ static inline void swapfunc(char *, char *, int, int, int);
 /*
  * Qsort routine from Bentley & McIlroy's "Engineering a Sort Function".
  */
-#define swapcode(TYPE, parmi, parmj, n)                                                  \
-	{                                                                                    \
-		long i	 = (n) / sizeof(TYPE);                                                   \
-		TYPE *pi = (TYPE *)(parmi);                                                      \
-		TYPE *pj = (TYPE *)(parmj);                                                      \
-		do {                                                                             \
-			TYPE t = *pi;                                                                \
-			*pi++  = *pj;                                                                \
-			*pj++  = t;                                                                  \
-		} while (--i > 0);                                                               \
+#define swapcode(TYPE, parmi, parmj, n) \
+	{                                   \
+		long i	 = (n) / sizeof(TYPE);  \
+		TYPE *pi = (TYPE *)(parmi);     \
+		TYPE *pj = (TYPE *)(parmj);     \
+		do {                            \
+			TYPE t = *pi;               \
+			*pi++  = *pj;               \
+			*pj++  = t;                 \
+		} while (--i > 0);              \
 	}
 
-#define SWAPINIT(TYPE, a, es)                                                            \
-	swaptype_##TYPE = ((char *)a - (char *)0) % sizeof(TYPE) || es % sizeof(TYPE) ? 2    \
-					  : es == sizeof(TYPE)										  ? 0    \
+#define SWAPINIT(TYPE, a, es)                                                         \
+	swaptype_##TYPE = ((char *)a - (char *)0) % sizeof(TYPE) || es % sizeof(TYPE) ? 2 \
+					  : es == sizeof(TYPE)										  ? 0 \
 																				  : 1;
 
 static inline void swapfunc(
@@ -65,20 +65,20 @@ static inline void swapfunc(
 	}
 }
 
-#define swap(a, b)                                                                       \
-	if (swaptype_long == 0) {                                                            \
-		long t		 = *(long *)(a);                                                     \
-		*(long *)(a) = *(long *)(b);                                                     \
-		*(long *)(b) = t;                                                                \
-	} else if (swaptype_int == 0) {                                                      \
-		int t		= *(int *)(a);                                                       \
-		*(int *)(a) = *(int *)(b);                                                       \
-		*(int *)(b) = t;                                                                 \
-	} else                                                                               \
+#define swap(a, b)                   \
+	if (swaptype_long == 0) {        \
+		long t		 = *(long *)(a); \
+		*(long *)(a) = *(long *)(b); \
+		*(long *)(b) = t;            \
+	} else if (swaptype_int == 0) {  \
+		int t		= *(int *)(a);   \
+		*(int *)(a) = *(int *)(b);   \
+		*(int *)(b) = t;             \
+	} else                           \
 		swapfunc(a, b, es, swaptype_long, swaptype_int)
 
-#define vecswap(a, b, n)                                                                 \
-	if ((n) > 0)                                                                         \
+#define vecswap(a, b, n) \
+	if ((n) > 0)         \
 	swapfunc(a, b, n, swaptype_long, swaptype_int)
 
 static inline char *med3(char *a, char *b, char *c, cmp_t *cmp) {

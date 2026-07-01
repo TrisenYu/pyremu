@@ -70,35 +70,29 @@ class PlatformConfig:
 
     isa: str = "rv64ima"
     timebase_freq: int = 10_000_000  # 10 MHz
-    pmp_entries: int = 16  # PMP 条目数 (0=禁用, 8/16/64 常见)
+    pmp_entries: int = 64  # PMP 条目数 (0=禁用, 8/16/64 常见)
 
     periph: PeripheralConfig = field(default_factory=PeripheralConfig)
-
-    # ---- 工厂: 从字典 ----
 
     @classmethod
     def from_dict(
         cls,
         d: dict[str, Any],
     ) -> PlatformConfig:
-        """从嵌套字典构建.
+        """从嵌套字典构建模拟器配置.
 
         ``periph`` 子字典映射到 PeripheralConfig 字段,
         其余键映射到 PlatformConfig 字段.
         """
         periph_dict: dict[str, Any] = d.get("periph", {})
         periph_fields = set(PeripheralConfig.__dataclass_fields__)
-        periph = PeripheralConfig(**{
-            k: v for k, v in periph_dict.items() if k in periph_fields
-        })
+        periph = PeripheralConfig(
+            **{k: v for k, v in periph_dict.items() if k in periph_fields}
+        )
 
         plat_fields = set(cls.__dataclass_fields__) - {"periph"}
-        plat_kw: dict[str, Any] = {
-            k: v for k, v in d.items() if k in plat_fields
-        }
+        plat_kw: dict[str, Any] = {k: v for k, v in d.items() if k in plat_fields}
         return cls(periph=periph, **plat_kw)
-
-    # ---- 工厂: 从文件 ----
 
     @classmethod
     def from_json(
@@ -128,11 +122,8 @@ class PlatformConfig:
             return cls.from_dict(yaml.safe_load(fh))
 
     # ---- 预设平台 ----
-
     @classmethod
-    def sifive_u54(
-        cls,
-    ) -> PlatformConfig:
+    def sifive_u54(cls) -> PlatformConfig:
         """SiFive Freedom U54 风格布局.
 
         DRAM @ 0x8000_0000, CLINT @ 0x0200_0000,
@@ -151,9 +142,7 @@ class PlatformConfig:
         )
 
     @classmethod
-    def qemu_virt(
-        cls,
-    ) -> PlatformConfig:
+    def qemu_virt(cls) -> PlatformConfig:
         """QEMU RISC-V virt 风格布局."""
         return cls(
             num_harts=1,
@@ -168,9 +157,7 @@ class PlatformConfig:
         )
 
     @classmethod
-    def minimal(
-        cls,
-    ) -> PlatformConfig:
+    def minimal(cls) -> PlatformConfig:
         """最小化单核平台 — 仅 CLINT + UART.
 
         内存从 0x0000_0000 起始. 适用于裸金属测试和 CI.

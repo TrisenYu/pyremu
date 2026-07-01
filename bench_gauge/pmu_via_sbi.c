@@ -97,55 +97,55 @@ static inline struct sbiret sbi_ecall(
 #define SBI_EXT_PMU 0x504D55UL
 
 /* 函数 ID */
-#define SBI_PMU_NUM_COUNTERS 0
+#define SBI_PMU_NUM_COUNTERS	 0
 #define SBI_PMU_COUNTER_GET_INFO 1
-#define SBI_PMU_COUNTER_CONFIG 2
-#define SBI_PMU_COUNTER_START 3
-#define SBI_PMU_COUNTER_STOP 4
-#define SBI_PMU_COUNTER_FW_READ 5
+#define SBI_PMU_COUNTER_CONFIG	 2
+#define SBI_PMU_COUNTER_START	 3
+#define SBI_PMU_COUNTER_STOP	 4
+#define SBI_PMU_COUNTER_FW_READ	 5
 
 /* 计数器类型掩码 (counter_get_info 返回值) */
 #define SBI_PMU_CTR_TYPE_MASK 0x0FULL
-#define SBI_PMU_CTR_TYPE_HW 0x00 /* 硬件计数器 */
-#define SBI_PMU_CTR_TYPE_FW 0x0F /* 固件计数器 */
+#define SBI_PMU_CTR_TYPE_HW	  0x00 /* 硬件计数器 */
+#define SBI_PMU_CTR_TYPE_FW	  0x0F /* 固件计数器 */
 
 /* 从 counter_get_info 返回值提取字段 */
-#define SBI_PMU_CTR_TYPE(info) ((info) & 0x0F)
-#define SBI_PMU_CTR_CSR(info) (((info) >> 16) & 0xFFFF)
+#define SBI_PMU_CTR_TYPE(info)	((info) & 0x0F)
+#define SBI_PMU_CTR_CSR(info)	(((info) >> 16) & 0xFFFF)
 #define SBI_PMU_CTR_WIDTH(info) ((info) >> 32)
 
 /* config_matching 标志 */
 #define SBI_PMU_CFG_CLEAR_VALUE (1UL << 0)
-#define SBI_PMU_CFG_AUTO_START (1UL << 1)
-#define SBI_PMU_CFG_SET_VUINH (1UL << 2)
-#define SBI_PMU_CFG_SET_VSINH (1UL << 3)
-#define SBI_PMU_CFG_SET_UINH (1UL << 4)
-#define SBI_PMU_CFG_SET_SINH (1UL << 5)
-#define SBI_PMU_CFG_SET_MINH (1UL << 6)
+#define SBI_PMU_CFG_AUTO_START	(1UL << 1)
+#define SBI_PMU_CFG_SET_VUINH	(1UL << 2)
+#define SBI_PMU_CFG_SET_VSINH	(1UL << 3)
+#define SBI_PMU_CFG_SET_UINH	(1UL << 4)
+#define SBI_PMU_CFG_SET_SINH	(1UL << 5)
+#define SBI_PMU_CFG_SET_MINH	(1UL << 6)
 /* 便利组合: S-mode 下仅允许 S+U 计数, 清除旧值后自动启动 */
-#define SBI_PMU_CFG_MEASURE                                                              \
+#define SBI_PMU_CFG_MEASURE \
 	(SBI_PMU_CFG_CLEAR_VALUE | SBI_PMU_CFG_AUTO_START | SBI_PMU_CFG_SET_UINH)
 
 /* start 标志 */
-#define SBI_PMU_START_SET_INIT (1UL << 0)
+#define SBI_PMU_START_SET_INIT	(1UL << 0)
 #define SBI_PMU_START_FROM_SNAP (1UL << 1)
 
 /* stop 标志 */
-#define SBI_PMU_STOP_RESET (1UL << 0)
+#define SBI_PMU_STOP_RESET	  (1UL << 0)
 #define SBI_PMU_STOP_SNAPSHOT (1UL << 1)
 
 /* 标准硬件事件编码 (event_idx) */
-#define SBI_PMU_EVENT_NO_EVENT 0x00000000UL
-#define SBI_PMU_EVENT_CPU_CYCLES 0x00000001UL
-#define SBI_PMU_EVENT_INSTRUCTIONS 0x00000002UL
-#define SBI_PMU_EVENT_L1_DCACHE_READ_MISS 0x00000003UL
+#define SBI_PMU_EVENT_NO_EVENT			   0x00000000UL
+#define SBI_PMU_EVENT_CPU_CYCLES		   0x00000001UL
+#define SBI_PMU_EVENT_INSTRUCTIONS		   0x00000002UL
+#define SBI_PMU_EVENT_L1_DCACHE_READ_MISS  0x00000003UL
 #define SBI_PMU_EVENT_L1_DCACHE_WRITE_MISS 0x00000004UL
-#define SBI_PMU_EVENT_L1_ICACHE_MISS 0x00000005UL
-#define SBI_PMU_EVENT_DTLB_MISS 0x00000006UL
-#define SBI_PMU_EVENT_ITLB_MISS 0x00000007UL
-#define SBI_PMU_EVENT_BRANCH_MISS 0x00000008UL
-#define SBI_PMU_EVENT_LOAD_MISS 0x00000009UL
-#define SBI_PMU_EVENT_STORE_MISS 0x0000000AUL
+#define SBI_PMU_EVENT_L1_ICACHE_MISS	   0x00000005UL
+#define SBI_PMU_EVENT_DTLB_MISS			   0x00000006UL
+#define SBI_PMU_EVENT_ITLB_MISS			   0x00000007UL
+#define SBI_PMU_EVENT_BRANCH_MISS		   0x00000008UL
+#define SBI_PMU_EVENT_LOAD_MISS			   0x00000009UL
+#define SBI_PMU_EVENT_STORE_MISS		   0x0000000AUL
 
 /* ===================================================================
  *  SBI PMU API — 原始封装

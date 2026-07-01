@@ -4,7 +4,7 @@
 
 /*
  * derived from SUPERCOP: https://bench.cr.yp.to/supercop.html
- * 
+ *
  * Copyright (c) 2011 Stanford University.
  * Copyright (c) 2014 Cryptography Research, Inc.
  * Released under the MIT License.  See LICENSE for license information.

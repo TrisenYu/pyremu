@@ -15,7 +15,10 @@ RV64 编码: pmpcfgN 覆盖 8 个条目, 仅偶数编号的 pmpcfg 可用.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Mapping
+
+from loguru import logger
 
 # PMP 配置位 (每 8-bit 条目中的位偏移)
 PMP_R = 0b0000_0001
@@ -29,8 +32,8 @@ PMP_A_NAPOT = 0b0001_1000  # Naturally Aligned Power-of-Two
 PMP_L = 0b1000_0000  # 锁定位
 
 # RiscvMode 值 → PMP 检查时的特权级逻辑:
-# M=4 且 MPRV=0 → 跳过 PMP; 否则按 MPP 特权级检查
-_MODE_M = 4
+# M=3 且 MPRV=0 → 跳过 PMP; 否则按 MPP 特权级检查
+_MODE_M = 3
 
 
 def _decode_pmpcfg(cfg_val: int, entry_idx: int) -> int:
@@ -39,7 +42,7 @@ def _decode_pmpcfg(cfg_val: int, entry_idx: int) -> int:
     return (cfg_val >> shift) & 0xFF
 
 
-def _decode_napot(pmpaddr_val: int) -> tuple[int, int]:
+def decode_napot(pmpaddr_val: int) -> tuple[int, int]:
     """解码 NAPOT 格式的 pmpaddr → (base, size).
 
     算法: 统计 pmpaddr 中从 LSB 开始的连续 1 的个数 k,
@@ -138,7 +141,7 @@ class Pmp:
         Args:
             pa: 物理地址.
             size: 访问字节数.
-            mode_val: 当前 RiscvMode.value (U=0, S=1, H=2, M=4, D=8).
+            mode_val: 当前 RiscvMode.value (U=0, S=1, H=2, M=3, D=8).
             mstatus_val: 当前 mstatus CSR 值 (用于 MPRV 检查).
             is_write: 是否为写操作.
             is_execute: 是否为取指操作.
@@ -151,8 +154,8 @@ class Pmp:
                 # MPRV=1: 使用 MPP 作为有效特权级
                 mpp = (mstatus_val >> 11) & 3
                 # MPP: 0=U, 1=S, 3=M
-                mpp_map = {0: 0, 1: 1, 3: 4}
-                eff_mode = mpp_map.get(mpp, 4)
+                mpp_map = {0: 0, 1: 1, 3: 3}
+                eff_mode = mpp_map.get(mpp, 3)
             else:
                 # M 模式且 MPRV=0: PMP 不检查
                 return True
@@ -162,6 +165,7 @@ class Pmp:
             return False
 
         # 按优先级遍历 PMP 条目 (低编号优先)
+        matched_any = False
         for i in range(self._num_entries):
             cfg = self._read_cfg(i)
             if not (cfg & PMP_A_MASK):  # OFF — 跳过
@@ -170,11 +174,25 @@ class Pmp:
             addr_field = self._read_addr(i)
             if not self._match(i, cfg, addr_field, pa, size):
                 continue
+            matched_any = True
 
             # 匹配成功 — 按该条目权限判断
-            return _check_perm(cfg, is_write, is_execute)
+            ok = _check_perm(cfg, is_write, is_execute)
+            if not ok and os.environ.get("PYREMU_TRACE_PMP", "") == "1":
+                logger.debug(
+                    f"[pmp] DENY pa={pa:#018x} size={size} "
+                    f"eff_mode={eff_mode} is_write={is_write} "
+                    f"matched_entry={i} cfg={cfg:#04x} addr_field={addr_field:#018x}"
+                )
+            return ok
 
         # 无匹配条目 — M 模式允许, S/U 拒绝
+        if eff_mode != _MODE_M and os.environ.get("PYREMU_TRACE_PMP", "") == "1":
+            logger.debug(
+                f"[pmp] NOMATCH pa={pa:#018x} size={size} "
+                f"eff_mode={eff_mode} is_write={is_write} matched_any={matched_any} "
+                f"num_entries={self._num_entries}"
+            )
         return eff_mode == _MODE_M
 
     # ---- 内部 ----
@@ -214,7 +232,7 @@ class Pmp:
             base = addr_field << 2
             rsize = 4
         elif a_mode == PMP_A_NAPOT:
-            base, rsize = _decode_napot(addr_field)
+            base, rsize = decode_napot(addr_field)
         else:
             return False  # OFF 或其他非法值
 

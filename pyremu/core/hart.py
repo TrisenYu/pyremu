@@ -24,7 +24,6 @@ from pyremu.core.registers import (
     gpr_idx_from_name,
     register_csr,
     register_fpr,
-    register_gpr,
 )
 from pyremu.memory.cache import TLB_SIZE
 from pyremu.memory.pmp import Pmp
@@ -35,18 +34,52 @@ if TYPE_CHECKING:
     from pyremu.memory.bus import Bus
 
 
+class GprFile:
+    """GPR 寄存器文件 — 32 个 64-bit 整数, x0 硬连线为 0.
+
+    替代 pydantic ``list[Reg]`` 作为指令执行热路径上的寄存器后端,
+    消除每条指令 ~150ns 的 pydantic 模型验证开销.
+
+    用法与 ``list[int]`` 一致: ``gprs[10]`` 读, ``gprs[10] = v`` 写.
+    x0 (索引 0) 写入被静默丢弃, 读取恒返回 0.
+    """
+
+    __slots__ = ("_r",)
+
+    def __init__(self) -> None:
+        self._r = [0] * 32
+
+    def __getitem__(self, idx: int) -> int:
+        return self._r[idx & 0x1F]
+
+    def __setitem__(self, idx: int, val: int) -> None:
+        i = idx & 0x1F
+        if i != 0:
+            self._r[i] = val & 0xFFFF_FFFF_FFFF_FFFF
+
+    def __iter__(self):
+        return iter(self._r)
+
+    def __len__(self) -> int:
+        return 32
+
+    def as_list(self) -> list[int]:
+        """返回底层 32 元素的副本, 供快照等外部使用."""
+        return self._r.copy()
+
+
 class RiscvMode(Enum):
     """RISC-V 特权级模式。
 
-    使用位编码 (1 << N) 以便将来做权限掩码比较:
+    数值按标准 RISC-V 特权级编码:
         U=0 (用户), S=1 (监管), H=2 ( hypervisor ),
-        M=4 (机器), D=8 (调试).
+        M=3 (机器), D=8 (调试).
     """
 
     U = 0
     S = 1
     H = 2
-    M = 4
+    M = 3
     D = 8
 
 
@@ -88,9 +121,9 @@ class HartWithRegs:
     快捷属性访问。
     """
 
-    def __init__(self, id: int, pmp_entries: int = 16):
+    def __init__(self, id: int, pmp_entries: int = 64):
         self.id = id
-        self.gprs = register_gpr()
+        self.gprs = GprFile()
         self.fprs = register_fpr()
         self.csrs = register_csr()
 
@@ -122,9 +155,6 @@ class HartWithRegs:
         # 共享总线引用 — 用于判断 MMIO 地址 (不可缓存) 和预留失效
         self._bus: Bus | None = None
 
-        # 全 hart 引用 — 用于 mfence.did 等需要广播到所有 hart 的操作
-        self._all_harts: list[HartWithRegs] | None = None
-
         # 中断控制器引用 — 每条指令执行后在指令边界检查是否有待处理中断
         self._interrupt_ctrl: InterruptController | None = None
 
@@ -146,6 +176,11 @@ class HartWithRegs:
         # 当 hart 执行 WFI 且无可处理中断时置位; 中断挂起且使能时硬件唤醒
         self._waiting: bool = False
 
+        # WFI 唤醒标记 — 从 WFI 被中断唤醒后置位, mret/sret 或重新进入 WFI 时清零.
+        # 此期间的指令 (中断 handler + 返回路径) 不计入 _total_instrs,
+        # 以保证指令计数器反映的是固件实际执行的非中断上下文指令.
+        self._wfi_woken: bool = False
+
     # ----------------------------------------------------------
     #  寄存器读写
     # ----------------------------------------------------------
@@ -160,17 +195,17 @@ class HartWithRegs:
         check, csr_name = check_csr(csr_id)
         if not check:
             return
-        # satp 写入必须通过 property setter 以同步更新 _mmu_mode
+        # 有副作用的 CSR 必须通过 property setter 写入以同步缓存
         if csr_name == "satp":
             self.satp_val = val
         else:
             self.csrs[csr_name].val = val
 
     def read_gpr(self, reg_id: int) -> int:
-        return self.gprs[reg_id & 0x1F].val
+        return self.gprs[reg_id & 0x1F]
 
     def write_gpr(self, reg_id: int, val: int):
-        self.gprs[reg_id & 0x1F].val = val
+        self.gprs[reg_id & 0x1F] = val
 
     def read_fpr(self, reg_id: int) -> float:
         return self.fprs[reg_id & 0x1F].val
@@ -388,17 +423,6 @@ class HartWithRegs:
     @interrupt_ctrl.setter
     def interrupt_ctrl(self, ctrl):
         self._interrupt_ctrl = ctrl
-
-    @property
-    def all_harts(self):
-        """所有 hart 的引用 (用于广播操作, 如 mfence.did)."""
-        return self._all_harts
-
-    @all_harts.setter
-    def all_harts(self, harts):
-        self._all_harts = harts
-
-    # ----------------------------------------------------------
 
     # ----------------------------------------------------------
     #  mip 快捷属性 (中断挂起位)
