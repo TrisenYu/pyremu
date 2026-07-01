@@ -14,7 +14,7 @@ pydevicetree==0.0.13
 pygments==2.20.0
 pylibfdt==1.7.2.post1
 pyparsing==3.3.2
-pytest==9.0.3
+pytest==9.1.1
 pytest-cov==7.1.0
 pyyaml==6.0.3
 rich==15.0.0
