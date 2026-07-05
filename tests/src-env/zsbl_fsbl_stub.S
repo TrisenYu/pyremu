@@ -18,9 +18,9 @@
 #   (COLD_BOOT 宏已弃用 — 单 hart 模式下无需修补 sbi_init)
 #
 # 流程:
-#   硬件上电 → ZSBL (_start) → 设置 a1=FDT, 跳转 FSBL →
-#   标记 coldboot_done=1 → 设置 mtvec → 读取 mhartid → 修补 sbi_init
-#   (可选, COLD_BOOT) → 最终由外部跳转到 OpenSBI _start_warm
+#   硬件上电 -> ZSBL (_start) -> 设置 a1=FDT, 跳转 FSBL ->
+#   标记 coldboot_done=1 -> 设置 mtvec -> 读取 mhartid -> 修补 sbi_init
+#   (可选, COLD_BOOT) -> 最终由外部跳转到 OpenSBI _start_warm
 # =============================================================================
 
 .section .text, "ax", @progbits
@@ -77,7 +77,7 @@ fsbl_start:
 #
 # 目标地址由固件 ELF 符号表提取:
 #   原始指令:  beq a0, a1, <offset>   (a0=mhartid, a1=1)
-#             → hart 1 跳到目标
+#             -> hart 1 跳到目标
 #   修补后:    j .                   (hart 1 在此自旋)
 #
 # 这用于早期多 hart 同步—确保只有 hart 0 完成整套 init_sm() 流程。

@@ -14,8 +14,8 @@ CFLAGS  = -fPIE -g -MD -MP
 LDFLAGS = -static
 
 # ---- 目标选择 ----
-# TARGET=riscv64 → 交叉编译, 输出到 bin/riscv64/
-# TARGET=host    → 本地编译, 输出到 bin/native-isa/
+# TARGET=riscv64 -> 交叉编译, 输出到 bin/riscv64/
+# TARGET=host    -> 本地编译, 输出到 bin/native-isa/
 TARGET ?= riscv64
 
 ifeq ($(TARGET),host)
@@ -54,8 +54,8 @@ phony += npm
 help:
 	@echo "rv8-bench — RISC-V benchmark suite"
 	@echo ""
-	@echo "  make                    = make all     (cross-compile → bin/riscv64/)"
-	@echo "  make all TARGET=host                   (native compile → bin/native-isa/)"
+	@echo "  make                    = make all     (cross-compile -> bin/riscv64/)"
+	@echo "  make all TARGET=host                   (native compile -> bin/native-isa/)"
 	@echo "  make TARGET=host CC=clang CXX=clang++  (native with clang)"
 	@echo "  make bin/riscv64/aes_O3.o              (single program)"
 	@echo "  make help                              (this help)"
@@ -68,7 +68,7 @@ clean:
 	rm -f $(O_PROGS) $(D_FILES)
 phony += clean
 
-# ---- 编译 + strip 规则: $(eval) 展开 O3/O2/Os × .c/.cc (1 模板 → 每个 opt 3 规则) ----
+# ---- 编译 + strip 规则: $(eval) 展开 O3/O2/Os × .c/.cc (1 模板 -> 每个 opt 3 规则) ----
 define compile_opt
 $(OUT_DIR)/%_$(1).o: %.c
 	@mkdir -p $$(@D)

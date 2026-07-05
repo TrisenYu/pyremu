@@ -31,7 +31,7 @@ dbg.cmd_disasm(hex(emu.harts[0].pc), "64")
 print()
 
 # 4. 单步执行并观察模式切换
-print("=== 逐条执行, 观察 M→S 切换 ===")
+print("=== 逐条执行, 观察 M->S 切换 ===")
 h = dbg.hart
 # 逐步执行直到检测到模式切换 (mret)
 # 使用 emu.step 而非 dbg.cmd_step, 避免每条都打印 PC + 反汇编
@@ -42,7 +42,7 @@ for _ in range(50):
     mode_before = h.mode.name
     emu.step()
     if h.mode.name != mode_before:
-        print(f">>> 特权级切换: {mode_before} → {h.mode.name} <<<")
+        print(f">>> 特权级切换: {mode_before} -> {h.mode.name} <<<")
         break
 
 # 用调试器确认切换后的状态

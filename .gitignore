@@ -18,3 +18,12 @@ wheels/
 .claude
 third-party/*
 !third-party/rust_smode_entry/
+!third-party/.linux-config
+
+# Native extension build artifacts (platform-specific, not committed)
+*.so
+*.dll
+*.dylib
+*.pyd
+pyremu/_native/target/
+

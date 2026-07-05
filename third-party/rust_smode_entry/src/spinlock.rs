@@ -47,7 +47,7 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinGuard<'_, T> {
         // TAS: while amoswap.w != 0 { spin }
         while self.lock.swap(1, Ordering::Acquire) != 0 {
-            // 自旋提示（对应 ref-emod 的 spin_lock_check → spin_trylock 循环）
+            // 自旋提示（对应 ref-emod 的 spin_lock_check -> spin_trylock 循环）
             core::hint::spin_loop();
         }
         SpinGuard { lock: self }

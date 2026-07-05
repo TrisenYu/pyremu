@@ -2,7 +2,7 @@
 """cProfile 基准: 与 makefile `emu` 目标完全一致的启动路径。
 
 用法:
-  python tools/profile_emu.py              # 运行 cProfile → tools/profile_emu.prof
+  python tools/profile_emu.py              # 运行 cProfile -> tools/profile_emu.prof
   snakeviz tools/profile_emu.prof          # 浏览器可视化
   python tools/profile_emu.py --tottime    # 按自身时间排序 (默认 cumulative)
 """

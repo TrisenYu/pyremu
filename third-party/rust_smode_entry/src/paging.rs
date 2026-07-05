@@ -55,7 +55,7 @@ impl Pte {
 //  VA 辅助
 // ---------------------------------------------------------------
 
-/// level 0 → VPN[2] (bits 38:30), 1 → VPN[1] (29:21), 2 → VPN[0] (20:12)
+/// level 0 -> VPN[2] (bits 38:30), 1 -> VPN[1] (29:21), 2 -> VPN[0] (20:12)
 #[inline]
 fn get_vpn(va: u64, level: u8) -> usize {
     match level {
@@ -66,7 +66,7 @@ fn get_vpn(va: u64, level: u8) -> usize {
     }
 }
 
-/// 物理地址 → PTE 指针。satp 有效时叠加 LINEAR_MAP_OFFSET。
+/// 物理地址 -> PTE 指针。satp 有效时叠加 LINEAR_MAP_OFFSET。
 #[inline]
 unsafe fn pte_ptr(pa: u64) -> *mut Pte {
     if csr::read_satp() != 0 {
@@ -84,7 +84,7 @@ unsafe fn pte_ptr(pa: u64) -> *mut Pte {
 /// `alloc=true` 时缺失的中间页表从 S-mode page pool 分配。
 ///
 /// 遍历顺序与硬件页表 walker 一致 (标准 Sv39):
-///   root[VPN[2]] → L2[VPN[1]] → L3[VPN[0]]
+///   root[VPN[2]] -> L2[VPN[1]] -> L3[VPN[0]]
 /// `get_vpn(va, i)` 的 `i` 是**页表层级**: 0=根表(GIGA), 1=中表(MEGA), 2=叶表(PAGE).
 fn get_leaf_pte(vaddr: u64, level: u8, alloc: bool) -> &'static mut Pte {
     let root_pa = context::root_pa();
@@ -151,7 +151,7 @@ pub fn unmap_page(vaddr: u64, level: u8) {
 }
 
 // ---------------------------------------------------------------
-//  VA → PA 翻译
+//  VA -> PA 翻译
 // ---------------------------------------------------------------
 
 struct WalkResult {
@@ -197,7 +197,7 @@ fn walk_page_table(va: u64) -> WalkResult {
     }
 }
 
-/// VA → PA。未映射返回 None。
+/// VA -> PA。未映射返回 None。
 pub fn get_pa(va: u64) -> Option<u64> {
     let r = walk_page_table(va);
     if r.level < 0 {
@@ -213,9 +213,9 @@ pub fn get_pa(va: u64) -> Option<u64> {
 //  初始化
 // ---------------------------------------------------------------
 
-/// 为 MMU 启用的瞬间建立双重映射 (PA=VA + PA+OFFSET→PA)。
+/// 为 MMU 启用的瞬间建立双重映射 (PA=VA + PA+OFFSET->PA)。
 ///
-/// `csrw satp` 后 PC 仍在低物理地址，必须有一条 PA→PA 的映射
+/// `csrw satp` 后 PC 仍在低物理地址，必须有一条 PA->PA 的映射
 /// 让 CPU 能继续取指，直到代码通过高 VA 访问 trampoline。
 ///
 /// 同时建立 LINEAR_MAP_OFFSET 映射，供 `pte_ptr()` 在 MMU 使能后
@@ -239,7 +239,7 @@ pub fn init_satp(root_pa: u64) -> u64 {
     (ppn & 0xF_FFFF_FFFF) | (8_u64 << 60)
 }
 
-/// 1 GiB 超级页线性映射。PA [LINEAR_MAP_START, +SIZE) → VA (PA + OFFSET)。
+/// 1 GiB 超级页线性映射。PA [LINEAR_MAP_START, +SIZE) -> VA (PA + OFFSET)。
 pub fn setup_linear_map() {
     let giga = 0x4000_0000_u64;
     let pages = LINEAR_MAP_SIZE.div_ceil(giga);

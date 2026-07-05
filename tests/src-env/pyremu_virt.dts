@@ -10,8 +10,8 @@
  *
  * 重要: /cpus 节点里的 CPU 数必须与 --harts 一致。
  * OpenSBI 启动流程依赖此数值:
- *   fw_platform_init → fdt_for_each_subnode(/cpus) → platform.hart_count
- *   sbi_init → cold boot → 等待 hart_count 个 hart 全部到达同步栅栏
+ *   fw_platform_init -> fdt_for_each_subnode(/cpus) -> platform.hart_count
+ *   sbi_init -> cold boot -> 等待 hart_count 个 hart 全部到达同步栅栏
  *
  * 如果 DTB 写 4 个 CPU 但只起了 2 个 hart, 同步栅栏永远等不到另外 2 个。
  * 多 hart 场景建议去掉 --fdt-file 用自动生成 DTB (CPU 数自动匹配 --harts).

@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
+
+"""
+virtio-blk MMIO 块设备 (virtio v1.2 规范, MMIO 传输层).
+
+实现 virtio-blk 设备的 MMIO 寄存器接口和 virtqueue 描述符处理,
+Guest 可通过该设备读写磁盘镜像 (raw 格式).
+
+特性:
+- virtio v1.0+ MMIO 传输层 (modern, 非 legacy)
+- 单 virtqueue (queue 0)
+- 支持 VIRTIO_BLK_T_IN / VIRTIO_BLK_T_OUT (读写)
+- 磁盘镜像以 raw 格式存储, 通过 pread/pwrite 访问
+
+寄存器布局 (OASIS virtio v1.2 MMIO):
+  0x000 | 4 | R | MagicValue         | 0x74726976 ("virt")
+  0x004 | 4 | R | Version            | 0x2
+  0x008 | 4 | R | DeviceID           | 0x2 (block)
+  0x00c | 4 | R | VendorID           | 0x0
+  0x010 | 4 | R | DeviceFeatures     | bits
+  0x014 | 4 | W | DeviceFeaturesSel  | page selector
+  0x020 | 4 | W | DriverFeatures     | bits
+  0x024 | 4 | W | DriverFeaturesSel  | page selector
+  0x030 | 4 | W | QueueSel           | queue index
+  0x034 | 4 | R | QueueNumMax        | max queue entries
+  0x038 | 4 | W | QueueNum           | set queue size
+  0x044 | 4 | W | QueueReady         | activate queue
+  0x050 | 4 | W | QueueNotify        | new buffer available
+  0x060 | 4 | R | InterruptStatus    | bit 0: used buffer
+  0x064 | 4 | W | InterruptACK       | clear interrupt
+  0x070 | 4 | R/W | Status           | device status
+  0x080 | 4 | W | QueueDescLow       | desc table (low 32)
+  0x084 | 4 | W | QueueDescHigh      | desc table (high 32)
+  0x090 | 4 | W | QueueDriverLow     | driver area (low 32)
+  0x094 | 4 | W | QueueDriverHigh    | driver area (high 32)
+  0x0a0 | 4 | W | QueueDeviceLow     | device area (low 32)
+  0x0a4 | 4 | W | QueueDeviceHigh    | device area (high 32)
+  0x0fc | 4 | R | ConfigGeneration   | config change counter
+  0x100 | 8 | R | Capacity           | total 512-byte sectors (u64 LE)
+"""
+
+from __future__ import annotations
+
+import os
+import struct
+from collections.abc import Callable
+from typing import TYPE_CHECKING
+
+from pyremu.memory.bus import Device
+
+if TYPE_CHECKING:
+    pass
+
+# ============================================================
+#  MMIO 寄存器偏移
+# ============================================================
+
+VIRTIO_MMIO_MAGIC_VALUE = 0x000
+VIRTIO_MMIO_VERSION = 0x004
+VIRTIO_MMIO_DEVICE_ID = 0x008
+VIRTIO_MMIO_VENDOR_ID = 0x00C
+VIRTIO_MMIO_DEVICE_FEATURES = 0x010
+VIRTIO_MMIO_DEVICE_FEATURES_SEL = 0x014
+VIRTIO_MMIO_DRIVER_FEATURES = 0x020
+VIRTIO_MMIO_DRIVER_FEATURES_SEL = 0x024
+VIRTIO_MMIO_QUEUE_SEL = 0x030
+VIRTIO_MMIO_QUEUE_NUM_MAX = 0x034
+VIRTIO_MMIO_QUEUE_NUM = 0x038
+VIRTIO_MMIO_QUEUE_READY = 0x044
+VIRTIO_MMIO_QUEUE_NOTIFY = 0x050
+VIRTIO_MMIO_INTERRUPT_STATUS = 0x060
+VIRTIO_MMIO_INTERRUPT_ACK = 0x064
+VIRTIO_MMIO_STATUS = 0x070
+VIRTIO_MMIO_QUEUE_DESC_LOW = 0x080
+VIRTIO_MMIO_QUEUE_DESC_HIGH = 0x084
+VIRTIO_MMIO_QUEUE_DRIVER_LOW = 0x090
+VIRTIO_MMIO_QUEUE_DRIVER_HIGH = 0x094
+VIRTIO_MMIO_QUEUE_DEVICE_LOW = 0x0A0
+VIRTIO_MMIO_QUEUE_DEVICE_HIGH = 0x0A4
+VIRTIO_MMIO_CONFIG_GENERATION = 0x0FC
+
+# virtio-blk 配置空间 (offset 0x100+)
+VIRTIO_BLK_CFG_CAPACITY = 0x000
+
+# 整个 MMIO 区域大小
+VIRTIO_MMIO_SIZE = 0x200
+
+# ============================================================
+#  设备状态位
+# ============================================================
+
+VIRTIO_STATUS_ACKNOWLEDGE = 1
+VIRTIO_STATUS_DRIVER = 2
+VIRTIO_STATUS_DRIVER_OK = 4
+VIRTIO_STATUS_FEATURES_OK = 8
+VIRTIO_STATUS_DEVICE_NEEDS_RESET = 0x40
+VIRTIO_STATUS_FAILED = 0x80
+
+# ============================================================
+#  Feature bits
+# ============================================================
+
+VIRTIO_F_VERSION_1 = 1 << 32
+VIRTIO_F_RING_INDIRECT_DESC = 1 << 28
+VIRTIO_F_RING_EVENT_IDX = 1 << 29
+VIRTIO_BLK_F_SIZE_MAX = 1 << 1
+VIRTIO_BLK_F_SEG_MAX = 1 << 2
+VIRTIO_BLK_F_BLK_SIZE = 1 << 6
+
+# 本设备支持的 feature (64-bit)
+_DEVICE_FEATURES = (
+    VIRTIO_F_VERSION_1
+    | VIRTIO_F_RING_INDIRECT_DESC
+    | VIRTIO_F_RING_EVENT_IDX
+)
+
+# ============================================================
+#  virtio-blk 请求类型
+# ============================================================
+
+VIRTIO_BLK_T_IN = 0
+VIRTIO_BLK_T_OUT = 1
+VIRTIO_BLK_T_FLUSH = 4
+VIRTIO_BLK_T_DISCARD = 11
+VIRTIO_BLK_T_WRITE_ZEROES = 13
+
+# ============================================================
+#  virtio-blk 响应状态
+# ============================================================
+
+VIRTIO_BLK_S_OK = 0
+VIRTIO_BLK_S_IOERR = 1
+VIRTIO_BLK_S_UNSUPP = 2
+
+# ============================================================
+#  virtqueue 描述符标志
+# ============================================================
+
+VRING_DESC_F_NEXT = 1
+VRING_DESC_F_WRITE = 2
+VRING_DESC_F_INDIRECT = 4
+
+# 描述符大小: u64 addr + u32 len + u16 flags + u16 next = 16 bytes
+_VRING_DESC_SIZE = 16
+
+# ============================================================
+#  扇区大小 (字节)
+# ============================================================
+
+SECTOR_SIZE = 512
+
+
+class VirtIOBlock(Device):
+    """virtio-blk MMIO 块设备.
+
+    通过 MMIO 寄存器接口暴露一个 virtio-blk 设备,
+    Guest 可以读写磁盘镜像 (raw 格式).
+
+    Usage::
+
+        vblk = VirtIOBlock(
+            image_path="disk.img",
+            mem_read=bus.read,
+            mem_write=bus.write,
+        )
+        bus.add_device(0x1000_8000, vblk)
+    """
+
+    def __init__(
+        self,
+        image_path: str,
+        mem_read: Callable[[int, int], bytes],
+        mem_write: Callable[[int, bytes], None],
+        queue_size_max: int = 256,
+    ) -> None:
+        self.base_addr = 0
+        self.size = VIRTIO_MMIO_SIZE
+
+        # 打开磁盘镜像 (不存在则创建)
+        if not os.path.exists(image_path):
+            with open(image_path, "wb") as f:
+                f.truncate(0)
+        self._fd = os.open(image_path, os.O_RDWR)
+        self._disk_size = os.lseek(self._fd, 0, os.SEEK_END)
+
+        # 内存访问回调 — 用于读写 Guest 物理内存中的 virtqueue 描述符
+        self._mem_read = mem_read
+        self._mem_write = mem_write
+
+        # ---- MMIO 寄存器 ----
+        self._device_features_sel: int = 0
+        self._driver_features_sel: int = 0
+        self._driver_features: int = 0
+        self._queue_sel: int = 0
+        self._queue_num: int = queue_size_max
+        self._queue_ready: bool = False
+        self._status: int = 0
+        self._interrupt_status: int = 0
+
+        # 队列地址 (64-bit)
+        self._queue_desc: int = 0
+        self._queue_driver: int = 0
+        self._queue_device: int = 0
+
+        # 上次看到的可用环索引 (用于检测新请求)
+        self._last_avail_idx: int = 0
+
+        self._queue_num_max: int = queue_size_max
+
+    # ---- Device 接口 ----
+
+    def read(self, offset: int, size: int) -> bytes:
+        if size not in (1, 2, 4, 8):
+            return b"\x00" * size
+        val = self._mmio_read(offset)
+        return val.to_bytes(size, "little")
+
+    def write(self, offset: int, data: bytes) -> None:
+        size = len(data)
+        if size not in (1, 2, 4):
+            return
+        val = int.from_bytes(data, "little")
+        self._mmio_write(offset, val, size)
+
+    # ---- MMIO 读 ----
+
+    def _mmio_read(self, offset: int) -> int:
+        """读取 MMIO 寄存器 (4 字节, 内部处理对齐)."""
+        if offset == VIRTIO_MMIO_MAGIC_VALUE:
+            return 0x74726976  # "virt"
+        if offset == VIRTIO_MMIO_VERSION:
+            return 0x2
+        if offset == VIRTIO_MMIO_DEVICE_ID:
+            return 0x2  # block device
+        if offset == VIRTIO_MMIO_VENDOR_ID:
+            return 0x0
+
+        if offset == VIRTIO_MMIO_DEVICE_FEATURES:
+            sel = self._device_features_sel
+            return (_DEVICE_FEATURES >> (sel * 32)) & 0xFFFF_FFFF
+
+        if offset == VIRTIO_MMIO_QUEUE_NUM_MAX:
+            return self._queue_num_max
+
+        if offset == VIRTIO_MMIO_INTERRUPT_STATUS:
+            return self._interrupt_status
+
+        if offset == VIRTIO_MMIO_STATUS:
+            return self._status
+
+        if offset == VIRTIO_MMIO_CONFIG_GENERATION:
+            return 0  # 配置不会变
+
+        # ---- virtio-blk 配置空间 (0x100+) ----
+        if offset >= 0x100:
+            return self._config_read(offset)
+
+        # 未实现的寄存器, 返回 0
+        return 0
+
+    # ---- MMIO 写 ----
+
+    def _mmio_write(self, offset: int, val: int, size: int) -> None:
+        """写入 MMIO 寄存器."""
+        if offset == VIRTIO_MMIO_DEVICE_FEATURES_SEL:
+            self._device_features_sel = val
+
+        elif offset == VIRTIO_MMIO_DRIVER_FEATURES:
+            sel = self._driver_features_sel
+            mask_low = (val & 0xFFFF_FFFF) << (sel * 32)
+            self._driver_features = (self._driver_features & ~(0xFFFF_FFFF << (sel * 32))) | mask_low
+
+        elif offset == VIRTIO_MMIO_DRIVER_FEATURES_SEL:
+            self._driver_features_sel = val
+
+        elif offset == VIRTIO_MMIO_QUEUE_SEL:
+            self._queue_sel = val
+
+        elif offset == VIRTIO_MMIO_QUEUE_NUM:
+            self._queue_num = min(val, self._queue_num_max)
+
+        elif offset == VIRTIO_MMIO_QUEUE_READY:
+            self._queue_ready = val != 0
+            if self._queue_ready:
+                self._last_avail_idx = 0
+
+        elif offset == VIRTIO_MMIO_QUEUE_NOTIFY:
+            if val == 0 and self._queue_ready:
+                self._process_queue()
+
+        elif offset == VIRTIO_MMIO_INTERRUPT_ACK:
+            self._interrupt_status &= ~val
+
+        elif offset == VIRTIO_MMIO_STATUS:
+            # 写 0 -> 设备重置
+            if val == 0:
+                self._reset()
+            else:
+                self._status = val
+
+        elif offset == VIRTIO_MMIO_QUEUE_DESC_LOW:
+            self._queue_desc = (self._queue_desc & 0xFFFF_FFFF_0000_0000) | (val & 0xFFFF_FFFF)
+
+        elif offset == VIRTIO_MMIO_QUEUE_DESC_HIGH:
+            self._queue_desc = (self._queue_desc & 0xFFFF_FFFF) | ((val & 0xFFFF_FFFF) << 32)
+
+        elif offset == VIRTIO_MMIO_QUEUE_DRIVER_LOW:
+            self._queue_driver = (self._queue_driver & 0xFFFF_FFFF_0000_0000) | (val & 0xFFFF_FFFF)
+
+        elif offset == VIRTIO_MMIO_QUEUE_DRIVER_HIGH:
+            self._queue_driver = (self._queue_driver & 0xFFFF_FFFF) | ((val & 0xFFFF_FFFF) << 32)
+
+        elif offset == VIRTIO_MMIO_QUEUE_DEVICE_LOW:
+            self._queue_device = (self._queue_device & 0xFFFF_FFFF_0000_0000) | (val & 0xFFFF_FFFF)
+
+        elif offset == VIRTIO_MMIO_QUEUE_DEVICE_HIGH:
+            self._queue_device = (self._queue_device & 0xFFFF_FFFF) | ((val & 0xFFFF_FFFF) << 32)
+
+    # ---- virtio-blk 配置空间 ----
+
+    def _config_read(self, offset: int) -> int:
+        """读取 virtio-blk 设备特定配置."""
+        local = offset - 0x100
+        if local == VIRTIO_BLK_CFG_CAPACITY:
+            # 低 32-bit 容量 (扇区数)
+            return (self._disk_size // SECTOR_SIZE) & 0xFFFF_FFFF
+        if local == VIRTIO_BLK_CFG_CAPACITY + 4:
+            # 高 32-bit 容量
+            return ((self._disk_size // SECTOR_SIZE) >> 32) & 0xFFFF_FFFF
+        return 0
+
+    # ---- virtqueue 处理 ----
+
+    def _process_queue(self) -> None:
+        """处理 virtqueue 中的待处理请求."""
+        qnum = self._queue_num
+        if qnum == 0 or self._queue_desc == 0 or \
+        self._queue_driver == 0 or self._queue_device == 0:
+            return
+
+        # 读取可用环结构
+        # [0] flags (u16), [2] idx (u16), [4+] ring (qnum * u16)
+        self._read_u16(self._queue_driver)
+        avail_idx = self._read_u16(self._queue_driver + 2)
+
+        # 处理所有新的可用描述符
+        processed = 0
+        while self._last_avail_idx != avail_idx:
+            # 可用环条目: offset 4 + self._last_avail_idx % qnum * 2
+            ring_off = 4 + (self._last_avail_idx % qnum) * 2
+            desc_head = self._read_u16(self._queue_driver + ring_off)
+
+            # 处理描述符链
+            ok = self._process_descriptor_chain(desc_head)
+            if not ok:
+                # 出错了也不影响后续请求的处理
+                pass
+
+            # 写入 used ring 条目
+            self._write_used_entry(self._last_avail_idx % qnum, desc_head, 0 if ok else 1)
+
+            self._last_avail_idx += 1
+            processed += 1
+
+        if processed > 0:
+            # 更新 used ring 的 idx
+            self._write_u16(self._queue_device + 2, self._last_avail_idx)
+            # 置中断状态位 (bit 0: used buffer notification)
+            self._interrupt_status |= 1
+
+    def _process_descriptor_chain(self, head: int) -> bool:
+        """处理一个描述符链: header -> data -> status."""
+
+        # 读取第一个描述符 -> 请求头 (virtio_blk_outhdr: 16 bytes)
+        desc_addr, desc_len, desc_flags, desc_next = self._read_descriptor(head)
+
+        if desc_len < 16:
+            return False
+
+        hdr_data = self._mem_read(desc_addr, 16)
+        req_type = int.from_bytes(hdr_data[0:4], "little")
+        # ioprio = int.from_bytes(hdr_data[4:8], "little")  # 未使用
+        sector = int.from_bytes(hdr_data[8:16], "little")
+
+        # 遍历到第二个描述符 -> 数据缓冲区
+        if not (desc_flags & VRING_DESC_F_NEXT):
+            return False
+        desc_addr, desc_len, desc_flags, desc_next = self._read_descriptor(desc_next)
+
+        # 遍历到第三个描述符 -> 状态字节
+        if not (desc_flags & VRING_DESC_F_NEXT):
+            return False
+        status_addr, _status_len, _status_flags, _ = self._read_descriptor(desc_next)
+
+        # 执行 I/O
+        if req_type == VIRTIO_BLK_T_IN:
+            ok = self._do_read(sector, desc_addr, desc_len)
+        elif req_type == VIRTIO_BLK_T_OUT:
+            ok = self._do_write(sector, desc_addr, desc_len)
+        elif req_type == VIRTIO_BLK_T_FLUSH:
+            # FLUSH: 把文件内容刷到磁盘
+            ok = self._do_flush()
+        elif req_type in (VIRTIO_BLK_T_DISCARD, VIRTIO_BLK_T_WRITE_ZEROES):
+            # 不支持的请求类型 -> 返回 VIRTIO_BLK_S_UNSUPP
+            self._mem_write(status_addr, bytes([VIRTIO_BLK_S_UNSUPP]))
+            return True
+        else:
+            ok = False
+
+        # 写入状态字节
+        status = VIRTIO_BLK_S_OK if ok else VIRTIO_BLK_S_IOERR
+        self._mem_write(status_addr, bytes([status]))
+
+        return ok
+
+    def _do_read(self, sector: int, buf_pa: int, buf_len: int) -> bool:
+        """从扇区 *sector* 读取数据到 Guest 物理地址 *buf_pa*."""
+        offset = sector * SECTOR_SIZE
+        if offset >= self._disk_size:
+            # 超出磁盘范围 — 返回全零
+            data = b"\x00" * buf_len
+        else:
+            data = os.pread(self._fd, buf_len, offset)
+        self._mem_write(buf_pa, data)
+        return True
+
+    def _do_write(self, sector: int, buf_pa: int, buf_len: int) -> bool:
+        """从 Guest 物理地址 *buf_pa* 写入数据到扇区 *sector*."""
+        data = self._mem_read(buf_pa, buf_len)
+        offset = sector * SECTOR_SIZE
+        os.pwrite(self._fd, data, offset)
+        # 更新磁盘大小 (如果写到了文件末尾之后)
+        end = offset + len(data)
+        self._disk_size = max(self._disk_size, end)
+        return True
+
+    def _do_flush(self) -> bool:
+        """将文件内容同步到磁盘."""
+        try:
+            os.fsync(self._fd)
+        except OSError:
+            return False
+        return True
+
+    # ---- virtqueue 辅助函数 ----
+
+    def _read_descriptor(self, idx: int) -> tuple[int, int, int, int]:
+        """读取第 *idx* 个 virtqueue 描述符 -> (addr, len, flags, next)."""
+        addr = self._queue_desc + idx * _VRING_DESC_SIZE
+        raw = self._mem_read(addr, _VRING_DESC_SIZE)
+        desc_addr = int.from_bytes(raw[0:8], "little")
+        desc_len = int.from_bytes(raw[8:12], "little")
+        desc_flags = int.from_bytes(raw[12:14], "little")
+        desc_next = int.from_bytes(raw[14:16], "little")
+        return desc_addr, desc_len, desc_flags, desc_next
+
+    def _write_used_entry(self, ring_idx: int, desc_head: int, _len_written: int) -> None:
+        """写入 used ring 条目.
+
+        Used ring 布局:
+          [0] flags (u16), [2] idx (u16), [4+] ring (ring_idx * 8)
+        used ring 条目: [0] id (u32), [4] len (u32) = 8 bytes
+        """
+        # Used ring 条目偏移: 2 (flags+idx) + ring_idx * 8
+        used_ring_start = self._queue_device
+        entry_off = used_ring_start + 4 + ring_idx * 8
+        raw = struct.pack("<II", desc_head, 0)
+        self._mem_write(entry_off, raw)
+
+    def _read_u16(self, pa: int) -> int:
+        raw = self._mem_read(pa, 2)
+        return int.from_bytes(raw, "little")
+
+    def _write_u16(self, pa: int, val: int) -> None:
+        self._mem_write(pa, struct.pack("<H", val & 0xFFFF))
+
+    def _reset(self) -> None:
+        """设备重置."""
+        self._status = 0
+        self._device_features_sel = 0
+        self._driver_features_sel = 0
+        self._driver_features = 0
+        self._queue_sel = 0
+        self._queue_ready = False
+        self._interrupt_status = 0
+        self._queue_desc = 0
+        self._queue_driver = 0
+        self._queue_device = 0
+        self._last_avail_idx = 0

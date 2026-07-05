@@ -36,6 +36,7 @@ from pyremu.core.hart import (
     RiscvMode,
 )
 from pyremu.core.trap import TrapType, trap_cause_code
+from pyremu.interrupt.controller import INT_SOURCE_MIP_MASK, IntSource
 
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
@@ -110,24 +111,19 @@ def deliver_trap(
     # M 模式下永不委派; S/U 模式下根据 medeleg/mideleg 判断
     delegate = False
     if hart.mode != RiscvMode.M:
-        if is_interrupt:
-            delegate = bool(hart.csrs["mideleg"].val & (1 << exc_code))
-        else:
-            delegate = bool(hart.csrs["medeleg"].val & (1 << exc_code))
+        choice = hart.csrs["mideleg"].val if is_interrupt else hart.csrs["medeleg"].val
+        delegate = bool(choice & (1 << exc_code))
 
     if _TRACE_TRAPS:
         _target = "S" if delegate else "M"
         _ctx = (
-            f"[trap:{hart.id}] {hart.mode.name}→{_target}: {cause.name} "
+            f"[trap:{hart.id}] {hart.mode.name}->{_target}: {cause.name} "
             f"tval={tval:#018x} pc={hart.pc:#018x} "
             f"exc_code={exc_code} mstatus={hart.mstatus_val:#018x}"
         )
         logger.debug(_ctx)
-
-    if delegate:
-        _trap_deliver_smode(hart, code, exc_code, tval, is_interrupt)
-    else:
-        _trap_deliver_mmode(hart, code, exc_code, tval, is_interrupt)
+    fn = _trap_deliver_smode if delegate else _trap_deliver_mmode
+    fn(hart, code, exc_code, tval, is_interrupt)
 
 
 # ---- S 模式 trap 投递 ----
@@ -174,11 +170,11 @@ def _trap_deliver_smode(
     stvec = hart.csrs["stvec"].val
     tvec_mode = stvec & 0x3
     tvec_base = stvec & ~0x3
-    if tvec_mode == 0:
+    if tvec_mode == 0 or not is_interrupt:
         hart.pc = tvec_base
     else:
         # vectored: 所有异常跳转 BASE, 中断跳转 BASE + 4 * exc_code
-        hart.pc = tvec_base if not is_interrupt else (tvec_base + 4 * exc_code)
+        hart.pc = (tvec_base + 4 * exc_code)
 
 
 # ---- M 模式 trap 投递 ----
@@ -225,10 +221,10 @@ def _trap_deliver_mmode(
     mtvec = hart.csrs["mtvec"].val
     tvec_mode = mtvec & 0x3
     tvec_base = mtvec & ~0x3
-    if tvec_mode == 0:
+    if tvec_mode == 0 or not is_interrupt:
         hart.pc = tvec_base
     else:
-        hart.pc = tvec_base if not is_interrupt else (tvec_base + 4 * exc_code)
+        hart.pc = (tvec_base + 4 * exc_code)
 
 
 # ============================================================
@@ -290,7 +286,7 @@ def trap_mret(
     # PC ← mepc
     hart.pc = hart.mepc_val & 0xFFFF_FFFF_FFFF_FFFF
 
-    # 从 trap 返回 → 清除 WFI 唤醒标记, 后续指令正常计数
+    # 从 trap 返回 -> 清除 WFI 唤醒标记, 后续指令正常计数
     hart._wfi_woken = False
 
 
@@ -325,7 +321,7 @@ def trap_sret(
     # PC ← sepc
     hart.pc = hart.sepc_val & 0xFFFF_FFFF_FFFF_FFFF
 
-    # 从 trap 返回 → 清除 WFI 唤醒标记, 后续指令正常计数
+    # 从 trap 返回 -> 清除 WFI 唤醒标记, 后续指令正常计数
     hart._wfi_woken = False
 
 
@@ -346,22 +342,21 @@ def handle_wfi(
     - 若中断已挂起且使能, WFI 不等待, 继续执行
     - 等待状态下中断挂起且使能时 hart 被唤醒
     - 唤醒后 PC 指向 WFI 下一条指令; 若中断可被响应则走正常中断处理
-    - mstatus.TW=1 且非 M 模式时执行 WFI → IllInstr
+    - mstatus.TW=1 且非 M 模式时执行 WFI -> IllInstr
 
     注意: 等待期间不检查 mstatus.MIE, 仅 mip & mie 非零即可唤醒.
     """
-    # TW (Timeout Wait) 检查: 非 M 模式下 mstatus.TW=1 → 非法指令异常
-    if hart.mode != RiscvMode.M:
-        if hart.mstatus_val & MSTATUS_TW:
-            deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
-            return
+    # TW (Timeout Wait) 检查: 非 M 模式下 mstatus.TW=1 -> 非法指令异常
+    if hart.mode != RiscvMode.M and hart.mstatus_val & MSTATUS_TW:
+        deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
+        return
 
     # 检查是否已有待处理且使能的中断
     # 若 mip & mie 非零, 立即返回 (NOP, PC 将 +4)
     if hart.mip_val & hart.mie_val:
         return  # 正常返回, 调用方会将 PC+4
 
-    # 无可处理中断 → 进入等待状态, 重置唤醒标记
+    # 无可处理中断 -> 进入等待状态, 重置唤醒标记
     hart._waiting = True
     hart._wfi_woken = False
 
@@ -369,6 +364,29 @@ def handle_wfi(
 # ============================================================
 #  中断检查 (指令边界)
 # ============================================================
+
+
+def _compute_next_timer(
+    hart: HartWithRegs,
+    ctrl,  # InterruptController
+) -> int:
+    """计算最早定时器唤醒时间 (mtime 值); 0 = 无定时器使能.
+
+    供中断缓存快速路径: 若 mtime < wakeup, 可跳过全量中断检查.
+    """
+    mie = hart._csr_read_raw("mie")
+    wakeup = 0
+    # MTIE (bit 7): CLINT mtimecmp
+    if mie & (1 << 7):
+        clint_wake = ctrl.get_next_timer_wakeup(hart.id)
+        if clint_wake:
+            wakeup = clint_wake
+    # STIE (bit 5): Sstc stimecmp
+    if mie & (1 << 5):
+        s_cmp = hart._csr_read_raw("stimecmp")
+        if s_cmp and (wakeup == 0 or s_cmp < wakeup):
+            wakeup = s_cmp
+    return wakeup
 
 
 def check_pending_interrupts(
@@ -386,19 +404,52 @@ def check_pending_interrupts(
     - M 模式 + MIE=0: 全局关中断, 不响应任何中断
     - S 模式 + SIE=0: 仅非委派 (M 级) 中断可抢占; 已委派中断被阻塞
     - U 模式: 全部中断全局使能
+
+    中断状态缓存: _int_state_version 跟踪所有中断相关状态变化.
+    若版本号未变且 mtime 未到下一唤醒点, 直接返回 False (~50ns),
+    避免每条指令遍历 CLINT+CSR+PLIC (~1272ns).
     """
     if hart._interrupt_ctrl is None:
         return False
 
-    has_pending, mip_bits, _ = hart._interrupt_ctrl.check_interrupt(hart.id)
-    if not has_pending:
+    ctrl = hart._interrupt_ctrl
+
+    # ---- 快速路径: 缓存命中 ----
+    if hart._int_cache_version == hart._int_state_version:
+        next_timer = hart._int_cache_next_timer
+        if next_timer == 0 or ctrl.get_mtime() < next_timer:
+            return False
+
+    # ---- 全量中断检查 ----
+    # 1. CLINT: 定时器 + 软件中断
+    has_pending, mip_bits, _ = ctrl.check_interrupt(hart.id)
+
+    # 2. STIP via stimecmp (Sstc 扩展)
+    #    S 模式直接写 stimecmp CSR 设置定时器, 无需 SBI ecall 往返.
+    #    硬件: mtime >= stimecmp > 0 ⇒ STIP 置位; 否则 STIP 清零.
+    stimecmp_val = hart._csr_read_raw("stimecmp")
+    if stimecmp_val > 0 and hart._interrupt_ctrl.get_mtime() >= stimecmp_val:
+        mip_bits |= INT_SOURCE_MIP_MASK[IntSource.STI]
+        has_pending = True
+
+    # 3. PLIC: 外部中断 (MEIP/SEIP)
+    plic_mip = 0
+    if hart._plic is not None:
+        plic_mip = hart._plic.get_pending_mip(hart.id)
+
+    # 合并全部硬件中断源
+    mip_bits = mip_bits | plic_mip
+    if not has_pending and plic_mip == 0:
+        # 无中断挂起 → 更新缓存供后续快速路径使用
+        hart._int_cache_version = hart._int_state_version
+        hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)
         return False
 
     # 更新 mip CSR: 合并硬件中断源和软件写入的 mip 位
-    current_mip = hart.mip_val
-    hart.mip_val = current_mip | mip_bits
+    current_mip = hart._csr_read_raw("mip")
+    hart._csr_write_raw("mip", current_mip | mip_bits)
 
-    # M 模式 + MIE=0 → 全局关中断
+    # M 模式 + MIE=0 -> 全局关中断
     if hart.mode == RiscvMode.M and not hart.mie:
         return False
 
@@ -460,15 +511,11 @@ def deliver_trap_nested_enabled(
 
     delegate = False
     if hart.mode != RiscvMode.M:
-        if is_interrupt:
-            delegate = bool(hart.csrs["mideleg"].val & (1 << exc_code))
-        else:
-            delegate = bool(hart.csrs["medeleg"].val & (1 << exc_code))
+        choice = hart.csrs["mideleg"].val if is_interrupt else hart.csrs["medeleg"].val
+        delegate = bool(choice & (1 << exc_code))
 
-    if delegate:
-        _trap_deliver_smode(hart, code, exc_code, tval, is_interrupt)
-    else:
-        _trap_deliver_mmode(hart, code, exc_code, tval, is_interrupt)
+    fn = _trap_deliver_smode if delegate else _trap_deliver_mmode
+    fn(hart, code, exc_code, tval, is_interrupt)
 
 
 def check_pending_interrupts_nested_enabled(
@@ -484,12 +531,24 @@ def check_pending_interrupts_nested_enabled(
     if hart._interrupt_ctrl is None:
         return False
 
-    has_pending, mip_bits, _ = hart._interrupt_ctrl.check_interrupt(hart.id)
+    ctrl = hart._interrupt_ctrl
+
+    # ---- 快速路径: 缓存命中 ----
+    if hart._int_cache_version == hart._int_state_version:
+        next_timer = hart._int_cache_next_timer
+        if next_timer == 0 or ctrl.get_mtime() < next_timer:
+            return False
+
+    # ---- 全量中断检查 ----
+    has_pending, mip_bits, _ = ctrl.check_interrupt(hart.id)
     if not has_pending:
+        # 无中断挂起 → 更新缓存
+        hart._int_cache_version = hart._int_state_version
+        hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)
         return False
 
-    current_mip = hart.mip_val
-    hart.mip_val = current_mip | mip_bits
+    current_mip = hart._csr_read_raw("mip")
+    hart._csr_write_raw("mip", current_mip | mip_bits)
 
     if hart.mode == RiscvMode.M and not hart.mie:
         return False
@@ -504,18 +563,9 @@ def check_pending_interrupts_nested_enabled(
         hart.mode == RiscvMode.S and hart.sie
     )
 
-    int_priority = [
-        (1 << 11, TrapType.MmodeExternInterrupt),
-        (1 << 3, TrapType.MmodeSoftInterrupt),
-        (1 << 7, TrapType.MmodeTimerInterrupt),
-        (1 << 9, TrapType.SmodeExternInterrupt),
-        (1 << 1, TrapType.SmodeSoftInterrupt),
-        (1 << 5, TrapType.SmodeTimerInterrupt),
-    ]
-    for mask, trap_type in int_priority:
-        if not (masked & mask):
-            continue
-        if (mideleg & mask) and not s_mode_global:
+    # 使用模块级预计算常量, 避免每条指令分配 list + 6 tuple.
+    for mask, trap_type in _INT_PRIORITY:
+        if not (masked & mask) or ((mideleg & mask) and not s_mode_global):
             continue
         deliver_trap_nested_enabled(
             hart,

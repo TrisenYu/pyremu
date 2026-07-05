@@ -16,9 +16,16 @@ RV64 编码: pmpcfgN 覆盖 8 个条目, 仅偶数编号的 pmpcfg 可用.
 from __future__ import annotations
 
 import os
+from array import array as _array
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 from loguru import logger
+
+from pyremu._native import (
+    native_available,
+    pmp_check as _native_pmp_check,
+)
 
 # PMP 配置位 (每 8-bit 条目中的位偏移)
 PMP_R = 0b0000_0001
@@ -31,8 +38,8 @@ PMP_A_NA4 = 0b0001_0000  # Naturally Aligned 4-byte
 PMP_A_NAPOT = 0b0001_1000  # Naturally Aligned Power-of-Two
 PMP_L = 0b1000_0000  # 锁定位
 
-# RiscvMode 值 → PMP 检查时的特权级逻辑:
-# M=3 且 MPRV=0 → 跳过 PMP; 否则按 MPP 特权级检查
+# RiscvMode 值 -> PMP 检查时的特权级逻辑:
+# M=3 且 MPRV=0 -> 跳过 PMP; 否则按 MPP 特权级检查
 _MODE_M = 3
 
 
@@ -43,7 +50,7 @@ def _decode_pmpcfg(cfg_val: int, entry_idx: int) -> int:
 
 
 def decode_napot(pmpaddr_val: int) -> tuple[int, int]:
-    """解码 NAPOT 格式的 pmpaddr → (base, size).
+    """解码 NAPOT 格式的 pmpaddr -> (base, size).
 
     算法: 统计 pmpaddr 中从 LSB 开始的连续 1 的个数 k,
         则 size = 2^(k+3), base = (pmpaddr & ~mask_k) << 2.
@@ -103,10 +110,31 @@ def _check_perm(cfg: int, is_write: bool, is_execute: bool) -> bool:
     return True
 
 
+@dataclass
+class PmpAccessInfo:
+    """PMP 检查所需的全部访问信息.
+
+    pa / size 描述访存操作的物理地址和大小;
+    mode_val / mstatus_val 提供当前 hart 的特权级和状态;
+    is_write / is_execute 区分读/写/执行;
+    pmpsplit / mdid 提供 TEE 飞地 PMP 虚拟化参数.
+    """
+
+    pa: int
+    size: int
+    mode_val: int
+    mstatus_val: int
+    is_write: bool = False
+    is_execute: bool = False
+    pmpsplit: int = 0
+    mdid: int = 0
+
+
 class Pmp:
     """Physical Memory Protection 检查器.
 
     直接读取 hart CSRs, 每次 check() 调用时重新计算.
+    支持 Rust native 加速路径 (零状态共享, 纯函数 FFI).
     """
 
     def __init__(
@@ -119,64 +147,113 @@ class Pmp:
             raise ValueError("num_entries must be 0..64")
         self._num_entries = num_entries
 
+        # Rust 加速: 扁平化 PMP 条目缓存 (64 u8 cfg + 64 u64 addr)
+        self._flat_cfg: bytearray = bytearray(64)
+        self._flat_addr: _array = _array("Q", [0] * 64)
+        self._cache_dirty: bool = True
+        self._use_native: bool = native_available()
+
     # ---- 属性 ----
 
     @property
     def num_entries(self) -> int:
         return self._num_entries
 
+    # ---- 缓存管理 ----
+
+    def invalidate_cache(self) -> None:
+        """PMP CSR 写入后标记缓存失效."""
+        self._cache_dirty = True
+
+    def _rebuild_cache(self) -> None:
+        """从 CSR dict 重建扁平化 PMP 数组."""
+        for i in range(self._num_entries):
+            self._flat_cfg[i] = self._read_cfg(i)
+            self._flat_addr[i] = self._read_addr(i)
+        # 清除剩余条目
+        for i in range(self._num_entries, 64):
+            self._flat_cfg[i] = 0
+            self._flat_addr[i] = 0
+        self._cache_dirty = False
+
     # ---- 权限检查入口 ----
 
-    def check(
-        self,
-        pa: int,
-        size: int,
-        mode_val: int,
-        mstatus_val: int,
-        is_write: bool = False,
-        is_execute: bool = False,
-    ) -> bool:
-        """检查物理地址访问是否允许. 返回 True 表示通过.
+    def check(self, info: PmpAccessInfo) -> bool:
+        """检查物理地址访问是否允许. 返回 True 表示通过."""
+        pa, size = info.pa, info.size
+        mode_val, mstatus_val = info.mode_val, info.mstatus_val
+        is_write, is_execute = info.is_write, info.is_execute
+        pmpsplit, mdid = info.pmpsplit, info.mdid
 
-        Args:
-            pa: 物理地址.
-            size: 访问字节数.
-            mode_val: 当前 RiscvMode.value (U=0, S=1, H=2, M=3, D=8).
-            mstatus_val: 当前 mstatus CSR 值 (用于 MPRV 检查).
-            is_write: 是否为写操作.
-            is_execute: 是否为取指操作.
-        """
+        # M-mode MPRV=0 — PMP 不检查 (RISC-V spec §3.7.1)
+        if mode_val == _MODE_M and ((mstatus_val >> 17) & 1) == 0:
+            return True
+
+        # 飞地 split 超限预检 (在所有路径前, 避免无谓的缓存重建)
+        if mdid != 0 and pmpsplit > 0 and pmpsplit >= self._num_entries:
+            if os.environ.get("PYREMU_TRACE_PMP", "") == "1":
+                logger.debug(
+                    f"[pmp] DENY enclave mdid={mdid} "
+                    f"pmpsplit={pmpsplit} >= num_entries={self._num_entries}"
+                )
+            return False
+
+        # Rust native 加速路径 (处理全部 PMP 逻辑: M-mode bypass, MPRV, pmpsplit, etc.)
+        if self._use_native:
+            if self._cache_dirty:
+                self._rebuild_cache()
+            return _native_pmp_check(
+                bytes(self._flat_cfg),
+                self._flat_addr,
+                self._num_entries,
+                pa,
+                size,
+                is_write=is_write,
+                is_execute=is_execute,
+                mode_val=mode_val,
+                mstatus_val=mstatus_val,
+                pmpsplit=pmpsplit,
+                mdid=mdid,
+            )
+
+        # 纯 Python fallback
+        return self._check_py(info)
+
+    def _check_py(self, info: PmpAccessInfo) -> bool:
+        """纯 Python PMP 检查 (native 库缺失时的 fallback)."""
+        pa, size = info.pa, info.size
+        mode_val, mstatus_val = info.mode_val, info.mstatus_val
+        is_write, is_execute = info.is_write, info.is_execute
+        pmpsplit, mdid = info.pmpsplit, info.mdid
+
         # 确定有效特权级
         eff_mode = mode_val
         if mode_val == _MODE_M:
             mprv = (mstatus_val >> 17) & 1
-            if mprv:
-                # MPRV=1: 使用 MPP 作为有效特权级
-                mpp = (mstatus_val >> 11) & 3
-                # MPP: 0=U, 1=S, 3=M
-                mpp_map = {0: 0, 1: 1, 3: 3}
-                eff_mode = mpp_map.get(mpp, 3)
-            else:
-                # M 模式且 MPRV=0: PMP 不检查
+            if not mprv:
                 return True
+            mpp = (mstatus_val >> 11) & 3
+            mpp_map = {0: 0, 1: 1, 3: 3}
+            eff_mode = mpp_map.get(mpp, 3)
 
-        # 若无 PMP 条目, S/U 模式拒绝所有访问
         if self._num_entries == 0:
             return False
 
+        enclave_mode = mdid != 0
+
         # 按优先级遍历 PMP 条目 (低编号优先)
-        matched_any = False
         for i in range(self._num_entries):
+            if enclave_mode and pmpsplit > 0 and i < pmpsplit:
+                continue
+
             cfg = self._read_cfg(i)
-            if not (cfg & PMP_A_MASK):  # OFF — 跳过
+            if not (cfg & PMP_A_MASK):
                 continue
 
             addr_field = self._read_addr(i)
             if not self._match(i, cfg, addr_field, pa, size):
                 continue
-            matched_any = True
 
-            # 匹配成功 — 按该条目权限判断
             ok = _check_perm(cfg, is_write, is_execute)
             if not ok and os.environ.get("PYREMU_TRACE_PMP", "") == "1":
                 logger.debug(
@@ -186,20 +263,13 @@ class Pmp:
                 )
             return ok
 
-        # 无匹配条目 — M 模式允许, S/U 拒绝
-        if eff_mode != _MODE_M and os.environ.get("PYREMU_TRACE_PMP", "") == "1":
-            logger.debug(
-                f"[pmp] NOMATCH pa={pa:#018x} size={size} "
-                f"eff_mode={eff_mode} is_write={is_write} matched_any={matched_any} "
-                f"num_entries={self._num_entries}"
-            )
         return eff_mode == _MODE_M
 
     # ---- 内部 ----
 
     def _read_cfg(self, idx: int) -> int:
         """读取第 *idx* 个 PMP 条目的 8-bit 配置."""
-        cfg_idx = idx // 4  # 每个 pmpcfg 存 4 个条目 (RV32), 或 8 个 (RV64)
+        idx // 4  # 每个 pmpcfg 存 4 个条目 (RV32), 或 8 个 (RV64)
         # RV64: 仅偶数编号的 pmpcfg 有效 (存储 8 条目)
         # 简化: 统一用 RV64 模型 — 按 8 条目编组
         cfg_reg = (idx // 8) * 2  # pmpcfg0, pmpcfg2, pmpcfg4, ...

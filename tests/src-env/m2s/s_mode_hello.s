@@ -1,7 +1,7 @@
 // SPDX-LICENSE-IDENTIFIER: GPL2.0
 // (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-// M 模式 → S 模式启动移交: 模拟 OpenSBI 将控制权移交给操作系统的 boot 片段.
+// M 模式 -> S 模式启动移交: 模拟 OpenSBI 将控制权移交给操作系统的 boot 片段.
 //
 // 流程:
 //   1. M 模式初始化 UART, 保存 mstatus 到共享内存, 设置 mtvec 和 mstatus.MPP=S
@@ -159,7 +159,7 @@ uart_puthex64:
     andi a0, a0, 0xF
     // 转换为 ASCII hex 字符
     li   t0, 10
-    blt  a0, t0, 2f          // a0 < 10 → 数字
+    blt  a0, t0, 2f          // a0 < 10 -> 数字
     addi a0, a0, 'a' - 10    // a-f
     j    3f
 2:

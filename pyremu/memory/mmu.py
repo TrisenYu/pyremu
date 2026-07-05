@@ -14,6 +14,13 @@ RISC-V 内存管理单元 (MMU): 页表项 (PTE) 定义与 Sv39 页表遍历。
 from enum import Enum
 from typing import Callable
 
+from pyremu._native import (
+    native_available,
+    pte_assemble_pa as _native_pte_assemble_pa,
+    pte_parse as _native_pte_parse,
+    sv39_decompose_va as _native_sv39_decompose_va,
+)
+
 # ============================================================
 #  地址翻译模式 (satp.MODE)
 # ============================================================
@@ -243,21 +250,28 @@ class PTE:
 # ============================================================
 #  VPN 分解 (Sv39 / Sv48)
 # ============================================================
-# Sv39: VA[38:12] 共 27 位 → vpn[2] = VA[38:30] (9b),
+# Sv39: VA[38:12] 共 27 位 -> vpn[2] = VA[38:30] (9b),
 #                           vpn[1] = VA[29:21] (9b),
 #                           vpn[0] = VA[20:12] (9b)
-# Sv48: VA[47:12] 共 36 位 → vpn[3] = VA[47:39],
+# Sv48: VA[47:12] 共 36 位 -> vpn[3] = VA[47:39],
 #                           vpn[2] = VA[38:30],
 #                           vpn[1] = VA[29:21],
 #                           vpn[0] = VA[20:12]
 
 
+_NATIVE_MMU = native_available()
+
+
 def _sv39_vpn(va: int) -> tuple:
     """将 39 位虚拟地址分解为 (vpn2, vpn1, vpn0)."""
-    vpn0 = (va >> 12) & 0x1FF
-    vpn1 = (va >> 21) & 0x1FF
-    vpn2 = (va >> 30) & 0x1FF
-    return vpn2, vpn1, vpn0
+    if _NATIVE_MMU:
+        v = _native_sv39_decompose_va(va)
+        return v.vpn2, v.vpn1, v.vpn0
+    return (
+        (va >> 30) & 0x1FF,
+        (va >> 21) & 0x1FF,
+        (va >> 12) & 0x1FF,
+    )
 
 
 def _sv48_vpn(va: int) -> tuple:
@@ -277,6 +291,11 @@ def _sv48_vpn(va: int) -> tuple:
 # 索引 = 对应级的 VPN, PTE 地址 = base + vpn * 8
 
 
+def _read_pte(pa: int, mem_read_phy: Callable[[int, int], bytes]) -> int:
+    """Read a 64-bit PTE from physical memory, return raw int."""
+    return int.from_bytes(mem_read_phy(pa, 8), "little", signed=False)
+
+
 def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes]) -> tuple:
     """Sv39 三级页表遍历.
 
@@ -287,53 +306,60 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
 
     Returns:
         (success: bool, ppn: int, perm_flags: int, page_size: int)
-        - success: 遍历成功且找到有效叶 PTE
-        - ppn: 叶 PTE 的物理页号
-        - perm_flags: PTE 权限位 (PTE_R|PTE_W|PTE_X|PTE_U 的组合)
-        - page_size: 映射的页大小 (4 KiB 普通页, 2 MiB 大页, 1 GiB 巨页)
     """
-    vpn = _sv39_vpn(va)
+    vpn = _sv39_vpn(va)  # (vpn2, vpn1, vpn0)
 
     # 一级页表: 基址 = root_ppn << PAGE_SHIFT, 索引 vpn[2]
     table_addr = (root_ppn << PAGE_SHIFT) & 0xFFFF_FFFF_FFFF_FFFF
-    pte_addr = table_addr + vpn[0] * 8  # vpn[2] 是最高 9 位
-    raw = int.from_bytes(mem_read_phy(pte_addr, 8), "little", signed=False)
-    pte = PTE.from_int(raw)
+    raw = _read_pte(table_addr + vpn[0] * 8, mem_read_phy)
 
-    if not pte.v:
-        return False, 0, 0, 0
-    if pte.r or pte.x:
-        # 1 GiB 巨页 (仅在第一级就命中, Sv39 不支持; 但规范允许)
-        # 实际 Sv39 第一级不应为叶, 返回错误
-        return False, 0, 0, 0
+    if _NATIVE_MMU:
+        l1 = _native_pte_parse(raw)
+        if not l1.is_ptr:
+            return False, 0, 0, 0
+    else:
+        pte = PTE.from_int(raw)
+        if not pte.v or pte.r or pte.x:
+            return False, 0, 0, 0
 
     # 二级页表
-    table_addr = (pte.ppn << PAGE_SHIFT) & 0xFFFF_FFFF_FFFF_FFFF
-    pte_addr = table_addr + vpn[1] * 8
-    raw = int.from_bytes(mem_read_phy(pte_addr, 8), "little", signed=False)
-    pte = PTE.from_int(raw)
+    l1_ppn = l1.ppn if _NATIVE_MMU else pte.ppn
+    table_addr = (l1_ppn << PAGE_SHIFT) & 0xFFFF_FFFF_FFFF_FFFF
+    raw = _read_pte(table_addr + vpn[1] * 8, mem_read_phy)
 
-    if not pte.v:
-        return False, 0, 0, 0
-    if pte.r or pte.x:
-        # 2 MiB 大页
-        # PTE 的 PPN[0] 字段 (10 bits) 不参与大页映射,
-        # 由 VA 的 vpn[0] (9 bits) 替代 PPN 的低 9 位
-        ppn = pte.ppn
-        # 清除 PPN 低 10 位 (bits[9:0]), 替换为 VA 的 vpn[0] (9 bits).
-        # Python ~0x3FF 产生负无穷精度整数, 必须显式截断到 64-bit.
-        ppn = (ppn & 0xFFFF_FFFF_FFFF_FC00) | vpn[2]
-        return True, ppn, _pte_perm_flags(pte), 2 * 1024 * 1024
+    if _NATIVE_MMU:
+        l2 = _native_pte_parse(raw)
+        if not l2.v:
+            return False, 0, 0, 0
+        if l2.is_leaf:
+            # 2 MiB 大页 — Rust 计算合并 PPN
+            ppn = _native_pte_assemble_pa(l2.ppn, va, level=1) >> 12
+            return True, ppn, l2.perm, 2 * 1024 * 1024
+        if not l2.is_ptr:
+            return False, 0, 0, 0
+    else:
+        pte = PTE.from_int(raw)
+        if not pte.v:
+            return False, 0, 0, 0
+        if pte.r or pte.x:
+            ppn = pte.ppn
+            ppn = (ppn & 0xFFFF_FFFF_FFFF_FE00) | vpn[2]
+            return True, ppn, _pte_perm_flags(pte), 2 * 1024 * 1024
 
     # 三级页表 (4 KiB 普通页)
-    table_addr = (pte.ppn << PAGE_SHIFT) & 0xFFFF_FFFF_FFFF_FFFF
-    pte_addr = table_addr + vpn[2] * 8
-    raw = int.from_bytes(mem_read_phy(pte_addr, 8), "little", signed=False)
-    pte = PTE.from_int(raw)
+    l2_ppn = l2.ppn if _NATIVE_MMU else pte.ppn
+    table_addr = (l2_ppn << PAGE_SHIFT) & 0xFFFF_FFFF_FFFF_FFFF
+    raw = _read_pte(table_addr + vpn[2] * 8, mem_read_phy)
 
+    if _NATIVE_MMU:
+        l3 = _native_pte_parse(raw)
+        if not l3.v or not l3.is_leaf:
+            return False, 0, 0, 0
+        return True, l3.ppn, l3.perm, PAGE_SIZE
+
+    pte = PTE.from_int(raw)
     if not pte.v or not (pte.r or pte.x):
         return False, 0, 0, 0
-
     return True, pte.ppn, _pte_perm_flags(pte), PAGE_SIZE
 
 
@@ -348,7 +374,7 @@ def _pte_perm_flags(pte: PTE) -> int:
 
 
 def translate_va(va: int, satp_val: int, mem_read_phy: Callable[[int, int], bytes]) -> tuple:
-    """根据 satp 配置进行虚拟地址 → 物理地址翻译.
+    """根据 satp 配置进行虚拟地址 -> 物理地址翻译.
 
     当前仅支持 Bare (直接等同物理地址) 和 Sv39.
 
@@ -381,7 +407,7 @@ def translate_va(va: int, satp_val: int, mem_read_phy: Callable[[int, int], byte
 
 
 # ============================================================
-#  PTE 标志位 → 可读字符串
+#  PTE 标志位 -> 可读字符串
 # ============================================================
 
 # Sv39 PTE 标志位掩码

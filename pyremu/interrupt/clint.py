@@ -8,7 +8,7 @@
 SiFive 兼容的 CLINT (Core Local Interruptor) 设备。
 
 CLINT 提供:
-- 核间中断 (IPI): 通过内存映射的 msip 寄存器, hart A 写 hart B 的 msip → hart B 收到
+- 核间中断 (IPI): 通过内存映射的 msip 寄存器, hart A 写 hart B 的 msip -> hart B 收到
                     Machine Software Interrupt
 - 定时器中断:     每个 hart 有独立的 mtimecmp, 当 mtime >= mtimecmp 时触发
                    Machine Timer Interrupt
@@ -22,6 +22,8 @@ CLINT 提供:
 同时实现 InterruptController 和 Device 接口, 以便 Bus 和 Emulator 使用。
 """
 
+from collections.abc import Callable
+
 from pyremu.interrupt.controller import INT_SOURCE_MIP_MASK, InterruptController, IntSource
 from pyremu.memory.bus import Device
 
@@ -29,7 +31,7 @@ from pyremu.memory.bus import Device
 CLINT_BASE = 0x0200_0000
 CLINT_SIZE = 0xC000  # 48 KiB
 
-# 中断优先级 → mip 位掩码 (按优先级从高到低排列).
+# 中断优先级 -> mip 位掩码 (按优先级从高到低排列).
 # 预计算为 (mask, IntSource) 元组, 避免每条指令在 check_interrupt 中
 # 遍历 IntSource Enum 并做 dict 查找 (profile 显示 6M Enum.__hash__/s).
 _INT_PRIORITY: list[tuple[int, IntSource]] = [
@@ -69,6 +71,9 @@ class CLINT(InterruptController, Device):
         # 全局 MTIME (单调计数器): 64-bit
         self._mtime = 0
 
+        # 中断状态变化回调列表 — 每个 hart 注册自己的 notify_int_state_change
+        self._int_state_cbs: list[Callable[[], None]] = []
+
     # ----------------------------------------------------------
     #  InterruptController 接口
     # ----------------------------------------------------------
@@ -103,19 +108,49 @@ class CLINT(InterruptController, Device):
         has_pending = mip != 0 and highest is not None
         return has_pending, mip, highest
 
+    def set_int_state_change_callback(self, cb: Callable[[], None]) -> None:
+        """注册中断状态变化回调 (每个 hart 在绑定 interrupt_ctrl 时调用).
+
+        支持多次注册 — CLINT 状态变化时所有回调均被调用.
+        """
+        self._int_state_cbs.append(cb)
+
+    def _notify_state_change(self) -> None:
+        """通知所有 hart 中断状态可能已改变."""
+        for cb in self._int_state_cbs:
+            cb()
+
     def send_ipi(self, target_hart_id: int) -> None:
         """向目标 hart 发送 IPI (置位 MSIP)."""
         if 0 <= target_hart_id < self._num_harts:
             self._msip[target_hart_id] |= 1
+            self._notify_state_change()
 
     def clear_ipi(self, hart_id: int) -> None:
         """清除 hart 的软件中断挂起位."""
         if 0 <= hart_id < self._num_harts:
             self._msip[hart_id] &= ~1
+            self._notify_state_change()
 
     def get_mtime(self) -> int:
         """返回当前全局时钟值."""
         return self._mtime
+
+    def get_next_timer_wakeup(self, hart_id: int) -> int:
+        """返回 hart 的下一次定时器唤醒时间 (mtime 值); 0 表示无定时器使能.
+
+        供中断缓存快速路径: 若 mtime < next_wakeup, 可跳过全量中断检查.
+        """
+        if not (0 <= hart_id < self._num_harts):
+            return 0
+        cmp = self._mtimecmp[hart_id]
+        return cmp if cmp > 0 else 0
+
+    def set_mtimecmp(self, hart_id: int, val: int) -> None:
+        """设置指定 hart 的定时器比较值 (供 SSTC stimecmp CSR 写入同步)."""
+        if 0 <= hart_id < self._num_harts:
+            self._mtimecmp[hart_id] = val & 0xFFFF_FFFF_FFFF_FFFF
+            self._notify_state_change()
 
     def tick(self, cycles: int = 1) -> None:
         """推进全局时钟."""
@@ -164,6 +199,7 @@ class CLINT(InterruptController, Device):
             hart_id = offset // 4
             if 0 <= hart_id < self._num_harts:
                 self._msip[hart_id] = val & 1
+                self._notify_state_change()
             return
 
         # MTIMECMP 区域
@@ -172,6 +208,7 @@ class CLINT(InterruptController, Device):
             hart_id = local_off // 8
             if 0 <= hart_id < self._num_harts:
                 self._mtimecmp[hart_id] = val & 0xFFFF_FFFF_FFFF_FFFF
+                self._notify_state_change()
             return
 
         # MTIME 寄存器

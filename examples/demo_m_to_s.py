@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""示例: M 模式切换 S 模式 — 模拟 OpenSBI → OS 移交.
+"""示例: M 模式切换 S 模式 — 模拟 OpenSBI -> OS 移交.
 
 预编译固件 m_mode_to_s_mode.elf 流程:
   1. M 模式: 初始化 UART, 配置 PMP, 设置 mstatus.MPP=S, mret 移交
@@ -42,11 +42,11 @@ def main() -> None:
             break
 
     # ---- 已切换到 S 模式, 打印 UART 输出 ----
-    print(f"\n=== MRET 切换: {mode_before} → {h.mode.name} ===")
+    print(f"\n=== MRET 切换: {mode_before} -> {h.mode.name} ===")
     print(f"  mstatus = {h.mstatus_val:#018x}")
 
     # ---- 继续执行 S 模式代码, 等待 UART 输出 ----
-    print("\n=== S 模式执行: UART 输出 ===  (UART TX → stdout)")
+    print("\n=== S 模式执行: UART 输出 ===  (UART TX -> stdout)")
     emu.run(2000)
 
     print("\n  最终状态:")

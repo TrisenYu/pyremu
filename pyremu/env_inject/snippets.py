@@ -232,7 +232,7 @@ def set_mtvec(vector_base: int, mode: int = 0) -> list[AsmSnippet]:
 
     Args:
         vector_base: trap 向量基址 (必须 4 字节对齐).
-        mode: 0 = 直接模式 (所有 trap → base), 1 = 向量模式 (base + 4×cause).
+        mode: 0 = 直接模式 (所有 trap -> base), 1 = 向量模式 (base + 4×cause).
 
     Returns:
         两段片段: [load mtvec 值到 t0, 写入 mtvec CSR].
@@ -296,7 +296,7 @@ def switch_to_umode(entry_addr: int, sp_addr: int = 0) -> list[AsmSnippet]:
     if sp_addr != 0:
         snippets.append(set_sp(sp_addr))
 
-    # mret → 切换到 U 模式, pc = mepc
+    # mret -> 切换到 U 模式, pc = mepc
     snippets.append(
         AsmSnippet(
             words=[0x30200073],  # mret
@@ -345,7 +345,7 @@ def hosted_bootstrap(
 
     snippets.append(set_sp(sp_value))
 
-    # 跳转到入口: jalr zero, t0, 0  → t0 = entry_addr
+    # 跳转到入口: jalr zero, t0, 0  -> t0 = entry_addr
     snippets.append(imm64(_T0, entry_addr))
     snippets.append(
         AsmSnippet(
@@ -377,7 +377,7 @@ def zsbl_stub(
     """
     snippets: list[AsmSnippet] = []
 
-    # 所有 hart 放行: DTB → a1 (PC 相对: DTB @ preload_addr + 0x10000)
+    # 所有 hart 放行: DTB -> a1 (PC 相对: DTB @ preload_addr + 0x10000)
     # 先跳转再算偏移太复杂, 直接用已知的 PC 相对偏移
     zsbl_pc = 10 * 4  # ZSBL 内 auipc 的 PC 偏移 (word 10)
     dtb_from_zsbl = 0x10000 - zsbl_pc  # DTB @ preload+64K
@@ -438,8 +438,8 @@ def fsbl_stub(
       - 置位冷启动完成标志 (绕过 OpenSBI init_warmboot 死等)
       - 设 mtvec = opensbi_addr
       - a0=mhartid, a1=DTB (PC 相对寻址: FSBL_PC + dtb_pc_offset)
-      - cold_boot=True: patch fw_next_mode→0 触发冷启动
-      - unimp → trap → OpenSBI
+      - cold_boot=True: patch fw_next_mode->0 触发冷启动
+      - unimp -> trap -> OpenSBI
 
     Args:
         opensbi_addr: OpenSBI 入口地址.
@@ -498,9 +498,9 @@ def fsbl_stub(
         )
     )
 
-    # 可选: patch sbi_init → 无条件冷启动 (next_mode 保持 S-mode)
+    # 可选: patch sbi_init -> 无条件冷启动 (next_mode 保持 S-mode)
     if cold_boot:
-        # sbi_init @ opensbi+0xe0d0: beq a0,a1,warm → j cold_boot
+        # sbi_init @ opensbi+0xe0d0: beq a0,a1,warm -> j cold_boot
         # 不改 fw_next_mode, 不影响 Domain0 Next Mode
         sb_addr = opensbi_addr + 0xE0D0
         j_imm = (0xE0D8 - 0xE0D0) >> 1  # =4
@@ -521,11 +521,11 @@ def fsbl_stub(
         )
     # (BSS 循环和 fw_next_mode 已由 debugger bus.write 处理)
 
-    # unimp → trap → mtvec → OpenSBI
+    # unimp -> trap -> mtvec -> OpenSBI
     snippets.append(
         AsmSnippet(
             words=[0x00000000],
-            desc="unimp  # trap → mtvec → OpenSBI",
+            desc="unimp  # trap -> mtvec -> OpenSBI",
         )
     )
 
@@ -543,11 +543,11 @@ def opensbi_coldboot_stub(
 ) -> list[AsmSnippet]:
     """为 OpenSBI FW_PAYLOAD / FW_JUMP 生成最小 FSBL 桩代码.
 
-    FW_PAYLOAD/FW_JUMP 在 sbi_init → init_warmboot 轮询等待
+    FW_PAYLOAD/FW_JUMP 在 sbi_init -> init_warmboot 轮询等待
     ``*(flag_addr)`` 变为非零 (表示冷启动完成). 没有 FSBL 时该标志
     永不为 1, 导致死循环.
 
-    此桩执行:  *(flag_addr) = 1;  jalr zero, 0(t0) → entry_addr.
+    此桩执行:  *(flag_addr) = 1;  jalr zero, 0(t0) -> entry_addr.
 
     Args:
         entry_addr: OpenSBI 入口 (PIE 搬迁后地址, 通常 = ram_base).

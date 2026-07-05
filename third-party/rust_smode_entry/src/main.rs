@@ -32,7 +32,7 @@ core::arch::global_asm!(include_str!("entry.s"));
 // ---------------------------------------------------------------
 
 /// 阶段一返回给 entry.s 的启动信息。`repr(C)` 确保与汇编的
-/// 寄存器约定一致（satp→a0, smode_sp→a1, va_offset→a2）。
+/// 寄存器约定一致（satp->a0, smode_sp->a1, va_offset->a2）。
 #[repr(C)]
 pub struct BootInfo {
     pub satp: u64,
@@ -57,7 +57,7 @@ pub unsafe extern "C" fn rust_main_before_mmu(
     man_pa_start: u64,
     man_size: u64,
 ) {
-    uart::uart_init();
+    // uart::uart_init();
     println!("[enclave] before MMU: id={enclave_id} pa=0x{man_pa_start:x} size=0x{man_size:x}\n");
     // _end 符号已由 entry.s 中的 PIE 重定位调整至运行时地址 (base_pa + link_addr),
     // 无需再加 load_offset, 否则会 double-count base_pa.
@@ -84,7 +84,7 @@ pub unsafe extern "C" fn rust_main_before_mmu(
 }
 
 // ---------------------------------------------------------------
-//  阶段二：MMU 使能后 —— 加载 ELF → sret U-mode
+//  阶段二：MMU 使能后 —— 加载 ELF -> sret U-mode
 // ---------------------------------------------------------------
 
 #[unsafe(no_mangle)]
@@ -120,7 +120,7 @@ pub unsafe extern "C" fn rust_main_after_mmu() {
     unsafe { core::arch::asm!("csrr {0}, time", out(reg) now) };
     call::sbi_set_timer(now + TIMER_INTERVAL);
 
-    println!("[enclave] entry=0x{entry:x} → sret\n");
+    println!("[enclave] entry=0x{entry:x} -> sret\n");
 }
 
 // ---------------------------------------------------------------

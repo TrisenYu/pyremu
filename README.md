@@ -18,7 +18,6 @@ Sv39 虚拟内存、L2 缓存 MESI 一致性协议、CLINT 时钟/核间中断�
 # 运行全部测试
 make test
 
-
 # 加载零阶段加载器作为上电初始化代码，
 # 设置内存基址为0x8000_0000
 # 同时以交互式调试器加载固件
@@ -101,6 +100,95 @@ third-party/            # 第三方固件 & S-mode 运行时
 ## 第三方代码
 
 - `third-party/rust_smode_entry/` — Rust 编写的 S-mode TEE 管理器，以 PIE 位置无关方式编译链接，由 M-mode 加载到动态分配的物理内存中运行
+
+## Rust Native 批量执行引擎
+
+`pyremu/_native/` 包含一个 Rust 编写的 **批量指令执行引擎** (`libdecode.so`)，将
+fetch-decode-execute 循环从 Python 移入 Rust，单次 FFI 调用批量执行最多 100000 条
+指令。相比纯 Python 路径，单条指令执行开销从 ~4000ns 降低到 ~10ns（~400× 提升）。
+
+### 工作原理
+
+```
+Python                              Rust (libdecode.so)
+  │                                     │
+  │  flush_l2()                         │
+  │  marshal HartState ──────────────→  │
+  │  run_batch() ────────────────────→  │  for hart in harts:
+  │                                     │    for instr in 0..max_instrs:
+  │                                     │      fetch → decode → execute
+  │                                     │      if ecall/csr/mmio → exit
+  │                                     │
+  │  ←──────────────────────────── return BatchResult
+  │  invalidate_l2()                    │
+  │  handle EXIT_SYS / EXIT_TRAP       │
+  │                                     │
+```
+
+每条 batch 边界执行 `flush_l2()`（将 Python 侧的 L2 脏行回写到 `bytearray`）和
+`invalidate_l2()`（丢弃 Rust 直接写入 `bytearray` 后 L2 中的过时行），确保两条
+数据路径的一致性。
+
+### 构建
+
+```bash
+# Debug 构建（带符号，便于 gdb/lldb 调试）
+cargo build --manifest-path pyremu/_native/Cargo.toml
+cp pyremu/_native/target/debug/libdecode.so pyremu/_native/libdecode.so
+
+# Release 构建（优化，生产使用）
+cargo build --release --manifest-path pyremu/_native/Cargo.toml
+cp pyremu/_native/target/release/libdecode.so pyremu/_native/libdecode.so
+
+# 运行 Rust 侧单元测试（~148 条）
+cargo test --manifest-path pyremu/_native/Cargo.toml
+```
+
+构建依赖: Rust 工具链 (edition 2021), 无需 `maturin`/`setuptools-rust`——输出为标准
+cdylib，通过 CPython 内置 `ctypes` 加载。
+
+### 纯 Python 回退
+
+`.so` 缺失或不兼容时，模拟器自动回退到纯 Python 执行路径。可通过环境变量显式禁用:
+
+```bash
+PYREMU_NATIVE_BATCH=0 python -m pyremu.debugger tests/bins/elf/...
+```
+
+也可以通过 `Emulator` 构造参数控制:
+
+```python
+emu = Emulator(cfg, native_batch=False)
+```
+
+### 已支持的指令（Phase A–E）
+
+Rust 引擎内联处理全部 RV64IMAC 指令:
+- **Phase A**: ALU (R/I/U/J/B/fence), M 扩展, RV64 32-bit 操作
+- **Phase B**: Load/Store (含 Sv39 MMU 翻译, TLB, PMP 检查)
+- **Phase C**: System (CSR 读写, ECALL/EBREAK/MRET/SRET/WFI/SFENCE.VMA, medeleg 委派)
+- **Phase D**: AMO (LR/SC/AMO*), Compressed (C0/C1/C2)
+- **Phase E**: 中断检查 (MTI/MSI/STI 优先级, mideleg 委派)
+
+不支持的 CSR 或 MMIO 设备访问会退出到 Python 逐条处理（`EXIT_SYS`），处理完继续
+回到 Rust 批量执行。
+
+### 状态结构体布局
+
+`HartState` 和 `BatchResult` 通过 `#[repr(C)]` 锁定内存布局，Rust 和 Python ctypes
+两侧必须逐字节一致。修改字段时需同步更新:
+
+| 文件 | 作用 |
+|------|------|
+| [state.rs](pyremu/_native/src/state.rs) | Rust `#[repr(C)]` 结构体定义 |
+| [hart.py](pyremu/core/hart.py) | Python ctypes `_fields_` + `marshal_hart`/`unmarshal_hart` |
+
+验证命令:
+```bash
+cargo test --manifest-path pyremu/_native/Cargo.toml   # sizeof/align
+uv run pytest tests/test_emulator.py::TestNativeBatchLayout   # Python 侧
+```
+
 ## 开发命令
 
 ```bash

@@ -57,7 +57,7 @@ class I2C(Device):
         self._nack: bool = False
 
         # 模拟从设备寄存器 (简化: 单一目标地址)
-        self._slave_data: dict[int, int] = {}  # reg_addr → value
+        self._slave_data: dict[int, int] = {}  # reg_addr -> value
 
     # ---- 公开方法 ----
 

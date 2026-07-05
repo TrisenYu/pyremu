@@ -139,7 +139,7 @@ def gpr_alias(idx: int) -> str:
 
 
 def gpr_idx_from_name(name: str) -> int | None:
-    """按名称或别名查找 GPR 索引 (例: "x10" → 10, "t0" → 5, "a0" → 10)."""
+    """按名称或别名查找 GPR 索引 (例: "x10" -> 10, "t0" -> 5, "a0" -> 10)."""
     name = name.lower()
     for idx, r in enumerate(_gpr):
         if r.name == name or (r.alias and r.alias == name):
@@ -180,7 +180,7 @@ class CsrAccess(Enum):
     dm_rw = 0b1100_11
 
 
-_csr_access_mask = 0b1111_10  # 清除 LSB (rw → ro)
+_csr_access_mask = 0b1111_10  # 清除 LSB (rw -> ro)
 
 
 class CSR(Reg):
@@ -431,7 +431,7 @@ def check_csr(csr_id: int) -> tuple[bool, str]:
 
 
 def csr_addr_from_name(name: str) -> int | None:
-    """按小写名称查找 CSR 地址 (例: "mtvec" → 0x305). 未找到返回 None."""
+    """按小写名称查找 CSR 地址 (例: "mtvec" -> 0x305). 未找到返回 None."""
     name = name.lower()
     for addr, csr in _csr_bank.items():
         if csr.name == name:
@@ -544,6 +544,6 @@ def check_csr_access(
 
 
 def register_csr():
-    """返回所有 CSR 的独立副本 (name → CSR 对象)."""
+    """返回所有 CSR 的独立副本 (name -> CSR 对象)."""
     ret = {v.name: v for _, v in _csr_bank.items()}
     return deepcopy(ret)

@@ -44,7 +44,7 @@ _start:
     la   t0, boot_lock
     li   t1, 1
     amoswap.w t2, t1, (t0)       // t2 = 旧值, [t0] = 1
-    bnez t2, warm_boot            // 锁已被占 → 热启动
+    bnez t2, warm_boot            // 锁已被占 -> 热启动
 
     // ---- 冷启动路径 ----
     la   a0, str_cold

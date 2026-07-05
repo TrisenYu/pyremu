@@ -119,7 +119,7 @@ pub fn map_sections() {
     }
 }
 
-/// 映射单个段：start_pa / end_pa → VA = PA + va_offset。
+/// 映射单个段：start_pa / end_pa -> VA = PA + va_offset。
 unsafe fn map_one_section(
     sec_start: u64,
     sec_end: u64,

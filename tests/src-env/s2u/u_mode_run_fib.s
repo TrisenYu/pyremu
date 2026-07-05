@@ -1,23 +1,23 @@
 // SPDX-LICENSE-IDENTIFIER: GPL2.0
 // (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-// M → S → U 特权级切换 + Sv39 栈保护 + UART 输入 + 递归 Fibonacci.
+// M -> S -> U 特权级切换 + Sv39 栈保护 + UART 输入 + 递归 Fibonacci.
 //
 // ═══════════════════════════════════════════════════════════════
 //  架构概述
 // ═══════════════════════════════════════════════════════════════
 //
-//  M 模式: PMP / medeleg / mstatus → MRET → S
-//  S 模式: stvec / sscratch / sstatus → Sv39 页表 → SRET → U
-//  U 模式: 读 UART → 约束 n → fib(n) → ECALL 报告
+//  M 模式: PMP / medeleg / mstatus -> MRET -> S
+//  S 模式: stvec / sscratch / sstatus -> Sv39 页表 -> SRET -> U
+//  U 模式: 读 UART -> 约束 n -> fib(n) -> ECALL 报告
 //
 //  Sv39 identity 映射 (4 KiB 页):
-//    VA 0x8000_0000–0x8000_FFFF → PA 同 (16 页, R+W+X+U, 代码/数据/BSS)
-//    VA 0x1000_0000–0x1000_0FFF → PA 同 ( 1 页, R+W+U,    UART MMIO)
-//    VA 0x8010_0000–0x8010_0FFF → PA 同 ( 1 页, R+W+U,    U 模式栈)
-//    VA 0x800F_F000–0x800F_FFFF   (保护页, 未映射 → StorePageFault 15)
+//    VA 0x8000_0000–0x8000_FFFF -> PA 同 (16 页, R+W+X+U, 代码/数据/BSS)
+//    VA 0x1000_0000–0x1000_0FFF -> PA 同 ( 1 页, R+W+U,    UART MMIO)
+//    VA 0x8010_0000–0x8010_0FFF -> PA 同 ( 1 页, R+W+U,    U 模式栈)
+//    VA 0x800F_F000–0x800F_FFFF   (保护页, 未映射 -> StorePageFault 15)
 //
-//  U 栈顶 = 0x8010_1000.  栈向下增长触及 0x800F_FFFF → trap → S 终止进程.
+//  U 栈顶 = 0x8010_1000.  栈向下增长触及 0x800F_FFFF -> trap -> S 终止进程.
 //
 //  sscratch 交换: S 模式进入前将 sscratch 指向 S 栈顶;
 //  trap handler 第一条指令用 csrrw sp, sscratch, sp 交换,
@@ -27,7 +27,7 @@
 //  UART 输入
 // ═══════════════════════════════════════════════════════════════
 //
-//   uart_poll → ring buffer (64B) → uart_getc → readline → parse_int_simple
+//   uart_poll -> ring buffer (64B) -> uart_getc -> readline -> parse_int_simple
 
 .section .text
 .globl _start
@@ -77,7 +77,7 @@ _start:
     la   t0, m_trap_handler
     csrw mtvec, t0
 
-    // 委派: ECALL + page faults 从 U/S 模式 → S 模式处理
+    // 委派: ECALL + page faults 从 U/S 模式 -> S 模式处理
     //   bits: 8 (ECALL-U) + 12 (InstrPF) + 13 (LdPF) + 15 (StPF)
     li   t0, 0xA100
     csrw medeleg, t0
@@ -90,7 +90,7 @@ _start:
     or   t0, t0, t1
     csrw mstatus, t0
 
-    // → S 模式入口
+    // -> S 模式入口
     la   t0, s_mode_boot
     csrw mepc, t0
     mret
@@ -131,7 +131,7 @@ s_mode_boot:
     // 建立 Sv39 页表 (含 U 栈保护页)
     call setup_sv39
 
-    // → U 模式入口
+    // -> U 模式入口
     la   t0, u_mode_main
     csrw sepc, t0
 
@@ -168,21 +168,21 @@ setup_sv39:
     // 仅需覆写用到的条目, 其余 V=0 即未映射.
     la   s0, page_tables       // s0 = L1
 
-    // -- L1[2] → L2_hi (VPN[2]=2, VA 0x8000_0000–0xBFFF_FFFF) --
+    // -- L1[2] -> L2_hi (VPN[2]=2, VA 0x8000_0000–0xBFFF_FFFF) --
     li   t0, 0x0000000020001001  // V=1, PPN=0x80004 (page_tables+0x1000)
     sd   t0, 16(s0)            // L1[2] = L1 + 16
 
-    // -- L1[0] → L2_lo (VPN[2]=0, VA 0x0000_0000–0x3FFF_FFFF) --
+    // -- L1[0] -> L2_lo (VPN[2]=0, VA 0x0000_0000–0x3FFF_FFFF) --
     li   t0, 0x0000000020001401  // V=1, PPN=0x80005 (page_tables+0x2000)
     sd   t0, 0(s0)             // L1[0] = L1 + 0
 
-    // -- L2_hi[0] → L3_main --
+    // -- L2_hi[0] -> L3_main --
     li   t0, 0x1000
     add  s1, s0, t0            // s1 = L2_hi (+1 page)
     li   t0, 0x0000000020001801  // V=1, PPN=0x80006 (page_tables+0x3000)
     sd   t0, 0(s1)
 
-    // -- L2_lo[128] → L3_uart (VPN[1]=128, VA 0x1000_0000) --
+    // -- L2_lo[128] -> L3_uart (VPN[1]=128, VA 0x1000_0000) --
     li   t0, 0x2000
     add  s2, s0, t0            // s2 = L2_lo (+2 pages)
     li   t0, 0x0000000020001c01  // V=1, PPN=0x80007 (page_tables+0x4000)
@@ -196,7 +196,7 @@ setup_sv39:
 1:
     sd   t0, 0(s1)
     addi s1, s1, 8
-    li   t2, (1 << 10)         // 下一 PPN → PTE += 0x400
+    li   t2, (1 << 10)         // 下一 PPN -> PTE += 0x400
     add  t0, t0, t2
     addi t1, t1, -1
     bnez t1, 1b
@@ -359,7 +359,7 @@ s_mode_idle:
 
 
 // ============================================================
-//  U 模式入口 (well-behaved) — 约束输入 → fib → 报告
+//  U 模式入口 (well-behaved) — 约束输入 -> fib -> 报告
 // ============================================================
 u_mode_main:
     li   sp, STACK_TOP_U
@@ -405,7 +405,7 @@ u_exit:
 
 
 // ============================================================
-//  U 模式入口 (pathological) — 不约束, 输入 0 → stack_bomb
+//  U 模式入口 (pathological) — 不约束, 输入 0 -> stack_bomb
 // ============================================================
 u_mode_bad:
     li   sp, STACK_TOP_U
@@ -427,7 +427,7 @@ u_mode_bad:
 
     mv   s4, a0
 
-    // 输入 0 → 栈溢出演示
+    // 输入 0 -> 栈溢出演示
     beqz s4, stack_bomb
 
     call uart_putdec
@@ -455,8 +455,8 @@ u_bad_exit:
 //  stack_bomb — 分配超大栈帧, 立即触及保护页
 //
 //  U 栈仅 1 页 (0x8010_0000–0x8010_0FFF), sp 初值 0x8010_1000.
-//  减去 0x2000 → sp=0x800F_F000 (保护页).
-//  随后 sd → StorePageFault (scause=15) → S 终止进程.
+//  减去 0x2000 -> sp=0x800F_F000 (保护页).
+//  随后 sd -> StorePageFault (scause=15) -> S 终止进程.
 // ============================================================
 stack_bomb:
     addi sp, sp, -16

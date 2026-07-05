@@ -5,10 +5,10 @@
 
 use crate::call;
 
-/// 使能发送器（空操作 — SBI ecall 无需硬件初始化）。
-pub fn uart_init() {
-    // ecall 路径无需初始化 UART 硬件
-}
+// /// 使能发送器（空操作 — SBI ecall 无需硬件初始化）。
+// pub fn uart_init() {
+//     // ecall 路径无需初始化 UART 硬件
+// }
 
 /// 发送一个字节。通过 legacy SBI putchar 阻塞输出。
 #[inline]

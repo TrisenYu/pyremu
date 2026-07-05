@@ -212,7 +212,7 @@ class TestAMOArithmetic:
 
     def test_amomin_d(self, hart):
         """AMOMIN.D: mem ← min(mem, op_val) 有符号比较."""
-        # mem=-5, op=10 → min = -5
+        # mem=-5, op=10 -> min = -5
         self._do_amo(
             hart,
             AmoFunct5.MIN,
@@ -225,7 +225,7 @@ class TestAMOArithmetic:
 
     def test_amomax_d(self, hart):
         """AMOMAX.D: mem ← max(mem, op_val) 有符号比较."""
-        # mem=-5, op=10 → max = 10
+        # mem=-5, op=10 -> max = 10
         self._do_amo(
             hart,
             AmoFunct5.MAX,
@@ -319,7 +319,7 @@ class TestAMOArithmetic:
         )
 
     def test_amomin_w(self, hart):
-        """AMOMIN.W 有符号比较: mem=-5, op=10 → min=-5."""
+        """AMOMIN.W 有符号比较: mem=-5, op=10 -> min=-5."""
         self._do_amo(
             hart,
             AmoFunct5.MIN,
@@ -332,7 +332,7 @@ class TestAMOArithmetic:
         )
 
     def test_amomax_w(self, hart):
-        """AMOMAX.W 有符号比较: mem=-5, op=10 → max=10."""
+        """AMOMAX.W 有符号比较: mem=-5, op=10 -> max=10."""
         self._do_amo(
             hart,
             AmoFunct5.MAX,
@@ -419,7 +419,7 @@ class TestAMOSignExtend:
     def test_rd_sign_extend_w_min_negative(self, hart):
         """AMOMIN.W: 旧值为 INT32_MIN (0x80000000), 符号扩展应正确."""
         hart.gprs[10] = 0x2000
-        hart.gprs[12] = 1  # op=1 → min(0x80000000, 1) = 0x80000000
+        hart.gprs[12] = 1  # op=1 -> min(0x80000000, 1) = 0x80000000
         min_val = 0x8000_0000
         hart._mem_write_phy(0x2000, min_val.to_bytes(4, "little"))
         instr = _make_amo_instr(AmoFunct5.MIN, AmoWidth.W, rd=15, rs1=10, rs2=12)

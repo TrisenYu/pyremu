@@ -11,7 +11,7 @@
 #   - S-mode:   默认无法访问 mcycle/minstret/mhpmevent (需 mcounteren 授权),
 #               更不可写 mcountinhibit/mhpmevent. **S-mode 应通过 SBI PMU 扩展
 #               (见 pmu_via_sbi.c) 获取计数器访问**, 或由 M-mode 固件代为操作.
-#   - U-mode:   默认完全无法访问 PMU CSR. 需 scounteren (S→U) 授权.
+#   - U-mode:   默认完全无法访问 PMU CSR. 需 scounteren (S->U) 授权.
 #
 # 典型用法 (M-mode, 如 OpenSBI):
 #
@@ -59,7 +59,7 @@
 
 # 计数器控制
 .equ CSR_MCOUNTINHIBIT,   0x320       # 每 bit 抑制对应计数器
-.equ CSR_MCOUNTEREN,      0x306       # M-mode → S-mode 计数器读权限
+.equ CSR_MCOUNTEREN,      0x306       # M-mode -> S-mode 计数器读权限
 
 # ------------------------------------------------------------
 #  标准硬件事件编码 (写入 mhpmeventN)
@@ -152,9 +152,9 @@ m_mode_pmu_stop:
 #  m_mode_pmu_read — 按索引读取计数器值
 #
 #   输入: a0 = 计数器索引
-#             0 → mcycle
-#             2 → minstret
-#             3..7 → mhpmcounter3..7
+#             0 -> mcycle
+#             2 -> minstret
+#             3..7 -> mhpmcounter3..7
 #   返回: a0 = 64-bit 计数值
 # ============================================================
 .global m_mode_pmu_read

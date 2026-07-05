@@ -87,23 +87,23 @@ pyremu/
 
 ### Data flow
 
-1. `utils/parse_bin.py` → `parse_firmware()` 用 LIEF 解析 ELF/PE/raw binary → `FirmwareImage` (entry_point + segments + symbols).
+1. `utils/parse_bin.py` -> `parse_firmware()` 用 LIEF 解析 ELF/PE/raw binary -> `FirmwareImage` (entry_point + segments + symbols).
 2. `emulator.Emulator` 创建 harts + Bus + CLINT + peripherals, 调用 `load_firmware(image)` 将各段写入 RAM, 所有 hart 的 PC 设到入口地址.
 3. 可选: `emulator.load_dtb(addr)` 将 FDT blob 加载到 RAM 并将地址写入 `a1` (x11), 供固件通过设备树发现外设.
 4. 执行循环 (`step` / `run`): 每个未 halted 的 hart:
    - 若 `_waiting` (WFI 等待): 仅检查中断唤醒, 不取指/执行
-   - 否则: 取指 4 字节 → `Hart.exec_instr(instr)` → 推进 PC 或跳转
-   - 指令边界检查中断 → CLINT 时钟 tick.
+   - 否则: 取指 4 字节 -> `Hart.exec_instr(instr)` -> 推进 PC 或跳转
+   - 指令边界检查中断 -> CLINT 时钟 tick.
 5. `debugger.Debugger` 包装 Emulator, 提供单步 (`step_one`)、快照/回滚、REPL 命令分发.
 
 ### WFI 低功耗等待
 
 Hart 执行 WFI 指令时:
-- 若已有待处理且使能的中断 (`mip & mie ≠ 0`) → 立即返回 (NOP), 中断在指令边界投递
+- 若已有待处理且使能的中断 (`mip & mie ≠ 0`) -> 立即返回 (NOP), 中断在指令边界投递
 - 否则 hart 进入 `_waiting` 状态, PC 指向 WFI 下一条指令
 - 等待中的 hart 在 `step()` 中被跳过 (不取指/执行), 仅轮询中断
 - 当中断变为挂起且使能时 `deliver_trap` 唤醒 hart (清除 `_waiting`)
-- `mstatus.TW=1` 且非 M 模式执行 WFI → IllInstr 陷态
+- `mstatus.TW=1` 且非 M 模式执行 WFI -> IllInstr 陷态
 
 ### Class hierarchy
 
@@ -134,27 +134,27 @@ PlatformConfig (platform.py) — dataclass, 描述 CPU 拓扑、内存布局、�
 └── 工厂方法: qemu_virt(), sifive_u54(), dump_json/toml/yaml()
 
 HartWithRegs (core/hart.py)
-    gprs[32], fprs[32], csrs (name→CSR), itlb/dtlb,
+    gprs[32], fprs[32], csrs (name->CSR), itlb/dtlb,
     pc, mode, _bus: Bus, _interrupt_ctrl: InterruptController,
     _mem_read_phy, _mem_write_phy,
     reservation (LR/SC), _halted, _consecutive_traps, _waiting
     mstatus/mtvec/mepc/mcause/… 快捷 property
 └── Hart (core/decoder.py)  ← 仅继承 HartWithRegs
-        exec_instr() → 返回 2/4 (PC 需推进) 或 0 (PC 已被修改)
+        exec_instr() -> 返回 2/4 (PC 需推进) 或 0 (PC 已被修改)
         调用 mem_check_aux 中的独立函数: mem_read(hart, va, size) /
         mem_write(hart, va, data) / validate_csr(hart, addr, write)
         调用 trap_handler 中的独立函数: deliver_trap(hart, ...) /
         trap_ecall(hart) / handle_wfi(hart) 等
         handle_alu/handle_op_imm/handle_op32/handle_ld/handle_st/
         handle_br/handle_jalr/handle_sys/handle_fence/handle_amo/
-        handle_compressed → _handle_compressed_c0/_c1/_c2
+        handle_compressed -> _handle_compressed_c0/_c1/_c2
 ```
 
 ### Instruction execution flow
 
 `Hart.exec_instr(instr: int) -> int`:
 
-1. 若 `parse_compressed(instr)` → `handle_compressed(instr & 0xFFFF)` → 按象限 (C0/C1/C2) 分发.
+1. 若 `parse_compressed(instr)` -> `handle_compressed(instr & 0xFFFF)` -> 按象限 (C0/C1/C2) 分发.
 2. 否则按 `Opc(parse_opcode(instr))` 分发到对应 handler.
 3. 任何 `ValueError` / `NotImplementedError` (非法编码、未实现 opcode) 统一转为 `deliver_trap(self, TrapType.IllInstr, ...)`.
 4. 返回 0 (PC 已修改, 如跳转/trap) 或 2/4 (调用方负责 `pc += advance`).
@@ -162,7 +162,7 @@ HartWithRegs (core/hart.py)
 **字段提取器** (module-level, decoder.py):
 `parse_opcode`, `parse_rd`, `parse_func3`, `parse_rs1`, `parse_rs2`, `parse_func7`,
 `parse_imm12_se`, `parse_imm_s`, `parse_imm_b`, `parse_imm_j`, `parse_imm20_raw`,
-`parse_compressed` (低 2 位 ≠ 3 → 16-bit), `_sext(val, bits)`.
+`parse_compressed` (低 2 位 ≠ 3 -> 16-bit), `_sext(val, bits)`.
 
 **枚举**: `Opc`, `aluOp`, `sysOp`, `brFn3`, `ldFn3`, `stFn3`, `sysFn12`, `AmoFunct5`, `AmoWidth`.
 
@@ -172,17 +172,17 @@ HartWithRegs (core/hart.py)
 
 ```
 mem_read(hart, va, size) / mem_write(hart, va, data)
-  → _translate_addr(hart, va)
-      → satp.MODE == Bare → VA 即 PA (直接通过)
-      → hart.dtlb.lookup(vpn)  → hit: 返回 PA
-      → miss: translate_va() → sv39_walk(root_ppn, va) → 3 级页表遍历
-              L1 (VPN[2]) → L2 (VPN[1]) → L3 (VPN[0])
+  -> _translate_addr(hart, va)
+      -> satp.MODE == Bare -> VA 即 PA (直接通过)
+      -> hart.dtlb.lookup(vpn)  -> hit: 返回 PA
+      -> miss: translate_va() -> sv39_walk(root_ppn, va) -> 3 级页表遍历
+              L1 (VPN[2]) -> L2 (VPN[1]) -> L3 (VPN[0])
               支持 4 KiB 叶子页和 2 MiB 超级页
-              → 结果插入 TLB
-      → 翻译失败 → deliver_trap(hart, InstrPageFault / LdPageFault / StPageFault, ...)
-  → PMP 检查 → PMA 检查
-  → hart._mem_read_phy(pa, size) / hart._mem_write_phy(pa, data)
-  → Bus.read/write → 设备 MMIO (直通) → L2 缓存 → RAM
+              -> 结果插入 TLB
+      -> 翻译失败 -> deliver_trap(hart, InstrPageFault / LdPageFault / StPageFault, ...)
+  -> PMP 检查 -> PMA 检查
+  -> hart._mem_read_phy(pa, size) / hart._mem_write_phy(pa, data)
+  -> Bus.read/write -> 设备 MMIO (直通) -> L2 缓存 -> RAM
 ```
 
 **PMA (Physical Memory Attributes)** — Bus 提供:
@@ -192,8 +192,8 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 - `AccessFaultError` 供上层 PMA 违例使用
 
 **安全读写** — Bus 同时提供不抛异常的版本, 供调试器等外部调用方使用:
-- `try_read(addr, size) → bytes | None` — 失败返回 None
-- `try_write(addr, data) → bool` — 失败返回 False
+- `try_read(addr, size) -> bytes | None` — 失败返回 None
+- `try_write(addr, data) -> bool` — 失败返回 False
 - 将设备/L2 缓存异常统一转换为返回值, 调用方无需 try/except
 
 ### Trap handling & delegation
@@ -202,7 +202,7 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 
 `deliver_trap(hart, cause, tval, is_interrupt)` — 委派感知的陷态入口:
 
-1. **委派检查**: 若 `mode != M` 且 `medeleg[exc_code]` (异常) 或 `mideleg[exc_code]` (中断) 置位 → 委派到 S 模式
+1. **委派检查**: 若 `mode != M` 且 `medeleg[exc_code]` (异常) 或 `mideleg[exc_code]` (中断) 置位 -> 委派到 S 模式
 2. **S 模式投递** (`_trap_deliver_smode`): 保存到 `sepc`/`scause`/`stval`, 更新 `SPIE`/`SIE`/`SPP`, 切换到 S 模式, 跳转 `stvec`
 3. **M 模式投递** (`_trap_deliver_mmode`): 保存到 `mepc`/`mcause`/`mtval`, 更新 `MPIE`/`MIE`/`MPP`, 切换到 M 模式, 跳转 `mtvec`
 4. M 模式下发生的 trap **永不委派**
@@ -217,11 +217,11 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 
 `trap_sret(hart)`: 恢复 `mode ← SPP`, `SIE ← SPIE`, `pc ← sepc`.
 
-`handle_wfi(hart)`: 若 `mstatus.TW=1` 且非 M 模式 → IllInstr; 若已有待处理中断 → 立即返回 (NOP); 否则 hart 进入 `_waiting` 状态.
+`handle_wfi(hart)`: 若 `mstatus.TW=1` 且非 M 模式 -> IllInstr; 若已有待处理中断 -> 立即返回 (NOP); 否则 hart 进入 `_waiting` 状态.
 
 连续 trap 检测: `deliver_trap` 递增 `_consecutive_traps`; 指令正常执行时清零. 超过阈值 (3) 则 hart 进入 `_halted` 状态并转储全部寄存器.
 
-**trap.py** 提供: `TrapType` 枚举 (14 异常 + 10 中断), `trap_cause_code(trap) → int`, `trap_is_interrupt(trap) → bool`, `trap_cause_name(mcause_val) → str` (mcause 值 → 可读名称).
+**trap.py** 提供: `TrapType` 枚举 (14 异常 + 10 中断), `trap_cause_code(trap) -> int`, `trap_is_interrupt(trap) -> bool`, `trap_cause_name(mcause_val) -> str` (mcause 值 -> 可读名称).
 
 ## Debugger (rvdb)
 
@@ -255,18 +255,18 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 | 文件 | 说明 |
 |------|------|
 | [demo_emulator.py](examples/demo_emulator.py) | 纯 Python API: 加载固件, 运行 N 周期, 检查 hart 状态, dump 内存和寄存器 |
-| [demo_debugger.py](examples/demo_debugger.py) | Debugger 编程接口: 反汇编入口, 单步观测 M→S 模式切换, 检查寄存器 |
-| [demo_m_to_s.py](examples/demo_m_to_s.py) | M→S 移交完整演示: 模拟 OpenSBI → OS boot, 观测 UART 输出和 WFI 状态 |
-| [demo_s_to_u.py](examples/demo_s_to_u.py) | M→S→U 完整演示: UART 输入, Sv39 栈保护页, fib 栈帧验证, 病态进程 S 模式终止 |
+| [demo_debugger.py](examples/demo_debugger.py) | Debugger 编程接口: 反汇编入口, 单步观测 M->S 模式切换, 检查寄存器 |
+| [demo_m_to_s.py](examples/demo_m_to_s.py) | M->S 移交完整演示: 模拟 OpenSBI -> OS boot, 观测 UART 输出和 WFI 状态 |
+| [demo_s_to_u.py](examples/demo_s_to_u.py) | M->S->U 完整演示: UART 输入, Sv39 栈保护页, fib 栈帧验证, 病态进程 S 模式终止 |
 
 运行: `uv run python examples/demo_emulator.py` (各文件均可独立运行).
 
 ### 测试汇编与算法
 
-- [tests/src-env/](tests/src-env/) — 汇编测试源码 (M→S 移交, Sv39 页表设置, ZSBL 启动, UART 输入)
+- [tests/src-env/](tests/src-env/) — 汇编测试源码 (M->S 移交, Sv39 页表设置, ZSBL 启动, UART 输入)
   - 所有目标通过 [makefile](tests/src-env/makefile) 构建, 使用 `/opt/custom-llvm/bin/` 下的自定义 LLVM 工具链
-  - `make build-m2s` 编译 M→S 测试固件 (`s_mode_hello.elf`)
-  - `make build-s2u` 编译 M→S→U 测试固件 (`u_mode_run_fib.elf`, 含 Sv39 + UART 输入 + fib)
+  - `make build-m2s` 编译 M->S 测试固件 (`s_mode_hello.elf`)
+  - `make build-s2u` 编译 M->S->U 测试固件 (`u_mode_run_fib.elf`, 含 Sv39 + UART 输入 + fib)
   - `make build-multi` 编译多程序内核 (`kernel.elf`: kernel.s + prog_fib.s + prog_nqueen.s)
   - `make all` 构建全部目标
 - [tests/src-alg/](tests/src-alg/) — C++ 算法基准 (n-queen, subset), 供未来性能测试
@@ -331,7 +331,7 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 | test_amo.py | 17 | LR/SC/AMOSWAP/AMOADD/AMOXOR/AMOAND/AMOOR/AMOMIN/AMOMAX/AMOMINU/AMOMAXU (.W/.D) |
 | test_compressed.py | 19 | C0/C1/C2 全部已实现压缩指令, 含非法编码陷态 |
 | test_disasm.py | 59 | 所有指令格式反汇编 (R/I/S/B/U/J + CSR + priv + AMO + compressed) |
-| test_emulator.py | 55 | 多 hart 执行循环, 固件加载, 内存 dump, PC 推进, store 指令写入 RAM, AUIPC sign-extend 回归, M→S 模式切换, PMP 配置, WFI 低功耗等待, UART 输出, 汇编反汇编集成, GPR 值规范化回归 |
+| test_emulator.py | 55 | 多 hart 执行循环, 固件加载, 内存 dump, PC 推进, store 指令写入 RAM, AUIPC sign-extend 回归, M->S 模式切换, PMP 配置, WFI 低功耗等待, UART 输出, 汇编反汇编集成, GPR 值规范化回归 |
 | test_bus.py | 14 | 总线读写, 设备注册与路由, PMA 检查 (RAM 范围, 设备检测, 空洞地址), try_read/try_write |
 | test_clint.py | 12 | mtime 递增, mtimecmp 定时器中断, MSIP 软件中断 |
 | test_cache_base.py | 10 | CacheBase/CacheLineBase 抽象接口 |
@@ -340,6 +340,30 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 | test_debugger.py | 220 | 调试器 REPL 命令分发, 反汇编, 断点 (addr/instr/opcode), PC 校验, 栈回溯, 符号表, info/status |
 
 ## Important design notes
+
+### FFI struct 布局锁定: Python ctypes ↔ Rust `#[repr(C)]` 同步
+
+`HartState`, `TlbEntry`, `BatchResult` 通过 ctypes 跨越 FFI 边界传递.
+**两侧布局必须逐字节一致**, 否则 Rust 在错误偏移处读取字段 → SIGBUS.
+
+核心约束:
+- **array-of-structs, 非 struct-of-arrays**. `[TlbEntry; 32]` 在两侧必须是
+  连续 24 字节条目数组, 不能拆成 `itlb_vpn[32] + itlb_ppn[32] + ...`.
+- 修改 `HartState` / `TlbEntry` / `BatchResult` 字段时, 必须同步更新三方:
+  1. Rust `#[repr(C)]` struct (`pyremu/_native/src/state.rs`)
+  2. Python ctypes `_fields_` (`pyremu/core/hart.py`)
+  3. `marshal_hart()` / `unmarshal_hart()` 字段读写
+- 验证命令:
+  ```bash
+  cargo test --manifest-path pyremu/_native/Cargo.toml  # Rust 侧 sizeof/align
+  uv run pytest tests/test_emulator.py::TestNativeBatchLayout  # Python 侧
+  ```
+- `TestNativeBatchLayout` 锁死: TlbEntry ≡ 24B, HartState 对齐 + < 4KB,
+  itlb/dtlb 确保 `.vpn` / `.ppn` / `.valid` 属性存在 (即 struct 非分离数组).
+
+**教训**: 初次实现 Phase B 时, Rust 侧新增 `itlb: [TlbEntry; 32]` 但 Python 侧误用
+分离数组布局. 旧测试因 `PYREMU_NATIVE_BATCH=0` 从未触发 native batch → 静默通过.
+首次固件启动才暴露 SIGBUS. 参见 [CHANGELOG.md](CHANGELOG.md) 2026-07-05 条目.
 
 ### GPR 值的 64-bit 规范化与 Python 位运算陷阱
 
@@ -416,9 +440,9 @@ s_trap_handler:
 ```python
 def make_pte(flags, ppn):
     val = flags
-    val |= (ppn & 0x3FF) << 10           # PPN[9:0]  → bits[19:10]
-    val |= ((ppn >> 10) & 0x1FF) << 20   # PPN[18:10] → bits[28:20]
-    val |= ((ppn >> 19) & 0x1FFFFFFF) << 29  # PPN[43:19] → bits[53:29]
+    val |= (ppn & 0x3FF) << 10           # PPN[9:0]  -> bits[19:10]
+    val |= ((ppn >> 10) & 0x1FF) << 20   # PPN[18:10] -> bits[28:20]
+    val |= ((ppn >> 19) & 0x1FFFFFFF) << 29  # PPN[43:19] -> bits[53:29]
     return val
 ```
 
@@ -430,7 +454,7 @@ def make_pte(flags, ppn):
 UART RX 通过三层解耦实现鲁棒的字符输入:
 
 ```
-UART RXDATA ──poll──→ ring buffer ──getc──→ line buffer ──parse──→ 结果
+UART RXDATA ──poll──-> ring buffer ──getc──-> line buffer ──parse──-> 结果
   (IP.rxwm)         (64B FIFO)   (阻塞)    (退格编辑)     (宽松)
 ```
 
@@ -455,11 +479,43 @@ csrw medeleg, t0
 未委派的页错误会路由到 M 模式, M 模式 handler 若仅做 `mepc+4; mret`, 则错误
 被静默跳过 (指令不执行但无任何可见效果, 保护页形同虚设).
 
+
+
+### 每个 bug 修复必须附带回归测试
+
+项目中发现的每一个 bug, 修复时必须同步补充至少一个针对性测试用例,
+验证修复后的正确行为并锁定回归底线.
+
+测试用例要求:
+- 能复现修复前的错误行为 (修复前的代码跑该测试必失败)
+- 覆盖 bug 的精确触发条件 (不要用碰巧不会触发 bug 的宽松参数)
+- 如涉及位掩码/偏移量, 选择能使修前/修后产生不同结果的具体值
+
+反例 — 已有的 `test_megapage_ppn_mask_regression` 使用 `PPN=0xABCD0` (bit 9=0),
+而 bug 恰好在 bit 9=1 时触发, 因此该测试未能拦住 Sv39 2 MiB 掩码回归.
+
+正例 — [test_mmu.py](tests/test_mmu.py) `test_megapage_ppn_bit9_preserved`:
+使用真实触发值 `PPN=0x80200` (bit 9=1), 且追加了显式断言 `pa != old_buggy_pa`
+确保旧掩码产生的错误值不再出现.
+
+### Sv39 2 MiB 超级页: PPN 掩码必须清 9 位而非 10 位
+
+2 MiB 超级页的 page offset 为 VA[20:0] (21 bits), vpn[0] = VA[20:12] (9 bits)
+替换 PPN[8:0]. PPN bit 9 及以上属于物理地址有效位, 不能清零.
+
+```python
+# ❌ 掩码清 10 位 — PPN bit 9 被错误清零
+ppn = (pte.ppn & ~0x3FF) | vpn[2]
+
+# ✅ 掩码清 9 位
+ppn = (pte.ppn & ~0x1FF) | vpn[2]
+```
+
 ## Changelog
 
 关键 bug 修复记录在 [CHANGELOG.md](CHANGELOG.md) 中, 包含:
 - `_sext()` 返回负 Python int 导致 BEQ/BNE 误判 — 规范化到 `[0, 2^64)`
-- SFENCE.VMA funct12 编码错误 (0x104 → 0x120)
+- SFENCE.VMA funct12 编码错误 (0x104 -> 0x120)
 - `csrw satp` 绕过 `_mmu_mode` 更新
 - TLB 不可迭代 (缺少 `__iter__`)
 - C.JALR / CSRRW 等 rd==rs1 读写竞争
@@ -472,7 +528,7 @@ csrw medeleg, t0
 
 RISC-V "V" 向量扩展为 RV64 基础 ISA 增加 ~200 条向量指令, 操作数宽度从 8-bit 到 64-bit, 支持 LMUL (1/2/4/8) 分组、mask/tail 策略。关键 opcode: `0x57` (OP-V)。
 
-**当前状态**: 未实现。任何 V 扩展指令命中 `Opc` 枚举未覆盖的 opcode 0x57, 经 `exec_instr()` → `ValueError` → `IllInstr` 陷态。
+**当前状态**: 未实现。任何 V 扩展指令命中 `Opc` 枚举未覆盖的 opcode 0x57, 经 `exec_instr()` -> `ValueError` -> `IllInstr` 陷态。
 
 **已知影响**: 本仓库中的 `custom_opensbi_fw_payload.elf` 已以 `-march=rv64imac` (不带 `v`) 重编译, 不再触发此问题. 直接从上游编译的 PLATFORM=generic 固件若启用 V 扩展仍需 `-march=rv64imac`.
 
@@ -500,7 +556,7 @@ RISC-V "V" 向量扩展为 RV64 基础 ISA 增加 ~200 条向量指令, 操作�
 - `.payload` (0x200000, 8 KiB): 微型测试 payload (SBI ecall 打印)
 - 需要 `ram_base=0` 加载, FDT 通过 a1 传入 (需含 `/chosen/stdout-path`)
 - **已修复**: V 扩展指令已通过 `-march=rv64imac` 重编译移除; `_sext` 规范化 bug 修复后固件可成功通过 `fw_platform_init` 到达 `_start_hang`
-- 启动流程: `_start` → `fw_boot_hart`(-1) → `_try_lottery`(AMOSWAP) → PIE 重定位 → BSS 零填充 (约 800 KB, ~300K 指令) → `_scratch_init` → `fw_platform_init` (FDT 解析 `/cpus`, `/chosen`, 遍历子节点) → `_fdt_reloc_done`(设 `_boot_status=1`) → `_start_warm` → `sbi_init()` → `_start_hang`(WFI 空闲)
+- 启动流程: `_start` -> `fw_boot_hart`(-1) -> `_try_lottery`(AMOSWAP) -> PIE 重定位 -> BSS 零填充 (约 800 KB, ~300K 指令) -> `_scratch_init` -> `fw_platform_init` (FDT 解析 `/cpus`, `/chosen`, 遍历子节点) -> `_fdt_reloc_done`(设 `_boot_status=1`) -> `_start_warm` -> `sbi_init()` -> `_start_hang`(WFI 空闲)
 
 ## Code style
 
@@ -651,7 +707,7 @@ third-party/
       Kconfig                   # PHYS_MEM_START / POOL_BASE / POOL_SIZE 默认值
     firmware/
       fw_base.S                 # 固件入口: lottery, PIE 重定位, BSS 清零, _start_warm
-      objects.mk                # ENCLAVE_MOD_MAN_BIN_PATH → 嵌入 Rust 二进制到 .coffer_enclave_man
+      objects.mk                # ENCLAVE_MOD_MAN_BIN_PATH -> 嵌入 Rust 二进制到 .coffer_enclave_man
       payloads/test_main.c      # 测试 payload: 调用 SBI_ENCLAVE_CREATE ecall
   rust_smode_entry/             # Rust S-mode 飞地运行时
     src/main.rs                 # 入口: 计算 load_offset, 初始化上下文, 映射段
@@ -660,7 +716,7 @@ third-party/
     src/paging.rs               # Sv39 页表操作: PTE, map_page, init_satp
     src/entry.s                 # 汇编入口: _start, trap_vector, SAVE/RESTORE_CONTEXT
     link.ld.S                   # 链接脚本模板 (LINK_BASE 由 CPP 预处理)
-    Makefile                    # cargo build → llvm-objcopy → rust_smode_entry.bin
+    Makefile                    # cargo build -> llvm-objcopy -> rust_smode_entry.bin
     config.mk                   # 编译期常量: TIMER_INTERVAL, UART_BASE, LINK_BASE
 ```
 
@@ -672,40 +728,47 @@ third-party/
 0x80080000 - 0x80083CA8   .data
 0x80084000 - 0x80147A48   .bss (~800 KiB, 含 enclave_regions, owner_tag_per2MB 等)
 0x80180000 - 0x80185BF8   .coffer_enclave_man (Rust 管理器 ~23 KiB, 由 objects.mk 嵌入)
-0x80200000 - 0x80202020   .payload (测试 payload ~8 KiB)
+0x80200000 - 0x80202020   .payload (测试 payload ~8 KiB, 仅 fw_payload)
 ---
-0x81000000                 POOL_BASE (飞地内存池起始, 默认值)
-0x81000000 - 0x87000000   POOL (96 MiB, POOL_SIZE=0x6000000)
+0x80200000                 FW_JUMP_ADDR (fw_jump 模式: Linux 内核 Image 加载地址)
+0x80200000 - 0x81C42000   Linux Kernel Image (~28 MiB, 仅 fw_jump/fw_dynamic)
+---
+0x83000000                 POOL_BASE (飞地内存池起始, 统一默认值)
+0x83000000 - 0x89000000   POOL (96 MiB, POOL_SIZE=0x6000000)
                           飞地运行时的代码/数据由此池分配 (2 MiB 粒度)
+
+设计要点: POOL_BASE=0x83000000 (ram_base + 48 MiB) 确保飞地池位于内核
+Image 上方, fw_payload / fw_jump / fw_dynamic 三种编译产物均无冲突.
+fw_payload 模式下 Kernel 区域空闲, 仅浪费 48 MiB 空洞 (不影响功能).
 ```
 
 ### TEE 启动流程
 
 ```
 M-mode _start (fw_base.S)
-  → fw_boot_hart / _try_lottery (AMOSWAP, 仅 hart 0 胜出)
-  → PIE 重定位 (R_RISCV_RELATIVE)
-  → BSS 清零 (FW_SKIP_BSS_ZERO=1 时跳过, Python RAM 已由 load_firmware 零填)
-  → _start_warm → sbi_init() → init_cold_startup()
-    → sbi_ecall_init()  ← 注册 SBI ecall 扩展 (含 0x20221222 enclave ext)
-    → sbi_domain_finalize()
-    → sbi_hart_protection_configure()  ← 配置 SMEPMP (若支持)
-    → init_sm()  ← TEE 管理器初始化:
+  -> fw_boot_hart / _try_lottery (AMOSWAP, 仅 hart 0 胜出)
+  -> PIE 重定位 (R_RISCV_RELATIVE)
+  -> BSS 清零 (FW_SKIP_BSS_ZERO=1 时跳过, Python RAM 已由 load_firmware 零填)
+  -> _start_warm -> sbi_init() -> init_cold_startup()
+    -> sbi_ecall_init()  ← 注册 SBI ecall 扩展 (含 0x20221222 enclave ext)
+    -> sbi_domain_finalize()
+    -> sbi_hart_protection_configure()  ← 配置 SMEPMP (若支持)
+    -> init_sm()  ← TEE 管理器初始化:
       1. sbi_ecall_register_extension(&ecall_enclave)
       2. init_ext_ipi()
-      3. init_owners_bitmap() → 设置 enclave_regions[0..255], host 内存区域
-      4. activate_lpmp(0) → 激活 host PMP (保护固件区 + 池外区域)
-    → sbi_hsm_hart_start_finish() → mret → S-mode payload
-  → test_main() 调用 sbi_ecall(SBI_EXT_ENCLAVE, SBI_ENCLAVE_CREATE, ...)
-    → ECALL → M-mode → create_enclave_handler()
-      → enclave_id = max_enclave_id++ (首次: id=1)
-      → clear_entire_pool() (首次飞地时清池)
-      → try_to_set_mem_ownership() → 从池中分配 2 MiB
-      → load_payload_from_low_privilege() → 复制 Rust 二进制到分配的 PA
-      → init_enclave_ctx(base_pa) → mepc=base_pa, MPP=S-mode
-      → alter_hart_ctx_for_enclave(0, 1) → 保存 host 上下文, 恢复飞地上下文
-        → activate_lpmp(1) → 激活飞地 PMP
-      → mret → S-mode 飞地入口 (Rust _start)
+      3. init_owners_bitmap() -> 设置 enclave_regions[0..255], host 内存区域
+      4. activate_lpmp(0) -> 激活 host PMP (保护固件区 + 池外区域)
+    -> sbi_hsm_hart_start_finish() -> mret -> S-mode payload
+  -> test_main() 调用 sbi_ecall(SBI_EXT_ENCLAVE, SBI_ENCLAVE_CREATE, ...)
+    -> ECALL -> M-mode -> create_enclave_handler()
+      -> enclave_id = max_enclave_id++ (首次: id=1)
+      -> clear_entire_pool() (首次飞地时清池)
+      -> try_to_set_mem_ownership() -> 从池中分配 2 MiB
+      -> load_payload_from_low_privilege() -> 复制 Rust 二进制到分配的 PA
+      -> init_enclave_ctx(base_pa) -> mepc=base_pa, MPP=S-mode
+      -> alter_hart_ctx_for_enclave(0, 1) -> 保存 host 上下文, 恢复飞地上下文
+        -> activate_lpmp(1) -> 激活飞地 PMP
+      -> mret -> S-mode 飞地入口 (Rust _start)
 ```
 
 ### ecall 接口 (扩展 ID: 0x20221222)
@@ -749,7 +812,7 @@ make PLATFORM=generic FW_SKIP_BSS_ZERO=1 FW_PAYLOAD=y -j$(nproc)
 
 ```bash
 # 在 third-party/rust_smode_entry 目录中:
-make  # cargo build --release → llvm-objcopy → rust_smode_entry.bin
+make  # cargo build --release -> llvm-objcopy -> rust_smode_entry.bin
 ```
 
 OpenSBI 编译时 `objects.mk` 自动检测 `rust_smode_entry/rust_smode_entry.bin` 并嵌入。

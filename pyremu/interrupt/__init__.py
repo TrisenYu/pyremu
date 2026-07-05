@@ -6,10 +6,12 @@
 
 from pyremu.interrupt.clint import CLINT
 from pyremu.interrupt.controller import INT_SOURCE_MIP_MASK, InterruptController, IntSource
+from pyremu.interrupt.plic import PLIC
 
 __all__ = [
     "CLINT",
     "INT_SOURCE_MIP_MASK",
     "InterruptController",
     "IntSource",
+    "PLIC",
 ]

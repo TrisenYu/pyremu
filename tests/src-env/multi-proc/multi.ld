@@ -2,7 +2,7 @@
  * 多程序内核链接脚本.
  *
  * 内核 (M+S) + 多个 U 模式用户程序共同链接.
- * 布局: .tohost → .text (所有输入文件合并) → .rodata → .data → .bss
+ * 布局: .tohost -> .text (所有输入文件合并) -> .rodata -> .data -> .bss
  *
  * 输出入口: _start (kernel.s 定义)
  */

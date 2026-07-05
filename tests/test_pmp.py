@@ -16,7 +16,15 @@ from pyremu.core.mem_check_aux import (
     mem_write,
 )
 from pyremu.memory.bus import Bus
-from pyremu.memory.pmp import PMP_A_NAPOT, PMP_R, PMP_W, PMP_X, Pmp, decode_napot
+from pyremu.memory.pmp import (
+    PMP_A_NAPOT,
+    PMP_R,
+    PMP_W,
+    PMP_X,
+    Pmp,
+    PmpAccessInfo,
+    decode_napot,
+)
 
 # ============================================================
 #  NAPOT 编解码
@@ -24,7 +32,7 @@ from pyremu.memory.pmp import PMP_A_NAPOT, PMP_R, PMP_W, PMP_X, Pmp, decode_napo
 
 
 class TestNapotDecode:
-    """验证 NAPOT 格式的 pmpaddr → (base, size) 解码."""
+    """验证 NAPOT 格式的 pmpaddr -> (base, size) 解码."""
 
     # es: expected_size
     # eb: expected_base
@@ -90,28 +98,28 @@ class TestPmpCheck:
     def test_m_mode_bypass(self, pmp):
         """M 模式 + MPRV=0: PMP 不检查, 直接放行."""
         # 无 PMP 条目 — S/U 会拒绝, M 放行
-        assert pmp.check(0x1000, 4, mode_val=3, mstatus_val=0, is_write=True)
+        assert pmp.check(PmpAccessInfo(pa=0x1000, size=4, mode_val=3, mstatus_val=0, is_write=True))
 
     def test_m_mode_mprv_uses_mpp(self, pmp):
         """M 模式 + MPRV=1: 按 MPP 特权级检查."""
         # MPRV=1, MPP=0 (U) — 应作为 U 模式检查
-        # 0 条目 → U 模式拒绝
+        # 0 条目 -> U 模式拒绝
         mstatus = (1 << 17) | (0 << 11)  # MPRV=1, MPP=U
-        assert not pmp.check(0x1000, 4, mode_val=3, mstatus_val=mstatus)
+        assert not pmp.check(PmpAccessInfo(0x1000, 4, mode_val=3, mstatus_val=mstatus))
 
     # ---- TOR ----
 
     def test_tor_range(self, pmp):
-        """TOR: pmpaddr[0]=0x1000 → 范围 [0, 0x4000)."""
+        """TOR: pmpaddr[0]=0x1000 -> 范围 [0, 0x4000)."""
         self._set_csrs(
             pmp,
             [
                 (0b1000 | 0b0001, 0x1000),  # TOR, R, entry 0: [0, 0x4000)
             ],
         )
-        # 0x1000 << 2 = 0x4000 → range [0, 0x4000)
-        assert pmp.check(0x0000, 4, mode_val=0, mstatus_val=0)  # inside
-        assert not pmp.check(0x4000, 1, mode_val=0, mstatus_val=0)  # at hi bound
+        # 0x1000 << 2 = 0x4000 -> range [0, 0x4000)
+        assert pmp.check(PmpAccessInfo(0x0000, 4, mode_val=0, mstatus_val=0))  # inside
+        assert not pmp.check(PmpAccessInfo(0x4000, 1, mode_val=0, mstatus_val=0))  # at hi bound
 
     def test_tor_range_multi_entry(self, pmp):
         """TOR 多条目: [addr[0]<<2, addr[1]<<2)."""
@@ -122,9 +130,9 @@ class TestPmpCheck:
                 (0b1000 | 0b0001, 0x2000),  # entry 1: [0x4000, 0x8000)
             ],
         )
-        assert pmp.check(0x0000, 4, mode_val=0, mstatus_val=0)  # entry 0
-        assert pmp.check(0x4000, 4, mode_val=0, mstatus_val=0)  # entry 1
-        assert not pmp.check(0x8000, 4, mode_val=0, mstatus_val=0)  # out
+        assert pmp.check(PmpAccessInfo(0x0000, 4, mode_val=0, mstatus_val=0))  # entry 0
+        assert pmp.check(PmpAccessInfo(0x4000, 4, mode_val=0, mstatus_val=0))  # entry 1
+        assert not pmp.check(PmpAccessInfo(0x8000, 4, mode_val=0, mstatus_val=0))  # out
 
     # ---- NA4 ----
 
@@ -137,8 +145,8 @@ class TestPmpCheck:
             ],
         )
         # addr = pmpaddr << 2 = 0x8000_0000
-        assert pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0)
-        assert not pmp.check(0x8000_0004, 4, mode_val=0, mstatus_val=0)
+        assert pmp.check(PmpAccessInfo(0x8000_0000, 4, mode_val=0, mstatus_val=0))
+        assert not pmp.check(PmpAccessInfo(0x8000_0004, 4, mode_val=0, mstatus_val=0))
 
     # ---- NAPOT ----
 
@@ -151,9 +159,9 @@ class TestPmpCheck:
                 (0b11_000 | 0b0111, val),  # NAPOT, RWX
             ],
         )
-        assert pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0)
-        assert pmp.check(0x8000_0FFC, 4, mode_val=0, mstatus_val=0)  # last 4B
-        assert not pmp.check(0x8000_1000, 4, mode_val=0, mstatus_val=0)  # out
+        assert pmp.check(PmpAccessInfo(0x8000_0000, 4, mode_val=0, mstatus_val=0))
+        assert pmp.check(PmpAccessInfo(0x8000_0FFC, 4, mode_val=0, mstatus_val=0))  # last 4B
+        assert not pmp.check(PmpAccessInfo(0x8000_1000, 4, mode_val=0, mstatus_val=0))  # out
 
     def test_napot_cross_boundary_access(self, pmp):
         """跨边界访问被拒绝."""
@@ -164,8 +172,8 @@ class TestPmpCheck:
                 (0b11_000 | 0b0111, val),
             ],
         )
-        # 从 0xFFC 读 8 字节 → 超出区域
-        assert not pmp.check(0x8000_0FFC, 8, mode_val=0, mstatus_val=0)
+        # 从 0xFFC 读 8 字节 -> 超出区域
+        assert not pmp.check(PmpAccessInfo(0x8000_0FFC, 8, mode_val=0, mstatus_val=0))
 
     # ---- 权限 ----
 
@@ -178,9 +186,9 @@ class TestPmpCheck:
                 (0b11_000 | 0b0010, val),  # NAPOT, W only (no R)
             ],
         )
-        assert not pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0)
+        assert not pmp.check(PmpAccessInfo(0x8000_0000, 4, mode_val=0, mstatus_val=0))
         # R=0 时 W 也拒绝 (PMP 要求 R 必须置位)
-        assert not pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0, is_write=True)
+        assert not pmp.check(PmpAccessInfo(pa=0x8000_0000, size=4, mode_val=0, mstatus_val=0, is_write=True))
 
     def test_w_denied(self, pmp):
         """W=0 拒绝写."""
@@ -191,22 +199,22 @@ class TestPmpCheck:
                 (0b11_000 | 0b0101, val),  # NAPOT, R+X
             ],
         )
-        assert pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0)  # read OK
-        assert not pmp.check(0x8000_0000, 4, mode_val=0, mstatus_val=0, is_write=True)
+        assert pmp.check(PmpAccessInfo(0x8000_0000, 4, mode_val=0, mstatus_val=0))  # read OK
+        assert not pmp.check(PmpAccessInfo(pa=0x8000_0000, size=4, mode_val=0, mstatus_val=0, is_write=True))
 
     # ---- 无条目 ----
 
     def test_no_entries_s_mode_rejected(self, pmp):
-        """0 条目 → S 模式拒绝."""
-        assert not pmp.check(0x1000, 4, mode_val=1, mstatus_val=0)
+        """0 条目 -> S 模式拒绝."""
+        assert not pmp.check(PmpAccessInfo(0x1000, 4, mode_val=1, mstatus_val=0))
 
     # ---- S-mode by default rejected with no match ----
 
     def test_s_mode_no_match_rejected(self, pmp):
-        """S 模式无匹配 PMP 条目 → 拒绝."""
+        """S 模式无匹配 PMP 条目 -> 拒绝."""
         # 每条目都 OFF, 无匹配
         pmp._num_entries = 4
-        assert not pmp.check(0x1000, 4, mode_val=1, mstatus_val=0)
+        assert not pmp.check(PmpAccessInfo(0x1000, 4, mode_val=1, mstatus_val=0))
 
 
 # ============================================================
@@ -234,14 +242,14 @@ class TestPmpCsrRange:
         assert advance == 4, "pmpaddr7 应可访问"
 
     def test_pmpaddr_8_traps(self, hart):
-        """pmpaddr8 (超出 8 条目) → IllInstr."""
+        """pmpaddr8 (超出 8 条目) -> IllInstr."""
         hart.mode = RiscvMode.M
         instr = self._csrrw_instr(0x3B8)  # pmpaddr8
         hart.exec_instr(instr)
         assert hart.mcause_val == 2, f"应为 IllInstr, 实际 {hart.mcause_val}"
 
     def test_pmpcfg2_traps(self, hart):
-        """pmpcfg2 (覆盖条目 8-15, 超出 8 条目) → IllInstr."""
+        """pmpcfg2 (覆盖条目 8-15, 超出 8 条目) -> IllInstr."""
         hart.mode = RiscvMode.M
         instr = self._csrrw_instr(0x3A2)  # pmpcfg2
         hart.exec_instr(instr)
@@ -322,21 +330,21 @@ class TestPmpInHart:
         assert hart.mcause_val == 0
 
     def test_umode_store_pmp_rw_ok(self, hart):
-        """U 模式, PMP 允许 RW → store 成功."""
+        """U 模式, PMP 允许 RW -> store 成功."""
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=True)
         hart.mode = RiscvMode.U
         mem_write(hart, 0x8000_1000, b"\x11\x22")
         assert hart.mcause_val == 0
 
     def test_umode_store_pmp_w_denied(self, hart):
-        """U 模式, PMP W=0 → StAccessFault."""
+        """U 模式, PMP W=0 -> StAccessFault."""
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=False)
         hart.mode = RiscvMode.U
         mem_write(hart, 0x8000_1000, b"\x11\x22")
         assert hart.mcause_val == 7, f"应为 StAccessFault(7), 实际 {hart.mcause_val}"
 
     def test_umode_load_pmp_r_denied(self, hart):
-        """U 模式, PMP R=0 → LdAccessFault."""
+        """U 模式, PMP R=0 -> LdAccessFault."""
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=False, w=True)
         hart.mode = RiscvMode.U
         # 先写入实际数据
@@ -384,7 +392,7 @@ class TestInstrFetchPmp:
         hart.csrs["pmpcfg0"].val = cfg
 
     def test_bare_fetch_x_ok(self, hart):
-        """Bare 模式, PMP X=1 → 取指通过."""
+        """Bare 模式, PMP X=1 -> 取指通过."""
         self._setup_napot(hart, 0x8000_1000, 12, r=True, w=False, x=True)
         hart.mode = RiscvMode.S
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
@@ -392,7 +400,7 @@ class TestInstrFetchPmp:
         assert pa == 0x8000_1000
 
     def test_bare_fetch_x_denied(self, hart):
-        """Bare 模式, PMP X=0 → InstrAccessFault."""
+        """Bare 模式, PMP X=0 -> InstrAccessFault."""
         self._setup_napot(hart, 0x8000_1000, 12, r=True, w=True, x=False)
         hart.mode = RiscvMode.S
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
@@ -402,8 +410,8 @@ class TestInstrFetchPmp:
         )
 
     def test_bare_fetch_no_match_s_mode(self, hart):
-        """S 模式无匹配 PMP 条目 → InstrAccessFault."""
-        # 所有条目 OFF → S 模式取指被拒
+        """S 模式无匹配 PMP 条目 -> InstrAccessFault."""
+        # 所有条目 OFF -> S 模式取指被拒
         hart.mode = RiscvMode.S
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
         assert not ok
@@ -413,13 +421,13 @@ class TestInstrFetchPmp:
         """M 模式取指 (MPRV=0) 不受 PMP 限制."""
         self._setup_napot(hart, 0x8000_1000, 12, r=True, w=True, x=False)
         hart.mode = RiscvMode.M
-        # M 模式 MPRV=0 → PMP 自动放行
+        # M 模式 MPRV=0 -> PMP 自动放行
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
         assert ok
         assert pa == 0x8000_1000
 
     def test_fetch_pma_invalid_addr(self, hart):
-        """取指地址不在有效内存范围 → InstrAccessFault."""
+        """取指地址不在有效内存范围 -> InstrAccessFault."""
         hart.mode = RiscvMode.M
         # M 模式 PMP 放行, 但 PMA 检查拒绝 (无效地址)
         ok, pa = check_instruction_fetch(hart, 0xDEAD_BEEF)

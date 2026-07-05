@@ -163,7 +163,7 @@ class TestParseElf:
         for p in elf_paths:
             img = parse_firmware(p)
             assert img is not None
-            # 可重定位对象 (.o) 没有 program headers → segments 可为空
+            # 可重定位对象 (.o) 没有 program headers -> segments 可为空
             for seg in img.segments:
                 assert isinstance(seg, FirmwareSegment)
                 assert seg.vaddr >= 0
@@ -180,14 +180,15 @@ class TestParseElf:
         for p in elf_paths:
             img = parse_firmware(p)
             assert img is not None
-            if len(img.segments) > 0:
-                has_linked = True
-                # 入口地址应落在某个段内
-                code_addrs = {(seg.vaddr, seg.vaddr + seg.memsz) for seg in img.segments}
-                assert any(start <= img.entry_point < end for start, end in code_addrs), (
-                    f"{Path(p).name}: entry 0x{img.entry_point:x} "
-                    f"不在任何段内, 段范围: {code_addrs}"
-                )
+            if len(img.segments) <= 0:
+                continue
+            has_linked = True
+            # 入口地址应落在某个段内
+            code_addrs = {(seg.vaddr, seg.vaddr + seg.memsz) for seg in img.segments}
+            assert any(start <= img.entry_point < end for start, end in code_addrs), (
+                f"{Path(p).name}: entry 0x{img.entry_point:x} "
+                f"不在任何段内, 段范围: {code_addrs}"
+            )
         if not has_linked:
             pytest.skip("当前测试数据仅包含可重定位对象 (.o), 无 LOAD 段")
 

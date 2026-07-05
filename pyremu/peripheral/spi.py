@@ -9,7 +9,7 @@ SPI 主模式控制器.
 寄存器布局 (每寄存器 4 字节宽):
   偏移    名称     读写    描述
   ──────────────────────────────────────
-  0x00    CTRL     R/W    控制: bit0=EN, bit1=CPOL, bit2=CPHA, bit8:11=frame_len(0→8bit)
+  0x00    CTRL     R/W    控制: bit0=EN, bit1=CPOL, bit2=CPHA, bit8:11=frame_len(0->8bit)
   0x04    STATUS   R      状态: bit0=busy, bit1=rx_avail
   0x08    TXDATA   W      发送数据 (写入后启动传输, 同时捕获到 RXDATA)
   0x0C    RXDATA   R      接收数据 (上次传输的结果)

@@ -14,6 +14,7 @@ Hart (硬件线程) 的寄存器文件定义，包含:
 
 from __future__ import annotations
 
+import ctypes
 from collections.abc import Callable
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -31,6 +32,7 @@ from pyremu.memory.tlb import TLB
 
 if TYPE_CHECKING:
     from pyremu.interrupt.controller import InterruptController
+    from pyremu.interrupt.plic import PLIC
     from pyremu.memory.bus import Bus
 
 
@@ -83,6 +85,18 @@ class RiscvMode(Enum):
     D = 8
 
 
+# u8 privilege value → RiscvMode (for unmarshalling from FFI / wire formats).
+_MODE_FROM_U8: dict[int, RiscvMode] = {0: RiscvMode.U, 1: RiscvMode.S, 3: RiscvMode.M}
+
+
+def mode_from_u8(raw: int) -> RiscvMode:
+    """Convert the wire-level u8 privilege encoding to a ``RiscvMode``.
+
+    Unknown values fall back to M-mode.
+    """
+    return _MODE_FROM_U8.get(raw, RiscvMode.M)
+
+
 # ============================================================
 #  mstatus / sstatus 位字段定义 (RV64)
 # ============================================================
@@ -99,6 +113,24 @@ MSTATUS_MPP = 0b11 << 11  # Machine 先前特权级 (0=U, 1=S, 3=M)
 MSTATUS_FS = 0b11 << 13  # 浮点单元状态
 MSTATUS_XS = 0b11 << 15  # 用户扩展状态
 MSTATUS_MPRV = 1 << 17  # 修改特权级下的内存访问特权
+
+# sstatus 是 mstatus 的受限视图 (RISC-V 特权规范 §4.1.1).
+# sstatus 的读写必须通过 mstatus 的对应位, 两者不可独立.
+_SSTATUS_MASK = (
+    MSTATUS_SIE
+    | MSTATUS_SPIE
+    | MSTATUS_UBE
+    | MSTATUS_SPP
+    | MSTATUS_VS
+    | MSTATUS_FS
+    | MSTATUS_XS
+    | MSTATUS_MPRV  # SUM 复用 MPRV 位? 不, SUM=bit18, bit17=MPRV
+    | (1 << 18)  # SUM: permit Supervisor User Memory access
+    | (1 << 19)  # MXR: Make eXecutable Readable
+    | (1 << 63)  # SD: state dirty (read-only, = FS==3 || XS==3)
+)
+# writable sstatus mask 排除 VS (bits 9-10) 和 SD (bit 63)
+_SSTATUS_WRITABLE_MASK = _SSTATUS_MASK & ~(MSTATUS_VS | (1 << 63))
 MSTATUS_SUM = 1 << 18  # 允许 S 模式访问 U 模式页
 MSTATUS_MXR = 1 << 19  # 使能可执行内存的可读
 MSTATUS_TVM = 1 << 20  # 陷入 S 模式访问 satp
@@ -106,7 +138,7 @@ MSTATUS_TW = 1 << 21  # 陷入 WFI
 MSTATUS_TSR = 1 << 22  # 陷入 SRET
 MSTATUS_SD = 1 << 63  # 状态脏位 (FS 或 XS 为脏时置 1)
 
-# SPP / MPP 编码 → RiscvMode 的映射
+# SPP / MPP 编码 -> RiscvMode 的映射
 _SPP_TO_MODE = {0: RiscvMode.U, 1: RiscvMode.S}
 _MPP_TO_MODE = {0: RiscvMode.U, 1: RiscvMode.S, 3: RiscvMode.M}
 _MODE_TO_MPP = {RiscvMode.U: 0, RiscvMode.S: 1, RiscvMode.M: 3}
@@ -132,6 +164,9 @@ class HartWithRegs:
         self.csrs["mvendorid"].val = 0  # 非商业实现
         self.csrs["marchid"].val = 0  # 未指定架构 ID
         self.csrs["mimpid"].val = 1  # 实现版本
+        # misa: MXL=2 (RV64) | A | C | I | M | F | D
+        #    (与 DTB riscv,isa 字段一致: rv64imafdc)
+        self.csrs["misa"].val = (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12) | (1 << 5) | (1 << 3)
 
         self.pc = 0
         self.mode = RiscvMode.M
@@ -161,6 +196,9 @@ class HartWithRegs:
         # 中断控制器引用 — 每条指令执行后在指令边界检查是否有待处理中断
         self._interrupt_ctrl: InterruptController | None = None
 
+        # PLIC 引用 — 外部中断 (MEIP/SEIP), 与 CLINT 互补
+        self._plic: PLIC | None = None
+
         # LR/SC 预留 (A-extension 原子指令)
         # 执行 LR 时记录预留地址; 任何 hart 向该地址写入时清除预留;
         # SC 仅在预留有效时成功, 否则失败; trap 发生时也清除预留
@@ -178,6 +216,9 @@ class HartWithRegs:
         # mdid 缓存 — 避免每周期通过 pydantic dict 读取 (热路径, ~1M 次/基准测试)
         self._mdid_val: int = 0
 
+        # pmpsplit 缓存 — PMP 条目拆分点: 低 [0, split) 归 host, 高 [split, N) 归飞地
+        self._pmpsplit_val: int = 0
+
         # WFI 低功耗等待状态
         # 当 hart 执行 WFI 且无可处理中断时置位; 中断挂起且使能时硬件唤醒
         self._waiting: bool = False
@@ -187,15 +228,57 @@ class HartWithRegs:
         # 以保证指令计数器反映的是固件实际执行的非中断上下文指令.
         self._wfi_woken: bool = False
 
+        # 中断状态缓存 — 避免每条指令都做完整的 CLINT+CSR+PLIC 遍历 (~1272 ns).
+        # _int_state_version 在软件写 CSR / CLINT 变化 / 特权级切换时递增.
+        # check_pending_interrupts 发现版本未变且 timer 未到期时直接返回 False.
+        self._int_state_version: int = 0
+        self._int_cache_version: int = -1  # -1 = 首次调用强制全量检查
+        self._int_cache_next_timer: int = 0  # 最近 timer 唤醒时间 (0 = 无 timer 使能)
+
     # ----------------------------------------------------------
     #  寄存器读写
     # ----------------------------------------------------------
+
+    def _csr_read_raw(self, csr_name: str) -> int:
+        """Read CSR value bypassing pydantic model (hot path, ~10% faster)."""
+        csr = self.csrs[csr_name]
+        assert csr is not None, f"CSR {csr_name!r} not found in hart {self.id}"
+        return csr.__dict__["val"]
 
     def read_csr(self, csr_id: int) -> int:
         check, csr_name = check_csr(csr_id)
         if not check:
             return -1
-        return self.csrs[csr_name].val
+        # 硬件计数器 — 从 CLINT 动态读取 (time / timeh)
+        # RISC-V 规范: time / timeh 是内存映射 CLINT mtime 的只读 CSR 镜像
+        if csr_name == "time" and self._interrupt_ctrl is not None:
+            return self._interrupt_ctrl.get_mtime()
+        if csr_name == "timeh" and self._interrupt_ctrl is not None:
+            return (self._interrupt_ctrl.get_mtime() >> 32) & 0xFFFF_FFFF
+        # sstatus 是 mstatus 的受限视图, 读取 sstatus 时返回 mstatus 的对应位
+        if csr_name == "sstatus":
+            mval = self._csr_read_raw("mstatus")
+            return mval & _SSTATUS_MASK
+        return self._csr_read_raw(csr_name)
+
+    # CSR names whose writes affect interrupt state and must invalidate the
+    # check_pending_interrupts cache.
+    _INT_SENSITIVE_CSRS: frozenset[str] = frozenset({
+        "mip", "mie", "mideleg", "mstatus", "stimecmp",
+    })
+
+    def _csr_write_raw(self, csr_name: str, val: int) -> None:
+        """Write CSR value bypassing pydantic ``BaseModel.__setattr__``.
+
+        Hot-path optimization: ``h.csrs[name].val = v`` costs ~120ns per write
+        in pydantic field-set machinery; ``__dict__['val']`` is ~40ns (3× faster).
+        Callers MUST ensure *csr_name* is valid and no side-effects are required.
+        """
+        csr = self.csrs[csr_name]
+        assert csr is not None, f"CSR {csr_name!r} not found in hart {self.id}"
+        csr.__dict__["val"] = val & 0xFFFF_FFFF_FFFF_FFFF  # type: ignore[index]  # pydantic MappingProxyType vs runtime dict
+        if csr_name in self._INT_SENSITIVE_CSRS:
+            self._int_state_version += 1
 
     def write_csr(self, csr_id: int, val: int):
         check, csr_name = check_csr(csr_id)
@@ -206,8 +289,35 @@ class HartWithRegs:
             self.satp_val = val
         elif csr_name == "mdid":
             self.mdid_val = val
+        elif csr_name == "pmpsplit":
+            self.pmpsplit_val = val
+        elif csr_name.startswith(("pmpcfg", "pmpaddr")):
+            # PMP CSR 写入 → 使 Rust 扁平缓存失效
+            self._csr_write_raw(csr_name, val)
+            self._pmp.invalidate_cache()
+            return
+        elif csr_name == "stimecmp":
+            # SSTC: S-mode 直接写 stimecmp -> 同步到 CLINT mtimecmp
+            # 用于 timer 比较 (mtime >= stimecmp 时触发 STIP)
+            self._csr_write_raw(csr_name, val)
+            if self._interrupt_ctrl is not None:
+                self._interrupt_ctrl.set_mtimecmp(self.id, val)
+        elif csr_name == "stimecmph":
+            # RV32 only: stimecmp 高 32 位 (RV64 上 stimecmp 已是 64-bit)
+            cur = self._csr_read_raw("stimecmp") & 0xFFFF_FFFF
+            merged = cur | ((val & 0xFFFF_FFFF) << 32)
+            self._csr_write_raw("stimecmp", merged)
+            self._csr_write_raw(csr_name, val & 0xFFFF_FFFF)
+            if self._interrupt_ctrl is not None:
+                self._interrupt_ctrl.set_mtimecmp(self.id, merged)
+        elif csr_name == "sstatus":
+            # sstatus 是 mstatus 的受限视图: 写入 sstatus 时更新 mstatus 对应位
+            mstatus = self._csr_read_raw("mstatus")
+            mstatus = (mstatus & ~_SSTATUS_WRITABLE_MASK) | (val & _SSTATUS_WRITABLE_MASK)
+            self._csr_write_raw("mstatus", mstatus)
+            self._csr_write_raw("sstatus", mstatus & _SSTATUS_MASK)
         else:
-            self.csrs[csr_name].val = val
+            self._csr_write_raw(csr_name, val)
 
     def read_gpr(self, reg_id: int) -> int:
         return self.gprs[reg_id & 0x1F]
@@ -431,6 +541,26 @@ class HartWithRegs:
     @interrupt_ctrl.setter
     def interrupt_ctrl(self, ctrl):
         self._interrupt_ctrl = ctrl
+        # 自动注册中断状态变化回调 — 即使外部替换 CLINT 也不漏通知
+        if ctrl is not None:
+            ctrl.set_int_state_change_callback(self.notify_int_state_change)
+
+    @property
+    def plic(self):
+        """PLIC 中断控制器 (外部中断 MEIP/SEIP)."""
+        return self._plic
+
+    @plic.setter
+    def plic(self, p):
+        self._plic = p
+
+    def notify_int_state_change(self) -> None:
+        """通知中断状态可能已改变 (CSR 写入 / CLINT 更新 / 特权级切换).
+
+        递增版本号使 check_pending_interrupts 的缓存失效,
+        触发下一条指令的全量中断检查.
+        """
+        self._int_state_version += 1
 
     @property
     def all_harts(self):
@@ -455,6 +585,26 @@ class HartWithRegs:
         val = v & 0xFFFF_FFFF_FFFF_FFFF
         self._mdid_val = val
         self.csrs["mdid"].val = val
+
+    # ----------------------------------------------------------
+    #  pmpsplit — PMP 条目拆分 (TEE 飞地 PMP 虚拟化)
+    # ----------------------------------------------------------
+
+    @property
+    def pmpsplit_val(self) -> int:
+        """读取 pmpsplit CSR — PMP 条目拆分点.
+
+        PMP 条目 [0, split) 归 host (mdid==0) 使用,
+        [split, N) 归飞地 (mdid!=0) 使用.
+        值为 0 时全部条目归 host (无飞地 PMP 隔离).
+        """
+        return self._pmpsplit_val
+
+    @pmpsplit_val.setter
+    def pmpsplit_val(self, v: int):
+        val = v & 0xFFFF_FFFF_FFFF_FFFF
+        self._pmpsplit_val = val
+        self.csrs["pmpsplit"].val = val
 
     # ----------------------------------------------------------
     #  mip 快捷属性 (中断挂起位)
@@ -501,3 +651,198 @@ class HartWithRegs:
     #  deliver_trap / trap_ecall / trap_ebreak / trap_mret / trap_sret /
     #  handle_wfi / check_pending_interrupts
     # ----------------------------------------------------------
+
+
+# ============================================================
+#  FFI state structs — ctypes mirror of Rust repr(C) layouts
+# ============================================================
+
+
+
+class TlbEntry(ctypes.Structure):
+    """Single TLB entry — must match Rust ``state::TlbEntry`` exactly (24 bytes)."""
+    _fields_ = [
+        ("vpn", ctypes.c_uint64),
+        ("ppn", ctypes.c_uint64),
+        ("perm", ctypes.c_uint8),
+        ("level", ctypes.c_uint8),
+        ("valid", ctypes.c_uint8),
+        ("mdid", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint32),
+    ]
+
+class HartState(ctypes.Structure):
+    """Per-hart state marshaled to/from the Rust batch execution loop.
+
+    Field order and types must exactly match ``state::HartState`` in Rust.
+    """
+
+    _fields_ = [
+        # GPRs: 32 × u64
+        ("gprs", ctypes.c_uint64 * 32),
+        # Key CSRs (u64)
+        ("mstatus", ctypes.c_uint64),
+        ("mtvec", ctypes.c_uint64),
+        ("stvec", ctypes.c_uint64),
+        ("mepc", ctypes.c_uint64),
+        ("sepc", ctypes.c_uint64),
+        ("mcause", ctypes.c_uint64),
+        ("scause", ctypes.c_uint64),
+        ("mtval", ctypes.c_uint64),
+        ("stval", ctypes.c_uint64),
+        ("satp", ctypes.c_uint64),
+        ("mie", ctypes.c_uint64),
+        ("mip", ctypes.c_uint64),
+        ("medeleg", ctypes.c_uint64),
+        ("mideleg", ctypes.c_uint64),
+        # PC
+        ("pc", ctypes.c_uint64),
+        # Reservation (LR/SC)
+        ("reservation_addr", ctypes.c_uint64),
+        # Single-byte fields (packed after u64s)
+        ("reservation_valid", ctypes.c_uint8),
+        ("mode", ctypes.c_uint8),
+        ("mmu_mode", ctypes.c_uint8),
+        ("waiting", ctypes.c_uint8),
+        ("halted", ctypes.c_uint8),
+        ("consecutive_traps", ctypes.c_uint8),
+        ("mdid", ctypes.c_uint8),
+        ("pmpsplit", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 6),
+        # ---- Phase B: TLB entries (array-of-structs, 32 × 2) ----
+        ("itlb", TlbEntry * 32),
+        ("dtlb", TlbEntry * 32),
+        # ---- Phase C: Extra CSRs ----
+        ("mscratch", ctypes.c_uint64),
+        ("sscratch", ctypes.c_uint64),
+        ("mhartid", ctypes.c_uint64),
+        ("mcounteren", ctypes.c_uint64),
+        ("scounteren", ctypes.c_uint64),
+        # ---- Phase E: cache ----
+        ("_mmu_mode_pad", ctypes.c_uint64),
+    ]
+
+
+class BatchResult(ctypes.Structure):
+    """Result returned by ``run_batch`` describing why the batch stopped."""
+
+    _fields_ = [
+        ("total_instrs", ctypes.c_uint64),
+        ("exit_reason", ctypes.c_uint8),
+        ("exit_hart_id", ctypes.c_uint8),
+        ("exit_pc", ctypes.c_uint64),
+        ("exit_instr", ctypes.c_uint32),
+        ("trap_cause", ctypes.c_uint32),
+        ("trap_tval", ctypes.c_uint64),
+        ("trap_is_interrupt", ctypes.c_uint8),
+        ("trap_delegated", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 6),
+    ]
+
+
+# Exit reason constants (must match state.rs)
+EXIT_NORMAL = 0
+EXIT_TRAP = 1
+EXIT_MMIO = 2
+EXIT_SYS = 3
+EXIT_EBREAK = 4
+EXIT_WFI_WAIT = 5
+EXIT_ERROR = 6
+
+
+# ============================================================
+#  Marshal / unmarshal
+# ============================================================
+
+
+def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
+    """Copy hart state from Python ``HartWithRegs`` into a Rust ``HartState``."""
+    for i in range(32):
+        state.gprs[i] = hart.gprs[i]
+
+    state.mstatus = hart.mstatus_val
+    state.mtvec = hart.csrs["mtvec"].val
+    state.stvec = hart.csrs["stvec"].val
+    state.mepc = hart.mepc_val
+    state.sepc = hart.sepc_val
+    state.mcause = hart.mcause_val
+    state.scause = hart.scause_val
+    state.mtval = hart.mtval_val
+    state.stval = hart.stval_val
+    state.satp = hart.satp_val
+    state.mie = hart.mie_val
+    state.mip = hart.mip_val
+    state.medeleg = hart.csrs["medeleg"].val
+    state.mideleg = hart.csrs["mideleg"].val
+
+    state.pc = hart.pc
+    state.mode = hart.mode.value
+    state.mmu_mode = hart.mmu_mode
+
+    state.reservation_valid = 1 if hart.reservation_valid else 0
+    state.reservation_addr = hart.reservation_addr
+
+    state.waiting = 1 if hart._waiting else 0
+    state.halted = 1 if hart._halted else 0
+    state.consecutive_traps = hart._consecutive_traps
+
+    state.mdid = hart.mdid_val
+    state.pmpsplit = hart.pmpsplit_val
+
+    # ---- Phase B: TLB entries ----
+    # Skip TLB marshalling for now — Rust handles TLB internally during batch.
+    # Python TLB stays as ground truth; before each batch, Rust TLB is cold
+    # but refills from page walks.
+
+    # ---- Phase C: Extra CSRs ----
+    state.mscratch = hart.csrs["mscratch"].val
+    state.sscratch = hart.csrs["sscratch"].val
+    state.mhartid = hart.csrs["mhartid"].val
+    state.mcounteren = hart.csrs["mcounteren"].val
+    state.scounteren = hart.csrs["scounteren"].val if "scounteren" in hart.csrs else 0
+
+
+def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
+    """Copy Rust ``HartState`` back into a Python ``HartWithRegs``."""
+    for i in range(32):
+        hart.gprs[i] = state.gprs[i]
+
+    hart.mstatus_val = state.mstatus
+    hart.csrs["mtvec"].val = state.mtvec
+    hart.csrs["stvec"].val = state.stvec
+    hart.mepc_val = state.mepc
+    hart.sepc_val = state.sepc
+    hart.mcause_val = state.mcause
+    hart.scause_val = state.scause
+    hart.mtval_val = state.mtval
+    hart.stval_val = state.stval
+    hart.satp_val = state.satp
+    hart._csr_write_raw("mie", state.mie)
+    hart._csr_write_raw("mip", state.mip)
+    hart.csrs["medeleg"].val = state.medeleg
+    hart.csrs["mideleg"].val = state.mideleg
+
+    hart.pc = state.pc
+    hart.mode = mode_from_u8(state.mode)
+    hart._mmu_mode = state.mmu_mode
+
+    hart._reservation_valid = state.reservation_valid != 0
+    hart._reservation_addr = state.reservation_addr
+
+    hart._waiting = state.waiting != 0
+    hart._halted = state.halted != 0
+    hart._consecutive_traps = state.consecutive_traps
+
+    hart._mdid_val = state.mdid
+    hart._pmpsplit_val = state.pmpsplit
+
+    # ---- Phase B: TLB — Rust TLB is cold after batch, don't write back ----
+    # Python TLB is ground truth.
+
+    # ---- Phase C: Extra CSRs ----
+    hart.csrs["mscratch"].val = state.mscratch
+    hart.csrs["sscratch"].val = state.sscratch
+    hart.csrs["mhartid"].val = state.mhartid
+    hart.csrs["mcounteren"].val = state.mcounteren
+    if "scounteren" in hart.csrs:
+        hart.csrs["scounteren"].val = state.scounteren

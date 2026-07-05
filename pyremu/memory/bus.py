@@ -23,7 +23,19 @@ PMA (Physical Memory Attributes):
 必须排除于所有缓存机制之外 — 不走 TLB 缓存, 不走 L2 缓存, 直通设备。
 """
 
+import ctypes
 from abc import ABC, abstractmethod
+
+from pyremu._native import (
+    bus_read_ram as _native_read_ram,
+    bus_write_ram as _native_write_ram,
+    native_available,
+)
+
+# Module-level cache for native pointers to bytearray buffers.
+# Stored here (not on Bus instances) so that deepcopy() never
+# touches ctypes from_buffer() objects, which segfault the GC.
+_ram_native_ptrs: dict[int, int] = {}  # id(bytearray) -> raw pointer
 
 
 class Device(ABC):
@@ -72,7 +84,7 @@ class Bus:
     """共享物理总线.
 
     所有 hart 通过 Bus.read() / Bus.write() 访问物理资源。
-    地址路由顺序: 设备 MMIO → L2 缓存 → RAM 直读。
+    地址路由顺序: 设备 MMIO -> L2 缓存 -> RAM 直读。
 
     设备地址的读写保证:
     - 不经过 L2 缓存 (直通设备)
@@ -91,12 +103,27 @@ class Bus:
         self._ram_end = ram_base + ram_size
         self._ram_size = ram_size
         self._l2 = l2_cache
-        self._devices: dict[int, Device] = {}  # base_addr → device
+        self._devices: dict[int, Device] = {}  # base_addr -> device
 
         # VMA 影子映射: 固件链接在低地址但 RAM 在高地址时,
         # 自动将 [shadow_base, shadow_base+shadow_size) 别名到 RAM 起始处.
         self._shadow_base: int | None = None
         self._shadow_size: int = 0
+
+        # Rust native fast-path (zero-allocation RAM read/write).
+        # All native state is stored as plain Python ints (deepcopy-safe).
+        self._use_native: bool = native_available()
+        self._ram_native_ptr: int = 0
+        self._read_out_ptr: int = 0
+        if self._use_native:
+            tmp = (ctypes.c_uint8 * ram_size).from_buffer(self._ram)
+            self._ram_native_ptr = ctypes.cast(tmp, ctypes.c_void_p).value  # type: ignore[arg-type]
+            self._ram_buf_type = ctypes.c_uint8 * ram_size
+            # Read-out buffer: a single c_uint64, pointer cached as int.
+            self._read_out = ctypes.c_uint64(0)
+            self._read_out_ptr = ctypes.cast(
+                ctypes.pointer(self._read_out), ctypes.c_void_p
+            ).value  # type: ignore[arg-type]
 
         # 设备查找缓存 — 按基址排序的 (base, end, device) 列表, 用于二分查找.
         # add_device 后置 None, 首次 _find_device 时重建.
@@ -172,11 +199,10 @@ class Bus:
         """判断物理地址是否属于 MMIO 设备区域 (不可缓存).
 
         Hart 在 TLB 插入前调用此方法, 对设备地址跳过缓存。
+        O(log n) 二分查找, 复用 _find_device 的排序缓存。
         """
-        for base, dev in self._devices.items():
-            if base <= addr < base + dev.size:
-                return True
-        return False
+        dev, _ = self._find_device(addr)
+        return dev is not None
 
     def is_valid_addr(self, addr: int) -> bool:
         """PMA 检查: 地址是否在有效物理区域 (主存或 I/O 设备).
@@ -204,20 +230,41 @@ class Bus:
     #  RAM 直接访问 (绕过 L2, 供 L2 回退和调试使用)
     # ----------------------------------------------------------
 
+    @staticmethod
+    def _addr_in_range(addr: int, size: int, base: int, extent: int) -> bool:
+        """Check whether the interval [*addr*, *addr* + *size*) is contained
+        within [*base*, *base* + *extent*)."""
+        return base <= addr and addr + size <= base + extent
+
     def _ram_offset(self, addr: int, size: int) -> int | None:
         """将地址映射到 RAM 偏移量; 不在任何 RAM 范围则返回 None."""
-        if self._ram_base <= addr and addr + size <= self._ram_end:
+        if self._addr_in_range(addr, size, self._ram_base, self._ram_size):
             return addr - self._ram_base
-        if self._shadow_base is not None:
-            if self._shadow_base <= addr and addr + size <= self._shadow_base + self._shadow_size:
-                return addr - self._shadow_base
+        if self._shadow_base is None:
+            return None
+        if self._addr_in_range(addr, size, self._shadow_base, self._shadow_size):
+            return addr - self._shadow_base
         return None
+
 
     def _ram_read_direct(self, addr: int, size: int) -> bytes:
         """直接从 RAM 读取 (绕过 L2 缓存).
 
         *addr* 超出 RAM 范围时返回全 0 (模拟未映射物理地址).
         """
+        # Rust native fast path: only for regular access sizes (1/2/4/8).
+        # L2 cache line fills (64 B) would overflow the 8-byte read-out buffer.
+        if self._use_native and self._ram_native_ptr and size in (1, 2, 4, 8) and \
+        _native_read_ram(
+            self._ram_buf_type.from_buffer(self._ram),
+            self._ram_size, self._ram_base,
+            self._shadow_base if self._shadow_base is not None else 0,
+            self._shadow_size,
+            addr, size, self._read_out_ptr,
+        ):
+            return ctypes.string_at(self._read_out_ptr, size)
+
+        # Pure Python fallback
         off = self._ram_offset(addr, size)
         if off is None:
             return b"\x00" * size
@@ -228,17 +275,66 @@ class Bus:
 
         *addr* 超出 RAM 范围时静默丢弃 (由上层 PMA 检查保证不会发生).
         """
-        off = self._ram_offset(addr, len(data))
-        if off is None:
+        data_len = len(data)
+        # Rust native fast path: only for regular access sizes (1/2/4/8).
+        # L2 cache line fills produce larger writes via the Python path.
+        if self._use_native and self._ram_native_ptr and data_len in (1, 2, 4, 8) and \
+        _native_write_ram(
+            self._ram_buf_type.from_buffer(self._ram),
+            self._ram_size, self._ram_base,
+            0 if self._shadow_base is None else self._shadow_base,
+            self._shadow_size,
+            addr, data, data_len,
+        ):
             return
-        self._ram[off : off + len(data)] = data
+
+        # Pure Python fallback
+        ofs = self._ram_offset(addr, data_len)
+        if ofs is None:
+            return
+        self._ram[ofs : ofs + data_len] = data
+
+    def write_ram_direct(self, addr: int, data: bytes) -> None:
+        """绕过 L2 缓存和设备 MMIO, 直接向 RAM 写入数据.
+
+        用于固件/内核镜像等大批量数据加载场景.
+        调用方需确保写入完成后 L2 缓存中无目标地址的脏行
+        (加载前 hart 尚未运行, 故天然安全).
+        """
+        self._ram_write_direct(addr, data)
+
+    def flush_l2(self) -> int:
+        """将 L2 缓存中全部脏行回写到 RAM (bytearray).
+
+        native batch 执行前必须调用, 确保 Rust 从 bytearray 读取时
+        能看到 Python 侧通过 bus.write() 写入的全部数据.
+
+        Returns:
+            回写的缓存行数; 无 L2 时返回 0.
+        """
+        if self._l2 is not None:
+            return self._l2.flush_all()
+        return 0
+
+    def invalidate_l2(self) -> int:
+        """使 L2 缓存全部行失效 (脏行先回写).
+
+        native batch 执行后调用, 确保 Python 侧后续通过 L2 读取时
+        不会命中 Rust 直接修改 bytearray 前的过时缓存行.
+
+        Returns:
+            失效的缓存行数; 无 L2 时返回 0.
+        """
+        if self._l2 is not None:
+            return self._l2.invalidate_all()
+        return 0
 
     # ----------------------------------------------------------
     #  总线读写 (外部接口 — Hart 的 _mem_read_phy / _mem_write_phy 使用)
     # ----------------------------------------------------------
 
     def read(self, addr: int, size: int) -> bytes:
-        """总线读: 设备 (直通) → L2 缓存 → RAM.
+        """总线读: 设备 (直通) -> L2 缓存 -> RAM.
 
         设备地址绕过 L2, 直接读设备寄存器 (有副作用).
         """
@@ -254,7 +350,7 @@ class Bus:
         return self._ram_read_direct(addr, size)
 
     def write(self, addr: int, data: bytes) -> None:
-        """总线写: 设备 (直通) → L2 缓存 → RAM.
+        """总线写: 设备 (直通) -> L2 缓存 -> RAM.
 
         设备地址绕过 L2, 直接写设备寄存器 (有副作用).
         """
@@ -292,6 +388,12 @@ class Bus:
 
     def read_u64(self, addr: int) -> int | None:
         ret = self.try_read(addr, 8)
+        if ret is None:
+            return None
+        return int.from_bytes(ret, 'little')
+
+    def read_u32(self, addr: int) -> int | None:
+        ret = self.try_read(addr, 4)
         if ret is None:
             return None
         return int.from_bytes(ret, 'little')

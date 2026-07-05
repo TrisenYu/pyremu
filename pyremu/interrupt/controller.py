@@ -35,7 +35,7 @@ class IntSource(Enum):
     STI = 5  # Supervisor Timer Interrupt
 
 
-# 中断源 → mip/sip 位掩码映射
+# 中断源 -> mip/sip 位掩码映射
 INT_SOURCE_MIP_MASK: dict[IntSource, int] = {
     IntSource.MEI: 1 << 11,  # MEIP
     IntSource.MSI: 1 << 3,  # MSIP
@@ -95,4 +95,17 @@ class InterruptController(ABC):
     @abstractmethod
     def tick(self, cycles: int = 1) -> None:
         """推进全局时钟 *cycles* 个周期 (用于定时器中断)."""
+        pass
+
+    @abstractmethod
+    def set_mtimecmp(self, hart_id: int, val: int) -> None:
+        """设置指定 hart 的定时器比较值 (SSTC stimecmp CSR 同步)."""
+        pass
+
+    @abstractmethod
+    def get_next_timer_wakeup(self, hart_id: int) -> int:
+        """返回 hart 的下一次定时器唤醒时间 (mtime 值); 0 = 无定时器.
+
+        供中断缓存快速路径: 若 mtime < wakeup, 可跳过全量中断检查.
+        """
         pass

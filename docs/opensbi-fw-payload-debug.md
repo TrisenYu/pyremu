@@ -16,7 +16,7 @@ pyremu 充当 FSBL 角色: 加载固件、生成/注入 DTB、通过 a1 寄存�
 
 ### Bug #1: `_sext()` 负 Python int 导致 BEQ/BNE 误判
 
-**症状**: `fw_platform_init` → `fdt_path_offset(fdt, "/")` → `fdt_ro_probe_` 中
+**症状**: `fw_platform_init` -> `fdt_path_offset(fdt, "/")` -> `fdt_ro_probe_` 中
 magic 检查失败, 返回 -9 (FDT_ERR_BADVERSION), 固件进入 `0x1F9D4` WFI 死循环。
 
 **根因**: `_sext(val, 32)` 对符号位为 1 的值返回负 Python int (如 `-805306368`
@@ -43,7 +43,7 @@ magic 检查失败, 返回 -9 (FDT_ERR_BADVERSION), 固件进入 `0x1F9D4` WFI �
 ### Bug #3: C.SUB (RV64C sf=3) 未实现
 
 **症状**: `_scratch_init` 中 `c.sub x15, x14` (0x8F99) 落入 `sf=0b11` 分支,
-触发 NotImplementedError → IllInstr trap。
+触发 NotImplementedError -> IllInstr trap。
 
 **根因**: RV64 C 扩展的 C1 ALU 操作中, `bits[11:10]=11` (sf=3) 编码了
 C.SUB / C.XOR / C.OR / C.AND 指令 (3-bit 压缩寄存器), 但 handler 仅覆盖
@@ -57,15 +57,15 @@ sf=00,01,10。
 ### 启动流程
 
 ```
-_start (0x0, PIE → 0x80000000)
-  ├─ fw_boot_hart() → -1 (自己就是 boot hart)
-  ├─ _try_lottery → AMOSWAP 抢 lottery
+_start (0x0, PIE -> 0x80000000)
+  ├─ fw_boot_hart() -> -1 (自己就是 boot hart)
+  ├─ _try_lottery -> AMOSWAP 抢 lottery
   ├─ PIE 重定位 (~7,500 步)
   ├─ BSS 零填充 (~300,000 步, 约 800 KB)
   ├─ _scratch_init
   ├─ fw_platform_init: FDT 解析 /cpus, /chosen, CLINT, UART
-  ├─ _start_warm → blt hart_id, hart_count → boot
-  └─ sbi_init → cold boot 或 warm boot
+  ├─ _start_warm -> blt hart_id, hart_count -> boot
+  └─ sbi_init -> cold boot 或 warm boot
 ```
 
 ### 单 hart 无法通过同步栅栏
@@ -85,12 +85,12 @@ DWARF 标志地址 `*(x11-868)` 由 `sbi_hsm` 模块管理。FW_PAYLOAD 模式�
 
 **hart 数必须与 DTB /cpus 节点数一致**: `fw_platform_init` 从 DTB 获取
 `hart_count`, `sbi_init` 用此值建立同步栅栏。DTB 写 4 个 CPU 但只起 2 个
-hart → 死等另外 2 个。
+hart -> 死等另外 2 个。
 
 ### 直接跳转 payload 失败
 
 `--prog-cnt=0x80200000` 绕过 OpenSBI 初始化直接执行 payload, 但
-payload 通过 `jalr` 调用 SBI 函数表 → 表为空指针 → 跳转到 0x0 →
+payload 通过 `jalr` 调用 SBI 函数表 -> 表为空指针 -> 跳转到 0x0 ->
 IllInstr (0x00000000 非法指令)。
 
 ### 结论

@@ -5,9 +5,12 @@
 
 """多核模拟器集成测试: 多 hart 执行, IPI, AMO 跨 hart 竞争."""
 
+import ctypes
+
 import pytest
 
 from pyremu.core.decoder import Hart
+from pyremu.core.hart import BatchResult, HartState, TlbEntry
 from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.trap_handler import check_pending_interrupts
 from pyremu.emulator import Emulator
@@ -39,6 +42,20 @@ class TestEmulatorInit:
         emu = Emulator(num_harts=4)
         assert emu.bus.is_device_addr(emu.clint.base_addr)
 
+    def test_misa_initialized(self):
+        """misa CSR 复位后非零, 包含 MXL=2 (RV64) 及 I/M/A/C 扩展位."""
+        emu = Emulator(num_harts=1)
+        misa = emu.harts[0].csrs["misa"].val
+        assert misa != 0, "misa 应为非零, 告知 OS 可用扩展"
+        # MXL = bits[63:62], RV64 = 2
+        mxl = (misa >> 62) & 0x3
+        assert mxl == 2, f"MXL 应为 2 (RV64), 实际 {mxl}"
+        # I (bit 8), M (bit 12), A (bit 0), C (bit 2) 应置位
+        assert misa & (1 << 8), "I (base integer) 扩展位应置位"
+        assert misa & (1 << 12), "M (mul/div) 扩展位应置位"
+        assert misa & (1 << 0), "A (atomic) 扩展位应置位"
+        assert misa & (1 << 2), "C (compressed) 扩展位应置位"
+
 
 class TestEmulatorExecution:
     """执行循环."""
@@ -69,7 +86,7 @@ class TestEmulatorExecution:
     def test_hart_gpr_write_independent(self):
         """hart 间寄存器独立: hart 0 写 x5, 不影响 hart 1 的 x5."""
         emu = Emulator(num_harts=4, prog_cnt=0x1000, ram_base=0)
-        # ADDI x5, x10, 0 → x5 = x10 (每条 hart 的 x10 不同)
+        # ADDI x5, x10, 0 -> x5 = x10 (每条 hart 的 x10 不同)
         # Instr: imm[11:0]=0, rs1=x10, funct3=000, rd=x5, op=0010011
         instr = (0 << 20) | (10 << 15) | (5 << 7) | 0b0010011
         emu.load_code(0x1000, instr.to_bytes(4, "little"))
@@ -96,7 +113,7 @@ class TestEmulatorExecution:
         # zero 永远为 0
         assert h.read_gpr_by_name("zero") == 0
         assert h.read_gpr_by_name("x0") == 0
-        # 不存在 → 0
+        # 不存在 -> 0
         assert h.read_gpr_by_name("nonexistent") == 0
 
     def test_read_csr_by_name(self):
@@ -111,7 +128,7 @@ class TestEmulatorExecution:
         # mstatus
         h.csrs["mstatus"].val = 0x1800
         assert h.read_csr_by_name("mstatus") == 0x1800
-        # 不存在 → 0
+        # 不存在 -> 0
         assert h.read_csr_by_name("nonexistent") == 0
 
 
@@ -338,8 +355,8 @@ class TestEmulatorState:
 class TestEmulatorStoreMemory:
     """通过 hart 执行 store 指令写入物理内存.
 
-    验证完整的 store 路径: exec_instr → handle_st → _mem_write →
-    _translate_full → _mem_write_phy → Bus.write → RAM/L2。
+    验证完整的 store 路径: exec_instr -> handle_st -> _mem_write ->
+    _translate_full -> _mem_write_phy -> Bus.write -> RAM/L2。
     这是对 #sw-not-writing-to-ram 的回归测试。
     """
 
@@ -421,8 +438,8 @@ class TestMDivideByZero:
     """验证 DIV/DIVU/REM/REMU 在除数为零时的行为.
 
     RISC-V 特权架构规定:
-    - DIV[U] 除零 → 返回 −1 (所有位为 1)
-    - REM[U] 除零 → 返回被除数 (dividend)
+    - DIV[U] 除零 -> 返回 −1 (所有位为 1)
+    - REM[U] 除零 -> 返回被除数 (dividend)
     不触发异常.
     """
 
@@ -445,25 +462,25 @@ class TestMDivideByZero:
         return h.gprs[rd]
 
     def test_div_by_zero(self, emu):
-        """DIV x5, x10, x0 (divisor=0) → x5 = -1."""
+        """DIV x5, x10, x0 (divisor=0) -> x5 = -1."""
         emu.harts[0].gprs[10] = 42
         result = self._exec_rtype(emu, funct3=4, funct7=1, rd=5, rs1=10, rs2=0)
         assert result == 0xFFFF_FFFF_FFFF_FFFF, f"应为 -1, 实际 {result:#x}"
 
     def test_divu_by_zero(self, emu):
-        """DIVU x5, x10, x0 → x5 = -1 (all-1s)."""
+        """DIVU x5, x10, x0 -> x5 = -1 (all-1s)."""
         emu.harts[0].gprs[10] = 0x8000_0000_0000_0000
         result = self._exec_rtype(emu, funct3=5, funct7=1, rd=5, rs1=10, rs2=0)
         assert result == 0xFFFF_FFFF_FFFF_FFFF
 
     def test_rem_by_zero(self, emu):
-        """REM x5, x10, x0 → x5 = x10 (dividend)."""
+        """REM x5, x10, x0 -> x5 = x10 (dividend)."""
         emu.harts[0].gprs[10] = 42
         result = self._exec_rtype(emu, funct3=6, funct7=1, rd=5, rs1=10, rs2=0)
         assert result == 42
 
     def test_remu_by_zero(self, emu):
-        """REMU x5, x10, x0 → x5 = x10."""
+        """REMU x5, x10, x0 -> x5 = x10."""
         emu.harts[0].gprs[10] = 0xDEAD
         result = self._exec_rtype(emu, funct3=7, funct7=1, rd=5, rs1=10, rs2=0)
         assert result == 0xDEAD
@@ -749,7 +766,7 @@ class TestStoreImmediateOffset:
     def test_sd_offset_2047(self, emu):
         """sd offset=2047: 12-bit S-type 最大正偏移."""
         val, mcause = self._exec_sd(emu, 2047)
-        # 2047 未对齐 → 预期 StAddrMisaligned
+        # 2047 未对齐 -> 预期 StAddrMisaligned
         assert mcause == 0x6
 
 
@@ -787,12 +804,12 @@ class TestAuipcSignExtension:
         assert result == 0
 
     def test_lui_negative(self, emu):
-        """LUI with bit 31 set → sign-extended to 64-bit negative."""
+        """LUI with bit 31 set -> sign-extended to 64-bit negative."""
         h = emu.harts[0]
         h.pc = 0x80000000
         instr = (0xFFFFF << 12) | (5 << 7) | 0b0110111  # LUI x5, 0xFFFFF
         h.exec_instr(instr)
-        # imm20_raw << 12 = 0xFFFFF000, sign-extended from 32-bit → -0x1000
+        # imm20_raw << 12 = 0xFFFFF000, sign-extended from 32-bit -> -0x1000
         assert h.gprs[5] == 0xFFFFFFFFFFFFF000
 
 
@@ -841,7 +858,7 @@ class TestLoadAlignmentSizes:
         assert val == 0x4F4E4D4C
 
     def test_lh_misaligned(self, emu):
-        """lh 从奇数地址 → 应对齐故障."""
+        """lh 从奇数地址 -> 应对齐故障."""
         val, mcause = self._exec_load(emu, 0x80000049, 0b001)  # funct3=lh
         assert mcause == 0x4  # LdAddrMisaligned
 
@@ -1383,6 +1400,61 @@ class TestEmulatorProperties:
         emu.step()
         assert emu.total_instructions == 2
 
+    def test_counter_csr_sync_per_step(self):
+        """mcycle/cycle/minstret/instret/time CSR 每条指令后同步更新."""
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
+        emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10)
+        h = emu.harts[0]
+
+        # 初始值取决于复位, 允许从 0 开始
+        c0 = h.csrs["mcycle"].val
+        i0 = h.csrs["minstret"].val
+        t0 = h.csrs["time"].val
+        emu.step()
+        c1 = h.csrs["mcycle"].val
+        i1 = h.csrs["minstret"].val
+        t1 = h.csrs["time"].val
+        assert c1 > c0, f"mcycle 应递增: {c0} -> {c1}"
+        assert i1 > i0, f"minstret 应递增: {i0} -> {i1}"
+        assert t1 > t0, f"time 应递增 (来自 CLINT mtime): {t0} -> {t1}"
+        # time 应等于 CLINT 的 mtime
+        assert t1 == emu.clint.get_mtime(), (
+            f"time CSR 应与 CLINT mtime 同步: {t1} vs {emu.clint.get_mtime()}"
+        )
+
+        # cycle / instret 为只读影子, 应与 mcycle / minstret 同步
+        assert h.csrs["cycle"].val == c1, "cycle 应与 mcycle 同步"
+        assert h.csrs["instret"].val == i1, "instret 应与 minstret 同步"
+
+        # 执行更多指令, 验证差值
+        emu.step()
+        emu.step()
+        delta_c = h.csrs["mcycle"].val - c1
+        delta_i = h.csrs["minstret"].val - i1
+        delta_t = h.csrs["time"].val - t1
+        assert delta_c == 2, f"3 步后 mcycle 差值应为 2, 实际 {delta_c}"
+        assert delta_i == 2, f"3 步后 minstret 差值应为 2, 实际 {delta_i}"
+        assert delta_t == 2, f"3 步后 time 差值应为 2, 实际 {delta_t}"
+
+
+class TestL2SizeZero:
+    """l2_size=0 退化场景: L2 内部收敛为最小可用缓存, 不崩溃."""
+
+    def test_l2_size_zero_emulator_runs(self):
+        """l2_size=0 的 Emulator 可正常执行指令, 不触发 IndexError."""
+        from pyremu.platform import PlatformConfig
+        cfg = PlatformConfig.qemu_virt()
+        cfg.num_harts = 1
+        cfg.l2_size = 0
+        cfg.ram_base = 0x80000000
+        emu = Emulator(config=cfg)
+        # 写入两条 nop 指令
+        emu.load_code(0x80000000, b"\x13\x00\x00\x00\x13\x00\x00\x00")
+        emu.step()
+        assert emu.harts[0].pc == 0x80000004
+        emu.step()
+        assert emu.harts[0].pc == 0x80000008
+
 
 # ============================================================
 #  SPI / I2C / GPIO 外设初始化 — 默认 qemu_virt 配置
@@ -1459,3 +1531,174 @@ class TestDeviceTree:
         magic_bytes = emu.bus.read(addr, 4)
         magic = int.from_bytes(magic_bytes, "big")
         assert magic == 0xD00DFEED
+
+    def test_default_bootargs_provides_console(self):
+        """未指定 bootargs 时, 默认包含 earlycon=sbi keep_bootcon."""
+        emu = Emulator()
+        dtb = emu.build_dtb()
+        assert b"earlycon=sbi" in dtb, (
+            "默认 bootargs 应包含 earlycon=sbi 以确保内核输出可见"
+        )
+        assert b"console=ttySIF0" in dtb, (
+            "默认 bootargs 应包含 console=ttySIF0 以将 UART 设为首选控制台"
+        )
+        assert b"keep_bootcon" in dtb, (
+            "默认 bootargs 应包含 keep_bootcon 以防止 bootconsole 过早关闭"
+        )
+
+    def test_explicit_bootargs_overrides_default(self):
+        """显式指定 bootargs 时使用用户值而非默认值."""
+        emu = Emulator(bootargs="console=ttyS0 debug")
+        dtb = emu.build_dtb()
+        assert b"console=ttyS0 debug" in dtb
+        # 默认值不应出现
+        assert b"keep_bootcon" not in dtb
+
+
+class TestBusErrorOnUnmappedAccess:
+    """通过完整取指-执行流水线触发 Bus error, 验证 PMA 空洞地址访问 -> AccessFault.
+
+    模拟 Linux 内核启动中探访未映射 MMIO 地址时发生的 Bus error 场景.
+    与 ``test_trap.py::TestMemoryAccessFaults`` 的区别: 本测试经过
+    fetch → decode → execute → translate → PMP → PMA 完整路径,
+    而非直接调用 ``mem_read`` / ``mem_write``.
+    """
+
+    RAM_BASE = 0x8000_0000
+    HOLE_ADDR = 0x4000_0000  # 非 RAM、非设备 MMIO 的空洞地址
+
+    @pytest.fixture
+    def emu(self) -> Emulator:
+        emu = Emulator(num_harts=1)
+        # 使用纯 Python 路径以隔离测试目标 (不受 native batch 影响)
+        emu._native_batch = False
+        return emu
+
+    def test_load_from_unmapped_addr_traps(self, emu):
+        """lw 从空洞地址读取 -> 经完整流水线触发 LdAccessFault."""
+        h = emu.harts[0]
+        h.pc = self.RAM_BASE
+        # 将目标地址放入 x10 (rs1)
+        h.gprs[10] = self.HOLE_ADDR
+
+        # lw x5, 0(x10): opcode=0000011 funct3=010 rd=5 rs1=10 imm=0
+        instr = (0 << 20) | (10 << 15) | (2 << 12) | (5 << 7) | 0x3
+        emu.load_code(self.RAM_BASE, instr.to_bytes(4, "little"))
+
+        emu.step()
+
+        # 应触发 LdAccessFault (mcause = 5)
+        assert h.mcause_val == 5, (
+            f"应为 LdAccessFault (5), 实际 mcause={h.mcause_val}"
+        )
+        # PC 应跳转到 mtvec (默认 0x0), 而非停留在加载指令之后
+        assert h.pc != self.RAM_BASE + 4, (
+            f"PC 不应指向下一条指令, 应已跳转到 mtvec handler, 实际 pc={h.pc:#x}"
+        )
+
+    def test_store_to_unmapped_addr_traps(self, emu):
+        """sw 到空洞地址 -> 经完整流水线触发 StAccessFault."""
+        h = emu.harts[0]
+        h.pc = self.RAM_BASE
+        h.gprs[10] = self.HOLE_ADDR  # rs1 = 目标地址
+        h.gprs[11] = 0xDEAD_BEEF  # rs2 = 写入值
+
+        # sw x11, 0(x10): opcode=0100011 funct3=010 rs2=11 rs1=10 imm=0
+        instr = (0 << 25) | (11 << 20) | (10 << 15) | (2 << 12) | 0x23
+        emu.load_code(self.RAM_BASE, instr.to_bytes(4, "little"))
+
+        emu.step()
+
+        # 应触发 StAccessFault (mcause = 7)
+        assert h.mcause_val == 7, (
+            f"应为 StAccessFault (7), 实际 mcause={h.mcause_val}"
+        )
+        assert h.pc != self.RAM_BASE + 4, (
+            f"PC 应已跳转到 mtvec handler, 实际 pc={h.pc:#x}"
+        )
+
+    def test_device_addr_load_succeeds(self, emu):
+        """从已注册设备 MMIO 地址读取不触发 Bus error (经过设备路径)."""
+        h = emu.harts[0]
+        h.pc = self.RAM_BASE
+        # UART 基址 (默认 0x1000_0000) 已注册为设备
+        uart_base = 0x1000_0000
+        h.gprs[10] = uart_base
+
+        # lw x5, 0(x10)
+        instr = (0 << 20) | (10 << 15) | (2 << 12) | (5 << 7) | 0x3
+        emu.load_code(self.RAM_BASE, instr.to_bytes(4, "little"))
+
+        emu.step()
+
+        # UART 是已注册设备, 不应触发 AccessFault
+        assert h.mcause_val != 5, (
+            f"设备 MMIO 读取不应触发 LdAccessFault, 实际 mcause={h.mcause_val}"
+        )
+
+    def test_ram_boundary_crossing_traps(self, emu):
+        """跨 RAM 边界的 load -> LdAccessFault (部分字节在空洞中)."""
+        h = emu.harts[0]
+        h.pc = self.RAM_BASE
+        # 定位到 RAM 最后 4 字节, ld 8 字节 → 高 4 字节溢出到空洞
+        ram_end = self.RAM_BASE + emu.bus.ram_size
+        h.gprs[10] = ram_end - 4
+
+        # ld x5, 0(x10): opcode=0000011 funct3=011 rd=5 rs1=10 imm=0
+        instr = (0 << 20) | (10 << 15) | (3 << 12) | (5 << 7) | 0x3
+        emu.load_code(self.RAM_BASE, instr.to_bytes(4, "little"))
+
+        emu.step()
+
+        # PMA 检查应拒绝跨边界访问
+        assert h.mcause_val in (5, 4), (
+            f"跨边界访问应触发 LdAccessFault(5) 或 LdAddrMisaligned(4), "
+            f"实际 mcause={h.mcause_val}"
+        )
+
+
+class TestNativeBatchLayout:
+    """Python ctypes ↔ Rust repr(C) 结构体布局一致性验证.
+
+    Rust 侧将 TLB 存储为 ``[TlbEntry; 32]`` (array-of-structs).
+    若 Python 侧错误地使用分离数组 (如 itlb_vpn, itlb_ppn, ...)
+    会造成内存布局不匹配 → SIGBUS (Bus error).
+    这些用例在每次构建后锁死布局合约.
+    """
+
+    def test_tlb_entry_size_24(self) -> None:
+        """TlbEntry 必须恰好 24 字节."""
+        assert ctypes.sizeof(TlbEntry) == 24, (
+            f"TlbEntry 应为 24 字节, 实际 {ctypes.sizeof(TlbEntry)}B"
+        )
+
+    def test_hart_state_8byte_aligned(self) -> None:
+        """HartState 必须 8 字节对齐."""
+        assert ctypes.sizeof(HartState) % 8 == 0
+
+    def test_hart_state_under_4k(self) -> None:
+        """HartState 不应膨胀超过 4096 字节."""
+        assert ctypes.sizeof(HartState) < 4096
+
+    def test_batch_result_8byte_aligned(self) -> None:
+        """BatchResult 必须 8 字节对齐."""
+        assert ctypes.sizeof(BatchResult) % 8 == 0
+
+    def test_itlb_is_array_of_structs(self) -> None:
+        """itlb 确保 array-of-structs 而非 struct-of-arrays.
+
+        struct-of-arrays 会导致 Rust 在 offsetof(itlb[i].ppn) 读到垃圾 → SIGBUS.
+        """
+        hs = HartState()
+        assert len(hs.itlb) == 32
+        assert hasattr(hs.itlb[0], "vpn")
+        assert hasattr(hs.itlb[0], "ppn")
+        assert hasattr(hs.itlb[0], "valid")
+
+    def test_dtlb_is_array_of_structs(self) -> None:
+        """dtlb 确保 array-of-structs."""
+        hs = HartState()
+        assert len(hs.dtlb) == 32
+        assert hasattr(hs.dtlb[0], "vpn")
+        assert hasattr(hs.dtlb[0], "ppn")
+        assert hasattr(hs.dtlb[0], "valid")

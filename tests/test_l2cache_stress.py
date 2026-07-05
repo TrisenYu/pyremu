@@ -40,7 +40,7 @@ class TestCacheWriteAllocateThenRead:
     """Write-allocate: write to an address (cache miss), then read it back."""
 
     def test_single_write_allocate_read_back(self):
-        """Write data to a new address → should be readable immediately."""
+        """Write data to a new address -> should be readable immediately."""
         ram, rf, wf = _make_ram()
         l2 = L2Cache(size=16 * 1024, line_size=64, ways=4)
         l2.set_ram_backend(rf, wf)
@@ -80,7 +80,7 @@ class TestCacheEvictionIntegrity:
     def test_dirty_line_survives_eviction(self):
         """Write to address A, evict it by filling the same set, re-read A."""
         ram, rf, wf = _make_ram()
-        # 1 set × 2 ways → easy to force eviction
+        # 1 set × 2 ways -> easy to force eviction
         l2 = L2Cache(size=128, line_size=64, ways=2)
         l2.set_ram_backend(rf, wf)
 
@@ -180,7 +180,7 @@ class TestCrossCacheLineAccess:
         l2 = L2Cache(size=16 * 1024, line_size=64, ways=4)
         l2.set_ram_backend(rf, wf)
 
-        # offset 56 → 8 bytes in line 0, 8 bytes in line 1
+        # offset 56 -> 8 bytes in line 0, 8 bytes in line 1
         addr = 0x1038  # 0x1038 & 63 = 56
         data = bytes([0xA0 + i for i in range(16)])
         l2.write(addr, data)
@@ -198,7 +198,7 @@ class TestCrossCacheLineAccess:
         l2 = L2Cache(size=16 * 1024, line_size=64, ways=4)
         l2.set_ram_backend(rf, wf)
 
-        # Read at offset 60 in line 0 → crosses into line 1
+        # Read at offset 60 in line 0 -> crosses into line 1
         addr = 0x003C  # 0x3C = 60
         data = l2.read(addr, 8)
         expected = bytes([0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43])
@@ -210,7 +210,7 @@ class TestCrossCacheLineAccess:
         l2 = L2Cache(size=4 * 1024, line_size=64, ways=4)
         l2.set_ram_backend(rf, wf)
 
-        # Write 32 bytes at offset 48 → crosses cache line
+        # Write 32 bytes at offset 48 -> crosses cache line
         addr = 0x2030  # offset 48, 16 bytes in line N, 16 bytes in line N+1
         original = bytes([0xE0 + i for i in range(32)])
         l2.write(addr, original)
@@ -269,7 +269,7 @@ class TestCacheSetAliasing:
         set_idx = 5
         shift = l2._line_shift
 
-        # Write 3 addresses mapping to the same set (2 ways → 3rd evicts oldest)
+        # Write 3 addresses mapping to the same set (2 ways -> 3rd evicts oldest)
         addrs = [
             (0x100 << shift) | (set_idx << shift),
             (0x200 << shift) | (set_idx << shift),

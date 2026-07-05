@@ -101,7 +101,7 @@ class TestCLINTBusIntegration:
     """通过 Bus 访问 CLINT."""
 
     def test_bus_write_to_msip(self):
-        """通过总线写 MSIP → IPI 触发."""
+        """通过总线写 MSIP -> IPI 触发."""
         clint = CLINT(num_harts=4)
         bus = Bus(ram_size=1024 * 1024)
         bus.add_device(CLINT_BASE, clint)

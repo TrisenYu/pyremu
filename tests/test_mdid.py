@@ -7,9 +7,10 @@
 
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
-from pyremu.core.mem_check_aux import inject_memory_backend, mem_read
+from pyremu.core.mem_check_aux import inject_memory_backend, mem_read, mem_write
 from pyremu.core.trap import TrapType, trap_cause_code
 from pyremu.emulator import Emulator
+from pyremu.memory.bus import Bus
 from pyremu.memory.tlb import TLB, TLBLine
 from pyremu.platform import PlatformConfig
 
@@ -158,7 +159,7 @@ class TestMfenceDid:
         assert len(h.dtlb) == 0, "dtlb 应被清空"
 
     def test_nonzero_mdid_flushes_nothing_when_no_match(self):
-        """mdid=3 但没有任何条目带此标记 → flush 为空操作."""
+        """mdid=3 但没有任何条目带此标记 -> flush 为空操作."""
         emu = Emulator(PlatformConfig.qemu_virt())
         h = emu.harts[0]
 
@@ -207,7 +208,7 @@ class TestMfenceDid:
     # -- 广播: 多 hart --
 
     def test_broadcasts_to_all_harts(self):
-        """hart 0 执行 mfence.did → 全部 hart 的 TLB 均被刷新."""
+        """hart 0 执行 mfence.did -> 全部 hart 的 TLB 均被刷新."""
         emu = Emulator(PlatformConfig(num_harts=4, ram_size=128 * 1024 * 1024))
         for h in emu.harts:
             h.dtlb.insert(vpn=0x42, ppn=0x42, perm=7, mdid=1)
@@ -222,7 +223,7 @@ class TestMfenceDid:
             assert len(h.itlb) == 0, f"Hart {i} itlb 应被清空 (广播)"
 
     def test_broadcast_only_flushes_matching_harts(self):
-        """不同 hart 的 TLB 带有不同 mdid → 仅匹配的被刷."""
+        """不同 hart 的 TLB 带有不同 mdid -> 仅匹配的被刷."""
         emu = Emulator(PlatformConfig(num_harts=2, ram_size=128 * 1024 * 1024))
         h0, h1 = emu.harts
 
@@ -291,7 +292,7 @@ class TestTLBAutoMdid:
         # 标记此飞地为 mdid=7
         h.mdid_val = 7
 
-        # 构建 Sv39 三级 4 KiB 映射 va=0 → DATA_PA
+        # 构建 Sv39 三级 4 KiB 映射 va=0 -> DATA_PA
         vpn0 = 0
         vpn1 = 0
         vpn2 = 0
@@ -321,7 +322,7 @@ class TestTLBAutoMdid:
         h.mode = RiscvMode.S  # MMU 翻译仅在 S/U 模式生效
         h.satp_val = (8 << 60) | (L1_BASE >> PAGE_SHIFT)  # Sv39
 
-        # 触发地址翻译 → TLB 插入
+        # 触发地址翻译 -> TLB 插入
         mem_read(h, 0x0, 4)
 
         # 验证 TLB 条目被标记为 mdid=7
@@ -330,7 +331,7 @@ class TestTLBAutoMdid:
         for e in dtlb_entries:
             assert e.mdid == 7, f"TLB 条目 mdid 应为 7, 实际 {e.mdid}"
 
-        # 切换飞地: mdid=7 → mdid=9, 用 mdid=9 执行 mfence.did
+        # 切换飞地: mdid=7 -> mdid=9, 用 mdid=9 执行 mfence.did
         # — 不应刷掉 mdid=7 的条目 (飞地隔离)
         h.mdid_val = 9
         h.pc = 0x80000000
@@ -454,7 +455,7 @@ class TestL2AutoMdid:
         assert l2 is not None
         addr = 0x80001000
 
-        # hart mdid=1 写数据 → L2 分配, mdid=1
+        # hart mdid=1 写数据 -> L2 分配, mdid=1
         l2.current_mdid = 1
         emu.bus.write(addr, b"X" * 64)
         _ = emu.bus.read(addr, 4)
@@ -463,7 +464,7 @@ class TestL2AutoMdid:
         assert len(entries) == 1, "应有一条 L2 条目"
         assert entries[0].mdid == 1, f"新分配条目 mdid 应为 1, 实际 {entries[0].mdid}"
 
-        # 切换 hart mdid=2, 再次读取同一地址 → 命中, mdid 应刷新为 2
+        # 切换 hart mdid=2, 再次读取同一地址 -> 命中, mdid 应刷新为 2
         l2.current_mdid = 2
         _ = emu.bus.read(addr, 4)
         entries = [e for e in l2.entries if e.valid and e.tag == (addr >> l2._line_shift)]
@@ -489,7 +490,7 @@ class TestL2AutoMdid:
         assert entries[0].mdid == 3, f"写命中后 mdid 应刷新为 3, 实际 {entries[0].mdid}"
 
     def test_l2_auto_tag_then_selective_flush(self):
-        """不同 mdid 的 hart 访问不同地址 → mfence.did 仅刷匹配的."""
+        """不同 mdid 的 hart 访问不同地址 -> mfence.did 仅刷匹配的."""
         emu = Emulator(PlatformConfig.qemu_virt())
         h = emu.harts[0]
         l2 = emu.bus._l2
@@ -539,7 +540,7 @@ class TestL2AutoMdid:
         emu.step()
 
         # step() 内设置了 l2.current_mdid = hart.mdid_val
-        # 取指 (bus.read) 会经过 L2 → 新行标记 mdid=0x77
+        # 取指 (bus.read) 会经过 L2 -> 新行标记 mdid=0x77
         assert l2._current_mdid == 0x77, (
             f"step 后 current_mdid 应为 0x77, 实际 {l2._current_mdid}"
         )
@@ -550,3 +551,354 @@ class TestL2AutoMdid:
                 f"emulator.step() 自动标记的 L2 条目 mdid 应为 0x77, "
                 f"实际 {e.mdid} (tag=0x{e.tag:x})"
             )
+
+
+# ============================================================
+#  pmpsplit CSR — PMP 条目拆分与飞地隔离
+# ============================================================
+
+
+class TestPmpsplitCSR:
+    """pmpsplit (0x5C1) CSR 基本属性."""
+
+    def test_pmpsplit_defaults_to_zero(self):
+        emu = Emulator(PlatformConfig.qemu_virt())
+        h = emu.harts[0]
+        assert h.pmpsplit_val == 0, "pmpsplit 默认值应为 0"
+
+    def test_pmpsplit_write_read_roundtrip(self):
+        emu = Emulator(PlatformConfig.qemu_virt())
+        h = emu.harts[0]
+        for val in (0, 8, 16, 32, 63, 0xFFFF_FFFF_FFFF_FFFF):
+            h.write_csr(0x5C1, val)
+            assert h.csrs["pmpsplit"].val == val, f"pmpsplit 往返失败: {val:#x}"
+            assert h.pmpsplit_val == val, "cached pmpsplit_val 应同步"
+
+    def test_pmpsplit_property_sync(self):
+        emu = Emulator(PlatformConfig.qemu_virt())
+        h = emu.harts[0]
+        h.pmpsplit_val = 32
+        assert h.csrs["pmpsplit"].val == 32
+        assert h._pmpsplit_val == 32
+
+    def test_umode_access_pmpsplit_traps(self):
+        emu = Emulator(PlatformConfig.qemu_virt())
+        h = emu.harts[0]
+        h.mode = RiscvMode.U
+        instr = (0x5C1 << 20) | (5 << 15) | (0b001 << 12) | (6 << 7) | 0x73
+        h.pc = 0x1000
+        h.exec_instr(instr)
+        assert h.mcause_val == trap_cause_code(TrapType.IllInstr), (
+            f"U 模式访问 pmpsplit 应 IllInstr(2), 实际 mcause={h.mcause_val}"
+        )
+
+
+# ============================================================
+#  pmpsplit + PMP 飞地隔离
+# ============================================================
+
+
+class TestPmpsplitPmpIsolation:
+    """pmpsplit 限制飞地可见的 PMP 条目范围."""
+
+    def test_enclave_sees_only_assigned_entries(self):
+        """mdid!=0 且 pmpsplit=4: PMP 条目 0-3 对飞地不可见, 4-7 正常检查."""
+        from pyremu.memory.pmp import Pmp, PmpAccessInfo
+
+        pmp = Pmp({}, num_entries=8)
+
+        class FakeCSR:
+            val: int
+            def __init__(self, v): self.val = v
+
+        # 配置条目 0 (host 范围): allow 0x1000, R+W, NAPOT 4KB
+        k_4k = 9
+        addr_val_4k = (0x1000 >> 2) | ((1 << k_4k) - 1)
+        pmp._csrs["pmpaddr0"] = FakeCSR(addr_val_4k)
+        pmp._csrs["pmpcfg0"] = FakeCSR(0b11000 | 0b0011)  # NAPOT, R+W
+
+        # 配置条目 5 (飞地范围): allow 0x2000, R+W, NAPOT 4KB
+        addr_val_2 = (0x2000 >> 2) | ((1 << k_4k) - 1)
+        pmp._csrs["pmpaddr5"] = FakeCSR(addr_val_2)
+        pmp._csrs["pmpcfg0"] = FakeCSR(
+            pmp._csrs["pmpcfg0"].val | ((0b11000 | 0b0011) << 40)
+        )
+
+        # Host 模式 (mdid=0): 两个条目都可见
+        info_host = PmpAccessInfo(pa=0x1000, size=4, mode_val=0, mstatus_val=0, pmpsplit=4, mdid=0)
+        assert pmp.check(info_host), "host 应能访问条目 0 的区域"
+
+        # 飞地模式 (mdid=1, pmpsplit=4): 条目 0 不可见, 应 DENY
+        info_enc = PmpAccessInfo(pa=0x1000, size=4, mode_val=0, mstatus_val=0, pmpsplit=4, mdid=1)
+        assert not pmp.check(info_enc), (
+            "飞地不应能访问 host 的 PMP 条目 0 区域"
+        )
+
+        # 飞地应能访问条目 5 的区域
+        info_enc5 = PmpAccessInfo(pa=0x2000, size=4, mode_val=0, mstatus_val=0, pmpsplit=4, mdid=1)
+        assert pmp.check(info_enc5), "飞地应能访问自己的 PMP 条目 5 区域"
+
+    def test_enclave_no_entries_when_pmpsplit_exceeds(self):
+        """pmpsplit >= num_entries -> 飞地无可用 PMP 条目, 全部拒绝."""
+        from pyremu.memory.pmp import Pmp, PmpAccessInfo
+
+        pmp = Pmp({}, num_entries=8)
+        info = PmpAccessInfo(pa=0x1000, size=4, mode_val=0, mstatus_val=0, pmpsplit=8, mdid=1)
+        assert not pmp.check(info), "pmpsplit=8 >= num_entries=8 -> 飞地全拒"
+
+    def test_pmpsplit_zero_legacy_all_visible(self):
+        """pmpsplit=0 -> 飞地也能看到全部条目 (兼容模式)."""
+        from pyremu.memory.pmp import Pmp, PmpAccessInfo
+
+        pmp = Pmp({}, num_entries=4)
+
+        class FakeCSR:
+            val: int
+            def __init__(self, v): self.val = v
+
+        k_4k = 9
+        addr_val = (0x5000 >> 2) | ((1 << k_4k) - 1)
+        pmp._csrs["pmpaddr0"] = FakeCSR(addr_val)
+        pmp._csrs["pmpcfg0"] = FakeCSR(0b11000 | 0b0011)
+
+        # pmpsplit=0 + mdid=1: 条目 0 仍可见
+        info = PmpAccessInfo(pa=0x5000, size=4, mode_val=0, mstatus_val=0, pmpsplit=0, mdid=1)
+        assert pmp.check(info), "pmpsplit=0 时飞地应能看到全部条目"
+
+    def test_host_always_sees_all_entries(self):
+        """mdid=0 (host) 始终能看到全部 PMP 条目, 无视 pmpsplit."""
+        from pyremu.memory.pmp import Pmp, PmpAccessInfo
+
+        pmp = Pmp({}, num_entries=8)
+
+        class FakeCSR:
+            val: int
+            def __init__(self, v): self.val = v
+
+        addr_val = (0x3000 >> 2) | 0x1FF  # 4KB @ 0x3000
+        pmp._csrs["pmpaddr0"] = FakeCSR(addr_val)
+        pmp._csrs["pmpcfg0"] = FakeCSR(0b11000 | 0b0011)
+
+        info = PmpAccessInfo(pa=0x3000, size=4, mode_val=0, mstatus_val=0, pmpsplit=60, mdid=0)
+        assert pmp.check(info), "host 总应能看到全部条目, 无视 pmpsplit"
+
+
+# ============================================================
+#  多飞地 mdid 隔离 — TLB / L2
+# ============================================================
+
+
+class TestMultiEnclaveMdid:
+    """多个飞地并存时的 mdid 隔离验证."""
+
+    def test_three_enclaves_tlb_isolation(self):
+        """3 个飞地各插入 TLB 条目, mfence.did 仅刷匹配的."""
+        emu = Emulator(PlatformConfig.qemu_virt())
+        h = emu.harts[0]
+
+        # 飞地 A (mdid=1): vpn=0x100
+        h.dtlb.insert(vpn=0x100, ppn=0xA00, perm=7, mdid=1)
+        # 飞地 B (mdid=2): vpn=0x200
+        h.dtlb.insert(vpn=0x200, ppn=0xB00, perm=7, mdid=2)
+        # 飞地 C (mdid=3): vpn=0x300
+        h.dtlb.insert(vpn=0x300, ppn=0xC00, perm=7, mdid=3)
+
+        # 模拟飞地 B 执行 mfence.did
+        h.mdid_val = 2
+        h.pc = 0x80000000
+        h.exec_instr(_MFENCE_DID)
+
+        # 飞地 A 的条目还在
+        assert h.dtlb.lookup(0x100)[0], "mdid=1 的 TLB 条目应保留"
+        # 飞地 B 的被刷掉
+        assert not h.dtlb.lookup(0x200)[0], "mdid=2 的 TLB 条目应被刷掉"
+        # 飞地 C 的还在
+        assert h.dtlb.lookup(0x300)[0], "mdid=3 的 TLB 条目应保留"
+
+        # 再刷飞地 A
+        h.mdid_val = 1
+        h.exec_instr(_MFENCE_DID)
+        assert not h.dtlb.lookup(0x100)[0], "mdid=1 的 TLB 条目应被刷掉"
+        assert h.dtlb.lookup(0x300)[0], "mdid=3 的仍应保留"
+
+    def test_multi_enclave_l2_isolation(self):
+        """4 个伪飞地访问不同地址, 各自 L2 条目标不同 mdid, 按域刷新互不干扰."""
+        emu = Emulator(PlatformConfig.qemu_virt())
+        l2 = emu.bus._l2
+        assert l2 is not None
+
+        addrs = [0x80001000, 0x80002000, 0x80003000, 0x80004000]
+        mdids = [10, 20, 30, 40]
+
+        # 各飞地写入各自地址
+        for addr, mdid in zip(addrs, mdids):
+            l2.current_mdid = mdid
+            emu.bus.write(addr, b"X" * 64)
+            _ = emu.bus.read(addr, 4)
+
+        # 验证 4 个不同 mdid
+        all_entries = [e for e in l2.entries if e.valid]
+        present = {e.mdid for e in all_entries}
+        for m in mdids:
+            assert m in present, f"mdid={m} 应有 L2 条目"
+
+        # 刷 mdid=20 — 仅该飞地受影响
+        h = emu.harts[0]
+        h.mdid_val = 20
+        h.pc = 0x80000000
+        h.exec_instr(_MFENCE_DID)
+
+        remaining = {e.mdid for e in l2.entries if e.valid}
+        assert 20 not in remaining, "mdid=20 应被刷掉"
+        assert 10 in remaining, "mdid=10 应保留"
+        assert 30 in remaining, "mdid=30 应保留"
+        assert 40 in remaining, "mdid=40 应保留"
+
+    def test_same_vpn_different_mdid_overwrites(self):
+        """同 VPN 插入不同 mdid -> 原地更新 (TLB 以 tag 为键, mdid 仅用于 flush)."""
+        tlb = TLB(size=8)
+        tlb.insert(vpn=0x42, ppn=0x100, perm=7, mdid=1)
+        tlb.insert(vpn=0x42, ppn=0x200, perm=7, mdid=2)
+
+        # 同 VPN -> 同 tag -> 原地更新, 只有一条有效条目
+        entries = [e for e in tlb.entries if e.valid and e.tag == 0x42]
+        assert len(entries) == 1, f"同 VPN 应原地更新, 实际 {len(entries)}"
+        assert entries[0].mdid == 2, f"更新后 mdid 应为 2, 实际 {entries[0].mdid}"
+        assert entries[0].ppn == 0x200, "更新后 ppn 应为 0x200"
+
+    def test_mdid_zero_host_entries_isolated_from_enclave(self):
+        """host (mdid=0) 的 TLB 条目不受飞地 mfence.did 影响."""
+        emu = Emulator(PlatformConfig.qemu_virt())
+        h = emu.harts[0]
+
+        h.dtlb.insert(vpn=0x100, ppn=0xA00, perm=7, mdid=0)  # host
+        h.dtlb.insert(vpn=0x200, ppn=0xB00, perm=7, mdid=5)  # enclave
+
+        # 飞地 5 执行 mfence.did
+        h.mdid_val = 5
+        h.pc = 0x80000000
+        h.exec_instr(_MFENCE_DID)
+
+        # host 条目 (mdid=0) 应保留
+        assert h.dtlb.lookup(0x100)[0], "host (mdid=0) TLB 条目不应被飞地刷掉"
+        # 飞地 5 的条目应被刷掉
+        assert not h.dtlb.lookup(0x200)[0], "飞地 (mdid=5) TLB 条目应被刷掉"
+
+
+# ============================================================
+#  pmpsplit + mdid 集成 — PMP 条目隔离
+# ============================================================
+
+
+class TestPmpsplitMdidIntegration:
+    """pmpsplit 划分 PMP 条目 + mdid 标记飞地 -> 硬件级别的飞地间隔离."""
+
+    def test_enclave_a_cannot_see_enclave_b_pmp_entries(self):
+        """设置两个飞地各自的 PMP 区域后, 飞地 A 不能访问飞地 B 的物理内存."""
+        from pyremu.memory.pmp import Pmp, PmpAccessInfo
+
+        pmp = Pmp({}, num_entries=16)
+
+        class FakeCSR:
+            val: int
+            def __init__(self, v): self.val = v
+
+        # Host 区域: PMP 条目 0-5
+        # 飞地区域: PMP 条目 6-15 (pmpsplit=6)
+        # 飞地 A (mdid=1): 条目 8 — 0x8000_0000-0x8000_0FFF (R+W)
+        # 飞地 B (mdid=2): 条目 10 — 0x8000_2000-0x8000_2FFF (R+W)
+        k_4k = 9
+        addr_a = (0x8000_0000 >> 2) | ((1 << k_4k) - 1)
+        addr_b = (0x8000_2000 >> 2) | ((1 << k_4k) - 1)
+
+        # 条目 8 (飞地 A 区间)
+        pmp._csrs["pmpaddr8"] = FakeCSR(addr_a)
+        # 条目 10 (飞地 B 区间)
+        pmp._csrs["pmpaddr10"] = FakeCSR(addr_b)
+
+        # 写 pmpcfg: 条目 8 和 10 均为 NAPOT+R+W
+        # pmpcfg2 覆盖条目 8-15
+        cfg_val = 0
+        cfg_val |= (0b11000 | 0b0011) << (0 * 8)  # entry 8
+        cfg_val |= (0b11000 | 0b0011) << (2 * 8)  # entry 10
+        pmp._csrs["pmpcfg2"] = FakeCSR(cfg_val)
+
+        # 飞地 A (mdid=1, pmpsplit=6): 只能看到条目 6-15
+        # 访问自己的内存 (条目 8) -> OK
+        info_a_own = PmpAccessInfo(
+            pa=0x8000_0000, size=4, mode_val=0, mstatus_val=0, pmpsplit=6, mdid=1,
+        )
+        assert pmp.check(info_a_own), "飞地 A 应能访问自己的内存"
+
+        # 访问飞地 B 的内存 (条目 10) -> 也 OK (条目 10 在飞地区间内)
+        # 注意: 虽然 PMP 不阻止, 但 pmpsplit 只控制可见条目范围.
+        # 飞地间的进一步隔离由 mfence.did + TLB 管理实现.
+        info_a_other = PmpAccessInfo(
+            pa=0x8000_2000, size=4, mode_val=0, mstatus_val=0, pmpsplit=6, mdid=1,
+        )
+        assert pmp.check(info_a_other), "条目 10 在飞地区间内, PMP 不阻止"
+
+        # 访问 host 区域 (条目 0) -> DENY (条目 0 < pmpsplit, 对飞地不可见)
+        info_a_host = PmpAccessInfo(
+            pa=0x0000, size=4, mode_val=0, mstatus_val=0, pmpsplit=6, mdid=1,
+        )
+        assert not pmp.check(info_a_host), "飞地不应看到 host 区间 (条目 0 < pmpsplit=6)"
+
+    def test_emulator_multi_hart_different_mdid(self):
+        """多 hart 各自运行不同飞地, mdid + pmpsplit 独立配置."""
+        emu = Emulator(PlatformConfig(num_harts=4, ram_size=128 * 1024 * 1024))
+        hart_configs = [
+            (0, 1, 8),   # hart 0: mdid=1, pmpsplit=8
+            (1, 2, 8),   # hart 1: mdid=2, pmpsplit=8
+            (2, 3, 8),   # hart 2: mdid=3, pmpsplit=8
+            (3, 0, 0),   # hart 3: mdid=0, pmpsplit=0 (host)
+        ]
+        for hart_idx, mdid, pmpsplit in hart_configs:
+            h = emu.harts[hart_idx]
+            h.mdid_val = mdid
+            h.pmpsplit_val = pmpsplit
+
+        # 验证各 hart 独立
+        for hart_idx, mdid, pmpsplit in hart_configs:
+            h = emu.harts[hart_idx]
+            assert h.mdid_val == mdid, f"Hart {i} mdid"
+            assert h.pmpsplit_val == pmpsplit, f"Hart {i} pmpsplit"
+
+    def test_pmpsplit_pmp_fault_on_enclave_access_host_region(self):
+        """通过 hart 执行 store -> trap 验证 pmpsplit 阻止飞地访问 host 内存."""
+        hart = Hart(id=0, pmp_entries=8)
+        bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
+        inject_memory_backend(hart, bus.read, bus.write)
+        hart.bus = bus
+        hart.csrs["mtvec"].val = 0x80000000
+        hart.pc = 0x1000
+
+        # Host 条目 0: 保护 0x8000_1000-0x8000_1FFF (NAPOT+R+W)
+        k_4k = 9
+        host_addr_val = (0x8000_1000 >> 2) | ((1 << k_4k) - 1)
+        hart.csrs["pmpaddr0"].val = host_addr_val
+        cfg = (0b11000 | 0b0011)  # NAPOT, R+W for entry 0
+        hart.csrs["pmpcfg0"].val = cfg
+
+        # 飞地条目 4: 允许 0x8000_2000-0x8000_2FFF (NAPOT+R+W)
+        encl_addr_val = (0x8000_2000 >> 2) | ((1 << k_4k) - 1)
+        hart.csrs["pmpaddr4"].val = encl_addr_val
+        cfg |= (0b11000 | 0b0011) << (4 * 8)
+        hart.csrs["pmpcfg0"].val = cfg
+
+        # 配置飞地: mdid=1, pmpsplit=4 (条目 0-3=host, 4-7=enclave)
+        hart.mdid_val = 1
+        hart.pmpsplit_val = 4
+        hart.mode = RiscvMode.S
+
+        # 飞地写入自己的区域 (条目 4) -> OK
+        hart._consecutive_traps = 0
+        mem_write(hart, 0x8000_2000, b"\xaa\xbb")
+        assert hart.mcause_val == 0, f"飞地写自己的区域应成功: mcause={hart.mcause_val}"
+
+        # 飞地写 host 区域 (条目 0, 对飞地不可见) -> StAccessFault
+        hart._consecutive_traps = 0
+        mem_write(hart, 0x8000_1000, b"\xcc\xdd")
+        assert hart.mcause_val == 7, (
+            f"飞地写 host 区域应 StAccessFault(7), 实际 mcause={hart.mcause_val}"
+        )

@@ -33,24 +33,24 @@ def _i_type_load(opcode: int, rd: int, funct3: int, rs1: int, imm12: int) -> int
 
 def _s_type(opcode: int, funct3: int, rs1: int, rs2: int, imm12: int) -> int:
     return (
-        ((imm12 & 0xFE0) << 20)    # imm[11:5] → bits[31:25]
+        ((imm12 & 0xFE0) << 20)    # imm[11:5] -> bits[31:25]
         | (rs2 << 20)
         | (rs1 << 15)
         | (funct3 << 12)
-        | ((imm12 & 0x1F) << 7)    # imm[4:0]  → bits[11:7]
+        | ((imm12 & 0x1F) << 7)    # imm[4:0]  -> bits[11:7]
         | opcode
     )
 
 
 def _b_type(opcode: int, funct3: int, rs1: int, rs2: int, offset: int) -> int:
     return (
-        ((offset & 0x1000) << 19)  # imm[12] → bit[31]
-        | ((offset & 0x7E0) << 20)  # imm[10:5] → bits[30:25]
+        ((offset & 0x1000) << 19)  # imm[12] -> bit[31]
+        | ((offset & 0x7E0) << 20)  # imm[10:5] -> bits[30:25]
         | (rs2 << 20)
         | (rs1 << 15)
         | (funct3 << 12)
-        | ((offset & 0x1E) << 7)   # imm[4:1] → bits[11:8]
-        | ((offset & 0x800) >> 4)  # imm[11] → bit[7]
+        | ((offset & 0x1E) << 7)   # imm[4:1] -> bits[11:8]
+        | ((offset & 0x800) >> 4)  # imm[11] -> bit[7]
         | opcode
     )
 
@@ -61,17 +61,17 @@ def _u_type(opcode: int, rd: int, imm20: int) -> int:
 
 def _j_type(opcode: int, rd: int, offset: int) -> int:
     return (
-        ((offset & 0x100000) << 11)  # imm[20]   → bit[31]
-        | ((offset & 0x7FE) << 20)   # imm[10:1] → bits[30:21]
-        | ((offset & 0x800) << 9)    # imm[11]   → bit[20]
-        | ((offset & 0xFF000) << 0)  # imm[19:12]→ bits[19:12]
+        ((offset & 0x100000) << 11)  # imm[20]   -> bit[31]
+        | ((offset & 0x7FE) << 20)   # imm[10:1] -> bits[30:21]
+        | ((offset & 0x800) << 9)    # imm[11]   -> bit[20]
+        | ((offset & 0xFF000) << 0)  # imm[19:12]-> bits[19:12]
         | (rd << 7)
         | opcode
     )
 
 
 # ============================================================
-#  C 寄存器映射: 3-bit creg → 实际寄存器号 (x8–x15)
+#  C 寄存器映射: 3-bit creg -> 实际寄存器号 (x8–x15)
 # ============================================================
 
 def _c_reg(creg: int) -> int:
@@ -164,7 +164,7 @@ class TestCompressedDifferential:
     """差分测试: 每条 C 指令 vs 等价 32-bit 指令."""
 
     # ===========================================================
-    #  C.ADDI (rd≠0)  ←→  ADDI rd, rd, imm
+    #  C.ADDI (rd≠0)  ←->  ADDI rd, rd, imm
     #  Encoding: funct3=000, rd[11:7], imm[5]=bit12, imm[4:0]=bits[6:2]
     # ===========================================================
     @pytest.mark.parametrize("rd,init_val,imm", [
@@ -195,13 +195,13 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.ADDIW (rd≠0)  ←→  ADDIW rd, rd, imm
+    #  C.ADDIW (rd≠0)  ←->  ADDIW rd, rd, imm
     #  Encoding: funct3=001, rd[11:7], imm[5]=bit12, imm[4:0]=bits[6:2]
     # ===========================================================
     @pytest.mark.parametrize("rd,init_val,imm", [
         (5, 10, 3),
         (7, 0, -5),
-        (8, 0xFFFF_FFFF_8000_0000, 1),  # 32-bit overflow → sign-extend
+        (8, 0xFFFF_FFFF_8000_0000, 1),  # 32-bit overflow -> sign-extend
         (9, 100, -32),
     ])
     def test_c_addiw_vs_addiw(self, rd, init_val, imm):
@@ -224,7 +224,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.LI (rd≠0)  ←→  ADDI rd, x0, imm
+    #  C.LI (rd≠0)  ←->  ADDI rd, x0, imm
     #  Encoding: funct3=010, rd[11:7], imm[5]=bit12, imm[4:0]=bits[6:2]
     # ===========================================================
     @pytest.mark.parametrize("rd,imm", [
@@ -246,7 +246,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.LUI (rd∉{0,2}, nzimm≠0)  ←→  LUI rd, imm20
+    #  C.LUI (rd∉{0,2}, nzimm≠0)  ←->  LUI rd, imm20
     #  Encoding: funct3=011, rd[11:7],
     #    imm[17]=bit12, imm[16:12]=bits[6:2]
     # ===========================================================
@@ -269,8 +269,8 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.ADDI16SP  ←→  ADDI x2, x2, nzimm
-    #  6-bit nzimm[9:4] → sign-extend to 10-bit (nzimm[3:0]=0)
+    #  C.ADDI16SP  ←->  ADDI x2, x2, nzimm
+    #  6-bit nzimm[9:4] -> sign-extend to 10-bit (nzimm[3:0]=0)
     #  nzimm[9]=bit12, nzimm[8:7]=bits[4:3], nzimm[6]=bit5,
     #  nzimm[5]=bit2, nzimm[4]=bit6
     # ===========================================================
@@ -305,7 +305,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.ADDI4SPN  ←→  ADDI rd, x2, nzuimm
+    #  C.ADDI4SPN  ←->  ADDI rd, x2, nzuimm
     #  C0 quadrant: funct3=000, rd'[4:2]
     #  nzuimm[9:6]=bits[10:7], nzuimm[5]=bit12, nzuimm[4]=bit11,
     #  nzuimm[3]=bit5, nzuimm[2]=bit6
@@ -318,14 +318,14 @@ class TestCompressedDifferential:
     def test_c_addi4spn_vs_addi_sp(self, rd_creg, init_sp, nzuimm):
         ram, rf, wf = _make_ram()
         rd = _c_reg(rd_creg)
-        # C.ADDI4SPN: nzuimm[5:4]→instr[12:11], nzuimm[9:6]→instr[10:7],
-        #   nzuimm[2]→instr[6], nzuimm[3]→instr[5]
+        # C.ADDI4SPN: nzuimm[5:4]->instr[12:11], nzuimm[9:6]->instr[10:7],
+        #   nzuimm[2]->instr[6], nzuimm[3]->instr[5]
         c_instr = _c0(0b000, rd_creg, (
-            ((nzuimm >> 2) & 0x1) << 6    # nzuimm[2] → instr[6]
-            | ((nzuimm >> 3) & 0x1) << 5   # nzuimm[3] → instr[5]
-            | ((nzuimm >> 4) & 0x1) << 11  # nzuimm[4] → instr[11]
-            | ((nzuimm >> 5) & 0x1) << 12  # nzuimm[5] → instr[12]
-            | ((nzuimm >> 6) & 0xF) << 7   # nzuimm[9:6] → instr[10:7]
+            ((nzuimm >> 2) & 0x1) << 6    # nzuimm[2] -> instr[6]
+            | ((nzuimm >> 3) & 0x1) << 5   # nzuimm[3] -> instr[5]
+            | ((nzuimm >> 4) & 0x1) << 11  # nzuimm[4] -> instr[11]
+            | ((nzuimm >> 5) & 0x1) << 12  # nzuimm[5] -> instr[12]
+            | ((nzuimm >> 6) & 0xF) << 7   # nzuimm[9:6] -> instr[10:7]
         ))
         nc_instr = _i_type(Opc.opImm.value, rd, 0b000, 2, nzuimm & 0xFFF)
 
@@ -342,7 +342,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.SRLI  ←→  SRLI rd, rd, shamt
+    #  C.SRLI  ←->  SRLI rd, rd, shamt
     #  RV64C: sf=00, shamt = {bit12, bits[6:2]} (1-63)
     # ===========================================================
     @pytest.mark.parametrize("rd_creg,init_val,shamt", [
@@ -379,7 +379,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.SRAI  ←→  SRAI rd, rd, shamt
+    #  C.SRAI  ←->  SRAI rd, rd, shamt
     #  RV64C: sf=01, shamt = {bit12, bits[6:2]} (1-63)
     # ===========================================================
     @pytest.mark.parametrize("rd_creg,init_val,shamt", [
@@ -418,7 +418,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.ANDI  ←→  ANDI rd, rd, imm
+    #  C.ANDI  ←->  ANDI rd, rd, imm
     #  sf=10, bit12=imm[5], bits[6:2]=imm[4:0]
     # ===========================================================
     @pytest.mark.parametrize("rd_creg,init_val,imm6", [
@@ -433,8 +433,8 @@ class TestCompressedDifferential:
         val6 = imm6 & 0x3F
         c_instr = _c1(0b100, rd_creg,
             (0b10 << 10)                    # sf=10 = C.ANDI
-            | ((val6 & 0x20) << 7)          # imm[5] → bit12
-            | ((val6 & 0x1F) << 2)          # imm[4:0] → bits[6:2]
+            | ((val6 & 0x20) << 7)          # imm[5] -> bit12
+            | ((val6 & 0x1F) << 2)          # imm[4:0] -> bits[6:2]
         )
         imm12 = _sext(imm6, 6) & 0xFFF
         nc_instr = _i_type(Opc.opImm.value, rd, 0b111, rd, imm12)
@@ -452,7 +452,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.SUB / C.XOR / C.OR / C.AND  ←→  sub/xor/or/and
+    #  C.SUB / C.XOR / C.OR / C.AND  ←->  sub/xor/or/and
     #  RV64C: sf=01, bit[6:5]=op (00=SUB,01=XOR,10=OR,11=AND)
     # ===========================================================
     @pytest.mark.parametrize("rd_creg,rs2_creg,v1,v2,op_bits", [
@@ -471,8 +471,8 @@ class TestCompressedDifferential:
         c_instr = _c1(0b100, rd_creg,
             (0b11 << 10)                      # sf=11
             | (0 << 12)                       # bit12=0
-            | (op_bits << 5)                  # op → bits[6:5]
-            | (rs2_creg << 2)                 # rs2' → bits[4:2]
+            | (op_bits << 5)                  # op -> bits[6:5]
+            | (rs2_creg << 2)                 # rs2' -> bits[4:2]
         )
 
         funct3_map = {0b00: 0b000, 0b01: 0b100, 0b10: 0b110, 0b11: 0b111}
@@ -494,15 +494,15 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.SUBW / C.ADDW  ←→  subw / addw
-    #  RV64C only: sf=11, bit[6:5]=00→SUBW, 01→ADDW
+    #  C.SUBW / C.ADDW  ←->  subw / addw
+    #  RV64C only: sf=11, bit[6:5]=00->SUBW, 01->ADDW
     # ===========================================================
     @pytest.mark.parametrize("rd_creg,rs2_creg,v1,v2,op_bit5", [
         (3, 5, 100, 30, 0),                  # SUBW
         (1, 7, 0xFFFF_FFFF_8000_0000, 1, 1), # ADDW: overflow wraps in 32-bit
         (0, 2, 5, 10, 0),                    # SUBW: negative result (sign-extended)
         (4, 6, 10, 10, 0),                   # SUBW: 0 result
-        (3, 5, 0x1_0000_0001, 1, 1),        # ADDW: 32-bit wrap to 2 → sext32
+        (3, 5, 0x1_0000_0001, 1, 1),        # ADDW: 32-bit wrap to 2 -> sext32
     ])
     def test_c_subw_addw_vs_32bit(self, rd_creg, rs2_creg, v1, v2, op_bit5):
         ram, rf, wf = _make_ram()
@@ -512,9 +512,9 @@ class TestCompressedDifferential:
         c_instr = _c1(0b100, rd_creg,
             (0b11 << 10)                      # sf=11
             | (1 << 12)                       # bit12=1 (RV64C)
-            | (op_bit5 << 5)                  # 0=SUBW, 1=ADDW → bit[5]
+            | (op_bit5 << 5)                  # 0=SUBW, 1=ADDW -> bit[5]
             | (0 << 6)                        # bit[6]=0
-            | (rs2_creg << 2)                 # rs2' → bits[4:2]
+            | (rs2_creg << 2)                 # rs2' -> bits[4:2]
         )
 
         if op_bit5 == 0:
@@ -539,7 +539,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.LW  ←→  LW rd, uimm(rs1)
+    #  C.LW  ←->  LW rd, uimm(rs1)
     #  C0: funct3=010, uimm[6]=bit6, uimm[5:3]=bits[12:10], uimm[2]=bit5
     # ===========================================================
     @pytest.mark.parametrize("rd_creg,rs1_creg,init_rs1,uimm,mem_val", [
@@ -558,9 +558,9 @@ class TestCompressedDifferential:
         # C.LW: uimm[5:3]=bits[12:10], uimm[2]=bit6, uimm[6]=bit5
         c_instr = _c0(0b010, rd_creg, (
             (rs1_creg << 7)                   # rs1' in bits[9:7]
-            | ((uimm >> 2) & 0x1) << 6        # uimm[2] → bit[6]
-            | ((uimm >> 3) & 0x7) << 10       # uimm[5:3] → bits[12:10]
-            | ((uimm >> 6) & 0x1) << 5        # uimm[6] → bit[5]
+            | ((uimm >> 2) & 0x1) << 6        # uimm[2] -> bit[6]
+            | ((uimm >> 3) & 0x7) << 10       # uimm[5:3] -> bits[12:10]
+            | ((uimm >> 6) & 0x1) << 5        # uimm[6] -> bit[5]
         ))
         nc_instr = _i_type_load(Opc.ld.value, rd, 0b010, rs1, uimm & 0xFFF)
 
@@ -577,7 +577,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.SW  ←→  SW rs2, uimm(rs1)
+    #  C.SW  ←->  SW rs2, uimm(rs1)
     #  C0: funct3=110, uimm same layout as C.LW, rs2' at bits[4:2]
     # ===========================================================
     @pytest.mark.parametrize("rs2_creg,rs1_creg,init_rs1,init_rs2,uimm", [
@@ -593,9 +593,9 @@ class TestCompressedDifferential:
         # C.SW: funct3=110, uimm same layout as C.LW
         c_instr = _c0(0b110, rs2_creg, (       # rd field = rs2' for C.SW
             (rs1_creg << 7)
-            | ((uimm >> 2) & 0x1) << 6         # uimm[2] → bit[6]
-            | ((uimm >> 3) & 0x7) << 10        # uimm[5:3] → bits[12:10]
-            | ((uimm >> 6) & 0x1) << 5         # uimm[6] → bit[5]
+            | ((uimm >> 2) & 0x1) << 6         # uimm[2] -> bit[6]
+            | ((uimm >> 3) & 0x7) << 10        # uimm[5:3] -> bits[12:10]
+            | ((uimm >> 6) & 0x1) << 5         # uimm[6] -> bit[5]
         ))
         nc_instr = _s_type(Opc.st.value, 0b010, rs1, rs2, uimm & 0xFFF)
 
@@ -621,7 +621,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.LD  ←→  LD rd, uimm(rs1)
+    #  C.LD  ←->  LD rd, uimm(rs1)
     #  C0: funct3=011, uimm[7:6]=bits[6:5], uimm[5:3]=bits[12:10]
     # ===========================================================
     @pytest.mark.parametrize("rd_creg,rs1_creg,init_rs1,uimm,mem_val", [
@@ -639,8 +639,8 @@ class TestCompressedDifferential:
         # C.LD: uimm[7:6]=bits[6:5], uimm[5:3]=bits[12:10]
         c_instr = _c0(0b011, rd_creg, (
             (rs1_creg << 7)
-            | ((uimm >> 6) & 0x3) << 5         # uimm[7:6] → bits[6:5]
-            | ((uimm >> 3) & 0x7) << 10        # uimm[5:3] → bits[12:10]
+            | ((uimm >> 6) & 0x3) << 5         # uimm[7:6] -> bits[6:5]
+            | ((uimm >> 3) & 0x7) << 10        # uimm[5:3] -> bits[12:10]
         ))
         nc_instr = _i_type_load(Opc.ld.value, rd, 0b011, rs1, uimm & 0xFFF)
 
@@ -657,7 +657,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.SD  ←→  SD rs2, uimm(rs1)
+    #  C.SD  ←->  SD rs2, uimm(rs1)
     #  C0: funct3=111, uimm same layout as C.LD, rs2' at bits[4:2]
     # ===========================================================
     @pytest.mark.parametrize("rs2_creg,rs1_creg,init_rs1,init_rs2,uimm", [
@@ -700,7 +700,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.SLLI  ←→  SLLI rd, rd, shamt
+    #  C.SLLI  ←->  SLLI rd, rd, shamt
     #  C2: funct3=000, rd[11:7], bit12=shamt[5], bits[6:2]=shamt[4:0]
     # ===========================================================
     @pytest.mark.parametrize("rd,init_val,shamt", [
@@ -710,8 +710,8 @@ class TestCompressedDifferential:
     def test_c_slli_vs_slli(self, rd, init_val, shamt):
         ram, rf, wf = _make_ram()
         c_instr = _c2(0b000, rd,
-            ((shamt & 0x20) << 7)               # shamt[5] → bit12
-            | ((shamt & 0x1F) << 2)             # shamt[4:0] → bits[6:2]
+            ((shamt & 0x20) << 7)               # shamt[5] -> bit12
+            | ((shamt & 0x1F) << 2)             # shamt[4:0] -> bits[6:2]
         )
         nc_instr = _i_type(Opc.opImm.value, rd, 0b001, rd, shamt & 0x3F)
 
@@ -728,7 +728,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.MV (rd≠0, rs2≠0)  ←→  ADD rd, x0, rs2
+    #  C.MV (rd≠0, rs2≠0)  ←->  ADD rd, x0, rs2
     #  C2: funct3=100, bit12=0, rd[11:7], rs2[6:2]
     # ===========================================================
     @pytest.mark.parametrize("rd,rs2,init_rs2", [
@@ -737,8 +737,8 @@ class TestCompressedDifferential:
     def test_c_mv_vs_add_x0(self, rd, rs2, init_rs2):
         ram, rf, wf = _make_ram()
         c_instr = _c2(0b100, rd,
-            (0 << 12)                           # bit12=0 → C.MV
-            | (rs2 << 2)                        # rs2 → bits[6:2]
+            (0 << 12)                           # bit12=0 -> C.MV
+            | (rs2 << 2)                        # rs2 -> bits[6:2]
         )
         nc_instr = _r_type(Opc.op.value, rd, 0b000, 0, rs2, 0b0000000)
 
@@ -755,7 +755,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.JR (rs1≠0)  ←→  JALR x0, rs1, 0
+    #  C.JR (rs1≠0)  ←->  JALR x0, rs1, 0
     #  C2: funct3=100, bit12=0, rs2=0
     #  Note: C.JR uses rs1 in bits[11:7], not _creg
     # ===========================================================
@@ -765,7 +765,7 @@ class TestCompressedDifferential:
     def test_c_jr_vs_jalr_x0(self, rs1, target):
         ram, rf, wf = _make_ram()
         c_instr = _c2(0b100, rs1,
-            (0 << 12) | (0 << 2)                # bit12=0, rs2=0 → C.JR
+            (0 << 12) | (0 << 2)                # bit12=0, rs2=0 -> C.JR
         )
         nc_instr = _i_type(Opc.jalr.value, 0, 0b000, rs1, 0)
 
@@ -785,7 +785,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.JALR (rs1≠0)  ←→  JALR ra, rs1, 0
+    #  C.JALR (rs1≠0)  ←->  JALR ra, rs1, 0
     #  C2: funct3=100, bit12=1, rs2=0
     #  Note: C.JALR saves pc+2 to ra. JALR saves pc+4 to ra.
     #  These WILL differ — skip x1 in GPR comparison.
@@ -796,7 +796,7 @@ class TestCompressedDifferential:
     def test_c_jalr_vs_jalr_ra(self, rs1, target):
         ram, rf, wf = _make_ram()
         c_instr = _c2(0b100, rs1,
-            (1 << 12) | (0 << 2)                # bit12=1 → C.JALR, rs2=0
+            (1 << 12) | (0 << 2)                # bit12=1 -> C.JALR, rs2=0
         )
         nc_instr = _i_type(Opc.jalr.value, 1, 0b000, rs1, 0)
 
@@ -823,7 +823,7 @@ class TestCompressedDifferential:
             )
 
     # ===========================================================
-    #  C.LWSP (rd≠0)  ←→  LW rd, uimm(x2)
+    #  C.LWSP (rd≠0)  ←->  LW rd, uimm(x2)
     #  C2: funct3=010, rd[11:7]
     #  uimm[7:6]=bits[6:5], uimm[5]=bit12, uimm[4:2]=bits[4:2]
     # ===========================================================
@@ -840,9 +840,9 @@ class TestCompressedDifferential:
 
         # C.LWSP: uimm[7:6]=bits[6:5], uimm[5]=bit12, uimm[4:2]=bits[4:2]
         c_instr = _c2(0b010, rd, (
-            ((uimm >> 2) & 0x7) << 2            # uimm[4:2] → bits[4:2]
-            | ((uimm >> 5) & 0x1) << 12         # uimm[5] → bit12
-            | ((uimm >> 6) & 0x3) << 5          # uimm[7:6] → bits[6:5]
+            ((uimm >> 2) & 0x7) << 2            # uimm[4:2] -> bits[4:2]
+            | ((uimm >> 5) & 0x1) << 12         # uimm[5] -> bit12
+            | ((uimm >> 6) & 0x3) << 5          # uimm[7:6] -> bits[6:5]
         ))
         nc_instr = _i_type_load(Opc.ld.value, rd, 0b010, 2, uimm & 0xFFF)
 
@@ -859,7 +859,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.LDSP  ←→  LD rd, uimm(x2)
+    #  C.LDSP  ←->  LD rd, uimm(x2)
     #  C2: funct3=011, rd[11:7]
     #  uimm[8:6]=bits[4:2], uimm[5]=bit12, uimm[4:3]=bits[6:5]
     # ===========================================================
@@ -875,9 +875,9 @@ class TestCompressedDifferential:
 
         # C.LDSP: uimm[8:6]=bits[4:2], uimm[5]=bit12, uimm[4:3]=bits[6:5]
         c_instr = _c2(0b011, rd, (
-            ((uimm >> 6) & 0x7) << 2             # uimm[8:6] → bits[4:2]
-            | ((uimm >> 5) & 0x1) << 12          # uimm[5] → bit12
-            | ((uimm >> 3) & 0x3) << 5           # uimm[4:3] → bits[6:5]
+            ((uimm >> 6) & 0x7) << 2             # uimm[8:6] -> bits[4:2]
+            | ((uimm >> 5) & 0x1) << 12          # uimm[5] -> bit12
+            | ((uimm >> 3) & 0x3) << 5           # uimm[4:3] -> bits[6:5]
         ))
         nc_instr = _i_type_load(Opc.ld.value, rd, 0b011, 2, uimm & 0xFFF)
 
@@ -894,7 +894,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.SWSP  ←→  SW rs2, uimm(x2)
+    #  C.SWSP  ←->  SW rs2, uimm(x2)
     #  C2: funct3=110, rs2[6:2]
     #  uimm[7:6]=bits[8:7], uimm[5:2]=bits[12:9]
     #  Note: rs2 is in bits[6:2], NOT bits[11:7]!
@@ -910,9 +910,9 @@ class TestCompressedDifferential:
         # C.SWSP: uimm[7:6]=instr[8:7], uimm[5:2]=instr[12:9], rs2=instr[6:2]
         c_instr = (
             (0b110 << 13)                       # funct3 [15:13]
-            | ((uimm >> 2) & 0xF) << 9          # uimm[5:2] → bits[12:9]
-            | ((uimm >> 6) & 0x3) << 7          # uimm[7:6] → bits[8:7]
-            | (rs2 & 0x1F) << 2                 # rs2 → bits[6:2]
+            | ((uimm >> 2) & 0xF) << 9          # uimm[5:2] -> bits[12:9]
+            | ((uimm >> 6) & 0x3) << 7          # uimm[7:6] -> bits[8:7]
+            | (rs2 & 0x1F) << 2                 # rs2 -> bits[6:2]
             | 0b10                              # quadrant C2
         )
         nc_instr = _s_type(Opc.st.value, 0b010, 2, rs2, uimm & 0xFFF)
@@ -939,7 +939,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.SDSP  ←→  SD rs2, uimm(x2)
+    #  C.SDSP  ←->  SD rs2, uimm(x2)
     #  C2: funct3=111, rs2[6:2]
     #  uimm[8:6]=bits[9:7], uimm[5:3]=bits[12:10]
     #  Note: rs2 is in bits[6:2], NOT bits[11:7]!
@@ -955,9 +955,9 @@ class TestCompressedDifferential:
         # C.SDSP: uimm[8:6]=instr[9:7], uimm[5:3]=instr[12:10], rs2=instr[6:2]
         c_instr = (
             (0b111 << 13)                       # funct3 [15:13]
-            | ((uimm >> 3) & 0x7) << 10         # uimm[5:3] → bits[12:10]
-            | ((uimm >> 6) & 0x7) << 7          # uimm[8:6] → bits[9:7]
-            | (rs2 & 0x1F) << 2                 # rs2 → bits[6:2]
+            | ((uimm >> 3) & 0x7) << 10         # uimm[5:3] -> bits[12:10]
+            | ((uimm >> 6) & 0x7) << 7          # uimm[8:6] -> bits[9:7]
+            | (rs2 & 0x1F) << 2                 # rs2 -> bits[6:2]
             | 0b10                              # quadrant C2
         )
         nc_instr = _s_type(Opc.st.value, 0b011, 2, rs2, uimm & 0xFFF)
@@ -984,7 +984,7 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.J  ←→  JAL x0, offset
+    #  C.J  ←->  JAL x0, offset
     #  C1: funct3=101, offset[11]=bit12, offset[10]=bit8,
     #      offset[9:8]=bits[10:9], offset[7]=bit6, offset[6]=bit7,
     #      offset[5]=bit2, offset[4]=bit11, offset[3:1]=bits[5:3]
@@ -999,14 +999,14 @@ class TestCompressedDifferential:
         #   offset[9:8]=bits[10:9], offset[7]=bit6, offset[6]=bit7,
         #   offset[5]=bit2, offset[4]=bit11, offset[3:1]=bits[5:3]
         c_instr = _c1(0b101, 0, (
-            ((offset >> 11) & 0x1) << 12         # offset[11] → bit[12]
-            | ((offset >> 4) & 0x1) << 11        # offset[4] → bit[11]
-            | ((offset >> 8) & 0x3) << 9         # offset[9:8] → bits[10:9]
-            | ((offset >> 10) & 0x1) << 8        # offset[10] → bit[8]
-            | ((offset >> 6) & 0x1) << 7         # offset[6] → bit[7]
-            | ((offset >> 7) & 0x1) << 6         # offset[7] → bit[6]
-            | ((offset >> 1) & 0x7) << 3         # offset[3:1] → bits[5:3]
-            | ((offset >> 5) & 0x1) << 2         # offset[5] → bit[2]
+            ((offset >> 11) & 0x1) << 12         # offset[11] -> bit[12]
+            | ((offset >> 4) & 0x1) << 11        # offset[4] -> bit[11]
+            | ((offset >> 8) & 0x3) << 9         # offset[9:8] -> bits[10:9]
+            | ((offset >> 10) & 0x1) << 8        # offset[10] -> bit[8]
+            | ((offset >> 6) & 0x1) << 7         # offset[6] -> bit[7]
+            | ((offset >> 7) & 0x1) << 6         # offset[7] -> bit[6]
+            | ((offset >> 1) & 0x7) << 3         # offset[3:1] -> bits[5:3]
+            | ((offset >> 5) & 0x1) << 2         # offset[5] -> bit[2]
         ))
         nc_instr = _j_type(Opc.jal.value, 0, offset)
 
@@ -1024,14 +1024,14 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.BEQZ  ←→  BEQ rs1, x0, offset
+    #  C.BEQZ  ←->  BEQ rs1, x0, offset
     #  C1: funct3=110, rs1' in bits[9:7] (C-register)
     #  offset[8]=bit12, offset[4:3]=bits[11:10], offset[7:6]=bits[6:5],
     #  offset[2:1]=bits[4:3], offset[5]=bit2
     # ===========================================================
     @pytest.mark.parametrize("rs1_creg,init_rs1,init_pc,offset", [
-        (3, 0, 0x8000_0000, 4),       # rs1==0 → taken, positive
-        (5, 1, 0x8000_0000, 8),       # rs1≠0 → not taken
+        (3, 0, 0x8000_0000, 4),       # rs1==0 -> taken, positive
+        (5, 1, 0x8000_0000, 8),       # rs1≠0 -> not taken
         (7, 0, 0x8000_0000, -16),     # taken, negative offset
         (0, 0xFFFF_FFFF_FFFF_FFFF, 0x8000_0000, 128),  # not taken, rs1≠0
     ])
@@ -1040,11 +1040,11 @@ class TestCompressedDifferential:
         rs1 = _c_reg(rs1_creg)
         # C.BEQZ encoding per spec:
         c_instr = _c1(0b110, rs1_creg, (          # rd field = rs1' for BEQZ
-            ((offset >> 8) & 0x1) << 12            # offset[8] → bit[12]
-            | ((offset >> 3) & 0x3) << 10          # offset[4:3] → bits[11:10]
-            | ((offset >> 6) & 0x3) << 5           # offset[7:6] → bits[6:5]
-            | ((offset >> 1) & 0x3) << 3           # offset[2:1] → bits[4:3]
-            | ((offset >> 5) & 0x1) << 2           # offset[5] → bit[2]
+            ((offset >> 8) & 0x1) << 12            # offset[8] -> bit[12]
+            | ((offset >> 3) & 0x3) << 10          # offset[4:3] -> bits[11:10]
+            | ((offset >> 6) & 0x3) << 5           # offset[7:6] -> bits[6:5]
+            | ((offset >> 1) & 0x3) << 3           # offset[2:1] -> bits[4:3]
+            | ((offset >> 5) & 0x1) << 2           # offset[5] -> bit[2]
         ))
         nc_instr = _b_type(Opc.br.value, 0b000, rs1, 0, offset)
 
@@ -1064,12 +1064,12 @@ class TestCompressedDifferential:
         _assert_gprs_equal(_snapshot_gprs(hc), _snapshot_gprs(hn))
 
     # ===========================================================
-    #  C.BNEZ  ←→  BNE rs1, x0, offset
+    #  C.BNEZ  ←->  BNE rs1, x0, offset
     #  C1: funct3=111, same offset encoding as C.BEQZ
     # ===========================================================
     @pytest.mark.parametrize("rs1_creg,init_rs1,init_pc,offset", [
-        (3, 5, 0x8000_0000, 8),       # rs1≠0 → taken
-        (5, 0, 0x8000_0000, 4),       # rs1==0 → not taken
+        (3, 5, 0x8000_0000, 8),       # rs1≠0 -> taken
+        (5, 0, 0x8000_0000, 4),       # rs1==0 -> not taken
         (7, -1, 0x8000_0000, -32),    # taken, negative offset
     ])
     def test_c_bnez_vs_bne_x0(self, rs1_creg, init_rs1, init_pc, offset):

@@ -13,8 +13,8 @@
  *   - OpenSBI 自身的性能分析 (通过内部 API, 非 SBI ecall)
  *
  * 与 pmu.s 的关系:
- *   pmu.s        → M-mode 直接操作 CSR, 最小开销, 适合裸机/boot 阶段
- *   pmu_via_sbi.c → S-mode 通过 ecall 委托 M-mode, 额外 1 次 ecall 开销
+ *   pmu.s        -> M-mode 直接操作 CSR, 最小开销, 适合裸机/boot 阶段
+ *   pmu_via_sbi.c -> S-mode 通过 ecall 委托 M-mode, 额外 1 次 ecall 开销
  *
  * 使用流程:
  *

@@ -174,7 +174,7 @@ temp_stvec:
 .L1_trap_vec:
     auipc s7, %pcrel_hi(trap_vector)
     addi  s7, s7, %pcrel_lo(.L1_trap_vec)
-    add  s7, s7, a2             # PA → VA (a2 = va_offset 仍有效)
+    add  s7, s7, a2             # PA -> VA (a2 = va_offset 仍有效)
     csrw stvec, s7
     # 以及其余初始化操作
     call rust_main_after_mmu
@@ -201,17 +201,17 @@ early_trap:
 trap_vector:
     # sscratch 交换：sp ↔ sscratch
     csrrw sp, sscratch, sp
-    bnez  sp, .L_user_trap      # sp != 0 → 用户态陷态
+    bnez  sp, .L_user_trap      # sp != 0 -> 用户态陷态
 
     # ---- 内核陷态：sscratch == 0 ----
     csrr  sp, sstatus
     andi  sp, sp, 0x100         # SPP bit
-    bnez  sp, .L_kernel_trap    # SPP=1 → 内核陷态
+    bnez  sp, .L_kernel_trap    # SPP=1 -> 内核陷态
 
     # ---- 新线程首次陷态：SPP=0，需分配内核栈 ----
     csrrw sp, sscratch, sp      # 恢复 sp
     SAVE_CONTEXT
-    jal   alloc_smode_stack     # 分配内核栈 → a0
+    jal   alloc_smode_stack     # 分配内核栈 -> a0
     csrw  sscratch, a0
     RESTORE_CONTEXT
     csrrw sp, sscratch, sp
@@ -229,7 +229,7 @@ trap_vector:
     csrrw t1, sscratch, x0
     sd   t1, 256(sp)
 
-    # 准备 C ABI 参数 → trap_dispatch(gprs, sepc, scause, stval)
+    # 准备 C ABI 参数 -> trap_dispatch(gprs, sepc, scause, stval)
     mv    a0, sp                # a0 = &TrapGprs
     csrr  a1, sepc
     csrr  a2, scause

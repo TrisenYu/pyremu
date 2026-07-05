@@ -59,9 +59,9 @@ class CacheBase(ABC):
     - 刷新 (flush / flush_all)
 
     子类职责:
-    - _make_line() → 创建子类缓存行实例
-    - _match(entry, key) → 定义 tag 匹配规则
-    - _on_evict(entry) → 逐出时的自定义行为 (如回写)
+    - _make_line() -> 创建子类缓存行实例
+    - _match(entry, key) -> 定义 tag 匹配规则
+    - _on_evict(entry) -> 逐出时的自定义行为 (如回写)
     - 可覆写 _pick_victim() 自定义替换策略
     """
 
@@ -79,7 +79,7 @@ class CacheBase(ABC):
         self._fifo_ptr: int = 0  # FIFO 写入指针
         self._hits: int = 0
         self._misses: int = 0
-        self._tag_to_idx: dict[int, int] = {}  # O(1) tag→index 快速查找
+        self._tag_to_idx: dict[int, int] = {}  # O(1) tag->index 快速查找
 
     # ----------------------------------------------------------
     #  子类必须实现的抽象方法
@@ -167,7 +167,7 @@ class CacheBase(ABC):
         idx = self._pick_victim()
         victim = self._entries[idx]
         if victim.valid:
-            self._tag_to_idx.pop(victim.tag, None)  # 清理旧 tag→index 映射
+            self._tag_to_idx.pop(victim.tag, None)  # 清理旧 tag->index 映射
             self._on_evict(victim)
         victim.valid = False
         victim.dirty = False
@@ -218,13 +218,14 @@ class CacheBase(ABC):
         """
         count = 0
         for entry in self._entries:
-            if entry.valid and entry.mdid == mdid:
-                self._on_evict(entry)
-                self._tag_to_idx.pop(entry.tag, None)
-                entry.valid = False
-                entry.tag = 0
-                entry.dirty = False
-                count += 1
+            if not (entry.valid and entry.mdid == mdid):
+                continue
+            self._on_evict(entry)
+            self._tag_to_idx.pop(entry.tag, None)
+            entry.valid = False
+            entry.tag = 0
+            entry.dirty = False
+            count += 1
         return count
 
     # ----------------------------------------------------------

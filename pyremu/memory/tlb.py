@@ -8,7 +8,7 @@
 """
 翻译后备缓冲器 (Translation Lookaside Buffer, TLB).
 
-TLB 缓存最近使用的虚拟页号 (VPN) → 物理页号 (PPN) 映射,
+TLB 缓存最近使用的虚拟页号 (VPN) -> 物理页号 (PPN) 映射,
 加速从虚拟地址到物理地址的转换, 避免每次内存访问都遍历页表。
 
 重构为继承 CacheBase 抽象基类, 统一缓存管理框架。
@@ -35,7 +35,7 @@ class TLBLine(CacheLineBase):
 
 
 class TLB(CacheBase):
-    """全相联 TLB, 继承 CacheBase 提供 VPN→PPN 映射缓存.
+    """全相联 TLB, 继承 CacheBase 提供 VPN->PPN 映射缓存.
 
     默认 FIFO 替换策略, 支持按 VPN 查找/插入/刷新。
     保持与旧版兼容的 lookup/insert/flush 接口。
@@ -184,7 +184,7 @@ class TLB(CacheBase):
         return self._num_entries
 
 def decode_tlb_perm(perm: int) -> str:
-    """TLB 权限位 → 可读字符串: 0b1111 → 'RWXU'."""
+    """TLB 权限位 -> 可读字符串: 0b1111 -> 'RWXU'."""
     r = "R" if perm & 1 else "-"
     w = "W" if perm & 2 else "-"
     x = "X" if perm & 4 else "-"

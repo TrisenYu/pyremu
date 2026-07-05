@@ -41,7 +41,7 @@ TrapType = Enum("TrapType", (
 ))
 
 # ============================================================
-#  TrapType → mcause/scause 编码映射
+#  TrapType -> mcause/scause 编码映射
 #  异常: code = 直接编号 (bit 63 = 0)
 #  中断: code = 直接编号 | (1 << 63)
 # ============================================================
@@ -88,7 +88,7 @@ def trap_is_interrupt(trap: TrapType) -> bool:
     return (code >> 63) & 1 == 1
 
 
-# mcause/scause 编码 → TrapType 名称逆向映射 (惰性构建)
+# mcause/scause 编码 -> TrapType 名称逆向映射 (惰性构建)
 _CAUSE_CODE_NAME: dict[int, str] = {code: trap.name for trap, code in _TRAP_CAUSE_CODE.items()}
 
 

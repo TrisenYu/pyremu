@@ -2,7 +2,7 @@
 //! Uses inline `asm!()` (Rust 2024 stabilised asm).
 //!
 //! `read_csr!(sstatus)` 等宏通过 `stringify!` 将 CSR 寄存器名直接拼入
-//! asm 模板，与 C 的 `read_csr(sstatus)` → `"csrr %0, sstatus"` 等效。
+//! asm 模板，与 C 的 `read_csr(sstatus)` -> `"csrr %0, sstatus"` 等效。
 //!
 //! 此文件为完整的 S-mode CSR 参考定义，未使用的常量与包装函数有意保留。
 
@@ -41,7 +41,7 @@ pub const SEI: u64 = 0x200;
 // ---------------------------------------------------------------
 //  CSR 读写宏
 //  用法: read_csr!(sstatus), write_csr!(sie, val), clear_csr!(sip, mask)
-//  `$csr:ident` → `stringify!` → 汇编器接收小写 CSR 寄存器名。
+//  `$csr:ident` -> `stringify!` -> 汇编器接收小写 CSR 寄存器名。
 // ---------------------------------------------------------------
 
 macro_rules! read_csr {

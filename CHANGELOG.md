@@ -1,15 +1,52 @@
-# Changelog
+## 2026-07-05
 
-本文档记录开发过程中发现的根因级 bug 及其修复, 供后续开发参考。
+### FFI struct 布局不匹配: Python struct-of-arrays ↔ Rust array-of-structs → SIGBUS
+
+**触发场景**: 更新 `libdecode.so` (Rust cdylib) 后, 若 Python ctypes `HartState` 字段
+布局未同步更新, 运行时 Rust 在错误偏移处读取 TLB 条目 → 读到垃圾 PPN →
+page walk 访问无效物理地址 → SIGBUS (signal 7).
+
+**根因**: Rust 将 TLB 存储为 `[TlbEntry; 32]` (array-of-structs), 每个 `TlbEntry` 24 字节
+连续排布. 初版 Python ctypes 定义 **误用 struct-of-arrays**: 将各字段拆为独立数组
+(`itlb_vpn: uint64[32] + itlb_ppn: uint64[32] + ...`). 编译器/ABI 层面两种布局的
+字节偏移完全不同:
+
+```
+ Rust AoS: TlbEntry[0]   = bytes 0-23    (vpn, ppn, perm, level, valid, mdid, _pad)
+           TlbEntry[1]   = bytes 24-47   ...
+ Py  SoA:  itlb_vpn[0..31]  = bytes 0-255
+           itlb_ppn[0..31]  = bytes 256-511
+           itlb_valid[0]    = bytes 1024-1055  ...
+```
+
+Rust 在 `itlb[0].ppn` 期望读取 offset +8 的 u64 (PPN0), 但 Python SoA 布局中
+offset +8 落在 `itlb_vpn[1]` (VPN1) 内部. 被污染的 PPN 指向无效物理地址,
+`sv39_walk` 用该地址读 PTE 时触发 SIGBUS.
+
+**为什么低覆盖率测试未能发现**: 旧测试均使用 `PYREMU_NATIVE_BATCH=0` 降级为纯 Python
+路径, 从未调用 `run_batch` → Rust 从不访问 TLB → 布局不匹配被静默掩盖.
+第一次启用 native batch 的固件启动流程才暴露此问题.
+
+**修复**:
+1. 定义 `TlbEntry(ctypes.Structure)` — vpn(u64) + ppn(u64) + 4×u8 + pad(u32) = 24B
+2. HartState 改用 `TlbEntry * 32` (array-of-structs, 与 Rust 逐字节对齐)
+3. 新增 `TestNativeBatchLayout` (6 个用例) 锁死 `sizeof`/对齐/结构形态
+4. CLAUDE.md 追加 "FFI struct 布局锁定" 条目, 要求修改 HartState 时两侧同步验证
+
+**通用原则**: 每当你修改 Rust `#[repr(C)]` struct (尤其是增减字段) 时:
+1. 同步更新 Python ctypes `_fields_`
+2. 运行 `TestNativeBatchLayout` 验证 `sizeof()` 和结构层级
+3. 确保 `cargo test` (Rust 侧) 和 `uv run pytest tests/test_emulator.py::TestNativeBatchLayout` 齐过
 
 ---
+
 
 ## 2026-06-29
 
 ### C.LW/C.SW 压缩指令 uimm 位域解码 swap — instr[5]↔instr[6] 互换
 
 **症状**: 压缩指令差分测试中 `C.LW`/`C.SW` offset≠0 时读/写到错误地址
-(如 offset=4 → 解码为 offset=64 → 越界崩溃).
+(如 offset=4 -> 解码为 offset=64 -> 越界崩溃).
 
 **根因**: [decoder.py:1074-1080](pyremu/core/decoder.py#L1074) 中 C.LW/C.SW 的 uimm 解码
 将 spec 定义的位域互换: `uimm[2]` 从 `instr[5]` 读取 (应为 `instr[6]`),
@@ -23,7 +60,7 @@ offset=0 时两个位均为 0, swap 不影响结果, 故旧测试全部通过.
 offset≠0 时 (如 C.LW x8, 4(x9)) 两个位值不同, swap 导致解码错误.
 
 **修复**: 交换 `(instr >> 5) & 0x1` 与 `(instr >> 6) & 0x1` 在 uimm 构造中的位置.
-同时修复注释 `{instr[6], ..., instr[5]}` → `{instr[5], ..., instr[6]}`.
+同时修复注释 `{instr[6], ..., instr[5]}` -> `{instr[5], ..., instr[6]}`.
 
 **验证**: 100 项压缩指令差分测试 (`test_compressed_diff.py`) 全部通过,
 含 offset≠0 的 C.LW/C.SW/C.LD/C.SD/C.LWSP/C.SWSP/C.LDSP/C.SDSP 用例.
@@ -41,7 +78,7 @@ offset≠0 时 (如 C.LW x8, 4(x9)) 两个位值不同, swap 导致解码错误.
   经 `.option norvc` / `.option rvc` 分别获得 32-bit 与 16-bit 编码,
   在相同初始 GPR/内存状态下执行, 比对全部 32 个 GPR 及内存副作用
 - **编码验证**: 测试编码经 `llvm-objdump -d --mattr=+c` 逐条验证与 LLVM 输出一致,
-  遵循 LLVM 的内部编码约定 (sf=11→C.SUB, sf=01→C.SRAI 等)
+  遵循 LLVM 的内部编码约定 (sf=11->C.SUB, sf=01->C.SRAI 等)
 
 ### 调试方法: 指令级计数定位死循环
 
@@ -49,7 +86,7 @@ offset≠0 时 (如 C.LW x8, 4(x9)) 两个位值不同, swap 导致解码错误.
 
 ```python
 # 在 emulator.step() 或 exec_instr() 中插入计数器
-_instr_counts = {}  # PC → 执行次数
+_instr_counts = {}  # PC -> 执行次数
 
 # 每执行一条指令:
 _instr_counts[hart.pc] = _instr_counts.get(hart.pc, 0) + 1
@@ -69,7 +106,7 @@ if _instr_counts[hart.pc] > 100000:
 ### rv64imafdc 固件 FDT 解析死循环 — 编译器 march 缺扩展导致代码生成差异
 
 **症状**: `rv64imafdc_ztee` (缺显式 zicsr/zifencei) 编译的 OpenSBI 固件
-在 `fw_platform_init` → `fdt_driver_init_by_offset` → `sbi_memcmp` 中
+在 `fw_platform_init` -> `fdt_driver_init_by_offset` -> `sbi_memcmp` 中
 无限循环 (110k+ `sbi_memcmp` 调用且持续增长). 而 `rv64g_ztee` (= imafd + zicsr + zifencei)
 编译产物正常运行.
 
@@ -87,7 +124,7 @@ if _instr_counts[hart.pc] > 100000:
 
 **根因**: 去掉 zicsr/zifencei 或 f/d 后, 编译器 (LLVM 22 定制版) 生成不同的指令序列,
 在 FDT 属性解析的 byteswap 中读取到错误数据 (`lw` 读到 `0x0F000000` 而非 `0x04000000`),
-导致 prop_len 错误 → 扫描越过 FDT 边界 → sbi_memcmp 收到垃圾参数 → 死循环.
+导致 prop_len 错误 -> 扫描越过 FDT 边界 -> sbi_memcmp 收到垃圾参数 -> 死循环.
 
 **已排除的假设**:
 - ❌ L2 缓存数据损坏 — 18 项压力测试通过
@@ -108,7 +145,7 @@ if _instr_counts[hart.pc] > 100000:
 
 **症状**: `make emu` 启动后无 OpenSBI logo 输出, hart 在 `0x8000E670`
 (`init_warmboot+0x30`) 处自旋数百万周期不前进. `fw_platform_init` 可正常通过
-(设备树参数正确时), 但 `sbi_init` → `init_coldboot` → `init_warmboot` 卡死.
+(设备树参数正确时), 但 `sbi_init` -> `init_coldboot` -> `init_warmboot` 卡死.
 
 **修复**:
 - [zsbl_fsbl_stub.S](tests/src-env/zsbl_fsbl_stub.S): 硬编码地址改为预处理器宏
@@ -118,7 +155,7 @@ if _instr_counts[hart.pc] > 100000:
   (`RAM_BASE + vaddr`) 后作为 `-D` 标志传入汇编器. 类似
   `rust_smode_entry/config.mk` 的配置化方式, 固件重编译后无需手动更新地址
 - [makefile](makefile): `emu` 目标添加完整依赖链:
-  `build-fw` → 拷贝固件到 `tests/` → `$(zsbl_fsbl)` (自动提取符号重建) → 启动调试器
+  `build-fw` -> 拷贝固件到 `tests/` -> `$(zsbl_fsbl)` (自动提取符号重建) -> 启动调试器
 
 **设计原则**: 硬编码跨二进制地址不可靠. 构建系统应从固件符号表自动提取,
 通过 `-D` 预处理器宏注入汇编器, 消除手工维护.
@@ -132,7 +169,7 @@ if _instr_counts[hart.pc] > 100000:
 memset/memcpy 等函数中生成 FPU 访存指令 (`fsd`/`fld`).
 
 **修改**: [Makefile:415](third-party/custom-opensbi/Makefile#L415):
-`-march=rv64imafdc_ztee` → `-march=rv64imac_ztee`.
+`-march=rv64imafdc_ztee` -> `-march=rv64imac_ztee`.
 ABI 保持 `lp64` (soft-float), 编译器不再生成任何 FPU 指令.
 
 ---
@@ -149,7 +186,7 @@ ABI 保持 `lp64` (soft-float), 编译器不再生成任何 FPU 指令.
 硬件中两值均为 `0xFFFFFFFFD00DFEED`, 但 emulator 中 Python `a5 == a6` 为 `False`,
 导致 `BNE a5, a6` 误分支.
 
-**症状**: `custom_opensbi_fw_payload.elf` 在 `fw_platform_init` → `fdt_ro_probe_` 中,
+**症状**: `custom_opensbi_fw_payload.elf` 在 `fw_platform_init` -> `fdt_ro_probe_` 中,
 magic 值 `0xD00DFEED` 通过 SLLIW 拼装 (产生负 int) 与 LUI+ADDI 构建的预期值
 (产生正 64-bit int) 比较, `BNE` 误判为不等, 固件进入 `0x1F9D4` WFI 死循环.
 
@@ -157,7 +194,7 @@ magic 值 `0xD00DFEED` 通过 SLLIW 拼装 (产生负 int) 与 LUI+ADDI 构建�
 - [decoder.py:54-62](pyremu/core/decoder.py#L54-L62): `_sext()` 对 `bits≤64` 归一化
   到 `[0, 2^64)` 无符号范围, 确保任意路径构建的同值 bit pattern 在 Python `==` 下相等.
 - [disassem.py:41-46](pyremu/utils/disassem.py#L41-L46): `_fmt_imm()` 检测 bit 63
-  置位时还原为有符号显示 (如 `0xFF…F0` → `-16`).
+  置位时还原为有符号显示 (如 `0xFF…F0` -> `-16`).
 
 **新增测试** (`tests/test_emulator.py`):
 - `TestRegValueCanonicalization.test_slliw_produces_64bit_canonical`
@@ -175,7 +212,7 @@ GPR 的值现在均为规范化 64-bit 表示, 消除了此前位运算与 `==`/
 **背景**: `custom_opensbi_fw_payload.elf` 为 PLATFORM=generic 编译, 无嵌入式 DTB
 (二进制内搜索不到 `d00dfeed` magic), 完全依赖 `a1` 寄存器接收外部设备树.
 此前 `--fdt` 默认关闭, 用户不传参时 a1=0, `fw_platform_init` 读地址 0 的 magic
-不匹配 → 返回 `FDT_ERR_BADMAGIC` → `0x1F9D4` WFI 死循环 (正确行为但体验差).
+不匹配 -> 返回 `FDT_ERR_BADMAGIC` -> `0x1F9D4` WFI 死循环 (正确行为但体验差).
 
 **修改**:
 - [debugger.py:2156-2163](pyremu/debugger.py#L2156-L2163): `--fdt` 默认值由 `None` 改为 `-1` (auto),
@@ -238,8 +275,8 @@ disassembler 均硬编码为 `0x104`, 导致合法编码的 SFENCE.VMA 被误判
 mcause=2), 进而路由到 M 模式 trap handler (因为 medeleg 未委派该异常), M 模式 handler 仅做
 `mepc+4; mret` 跳过该指令, SFENCE.VMA 实际从未执行, TLB 在 satp 写入后未被刷新.
 
-**症状**: `csrw satp` → `sfence.vma` → Illegal Instruction trap to M-mode →
-指令被跳过 → TLB 可能残留旧条目.
+**症状**: `csrw satp` -> `sfence.vma` -> Illegal Instruction trap to M-mode ->
+指令被跳过 -> TLB 可能残留旧条目.
 
 **修复**: [decoder.py:845](pyremu/core/decoder.py#L845), [disassem.py:307](pyremu/utils/disassem.py#L307),
 [tests/test_trap.py:532-547](tests/test_trap.py#L532) — 将 `0x104` 改为 `0x120`, 并新增回归测试
@@ -295,8 +332,8 @@ MODE 字段提取翻译模式). 然而 CSR 写入指令 (`csrrw` / `csrw` 等) �
 - `TestL2Properties::test_entries_property`: `entries` 属性返回内部列表
 
 **Emulator** ([test_emulator.py](tests/test_emulator.py), +17 用例):
-- `TestStepEdgeCases`: halted hart 跳过, 连续 trap 停止, 未实现 opcode→IllInstr
-- `TestLoadFirmware`: `image=None` → ValueError
+- `TestStepEdgeCases`: halted hart 跳过, 连续 trap 停止, 未实现 opcode->IllInstr
+- `TestLoadFirmware`: `image=None` -> ValueError
 - `TestRunTimeout`: 超时 TimeoutError 抛出, `run()` 返回 int, `yield_every=0` 不限速
 - `TestEmulatorProperties`: `peripherals` 字典, `cycle`/`total_instructions` 属性, `mem_hexdump`
 - `TestPeripheralInit`: SPI/I2C/GPIO 默认总线注册地址验证
@@ -320,8 +357,8 @@ MODE 字段提取翻译模式). 然而 CSR 写入指令 (`csrrw` / `csrw` 等) �
 
 **迁至 [decoder.py](pyremu/core/decoder.py)**:
 - `parse_func12(instr)` — funct12 字段提取 (bits[31:20])
-- `decode_c_sdsp(half)` — 16-bit c.sdsp 解码 → `(rs2, uimm) | None`
-- `decode_sd_sp(instr)` — 32-bit sd to sp 解码 → `(rs2, imm) | None`
+- `decode_c_sdsp(half)` — 16-bit c.sdsp 解码 -> `(rs2, uimm) | None`
+- `decode_sd_sp(instr)` — 32-bit sd to sp 解码 -> `(rs2, imm) | None`
 
 **迁至 [mmu.py](pyremu/memory/mmu.py)**:
 - `satp_root_ppn(satp_val)` — 从 satp CSR 提取 44-bit 根页表 PPN
@@ -351,8 +388,8 @@ cache / debugger / emulator / preload / snippets 模块的覆盖率缺口全量�
 CSR 模块中部分 CSR 寄存器具有"写入即产生副作用"的语义 (如 satp 触发 MMU 模式切换), 而 `HartWithRegs`
 通过 property 封装了这些副作用. 当前的 CSR 访问路径有二:
 
-1. **Python API**: `hart.satp_val = X` → 触发 `satp_val.setter` → 副作用执行 ✓
-2. **CSR 指令执行**: `handle_sys()` → `write_csr()` → `csrs["satp"].val = X` → 副作用被绕过 ✗
+1. **Python API**: `hart.satp_val = X` -> 触发 `satp_val.setter` -> 副作用执行 ✓
+2. **CSR 指令执行**: `handle_sys()` -> `write_csr()` -> `csrs["satp"].val = X` -> 副作用被绕过 ✗
 
 修复方案 (本次采用): 在 `write_csr()` 中添加白名单检测, 对已知有副作用的 CSR (目前仅 satp)
 显式路由到 property setter. 长期方案: 在 CSR 模型 (`Reg` / `CSR`) 中引入 `on_write` 回调机制.

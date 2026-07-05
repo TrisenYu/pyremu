@@ -40,7 +40,7 @@ _UNKNOWN = "<unknown opcode>"
 def _fmt_imm(val: int) -> str:
     """格式化指令立即数: 有符号十进制 (处理 64-bit 规范化值)."""
     # _sext 规范化后, 负立即数以 64-bit 无符号形式传入.
-    # 若 bit 63 置位则还原为有符号显示 (例如 0xFF…F0 → -16).
+    # 若 bit 63 置位则还原为有符号显示 (例如 0xFF…F0 -> -16).
     if val >= (1 << 63):
         val = val - (1 << 64)
     return str(val)
@@ -69,7 +69,7 @@ def _rs2(instr: int) -> str:
 
 
 # ============================================================
-#  R-type 编码表 — funct3 → (func7 → mnemonic)
+#  R-type 编码表 — funct3 -> (func7 -> mnemonic)
 # ============================================================
 
 _R_FUNCT3_MAP: dict[int, dict[int, str]] = {
@@ -126,7 +126,7 @@ def _dis_itype(instr: int) -> str:
             return f"srai    {_rd(instr)}, {_rs1(instr)}, {shamt}"
         return _UNKNOWN
 
-    f7 = parse_func7(instr)  # 非 shift I-type 才使用 funct7
+    parse_func7(instr)  # 非 shift I-type 才使用 funct7
 
     mnemonic = _IMM_FUNCT3_MAP.get(f3)
     if mnemonic is None:
@@ -285,7 +285,7 @@ _CSR_MNEMONIC: dict[int, str] = {
 
 
 def _csr_name(addr: int) -> str:
-    """CSR 地址 → 名称, 未找到则返回地址 hex."""
+    """CSR 地址 -> 名称, 未找到则返回地址 hex."""
     ok, name = check_csr(addr)
     return name if ok else f"0x{addr:03x}"
 
@@ -370,7 +370,7 @@ def _dis_amo(instr: int) -> str:
 
 
 def _c_x8(idx3: int) -> str:
-    """3-bit 压缩寄存器索引 → ABI 名 (x8–x15)."""
+    """3-bit 压缩寄存器索引 -> ABI 名 (x8–x15)."""
     return gpr_name(8 + (idx3 & 0b111))
 
 
@@ -398,10 +398,10 @@ def _dis_compressed(
             # nzuimm[2]    = instr[6],    nzuimm[3]    = instr[5]
             # 基址寄存器固定为 sp (x2), bits[9:7] 属于立即数而非 rs1' 字段.
             uimm = (
-                ((c16 >> 7) & 0x0F) << 6   # instr[10:7] → nzuimm[9:6]
-                | ((c16 >> 11) & 0x03) << 4  # instr[12:11] → nzuimm[5:4]
-                | ((c16 >> 5) & 1) << 3      # instr[5] → nzuimm[3]
-                | ((c16 >> 6) & 1) << 2      # instr[6] → nzuimm[2]
+                ((c16 >> 7) & 0x0F) << 6   # instr[10:7] -> nzuimm[9:6]
+                | ((c16 >> 11) & 0x03) << 4  # instr[12:11] -> nzuimm[5:4]
+                | ((c16 >> 5) & 1) << 3      # instr[5] -> nzuimm[3]
+                | ((c16 >> 6) & 1) << 2      # instr[6] -> nzuimm[2]
             )
             if uimm == 0:
                 return f"c.?    0x{c16:04x}  # C.ADDI4SPN nzuimm=0 (reserved)"
@@ -435,7 +435,7 @@ def _dis_compressed(
         imm6_se = (imm6 & 0x20) and (imm6 | ~0x3F) or imm6  # sext 6-bit
 
         if funct3 == 0b000:  # C.NOP / C.ADDI
-            if imm6 == 0 and ((c16 >> 7) & 0x1F) == 0:  # rd=x0, imm=0 → C.NOP
+            if imm6 == 0 and ((c16 >> 7) & 0x1F) == 0:  # rd=x0, imm=0 -> C.NOP
                 return "c.nop"
             return f"c.addi  {rd_name}, {imm6_se}"
 
@@ -474,7 +474,7 @@ def _dis_compressed(
 
         if funct3 == 0b100:  # misc ALU: SRLI / SRAI / ANDI / SUB/XOR/OR/AND
             rd_p = _c_x8(c16 >> 7)
-            shamt5 = ((c16 >> 12) & 1) << 5  # bit 12 → shamt[5] for RV64C
+            shamt5 = ((c16 >> 12) & 1) << 5  # bit 12 -> shamt[5] for RV64C
             uimm = ((c16 >> 2) & 0x1F) | shamt5
             imm6_se_alt = ((c16 >> 12) & 1) << 5 | ((c16 >> 2) & 0x1F)
             imm6_se_alt = (imm6_se_alt & 0x20) and (imm6_se_alt | ~0x3F) or imm6_se_alt

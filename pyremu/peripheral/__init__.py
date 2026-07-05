@@ -20,5 +20,6 @@ from pyremu.peripheral.gpio import GPIO
 from pyremu.peripheral.i2c import I2C
 from pyremu.peripheral.spi import SPI
 from pyremu.peripheral.uart import UART
+from pyremu.peripheral.virtio_blk import VirtIOBlock
 
-__all__ = ["UART", "SPI", "I2C", "GPIO"]
+__all__ = ["UART", "SPI", "I2C", "GPIO", "VirtIOBlock"]

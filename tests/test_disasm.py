@@ -223,9 +223,9 @@ class TestBranch:
         assert "beq" in result and "0x80000010" in result
 
     def test_bne_backward(self):
-        # offset = -8: sign-extend to 13-bit → 0x1FF8
+        # offset = -8: sign-extend to 13-bit -> 0x1FF8
         # B-type encoding: imm[12]=1, imm[10:5]=0x3F(all1s), imm[4:1]=0xC(12), imm[11]=1
-        # offset=-8 → imm12=1, imm10_5=0x3F, imm4_1=0xC, imm11=1
+        # offset=-8 -> imm12=1, imm10_5=0x3F, imm4_1=0xC, imm11=1
         instr = _b_type(1, 0x3F, 0, 1, 1, 0xC, 1, BR)
         result = disasm(instr, 0x80000010)
         assert "bne" in result and "0x80000008" in result
@@ -344,88 +344,88 @@ class TestCompressed:
     """覆盖 RV64C 常用压缩指令, 编码来自 nonsense.o / RISC-V 规范."""
 
     def test_c_nop(self):
-        """0x0001 → c.nop."""
+        """0x0001 -> c.nop."""
         assert "c.nop" in disasm(0x0001, 0x5EC)
 
     def test_c_ebreak(self):
-        """0x9002 → c.ebreak."""
+        """0x9002 -> c.ebreak."""
         assert "c.ebreak" in disasm(0x9002, 0x5E0)
 
     def test_c_mv_a5_a0(self):
-        """nonsense.o @5c4: 87aa → c.mv a5, a0."""
+        """nonsense.o @5c4: 87aa -> c.mv a5, a0."""
         result = disasm(0x87AA, 0x5C4)
         assert result.startswith("c.mv")
         assert "x15" in result and "x10" in result
 
     def test_c_mv_a6_sp(self):
-        """nonsense.o @5da: 880a → c.mv a6, sp."""
+        """nonsense.o @5da: 880a -> c.mv a6, sp."""
         result = disasm(0x880A, 0x5DA)
         assert result.startswith("c.mv")
         assert "x16" in result and "x2" in result
 
     def test_c_jr_ra(self):
-        """0x8082 → c.jr ra (ret)."""
+        """0x8082 -> c.jr ra (ret)."""
         result = disasm(0x8082, 0x5EA)
         assert result.startswith("c.jr")
         assert "x1" in result
 
     def test_c_jr_a5(self):
-        """nonsense.o @60c: 8782 → c.jr a5."""
+        """nonsense.o @60c: 8782 -> c.jr a5."""
         result = disasm(0x8782, 0x60C)
         assert result.startswith("c.jr")
         assert "x15" in result
 
     def test_c_li_d3_0(self):
-        """nonsense.o @5d6: 4681 → c.li a3, 0."""
+        """nonsense.o @5d6: 4681 -> c.li a3, 0."""
         result = disasm(0x4681, 0x5D6)
         assert result.startswith("c.li")
 
     def test_c_li_a4_0(self):
-        """nonsense.o @5d8: 4701 → c.li a4, 0."""
+        """nonsense.o @5d8: 4701 -> c.li a4, 0."""
         result = disasm(0x4701, 0x5D8)
         assert result.startswith("c.li")
 
     def test_c_add_a1_a5(self):
-        """nonsense.o @628: 95be → c.add a1, a5."""
+        """nonsense.o @628: 95be -> c.add a1, a5."""
         result = disasm(0x95BE, 0x628)
         assert result.startswith("c.add")
         assert "x11" in result and "x15" in result
 
     def test_c_sub_a1_a0(self):
-        """nonsense.o @620: 8d89 → c.sub a1, a0."""
+        """nonsense.o @620: 8d89 -> c.sub a1, a0."""
         result = disasm(0x8D89, 0x620)
         assert result.startswith("c.sub")
         assert "x11" in result and "x10" in result
 
     def test_c_beqz_a5(self):
-        """nonsense.o @60a: c391 → c.beqz a5, 0x60e."""
+        """nonsense.o @60a: c391 -> c.beqz a5, 0x60e."""
         result = disasm(0xC391, 0x60A)
         assert result.startswith("c.beqz")
 
     def test_c_srai_a1_1(self):
-        """nonsense.o @62a: 8585 → c.srai a1, 0x1."""
+        """nonsense.o @62a: 8585 -> c.srai a1, 0x1."""
         result = disasm(0x8585, 0x62A)
         assert result.startswith("c.srai")
 
     def test_c_srli_a1_3f(self):
-        """nonsense.o @626: 91fd → c.srli a1, 0x3f."""
+        """nonsense.o @626: 91fd -> c.srli a1, 0x3f."""
         result = disasm(0x91FD, 0x626)
         assert result.startswith("c.srli")
 
     def test_c_ldsp_a1_sp_0(self):
-        """nonsense.o @5ce: 6582 → c.ldsp a1, 0(sp)."""
+        """nonsense.o @5ce: 6582 -> c.ldsp a1, 0(sp)."""
         result = disasm(0x6582, 0x5CE)
         assert result.startswith("c.ldsp")
         assert "x11" in result
 
     def test_c_addi_a2_sp_8(self):
-        """0x0030 → c.addi a2, 8 (rd=x12)."""
+        """0x0030 -> c.addi a2, 8 (rd=x12)."""
         result = disasm(0x0030, 0x5D0)
         assert result.startswith("c.addi")
 
     def test_4byte_read_contains_compressed(self):
         """模拟 Emulator 取指: 一次读 4 字节, 低两位 ≠ 11 的按 16-bit 解码."""
-        # nonsense.o @5c4: bytes = aa 87 17 25 → instr = 0x251787aa
+        # nonsense.o @5c4: bytes = aa 87 17 25 -> instr = 0x251787aa
         result = disasm(0x251787AA, 0x5C4)
         assert result.startswith("c.mv")
         assert "x15" in result and "x10" in result
@@ -434,7 +434,7 @@ class TestCompressed:
         """C.ADDI16SP sp += 112 — 编码 nzimm[9:4]=7 (0b000111)."""
         # bit12=0, bits[4:3]=00, bit5=1, bit2=1, bit6=1
         # [15:13]=011, [12]=0, [11:7]=00010, [6]=1, [5]=1, [4]=0, [3]=0, [2]=1, [1:0]=01
-        # → 0x6165
+        # -> 0x6165
         result = disasm(0x6165, 0x8001_981E)
         assert result.startswith("c.addi16sp")
         assert "112" in result or "sp" in result
@@ -443,7 +443,7 @@ class TestCompressed:
         """C.ADDI16SP sp -= 112 — 编码 nzimm[9:4]=-7 (0b111001)."""
         # bit12=1, bits[4:3]=11, bit5=0, bit2=0, bit6=1
         # [15:13]=011, [12]=1, [11:7]=00010, [6]=1, [5]=0, [4]=1, [3]=1, [2]=0, [1:0]=01
-        # → 0x7159
+        # -> 0x7159
         result = disasm(0x7159, 0x8001_981E)
         assert result.startswith("c.addi16sp")
         assert "-" in result
@@ -451,7 +451,7 @@ class TestCompressed:
     def test_c_jalr(self):
         """C.JALR x11 — funct3=100, bit12=1, rs1=x11, rs2=0."""
         # [15:13]=100, [12]=1, [11:7]=01011, [6:2]=00000, [1:0]=10
-        # → 0x9582
+        # -> 0x9582
         result = disasm(0x9582, 0x8001_9902)
         assert result.startswith("c.jalr")
         assert "x11" in result
@@ -459,7 +459,7 @@ class TestCompressed:
     def test_c_jalr_ra(self):
         """C.JALR ra — funct3=100, bit12=1, rs1=x1, rs2=0."""
         # [15:13]=100, [12]=1, [11:7]=00001, [6:2]=00000, [1:0]=10
-        # → 0x9082
+        # -> 0x9082
         result = disasm(0x9082, 0x8001_9902)
         assert result.startswith("c.jalr")
         assert "x1" in result
@@ -489,7 +489,7 @@ class TestCompressedLargeOffset:
     # -- C0 quadrant: C.SD / C.LD (uimm[7:6] ≠ 0 时才与 C.SW/C.LW 有差异) --
 
     def test_c_sd_large_offset_144(self):
-        """C.SD x14, 144(x12): uimm[7:6]=2, uimm[5:3]=2 → offset=144."""
+        """C.SD x14, 144(x12): uimm[7:6]=2, uimm[5:3]=2 -> offset=144."""
         instr = (0b111 << 13) | (2 << 10) | (4 << 7) | (2 << 5) | (6 << 2)
         result = disasm(instr, 0x80001000)
         assert result.startswith("c.sd"), f"期望 C.SD, 得到: {result}"
@@ -497,7 +497,7 @@ class TestCompressedLargeOffset:
         assert "x14" in result and "x12" in result, f"期望 x14,x12, 得到: {result}"
 
     def test_c_ld_large_offset_144(self):
-        """C.LD x14, 144(x12): uimm[7:6]=2, uimm[5:3]=2 → offset=144."""
+        """C.LD x14, 144(x12): uimm[7:6]=2, uimm[5:3]=2 -> offset=144."""
         instr = (0b011 << 13) | (2 << 10) | (4 << 7) | (2 << 5) | (6 << 2)
         result = disasm(instr, 0x80001000)
         assert result.startswith("c.ld"), f"期望 C.LD, 得到: {result}"
@@ -565,10 +565,10 @@ class TestCompressedLargeOffset:
         # 相同 raw 位但 funct3 改为 C.SDSP(111): bits[12:10]=101, bits[9:7]=000
         # 这会得到 offset = 0<<6 | 5<<3 = 40 — 巧合!
         # 用另一个能体现差异的 offset:
-        # C.SDSP 偏移 72: bits[12:10]=001, bits[9:7]=011 → offset = 3<<6|1<<3 = 192+8=200... hmm
+        # C.SDSP 偏移 72: bits[12:10]=001, bits[9:7]=011 -> offset = 3<<6|1<<3 = 192+8=200... hmm
         # Let me think of a better example.
-        # C.SWSP offset 60: bits[12:9]=1111, bits[8:7]=00 → offset = 0<<6|15<<2 = 60
-        # Same raw bits as C.SDSP: bits[12:10]=111, bits[9:7]=100 → offset = 4<<6|7<<3 = 256+56 = 312
+        # C.SWSP offset 60: bits[12:9]=1111, bits[8:7]=00 -> offset = 0<<6|15<<2 = 60
+        # Same raw bits as C.SDSP: bits[12:10]=111, bits[9:7]=100 -> offset = 4<<6|7<<3 = 256+56 = 312
         instr_swsp_60 = (0b110 << 13) | (15 << 9) | (5 << 2) | 0b10
         instr_sdsp_same = (0b111 << 13) | (7 << 10) | (4 << 7) | (5 << 2) | 0b10
         result_60 = disasm(instr_swsp_60, 0)
@@ -581,7 +581,7 @@ class TestCompressedLargeOffset:
     # -- C0 quadrant: C.ADDI4SPN --
 
     def test_c_addi4spn_basic(self):
-        """C.ADDI4SPN a0, sp, 16 → 基本编码."""
+        """C.ADDI4SPN a0, sp, 16 -> 基本编码."""
         # nzuimm=16: nz96=0000, nz54=01, nz3=0, nz2=0
         # instr[6]=nz2=0, instr[5]=nz3=0
         instr = (0b000 << 13) | (0b01 << 11) | (0 << 7) | (0 << 6) | (0 << 5) | (2 << 2)
@@ -590,7 +590,7 @@ class TestCompressedLargeOffset:
         assert "16" in result, f"期望偏移 16, 得到: {result}"
 
     def test_c_addi4spn_nz3_neq_nz2(self):
-        """C.ADDI4SPN a1, sp, 20 → nzuimm[3:2]=01, 验证 instr[5]/instr[6] 未交换."""
+        """C.ADDI4SPN a1, sp, 20 -> nzuimm[3:2]=01, 验证 instr[5]/instr[6] 未交换."""
         # nzuimm=20=0b10100: nz96=0, nz54=01, nz3=0, nz2=1
         # instr[6]=nz2=1, instr[5]=nz3=0
         instr = (0b000 << 13) | (0b01 << 11) | (0 << 7) | (1 << 6) | (0 << 5) | (3 << 2)
@@ -599,7 +599,7 @@ class TestCompressedLargeOffset:
         assert "20" in result, f"期望偏移 20, 得到: {result}"
 
     def test_c_addi4spn_nz2_neq_nz3(self):
-        """C.ADDI4SPN a2, sp, 24 → nzuimm[3:2]=10, 验证 instr[5]/instr[6] 未交换."""
+        """C.ADDI4SPN a2, sp, 24 -> nzuimm[3:2]=10, 验证 instr[5]/instr[6] 未交换."""
         # nzuimm=24=0b11000: nz96=0, nz54=01, nz3=1, nz2=0
         # instr[6]=nz2=0, instr[5]=nz3=1
         instr = (0b000 << 13) | (0b01 << 11) | (0 << 7) | (0 << 6) | (1 << 5) | (4 << 2)
@@ -608,7 +608,7 @@ class TestCompressedLargeOffset:
         assert "24" in result, f"期望偏移 24, 得到: {result}"
 
     def test_c_addi4spn_large_imm(self):
-        """C.ADDI4SPN a5, sp, 716 → 较大立即数, 覆盖全部位域."""
+        """C.ADDI4SPN a5, sp, 716 -> 较大立即数, 覆盖全部位域."""
         # nzuimm=716=0x2CC=0b1011001100: nz96=1011, nz54=00, nz3=1, nz2=1
         # instr[6]=nz2=1, instr[5]=nz3=1
         instr = (0b000 << 13) | (0b00 << 11) | (0b1011 << 7) | (1 << 6) | (1 << 5) | (6 << 2)

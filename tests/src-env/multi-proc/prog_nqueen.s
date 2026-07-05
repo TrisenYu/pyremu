@@ -17,7 +17,7 @@ u_nqueen_entry:
     li   s4, 1                 // s4 = n
 
 1:
-    // nqueen_solve(n) → a0 = solutions
+    // nqueen_solve(n) -> a0 = solutions
     mv   a0, s4
     call nqueen_solve
     mv   s5, a0                // s5 = solutions
@@ -49,7 +49,7 @@ u_nqueen_entry:
 
 
 // ============================================================
-//  nqueen_solve(n) → solutions
+//  nqueen_solve(n) -> solutions
 // ============================================================
 nqueen_solve:
     addi sp, sp, -16
@@ -118,7 +118,7 @@ dfs_try_cols:
     li   s4, 0                 // col_idx (callee-saved)
 
 1:
-    bge  s4, s5, dfs_ret       // col_idx >= n → 返回
+    bge  s4, s5, dfs_ret       // col_idx >= n -> 返回
 
     li   t1, 1
     sll  t1, t1, s4            // bit = 1 << col_idx

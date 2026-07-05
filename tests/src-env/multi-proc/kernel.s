@@ -4,11 +4,11 @@
 // M+S 模式内核: 进程调度 + trap 处理 + UART 驱动.
 //
 // 特性:
-//   - Round-robin 调度 (CLINT MTI → S 模式 STI)
+//   - Round-robin 调度 (CLINT MTI -> S 模式 STI)
 //   - 最多 MAX_PROCS 个 U 模式进程
 //   - 每进程独立栈 + 保护页 (Sv39)
 //   - ECALL 系统调用分发 (report/exit/uart_putc/uart_puts/uart_getc/report_nq)
-//   - 页错误 → 终止进程, 调度下一个
+//   - 页错误 -> 终止进程, 调度下一个
 //
 // 链接: 与 prog_fib.o + prog_nqueen.o 共同链接.
 // 符号: process_table, num_processes, current_pid 供 Python Loader 访问.
@@ -94,10 +94,10 @@ _start:
     la   t0, m_trap_handler
     csrw mtvec, t0
 
-    // 委派异常: ECALL + page faults → S
+    // 委派异常: ECALL + page faults -> S
     li   t0, 0xB100           // bits 8,12,13,15
     csrw medeleg, t0
-    // 委派中断: MTI → S
+    // 委派中断: MTI -> S
     li   t0, (1 << 7)
     csrw mideleg, t0
     // 使能 MTIE
@@ -111,7 +111,7 @@ _start:
     or   t0, t0, t1
     csrw mstatus, t0
 
-    // → S 模式入口
+    // -> S 模式入口
     la   t0, s_mode_boot
     csrw mepc, t0
     mret
@@ -161,7 +161,7 @@ s_mode_boot:
     la   a0, str_boot
     call uart_puts
 
-    // 首次调度 → U 模式
+    // 首次调度 -> U 模式
     call schedule_next
     // schedule_next 已设置 sepc 和 sscratch (进程的 U sp)
     csrrw sp, sscratch, sp     // sp = U 栈, sscratch = S 栈 (schedule_next 的栈帧)
@@ -254,7 +254,7 @@ restore_gprs_from_frame:
 
 
 // ============================================================
-//  copy_gprs_to_pcb — 帧 GPR 区域 → PCB[current_pid]
+//  copy_gprs_to_pcb — 帧 GPR 区域 -> PCB[current_pid]
 //    输入: t2 = PCB 基址  (调用前已计算)
 //    使用 fp 寻址帧 (fp 在 trap 入口设定后不变)
 // ============================================================
@@ -269,7 +269,7 @@ copy_gprs_to_pcb:
 
 
 // ============================================================
-//  copy_gprs_from_pcb — PCB[pid] → 帧 GPR 区域
+//  copy_gprs_from_pcb — PCB[pid] -> 帧 GPR 区域
 //    输入: t3 = PCB 基址
 // ============================================================
 copy_gprs_from_pcb:
@@ -302,7 +302,7 @@ setup_sv39:
     //   RISC-V 标准连续编码: PTE = 0x20000001 | (((base + k) & 0x3FF) << 10)
     //   注: 当前布局下 PPN[1]=0, PPN[2]=1, 故可简化为上述公式.
 
-    // L1[2] → L2_hi (PPN = base + 1)
+    // L1[2] -> L2_hi (PPN = base + 1)
     addi t0, s1, 1
     andi t0, t0, 0x3FF
     slli t0, t0, 10
@@ -310,7 +310,7 @@ setup_sv39:
     or   t0, t0, t1
     sd   t0, 16(s0)
 
-    // L1[0] → L2_lo (PPN = base + 2)
+    // L1[0] -> L2_lo (PPN = base + 2)
     addi t0, s1, 2
     andi t0, t0, 0x3FF
     slli t0, t0, 10
@@ -318,7 +318,7 @@ setup_sv39:
     or   t0, t0, t1
     sd   t0, 0(s0)
 
-    // L2_hi[0] → L3_main (PPN = base + 3)
+    // L2_hi[0] -> L3_main (PPN = base + 3)
     li   t2, 0x1000
     add  t2, s0, t2             // t2 = &L2_hi[0] (写目标)
     addi t0, s1, 3
@@ -328,7 +328,7 @@ setup_sv39:
     or   t0, t0, t1
     sd   t0, 0(t2)
 
-    // L2_lo[128] → L3_uart (PPN = base + 4)
+    // L2_lo[128] -> L3_uart (PPN = base + 4)
     li   t2, 0x2000
     add  t2, s0, t2             // t2 = &L2_lo
     addi t0, s1, 4
@@ -338,7 +338,7 @@ setup_sv39:
     or   t0, t0, t1
     sd   t0, 1024(t2)
 
-    // L2_lo[16] → L3_clint (PPN = base + 5)
+    // L2_lo[16] -> L3_clint (PPN = base + 5)
     addi t0, s1, 5
     andi t0, t0, 0x3FF
     slli t0, t0, 10
@@ -362,7 +362,7 @@ setup_sv39:
     // 每进程 U 栈: pid 0..MAX_PROCS-1 各 1 页 (保护页在下方, 不映射)
     //   栈地址 = STACK_BASE_U + pid * 0x2000
     //   L3_main 索引 = (STACK_BASE_U >> 12) + pid * 2
-    //   STACK_BASE_U = 0x80100000 → VPN[0] = 0x100
+    //   STACK_BASE_U = 0x80100000 -> VPN[0] = 0x100
     li   t0, 0x3000
     add  s1, s0, t0            // s1 = L3_main
     li   t3, MAX_PROCS         // 循环计数
@@ -370,7 +370,7 @@ setup_sv39:
     // 栈 PTE 基: PPN = STACK_BASE_U >> 12 = 0x80100, 每进程 +2
     li   t0, 0x0000000020040017  // PPN=0x80100, R+W+U
     li   t4, 0x100             // 第一个 L3 索引 (VA 0x80100000 的 VPN[0])
-    slli t4, t4, 3             // 索引 → 字节偏移 (×8)
+    slli t4, t4, 3             // 索引 -> 字节偏移 (×8)
     add  s1, s1, t4            // s1 = &L3_main[0x100]
 
 2:
@@ -450,7 +450,7 @@ schedule_next:
     // -- 保存当前进程 --
     la   t0, current_pid
     lw   t1, 0(t0)
-    bltz t1, sched_find_next   // current_pid < 0 → 首次调度
+    bltz t1, sched_find_next   // current_pid < 0 -> 首次调度
 
     // PCB 地址 = process_table + current_pid * PCB_SIZE
     la   t2, process_table
@@ -510,7 +510,7 @@ sched_no_wrap:
     li   t0, MAX_PROCS
     blt  t5, t0, sched_scan    // 未扫满一轮, 继续
 
-    // 无 READY 进程 → idle
+    // 无 READY 进程 -> idle
     // (s_mode_idle 在文件末尾定义)
     j    s_mode_idle_label
 
@@ -525,7 +525,7 @@ sched_found:
 
     // 恢复 sepc ← PCB[t2].saved_sepc (若首次则为 entry_pc)
     ld   t5, PCB_SEPC_OFF(t3)
-    beqz t5, 1f                // sepc==0 → 首次, 用 entry_pc
+    beqz t5, 1f                // sepc==0 -> 首次, 用 entry_pc
     csrw sepc, t5
     j    2f
 1:
@@ -533,10 +533,10 @@ sched_found:
     csrw sepc, t5
 2:
 
-    // 恢复 U sp → sscratch (s_trap_done 会交换回 sp)
+    // 恢复 U sp -> sscratch (s_trap_done 会交换回 sp)
     ld   t5, PCB_SP_OFF(t3)
-    bnez t5, 3f                // sp 有值 → 恢复
-    ld   t5, PCB_STACK_OFF(t3) // 首次 → 用 stack_top
+    bnez t5, 3f                // sp 有值 -> 恢复
+    ld   t5, PCB_STACK_OFF(t3) // 首次 -> 用 stack_top
 3:
     // 写入 sscratch, 供 s_trap_done 的 csrrw 交换
     csrw sscratch, t5
@@ -556,7 +556,7 @@ sched_found:
 terminate_current:
     la   t0, current_pid
     lw   t1, 0(t0)
-    bltz t1, sched_find_next   // 无当前进程 → 直接调度
+    bltz t1, sched_find_next   // 无当前进程 -> 直接调度
 
     la   t2, process_table
     li   t3, PCB_SIZE
@@ -580,7 +580,7 @@ terminate_current:
     sw   t3, 0(t0)
 
     // 设置 ra = s_trap_done: schedule_next 的 ret 将直接跳转到
-    // s_trap_done (恢复 trap 帧 → sret 到新进程),
+    // s_trap_done (恢复 trap 帧 -> sret 到新进程),
     // 而非 sys_exit (会落入 s_trap_fault)
     la   ra, s_trap_done
     j    schedule_next
@@ -606,7 +606,7 @@ s_trap_handler:
     // 保存全部用户 GPR 到帧
     call save_gprs_to_frame
 
-    // 帧 GPR → PCB (若有当前进程)
+    // 帧 GPR -> PCB (若有当前进程)
     la   t2, current_pid
     lw   t1, 0(t2)
     bltz t1, 1f
@@ -619,7 +619,7 @@ s_trap_handler:
 
     csrr t0, scause
 
-    // 中断? (bit 63 置位 → 负数)
+    // 中断? (bit 63 置位 -> 负数)
     bltz t0, s_trap_interrupt
 
     // ---- 异常 ----
@@ -642,7 +642,7 @@ s_trap_handler:
     li   t1, 5                  // report nqueen
     beq  a7, t1, sys_report_nq
 
-    // 未知 syscall → exit(255)
+    // 未知 syscall -> exit(255)
     li   a0, 255
     j    sys_exit
 
@@ -731,7 +731,7 @@ s_trap_interrupt:
     // 保存当前进程的 sepc/sp
     la   t0, current_pid
     lw   t1, 0(t0)
-    bltz t1, 2f               // 无当前进程 → 直接调度
+    bltz t1, 2f               // 无当前进程 -> 直接调度
 
     la   t2, process_table
     li   t3, PCB_SIZE
@@ -753,7 +753,7 @@ s_trap_interrupt:
     // schedule_next 会跳转到 s_trap_done 或直接到新进程
 
 s_trap_done:
-    // PCB GPR → 帧 (恢复当前进程的寄存器)
+    // PCB GPR -> 帧 (恢复当前进程的寄存器)
     la   t0, current_pid
     lw   t1, 0(t0)
     bltz t1, 1f

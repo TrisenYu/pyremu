@@ -55,7 +55,7 @@ def seize_val_err(
 
     适用于因用户输入无效整数而触发 ValueError 的命令方法 (如调试器 REPL).
     若被装饰函数的第一个参数 (self) 具有 _err 方法 (如 Debugger),
-    则通过 _err → Rich Console 输出; 否则降级为 print.
+    则通过 _err -> Rich Console 输出; 否则降级为 print.
 
     Args:
         err_msg: 固定的错误描述字符串, ValueError 发生时输出.

@@ -3,7 +3,7 @@
 # SPDX-LICENSE-IDENTIFIER: GPL2.0
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""内存访问辅助函数 — VA→PA 翻译, CSR 权限校验, PMP/PMA 检查.
+"""内存访问辅助函数 — VA->PA 翻译, CSR 权限校验, PMP/PMA 检查.
 
 原 MemoryAccessor mixin 已拆分为本模块中的独立函数,
 所有函数将 hart 作为显式第一参数, 消除 mixin 的隐式依赖和静态分析告警.
@@ -19,6 +19,7 @@ from pyremu.core.registers import CsrAccessError, check_csr_access
 from pyremu.core.trap import TrapType
 from pyremu.core.trap_handler import deliver_trap
 from pyremu.memory.mmu import PAGE_SIZE, SATP_MODE_BARE, translate_va
+from pyremu.memory.pmp import PmpAccessInfo
 
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
@@ -78,9 +79,9 @@ def validate_csr(
     """验证 CSR 访问的合法性 (PMP 范围 + 特权级 + 读写权限).
 
     检查顺序:
-    1. PMP CSR 地址范围 (越界 → CsrAccessError → IllInstr)
-    2. 特权级权限 (低特权访问高特权 CSR → CsrAccessError → IllInstr)
-    3. 只读检查 (写入只读 CSR → CsrAccessError → IllInstr)
+    1. PMP CSR 地址范围 (越界 -> CsrAccessError -> IllInstr)
+    2. 特权级权限 (低特权访问高特权 CSR -> CsrAccessError -> IllInstr)
+    3. 只读检查 (写入只读 CSR -> CsrAccessError -> IllInstr)
 
     由 handle_sys 的各 CSR 指令 handler 在访问前调用.
     """
@@ -93,7 +94,7 @@ def validate_csr(
 
 
 # ============================================================
-#  地址翻译 (VA → PA, 经 TLB 缓存)
+#  地址翻译 (VA -> PA, 经 TLB 缓存)
 # ============================================================
 
 
@@ -172,7 +173,7 @@ def mem_read(
 ) -> bytes:
     """从虚拟地址 *addr* 读取 *size* 字节.
 
-    经过路径: 对齐检查 → VA→PA (TLB/页表) → PMP → PMA → 物理内存后端.
+    经过路径: 对齐检查 -> VA->PA (TLB/页表) -> PMP -> PMA -> 物理内存后端.
 
     可能触发的陷态:
     - LdAddrMisaligned: 地址未对齐
@@ -197,7 +198,10 @@ def mem_read(
 
     # PMP 检查 — 物理内存保护 (对 M 模式且 MPRV=0 自动放行)
     pmp: Pmp = hart._pmp
-    if not pmp.check(pa, size, hart.mode.value, hart.mstatus_val, is_write=False):
+    if not pmp.check(PmpAccessInfo(
+        pa=pa, size=size, mode_val=hart.mode.value, mstatus_val=hart.mstatus_val,
+        is_write=False, pmpsplit=hart.pmpsplit_val, mdid=hart.mdid_val,
+    )):
         deliver_trap(hart, TrapType.LdAccessFault, tval=addr, is_interrupt=False)
         return b"\x00" * size
 
@@ -217,7 +221,7 @@ def mem_write(
 ) -> None:
     """向虚拟地址 *addr* 写入 *data*.
 
-    经过路径: 对齐检查 → VA→PA (TLB/页表) → PMP → PMA → 物理内存后端.
+    经过路径: 对齐检查 -> VA->PA (TLB/页表) -> PMP -> PMA -> 物理内存后端.
 
     可能触发的陷态:
     - StAddrMisaligned: 地址未对齐
@@ -244,7 +248,10 @@ def mem_write(
 
     # PMP 检查
     pmp: Pmp = hart._pmp
-    if not pmp.check(pa, size, hart.mode.value, hart.mstatus_val, is_write=True):
+    if not pmp.check(PmpAccessInfo(
+        pa=pa, size=size, mode_val=hart.mode.value, mstatus_val=hart.mstatus_val,
+        is_write=True, pmpsplit=hart.pmpsplit_val, mdid=hart.mdid_val,
+    )):
         deliver_trap(hart, TrapType.StAccessFault, tval=addr, is_interrupt=False)
         return
 
@@ -258,7 +265,7 @@ def mem_write(
 
 
 # ============================================================
-#  取指校验 (VA → PA via itlb → PMP execute check)
+#  取指校验 (VA -> PA via itlb -> PMP execute check)
 # ============================================================
 
 
@@ -268,7 +275,7 @@ def check_instruction_fetch(
 ) -> tuple[bool, int]:
     """校验从虚拟地址 *va* 取指的合法性, 返回 (ok, pa).
 
-    路径: VA → PA (itlb 或页表遍历) → PMP (is_execute=True).
+    路径: VA -> PA (itlb 或页表遍历) -> PMP (is_execute=True).
 
     可能触发的陷态:
     - InstrPageFault: 页表翻译失败 (非 Bare 模式)
@@ -289,7 +296,7 @@ def check_instruction_fetch(
             offset = va & (PAGE_SIZE - 1)
             pa = (ppn << 12 | offset) & 0xFFFF_FFFF_FFFF_FFFF
         else:
-            # itlb miss → 页表遍历
+            # itlb miss -> 页表遍历
             if hart._mem_read_phy is None:
                 deliver_trap(
                     hart, TrapType.InstrPageFault, tval=va, is_interrupt=False
@@ -316,9 +323,10 @@ def check_instruction_fetch(
 
     # PMP 检查 — 所有模式均需通过, is_execute=True
     pmp: Pmp = hart._pmp
-    if not pmp.check(
-        pa, 4, hart.mode.value, hart.mstatus_val, is_execute=True
-    ):
+    if not pmp.check(PmpAccessInfo(
+        pa=pa, size=4, mode_val=hart.mode.value, mstatus_val=hart.mstatus_val,
+        is_execute=True, pmpsplit=hart.pmpsplit_val, mdid=hart.mdid_val,
+    )):
         deliver_trap(
             hart, TrapType.InstrAccessFault, tval=va, is_interrupt=False
         )

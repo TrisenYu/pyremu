@@ -32,7 +32,7 @@ fn check_elf_format(
     false
 }
 
-/// Elf64_Word → PTE flags —— 对应 set_pte_flag_via_elf64word。
+/// Elf64_Word -> PTE flags —— 对应 set_pte_flag_via_elf64word。
 fn set_pte_flag_via_elf64word(word: u32) -> u8 {
     let mut ret = PTE_V | PTE_U;
     if PF_R & word != 0 {
@@ -65,14 +65,14 @@ unsafe fn map_one_segment(elf_paddr: u64, prog_header: elf::segment::ProgramHead
     };
     paging::map_page_in_range(&cfg, (ed_va - cfg.vbase) >> PAGE_SHIFT);
 
-    // filesz >= memsz → 无 BSS
+    // filesz >= memsz -> 无 BSS
     if prog_header.p_filesz >= prog_header.p_memsz {
         return;
     }
 
     let diff = memory::page_up(prog_header.p_memsz) - memory::page_up(prog_header.p_filesz);
 
-    // 小段：从 U-mode 页池分配 → memset → return
+    // 小段：从 U-mode 页池分配 -> memset -> return
     if diff < CHUNK_2M_SIZE {
         let n = diff >> PAGE_SHIFT;
         cfg.vbase = ed_va;

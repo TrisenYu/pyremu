@@ -7,12 +7,12 @@
 
 
 def fmt_addr(addr: int) -> str:
-    """64 位地址 → 0x 前缀固定 16 位 hex 字符串."""
+    """64 位地址 -> 0x 前缀固定 16 位 hex 字符串."""
     return f"0x{addr:016x}"
 
 
 def fmt_hexdump(data: bytes, addr: int = 0, *, columns: int = 16) -> str:
-    """字节序列 → 经典 hexdump 文本 (地址 | hex | ASCII).
+    """字节序列 -> 经典 hexdump 文本 (地址 | hex | ASCII).
 
     Args:
         data: 原始字节.

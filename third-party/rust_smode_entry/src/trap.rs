@@ -228,7 +228,7 @@ pub unsafe extern "C" fn trap_dispatch(gprs: &mut TrapGprs, sepc: u64, scause: u
         return;
     }
 
-    // 页错误：额外输出 VA → PA 诊断信息
+    // 页错误：额外输出 VA -> PA 诊断信息
     if scause == 0xc || scause == 0xd || scause == 0xf {
         if let Some(pa) = paging::get_pa(stval) {
             println!("page_fault: va=0x{stval:x} pa=0x{pa:x}\n");

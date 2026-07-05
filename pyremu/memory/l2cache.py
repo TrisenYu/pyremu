@@ -65,9 +65,9 @@ class L2Cache(CacheBase):
         ram_write_fn=None,  # 回调: write(addr, data) -> None
     ) -> None:
         self._line_size = line_size
-        self._ways = ways
-        self._num_sets = size // (line_size * ways)
-        self._line_shift = (line_size - 1).bit_length()  # 64 → 6 bits
+        self._ways = max(1, ways)
+        self._num_sets = max(1, size // (line_size * self._ways))
+        self._line_shift = (line_size - 1).bit_length()  # 64 -> 6 bits
 
         # RAM 后端回调 (用于未命中加载和回写)
         self._ram_read = ram_read_fn
@@ -81,7 +81,9 @@ class L2Cache(CacheBase):
 
         # 初始化: 每路一条空行, 按组预分区避免热路径上 list slice 分配
         # _entries 存储 L2CacheLine, 覆盖父类的 CacheLineBase 类型 (静态检查忽略)
-        self._entries: list[L2CacheLine] = [self._make_line() for _ in range(self._num_sets * ways)]  # type: ignore[assignment]
+        self._entries: list[L2CacheLine] = [
+            self._make_line() for _ in range(self._num_sets * ways)
+        ]
         self._sets: list[list[L2CacheLine]] = [
             self._entries[i * ways : (i + 1) * ways] for i in range(self._num_sets)
         ]
@@ -113,7 +115,7 @@ class L2Cache(CacheBase):
         """M 状态脏行逐出时回写 RAM."""
         l2e: L2CacheLine = entry  # type: ignore
         if l2e.mesi == MESIState.MODIFIED and self._ram_write:
-            # 计算物理地址: tag << line_shift → 对齐到缓存行
+            # 计算物理地址: tag << line_shift -> 对齐到缓存行
             pa = l2e.tag << self._line_shift
             self._ram_write(pa, bytes(l2e.data))
 
@@ -219,7 +221,7 @@ class L2Cache(CacheBase):
         tag: int,
         offset: int,
     ) -> bytes:
-        """未命中时: 选择 victim → 逐出 → 从 RAM 加载整行 → 返回数据."""
+        """未命中时: 选择 victim -> 逐出 -> 从 RAM 加载整行 -> 返回数据."""
         # 选择 victim (同组内的 LRU)
         # 全部有效但不应发生; 回退到第一个
 
@@ -332,10 +334,10 @@ class L2Cache(CacheBase):
         victim = way_entries[victim_idx]
 
         # 逐出旧行
-        if victim.valid and victim.mesi == MESIState.MODIFIED:
-            if self._ram_write:
-                pa = victim.tag << self._line_shift
-                self._ram_write(pa, bytes(victim.data))
+        if victim.valid and victim.mesi == MESIState.MODIFIED and \
+        self._ram_write:
+            pa = victim.tag << self._line_shift
+            self._ram_write(pa, bytes(victim.data))
 
         # 从 RAM 加载整行 (或清零)
         line_addr = (addr >> self._line_shift) << self._line_shift
@@ -356,7 +358,7 @@ class L2Cache(CacheBase):
         victim.mesi = MESIState.MODIFIED
 
     def _pick_victim_in_set(self, way_entries: list[L2CacheLine]) -> int:
-        """在一组内选择要逐出的路 (优先无效 → LRU)."""
+        """在一组内选择要逐出的路 (优先无效 -> LRU)."""
         # 优先选无效的
         for i, e in enumerate(way_entries):
             if not e.valid:
@@ -398,6 +400,49 @@ class L2Cache(CacheBase):
             e.valid = False
             e.mesi = MESIState.INVALID
             return
+
+    def flush_all(self) -> int:
+        """将全部脏行 (MODIFIED) 回写到 RAM, 保持有效 (降级为 EXCLUSIVE).
+
+        用于 native batch 执行前: 确保 Rust 从 bytearray 读取时
+        能看到 Python 侧通过 L2 写入的全部数据。
+
+        Returns:
+            回写的缓存行数.
+        """
+        count = 0
+        for e in self._entries:
+            if not e.valid or e.mesi != MESIState.MODIFIED:
+                continue
+            if self._ram_write is not None:
+                pa = e.tag << self._line_shift
+                self._ram_write(pa, e.data)  # bytearray 直接写入, 避免 bytes() 拷贝
+            e.mesi = MESIState.EXCLUSIVE
+            e.dirty = False
+            count += 1
+        return count
+
+    def invalidate_all(self) -> int:
+        """使全部缓存行失效, 脏行先回写 RAM.
+
+        用于 native batch 执行后: Rust 可能直接修改了 bytearray,
+        而 L2 中对应地址的旧缓存行已过时, 必须丢弃。
+
+        Returns:
+            失效的缓存行数.
+        """
+        count = 0
+        for e in self._entries:
+            if not e.valid:
+                continue
+            if e.mesi == MESIState.MODIFIED and self._ram_write is not None:
+                pa = e.tag << self._line_shift
+                self._ram_write(pa, e.data)  # bytearray 直接写入, 避免 bytes() 拷贝
+            e.valid = False
+            e.mesi = MESIState.INVALID
+            e.dirty = False
+            count += 1
+        return count
 
     def set_ram_backend(self, read_fn, write_fn) -> None:
         """注入 RAM 后端回调 (Bus 初始化时调用)."""

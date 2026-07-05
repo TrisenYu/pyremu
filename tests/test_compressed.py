@@ -27,7 +27,7 @@ def _make_ram():
 
 # ============================================================
 #  编码辅助: C1/C2 共用 bits[11:7] 为 rd 或 rs1 字段
-#  C0 使用 3-bit 压缩寄存器号 (rd'/rs1'/rs2' ∈ [0,7] → x8–x15)
+#  C0 使用 3-bit 压缩寄存器号 (rd'/rs1'/rs2' ∈ [0,7] -> x8–x15)
 # ============================================================
 
 
@@ -55,7 +55,7 @@ class TestCompressedC1:
     """C1 象限 (低 2 位 = 01)."""
 
     def test_c_addi(self):
-        """C.ADDI x5, 3 → x5 += 3."""
+        """C.ADDI x5, 3 -> x5 += 3."""
         h = Hart(id=0)
         h.gprs[5] = 10
         # imm[4:0]=3 在 bits[6:2], imm[5]=0
@@ -64,7 +64,7 @@ class TestCompressedC1:
         assert h.gprs[5] == 13
 
     def test_c_addiw(self):
-        """C.ADDIW x5, -2 → 对 32-bit 做加法再符号扩展 (RV64C)."""
+        """C.ADDIW x5, -2 -> 对 32-bit 做加法再符号扩展 (RV64C)."""
         h = Hart(id=0)
         h.gprs[5] = 10
         imm = 0x3E  # 6-bit -2: [5]=1, [4:0]=30
@@ -73,7 +73,7 @@ class TestCompressedC1:
         assert h.gprs[5] == 8
 
     def test_c_li(self):
-        """C.LI x5, -1 → x5 = -1."""
+        """C.LI x5, -1 -> x5 = -1."""
         h = Hart(id=0)
         # imm=-1: bit[12]=1, bits[6:2]=31
         instr = _c1(0b010, 5, (1 << 12) | (31 << 2))
@@ -81,7 +81,7 @@ class TestCompressedC1:
         assert h.gprs[5] == 0xFFFF_FFFF_FFFF_FFFF
 
     def test_c_mv(self):
-        """C.MV x10, x5 → x10 = x5."""
+        """C.MV x10, x5 -> x10 = x5."""
         h = Hart(id=0)
         h.gprs[5] = 0xCAFE
         instr = _c2(0b100, 10, 5 << 2)
@@ -89,7 +89,7 @@ class TestCompressedC1:
         assert h.gprs[10] == 0xCAFE
 
     def test_c_jr(self):
-        """C.JR x5 → pc = x5."""
+        """C.JR x5 -> pc = x5."""
         h = Hart(id=0)
         h.gprs[5] = 0x3000
         h.pc = 0x1000
@@ -99,7 +99,7 @@ class TestCompressedC1:
         assert h.pc == 0x3000
 
     def test_c_jalr(self):
-        """C.JALR x5 → ra=pc+2, pc=x5."""
+        """C.JALR x5 -> ra=pc+2, pc=x5."""
         h = Hart(id=0)
         h.gprs[5] = 0x4000
         h.pc = 0x1000
@@ -122,7 +122,7 @@ class TestCompressedC1:
         assert h.pc == old_ra, f"PC 应为 ra 旧值 0x{old_ra:x}, 实际 0x{h.pc:x}"
 
     def test_c_ebreak(self):
-        """C.EBREAK → Breakpoint trap."""
+        """C.EBREAK -> Breakpoint trap."""
         h = Hart(id=0)
         h.csrs["mtvec"].val = 0x80000000
         h.pc = 0x1000
@@ -135,7 +135,7 @@ class TestCompressedC1:
         h = Hart(id=0)
         h.gprs[8] = 0
         h.pc = 0x2000
-        # offset[2:1]=2→4, rs1'=0→x8, funct3=110
+        # offset[2:1]=2->4, rs1'=0->x8, funct3=110
         instr = _c1(0b110, 0, 2 << 3)
         h.exec_instr(instr)
         assert h.pc == 0x2004
@@ -154,7 +154,7 @@ class TestCompressedC1:
         [
             # 基本用例
             (10, 5, 3, _c2(0b000, 10, 3 << 2), 40),
-            # RV64 6-bit shamt: shamt=48 → shamt[5]=1, shamt[4:0]=16
+            # RV64 6-bit shamt: shamt=48 -> shamt[5]=1, shamt[4:0]=16
             (10, 0x1000, 48, _c2(0b000, 10, (16 << 2) | (1 << 12)), 0x1000_0000_0000_0000),
             # 回归: firmware fdt_ro_probe_ 0x07a2 (rd=a5, shamt=8)
             # 此前 bug 从 bit[7] 提取 shamt[5], 把 shamt=8 误算为 40
@@ -246,7 +246,7 @@ class TestCompressedC1:
         assert h.gprs[2] == 0x80248E30  # -0x70, 不是 -0x140
 
     def test_c_addi16sp_rejects_zero(self):
-        """C.ADDI16SP: nzuimm=0 为非法指令 → IllInstr 陷态."""
+        """C.ADDI16SP: nzuimm=0 为非法指令 -> IllInstr 陷态."""
         h = Hart(id=0)
         h.csrs["mtvec"].val = 0x80000000
         # 构造 nzuimm=0 的 C.ADDI16SP (所有立即数位全 0, rd=2)
@@ -273,7 +273,7 @@ class TestCompressedC1:
         assert h.gprs[rd] == expected
 
     def test_c_lui_rejects_zero(self):
-        """C.LUI: nzuimm=0 为非法指令 → IllInstr 陷态."""
+        """C.LUI: nzuimm=0 为非法指令 -> IllInstr 陷态."""
         h = Hart(id=0)
         h.csrs["mtvec"].val = 0x80000000
         # 构造 nzuimm=0 的 C.LUI (rd=10, 所有立即数位全 0)
@@ -286,7 +286,7 @@ class TestCompressedC1:
         h = Hart(id=0)
         h.gprs[5] = 0xDEADBEEFCAFE0000
         # C.LUI x5, 31: nzimm[17:12]=31, rd=5
-        # scatter 直接占据 inst[12:2], inst[6:2]=31 → scatter=0x7C
+        # scatter 直接占据 inst[12:2], inst[6:2]=31 -> scatter=0x7C
         instr = _c1(0b011, 5, 0x7C)
         h.exec_instr(instr)
         assert h.gprs[5] == 0x1F000
@@ -312,9 +312,9 @@ class TestCompressedC0:
         "rd_creg, imm, expected_reg",
         [
             (0, 16, 8),  # nzuimm=16: [5:4]=01,[9:6]=0000,[3]=0,[2]=0
-            (0, 20, 8),  # nzuimm[3:2]=01  → instr[5]=0,instr[6]=1  (bit swap 可检出)
-            (0, 24, 8),  # nzuimm[3:2]=10  → instr[5]=1,instr[6]=0  (bit swap 可检出)
-            (0, 28, 8),  # nzuimm[3:2]=11  → instr[5]=1,instr[6]=1
+            (0, 20, 8),  # nzuimm[3:2]=01  -> instr[5]=0,instr[6]=1  (bit swap 可检出)
+            (0, 24, 8),  # nzuimm[3:2]=10  -> instr[5]=1,instr[6]=0  (bit swap 可检出)
+            (0, 28, 8),  # nzuimm[3:2]=11  -> instr[5]=1,instr[6]=1
             (1, 36, 9),  # rd=s1, nzuimm=36: [3:2]=01
             (6, 44, 14),  # rd=a5, nzuimm=44: [3:2]=11
             (2, 716, 10),  # rd=a0, nzuimm=716 (0x2CC): 覆盖较大立即数
@@ -335,7 +335,7 @@ class TestCompressedC0:
         assert hart.gprs[expected_reg] == 0x8000 + imm
 
     def test_c_lw(self, hart):
-        """C.LW x8, 8(x10) → 加载 32-bit."""
+        """C.LW x8, 8(x10) -> 加载 32-bit."""
         test_val = 0xDEAD
         hart._mem_write_phy(0x8008, test_val.to_bytes(4, "little"))
         hart.gprs[10] = 0x8000
@@ -347,7 +347,7 @@ class TestCompressedC0:
         assert (hart.gprs[8] & 0xFFFF) == 0xDEAD
 
     def test_c_ld(self, hart):
-        """C.LD x8, 8(x10) → 加载 64-bit."""
+        """C.LD x8, 8(x10) -> 加载 64-bit."""
         test_val = 0xFEED_CACE
         hart._mem_write_phy(0x8008, test_val.to_bytes(8, "little"))
         hart.gprs[10] = 0x8000
@@ -357,10 +357,10 @@ class TestCompressedC0:
         assert hart.gprs[8] == test_val
 
     def test_c_sw(self, hart):
-        """C.SW x9, 8(x10) → 存储 32-bit."""
+        """C.SW x9, 8(x10) -> 存储 32-bit."""
         hart.gprs[10] = 0x8000
         hart.gprs[9] = 0xCAFE
-        # rs2'=1→x9, rd' bits 是 rs2'
+        # rs2'=1->x9, rd' bits 是 rs2'
         scatter = (1 << 10) | (2 << 7)
         instr = _c0(0b110, 1, 0, scatter)
         hart.exec_instr(instr)
@@ -368,7 +368,7 @@ class TestCompressedC0:
         assert val == 0xCAFE
 
     def test_c_sd(self, hart):
-        """C.SD x9, 8(x10) → 存储 64-bit."""
+        """C.SD x9, 8(x10) -> 存储 64-bit."""
         hart.gprs[10] = 0x8000
         hart.gprs[9] = 0xDEAD_BEEF
         scatter = (1 << 10) | (2 << 7)
@@ -383,7 +383,7 @@ class TestCompressedC0:
         """C.SD x14, 144(x12) — uimm[7:6]=2, 偏移 ≠ 8*n 时验证位布局."""
         hart.gprs[12] = 0x8000
         hart.gprs[14] = 0xDEAD_BEEF_CAFE
-        # offset=144 → uimm_field=18 → uimm[5:3]=2, uimm[7:6]=2
+        # offset=144 -> uimm_field=18 -> uimm[5:3]=2, uimm[7:6]=2
         # C.SD: funct3=111, rs1_creg=4(x12), rs2_creg=6(x14)
         instr = (0b111 << 13) | (2 << 10) | (4 << 7) | (2 << 5) | (6 << 2)
         hart.exec_instr(instr)
@@ -408,7 +408,7 @@ class TestCompressedC0:
         """C.SD 与 C.SW 的同 bit pattern 应解码为不同偏移 (验证布局分立)."""
         hart.gprs[10] = 0x8000
         # C.SD: funct3=111, offset=200, rs1_creg=2(x10), rs2_creg=4(x12)
-        # uimm_field=25 → uimm[5:3]=1, uimm[7:6]=3
+        # uimm_field=25 -> uimm[5:3]=1, uimm[7:6]=3
         hart.gprs[12] = 0xAAAA
         instr_sd = (0b111 << 13) | (1 << 10) | (2 << 7) | (3 << 5) | (4 << 2)
         hart.exec_instr(instr_sd)
@@ -424,7 +424,7 @@ class TestCompressedC0:
         # C.SW: uimm = instr[6]<<6 | instr[12:10]<<3 | instr[5]<<2
         # = 1<<6 | 1<<3 | 1<<2 = 64 + 8 + 4 = 76
         val_at_76 = int.from_bytes(hart._mem_read_phy(0x8000 + 76, 4), "little") & 0xFFFF_FFFF
-        assert val_at_76 == 0xBBBB, "C.SW 与 C.SD 应有不同偏移: C.SW→76, 实际写了偏移 ?"
+        assert val_at_76 == 0xBBBB, "C.SW 与 C.SD 应有不同偏移: C.SW->76, 实际写了偏移 ?"
         # 确认 C.SD 的偏移 200 处没有被 C.SW 覆写
         val_still = int.from_bytes(hart._mem_read_phy(0x8000 + 200, 8), "little")
         assert val_still == 0xAAAA, "C.SW 不应覆写 C.SD 的偏移 200 位置"
@@ -447,7 +447,7 @@ class TestCompressedC2:
         return h
 
     def test_c_lwsp(self, hart):
-        """C.LWSP x10, 8 → 从 sp+8 加载 32-bit."""
+        """C.LWSP x10, 8 -> 从 sp+8 加载 32-bit."""
         test_val = 0x12345678
         hart._mem_write_phy(0x8008, test_val.to_bytes(4, "little"))
         # C.LWSP: funct3=010, uimm=8, rd=10
@@ -457,7 +457,7 @@ class TestCompressedC2:
         assert hart.gprs[10] == test_val
 
     def test_c_ldsp(self, hart):
-        """C.LDSP x10, 8 → 从 sp+8 加载 64-bit."""
+        """C.LDSP x10, 8 -> 从 sp+8 加载 64-bit."""
         test_val = 0xFEED_FACE
         hart._mem_write_phy(0x8008, test_val.to_bytes(8, "little"))
         # C.LDSP: funct3=011, uimm=8, rd=10
@@ -468,7 +468,7 @@ class TestCompressedC2:
         assert hart.gprs[10] == test_val
 
     def test_c_swsp(self, hart):
-        """C.SWSP x5, 4 → 向 sp+4 存储 32-bit."""
+        """C.SWSP x5, 4 -> 向 sp+4 存储 32-bit."""
         hart.gprs[5] = 0xBEEF
         # C.SWSP: funct3=110, uimm=4, rs2=x5
         # bit[15:13]=110, bits[12:9]=0001(uimm[5:2]), bits[8:7]=00(uimm[7:6])
@@ -478,7 +478,7 @@ class TestCompressedC2:
         assert val == 0xBEEF
 
     def test_c_sdsp(self, hart):
-        """C.SDSP x5, 8 → 向 sp+8 存储 64-bit."""
+        """C.SDSP x5, 8 -> 向 sp+8 存储 64-bit."""
         hart.gprs[5] = 0xDEAD_BEEF
         # C.SDSP: funct3=111, uimm=8, rs2=x5
         # uimm=8: imm[5:3]=001, imm[8:6]=000
@@ -551,7 +551,7 @@ class TestCompressedC2:
     # -- C.ADD (回归: 曾被误当 C.MV 执行) --
 
     def test_c_add(self, hart):
-        """C.ADD x5, x6 → x5 += x6 (非 x5 = x6)."""
+        """C.ADD x5, x6 -> x5 += x6 (非 x5 = x6)."""
         hart.gprs[5] = 0x804E0
         hart.gprs[6] = 0x80000000
         # C.ADD: C2 象限 (bit1:0=10), funct3=4, bit12=1, rd_rs1=x5, rs2=x6
@@ -574,7 +574,7 @@ class TestCompressedC2:
     # -- C.SUB (RV64C, 回归: sf=0b11 未实现) --
 
     def test_c_sub(self, hart):
-        """C.SUB x15, x14 → x15 -= x14 (sf=3 variant)."""
+        """C.SUB x15, x14 -> x15 -= x14 (sf=3 variant)."""
         hart.gprs[15] = 0x804E0
         hart.gprs[14] = 0x3E8
         # C.SUB: C1, funct3=4, bit12=0, bits[11:10]=11, bits[6:5]=00
@@ -585,7 +585,7 @@ class TestCompressedC2:
         assert hart.gprs[15] == expected, f"C.SUB: {hart.gprs[15]:#x} != {expected:#x}"
 
     def test_c_or(self, hart):
-        """C.OR x15, x14 → x15 |= x14 (RV64C sf=3, bits[6:5]=10)."""
+        """C.OR x15, x14 -> x15 |= x14 (RV64C sf=3, bits[6:5]=10)."""
         hart.gprs[15] = 0xF0
         hart.gprs[14] = 0x0F
         # C.OR: C1, funct3=4, bit12=0, bits[11:10]=11, bits[6:5]=10
@@ -644,7 +644,7 @@ class TestCompressedC2:
         # C.ANDI x15, 1
         instr_andi = (0b100 << 13) | (0b010 << 10) | (7 << 7) | (0b00001 << 2) | 0b01
         hart.exec_instr(instr_andi)
-        # H-bit=0 → 结果应为 0
+        # H-bit=0 -> 结果应为 0
         assert hart.gprs[15] == 0, (
             f"misa H-bit 检测失败: 期望 0, 实际 0x{hart.gprs[15]:x}"
         )
@@ -659,7 +659,7 @@ class TestCompressedC2:
         # C.ANDI x15, 1
         instr_andi = (0b100 << 13) | (0b010 << 10) | (7 << 7) | (0b00001 << 2) | 0b01
         hart.exec_instr(instr_andi)
-        # H-bit=1 → 结果应为 1
+        # H-bit=1 -> 结果应为 1
         assert hart.gprs[15] == 1, f"H-bit=1 检测失败: 期望 1, 实际 {hart.gprs[15]}"
 
 
@@ -670,10 +670,10 @@ class TestCompressedC2:
 #  背景: rv64imafdc 在此函数中卡死, rv64g 正常.
 #  寄存器差异: callee-saved 分配不同 (s1 vs s3 缓存 FDT),
 #  但函数参数 (a0/a1/a2) 语义一致. 需验证:
-#    1. C.ADDI16SP 栈帧分配 → 保存/恢复 callee-saved
-#    2. C.JALR 间接调用 (strnlen / memcmp) → 参数无损
-#    3. while-loop 终止条件 → 各边界情况
-#    4. strnlen / memcmp 逐字节结果 → 与 march 无关
+#    1. C.ADDI16SP 栈帧分配 -> 保存/恢复 callee-saved
+#    2. C.JALR 间接调用 (strnlen / memcmp) -> 参数无损
+#    3. while-loop 终止条件 -> 各边界情况
+#    4. strnlen / memcmp 逐字节结果 -> 与 march 无关
 # ============================================================
 
 
@@ -687,7 +687,7 @@ class TestFdtProbeScenario:
     # -- 栈帧完整性 -------------------------------------------------------
 
     def test_c_addi16sp_prologue_save_restore_ra(self):
-        """C.ADDI16SP 分配栈帧 → sd ra → ld ra → sp 复原."""
+        """C.ADDI16SP 分配栈帧 -> sd ra -> ld ra -> sp 复原."""
         ram, read_fn, write_fn = _make_ram()
         h = Hart(id=0)
         inject_memory_backend(h, read_fn, write_fn)
@@ -764,7 +764,7 @@ class TestFdtProbeScenario:
         assert h.gprs[12] == 0x80042EE0, "a2 被破坏"
 
     def test_c_mv_then_c_jalr_call_chain(self):
-        """C.MV 设置参数 → C.JALR: 模拟 strnlen(compat_str, prop_len)."""
+        """C.MV 设置参数 -> C.JALR: 模拟 strnlen(compat_str, prop_len)."""
         h = Hart(id=0)
         h.gprs[19] = 0x87FF0000  # s3 = compat_str
         h.gprs[21] = 14          # s5 = prop_len
@@ -788,7 +788,7 @@ class TestFdtProbeScenario:
 # ============================================================
 
 def _make_sd(rs2: int, rs1: int, offset: int) -> int:
-    """构造 SD 指令: rs2 → [rs1 + offset].
+    """构造 SD 指令: rs2 -> [rs1 + offset].
 
     S-type 位布局: imm[11:5]@31:25, rs2@24:20, rs1@19:15, funct3@14:12,
                    imm[4:0]@11:7, opcode@6:0.
@@ -849,7 +849,7 @@ class TestFdtWhileLoop:
         return it
 
     def test_single_string_exact_prop_len(self):
-        """prop_len 恰好等于数据长度 (str + NUL) → 1 次迭代后退出."""
+        """prop_len 恰好等于数据长度 (str + NUL) -> 1 次迭代后退出."""
         # "pyremu,riscv64" = 14 chars + NUL = 15 bytes
         assert self._run_while(b"pyremu,riscv64\x00", 15) == 1
 
@@ -861,15 +861,15 @@ class TestFdtWhileLoop:
         assert self._run_while(b"ns16550\x00snps\x00", 13) == 2
 
     def test_prop_len_too_short_no_null(self):
-        """prop_len 小于首字符串长度且无 NUL → strnlen 返回 maxlen → 退出."""
+        """prop_len 小于首字符串长度且无 NUL -> strnlen 返回 maxlen -> 退出."""
         # "pyremu,riscv64" = 14 chars, prop_len=8 不包含 NUL
-        # strnlen 返回 8, compat_len=9 > 8 → 退出 (0 次迭代)
+        # strnlen 返回 8, compat_len=9 > 8 -> 退出 (0 次迭代)
         assert self._run_while(b"pyremu,riscv64\x00", 8) == 0
 
     def test_boundary_compat_len_equals_prop_len(self):
-        # strnlen("abc\0", 4) = 3, compat_len = 4 <= 4 → 进入
+        # strnlen("abc\0", 4) = 3, compat_len = 4 <= 4 -> 进入
         assert self._run_while(b"abc\x00", 4) == 1
-        # strnlen("abc\0", 3) = 3, compat_len = 4 > 3 → 退出
+        # strnlen("abc\0", 3) = 3, compat_len = 4 > 3 -> 退出
         assert self._run_while(b"abc\x00", 3) == 0
 
     def test_two_strings_different_lengths(self):
