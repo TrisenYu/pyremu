@@ -1859,6 +1859,9 @@ class TestStackWalk:
 
         _walk_frame_chain 在 saved_ra==0 时提前 break (不追加空帧),
         因此要得到 N 帧需要 N-1 层非零 RA 链接.
+
+        FP 链终止后, 若最后一帧 RA 非零, RA 推断逻辑会追加一个调用者帧.
+        此处帧 #2 的 RA=0x80000300 -> 追加帧 #3 (pc=0x800002FC).
         """
         dbg = _make_dbg()
         h = dbg.hart
@@ -1881,7 +1884,7 @@ class TestStackWalk:
         bus.write(0x80001180 - 8, (0).to_bytes(8, "little"))
 
         frames = dbg._walk_frame_chain()
-        assert len(frames) == 3
+        assert len(frames) == 4  # FP 链 3 帧 + RA 推断 1 帧
         assert frames[0].idx == 0
         assert frames[0].fp == 0x80001080
         assert frames[1].idx == 1
@@ -1892,6 +1895,12 @@ class TestStackWalk:
         assert frames[2].idx == 2
         assert frames[2].fp == 0x80001180
         assert frames[2].ra == 0x80000300
+        # 帧 #3 (RA 推断): 由帧 #2 的 RA=0x80000300 推导
+        assert frames[3].idx == 3
+        assert frames[3].fp == 0
+        assert frames[3].pc == 0x800002FC  # frames[2].ra - 4
+        assert frames[3].ra == 0
+        assert "FP 链终止" in frames[3].note
 
     def test_stack_walk_detects_cycle(self):
         """FP 链成环 -> 截断回溯."""
@@ -1942,9 +1951,9 @@ class TestStackWalk:
         dbg.cmd_frame("99")  # 超出范围
 
     def test_stale_sepc_from_ms_transition_skipped(self):
-        """M→S mret 残留 sepc (裸 PA) 不生成虚假边界帧.
+        """M->S mret 残留 sepc (裸 PA) 不生成虚假边界帧.
 
-        M→S 启动后 SPP=0 (mret 清零), sepc 仍保留 M 模式设置的
+        M->S 启动后 SPP=0 (mret 清零), sepc 仍保留 M 模式设置的
         内核入口 PA (如 0x80201048). 这不是真实 trap 现场,
         不应在栈回溯中显示为 #XX 边界帧.
         """
@@ -1956,7 +1965,7 @@ class TestStackWalk:
         h.gprs[2] = 0x80001000  # sp
         # 设置 mstatus: SPP=U (0)
         h.csrs["mstatus"].val = (h.csrs["mstatus"].val & ~(1 << 8))  # SPP=0
-        # 模拟 M→S mret 后的 sepc: 内核入口 PA
+        # 模拟 M->S mret 后的 sepc: 内核入口 PA
         h.csrs["sepc"].val = 0x80201048
         # stvec 需指向合法代码 (用于 _parse_trap_save_offsets 反汇编)
         # 写一条 ret (jalr x0, x1, 0) 到 stvec 位置
@@ -1967,16 +1976,16 @@ class TestStackWalk:
         frames = dbg._walk_frame_chain()
         # 应只有帧 #0 (当前执行点), 不应有虚假的边界帧
         assert len(frames) == 1, (
-            f"M→S 残留 sepc 不应生成边界帧, 但得到 {len(frames)} 帧"
+            f"M->S 残留 sepc 不应生成边界帧, 但得到 {len(frames)} 帧"
         )
         assert frames[0].idx == 0
 
     def test_stale_sepc_sv39_ram_addr_skipped(self):
-        """Sv39 启用后 SPP=S 时 sepc 为裸 RAM 地址 → 残留 sepc, 不生成边界帧.
+        """Sv39 启用后 SPP=S 时 sepc 为裸 RAM 地址 -> 残留 sepc, 不生成边界帧.
 
         Kernel 在 S 模式运行 (SPP=S), Sv39 启用, 但 sepc 指向 0x80201048
-        (物理 RAM 地址).  这不是真实的 S→S trap 现场 — 内核代码运行在高
-        VA (0xffffffc6XXXXXXXX), sepc 中的低地址是 M→S 过渡后的残留值.
+        (物理 RAM 地址).  这不是真实的 S->S trap 现场 — 内核代码运行在高
+        VA (0xffffffc6XXXXXXXX), sepc 中的低地址是 M->S 过渡后的残留值.
         即使 SPP=S 也应跳过.
         """
         dbg = _make_dbg(ram_size=0x800000)
@@ -2000,7 +2009,7 @@ class TestStackWalk:
         dbg._emu.bus.write(stvec_addr, (0x00008067).to_bytes(4, "little"))
 
         frames = dbg._walk_frame_chain()
-        # Sv39 启用时 sepc 为裸 RAM 地址 → 残留, 不生成边界帧
+        # Sv39 启用时 sepc 为裸 RAM 地址 -> 残留, 不生成边界帧
         assert len(frames) == 1, (
             f"Sv39 + RAM sepc 不应生成边界帧 (即使是 SPP=S), 但得到 {len(frames)} 帧"
         )
@@ -2075,6 +2084,225 @@ class TestStackWalk:
         # 帧 #1 应带有损坏标记
         frame1 = frames[1]
         assert frame1.note, "帧 #1 在 RA 完全不可恢复时应带有损坏标记"
+
+
+# ============================================================
+#  U-mode 栈回溯 (backtrace)
+# ============================================================
+
+
+class TestUmodeBacktrace:
+    """U-mode 直接回溯与 S→U 边界帧恢复."""
+
+    @staticmethod
+    def _make_dbg(ram_size: int = 0x10000, ram_base: int = 0x80000000) -> Debugger:
+        emu = _make_emu(ram_size=ram_size, ram_base=ram_base)
+        emu.load_code(0x1000, b"\x13\x00\x00\x00")
+        return Debugger(emulator=emu, hart_id=0)
+
+    # ---------- 直接 U-mode FP 链 ----------
+
+    def test_umode_fp_chain_walk(self):
+        """hart 处于 U-mode 时, FP 链帧全部标记为 U.
+
+        使用 Bare 翻译 (mmu_mode=0), VA=PA.
+        """
+        dbg = self._make_dbg(ram_size=0x20000, ram_base=0x80000000)
+        h = dbg.hart
+        bus = dbg._emu.bus
+
+        h.mode = RiscvMode.U
+        h._mmu_mode = 0  # Bare 翻译
+        h.pc = 0x80001000
+        h.gprs[1] = 0x80002000  # ra (frame #1 uses live x1)
+        h.gprs[2] = 0x8000F000  # sp
+        h.gprs[8] = 0x8000F080  # fp
+
+        # 帧 #1 链接: saved_ra=0x80004000, saved_fp=0x8000F100
+        bus.write(0x8000F080 - 16, (0x8000F100).to_bytes(8, "little"))
+        bus.write(0x8000F080 - 8, (0x80004000).to_bytes(8, "little"))
+        # 帧 #2 链接: terminal
+        bus.write(0x8000F100 - 16, (0).to_bytes(8, "little"))
+        bus.write(0x8000F100 - 8, (0).to_bytes(8, "little"))
+
+        frames = dbg._walk_frame_chain()
+        assert len(frames) >= 3, f"应有 ≥3 帧 (含 RA 推断), 但只有 {len(frames)}"
+        for i, f in enumerate(frames):
+            assert f.mode == "U", f"帧 #{i} mode={f.mode!r}, 预期 U"
+        assert frames[0].pc == 0x80001000
+        assert frames[1].pc == 0x80001FFC  # ra - 4
+        assert frames[1].ra == 0x80004000
+
+    def test_umode_single_frame_when_fp_zero(self):
+        """U-mode 且 fp=0 时仅有当前帧."""
+        dbg = self._make_dbg()
+        h = dbg.hart
+        h.mode = RiscvMode.U
+        h._mmu_mode = 0
+        h.pc = 0x80001000
+        h.gprs[8] = 0  # fp = 0
+
+        frames = dbg._walk_frame_chain()
+        assert len(frames) == 1
+        assert frames[0].mode == "U"
+
+    def test_umode_ra_inference_when_fp_chain_broken(self):
+        """FP 链不可达时 (fp=0), 由 live RA 推断一个调用者帧."""
+        dbg = self._make_dbg()
+        h = dbg.hart
+        h.mode = RiscvMode.U
+        h._mmu_mode = 0
+        h.pc = 0x80001000
+        h.gprs[1] = 0x80002000  # ra — 有效返回地址
+        h.gprs[8] = 0  # fp = 0 → FP 链不可达
+
+        frames = dbg._walk_frame_chain()
+        assert len(frames) == 2, (
+            f"RA 推断应产生 1 个调用者帧 (共 2 帧), 但只有 {len(frames)}"
+        )
+        assert frames[0].mode == "U"
+        assert frames[1].mode == "U"
+        assert frames[1].pc == 0x80001FFC  # ra - 4
+        assert "RA 推断" in frames[1].note
+        assert frames[1].fp == 0  # 推断帧无有效 FP
+
+    # ---------- S→U 边界帧恢复 ----------
+
+    def test_smode_to_umode_boundary(self):
+        """S-mode 下 SPP=U: 从 sepc 恢复 U-mode FP 链."""
+        dbg = self._make_dbg(ram_size=0x20000, ram_base=0x80000000)
+        h = dbg.hart
+        bus = dbg._emu.bus
+
+        # S-mode 当前状态
+        h.mode = RiscvMode.S
+        h._mmu_mode = 0
+        h.pc = 0x80010000  # S-mode kernel code
+        h.gprs[2] = 0x8001F000  # S-mode sp
+        h.gprs[8] = 0x8001F080  # S-mode fp
+
+        # S-mode FP 链 (内核)
+        bus.write(0x8001F080 - 16, (0x8001F100).to_bytes(8, "little"))
+        bus.write(0x8001F080 - 8, (0x80010200).to_bytes(8, "little"))
+        bus.write(0x8001F100 - 16, (0).to_bytes(8, "little"))
+        bus.write(0x8001F100 - 8, (0).to_bytes(8, "little"))
+
+        # Trap CSRs: S-mode 捕获 U-mode 异常
+        h.csrs["sepc"].val = 0x80003AE8  # U-mode PC (fault site, valid PA)
+        h.csrs["scause"].val = 0xD  # LoadPageFault
+        # mstatus.SPP = U
+        h.csrs["mstatus"].val = h.csrs["mstatus"].val & ~(1 << 8)
+
+        # stvec 指向含 RA/FP 保存的 trap 入口
+        # addi sp,sp,-240; sd x1,0(sp); sd x8,8(sp)
+        tvec_addr = 0x80018000
+        h.csrs["stvec"].val = tvec_addr
+        trap_entry = bytes([
+            0x13, 0x01, 0x01, 0xF1,  # addi sp, sp, -240
+            0x23, 0x30, 0x11, 0x00,  # sd   x1, 0(sp)
+            0x23, 0x34, 0x81, 0x00,  # sd   x8, 8(sp)
+        ])
+        bus.write(tvec_addr, trap_entry)
+
+        # S-mode 内核栈上的 trap 帧 — 由栈扫描找到
+        trap_sp = 0x8001E000
+        bus.write(trap_sp, (0x80003AE8).to_bytes(8, "little"))  # trapped PC
+        bus.write(trap_sp + 0, (0).to_bytes(8, "little"))        # zero verify (sp+0)
+        bus.write(trap_sp + 8, (0x80002000).to_bytes(8, "little"))   # saved_ra @ ra_off=8
+        bus.write(trap_sp + 16, (0x8000F080).to_bytes(8, "little"))  # saved_fp @ fp_off=16
+
+        # U-mode FP 链 (位于 saved_fp=0x8000F080)
+        bus.write(0x8000F080 - 16, (0x8000F100).to_bytes(8, "little"))
+        bus.write(0x8000F080 - 8, (0x80003000).to_bytes(8, "little"))
+        bus.write(0x8000F100 - 16, (0).to_bytes(8, "little"))
+        bus.write(0x8000F100 - 8, (0).to_bytes(8, "little"))
+
+        frames = dbg._walk_frame_chain()
+
+        umode_frames = [f for f in frames if f.mode == "U"]
+        assert len(umode_frames) >= 1, (
+            f"应有 ≥1 个 U-mode 帧, 实际帧列表: "
+            f"{[(f.idx, f.mode, hex(f.pc)) for f in frames]}"
+        )
+
+    # ---------- Fallback trap offsets ----------
+
+    def test_fallback_trap_offsets_for_s_to_u(self):
+        """S→U 边界且 stvec 无 sd x1/sd x8 时, 回退到常见布局扫描."""
+        dbg = self._make_dbg(ram_size=0x30000, ram_base=0x80000000)
+        h = dbg.hart
+        bus = dbg._emu.bus
+
+        # S-mode 当前状态 (fp=0 → FP 链立即终止)
+        h.mode = RiscvMode.S
+        h._mmu_mode = 0
+        h.pc = 0x80010000
+        h.gprs[8] = 0  # fp=0
+        h.gprs[2] = 0x8001F000
+
+        # Trap CSRs: SPP=U
+        h.csrs["sepc"].val = 0x80001000  # U-mode PC
+        h.csrs["mstatus"].val = h.csrs["mstatus"].val & ~(1 << 8)
+
+        # stvec: ret 指令 — _parse_trap_save_offsets 返回 None
+        tvec_addr = 0x80018000
+        h.csrs["stvec"].val = tvec_addr
+        bus.write(tvec_addr, (0x00008067).to_bytes(4, "little"))  # ret
+
+        # 在 S-mode 栈上按紧凑布局 (ra_off=0, fp_off=8) 放 trap 帧
+        trap_sp = 0x8001E000
+        bus.write(trap_sp, (0x80001000).to_bytes(8, "little"))  # trapped PC
+        bus.write(trap_sp + 0, (0).to_bytes(8, "little"))        # zero verify
+        # saved_ra @ ra_off=0 — 但 zero verify 在同一个位置, 所以 ra_off=0 布局无法通过
+        # 用 ra_off=8, fp_off=64 (Linux pt_regs) 布局
+        # 在 trap_sp 上方找位置放 saved_ra
+        bus.write(trap_sp + 8, (0x80002000).to_bytes(8, "little"))   # saved_ra @ ra_off=8
+        bus.write(trap_sp + 64, (0x8000F080).to_bytes(8, "little"))  # saved_fp @ fp_off=64
+
+        # U-mode FP 链
+        bus.write(0x8000F080 - 16, (0x8000F100).to_bytes(8, "little"))
+        bus.write(0x8000F080 - 8, (0x80003000).to_bytes(8, "little"))
+        bus.write(0x8000F100 - 16, (0).to_bytes(8, "little"))
+        bus.write(0x8000F100 - 8, (0).to_bytes(8, "little"))
+
+        frames = dbg._walk_frame_chain()
+        assert len(frames) >= 2, (
+            f"fallback 应至少生成 1 个 U-mode 边界帧, 但只有 {len(frames)} 帧"
+        )
+        modes = [f.mode for f in frames]
+        assert "U" in modes, f"fallback 后应有 U-mode 帧, 模式列表: {modes}"
+
+    def test_fallback_all_fail_gives_pc_only_frame(self):
+        """所有 fallback 布局均失败时, 回退到仅 PC 帧且不崩溃."""
+        dbg = self._make_dbg(ram_size=0x20000, ram_base=0x80000000)
+        h = dbg.hart
+        bus = dbg._emu.bus
+
+        h.mode = RiscvMode.S
+        h._mmu_mode = 0
+        h.pc = 0x80010000
+        h.gprs[8] = 0  # fp=0
+
+        h.csrs["sepc"].val = 0x80001000  # U-mode PC
+        h.csrs["mstatus"].val = h.csrs["mstatus"].val & ~(1 << 8)  # SPP=U
+
+        # stvec: ret — _parse_trap_save_offsets 返回 None
+        tvec_addr = 0x80018000
+        h.csrs["stvec"].val = tvec_addr
+        bus.write(tvec_addr, (0x00008067).to_bytes(4, "little"))
+
+        # 不写任何 trap 帧数据 → 所有 fallback 布局在栈扫描中找不到 trapped PC
+        # _add_prev_mode_frame_fallback 捕获此情况并回退到仅 PC 帧
+
+        frames = dbg._walk_frame_chain()
+        assert len(frames) >= 2, (
+            f"fallback 应回退到仅 PC 帧 (≥2 帧), 但只有 {len(frames)}: "
+            f"{[(f.idx, f.mode, f.note) for f in frames]}"
+        )
+        last = frames[-1]
+        assert "无法解析" in last.note, (
+            f"fallback 失败时应带 '无法解析' 备注, 实际: {last.note!r}"
+        )
 
 
 # ============================================================

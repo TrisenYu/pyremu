@@ -1,10 +1,4 @@
-[package]
-name = "pyremu-native"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = ["cpu", "termio"]
+resolver = "2"
 
-[lib]
-crate-type = ["cdylib"]
-name = "decode"
-
-[dependencies]

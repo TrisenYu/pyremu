@@ -384,26 +384,27 @@ def translate_va(va: int, satp_val: int, mem_read_phy: Callable[[int, int], byte
         mem_read_phy: 物理内存读取回调.
 
     Returns:
-        (success: bool, pa: int)
+        (success: bool, pa: int, perm: int)
+        perm 为 PTE 权限位 (R|W|X|U), Bare 模式下固定返回 0xF (全权限).
     """
     mode = satp_val >> 60
 
     if mode == SATP_MODE_BARE:
-        # 无地址翻译: VA 即 PA
-        return True, va & 0xFFFF_FFFF_FFFF_FFFF
+        # 无地址翻译: VA 即 PA; 全权限 (物理地址无页级保护)
+        return True, va & 0xFFFF_FFFF_FFFF_FFFF, 0xF
 
     if mode == SATP_MODE_SV39:
         root_ppn = satp_val & ((1 << 44) - 1)
         ok, ppn, perm, _ = sv39_walk(root_ppn, va, mem_read_phy)
         if not ok:
-            return False, 0
+            return False, 0, 0
         # 物理地址 = PPN << 12 | offset (VA[11:0])
         offset = va & (PAGE_SIZE - 1)
         pa = (ppn << PAGE_SHIFT) | offset
-        return True, pa & 0xFFFF_FFFF_FFFF_FFFF
+        return True, pa & 0xFFFF_FFFF_FFFF_FFFF, perm
 
     # Sv48 等其他模式暂未实现
-    return False, 0
+    return False, 0, 0
 
 
 # ============================================================

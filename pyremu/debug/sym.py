@@ -10,6 +10,7 @@ from pathlib import Path as _Path
 
 from rich.table import Table
 
+from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import translate_addr
 from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
 from pyremu.debug._attrs import SharedMixinAttrs
@@ -71,11 +72,18 @@ class SymbolMixin(SharedMixinAttrs):
             if a == addr:
                 return name
 
-        # 3) ranges 未命中 → 不猜测
+        # 3) ranges 存在但未命中: 若地址落在 ranges 覆盖范围内
+        #    (第一个 range 的 start 到最后一个 range 的 end), 则放弃;
+        #    若落在覆盖范围外的空隙 (如 NOTYPE 标签和下一个 FUNC 之间),
+        #    则回退到最近前驱符号, 避免 .text 段入口代码无函数名.
         if ranges:
-            return None
+            first_start = ranges[0][0]
+            last_end = ranges[-1][1]
+            if first_start <= addr < last_end:
+                return None
+            # 地址在 ranges 覆盖范围外 -> 回退最近前驱
 
-        # 4) 无 ranges: 最近前驱
+        # 4) 无 ranges / ranges 覆盖范围外: 最近前驱
         best_name, best_dist = None, 0xFFFF_FFFF_FFFF_FFFF
         for name, a in symbols.items():
             if name.startswith("$") or name.startswith(".L"):
@@ -112,9 +120,11 @@ class SymbolMixin(SharedMixinAttrs):
 
         self._sym_symbols_pa.clear()
         self._sym_ranges_pa.clear()
+        self._pa_to_va = {}
         for name, va in self._sym_symbols.items():
             pa = (va + load_offset) & 0xFFFF_FFFF_FFFF_FFFF
             self._sym_symbols_pa[name] = pa
+            self._pa_to_va[pa] = va
         for start, end, name in self._sym_ranges:
             pa_start = (start + load_offset) & 0xFFFF_FFFF_FFFF_FFFF
             pa_end = (end + load_offset) & 0xFFFF_FFFF_FFFF_FFFF
@@ -185,12 +195,14 @@ class SymbolMixin(SharedMixinAttrs):
         避免将 blake2s G 宏等借用 x1 的临时数据值误判为合法返回地址.
         """
         h = self.hart
-        if h.mmu_mode != 0:
+        # M-mode 始终使用 Bare 翻译 (RISC-V spec §3.7.1), 即使 satp.MODE≠0.
+        # M-mode 下的所有地址均为物理地址, 不经过 Sv39 规范地址检查.
+        if h.mmu_mode != 0 and h.mode != RiscvMode.M:
             canonical = sv39_canonical_va(addr)
             if canonical is None:
                 return False
-            # 核态 (S/M/D): 仅接受 VA[38]=1 的内核规范地址
-            if h.mode.value >= 1:  # S=1, M=3, D=8
+            # 核态 (S/D): 仅接受 VA[38]=1 的内核规范地址
+            if h.mode.value >= 1:  # S=1, D=8
                 return bool(addr & (1 << 38))
             # 用户态 (U): 仅接受 VA[38]=0
             return not bool(addr & (1 << 38))

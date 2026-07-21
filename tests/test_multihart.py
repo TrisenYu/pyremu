@@ -4,6 +4,7 @@
 
 """多 hart 集成测试: 验证多核启动 + 定时器中断."""
 
+import os
 import struct
 
 import pytest
@@ -61,14 +62,16 @@ class TestMultiHartTimer:
     """验证定时器中断."""
 
     def test_clint_mtime_advances(self, multi_hart_emu):
-        """CLINT mtime 应随 step() 推进."""
+        """CLINT mtime 应随 step() 推进 — 每 hart 每指令 1 tick."""
         emu = multi_hart_emu
+        num_harts = len(emu.harts)
         mtime_before = emu.clint.get_mtime()
         for _ in range(100):
             emu.step()
         mtime_after = emu.clint.get_mtime()
-        assert mtime_after == mtime_before + 100, (
-            f"mtime 应推进 100, 实际 {mtime_after - mtime_before}"
+        expected = mtime_before + num_harts * 100
+        assert mtime_after == expected, (
+            f"mtime 应推进 {num_harts * 100}, 实际 {mtime_after - mtime_before}"
         )
 
     def test_mtimecmp_writable(self, multi_hart_emu):
@@ -98,3 +101,59 @@ class TestMultiHartTimer:
         _ = emu.clint.check_interrupt(0)  # 触发 CLINT 更新
         mip = emu.harts[0].csrs["mip"].val
         assert mip & (1 << 7), f"MTIP 未置位, mip=0x{mip:x}"
+
+
+class TestNativeBatchShortSlice:
+    """验证 Rust native batch 的 short-slice 机制防止 IPI 自旋死锁.
+
+    当 Hart 0 通过 CLINT MSIP 向 Hart 1 发送跨核中断后进入自旋等待,
+    short-slice 机制限制发送核的指令预算, 使接收核获得更多 CPU 时间
+    来完成 IPI 触发的工作.
+    """
+
+    def test_native_batch_no_double_halt_on_boot(self):
+        """原生 batch 多核启动不会因 MSIP 风暴导致 halted.
+
+        回归: 若 short-slice 机制缺失, Hart 0 发送 MSIP 后自旋消耗全部
+        时间片, Hart 1 无法响应 → MSIP 重复投递 → 连续 trap 检测触发 halted.
+        """
+        old_val = os.environ.get("PYREMU_NATIVE_BATCH")
+        os.environ["PYREMU_NATIVE_BATCH"] = "1"
+        try:
+            cfg = PlatformConfig.qemu_virt()
+            cfg.num_harts = 2
+            emu = Emulator(cfg)
+            kernel = parse_firmware("tests/bins/elf/kernel.elf")
+            assert kernel is not None, "kernel.elf 解析失败"
+            emu.load_firmware(kernel)
+
+            # Run enough steps to complete M→S boot transition.
+            # kernel.elf is small; 200 steps should suffice.
+            for _ in range(200):
+                emu.step()
+                if any(h._halted for h in emu.harts):
+                    hid = next(i for i, h in enumerate(emu.harts) if h._halted)
+                    pytest.fail(
+                        f"Hart {hid} halted during multi-hart boot "
+                        f"(insn: H0={emu.harts[0]._total_instrs} "
+                        f"H1={emu.harts[1]._total_instrs})"
+                    )
+
+            # Both harts should have made progress.
+            in0 = emu.harts[0]._total_instrs
+            in1 = emu.harts[1]._total_instrs
+            assert in0 > 0, f"Hart 0 未执行指令"
+            assert in1 > 0, f"Hart 1 未执行指令"
+
+            # No hart should be stuck in a trap loop (MSIP storm check).
+            for i, h in enumerate(emu.harts):
+                ct = h._consecutive_traps
+                assert ct < 3, (
+                    f"Hart {i} consecutive_traps={ct} >= 3 — "
+                    f"疑似 MSIP 风暴 (mode={h.mode.name} pc=0x{h.pc:x})"
+                )
+        finally:
+            if old_val is None:
+                del os.environ["PYREMU_NATIVE_BATCH"]
+            else:
+                os.environ["PYREMU_NATIVE_BATCH"] = old_val

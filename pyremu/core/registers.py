@@ -119,39 +119,6 @@ _fpr = [
 ]
 
 
-def register_gpr():
-    """返回 32 个 GPR 的独立副本."""
-    return deepcopy(_gpr)
-
-
-def gpr_name(idx: int) -> str:
-    """返回第 idx 号 GPR 的名称 (例: x0, x10)."""
-    if 0 <= idx < len(_gpr):
-        return _gpr[idx].name
-    return f"?x{idx}"
-
-
-def gpr_alias(idx: int) -> str:
-    """返回第 idx 号 GPR 的 ABI 别名 (例: zero, a0, sp)."""
-    if 0 <= idx < len(_gpr):
-        return _gpr[idx].alias
-    return ""
-
-
-def gpr_idx_from_name(name: str) -> int | None:
-    """按名称或别名查找 GPR 索引 (例: "x10" -> 10, "t0" -> 5, "a0" -> 10)."""
-    name = name.lower()
-    for idx, r in enumerate(_gpr):
-        if r.name == name or (r.alias and r.alias == name):
-            return idx
-    return None
-
-
-def register_fpr():
-    """返回 32 个 FPR 的独立副本."""
-    return deepcopy(_fpr)
-
-
 # ============================================================
 #  CSR 访问权限 & 特权级控制
 # ============================================================
@@ -188,6 +155,7 @@ class CSR(Reg):
 
     access: CsrAccess
     xlen: int = 64
+    implemented: bool = True
 
     def strip_w(self) -> "CSR":
         """设为只读 (低 2 位 = 10)."""
@@ -208,6 +176,11 @@ class CSR(Reg):
         val = self.access.value
         val |= 0b1000_00
         self.access = CsrAccess(val)
+        return self
+
+    def not_implemented(self) -> "CSR":
+        """标记为未实现 — 访问时始终抛出 IllInstr."""
+        self.implemented = False
         return self
 
 
@@ -396,8 +369,41 @@ _csr_bank: dict[int, CSR] = {
     0xF13: _MmodeCSR(name="mimpid").strip_w(),
     0xF14: _MmodeCSR(name="mhartid").strip_w(),
     0xF15: _MmodeCSR(name="mconfigptr").strip_w(),
-    0xFB0: _MmodeCSR(name="mtopi").strip_w(),
+    0xFB0: _MmodeCSR(name="mtopi").strip_w().not_implemented(),
 }
+
+
+def register_gpr():
+    """返回 32 个 GPR 的独立副本."""
+    return deepcopy(_gpr)
+
+
+def gpr_name(idx: int) -> str:
+    """返回第 idx 号 GPR 的名称 (例: x0, x10)."""
+    if 0 <= idx < len(_gpr):
+        return _gpr[idx].name
+    return f"?x{idx}"
+
+
+def gpr_alias(idx: int) -> str:
+    """返回第 idx 号 GPR 的 ABI 别名 (例: zero, a0, sp)."""
+    if 0 <= idx < len(_gpr):
+        return _gpr[idx].alias
+    return ""
+
+
+def gpr_idx_from_name(name: str) -> int | None:
+    """按名称或别名查找 GPR 索引 (例: "x10" -> 10, "t0" -> 5, "a0" -> 10)."""
+    name = name.lower()
+    for idx, r in enumerate(_gpr):
+        if r.name == name or (r.alias and r.alias == name):
+            return idx
+    return None
+
+
+def register_fpr():
+    """返回 32 个 FPR 的独立副本."""
+    return deepcopy(_fpr)
 
 # 批量生成编号连续的 CSR
 for i in range(0, 4):
@@ -531,6 +537,9 @@ def check_csr_access(
         raise CsrAccessError(csr_id, "unknown")
 
     csr = _csr_bank[csr_id]
+    if not csr.implemented:
+        raise CsrAccessError(csr_id, "unknown")
+
     access: CsrAccess = csr.access
 
     # 检查当前特权级是否允许读取该 CSR

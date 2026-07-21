@@ -127,6 +127,9 @@ s_mode_boot:
     csrs sstatus, t0
     li   t0, (1 << 8)
     csrc sstatus, t0
+    // SUM=1: 允许 S 模式访问 U 模式页 (读 faulting 指令、遍历用户栈等)
+    li   t0, (1 << 18)
+    csrs sstatus, t0
 
     // 建立 Sv39 页表 (含 U 栈保护页)
     call setup_sv39

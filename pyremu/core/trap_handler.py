@@ -35,7 +35,8 @@ from pyremu.core.hart import (
     MSTATUS_TW,
     RiscvMode,
 )
-from pyremu.core.trap import TrapType, trap_cause_code
+from pyremu.core.diag import log_sret_to_u, log_mret_to_u, log_ld_trap, TRACE_SRET_TO_U
+from pyremu.core.trap_def import trap_cause_code, TrapType
 from pyremu.interrupt.controller import INT_SOURCE_MIP_MASK, IntSource
 
 if TYPE_CHECKING:
@@ -54,6 +55,30 @@ _INT_PRIORITY: list[tuple[int, TrapType]] = [
     (1 << 1, TrapType.SmodeSoftInterrupt),  # SSI
     (1 << 5, TrapType.SmodeTimerInterrupt),  # STI
 ]
+
+# 硬件源管理的 mip 位掩码 (只读位, 反映外部中断信号).
+# 这些位在 check_pending_interrupts 中必须用硬件当前状态**替换** (非 OR 累加),
+# 否则一旦硬件源 (如 CLINT MSIP) 撤除后旧位仍残留在 mip CSR 中,
+# 导致无限中断重投递 (MSIP 风暴).
+_HW_MIP_MASK: int = (
+    INT_SOURCE_MIP_MASK[IntSource.MSI]  # bit 3 — CLINT _msip[hart_id]
+    | INT_SOURCE_MIP_MASK[IntSource.MTI]  # bit 7 — CLINT _mtimecmp
+    | INT_SOURCE_MIP_MASK[IntSource.STI]  # bit 5 — Sstc stimecmp
+    | INT_SOURCE_MIP_MASK[IntSource.MEI]  # bit 11 — PLIC
+    | INT_SOURCE_MIP_MASK[IntSource.SEI]  # bit 9 — PLIC
+)
+
+
+def _update_hw_mip(hart: HartWithRegs, hw_mip_bits: int) -> None:
+    """用当前硬件状态替换 mip CSR 中的硬件源位.
+
+    与简单的 `current_mip | hw_mip_bits` 不同, 此函数**清除**已不再被
+    硬件源断言的位, 防止中断源撤除后无限重投递 (如 CLINT MSIP 清零后
+    mip.MSIP 仍残留导致 MmodeSoftInterrupt 风暴).
+    """
+    current = hart._csr_read_raw("mip")
+    hart._csr_write_raw("mip", (current & ~_HW_MIP_MASK) | hw_mip_bits)
+
 
 # RiscvMode 枚举值预计算, 避免每条指令访问 .value property
 _MODE_M = RiscvMode.M.value
@@ -100,8 +125,9 @@ def deliver_trap(
     if was_wfi:
         hart._wfi_woken = True
 
-    # 连续 trap 计数 (正常执行指令时由 Emulator.step 清零)
-    hart._consecutive_traps += 1
+    # consecutive_traps is now tracked only at instruction boundaries
+    # (advance==0 && PC unchanged).  MRET/SRET resets it.
+    # Do NOT increment unconditionally here.
 
     # 获取 cause 编码 (中断标志已嵌入)
     code = trap_cause_code(cause)
@@ -122,8 +148,15 @@ def deliver_trap(
             f"exc_code={exc_code} mstatus={hart.mstatus_val:#018x}"
         )
         logger.debug(_ctx)
+    saved_pc = hart.pc
+    if TRACE_SRET_TO_U:
+        log_ld_trap(hart, code, tval)
     fn = _trap_deliver_smode if delegate else _trap_deliver_mmode
     fn(hart, code, exc_code, tval, is_interrupt)
+    # genuine trap-loop detection: PC didn't change -> same instruction
+    # keeps trapping
+    if hart.pc == saved_pc:
+        hart._consecutive_traps += 1
 
 
 # ---- S 模式 trap 投递 ----
@@ -176,6 +209,22 @@ def _trap_deliver_smode(
         # vectored: 所有异常跳转 BASE, 中断跳转 BASE + 4 * exc_code
         hart.pc = (tvec_base + 4 * exc_code)
 
+    # MSIP 中断投递到 S 模式: 同步清零 CLINT MSIP.
+    # 与 _trap_deliver_mmode 中的相同逻辑一致 — 当 MSIP 被 mideleg[3]=1
+    # 委派到 S 模式时, S-mode trap handler 可能无法通过 MMIO 清除 MSIP
+    # (需要访问仅 M-mode 可达的 CLINT 寄存器).  若不清零硬件源,
+    # sret 后 mip.MSIP 持续为 1 -> 死循环.
+    if is_interrupt and exc_code == 3:
+        ctrl = hart._interrupt_ctrl
+        if ctrl is not None:
+            try:
+                ctrl.clear_ipi(hart.id)
+            except AttributeError:
+                if hasattr(ctrl, '_msip') and hasattr(ctrl, '_notify_state_change'):
+                    ctrl._msip[hart.id] = 0
+                    ctrl._notify_state_change()
+        hart.mip_val &= ~(1 << 3)
+
 
 # ---- M 模式 trap 投递 ----
 
@@ -225,6 +274,33 @@ def _trap_deliver_mmode(
         hart.pc = tvec_base
     else:
         hart.pc = (tvec_base + 4 * exc_code)
+
+    # MSIP 中断: 同步清零 CLINT MSIP.
+    #
+    # RISC-V 规范: mip.MSIP 是只读位, 反映 CLINT 内存映射 MSIP 寄存器.
+    # 若 M 模式响应 MSIP 后不清零硬件源, mip.MSIP 将持续为 1,
+    # mret 后 check_pending_interrupts 立即再次命中 -> 死循环.
+    #
+    # 固件 handler 调用 sbi_ipi_process() -> mswi_ipi_clear() 尝试
+    # 写 0 到 CLINT MSIP, 但若该写入未达 CLINT (如 ACLINT MSWI 驱动
+    # 的基址与 CLINT 不一致), 则中断源永远不会被清除.
+    #
+    # 此处由模拟器保证: 当 MSIP 被 M 模式响应时, 硬件直接清零 CLINT 源.
+    # 这与某些 RISC-V 实现中 MSIP 为边沿触发自清零的行为一致.
+    if is_interrupt and exc_code == 3:  # MSIP (mcause code 3)
+        ctrl = hart._interrupt_ctrl
+        if ctrl is not None:
+            try:
+                ctrl.clear_ipi(hart.id)
+            except AttributeError:
+                # 非 CLINT 控制器没有 clear_ipi — 降级为直接操作
+                if hasattr(ctrl, '_msip') and hasattr(ctrl, '_notify_state_change'):
+                    ctrl._msip[hart.id] = 0
+                    ctrl._notify_state_change()
+        # 同步清零 mip CSR (与 Rust ``state.mip &= !(1 << 3)`` 一致).
+        # 硬件源已清除, 但 check_pending_interrupts 中的 _update_hw_mip
+        # 在 deliver_trap 之前已执行, mip.MSIP 可能仍为 1.
+        hart.mip_val &= ~(1 << 3)
 
 
 # ============================================================
@@ -286,8 +362,14 @@ def trap_mret(
     # PC ← mepc
     hart.pc = hart.mepc_val & 0xFFFF_FFFF_FFFF_FFFF
 
-    # 从 trap 返回 -> 清除 WFI 唤醒标记, 后续指令正常计数
-    hart._wfi_woken = False
+    if TRACE_SRET_TO_U and hart.mode == RiscvMode.U:
+        log_mret_to_u(hart)
+
+    # 注意: 不在此处清除 _wfi_woken.
+    # _wfi_woken 由 deliver_trap 在从 WFI 唤醒时置位, 意在让紧随其后的
+    # handle_wfi 将 WFI 视为 NOP 并推进 PC, 从而允许 while (...) wfi()
+    # 轮询循环在 trap handler 返回后重新检查状态条件.
+    # 若在此处提前清除, handle_wfi 将看不到该标记, hart 立即重回睡眠.
 
 
 def trap_sret(
@@ -321,8 +403,11 @@ def trap_sret(
     # PC ← sepc
     hart.pc = hart.sepc_val & 0xFFFF_FFFF_FFFF_FFFF
 
-    # 从 trap 返回 -> 清除 WFI 唤醒标记, 后续指令正常计数
-    hart._wfi_woken = False
+    # 诊断: 记录 sret→U 的完整寄存器状态 (PC 已更新后再记录)
+    if TRACE_SRET_TO_U and hart.mode == RiscvMode.U:
+        log_sret_to_u(hart)
+
+    # 不在此处清除 _wfi_woken (同 trap_mret 的注释说明).
 
 
 # ============================================================
@@ -349,6 +434,13 @@ def handle_wfi(
     # TW (Timeout Wait) 检查: 非 M 模式下 mstatus.TW=1 -> 非法指令异常
     if hart.mode != RiscvMode.M and hart.mstatus_val & MSTATUS_TW:
         deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
+        return
+
+    # 刚被中断唤醒 (MRET 回到 WFI): 视为 NOP, 推进 PC 以允许
+    # while (state != READY) wfi() 轮询循环在 trap handler 返回后
+    # 重新检查状态条件. 若仍不满足, 下次 WFI 会正常进入等待.
+    if hart._wfi_woken:
+        hart._wfi_woken = False
         return
 
     # 检查是否已有待处理且使能的中断
@@ -387,6 +479,77 @@ def _compute_next_timer(
         if s_cmp and (wakeup == 0 or s_cmp < wakeup):
             wakeup = s_cmp
     return wakeup
+
+
+def try_wfi_wakeup(
+    hart: HartWithRegs,
+) -> bool:
+    """WFI 唤醒检查 — 仅检查 mip & mie (中断源级使能), 不检查 mstatus.MIE.
+
+    WFI 的 NOP 条件 (RISC-V spec §3.6.1) 只要求 ''任一中断挂起且该中断源
+    在 mie CSR 中使能'', 不要求全局中断使能 (mstatus.MIE). 因此 WFI 唤醒
+    的检查条件也应只使用 mip & mie, 不引入 mstatus.MIE 这一额外门槛.
+
+    特殊处理 CLINT MSIP: 真实硬件上 CLINT 将 MSIP 位断言为独立物理中断线,
+    WFI 由此唤醒不依赖 mie.MSIE (只要求 CLINT MSIP 寄存器非零).
+    mie.MSIE 仅控制该中断是否被 *投递*.  这与 Rust native batch
+    ``try_wfi_wakeup`` 的行为一致 — 多核 TLB shootdown 场景中若
+    mie.MSIE 因固件代码路径被意外清零, 跳过该条件可避免发送核在
+    ``tlb_sync`` 中永远自旋的死锁.
+
+    若从 WFI 中被唤醒, 置位 _wfi_woken 标志以供 WFI handler 消费 (while
+    循环的 WFI NOP 路径). 返回 True 表示唤醒成功.
+    """
+    if not hart._waiting or hart._halted:
+        return False
+
+    ctrl = hart._interrupt_ctrl
+    if ctrl is None:
+        return False
+
+    # 将 CLINT 中断状态同步到 mip CSR (与 check_pending_interrupts 相同)
+    has_pending, mip_bits, _ = ctrl.check_interrupt(hart.id)
+
+    # CLINT MSIP 直接读取 — 硬件中断线, 不依赖 mie.MSIE.
+    msip_raw = (ctrl._msip[hart.id] & 1) != 0
+
+    # SSTC stimecmp -> STIP: S 模式直接写 stimecmp CSR 设定时器,
+    # 无需 SBI ecall 往返.  硬件语义: mtime >= stimecmp > 0 ⇒ STIP 置位.
+    # CLINT.check_interrupt 只返回 MSIP/MTIP, 不含 STIP, 故需在此补齐.
+    stimecmp_val = hart._csr_read_raw("stimecmp")
+    if stimecmp_val > 0 and ctrl.get_mtime() >= stimecmp_val:
+        mip_bits |= INT_SOURCE_MIP_MASK[IntSource.STI]
+        has_pending = True
+
+    # PLIC 外部中断 (MEIP/SEIP) — CLINT.check_interrupt 不含 PLIC 源位,
+    # 但 _update_hw_mip 的 _HW_MIP_MASK 覆盖 MEIP/SEIP (bits 11/9),
+    # 若此处不补齐则 _update_hw_mip 会清除 _native_sync_plic_mip() 刚置位的
+    # SEIP/MEIP → WFI 永远无法被 UART/virtio 等外设中断唤醒。
+    # 修正: 与 check_pending_interrupts (line 578-584) 相同的 PLIC 合并逻辑.
+    plic_mip = 0
+    if hart._plic is not None:
+        plic_mip = hart._plic.get_pending_mip(hart.id)
+    mip_bits = mip_bits | plic_mip
+
+    _update_hw_mip(hart, mip_bits)
+
+    if not has_pending and not msip_raw and plic_mip == 0:
+        return False
+
+    # WFI 唤醒: 检查 mip & mie (源级).  特殊处理 MSIP: 即使 mie.MSIE=0,
+    # 只要 CLINT MSIP 硬件寄存器非零即可唤醒 (与 Rust 行为一致).
+    if (hart.mip_val & hart.mie_val) == 0 and not msip_raw:
+        return False
+
+    # MSIP 硬件活跃但 mie.MSIE=0: 临时置位 MSIE, 确保后续
+    # check_pending_interrupts 可投递该中断到 M 模式 trap handler.
+    # (与 Rust ``exec.rs`` line 390-392 逻辑一致)
+    if msip_raw and (hart.csrs["mie"].val & (1 << 3)) == 0:
+        hart.csrs["mie"].val |= 1 << 3
+
+    hart._waiting = False
+    hart._wfi_woken = True
+    return True
 
 
 def check_pending_interrupts(
@@ -439,15 +602,18 @@ def check_pending_interrupts(
 
     # 合并全部硬件中断源
     mip_bits = mip_bits | plic_mip
+
+    # 更新 mip CSR: 用当前硬件状态替换硬件源位, 保留软件写入位.
+    # 必须在 early return 之前执行 — 即使无 pending 中断, 也要清除已撤除的
+    # 硬件源位 (如 MSIP 清零后 mip.MSIP 需同步为 0), 否则旧位残留
+    # 导致下次 mip & mie 仍命中 -> MSIP 风暴.
+    _update_hw_mip(hart, mip_bits)
+
     if not has_pending and plic_mip == 0:
-        # 无中断挂起 → 更新缓存供后续快速路径使用
+        # 无中断挂起 -> 更新缓存供后续快速路径使用
         hart._int_cache_version = hart._int_state_version
         hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)
         return False
-
-    # 更新 mip CSR: 合并硬件中断源和软件写入的 mip 位
-    current_mip = hart._csr_read_raw("mip")
-    hart._csr_write_raw("mip", current_mip | mip_bits)
 
     # M 模式 + MIE=0 -> 全局关中断
     if hart.mode == RiscvMode.M and not hart.mie:
@@ -502,9 +668,8 @@ def deliver_trap_nested_enabled(
     if was_wfi:
         hart._wfi_woken = True
 
-    # 嵌套中断不递增连续 trap 计数 (允许正常的多层嵌套)
-    if not is_interrupt:
-        hart._consecutive_traps += 1
+    # consecutive_traps is tracked at instruction boundaries;
+    # no unconditional increment here.
 
     code = trap_cause_code(cause)
     exc_code = code & 0x7FFF_FFFF_FFFF_FFFF
@@ -541,14 +706,14 @@ def check_pending_interrupts_nested_enabled(
 
     # ---- 全量中断检查 ----
     has_pending, mip_bits, _ = ctrl.check_interrupt(hart.id)
+
+    _update_hw_mip(hart, mip_bits)
+
     if not has_pending:
-        # 无中断挂起 → 更新缓存
+        # 无中断挂起 -> 更新缓存
         hart._int_cache_version = hart._int_state_version
         hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)
         return False
-
-    current_mip = hart._csr_read_raw("mip")
-    hart._csr_write_raw("mip", current_mip | mip_bits)
 
     if hart.mode == RiscvMode.M and not hart.mie:
         return False

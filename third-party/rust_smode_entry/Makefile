@@ -40,6 +40,8 @@ src/config_gen.rs: config.mk Makefile
 	@echo 'pub const UART_TXEN: u32 = $(UART_TXEN);' >> $@
 	@echo 'pub const SMODE_STACK_SIZE: u64 = $(SMODE_STACK_SIZE);' >> $@
 	@echo 'pub const LINK_BASE: u64 = $(LINK_BASE);' >> $@
+	@echo 'pub const ATTEST_ENABLE: bool = $(ATTEST_ENABLE);' >> $@
+	@echo 'pub const ATTEST_PUB_KEY: [u8; 33] = [$(ATTEST_PUB_KEY)];' >> $@
 phony += src/config_gen.rs
 
 

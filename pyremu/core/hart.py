@@ -5,8 +5,8 @@
 
 """
 Hart (硬件线程) 的寄存器文件定义，包含:
-- 通用整数寄存器 (GPR x0–x31)
-- 浮点寄存器 (FPR f0–f31)
+- 通用整数寄存器 (GPR x0-x31)
+- 浮点寄存器 (FPR f0-f31)
 - 控制和状态寄存器 (CSR)
 - 特权级模式 (RiscvMode)
 - mstatus 等关键 CSR 的位字段定义及快捷属性
@@ -14,11 +14,12 @@ Hart (硬件线程) 的寄存器文件定义，包含:
 
 from __future__ import annotations
 
-import ctypes
 from collections.abc import Callable
+import ctypes
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from pyremu.core.diag import HartDiag
 from pyremu.core.registers import (
     check_csr,
     csr_addr_from_name,
@@ -85,7 +86,7 @@ class RiscvMode(Enum):
     D = 8
 
 
-# u8 privilege value → RiscvMode (for unmarshalling from FFI / wire formats).
+# u8 privilege value -> RiscvMode (for unmarshalling from FFI / wire formats).
 _MODE_FROM_U8: dict[int, RiscvMode] = {0: RiscvMode.U, 1: RiscvMode.S, 3: RiscvMode.M}
 
 
@@ -157,6 +158,9 @@ class HartWithRegs:
         self.id = id
         self.gprs = GprFile()
         self.fprs = register_fpr()
+        # 浮点寄存器原始 bits (NaN-boxed u64) — FFI marshal 与位精确运算的真值源。
+        # self.fprs (FPR float 对象) 供调试器展示; _fpr_bits 为权威存储。
+        self._fpr_bits = [0] * 32
         self.csrs = register_csr()
 
         # 机器信息寄存器 — 只读, 复位时写入
@@ -164,9 +168,19 @@ class HartWithRegs:
         self.csrs["mvendorid"].val = 0  # 非商业实现
         self.csrs["marchid"].val = 0  # 未指定架构 ID
         self.csrs["mimpid"].val = 1  # 实现版本
-        # misa: MXL=2 (RV64) | A | C | I | M | F | D
-        #    (与 DTB riscv,isa 字段一致: rv64imafdc)
-        self.csrs["misa"].val = (2 << 62) | (1 << 0) | (1 << 2) | (1 << 8) | (1 << 12) | (1 << 5) | (1 << 3)
+        # misa: MXL=2 (RV64) | I | M | A | F | D | C | S | U
+        #    (与 DTB riscv,isa 字段一致: rv64imafdc, 加 S/U 支持)
+        self.csrs["misa"].val = (
+            (2 << 62)               # MXL=2 (RV64)
+            | (1 << 8)              # I — base integer
+            | (1 << 12)             # M — integer multiply/divide
+            | (1 << 0)              # A — atomic
+            | (1 << 5)              # F — single-precision float
+            | (1 << 3)              # D — double-precision float
+            | (1 << 2)              # C — compressed
+            | (1 << 18)             # S — supervisor mode
+            | (1 << 20)             # U — user mode
+        )
 
         self.pc = 0
         self.mode = RiscvMode.M
@@ -204,6 +218,7 @@ class HartWithRegs:
         # SC 仅在预留有效时成功, 否则失败; trap 发生时也清除预留
         self._reservation_addr: int = 0
         self._reservation_valid: bool = False
+        self._reservation_value: int = 0  # value loaded by LR, passed to SC for CAS
 
         # 页表遍历模式 — 由 satp CSR 的 MODE 字段决定
         # Bare=0, Sv39=8, Sv48=9, Sv57=10, Sv64=11
@@ -227,6 +242,14 @@ class HartWithRegs:
         # 此期间的指令 (中断 handler + 返回路径) 不计入 _total_instrs,
         # 以保证指令计数器反映的是固件实际执行的非中断上下文指令.
         self._wfi_woken: bool = False
+
+        # 每 hart 指令计数 — 该 hart 实际执行的指令数.
+        # 跨 batch 累加; native batch 中由 Rust 通过 state.total_instrs 更新,
+        # 纯 Python 路径中由 sync_counters 递增.
+        self._total_instrs: int = 0
+
+        # CLINT MSIP 边沿诊断 (并发路径 sync_msip 更新)
+        self.diag = HartDiag()
 
         # 中断状态缓存 — 避免每条指令都做完整的 CLINT+CSR+PLIC 遍历 (~1272 ns).
         # _int_state_version 在软件写 CSR / CLINT 变化 / 特权级切换时递增.
@@ -259,6 +282,12 @@ class HartWithRegs:
         if csr_name == "sstatus":
             mval = self._csr_read_raw("mstatus")
             return mval & _SSTATUS_MASK
+        # sie 是 mie 的受限视图 — 只有 mideleg 委派的位在 S 模式可见
+        if csr_name == "sie":
+            return self._csr_read_raw("mie") & self._csr_read_raw("mideleg")
+        # sip 是 mip 的受限视图 — 只有 mideleg 委派的位在 S 模式可见
+        if csr_name == "sip":
+            return self._csr_read_raw("mip") & self._csr_read_raw("mideleg")
         return self._csr_read_raw(csr_name)
 
     # CSR names whose writes affect interrupt state and must invalidate the
@@ -292,9 +321,15 @@ class HartWithRegs:
         elif csr_name == "pmpsplit":
             self.pmpsplit_val = val
         elif csr_name.startswith(("pmpcfg", "pmpaddr")):
-            # PMP CSR 写入 → 使 Rust 扁平缓存失效
+            # PMP CSR 写入 -> 使 Rust 扁平缓存失效, 并同步到所有 hart
             self._csr_write_raw(csr_name, val)
             self._pmp.invalidate_cache()
+            # 同步 PMP 到其他 hart — OpenSBI 冷启动 hart 可能不是 hart 0,
+            # 而 _step_native 始终使用 active[0]._pmp 构建传给 Rust 的扁平数组
+            for h in (self._all_harts or ()):
+                if h is not self:
+                    h._csr_write_raw(csr_name, val)
+                    h._pmp.invalidate_cache()
             return
         elif csr_name == "stimecmp":
             # SSTC: S-mode 直接写 stimecmp -> 同步到 CLINT mtimecmp
@@ -316,6 +351,19 @@ class HartWithRegs:
             mstatus = (mstatus & ~_SSTATUS_WRITABLE_MASK) | (val & _SSTATUS_WRITABLE_MASK)
             self._csr_write_raw("mstatus", mstatus)
             self._csr_write_raw("sstatus", mstatus & _SSTATUS_MASK)
+        elif csr_name == "sie":
+            # sie 是 mie 的受限视图 — 只有 mideleg 委派的位可通过 S 模式写
+            mideleg = self._csr_read_raw("mideleg")
+            old_mie = self._csr_read_raw("mie")
+            new_mie = (old_mie & ~mideleg) | (val & mideleg)
+            self._csr_write_raw("mie", new_mie)
+        elif csr_name == "sip":
+            # sip 是 mip 的受限视图 — 只有 mideleg 委派的位可通过 S 模式写
+            # (大多数中断是只读的, 但 SSIP 可被 S 模式软件置位/清除)
+            mideleg = self._csr_read_raw("mideleg")
+            old_mip = self._csr_read_raw("mip")
+            new_mip = (old_mip & ~mideleg) | (val & mideleg)
+            self._csr_write_raw("mip", new_mip)
         else:
             self._csr_write_raw(csr_name, val)
 
@@ -499,9 +547,25 @@ class HartWithRegs:
 
     @satp_val.setter
     def satp_val(self, v: int) -> None:
-        """写入 satp 时同步更新缓存的 MMU 模式."""
+        """写入 satp 时同步更新缓存的 MMU 模式.
+
+        ASID 字段 (bits[59:44]) 按 WARL 硬连线为 0: 本实现的 TLB (Python 与
+        Rust 批量引擎两侧) 查找均不带 ASID 标签。若允许 ASID 读回非零,
+        Linux 探测到 ASID 支持后会启用 ASID 分配器, 上下文切换时仅改写
+        satp.ASID 而不执行 sfence.vma — 前一地址空间的 TLB 表项残留命中,
+        用户进程读到脏数据随机 SIGSEGV (ld.so 崩溃)。读回 0 则内核走
+        no-ASID 路径, 每次 mm 切换显式 local_flush_tlb_all().
+
+        satp 写入只在 MODE 字段变化 (地址空间切换) 时刷新 TLB,
+        避免 marshal/unmarshal 边界的冗余冲刷引入副作用.
+        """
+        v &= ~(0xFFFF << 44)
         self.csrs["satp"].val = v & 0xFFFF_FFFF_FFFF_FFFF
-        self._mmu_mode = (v >> 60) & 0xF
+        new_mode = (v >> 60) & 0xF
+        if new_mode != self._mmu_mode:
+            self.itlb.flush_all()
+            self.dtlb.flush_all()
+        self._mmu_mode = new_mode
 
     # ----------------------------------------------------------
     #  页表遍历模式 (由 satp.MODE 字段驱动)
@@ -617,7 +681,7 @@ class HartWithRegs:
 
     @mip_val.setter
     def mip_val(self, v: int):
-        self.csrs["mip"].val = v
+        self._csr_write_raw("mip", v)
 
     @property
     def mie_val(self) -> int:
@@ -628,15 +692,17 @@ class HartWithRegs:
     #  LR/SC 预留管理 (A-extension)
     # ----------------------------------------------------------
 
-    def set_reservation(self, addr: int) -> None:
-        """设置 LR 预留地址 (原子 load-reserved 成功时调用)."""
+    def set_reservation(self, addr: int, value: int = 0) -> None:
+        """设置 LR 预留地址和加载值 (原子 load-reserved 成功时调用)."""
         self._reservation_addr = addr
         self._reservation_valid = True
+        self._reservation_value = value
 
     def clear_reservation(self) -> None:
         """清除 LR/SC 预留 (SC 失败 / 其他 hart 写入 / trap 时调用)."""
         self._reservation_valid = False
         self._reservation_addr = 0
+        self._reservation_value = 0
 
     @property
     def reservation_valid(self) -> bool:
@@ -668,8 +734,39 @@ class TlbEntry(ctypes.Structure):
         ("level", ctypes.c_uint8),
         ("valid", ctypes.c_uint8),
         ("mdid", ctypes.c_uint8),
-        ("_pad", ctypes.c_uint32),
+        ("tlb_epoch", ctypes.c_uint32),
     ]
+
+
+class HartDiagC(ctypes.Structure):
+    """Diagnostic counters — matches Rust ``HartDiag`` exactly."""
+    _fields_ = [
+        ("clint_msip_set", ctypes.c_uint64),
+        ("clint_msip_clr", ctypes.c_uint64),
+        ("clint_mtc_wr", ctypes.c_uint64),
+        ("clint_msip_wr0", ctypes.c_uint64),
+        ("clint_msip_wr1", ctypes.c_uint64),
+        ("clint_wr1_remote", ctypes.c_uint64),
+        ("clint_wr1_self", ctypes.c_uint64),
+        ("cooldown_start", ctypes.c_uint64),
+        ("wfi_wake_msip", ctypes.c_uint64),
+        ("wfi_wake_mtip", ctypes.c_uint64),
+        ("wfi_wake_other", ctypes.c_uint64),
+        ("trap_msip_total", ctypes.c_uint64),
+        ("trap_msip_delegated", ctypes.c_uint64),
+        ("msip_last_seen", ctypes.c_uint64),
+        ("msip_masked_by_msie", ctypes.c_uint64),
+        ("msip_pending_no_trap", ctypes.c_uint64),
+        ("nt_mip_snapshot", ctypes.c_uint64),
+        ("nt_mie_snapshot", ctypes.c_uint64),
+        ("msie_cleared_at_pc", ctypes.c_uint64),
+        ("wfi_wake_no_msip_trap", ctypes.c_uint64),
+        ("nt_mode", ctypes.c_uint8),
+        ("nt_clint_raw", ctypes.c_uint8),
+        ("_pad2", ctypes.c_uint8 * 6),
+        ("nt_pending", ctypes.c_uint64),
+    ]
+
 
 class HartState(ctypes.Structure):
     """Per-hart state marshaled to/from the Rust batch execution loop.
@@ -699,16 +796,18 @@ class HartState(ctypes.Structure):
         ("pc", ctypes.c_uint64),
         # Reservation (LR/SC)
         ("reservation_addr", ctypes.c_uint64),
+        ("reservation_value", ctypes.c_uint64),
         # Single-byte fields (packed after u64s)
         ("reservation_valid", ctypes.c_uint8),
         ("mode", ctypes.c_uint8),
         ("mmu_mode", ctypes.c_uint8),
         ("waiting", ctypes.c_uint8),
+        ("wfi_woken", ctypes.c_uint8),
         ("halted", ctypes.c_uint8),
         ("consecutive_traps", ctypes.c_uint8),
         ("mdid", ctypes.c_uint8),
         ("pmpsplit", ctypes.c_uint8),
-        ("_pad", ctypes.c_uint8 * 6),
+        ("_pad", ctypes.c_uint8 * 5),
         # ---- Phase B: TLB entries (array-of-structs, 32 × 2) ----
         ("itlb", TlbEntry * 32),
         ("dtlb", TlbEntry * 32),
@@ -718,8 +817,18 @@ class HartState(ctypes.Structure):
         ("mhartid", ctypes.c_uint64),
         ("mcounteren", ctypes.c_uint64),
         ("scounteren", ctypes.c_uint64),
+        # ---- Phase D: Sstc stimecmp ----
+        ("stimecmp", ctypes.c_uint64),
         # ---- Phase E: cache ----
         ("_mmu_mode_pad", ctypes.c_uint64),
+        # ---- Phase F: per-hart instruction counter ----
+        ("total_instrs", ctypes.c_uint64),
+        # ---- Diagnostic sub-struct (matches Rust HartDiag) ----
+        ("diag", HartDiagC),
+        # ---- Phase G: F/D floating point ----
+        ("fprs", ctypes.c_uint64 * 32),
+        ("fcsr", ctypes.c_uint32),
+        ("_fpad", ctypes.c_uint8 * 4),
     ]
 
 
@@ -744,10 +853,11 @@ class BatchResult(ctypes.Structure):
 EXIT_NORMAL = 0
 EXIT_TRAP = 1
 EXIT_MMIO = 2
-EXIT_SYS = 3
+EXIT_ECALL = 3
 EXIT_EBREAK = 4
 EXIT_WFI_WAIT = 5
 EXIT_ERROR = 6
+EXIT_BREAKPOINT = 7
 
 
 # ============================================================
@@ -781,8 +891,10 @@ def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
 
     state.reservation_valid = 1 if hart.reservation_valid else 0
     state.reservation_addr = hart.reservation_addr
+    state.reservation_value = hart._reservation_value
 
     state.waiting = 1 if hart._waiting else 0
+    state.wfi_woken = 1 if hart._wfi_woken else 0
     state.halted = 1 if hart._halted else 0
     state.consecutive_traps = hart._consecutive_traps
 
@@ -800,6 +912,19 @@ def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
     state.mhartid = hart.csrs["mhartid"].val
     state.mcounteren = hart.csrs["mcounteren"].val
     state.scounteren = hart.csrs["scounteren"].val if "scounteren" in hart.csrs else 0
+    state.stimecmp = hart.csrs["stimecmp"].val if "stimecmp" in hart.csrs else 0
+
+    # ---- Phase F: per-hart instruction counter ----
+    state.total_instrs = hart._total_instrs
+
+    # ---- Phase F2: MSIP edge counter — must survive round-trips so
+    # Rust sync_msip doesn't re-detect stale edges at batch start ----
+    state.diag.msip_last_seen = hart.diag.msip_last_seen
+
+    # ---- Phase G: F/D floating point ----
+    for i in range(32):
+        state.fprs[i] = hart._fpr_bits[i]
+    state.fcsr = hart.csrs["fcsr"].val & 0xFF
 
 
 def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
@@ -828,8 +953,10 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
 
     hart._reservation_valid = state.reservation_valid != 0
     hart._reservation_addr = state.reservation_addr
+    hart._reservation_value = state.reservation_value
 
     hart._waiting = state.waiting != 0
+    hart._wfi_woken = state.wfi_woken != 0
     hart._halted = state.halted != 0
     hart._consecutive_traps = state.consecutive_traps
 
@@ -846,3 +973,17 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
     hart.csrs["mcounteren"].val = state.mcounteren
     if "scounteren" in hart.csrs:
         hart.csrs["scounteren"].val = state.scounteren
+    hart._csr_write_raw("stimecmp", state.stimecmp)
+
+    # ---- Phase F: per-hart instruction counter ----
+    hart._total_instrs = state.total_instrs
+
+    # ---- Diagnostic: CLINT MSIP edge counters ----
+    hart.diag.load_ctypes(state.diag)
+
+    # ---- Phase G: F/D floating point ----
+    for i in range(32):
+        hart._fpr_bits[i] = state.fprs[i]
+    hart.csrs["fcsr"].val = state.fcsr & 0xFF
+    hart.csrs["frm"].val = (state.fcsr >> 5) & 0x7
+    hart.csrs["fflags"].val = state.fcsr & 0x1F

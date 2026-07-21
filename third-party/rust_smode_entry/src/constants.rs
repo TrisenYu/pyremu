@@ -100,6 +100,21 @@ pub const PF_W: u32 = 2;
 pub const PF_X: u32 = 1;
 
 // ---------------------------------------------------------------
+//  Attestation (secp256r1 ECDSA + SHA-256)
+// ---------------------------------------------------------------
+
+/// secp256r1 标量字节长度 (私钥 / 坐标)。
+pub const ECC_BYTES: usize = 32;
+/// 压缩公钥长度 = 0x02/0x03 前缀 + X 坐标。
+pub const PUB_KEY_LEN: usize = ECC_BYTES + 1; // 33
+/// ECDSA 签名长度 = r‖s。
+pub const SIG_LEN: usize = ECC_BYTES * 2; // 64
+/// SHA-256 摘要长度。
+pub const SHA256_DIGEST: usize = 32;
+
+// ATTEST_PUB_KEY: [u8; 33] 由 Makefile 从 config.mk 生成注入 config_gen.rs。
+
+// ---------------------------------------------------------------
 //  测试（仅 host 端编译时可用）
 // ---------------------------------------------------------------
 

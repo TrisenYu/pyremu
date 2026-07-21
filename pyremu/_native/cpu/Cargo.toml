@@ -1,0 +1,16 @@
+[package]
+name = "pyremu-native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "decode"
+
+[features]
+default = []
+diagnostic = []
+
+[dependencies]
+rand = "0.10.2"
+softfloat_pure = { git = "https://github.com/HarryR/softfloat-pure.git" }

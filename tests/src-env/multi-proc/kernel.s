@@ -149,6 +149,9 @@ s_mode_boot:
     csrs sstatus, t0
     li   t0, (1 << 8)
     csrc sstatus, t0
+    // SUM=1: 允许 S 模式访存 U 模式页 (读 faulting 指令、用户栈、进程切换)
+    li   t0, (1 << 18)
+    csrs sstatus, t0
 
     // 调试: 在 Sv39 前打印
     la   a0, str_boot

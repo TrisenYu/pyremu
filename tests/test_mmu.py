@@ -330,7 +330,7 @@ class TestSv39Walk:
 
         satp = (SATP_MODE_SV39 << 60) | root_ppn
         va = 0x0
-        ok, pa = translate_va(va, satp, read_fn)
+        ok, pa, _perm = translate_va(va, satp, read_fn)
         assert ok, "三层 4 KiB 页遍历应成功"
         assert pa == 0x40000, f"PA 应为 0x40000, 得到 0x{pa:x}"
 
@@ -355,7 +355,7 @@ class TestSv39Walk:
         satp = (SATP_MODE_SV39 << 60) | root_ppn
         # va: vpn0=0x1AB, offset=0xABC
         va = (0x1AB << 12) | 0xABC
-        ok, pa = translate_va(va, satp, read_fn)
+        ok, pa, _perm = translate_va(va, satp, read_fn)
         assert ok
         # PA: PPN[43:9]=0x20, PPN[8:0]=vpn0=0x1AB, offset=0xABC
         expected_pa = (0x41AB << 12) | 0xABC
@@ -388,7 +388,7 @@ class TestSv39Walk:
         satp = (SATP_MODE_SV39 << 60) | root_ppn
         # VA: vpn[0]=0xAB, offset=0xCDE
         va = (0xAB << 12) | 0xCDE
-        ok, pa = translate_va(va, satp, read_fn)
+        ok, pa, _perm = translate_va(va, satp, read_fn)
         assert ok, "大页翻译应成功"
         # PPN: 高位保留, PPN[8:0] -> vpn[0], offset 不变
         expected_pa = ((mega_ppn & 0xFFFFFFFFFFFE00) | 0xAB) << 12 | 0xCDE
@@ -421,7 +421,7 @@ class TestSv39Walk:
         satp = (SATP_MODE_SV39 << 60) | root_ppn
         # VA: vpn[0]=1 (匹配 Linux 启动场景), offset=0x4c
         va = (1 << 12) | 0x4C
-        ok, pa = translate_va(va, satp, read_fn)
+        ok, pa, _perm = translate_va(va, satp, read_fn)
         assert ok, "大页翻译应成功"
         # 正确: PPN bit 9 保留, PPN[8:0] -> vpn[0]=0x1
         expected_pa = ((mega_ppn & 0xFFFFFFFFFFFE00) | 0x1) << 12 | 0x4C
@@ -436,7 +436,7 @@ class TestSv39Walk:
         """Bare 模式: VA 即 PA, 不做翻译."""
         _, read_fn, _ = ram_ctx
         satp = SATP_MODE_BARE << 60
-        ok, pa = translate_va(0xDEADBEEF, satp, read_fn)
+        ok, pa, _perm = translate_va(0xDEADBEEF, satp, read_fn)
         assert ok
         assert pa == 0xDEADBEEF
 
@@ -450,14 +450,14 @@ class TestSv39Walk:
         self._write_pte(ram, write_fn, (1 << PAGE_SHIFT), invalid_pte)
 
         satp = (SATP_MODE_SV39 << 60) | root_ppn
-        ok, pa = translate_va(0x0, satp, read_fn)
+        ok, pa, _perm = translate_va(0x0, satp, read_fn)
         assert not ok, "无效 PTE 应导致翻译失败"
 
     def test_unsupported_mode_fails(self, ram_ctx):
         """未实现的模式 (如 Sv48) 应返回失败."""
         _, read_fn, _ = ram_ctx
         satp = (SATP_MODE_SV39 + 1) << 60  # 无效/未支持的模式
-        ok, pa = translate_va(0x0, satp, read_fn)
+        ok, pa, _perm = translate_va(0x0, satp, read_fn)
         assert not ok
 
 
@@ -778,3 +778,46 @@ class TestHartMMUIntegration:
         # VA=0x0 -> vpn[0]=0, mega PPN[9:0]=0 -> PA=0x800000
         ok, pa = translate_addr(hart, 0x0)
         assert ok and pa == 0x800000, f"PA=0x{pa:x}, ASID 不影响页表遍历"
+
+
+# ============================================================
+#  satp.ASID 硬连线为 0 (WARL) — 回归
+# ============================================================
+
+
+class TestSatpAsidHardwiredZero:
+    """satp.ASID (bits[59:44]) 必须写入即被清零 (WARL 读回 0).
+
+    回归背景: TLB (Python 与 Rust 批量引擎) 查找均不带 ASID 标签。旧行为
+    原样存储 ASID → Linux 探测到 ASID 支持 → 启用 ASID 分配器 → 上下文
+    切换仅改写 satp.ASID 而不执行 sfence.vma → 前一地址空间的 TLB 表项
+    残留命中 → 用户进程读脏数据 SIGSEGV (实测: ls 崩于 ld.so, 现场
+    satp=0x8000100000082f1b 即 ASID=1 证明分配器已激活)。
+    """
+
+    # Linux ASID 探测写法: ASID 全 1; PPN 取现场值 0x82f1b
+    PROBE = (8 << 60) | (0xFFFF << 44) | 0x82F1B
+    EXPECT = (8 << 60) | 0x82F1B
+
+    def test_setter_masks_asid(self):
+        """satp_val setter 写入全 1 ASID, 读回 ASID=0 且 MODE/PPN 保留."""
+        h = HartWithRegs(id=0)
+        h.satp_val = self.PROBE
+        assert h.satp_val == self.EXPECT
+        assert h.satp_val != self.PROBE, "旧行为 (ASID 原样存储) 不得重现"
+        assert h.mmu_mode == 8
+        assert h.satp_ppn == 0x82F1B
+
+    def test_write_csr_masks_asid(self):
+        """csrw satp 路径 (write_csr) 同样清零 ASID."""
+        h = HartWithRegs(id=0)
+        h.mode = RiscvMode.M
+        h.write_csr(0x180, self.PROBE)
+        assert h.satp_val == self.EXPECT
+        assert h.mmu_mode == 8
+
+    def test_nonzero_asid_field_from_live_session(self):
+        """现场触发值 0x8000100000082f1b (ASID=1) 写入后 ASID 归零."""
+        h = HartWithRegs(id=0)
+        h.satp_val = 0x8000_1000_0008_2F1B
+        assert h.satp_val == 0x8000_0000_0008_2F1B

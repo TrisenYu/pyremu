@@ -5,12 +5,24 @@
 """多 hart UART 行缓冲 + OpenSBI 彩票启动测试."""
 
 import functools
+import re
 
 import pytest
 
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import FirmwareImage, parse_firmware
+
+# ------------------------------------------------------------
+#  ANSI escape code stripping
+# ------------------------------------------------------------
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI escape codes from *text* (used by hart-coloured output)."""
+    return _ANSI_RE.sub("", text)
 
 # ------------------------------------------------------------
 #  模块级固件缓存 — 避免每个测试重复解析 ELF
@@ -88,27 +100,73 @@ def lottery_lines_4h(emu_4h: Emulator) -> list[str]:
 
 
 class TestUartLineBuffering:
-    """多 hart UART 行缓冲 — 输出不交错且带 hart 标签."""
+    """多 hart UART 行缓冲 — 输出不交错, 日志文件按 hart 隔离.
 
-    def test_each_line_has_hart_prefix(self, lottery_lines_4h: list[str]):
-        """每条输出行应以 '[hart N]' 开头."""
+    控制台输出不再添加 ``[hart N]`` 前缀 (与 QEMU -nographic 一致);
+    多 hart 调试信息通过 ``set_hart_log_dir()`` 提供的日志文件获取。
+    """
+
+    def test_lines_preserved_no_interleaving(self, lottery_lines_4h: list[str]):
+        """行级输出完整 — 不出现跨 hart 字符交错.
+
+        每条以 \\n 结尾的行应包含完整的 boot 消息
+        (如 "cold boot", "warm boot", "running")。
+        """
         assert len(lottery_lines_4h) > 0, "应有输出"
-        for line in lottery_lines_4h:
-            assert line.startswith("[hart "), f"行应以 '[hart N]' 开头, 得到: {line!r}"
+        all_text = "".join(lottery_lines_4h)
+        # 关键行完整 (不交错则每条消息完整可辨)
+        assert "cold boot\n" in all_text
+        assert "warm boot\n" in all_text
+        assert "running\n" in all_text
 
-    def test_no_interleaving_within_line(self, lottery_lines_4h: list[str]):
-        """单行内不应包含来自其他 hart 的片段 (无交错)."""
-        for line in lottery_lines_4h:
-            assert line.count("[hart ") == 1, f"行内出现多个 hart 标签 (交错): {line!r}"
+    def test_no_ansi_prefix_in_output(self, lottery_lines_4h: list[str]):
+        """控制台输出不含 [hart N] 前缀."""
+        all_text = "".join(lottery_lines_4h)
+        assert "[hart" not in _strip_ansi(all_text), (
+            f"不应含 [hart 前缀, 得到: {all_text[:120]}..."
+        )
 
     def test_all_harts_produce_output(self, lottery_lines_4h: list[str]):
-        """所有 4 个 hart 都应有输出."""
-        hart_ids: set[int] = set()
-        for line in lottery_lines_4h:
-            end = line.index("]")
-            n = int(line[6:end])
-            hart_ids.add(n)
-        assert hart_ids == {0, 1, 2, 3}, f"应包含所有 hart, 得到: {hart_ids}"
+        """所有 4 个 hart 都应有输出 (验证每 hart 至少输出一行)."""
+        # 每 hart 至少输出 "cold boot" 或 "warm boot" + "running";
+        # 4 hart 产生 >= 8 行输出 (每 hart cold/warm + running 各一行)
+        assert len(lottery_lines_4h) >= 8, (
+            f"4 hart 至少 8 行输出, 得到 {len(lottery_lines_4h)}"
+        )
+        # 恰好一个 cold boot
+        cold_count = sum(1 for ln in lottery_lines_4h if "cold boot" in ln)
+        assert cold_count == 1, f"应恰好 1 个 cold boot, 得到 {cold_count}"
+        # 其余 3 个 warm boot
+        warm_count = sum(1 for ln in lottery_lines_4h if "warm boot" in ln)
+        assert warm_count == 3, f"应 3 个 warm boot, 得到 {warm_count}"
+
+    def test_per_hart_log_files(self, tmp_path):
+        """日志文件按 hart 隔离 — 每个 hart 的日志文件含其完整输出."""
+        sink: list[str] = []
+        emu = _make_emu(4)
+        cap = _Capture()
+        emu.uart._tx_callback = cap
+        emu.uart.set_hart_log_dir(str(tmp_path))
+        img = _cached_firmware(_LOTTERY_ELF)
+        emu.load_firmware(img)
+        for _ in range(_LOTTERY_CYCLES):
+            emu.step()
+        emu.uart.flush_all()
+        emu.uart.close_logs()
+
+        # 各 hart 的日志文件应含其 boot 消息
+        hart_outputs: dict[int, str] = {}
+        for hid in range(4):
+            log = tmp_path / f"hart{hid}.log"
+            if log.exists():
+                hart_outputs[hid] = log.read_text()
+        assert len(hart_outputs) == 4, f"应有 4 个日志文件, 得到 {len(hart_outputs)}"
+        # 恰好一个 cold boot (在某个 hart 的日志中)
+        cold_harts = [h for h, t in hart_outputs.items() if "cold boot" in t]
+        assert len(cold_harts) == 1, f"应恰好 1 个 cold boot, 得到 {cold_harts}"
+        # 其余 3 个 warm boot
+        warm_harts = [h for h, t in hart_outputs.items() if "warm boot" in t]
+        assert len(warm_harts) == 3, f"应 3 个 warm boot, 得到 {warm_harts}"
 
 
 # ------------------------------------------------------------
@@ -143,16 +201,29 @@ class TestLotteryBoot:
             f"热启动应在冷启动之后: cold@{cold_idx}, warm@{warm_indices}"
         )
 
-    def test_cold_hart_runs_before_others(self, lottery_lines_4h: list[str]):
-        """冷启动 hart 的 running 应出现在其他 hart 的 warm 之前或同时."""
-        cold_line = next(ln for ln in lottery_lines_4h if "cold boot" in ln)
-        cold_hart = int(cold_line[6 : cold_line.index("]")])
-        cold_run_idx = next(
-            i
-            for i, ln in enumerate(lottery_lines_4h)
-            if "running" in ln and ln.startswith(f"[hart {cold_hart}]")
-        )
-        assert cold_run_idx is not None
+    def test_cold_hart_runs_before_others(self, tmp_path):
+        """冷启动 hart 的 running 应出现在自身日志中, 且日志按 hart 隔离."""
+        emu = _make_emu(4)
+        emu.uart.set_hart_log_dir(str(tmp_path))
+        img = _cached_firmware(_LOTTERY_ELF)
+        emu.load_firmware(img)
+        for _ in range(_LOTTERY_CYCLES):
+            emu.step()
+        emu.uart.flush_all()
+        emu.uart.close_logs()
+
+        # 找到冷启动 hart
+        cold_hart = None
+        for hid in range(4):
+            log = tmp_path / f"hart{hid}.log"
+            if log.exists() and "cold boot" in log.read_text():
+                cold_hart = hid
+                break
+        assert cold_hart is not None, "应有一个 cold boot hart"
+        # 冷启动 hart 的日志应包含 cold boot + running
+        cold_log = (tmp_path / f"hart{cold_hart}.log").read_text()
+        assert "cold boot" in cold_log
+        assert "running" in cold_log
 
     def test_lock_prevents_duplicate_cold(self):
         """多次运行均只有 1 个 cold boot (锁机制正确)."""

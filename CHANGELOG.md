@@ -1,3 +1,384 @@
+## 2026-07-21 — 多核 TLB/缓存一致性 + 中断投递修复
+
+### 多核 TLB 一致性: 跨批次 Python TLB 刷新 (最关键修复)
+
+**现象**: Linux 多核启动后用户空间命令 (如 `ls`) 间歇性 SIGSEGV, 动态链接器
+`ld-linux-riscv64-lp64d.so.1` 在 nonsense VA (如 `0x33d = NULL+0x33d`) 触发
+Load page fault (cause=13), 寄存器显示指针为小整数 (如 `a5=7`) 而非有效地址。
+
+**根因 — 三重 TLB 陈旧窗口**:
+
+1. **Python TLB 不参与 marshal/unmarshal** ([hart.py](pyremu/core/hart.py)):
+   "Python TLB is ground truth" 设计假设 Python TLB 条目在跨批次间一直有效,
+   但 Rust 批量执行期间内核可能修改页表 + SFENCE.VMA — Rust TLB 正确刷新,
+   Python TLB 的陈旧条目却毫发无损地存活到下一轮 Python 模式执行。
+   - 修复 ([emulator.py](pyremu/emulator.py)): 每轮 Rust batch 后无条件
+     `flush_all()` 全部 hart 的 itlb/dtlb。过度失效永远安全, 热 TLB 在
+     下轮 Python 执行中快速重建。
+
+2. **Rust batch 全部空闲退出时 WFI hart 的 TLB 未刷新**:
+   WFI hart 在主循环中不检查 `tlb_gen`。当 batch 因全部 idle 退出时,
+   WFI hart 的陈旧 Rust TLB 条目被 unmarshal 到 Python 侧, 下一轮 Python
+   模式执行命中错误 VA→PA 映射。
+   - 修复 ([hart_sched.rs](pyremu/_native/cpu/src/hart_sched.rs)): WFI 自旋
+     返回 false (batch 退出) 时, 与主循环同样的 `tlb_gen` 比较+刷新逻辑。
+
+3. **Python SFENCE.VMA 仅刷本地 hart**:
+   匹配 RISC-V 规范单 hart 语义, 但未提供与 Rust 引擎 `tlb_gen` 广播相同的
+   安全网。若 hart A 在 Python 模式下改 PTE + SFENCE.VMA, hart B 的陈旧
+   Python TLB 保留到下一 batch。
+   - 修复 ([decoder.py](pyremu/core/decoder.py)): Python SFENCE.VMA 同步
+     刷新全部 hart 的 itlb/dtlb, 匹配 Rust 引擎广播语义。
+
+**多核一致性完整链条** (修复后):
+
+| 边界 | 内存 | TLB | L2 |
+|------|------|-----|----|
+| Python→Rust | `flush_l2()` 回写脏行 | Rust 冷启动 | `flush_l2()` |
+| Rust 内部 | 共享 bytearray + TSO | `tlb_gen` 代际广播 | 绕过 L2 |
+| Rust→Python | bytearray 直接可见 | `flush_all()` 无条件刷 | `invalidate_l2()` |
+
+### 跨核 MSIP 投递: batch 边界竞争修复
+
+**现象**: 间歇性 TLB shootdown 死锁 — hart A 向 hart B 发 MSIP 请求 shootdown,
+MSIP 在 batch 执行期间到达, batch 退出后 Python 一致性检查将新到达的 MSIP
+当作"已投递但 CLINT 未清除"错误清零 → IPI 永久丢失 → hart B 永不执行 shootdown。
+
+**根因**: `_step_native` 的 MSIP 一致性检查仅依据 hart 的 mip.MSIP 和 CLINT._msip,
+无法区分"旧 MSIP 已投递待清除"与"新 MSIP 在 batch 期间到达"。
+
+- 修复 ([emulator.py](pyremu/emulator.py)): 保存 `_pre_batch_msip` (batch 前
+  CLINT MSIP 电平), 一致性检查增加 `_pre_batch_msip[hid]` 条件 — 仅当 MSIP
+  在 batch 前就已挂起时才允许清除 CLINT._msip。
+
+### PLIC 电平中断语义: claim/complete 修复
+
+**现象**: UART TX watermark 中断在一次 claim 后永久丢失 — ISR 每次仅发
+FIFO 深度个字符, TXDATA 写由 Rust inline 处理不经 Python, complete 后
+无人再调 `set_irq` 重新置位 pending。
+
+- 修复 ([plic.py](pyremu/interrupt/plic.py)): 新增 `_level[]` 数组记录设备侧
+  电平状态; `set_irq` 同步设置 `_level` 和 `_pending`; `_do_complete` 在
+  电平仍为高时自动重新置位 pending, 匹配 QEMU `sifive_plic` 行为。
+
+### WFI 唤醒标记生命周期修复
+
+**现象**: `trap_mret` / `trap_sret` 无条件清除 `_wfi_woken`, 导致
+`while (state != READY) wfi()` 轮询循环在 trap handler 返回后立即重回睡眠
+(而非将 WFI 视为 NOP 推进 PC 重新检查条件)。
+
+- 修复 ([trap_handler.py](pyremu/core/trap_handler.py)): `trap_mret`/`trap_sret`
+  不再清除 `_wfi_woken`; 改为在 `handle_wfi` 中, 若 `_wfi_woken` 置位,
+  将 WFI 视为 NOP 后清除标记。同时新增 `try_wfi_wakeup()` 供 idle poll 使用。
+
+### PLIC DTB 布尔属性编码修正
+
+**现象**: Linux 内核打印 `interrupt-controller: Boolean property without
+a value` 警告。
+
+- 修复 ([dtb.py](pyremu/utils/dtb.py)): `property_string("interrupt-controller", "")`
+  改为 `property("interrupt-controller", b"")` — DT 布尔属性必须零长度值,
+  空字符串含 `\0` 终止符 (长度为 1), 违反 DT 规范。
+
+### 调试器 stdin try 块收紧
+
+- 修复 ([base.py](pyremu/debug/base.py)): `_feed_uart_stdin` 中原先一个宽泛的
+  try/except 包裹全部 I/O 操作, 改为在每处具体调用点 (`uart.preload`,
+  `select.select`, `os.read`) 精确捕获、提前返回。
+
+### Rust 并发测试: cross_hart_msip_wakes_target 竞态修复
+
+- 修复 ([concurrent.rs](pyremu/_native/cpu/src/concurrent.rs)): hart 0 增加
+  延迟循环 (512 迭代) 确保 hart 1 先进入 WFI; PC 处增加安全 `jal` 防止
+  执行越界进入未初始化 RAM 导致 MRET 死循环覆盖 mcause。
+
+### HartState mip_val setter 优化
+
+- [hart.py](pyremu/core/hart.py): `mip_val` setter 改用 `_csr_write_raw`
+  绕过 pydantic 模型验证 (~10× 加速 CSR 写入热路径), 同时消除递归调用风险。
+
+### virtio-blk QueueNotify 内联处理 → WFI 空闲死锁修复
+
+**现象**: 内核启动到 `printk: legacy bootconsole [sbi0] disabled` 后, 四个 hart
+全部陷在 `cpu_do_idle` WFI 中无法推进。UART 输出出现逐行重复 (如
+`console [ttySIF0] enabled` 打印两次)。间歇性发生, 与 timer 是否恰好命中有关。
+
+**根因**: Rust batch 对 virtio `QueueNotify` 写操作采用内联处理 — 仅设
+`notify_pending=1` 而不退出 batch (减少 FFI 开销)。内核写完 QueueNotify
+后进入 WFI 等待 I/O 完成中断。`wfi_check_all_idle` 检测到所有 hart 空闲后,
+发现有定时器待触发 → timer fast-forward → 唤醒 hart → 定时器 handler 执行
+→ 设新定时器 → 再次 WFI → 循环反复。**virtqueue 始终得不到 Python 侧处理**
+(仅在 batch 退出后进行), 磁盘 I/O 永久挂起。
+
+**修复** ([handlers.rs](pyremu/_native/cpu/src/handlers.rs) +
+[hart_sched.rs](pyremu/_native/cpu/src/hart_sched.rs)):
+
+- `DevCtx` 新增 `has_pending_python_work()` 方法 — 封装"是否有设备将工作
+  延迟到 Python 侧"的检查语义。当前检查 virtio `notify_pending` 标志,
+  未来其他内联 MMIO 设备可直接扩展。
+- `hart_worker` 在进入 `wfi_spin` **之前**调用此方法: 若为真则立即以
+  `WFI_WAIT` 退出 batch, 而非进入 WFI 自旋 → Python 处理 virtqueue →
+  拉高完成中断 → 下一 batch 内核立即收到 I/O 响应。
+- WFI 模块 (`wfi.rs`) **完全不变** — 保持纯 CPU 概念, 不耦合任何设备类型。
+
+## 2026-07-16
+
+### UART 交互式终端即时回显 — QEMU 风格部分行刷新
+
+**现象**: 修复乱码和 stdin 死锁后, 交互式 shell 仍不理想 — `# ` 提示符和字符
+回显延迟显示, 需等待 `\n` 或 WFI 空闲轮询 (~50ms) 才批量出现。
+
+**根因 — 两层缓冲**: 
+1. **UART 行缓冲**: `_write_reg` 仅在遇 `\n` 时调 `_flush_hart` (带 `[hart N]`
+   前缀) 输出; 不以 `\n` 结尾的字节 (提示符 `# `、字符回显) 滞留在
+   `_line_bufs` 中。
+2. **flush_all 加前缀**: `flush_all()` 调用 `_flush_hart`, 给每段残余字节加
+   `[hart N]` 前缀。此前为修复"逐字符乱码"将 `flush_all` 限制为 WFI 条件调用,
+   但副作用是部分行在非 WFI 期间完全不显示。
+
+**修复 — QEMU 风格无前缀部分行刷新**:
+- UART ([uart.py](pyremu/peripheral/uart.py)): 新增 `_flush_hart_partial(hid)` —
+  输出原始字节不加 `[hart N]` 前缀; `flush_all()` 改为调用此方法。
+  `_flush_hart` 保留不变, 仅在 `\n` 时调用 (完整行加前缀)。
+- Emulator ([emulator.py](pyremu/emulator.py)):
+  - `_step_native`: `_native_flush_uart` 之后立即无条件 `flush_all()`,
+    确保每批次 Rust ring buffer 中的字节立即显示。
+  - `_native_finalize`: 入口处无条件 `flush_all()`, 刷新 ECALL/MMIO
+    处理中产生的额外 UART 输出。
+  - 移除旧的 WFI 条件 `flush_all` 守卫 (已不需要, 部分行刷新不加前缀)。
+
+**效果**: 完整行 (kernel log) 仍带 `[hart N]` 前缀; 部分行 (shell 提示符、
+字符回显) 不加前缀直接输出, 匹配 QEMU `-nographic` 行为。
+
+### UART TX 逐字符乱码修复 + stdin 死锁修复
+
+**现象 A — 逐字符 `[hart 0] X` 乱码**: Linux 启动输出每字符被单独
+`[hart 0]` 包裹, 产生 `[hart 0] [[hart 0]  [hart 0] 7...` 乱码, 完全不可读。
+
+**根因 — 两层叠加**:
+1. **`_native_finalize` 无条件 `flush_all()`**: `flush_all()` 在每批次末尾
+   无条件调用, 导致只要 `_line_bufs` 中有未完成的字符 (未遇 `\n`) 就被立即
+   刷出为独立行。
+2. **OpenSBI TXDATA 轮询 → 每字符一个 batch**: OpenSBI `sifive_uart_putchar`
+   先读 TXDATA 检查 TX FIFO 满 (bit 31), 再写 TXDATA。Native 引擎对 UART
+   读一律 exit 到 Python, 而写则 inline 缓冲。每字符的读→写序列跨 batch,
+   逐字符累积到 `_line_bufs` 后立即被 (1) 刷出 → 每字符一个 `[hart 0] X`。
+
+**修复 A**:
+- `_native_finalize` ([emulator.py](pyremu/emulator.py)): `flush_all()` 加
+  `wfi_waiting > 0` 条件, 仅在全部 hart WFI 空闲时刷新残余行缓冲。
+  正常以 `\n` 结尾的行在 `_write_reg` 中已即时经 `_flush_hart` 输出,
+  不受此影响; shell 提示符 `# ` 无 `\n` 仍需此兜底。
+- `try_handle_uart_concurrent` ([concurrent.rs](pyremu/_native/src/concurrent.rs)):
+  TXDATA 读 (offset 0) 返回 `Some(0)` (FIFO 不满), 不再 exit 到 Python。
+  RXDATA 读仍走 Python (需实际输入数据)。Load 路径增加 UART inline 读调用
+  (与 CLINT/virtio 读 inline 并列)。
+
+**现象 B — 客机无法接收终端输入 + `# ` 提示符不可见**:
+1. **stdin 转发死锁**: `_wfi_sleep_if_idle` 阻塞在 `_wake_event.wait()` 时,
+   Python 线程完全睡眠; `step()` 不返回 → `_feed_uart_stdin` (在 `step()` 之后)
+   永不被调用 → 用户输入滞留 stdin buffer → UART RX 永远为空 → PLIC 中断
+   永不触发 → 客机永久卡在 WFI。
+2. **`# ` 提示符**: shell 输出 `# ` (无 `\n`) 后立即 `read()` → 内核 WFI。
+   只有 WFI 空闲时 `flush_all()` 才将 `# ` 从行缓冲刷出。
+
+**修复 B — WFI 睡眠内联轮询**:
+- `Emulator._idle_poll_cb` ([emulator.py](pyremu/emulator.py)): 可选回调,
+  debugger 在 `_enter_run_mode` 时挂载, `_enter_repl_mode` 时清除。
+- `_wfi_sleep_if_idle` 修改: 当 `_idle_poll_cb` 存在时以 ~50ms 短间隔循环
+  (而非单次阻塞 `wait()`), 每轮调用回调检查 stdin。回调返回 `True` 时立即
+  退出睡眠, 使 PLIC 中断能在下一 batch 被投递。
+- `Debugger._idle_poll` ([base.py](pyremu/debug/base.py)): 转发 stdin +
+  `flush_all()`, 确保 WFI 期间 (a) 用户输入立即可用, (b) shell 提示符
+  在 ~50ms 内显示而非等到 step() 返回。
+
+### UART TX 行缓冲 + 空闲刷新 + RX PLIC 中断接线
+
+**TX 问题 — `/bin/sh` 提示符不可见**:
+- **现象**: `init=/bin/sh` 启动后内核打印 "Run /bin/sh as init process" 但 `# ` 提示符
+  不出现, 用户在 QEMU 中能看到但在 pyremu 中看不到。
+- **根因**: UART `_write_reg` 按行缓冲累加字节, 仅在 `\n` (0x0A) 时刷新到回调。
+  shell 的 `# ` 不以换行结尾, 写入后立即阻塞 `read(stdin)` → 字符永久滞留在行缓冲。
+- **修复**: 在系统进入 WFI 全空闲时调用 `flush_all()` 刷新所有 hart 的剩余行缓冲。
+  空闲检测点:
+  - `_native_finalize`: `_wfi_sleep_if_idle` 前 (native 并发引擎)
+  - `Debugger._run_until`: `all_idle` (纯 Python 路径, cnt==0 且全部 WFI)
+  - 仅在实际空闲时刷新, 不影响内核启动日志 (所有 `printk` 输出均以 `\n` 结尾,
+    正常路径已即时刷新)
+
+**设计取舍 — 逐字符 vs 行缓冲**:
+  初次尝试逐字符输出 (模拟真实 UART 无行缓冲) 导致多 hart 输出字符级交错
+  (`[hart 0] w[hart 1] w[hart 2] w`), 破坏了 lottery_boot 的按 hart 去交错保证。
+  回退到行缓冲 + WFI 空闲刷新方案: 多 hart 输出按行隔离 (buffer per hart), 空闲时
+  刷新部分行 (单 hart shell prompt) 不引入交差错乱。
+
+**RX 问题 — 客机无法接收终端输入**:
+- **现象**: 用户运行期间无法输入内容 (除 Ctrl+C 暂停), 即便键入字符客机也完全不响应。
+  `Debugger._feed_uart_stdin` 确实将字符 preload 到 `_rx_buf` 并置 `IP_RXWM`,
+  但 UART 未接入 PLIC → 内核驱动收不到中断 → 永不读取 RXDATA。
+- **修复**:
+  - `UART(plic=..., irq=...)` — 新增 PLIC 引用与中断源编号参数
+  - `UART_IRQ = 10` — 对齐 QEMU virt 平台, 与 DTB `serial@.../interrupts-extended` 一致
+  - `_update_plic_rx()` — 根据 RX buffer 状态 + IE.RXIE 同步 PLIC 中断线
+    (buffer 非空 + RXIE=1 → `plic.set_irq(10, True)`; 反之拉低)
+  - `preload()` / `_read_reg(RXDATA)` / `_write_reg(IE)` → 调 `_update_plic_rx()`
+  - PLIC claim 清除 `_pending[10]` 后若 buffer 仍有剩余字节, RXDATA 读取时重新拉高
+  - `emulator.py` 构造 UART 时传入 `self.plic` + `UART_IRQ`
+
+### 默认 bootargs 清理
+- 移除 `loglevel=8 debug ignore_loglevel dyndbg=...` (每次 SBI/timer 调用产生海量日志,
+  严重拖慢模拟器); 调试版本注释保留供日后使用
+- 默认仅有 `earlycon=sbi console=ttySIF0 random.trust_bootloader=on`
+- 测试更新: `TestDeviceTree` 不再断言 `keep_bootcon`
+
+## 2026-07-14
+
+### 多 hart SMP 启动崩溃修复 — per-hart PMP 隔离 (native 并发引擎)
+
+**现象**: `make emu-linux-jump hart_num=4` 启动时, 内核在 SMP bringup 阶段崩溃:
+```
+Oops - instruction access fault [#1]
+CPU: 0 ... epc : handle_exception+0x0 ... cause: 0x1 (instruction access fault)
+[<...>] cpuhp_bringup_ap → wait_for_completion → ...
+```
+1/2 hart 正常启动到 VFS panic; 3 hart 崩溃并可打印 Oops; 4 hart 卡在
+`smp: Bringing up secondary CPUs ...` 后无任何输出。故障随 hart 数递增而加剧
+—— 典型的数据竞争特征。
+
+**根因 — native 并发引擎跨 hart 共享单一 PMP**:
+- 每个 Python hart 有独立 `Pmp` ([hart.py](pyremu/core/hart.py) `self._pmp`),
+  但 `_step_native` 只把 `active[0]._pmp` 送入 native, 批次后再镜像到其它 hart。
+- `run_parallel` 将同一 `SharedPmpCtx` (`Arc<Send+Sync>`) 交给每个 hart 线程。
+- SMP bringup 时各 hart 的 OpenSBI warm-boot 并发执行 `sbi_hart_pmp_configure`
+  (清空再重写 8 条 PMP 表项)。多线程无同步地写同一 `cfg`/`addr` 裸指针数组 →
+  **数据竞争 + 瞬时执行权限丢失**: 某 hart 清表项的窗口内, boot hart 取指命中
+  内核 text 却被共享 PMP 拒绝 → `cause=1` 取指访问故障 (而非 `0xc` 缺页 —
+  证明是物理 PMP 拒绝, 非 MMU)。
+
+**修复 — 每 hart 独立 PMP 切片**:
+- FFI 契约不变 (`FfiPmpCtx.cfg/addr` 指针), 但缓冲改为 `num_harts * 64` 项连续
+  数组, hart `h` 使用 `[h*64, h*64+64)` 切片:
+  - `emulator.py` `_native_marshal_pmp` / `_native_unmarshal_pmp` — 逐 hart 拷入/
+    拷回自己的切片; 不再镜像; 仅在切片确被 Rust 改写时才 `sync_from_flat` (省 CSR 回写)。
+  - `concurrent.rs` `run_parallel` — spawn 时 `pmp_send.cfg/addr.add(hid*64)`, 每个
+    线程只见自己的切片。
+  - `exec.rs` `run_batch` (已弃用) 同步按 `hid*64` 偏移。
+- 回归测试 [tests/test_pmp_smp.py](tests/test_pmp_smp.py): 2/4 hart 各写不同 PMP,
+  批次后互不干扰 (修前必失败 — 全被压成 hart0 的值)。
+
+### 后续修复 — `PmpInfo.num` u8 溢出致 4 hart PMP 被静默禁用
+
+**现象**: 上述 per-hart 切片修复后, 4 hart 启动仍无 Linux 串口输出; hart0 到达
+S-mode 内核 (运行 5000 万+ 指令) 却在 `vprintk_store` 反复 `LdAccessFault`
+(cause=5), 每次 printk 均故障 → 无输出; 从核卡在 `0x8000a6f8` M-mode warm-boot。
+OpenSBI 报 "Boot HART PMP Count : 0", `show pmps` 全部 OFF —— 但内核仍能跑数千万
+S-mode 指令, 自相矛盾 (num>0 且全 OFF 时 S-mode 应全部拒绝)。
+
+**根因 — per-hart 切片引入的整型溢出**:
+- per-hart PMP 缓冲为 `64 * num_harts` 项扁平数组, 但 `PmpInfo.num` 误算为
+  `min(len(cfg), len(addr))` = *扁平总长* (应为 *每 hart* 条目数)。
+- `FfiPmpCtx.num` 是 `c_uint8`。4 hart 时总长 `64*4 = 256`, 写入 u8 溢出为
+  `256 & 0xFF = 0`。1~3 hart (64/128/192) 未溢出故未暴露。
+- `num=0` 触发两条独立路径, 恰好互相掩盖:
+  - `csr.rs` 的 pmpcfg/pmpaddr 读写以 `n < pmp.num` 为门控 → 全部 no-op/返回 0 →
+    OpenSBI 探测不到任何 PMP 表项 → "PMP Count : 0" → 跳过 lpmp / 内存域配置。
+  - `handlers.rs::pmp_ok` 首行 `if pmp.num == 0 { return true; }` → 放行一切访问 →
+    内核照跑 (解释了"全 OFF 却能跑"的矛盾)。
+- OpenSBI 未配置内存域, 4 hart SMP 交接留下不一致的 M-mode 陷态/域状态, 最终在
+  内核 printk 路径引发 `LdAccessFault` 风暴。
+
+**修复**: `PmpInfo` 按 `hart_num` 反算每 hart 条目数 `num = total // hart_num`
+(单 hart 默认 `hart_num=1` 向后兼容), 并在 `num > 0xFF` 时显式 `ValueError`
+防止未来再次静默溢出。`_native_marshal_pmp` 传入 `hart_num=len(self.harts)`。
+- 修复后 4 hart `num=64` (与 1~3 hart 一致), 启动产生 Linux 输出, 4 个 hart 均达
+  S-mode, 到达与单 hart 相同的预期 VFS panic (待挂载 rootfs)。
+- 回归测试 [tests/test_pmp_smp.py](tests/test_pmp_smp.py):
+  `test_pmpinfo_num_is_per_hart_not_flattened` (参数化 1/2/3/4/8 hart) +
+  `test_pmpinfo_num_survives_u8_ffi_at_four_harts` (经 `FfiPmpCtx.num` u8 往返仍为
+  64) —— 修前 4 hart 断言 `num==64` 必失败 (得 0)。
+
+### 停用并移除 `run_batch` (Python 侧)
+
+`step()` / `run()` 早已统一走 `run_parallel` (`_step_native` 的 `concurrent=True`
+分支), 串行 `run_batch` 分支为死代码。移除 Python 侧 `run_batch` 调用与 import,
+`_step_native` 只用 `run_parallel`。Rust `run_batch` 保留但标注 `#[deprecated]`。
+
+### `_step_native` / `build_dtb` 拆分
+
+- `_step_native` (268 行) 拆为编排器 + 9 个职责单一的 helper
+  (`_native_marshal_{dev,pmp,clint,uart}` / `_native_unmarshal_{pmp,clint}` /
+  `_native_flush_uart` / `_native_handle_exit` / `_native_finalize`)。
+- `build_dtb` (125 语句) 拆为 `_dtb_{chosen,aliases,cpus,memory,clint,plic,uart,
+  simple_devices,watchdog}` —— 每个函数写入一个/一组节点, 保持 begin/end 顺序。
+- `_NATIVE_MAX_INSTRS` 常量改为可变成员 `self._native_max_instrs` (调试器多步覆盖
+  的是实例值, 不再改写"常量"; 修正类型检查器 `Literal[100000]` 告警)。
+
+### initramfs (debootstrap rootfs) 接入
+
+- `utils/dtb.py`: 新增 `Initrd(start, end)` dataclass; `build_dtb(initrd=...)` 在
+  `/chosen` 写入 `linux,initrd-start` / `linux,initrd-end` (u64 大端), 即使无
+  bootargs 也生成 `/chosen`。
+- `emulator.py`: `load_initrd(path, addr)` 写入 RAM + 记录范围, 进入生成的 DTB。
+- `debug/cli.py`: `--initrd PATH` / `--initrd-addr ADDR` (默认置于 DTB 下方 2 MiB
+  对齐, 避开内核 Image)。
+- `makefile`: `build-initramfs` (debootstrap 目录 → `fakeroot cpio -H newc | gzip`);
+  `emu-linux-jump INITRD=$(INITRAMFS)` 折叠可选 rootfs (自动追加 `root=/dev/ram0
+  rdinit=...`)。
+- 回归 [tests/test_initrd.py](tests/test_initrd.py): DTB u64 编码往返 + `load_initrd`。
+
+**说明**: native 并发引擎目前不向 guest 投递 PLIC 外部中断, 故 virtio-blk
+`root=/dev/vda` 会因等不到完成中断而挂起; rootfs 采用 initramfs (无需中断,
+内核解包 cpio 到 tmpfs)。
+
+
+### Thread-per-hart 并发执行引擎 + CSR_MTOPI 死锁修复
+
+**背景**: Linux SMP 双核启动时 Hart 0 在 S-mode WFI 空闲, Hart 1 在 M-mode
+`tlb_sync` 自旋 (等待 Hart 0 消费 TLB shootdown 事件), 系统陷入沉默。
+AMO trace 显示 Hart 1 正确设置了 IPI 并递增 `tlb_sync`, 但 Hart 0 从未消费。
+
+**根因 — OpenSBI AIA 中断路径误激活**:
+`CSR_MTOPI` (0xFB0) 返回 `(0, CSR_OK)`, OpenSBI 的 `__check_ext_csr(CSR_MTOPI)`
+probe 成功 → `SBI_HART_EXT_SMAIA` 被检测为存在 → `sbi_trap_handler` 选择 AIA 路径:
+
+```c
+if (sbi_hart_has_extension(..., SBI_HART_EXT_SMAIA))
+    rc = sbi_trap_aia_irq();                             // ← AIA 路径
+else
+    rc = sbi_trap_nonaia_irq(mcause & ~MCAUSE_IRQ_MASK); // ← 本应走此路径
+```
+
+`sbi_trap_aia_irq()` 循环读取 `CSR_MTOPI` 获取最高优先级中断 ID, 但 `mtopi`
+始终返回 0 (无中断) → 循环体从不执行 → `sbi_ipi_process()` 从不被调用 →
+TLB shootdown handler 永远不触发 → 死锁.
+
+**修复**:
+- `csr.rs`: `0xFB0` read → `(0, CSR_ILL)`, write → `CSR_ILL`
+  (OpenSBI probe 捕获 IllInstr → SMAIA 不检测 → non-AIA 路径 → 基于 mcause 正确分发)
+- `registers.py`: `mtopi` 标记 `.not_implemented()` → `CsrAccessError` → IllInstr
+- 其他 AIA CSR (`mvien`, `mvip`, `mvienh`, `mviph`) 保持 `(0, CSR_OK)` — 读零无副作用
+
+**架构 — `run_parallel` (thread-per-hart)**:
+`pyremu/_native/src/concurrent.rs` — 每个活跃 hart 一个 OS 线程, 取代顺序
+round-robin batch. 真正并发执行, 不存在 batch 边界截断临界区的问题.
+- 共享 RAM: x86 TSO 下常规 load/store 直接可见, AMO 用 `AtomicU32`/`AtomicU64`
+- CLINT: `mtime`/`mtimecmp`/`msip` 均为 per-hart `Atomic*` — lock-free
+- 停止机制: `AtomicBool` stop flag, 任一 hart 触发 trap/ECALL/MMIO 时协调退出
+- WFI: spin-loop 检查 MSIP + mip&mie, 全 idle 检测返回 Python 做 `time.sleep()`
+- 环境变量 `PYREMU_NATIVE_SERIAL=1` 回退到 `run_batch`
+
+### 诊断字段重构: HartDiag + 调试器默认隐藏
+
+- `state.rs`: 25 个诊断计数器打包为 `HartDiag` `#[repr(C)]` 子结构,
+  `HartState` 以 `diag: HartDiag` 单字段暴露, FFI 布局不变
+- `base.py`: `_show_diag` 标志位, `PYREMU_DIAG_VERBOSE=1` 控制
+- `status.py`: `info` 概览 MSIP 列 + 详情 "MSIP edges"/"no-trap snap" 行默认隐藏
+- `makefile`: `emu-linux-jump-diag` target 自动启用
+
+### 控制台输出修复
+- `emulator.py`: 默认 bootargs 添加 `console=ttySIF0`
+- `dtb.py`: `/chosen` 恢复 `stdout-path`
+
 ## 2026-07-05
 
 ### FFI struct 布局不匹配: Python struct-of-arrays ↔ Rust array-of-structs → SIGBUS

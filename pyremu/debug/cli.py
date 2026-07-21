@@ -6,8 +6,8 @@
 """CLI 入口 — 解析参数、加载固件并启动交互调试器."""
 
 import argparse
-import sys
 from pathlib import Path
+import sys
 
 from loguru import logger
 
@@ -17,6 +17,9 @@ from pyremu.emulator import Emulator
 from pyremu.env_inject import Preloader
 from pyremu.platform import PeripheralConfig, PlatformConfig
 from pyremu.utils.parse_bin import FirmwareImage, parse_firmware
+
+# virtio-blk MMIO 基址 — 置于默认外设 (UART/SPI/I2C/GPIO/watchdog) 之后的空闲槽。
+_VIRTIO_BLK_BASE = 0x1000_5000
 
 # ============================================================
 #  Argument parser
@@ -107,6 +110,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--bootargs", type=str, default=None, metavar="ARGS",
         help="内核命令行参数, 写入 DTB /chosen/bootargs",
     )
+    p.add_argument(
+        "--initrd", type=str, default=None, metavar="PATH",
+        help="initramfs (cpio[.gz]) 文件, 加载到 RAM 并写入 DTB /chosen",
+    )
+    p.add_argument(
+        "--initrd-addr", type=lambda x: int(x, 0), default=None,
+        metavar="ADDR",
+        help="initramfs 加载地址 (默认 DTB 下方按 2 MiB 对齐)",
+    )
+    p.add_argument(
+        "--disk", type=str, default=None, metavar="PATH",
+        help="virtio-blk 磁盘镜像 (raw/ext4), 挂载为 /dev/vda; 无写权限时只读打开",
+    )
+    p.add_argument(
+        "--hart-logs", type=str, default=None, metavar="DIR",
+        help="将各 hart 的串口输出另存到 DIR/hart<N>.log (多核输出去交错)",
+    )
     return p
 
 
@@ -131,9 +151,9 @@ def _setup_logger(level: str) -> None:
 
 
 def _parse_ram_size(ram_str: str) -> int:
-    """解析 RAM 大小字符串 (支持 K/M/G 后缀) -> 字节数."""
-    s = ram_str.upper()
-    if s[-1] in _RAM_MUL:
+    """解析 RAM 大小字符串 (支持 K/KB/M/MB/G/GB 后缀) -> 字节数."""
+    s = ram_str.upper().rstrip("B")
+    if s and s[-1] in _RAM_MUL:
         return int(s[:-1]) * _RAM_MUL[s[-1]]
     return int(s)
 
@@ -248,6 +268,31 @@ def _setup_entry_symbol(
     return target_entry
 
 
+def _load_initrd(
+    emu: Emulator,
+    path: str | None,
+    addr: int | None,
+    ram_base: int,
+    ram_size: int,
+) -> None:
+    """加载 initramfs 到 RAM 并记录范围 (必须在生成 DTB 之前调用).
+
+    默认地址置于 DTB (RAM 顶端 −64 KiB) 下方, 按 2 MiB 向下对齐,
+    以避开内核 Image (ram_base + 0x200000) 区域。
+    """
+    if path is None:
+        return
+    size = Path(path).stat().st_size
+    if addr is None:
+        dtb_top = ram_base + ram_size - 0x10000
+        addr = (dtb_top - size) & ~0x1FFFFF  # 2 MiB 向下对齐
+    info = emu.load_initrd(path, addr)
+    logger.info(
+        f"initramfs 已加载: {path} -> PA 0x{info.start:x}..0x{info.end:x}"
+        f" ({fmt_size(size)})"
+    )
+
+
 def _load_kernel_image(
     emu: Emulator,
     kernel_path: str,
@@ -287,17 +332,47 @@ def debugger(args: list[str] | None = None) -> None:
     effective_entry = image.entry_point + load_offset
     prog_cnt = ns.prog_cnt if ns.prog_cnt is not None else effective_entry
 
+    # --disk: 启用 virtio-blk (base 置于 watchdog 之后的空闲 MMIO 槽)。
+    # 未显式给 --bootargs 时提供默认根挂载参数 (只读, ext4 root 所有)。
+    periph = PeripheralConfig()
+    bootargs = ns.bootargs
+    if ns.disk is not None:
+        periph.virtio_blk_base = _VIRTIO_BLK_BASE
+        if bootargs is None:
+            # debootstrap --variant=minbase 不创建 /sbin/init -> systemd 的
+            # 符号链接; 内核按序查找 init 会一路落到 /bin/sh 并阻塞在无输入
+            # 的 stdin read 上 (表现为指令计数器攀升但无输出)。
+            # 显式指定 systemd 路径绕过此问题。
+            # systemd.log_level=debug + console 目标: 若 systemd 静默失败,
+            # 至少能看到它输出了什么 (journald 转发到串口)。
+            bootargs = (
+                "earlycon=sbi console=ttySIF0 "
+                "root=/dev/vda ro "
+                "init=/usr/lib/systemd/systemd "
+                "random.trust_bootloader=on "
+                "deferred_probe_timeout=10 "
+                "systemd.log_level=debug systemd.log_target=console "
+                "systemd.journald.forward_to_console=1"
+            )
+
     plat_cfg = PlatformConfig(
         num_harts=ns.harts,
         ram_size=ram_size,
         ram_base=ns.ram_base,
         prog_cnt=prog_cnt,
-        periph=PeripheralConfig(),
+        periph=periph,
+        disk_image=ns.disk,
     )
-    emu = Emulator(plat_cfg, bootargs=ns.bootargs)
+    emu = Emulator(plat_cfg, bootargs=bootargs)
     emu.load_firmware(image, load_offset=load_offset)
+    if ns.hart_logs is not None and emu.uart is not None:
+        emu.uart.set_hart_log_dir(ns.hart_logs)
+        logger.info(f"各 hart 串口输出另存至: {ns.hart_logs}/hart<N>.log")
     for h in emu.harts:
         h.pc = prog_cnt
+
+    # initramfs 必须在生成 DTB 之前加载 (范围需写入 /chosen)。
+    _load_initrd(emu, ns.initrd, ns.initrd_addr, ns.ram_base, ram_size)
 
     fdt_addr = _configure_fdt(emu, ns, ns.ram_base, ram_size)
     fdt_note = (

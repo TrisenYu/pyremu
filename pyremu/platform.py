@@ -35,6 +35,7 @@ from typing import Any
 
 import yaml
 
+COMPILE_OPTS: str = "rv64imacfd_sstc_zicsr_zifencei"
 
 @dataclass
 class PeripheralConfig:
@@ -47,6 +48,7 @@ class PeripheralConfig:
     clint_base: int = 0x0200_0000
     plic_base: int = 0x0C00_0000  # PLIC 基址 (SiFive standard)
     virtio_blk_base: int = 0  # 0 = 禁用
+    watchdog_base: int = 0x1000_4000
 
 
 @dataclass
@@ -70,7 +72,7 @@ class PlatformConfig:
     prog_cnt: int = 0x8000_0000
     l2_size: int = 256 * 1024  # 256 KiB
 
-    isa: str = "rv64imac_sstc_zicsr_zifencei"
+    isa: str = COMPILE_OPTS
     timebase_freq: int = 10_000_000  # 10 MHz
     pmp_entries: int = 64  # PMP 条目数 (0=禁用, 8/16/64 常见)
     disk_image: str | None = None  # virtio-blk 磁盘镜像路径, None=不挂载
@@ -134,7 +136,7 @@ class PlatformConfig:
         """
         return cls(
             num_harts=4,
-            isa="rv64imac_sstc_zicsr_zifencei",
+            isa=COMPILE_OPTS,
             periph=PeripheralConfig(
                 uart_base=0x1000_0000,
                 spi_base=0x1001_0000,
@@ -149,7 +151,7 @@ class PlatformConfig:
         """QEMU RISC-V virt 风格布局."""
         return cls(
             num_harts=1,
-            isa="rv64imac_sstc_zicsr_zifencei",
+            isa=COMPILE_OPTS,
             periph=PeripheralConfig(
                 uart_base=0x1000_0000,
                 spi_base=0x1000_1000,

@@ -166,7 +166,7 @@ class Pmp:
         self._cache_dirty = True
 
     def _rebuild_cache(self) -> None:
-        """从 CSR dict 重建扁平化 PMP 数组."""
+        """从 CSR dict 重建扁平化 PMP 数组 (entries -> flat)."""
         for i in range(self._num_entries):
             self._flat_cfg[i] = self._read_cfg(i)
             self._flat_addr[i] = self._read_addr(i)
@@ -174,6 +174,31 @@ class Pmp:
         for i in range(self._num_entries, 64):
             self._flat_cfg[i] = 0
             self._flat_addr[i] = 0
+        self._cache_dirty = False
+
+    def _sync_from_flat(self) -> None:
+        """将 Rust batch 修改后的 flat 数组同步回 CSR entries (flat -> entries).
+
+        逐字节写回 pmpcfg 寄存器: 先读 CSR 当前值, 替换目标字节,
+        写回, 确保同一寄存器内其他条目不受影响.
+        """
+        # Phase 1: write config bytes (pmpcfg registers).
+        for i in range(self._num_entries):
+            cfg_reg = (i // 8) * 2
+            reg_name = f"pmpcfg{cfg_reg}"
+            if reg_name not in self._csrs:
+                continue
+            cfg_val = self._csrs[reg_name].val
+            byte_idx = i & 0x7
+            shift = byte_idx * 8
+            byte_mask = 0xFF << shift
+            cfg_val = (cfg_val & ~byte_mask) | (self._flat_cfg[i] << shift)
+            self._csrs[reg_name].val = cfg_val
+        # Phase 2: write address values (pmpaddr registers).
+        for i in range(self._num_entries):
+            reg_name = f"pmpaddr{i}"
+            if reg_name in self._csrs:
+                self._csrs[reg_name].val = self._flat_addr[i]
         self._cache_dirty = False
 
     # ---- 权限检查入口 ----
@@ -269,7 +294,7 @@ class Pmp:
 
     def _read_cfg(self, idx: int) -> int:
         """读取第 *idx* 个 PMP 条目的 8-bit 配置."""
-        idx // 4  # 每个 pmpcfg 存 4 个条目 (RV32), 或 8 个 (RV64)
+        # 每个 pmpcfg 存 4 个条目 (RV32), 或 8 个 (RV64) <-> idx // 4
         # RV64: 仅偶数编号的 pmpcfg 有效 (存储 8 条目)
         # 简化: 统一用 RV64 模型 — 按 8 条目编组
         cfg_reg = (idx // 8) * 2  # pmpcfg0, pmpcfg2, pmpcfg4, ...

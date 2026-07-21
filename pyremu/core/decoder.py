@@ -29,16 +29,22 @@ from pyremu._native import (
     exec_op32 as _native_op32,
     exec_op_imm as _native_op_imm,
     exec_op_imm32 as _native_op_imm32,
+    fp_exec_fma as _native_fp_fma,
+    fp_exec_op as _native_fp_op,
     native_available,
 )
 from pyremu.core.hart import HartWithRegs
 from pyremu.core.mem_check_aux import (
+    AccessFault,
+    AlignmentFault,
+    MemoryAccessFault,
+    PageFault,
     mem_read,
     mem_write,
     validate_csr,
 )
 from pyremu.core.registers import CsrAccessError
-from pyremu.core.trap import TrapType
+from pyremu.core.trap_def import TrapType
 from pyremu.core.trap_handler import (
     deliver_trap,
     handle_wfi,
@@ -106,13 +112,19 @@ class Opc(Enum):
     """
 
     ld = 0b00000_11  # 载入
-    opfp = 0b00001_11  # 浮点
+    opfp = 0b00001_11  # 浮点载入 (FLW/FLD) — LOAD-FP
     fence = 0b00011_11  # 内存/执行流屏障
     opImm = 0b00100_11  # 立即数 ALU (32-bit)
     opImm32 = 0b00110_11  # RV64 32-bit 立即数 ALU
     auipc = 0b00101_11  # 累加 pc
     st = 0b01000_11  # 写入
+    stfp = 0b01001_11  # 浮点存储 (FSW/FSD) — STORE-FP
     amo = 0b01011_11  # 原子
+    fmadd = 0b10000_11  # 融合乘加 FMADD
+    fmsub = 0b10001_11  # 融合乘减 FMSUB
+    fnmsub = 0b10010_11  # 负融合乘减 FNMSUB
+    fnmadd = 0b10011_11  # 负融合乘加 FNMADD
+    opFp = 0b10100_11  # 浮点算术/转换/比较 OP-FP
     op = 0b01100_11  # ALU (R-type)
     lui = 0b01101_11  # 立即数载入
     op32 = 0b01110_11  # RV64 32-bit 操作
@@ -403,6 +415,13 @@ class Hart(HartWithRegs):
         0b11100_11: "handle_sys",       # Opc.sys
         0b00011_11: "handle_fence",     # Opc.fence
         0b01011_11: "handle_amo",       # Opc.amo
+        0b00001_11: "handle_fp_load",   # Opc.opfp (FLW/FLD)
+        0b01001_11: "handle_fp_store",  # Opc.stfp (FSW/FSD)
+        0b10100_11: "handle_fp_op",     # Opc.opFp (OP-FP)
+        0b10000_11: "handle_fp_fma",    # Opc.fmadd
+        0b10001_11: "handle_fp_fma",    # Opc.fmsub
+        0b10010_11: "handle_fp_fma",    # Opc.fnmsub
+        0b10011_11: "handle_fp_fma",    # Opc.fnmadd
     }
 
     # ----------------------------------------------------------
@@ -773,7 +792,13 @@ class Hart(HartWithRegs):
         else:
             read_size = 8  # ld
 
+        saved_pc = self.pc
         mem = mem_read(self, addr, read_size)
+        # mem_read may have delivered a trap (LdPageFault / LdAccessFault) and
+        # redirected PC to stvec.  If so, do NOT overwrite rd — the kernel's
+        # trap handler must see the original register state.
+        if self.pc != saved_pc:
+            return 0
 
         if f == ldFn3.lb:
             val = _sext8(mem[0])
@@ -802,8 +827,7 @@ class Hart(HartWithRegs):
     #  Store (opcode = Opc.st)
     # ----------------------------------------------------------
     def handle_st(self, instr: int):
-        """Execute a store instruction.
-        TODO: integrate MMU / TLB for address translation."""
+        """Execute a store instruction."""
         f = self._f
         fn3 = f.func3
         rs1 = f.rs1
@@ -830,7 +854,127 @@ class Hart(HartWithRegs):
         else:
             raise ValueError(f"unhandled store funct3={fn3:#x}")
 
+        saved_pc = self.pc
         mem_write(self, addr, data)
+        # mem_write may have delivered a trap (StPageFault / StAccessFault) and
+        # redirected PC to stvec.  If so, return 0 so the caller doesn't advance PC.
+        if self.pc != saved_pc:
+            return 0
+        return 4
+
+    # ----------------------------------------------------------
+    #  F/D floating point (opcode = opfp/stfp/opFp/fmadd…)
+    #
+    #  计算委托给 native softfloat (fp_exec_op/fp_exec_fma);
+    #  Python 侧仅负责寄存器/内存路由与 NaN-boxing。无纯 Python FPU。
+    # ----------------------------------------------------------
+
+    _NANBOX_S = 0xFFFF_FFFF_0000_0000
+    _MSTATUS_FS = 0b11 << 13
+    _MSTATUS_SD = 1 << 63
+
+    def _fp_enabled(self) -> bool:
+        """mstatus.FS != Off。"""
+        return (self.mstatus_val & self._MSTATUS_FS) != 0
+
+    def _fp_mark_dirty(self) -> None:
+        """执行浮点指令后置 FS=Dirty 与 SD。"""
+        self.mstatus_val = self.mstatus_val | self._MSTATUS_FS | self._MSTATUS_SD
+
+    def _fp_frm(self) -> int:
+        """当前动态舍入模式 fcsr.frm。"""
+        return (self.csrs["fcsr"].val >> 5) & 0x7
+
+    def _fp_accumulate_flags(self, fflags: int) -> None:
+        """将异常标志累积进 fcsr.fflags 并同步 fflags CSR。"""
+        fcsr = (self.csrs["fcsr"].val | (fflags & 0x1F)) & 0xFF
+        self.csrs["fcsr"].val = fcsr
+        self.csrs["fflags"].val = fcsr & 0x1F
+
+    def handle_fp_load(self, instr: int) -> int:
+        """FLW / FLD — 从内存加载到 FPR。FLW 结果 NaN-boxed。"""
+        if not self._fp_enabled():
+            raise ValueError("FP disabled (mstatus.FS=Off)")
+        f = self._f
+        fn3 = f.func3
+        if fn3 == 0b010:
+            size = 4
+        elif fn3 == 0b011:
+            size = 8
+        else:
+            raise ValueError(f"invalid funct3={fn3:#x} for FP load")
+        addr = (self.gprs[f.rs1] + f.imm12_se) & 0xFFFF_FFFF_FFFF_FFFF
+        saved_pc = self.pc
+        mem = mem_read(self, addr, size)
+        if self.pc != saved_pc:
+            return 0
+        val = 0
+        for i in range(size):
+            val |= mem[i] << (8 * i)
+        self._fpr_bits[f.rd] = (self._NANBOX_S | val) if size == 4 else val
+        self._fp_mark_dirty()
+        return 4
+
+    def handle_fp_store(self, instr: int) -> int:
+        """FSW / FSD — 将 FPR 存入内存。FSW 存低 32 位。"""
+        if not self._fp_enabled():
+            raise ValueError("FP disabled (mstatus.FS=Off)")
+        f = self._f
+        fn3 = f.func3
+        if fn3 == 0b010:
+            size = 4
+        elif fn3 == 0b011:
+            size = 8
+        else:
+            raise ValueError(f"invalid funct3={fn3:#x} for FP store")
+        addr = (self.gprs[f.rs1] + f.imm_s) & 0xFFFF_FFFF_FFFF_FFFF
+        val = self._fpr_bits[f.rs2]
+        data = bytes([(val >> (8 * i)) & 0xFF for i in range(size)])
+        saved_pc = self.pc
+        mem_write(self, addr, data)
+        if self.pc != saved_pc:
+            return 0
+        return 4
+
+    def handle_fp_op(self, instr: int) -> int:
+        """OP-FP — 算术/转换/比较/符号/分类/移动 (native 计算)。"""
+        if not self._fp_enabled():
+            raise ValueError("FP disabled (mstatus.FS=Off)")
+        f = self._f
+        op5 = f.func7 >> 2
+        # int->float (0x1A) 与 FMV.*.X (0x1E) 的 rs1 源为 GPR。
+        if op5 in (0x1A, 0x1E):
+            rs1_bits = self.gprs[f.rs1]
+        else:
+            rs1_bits = self._fpr_bits[f.rs1]
+        rs2_bits = self._fpr_bits[f.rs2]
+        out = _native_fp_op(f.func7, f.func3, f.rs2, rs1_bits, rs2_bits, self._fp_frm())
+        if out.trap:
+            raise ValueError(f"invalid OP-FP funct7={f.func7:#x} funct3={f.func3:#x}")
+        if out.to_gpr:
+            if f.rd != 0:
+                self.gprs[f.rd] = out.value
+        else:
+            self._fpr_bits[f.rd] = out.value
+        self._fp_accumulate_flags(out.fflags)
+        self._fp_mark_dirty()
+        return 4
+
+    def handle_fp_fma(self, instr: int) -> int:
+        """FMADD/FMSUB/FNMSUB/FNMADD — 融合乘加 (native 计算)。"""
+        if not self._fp_enabled():
+            raise ValueError("FP disabled (mstatus.FS=Off)")
+        f = self._f
+        out = _native_fp_fma(
+            f.opcode, f.func3, f.fmt,
+            self._fpr_bits[f.rs1], self._fpr_bits[f.rs2], self._fpr_bits[f.rs3],
+            self._fp_frm(),
+        )
+        if out.trap:
+            raise ValueError(f"invalid FMA opcode={f.opcode:#x} fmt={f.fmt}")
+        self._fpr_bits[f.rd] = out.value
+        self._fp_accumulate_flags(out.fflags)
+        self._fp_mark_dirty()
         return 4
 
     # ----------------------------------------------------------
@@ -867,19 +1011,25 @@ class Hart(HartWithRegs):
 
         if op == AmoFunct5.LR:
             # Load-Reserved: 读取内存并设置预留
+            saved_pc = self.pc
             data_bytes = mem_read(self, addr, byte_len)
+            if self.pc != saved_pc:
+                return 0
             val = int.from_bytes(data_bytes, "little", signed=False) & mask
             if rd != 0:
                 # LR.D: 64-bit 值不需要符号扩展; LR.W: 32->64 符号扩展
                 self.gprs[rd] = val if is_64bit else _sext32(val)
-            self.set_reservation(addr)
+            self.set_reservation(addr, val)
             return 4
         elif op == AmoFunct5.SC:
             # Store-Conditional: 仅预留有效时写入
             if self.reservation_valid and self.reservation_addr == addr:
                 store_val = self.gprs[rs2] & mask
                 data = store_val.to_bytes(byte_len, "little", signed=False)
+                saved_pc = self.pc
                 mem_write(self, addr, data)
+                if self.pc != saved_pc:
+                    return 0
                 if rd != 0:
                     self.gprs[rd] = 0  # 成功 -> rd ← 0
             elif rd != 0:
@@ -887,7 +1037,10 @@ class Hart(HartWithRegs):
             self.clear_reservation()
             return 4
         # else: AMOxxx - 原子读-改-写
+        saved_pc = self.pc
         data_bytes = mem_read(self, addr, byte_len)
+        if self.pc != saved_pc:
+            return 0
         mem_val = int.from_bytes(data_bytes, "little", signed=False) & mask
         op_val = self.gprs[rs2] & mask
 
@@ -917,7 +1070,10 @@ class Hart(HartWithRegs):
             raise ValueError(f"unhandled AMO op: {op}")
 
         data = result.to_bytes(byte_len, "little", signed=False)
+        saved_pc = self.pc
         mem_write(self, addr, data)
+        if self.pc != saved_pc:
+            return 0
         if rd != 0:
             self.gprs[rd] = _sext(mem_val, 64) if is_64bit else _sext32(mem_val)
         return 4
@@ -970,13 +1126,24 @@ class Hart(HartWithRegs):
             elif funct12 == 0x120 or (0x121 <= funct12 <= 0x13F):
                 # SFENCE.VMA: funct7=0b0001001, funct12 = 0x120 | rs2.
                 # RISC-V spec: rs1=x0 时刷新全部 TLB; rs1≠x0 时仅刷新该 VA 对应条目.
+                # 同步刷新全部 hart 的 TLB — 匹配 Rust 引擎的 tlb_gen 广播语义,
+                # 确保多核 TLB 一致性。过度失效不破坏正确性，但可消除跨 hart 的陈旧
+                # TLB 窗口 (hart A 写 PTE + SFENCE.VMA 但 hart B 的 TLB 仍命中旧映射)。
                 if rs1 == 0:
                     self.itlb.flush_all()
                     self.dtlb.flush_all()
+                    for h in (self._all_harts or []):
+                        if h is not self:
+                            h.itlb.flush_all()
+                            h.dtlb.flush_all()
                 else:
                     vpn = self.gprs[rs1] >> 12
                     self.itlb.flush(vpn)
                     self.dtlb.flush(vpn)
+                    for h in (self._all_harts or []):
+                        if h is not self:
+                            h.itlb.flush(vpn)
+                            h.dtlb.flush(vpn)
             elif funct12 == 0x5A0:  # MFENCE.DID — 按内存域刷新全部 hart TLB + L2
                 # 读取当前 hart 的 mdid, 广播刷新所有 hart 中匹配的条目
                 mdid_val = self.mdid_val
@@ -1128,36 +1295,73 @@ class Hart(HartWithRegs):
 
         rs1 = cf.rs1p  # C0: creg-mapped rs1'
 
+        # C.FLD (RV64DC): fpr[rd'] = mem[rs1' + uimm]
+        if funct3 == 0b001:
+            if not self._fp_enabled():
+                raise ValueError("C.FLD: FP disabled (mstatus.FS=Off)")
+            uimm = cf.imm
+            addr = (self.gprs[rs1] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            saved_pc = self.pc
+            mem = mem_read(self, addr, 8)
+            if self.pc != saved_pc:
+                return 0
+            val = sum(mem[i] << (8 * i) for i in range(8))
+            self._fpr_bits[rd] = val
+            self._fp_mark_dirty()
+            return 2
+
         # C.LW / C.SW: uimm pre-decoded by Rust
         if funct3 in (0b010, 0b110):
             uimm = cf.imm
             addr = (self.gprs[rs1] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
             if funct3 == 0b010:  # C.LW
+                saved_pc = self.pc
                 mem = mem_read(self, addr, 4)
+                if self.pc != saved_pc:
+                    return 0
                 val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
                 self.gprs[rd] = _sext32(val)
             else:  # C.SW
                 rs2 = cf.rdp
                 v = self.gprs[rs2] & 0xFFFF_FFFF
                 data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
+                saved_pc = self.pc
                 mem_write(self, addr, data)
+                if self.pc != saved_pc:
+                    return 0
 
-        # C.LD / C.SD (RV64C): uimm pre-decoded by Rust (8-byte aligned)
-        elif funct3 in (0b011, 0b111):
+        # C.LD / C.SD / C.FSD (RV64C): uimm pre-decoded by Rust (8-byte aligned)
+        elif funct3 in (0b011, 0b111, 0b101):
             uimm = cf.imm
             addr = (self.gprs[rs1] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
             if funct3 == 0b011:  # C.LD
+                saved_pc = self.pc
                 mem = mem_read(self, addr, 8)
+                if self.pc != saved_pc:
+                    return 0
                 val = sum(mem[i] << (8 * i) for i in range(8))
                 self.gprs[rd] = val
+            elif funct3 == 0b101:  # C.FSD
+                if not self._fp_enabled():
+                    raise ValueError("C.FSD: FP disabled (mstatus.FS=Off)")
+                v = self._fpr_bits[rd]
+                data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
+                saved_pc = self.pc
+                mem_write(self, addr, data)
+                if self.pc != saved_pc:
+                    return 0
+                self._fp_mark_dirty()
             else:  # C.SD
                 rs2 = cf.rdp
                 v = self.gprs[rs2]
                 data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
+                saved_pc = self.pc
                 mem_write(self, addr, data)
+                if self.pc != saved_pc:
+                    return 0
 
         else:
-            raise NotImplementedError(f"C0 funct3={funct3:#05b} (FLD/FSD/reserved)")
+            raise NotImplementedError(f"C0 funct3={funct3:#05b} (reserved)")
         return 2
 
     # -- C1: Quadrant 1 (低 2 位 = 01) --
@@ -1301,11 +1505,29 @@ class Hart(HartWithRegs):
             self.gprs[rd_rs1] = (self.gprs[rd_rs1] << cf.imm) & 0xFFFF_FFFF_FFFF_FFFF
             return 2
 
+        # C.FLDSP: fpr[rd] = mem[sp + uimm] (RV64DC)
+        if funct3 == 0b001:
+            if not self._fp_enabled():
+                raise ValueError("C.FLDSP: FP disabled (mstatus.FS=Off)")
+            uimm = cf.imm
+            addr = (self.gprs[2] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            saved_pc = self.pc
+            mem = mem_read(self, addr, 8)
+            if self.pc != saved_pc:
+                return 0
+            val = sum(mem[i] << (8 * i) for i in range(8))
+            self._fpr_bits[rd_rs1] = val
+            self._fp_mark_dirty()
+            return 2
+
         # C.LWSP: uimm = cf.imm (4-byte aligned)
         if funct3 == 0b010:
             uimm = cf.imm
             addr = (self.gprs[2] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            saved_pc = self.pc
             mem = mem_read(self, addr, 4)
+            if self.pc != saved_pc:
+                return 0
             val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
             self.gprs[rd_rs1] = _sext32(val)
             return 2
@@ -1314,7 +1536,10 @@ class Hart(HartWithRegs):
         if funct3 == 0b011:
             uimm = cf.imm
             addr = (self.gprs[2] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            saved_pc = self.pc
             mem = mem_read(self, addr, 8)
+            if self.pc != saved_pc:
+                return 0
             val = sum(mem[i] << (8 * i) for i in range(8))
             self.gprs[rd_rs1] = val
             return 2
@@ -1346,13 +1571,31 @@ class Hart(HartWithRegs):
                 self.gprs[rd_rs1] = self.gprs[rs2]
             return 2
 
+        # C.FSDSP: mem[sp + uimm] = fpr[rs2] (RV64DC)
+        if funct3 == 0b101:
+            if not self._fp_enabled():
+                raise ValueError("C.FSDSP: FP disabled (mstatus.FS=Off)")
+            uimm = cf.imm2
+            addr = (self.gprs[2] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
+            v = self._fpr_bits[rs2]
+            data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
+            saved_pc = self.pc
+            mem_write(self, addr, data)
+            if self.pc != saved_pc:
+                return 0
+            self._fp_mark_dirty()
+            return 2
+
         # C.SWSP: uimm = cf.imm2 (4-byte aligned)
         if funct3 == 0b110:
             uimm = cf.imm2
             addr = (self.gprs[2] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
             v = self.gprs[rs2] & 0xFFFF_FFFF
             data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
+            saved_pc = self.pc
             mem_write(self, addr, data)
+            if self.pc != saved_pc:
+                return 0
             return 2
 
         # C.SDSP: uimm = cf.imm2 (8-byte aligned)
@@ -1361,10 +1604,13 @@ class Hart(HartWithRegs):
             addr = (self.gprs[2] + uimm) & 0xFFFF_FFFF_FFFF_FFFF
             v = self.gprs[rs2]
             data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
+            saved_pc = self.pc
             mem_write(self, addr, data)
+            if self.pc != saved_pc:
+                return 0
             return 2
 
-        raise NotImplementedError(f"C2 funct3={funct3:#05b} (FLDSP/FSDSP)")
+        raise NotImplementedError(f"C2 funct3={funct3:#05b} (reserved)")
 
     # -- 压缩指令调度入口 --
 
@@ -1413,6 +1659,8 @@ class Hart(HartWithRegs):
         if f.is_compressed:
             try:
                 return self.handle_compressed(instr & 0xFFFF)
+            except MemoryAccessFault:
+                return 0
             except (ValueError, NotImplementedError, CsrAccessError):
                 deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
                 return 0
@@ -1428,6 +1676,8 @@ class Hart(HartWithRegs):
         try:
             handler = getattr(self, method_name)
             return handler(instr)
+        except MemoryAccessFault:
+            return 0
         except (ValueError, NotImplementedError, CsrAccessError):
             # 操作码合法但编码字段无效 (如非法 funct3/funct12/nzuimm=0 等)
             deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)

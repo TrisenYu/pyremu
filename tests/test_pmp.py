@@ -9,12 +9,15 @@ import pytest
 
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
+from pyremu.emulator import Emulator
 from pyremu.core.mem_check_aux import (
+    MemoryAccessFault,
     check_instruction_fetch,
     inject_memory_backend,
     mem_read,
     mem_write,
 )
+from pyremu.core.registers import _MmodeCSR
 from pyremu.memory.bus import Bus
 from pyremu.memory.pmp import (
     PMP_A_NAPOT,
@@ -340,18 +343,22 @@ class TestPmpInHart:
         """U 模式, PMP W=0 -> StAccessFault."""
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=False)
         hart.mode = RiscvMode.U
-        mem_write(hart, 0x8000_1000, b"\x11\x22")
+        try:
+            mem_write(hart, 0x8000_1000, b"\x11\x22")
+        except MemoryAccessFault:
+            pass
         assert hart.mcause_val == 7, f"应为 StAccessFault(7), 实际 {hart.mcause_val}"
 
     def test_umode_load_pmp_r_denied(self, hart):
         """U 模式, PMP R=0 -> LdAccessFault."""
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=False, w=True)
         hart.mode = RiscvMode.U
-        # 先写入实际数据
         hart._mem_write_phy(0x8000_1000, b"\xde\xad")
-        # 清 trap 计数
         hart._consecutive_traps = 0
-        mem_read(hart, 0x8000_1000, 4)
+        try:
+            mem_read(hart, 0x8000_1000, 4)
+        except MemoryAccessFault:
+            pass
         assert hart.mcause_val == 5, f"应为 LdAccessFault(5), 实际 {hart.mcause_val}"
 
 
@@ -433,3 +440,215 @@ class TestInstrFetchPmp:
         ok, pa = check_instruction_fetch(hart, 0xDEAD_BEEF)
         assert not ok
         assert hart.mcause_val == 1
+
+
+# ============================================================
+#  Native batch PMP 取指检查 — 确保 Rust 侧与 Python 侧一致
+# ============================================================
+
+
+class TestNativeBatchPmpFetch:
+    """验证 native batch 对 PMP 取指权限的检查与纯 Python 路径一致.
+
+    Rust batch 通过 ``pmp_ok(fetch_pa, is_execute=true)`` 检查取指,
+    与 Python ``check_instruction_fetch`` 保持语义一致.
+    """
+
+    @pytest.fixture
+    def emu(self) -> Emulator:
+        """单 hart 模拟器, PMP entries=64, ram_base=0x8000_0000."""
+        return Emulator(
+            num_harts=1,
+            ram_base=0x8000_0000,
+            ram_size=0x1000_0000,  # 256 MiB
+            pmp_entries=64,
+            prog_cnt=0x8020_0000,
+        )
+
+    def _setup_napot_entry(self, emu: Emulator, idx: int,
+                           base: int, size_log2: int,
+                           r: bool, w: bool, x: bool):
+        """直接在 hart 上配置 NAPOT PMP 条目."""
+        hart = emu.harts[0]
+        k = size_log2 - 3
+        mask = (1 << k) - 1
+        pmpaddr_val = (base >> 2) | mask
+
+        cfg = PMP_A_NAPOT
+        if r:
+            cfg |= PMP_R
+        if w:
+            cfg |= PMP_W
+        if x:
+            cfg |= PMP_X
+
+        hart.csrs[f"pmpaddr{idx}"].val = pmpaddr_val
+        # pmpcfgN: 每个存 8 条目, RV64 仅偶数 cfg (pmpcfg0, pmpcfg2, ...)
+        cfg_reg = (idx // 8) * 2
+        existing = hart.csrs[f"pmpcfg{cfg_reg}"].val
+        shift = (idx % 8) * 8
+        # 清除旧条目位
+        existing &= ~(0xFF << shift)
+        existing |= (cfg << shift)
+        hart.csrs[f"pmpcfg{cfg_reg}"].val = existing
+        # 使 PMP 缓存失效
+        hart._pmp.invalidate_cache()
+
+    def test_native_batch_smode_fetch_allowed(self, emu: Emulator):
+        """S 模式取指 — PMP 覆盖该区域 (RWX) -> 正常执行, 无 trap."""
+        hart = emu.harts[0]
+
+        # 配置 PMP 条目 0: NAPOT 覆盖 [0x8000_0000, 0x8200_0000) 32 MiB RWX
+        self._setup_napot_entry(emu, 0, 0x8000_0000, 25, r=True, w=True, x=True)
+        # 配置 PMP 条目 1: NAPOT 覆盖 [0x0000_0000, 0x8000_0000) 2 GiB RWX
+        self._setup_napot_entry(emu, 1, 0x0000_0000, 31, r=True, w=True, x=True)
+
+        # 在 0x8020_1108 放置一条 ADDI 指令: addi x5, x0, 42
+        addi_instr = (42 << 20) | (5 << 7) | 0b0010011
+        emu.load_code(0x8020_1108, addi_instr.to_bytes(4, "little"))
+
+        # 切换到 S 模式
+        hart.pc = 0x8020_1108
+        hart.mode = RiscvMode.S
+        hart._consecutive_traps = 0
+        hart.gprs[5] = 0
+
+        emu.step()
+
+        # ADDI 应成功执行: x5 = 42, PC += 4, 无 trap
+        assert hart.gprs[5] == 42, f"x5 应为 42, 实际 {hart.gprs[5]}"
+        assert hart.pc == 0x8020_110C, f"PC 应为 0x8020_110C, 实际 {hart.pc:#018x}"
+        assert hart.mcause_val == 0, f"不应有 trap, mcause={hart.mcause_val}"
+
+    def test_native_batch_smode_fetch_denied(self, emu: Emulator):
+        """S 模式取指 — PMP X=0 -> InstrAccessFault."""
+        hart = emu.harts[0]
+
+        # 配置 PMP 条目 0: NAPOT 覆盖目标区域但 X=0 (仅 RW)
+        self._setup_napot_entry(emu, 0, 0x8000_0000, 25, r=True, w=True, x=False)
+
+        # 在 0x8020_1108 放置指令
+        addi_instr = (42 << 20) | (5 << 7) | 0b0010011
+        emu.load_code(0x8020_1108, addi_instr.to_bytes(4, "little"))
+
+        # S 模式
+        hart.pc = 0x8020_1108
+        hart.mode = RiscvMode.S
+        hart._consecutive_traps = 0
+        hart.gprs[5] = 0
+
+        emu.step()
+
+        # 应触发 InstrAccessFault (mcause=1)
+        assert hart.mcause_val == 1, (
+            f"应为 InstrAccessFault(1), 实际 mcause={hart.mcause_val}"
+        )
+
+    def test_native_batch_smode_no_match_denied(self, emu: Emulator):
+        """S 模式取指 — 所有 PMP 条目 OFF -> 拒绝."""
+        hart = emu.harts[0]
+
+        addi_instr = (42 << 20) | (5 << 7) | 0b0010011
+        emu.load_code(0x8020_1108, addi_instr.to_bytes(4, "little"))
+
+        hart.pc = 0x8020_1108
+        hart.mode = RiscvMode.S
+        hart._consecutive_traps = 0
+        hart.gprs[5] = 0
+
+        emu.step()
+
+        # 无 PMP 条目匹配 -> S 模式拒绝
+        assert hart.mcause_val == 1, (
+            f"应为 InstrAccessFault, 实际 mcause={hart.mcause_val}"
+        )
+
+    def test_native_batch_mmode_fetch_always_ok(self, emu: Emulator):
+        """M 模式 (MPRV=0) 取指 — PMP 检查始终通过."""
+        hart = emu.harts[0]
+
+        # 配置 PMP 条目 0: X=0 (不应影响 M 模式取指)
+        self._setup_napot_entry(emu, 0, 0x8000_0000, 25, r=True, w=True, x=False)
+
+        addi_instr = (42 << 20) | (5 << 7) | 0b0010011
+        emu.load_code(0x8020_1108, addi_instr.to_bytes(4, "little"))
+
+        hart.pc = 0x8020_1108
+        hart.mode = RiscvMode.M
+        hart._consecutive_traps = 0
+        hart.gprs[5] = 0
+
+        emu.step()
+
+        # M 模式取指应成功
+        assert hart.gprs[5] == 42, f"x5 应为 42, 实际 {hart.gprs[5]}"
+        assert hart.mcause_val == 0, f"M 模式不应 trap, mcause={hart.mcause_val}"
+
+
+class TestSyncFromFlat:
+    """验证 _sync_from_flat 正确将 flat 数组同步回 CSR entries."""
+
+    @staticmethod
+    def _make_pmp(num_entries: int = 16) -> Pmp:
+        csrs: dict[str, object] = {}
+        # Create pmpcfg registers (even-numbered, RV64: 8 entries each)
+        for reg_idx in range(0, (num_entries + 7) // 8 * 2, 2):
+            name = f"pmpcfg{reg_idx}"
+            csrs[name] = _MmodeCSR(name=name)
+        # Create pmpaddr registers
+        for i in range(num_entries):
+            name = f"pmpaddr{i}"
+            csrs[name] = _MmodeCSR(name=name)
+        return Pmp(csrs, num_entries)
+
+    def test_sync_cfg_to_entries(self):
+        """_sync_from_flat 将 flat_cfg 字节写回 pmpcfg CSR."""
+        pmp = self._make_pmp(16)
+        # Modify flat arrays directly (as Rust would)
+        pmp._flat_cfg[0] = 0x9F  # NAPOT, R=W=X=1 (locked)
+        pmp._flat_cfg[3] = 0x0B  # TOR, R=W=1
+        pmp._flat_cfg[8] = 0x18  # pmpcfg2, entry 8: NA4, X=1
+        pmp._sync_from_flat()
+
+        # pmpcfg0 = entries 0-7: byte 0 = 0x9F, byte 3 = 0x0B
+        cfg0 = pmp._csrs["pmpcfg0"].val
+        assert (cfg0 >> 0) & 0xFF == 0x9F, f"entry 0 cfg: {cfg0:016x}"
+        assert (cfg0 >> 24) & 0xFF == 0x0B, f"entry 3 cfg: {cfg0:016x}"
+        # pmpcfg2 = entries 8-15: byte 0 = 0x18
+        cfg2 = pmp._csrs["pmpcfg2"].val
+        assert (cfg2 >> 0) & 0xFF == 0x18, f"entry 8 cfg: {cfg2:016x}"
+
+    def test_sync_addr_to_entries(self):
+        """_sync_from_flat 将 flat_addr 值写回 pmpaddr CSR."""
+        pmp = self._make_pmp(8)
+        pmp._flat_addr[0] = 0x8000_0000
+        pmp._flat_addr[5] = 0xDEAD_BEEF_CAFE
+        pmp._flat_addr[7] = 0xFFFF_FFFF_FFFF_FFFF
+        pmp._sync_from_flat()
+
+        assert pmp._csrs["pmpaddr0"].val == 0x8000_0000
+        assert pmp._csrs["pmpaddr5"].val == 0xDEAD_BEEF_CAFE
+        assert pmp._csrs["pmpaddr7"].val == 0xFFFF_FFFF_FFFF_FFFF
+
+    def test_sync_clears_cache_dirty(self):
+        """_sync_from_flat 完成后 _cache_dirty 应为 False."""
+        pmp = self._make_pmp(4)
+        pmp._cache_dirty = True
+        pmp._sync_from_flat()
+        assert pmp._cache_dirty is False
+
+    def test_sync_roundtrip(self):
+        """_sync_from_flat -> _rebuild_cache 往返应保持数据一致."""
+        pmp = self._make_pmp(12)
+        # Set via flat arrays
+        for i in range(12):
+            pmp._flat_cfg[i] = (i * 17 + 3) & 0xFF
+            pmp._flat_addr[i] = 0x8000_0000 + i * 0x1000
+        pmp._sync_from_flat()
+
+        # Rebuild flat from entries
+        pmp._rebuild_cache()
+
+        for i in range(12):
+            assert pmp._flat_cfg[i] == (i * 17 + 3) & 0xFF, f"cfg[{i}] mismatch"
+            assert pmp._flat_addr[i] == 0x8000_0000 + i * 0x1000, f"addr[{i}] mismatch"

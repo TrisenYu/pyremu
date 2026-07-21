@@ -312,18 +312,16 @@ def _parse_pe(
         data = bytes(sec.content)
         if len(data) == 0:
             continue
-        segments.append(
-            FirmwareSegment(
-                vaddr=image_base + sec.virtual_address,
-                data=data,
-                memsz=sec.virtual_size,
-                name=(
-                    sec.name.decode("utf-8", errors="replace")
-                    if isinstance(sec.name, bytes)
-                    else str(sec.name)
-                ),
-            )
-        )
+        segments.append(FirmwareSegment(
+            vaddr=image_base + sec.virtual_address,
+            data=data,
+            memsz=sec.virtual_size,
+            name=(
+                sec.name.decode("utf-8", errors="replace")
+                if isinstance(sec.name, bytes)
+                else str(sec.name)
+            ),
+        ))
 
     # 提取导出符号 (函数/变量名 -> 地址)
     symbols: dict[str, int] = {}

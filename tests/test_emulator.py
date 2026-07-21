@@ -10,7 +10,14 @@ import ctypes
 import pytest
 
 from pyremu.core.decoder import Hart
-from pyremu.core.hart import BatchResult, HartState, TlbEntry
+from pyremu.core.hart import (
+    BatchResult,
+    HartState,
+    RiscvMode,
+    TlbEntry,
+    marshal_hart,
+    unmarshal_hart,
+)
 from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.trap_handler import check_pending_interrupts
 from pyremu.emulator import Emulator
@@ -1215,11 +1222,18 @@ class TestUartFlush:
         emu.step()  # SB — 写入 '\n'
 
         # \n 在 _write_reg 中触发即时刷新
-        assert len(captured) >= 1, f"写 \\n 应产生输出, 实际捕获: {captured}"
+        assert len(captured) >= 1, f"写 \\n 应产生输出, 实际: {captured}"
 
     def test_data_stays_buffered_until_newline_or_flush(self):
-        """写非 \\n 字符时数据留在行缓冲中, 直到 \\n 或 flush_all 才输出."""
-        emu = Emulator(num_harts=1, ram_size=128 * 1024 * 1024)
+        """写非 \\n 字符时数据留在行缓冲中, 直到 \\n 或 flush_all 才输出.
+
+        _write_reg 在 \\n 时即时刷新; 无 \\n 的字节留在行缓冲中,
+        由外部周期调用 flush_all (native 批次结束) 或显式调用输出.
+        _tx_callback (默认 _uart_tx_flush) 每次 write 后 flush stdout,
+        确保部分行一旦被 _flush_hart 刷新即可见, 不再滞留在 Python
+        stdout 缓冲区中等待下一行.
+        """
+        emu = Emulator(num_harts=1, ram_size=128 *1024 * 1024)
         assert emu.uart is not None
         captured: list[str] = []
 
@@ -1242,8 +1256,8 @@ class TestUartFlush:
         emu.step()  # LUI
         emu.step()  # SB — 写入 'A' 到 UART, 无 \n 不刷新
 
-        # emu.step() 设置了 writer, 'A' 被行缓冲, 不应立即输出
-        assert len(captured) == 0, f"无 \\n 时不应立即输出, 实际: {captured}"
+        # emu.step() 在纯 Python 路径不调 flush_all; 'A' 留在行缓冲中
+        assert len(captured) == 0, f"无 \\n 时纯 Python 路径不调 flush_all, 实际: {captured}"
 
         # flush_all 强制刷新, 'A' 应被输出
         emu.uart.flush_all()
@@ -1533,7 +1547,7 @@ class TestDeviceTree:
         assert magic == 0xD00DFEED
 
     def test_default_bootargs_provides_console(self):
-        """未指定 bootargs 时, 默认包含 earlycon=sbi keep_bootcon."""
+        """未指定 bootargs 时, 默认包含 earlycon=sbi console=ttySIF0."""
         emu = Emulator()
         dtb = emu.build_dtb()
         assert b"earlycon=sbi" in dtb, (
@@ -1542,8 +1556,8 @@ class TestDeviceTree:
         assert b"console=ttySIF0" in dtb, (
             "默认 bootargs 应包含 console=ttySIF0 以将 UART 设为首选控制台"
         )
-        assert b"keep_bootcon" in dtb, (
-            "默认 bootargs 应包含 keep_bootcon 以防止 bootconsole 过早关闭"
+        assert b"random.trust_bootloader=on" in dtb, (
+            "默认 bootargs 应包含 random.trust_bootloader=on 以完成 CRNG 初始化"
         )
 
     def test_explicit_bootargs_overrides_default(self):
@@ -1552,7 +1566,7 @@ class TestDeviceTree:
         dtb = emu.build_dtb()
         assert b"console=ttyS0 debug" in dtb
         # 默认值不应出现
-        assert b"keep_bootcon" not in dtb
+        assert b"console=ttySIF0" not in dtb
 
 
 class TestBusErrorOnUnmappedAccess:
@@ -1702,3 +1716,335 @@ class TestNativeBatchLayout:
         assert hasattr(hs.dtlb[0], "vpn")
         assert hasattr(hs.dtlb[0], "ppn")
         assert hasattr(hs.dtlb[0], "valid")
+
+
+class TestMarshalUnmarshalRoundtrip:
+    """marshal_hart → unmarshal_hart 双向数据完整性验证.
+
+    batch 边界 marshal/unmarshal 是 Python HartWithRegs ↔ Rust HartState
+    的唯一数据通道.  若任一字段在往返过程中丢失或损坏, batch 内部的 Rust
+    执行会基于错误状态继续运行 — 产生静默错误 (如 ld-linux s4=-1 消失).
+
+    本测试覆盖 HartState 中所有非 pad 字段的往返保真度.
+    """
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _fresh_hart(hart_id: int = 0) -> Hart:
+        """创建一个处于 M 模式的 Hart (__init__ 默认)."""
+        return Hart(id=hart_id)
+
+    @staticmethod
+    def _roundtrip(hart: Hart) -> Hart:
+        """marshal → unmarshal 到新 hart, 返回新 hart."""
+        state = HartState()
+        marshal_hart(hart, state)
+        out = Hart(id=hart.id + 1)
+        unmarshal_hart(state, out)
+        return out
+
+    # ---------- GPR 往返 ----------
+    def test_gpr_all_zero_init(self) -> None:
+        """所有 GPR 初始为 0 时往返不变."""
+        hart = self._fresh_hart()
+        out = self._roundtrip(hart)
+        for i in range(32):
+            assert out.gprs[i] == 0, f"gprs[{i}] = {out.gprs[i]}, expected 0"
+
+    def test_gpr_fills_pattern_roundtrip(self) -> None:
+        """每寄存器写入唯一值后往返不变."""
+        hart = self._fresh_hart()
+        for i in range(32):
+            # 用可识别模式: i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE
+            hart.gprs[i] = (i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE) & 0xFFFF_FFFF_FFFF_FFFF
+        # x0 写保护 — GprFile 应忽略写入
+        hart.gprs[0] = 0  # explicitly ensure
+        out = self._roundtrip(hart)
+        assert out.gprs[0] == 0, "x0 must always be 0"
+        for i in range(1, 32):
+            expected = (i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE) & 0xFFFF_FFFF_FFFF_FFFF
+            assert out.gprs[i] == expected, (
+                f"gprs[{i}] = {out.gprs[i]:#018x}, expected {expected:#018x}"
+            )
+
+    def test_s4_negative_one_preserved(self) -> None:
+        """s4 (x20) = -1 (0xFFFF_FFFF_FFFF_FFFF) 在往返后必须保持.
+
+        ld-linux 用 s4=-1 作为循环退出哨兵.  若 unmarshal 在某处将其清零
+        或截断, BNE s2,s4 将永不退出 — 继续迭代到 DT_RELA=7 → LoadPageFault.
+        """
+        hart = self._fresh_hart()
+        hart.gprs[20] = 0xFFFF_FFFF_FFFF_FFFF  # s4 = -1
+        out = self._roundtrip(hart)
+        assert out.gprs[20] == 0xFFFF_FFFF_FFFF_FFFF, (
+            f"s4 = {out.gprs[20]:#018x}, expected -1"
+        )
+
+    def test_gpr_edge_values_roundtrip(self) -> None:
+        """GPR 极端值 (0, -1, MAX, 符号位, 交替 bits) 往返不变."""
+        hart = self._fresh_hart()
+        test_values = {
+            1: 0,                           # zero
+            2: 0xFFFF_FFFF_FFFF_FFFF,       # -1 (ld-linux s4 sentinel)
+            3: 0x7FFF_FFFF_FFFF_FFFF,       # max positive signed
+            4: 0x8000_0000_0000_0000,       # min negative signed
+            5: 0xAAAA_AAAA_AAAA_AAAA,       # alternating bits
+            6: 0x5555_5555_5555_5555,       # alternating bits (inverted)
+            7: 0x0000_0000_0000_0001,       # 1 (smallest non-zero)
+            8: 0x8000_0000_0000_0001,       # sign bit + 1
+        }
+        for idx, val in test_values.items():
+            hart.gprs[idx] = val
+        out = self._roundtrip(hart)
+        for idx, val in test_values.items():
+            assert out.gprs[idx] == val, (
+                f"gprs[{idx}] = {out.gprs[idx]:#018x}, expected {val:#018x}"
+            )
+
+    # ---------- 关键 CSR 往返 ----------
+    @pytest.mark.parametrize("csr_name,val", [
+        ("mstatus", 0x0000000A00001800),  # MPP=M, SPP=S, FS=1, XS=1
+        ("mtvec", 0x80001000),            # vectored M-mode
+        ("stvec", 0x80200000),            # direct S-mode
+        ("mepc", 0x80001234),
+        ("sepc", 0x3FFF_FFFF_F000),
+        ("mcause", 0x8000_0000_0000_000D),  # LoadPageFault interrupt
+        ("scause", 0x0000_0000_0000_0008),  # EcallFromUmode
+        ("mtval", 0x0000_0033D),
+        ("stval", 0x3FFF_FFFF_F000),
+        ("satp", 0x8000_0000_0001_2345),  # Sv39, PPN=0x12345
+        ("mie", 0x888),                    # MEIE | SEIE | MTIE
+        ("mip", 0x080),                    # STIP
+        ("medeleg", 0xBEEF),
+        ("mideleg", 0xDEAD),
+    ])
+    def test_csr_roundtrip(self, csr_name: str, val: int) -> None:
+        """关键 CSR 往返不变."""
+        hart = self._fresh_hart()
+        hart.csrs[csr_name].val = val
+        out = self._roundtrip(hart)
+        actual = out.csrs[csr_name].val
+        assert actual == val, f"{csr_name}: {actual:#018x} ≠ expected {val:#018x}"
+
+    # ---------- 状态字段 ----------
+    def test_pc_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart.pc = 0x3FFF_FFFF_3ABA
+        out = self._roundtrip(hart)
+        assert out.pc == 0x3FFF_FFFF_3ABA
+
+    @pytest.mark.parametrize("mode", [RiscvMode.U, RiscvMode.S, RiscvMode.M])
+    def test_mode_roundtrip(self, mode: RiscvMode) -> None:
+        hart = Hart(id=0)
+        hart.mode = mode
+        out = self._roundtrip(hart)
+        assert out.mode == mode
+
+    def test_mmu_mode_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart._mmu_mode = 8  # Sv39
+        out = self._roundtrip(hart)
+        assert out.mmu_mode == 8
+
+    # ---------- LR/SC reservation ----------
+    def test_reservation_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart._reservation_valid = True
+        hart._reservation_addr = 0x8000_1234
+        out = self._roundtrip(hart)
+        assert out._reservation_valid is True
+        assert out._reservation_addr == 0x8000_1234
+
+    def test_reservation_invalid_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart._reservation_valid = False
+        out = self._roundtrip(hart)
+        assert out._reservation_valid is False
+
+    # ---------- WFI / halted ----------
+    def test_waiting_wfi_woken_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart._waiting = True
+        hart._wfi_woken = True
+        out = self._roundtrip(hart)
+        assert out._waiting is True
+        assert out._wfi_woken is True
+
+    def test_halted_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart._halted = True
+        hart._consecutive_traps = 3
+        out = self._roundtrip(hart)
+        assert out._halted is True
+        assert out._consecutive_traps == 3
+
+    # ---------- TEE CSRs ----------
+    def test_mdid_pmpsplit_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart._mdid_val = 5
+        hart._pmpsplit_val = 2
+        out = self._roundtrip(hart)
+        assert out.mdid_val == 5
+        assert out.pmpsplit_val == 2
+
+    # ---------- Extra CSRs ----------
+    def test_extra_csrs_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart.csrs["mscratch"].val = 0xDEAD_BEEF_0000_1111
+        hart.csrs["sscratch"].val = 0xCAFE_BABE_2222_3333
+
+        # mhartid is read-only (set in __init__ to hart.id)
+        # Write mcounteren directly
+        hart.csrs["mcounteren"].val = 0x0000_0000_0000_0007  # CY|TM|IR
+
+        out = self._roundtrip(hart)
+        assert out.csrs["mscratch"].val == 0xDEAD_BEEF_0000_1111
+        assert out.csrs["sscratch"].val == 0xCAFE_BABE_2222_3333
+        assert out.csrs["mhartid"].val == 0  # original hart had id=0
+        assert out.csrs["mcounteren"].val == 0x0000_0000_0000_0007
+
+    # ---------- instruction counter ----------
+    def test_total_instrs_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart._total_instrs = 123456789
+        out = self._roundtrip(hart)
+        assert out._total_instrs == 123456789
+
+    # ---------- float ----------
+    def test_fpr_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        for i in range(32):
+            hart._fpr_bits[i] = (0x3FF0_0000_0000_0000 + i * 0x1000_0000_0000) & 0xFFFF_FFFF_FFFF_FFFF
+        out = self._roundtrip(hart)
+        for i in range(32):
+            expected = (0x3FF0_0000_0000_0000 + i * 0x1000_0000_0000) & 0xFFFF_FFFF_FFFF_FFFF
+            assert out._fpr_bits[i] == expected, f"fpr[{i}] mismatch"
+
+    def test_fcsr_roundtrip(self) -> None:
+        hart = self._fresh_hart()
+        hart.csrs["fcsr"].val = 0x0000_0000_0000_00A0  # FRM=2, NV|DZ flags
+        out = self._roundtrip(hart)
+        assert out.csrs["fcsr"].val == 0x0000_0000_0000_00A0
+
+
+class TestLdLinuxAddrChain:
+    """AUIPC + slli/add: ld-linux 数组索引地址计算链.
+
+    ld-linux 偏移 0x3aba-0x3ace:
+      slli s1,a5,2; add s1,s1,a5; slli s1,s1,5
+      addi s1,s1,-0xa0; auipc a5,0x1e; addi a5,a5,0x542; add s1,s1,a5
+    若任一指令结果错误则 s1 指向错误元素 → ld a5,0(s1) 读到 DT_RELA=7.
+    """
+
+    SLLI_S1_A5_2 = 0x00279493    # 4B: slli s1, a5, 2
+    C_ADD_S1_A5 = 0x94BE          # 2B: c.add s1, a5
+    C_SLLI_S1_5 = 0x0496          # 2B: c.slli s1, 5
+    ADDI_S1_NEG_A0 = 0xF6048493  # 4B: addi s1, s1, -0xa0
+    AUIPC_A5_1E = 0x0001E797     # 4B: auipc a5, 0x1e
+    ADDI_A5_A5_542 = 0x54278793  # 4B: addi a5, a5, 0x542
+    C_ADD_S1_A5_FINAL = 0x94BE   # 2B: c.add s1, a5
+    PC_START = 0x3ABA
+    PC_AT_AUIPC = 0x3AC6  # 0x3aba + 4 + 2 + 2 + 4
+
+    @staticmethod
+    def _make_hart() -> Hart:
+        hart = Hart(id=0)
+        hart.mode = RiscvMode.M  # M-mode, bare translation
+        return hart
+
+    @pytest.mark.parametrize("counter", [0, 1, 2, 3, 5, 10, 256])
+    def test_s1_address(self, counter: int) -> None:
+        """s1 == (counter-1)*0xa0 + pc_auipc + 0x1e542."""
+        hart = self._make_hart()
+        hart.pc = self.PC_START
+        hart.gprs[15] = counter  # a5
+
+        for instr in (self.SLLI_S1_A5_2, self.C_ADD_S1_A5, self.C_SLLI_S1_5,
+                      self.ADDI_S1_NEG_A0, self.AUIPC_A5_1E,
+                      self.ADDI_A5_A5_542, self.C_ADD_S1_A5_FINAL):
+            hart.pc += hart.exec_instr(instr)
+
+        expected = (counter - 1) * 0xA0 + self.PC_AT_AUIPC + 0x1E000 + 0x542
+        assert hart.gprs[9] == expected, (
+            f"counter={counter}: s1={hart.gprs[9]:#018x}, expected {expected:#018x}"
+        )
+
+    @pytest.mark.parametrize("pc_base", [
+        0x3ABA,
+        0x3F_F7FD_cABA,  # ld-linux 运行时 VA
+    ])
+    @pytest.mark.parametrize("counter", [1, 2, 5])
+    def test_auipc_pc_relative(self, counter: int, pc_base: int) -> None:
+        """AUIPC 使用自身 PC 而非其他值."""
+        hart = self._make_hart()
+        hart.pc = pc_base
+        hart.gprs[15] = counter
+
+        for instr in (self.SLLI_S1_A5_2, self.C_ADD_S1_A5, self.C_SLLI_S1_5,
+                      self.ADDI_S1_NEG_A0, self.AUIPC_A5_1E,
+                      self.ADDI_A5_A5_542, self.C_ADD_S1_A5_FINAL):
+            hart.pc += hart.exec_instr(instr)
+
+        pc_auipc = pc_base + (self.PC_AT_AUIPC - self.PC_START)
+        expected = (counter - 1) * 0xA0 + pc_auipc + 0x1E000 + 0x542
+        assert hart.gprs[9] == expected
+        assert hart.gprs[15] == pc_auipc + 0x1E000 + 0x542
+
+
+class TestBranchEdgeCases:
+    """分支边界值测试 — ld-linux 循环退出条件.
+
+    ld-linux 偏移 0x3ab6:  bltz s2, 0x3b0a  (s2<0 时跳过循环)
+    ld-linux 偏移 0x3b06:  bne  s2, s4, 0x3ad0  (s2!=-1 时继续循环)
+    """
+
+    def _make_hart(self) -> Hart:
+        hart = Hart(id=0)
+        hart.mode = RiscvMode.M
+        return hart
+
+    # ---- BLTZ (s2 < 0 → branch) ----
+    @pytest.mark.parametrize("s2_val,taken", [
+        (-1, True),    # s2=-1 < 0 → branch to skip loop
+        (0, False),    # s2=0 >= 0 → fall through (enter loop)
+        (1, False),    # s2=1 >= 0 → fall through
+        (-2, True),    # s2=-2 < 0 → branch
+    ])
+    def test_bltz_edge(self, s2_val: int, taken: bool) -> None:
+        """BLTZ at 0x3ab6: branch taken iff s2 < 0."""
+        hart = self._make_hart()
+        hart.pc = 0x3AB6
+        hart.gprs[18] = s2_val & 0xFFFF_FFFF_FFFF_FFFF  # s2
+
+        # bltz s2, 0x3b0a = 0x04094a63
+        advance = hart.exec_instr(0x04094A63)
+        hart.pc += advance
+
+        if taken:
+            assert hart.pc == 0x3B0A, f"s2={s2_val}: should branch to 0x3b0a"
+        else:
+            # Fall-through: pc += advance (4 for non-taken 32-bit branch)
+            assert hart.pc == 0x3ABA, f"s2={s2_val}: should fall through to 0x3aba"
+
+    # ---- BNE (s2 != s4 → branch back) ----
+    @pytest.mark.parametrize("s2_val,s4_val,taken", [
+        (-1, -1, False),  # s2 == s4 → exit loop
+        (0, -1, True),    # s2 != s4 → continue loop
+        (1, -1, True),    # continue
+        (-2, -1, True),   # s2=-2 != -1 → continue
+    ])
+    def test_bne_exit_edge(self, s2_val: int, s4_val: int, taken: bool) -> None:
+        """BNE at 0x3b06: branch NOT taken when s2 == s4."""
+        hart = self._make_hart()
+        hart.pc = 0x3B06
+        hart.gprs[18] = s2_val & 0xFFFF_FFFF_FFFF_FFFF  # s2
+        hart.gprs[20] = s4_val & 0xFFFF_FFFF_FFFF_FFFF  # s4
+
+        # bne s2, s4, 0x3ad0 = 0xFD4915E3
+        advance = hart.exec_instr(0xFD4915E3)
+        hart.pc += advance
+
+        if taken:
+            assert hart.pc == 0x3AD0, f"s2={s2_val} s4={s4_val}: should loop to 0x3ad0"
+        else:
+            assert hart.pc == 0x3B0A, f"s2={s2_val} s4={s4_val}: should exit to 0x3b0a"

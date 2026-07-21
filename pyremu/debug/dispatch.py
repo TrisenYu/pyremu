@@ -4,7 +4,7 @@
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """DispatchMixin — REPL 命令分发、帮助信息、hart 切换."""
-
+from typing import Any
 import signal
 
 from rich.panel import Panel
@@ -61,60 +61,50 @@ class DispatchMixin(SharedMixinAttrs):
     # ----------------------------------------------------------
     #  主分发
     # ----------------------------------------------------------
+    @staticmethod
+    def _dispatch_aux(cmds: list[str], threshold: int, default_ans: Any=None) -> Any:
+        if len(cmds) > threshold:
+            return cmds[threshold]
+        return default_ans
 
     def _dispatch(self, parts: list[str]) -> bool:
         """分发 REPL 命令; 返回 False 表示退出."""
         cmd = parts[0].lower()
-
         if cmd in ("q", "quit", "exit"):
             return False
-
         # 执行控制
-        if cmd in ("b", "bp"):
+        elif cmd in ("b", "bp"):
             self._dispatch_bp(parts[1:])
-            return True
-        if cmd in ("s", "step"):
-            count = int(parts[1]) if len(parts) > 1 else 1
-            self.cmd_step(count)
-            return True
-        if cmd in ("c", "continue"):
+        elif cmd in ("s", "step"):
+            self.cmd_step(int(self._dispatch_aux(parts, 1, 1)))
+        elif cmd in ("c", "continue"):
             self.cmd_continue()
-            return True
-        if cmd == "watch":
-            addr = parts[1] if len(parts) > 1 else ""
-            size = parts[2] if len(parts) > 2 else "8"
+        elif cmd == "watch":
+            addr = self._dispatch_aux(parts, 1, "")
+            size = self._dispatch_aux(parts, 2, "8")
             self.cmd_watch(addr, size)
-            return True
-        if cmd in ("r", "run"):
-            n = int(parts[1]) if len(parts) > 1 else 1
+        elif cmd in ("r", "run"):
+            n = int(self._dispatch_aux(parts, 1, 1))
             self.cmd_run(n)
-            return True
-        if cmd in ("undo", "rollback"):
+        elif cmd in ("undo", "rollback"):
             self.rollback()
-            return True
-        if cmd == "restart":
+        elif cmd == "restart":
             self.cmd_restart()
-            return True
-
         # 寄存器
-        if cmd in ("regs", "gpr"):
+        elif cmd in ("regs", "gpr"):
             self.cmd_regs()
-            return True
-        if cmd == "reg":
+        elif cmd == "reg":
             if len(parts) < 2:
                 self._warn("用法: reg <name>  例: reg x10, reg a0")
-            else:
-                self.cmd_reg(" ".join(parts[1:]))
-            return True
-        if cmd in ("set", "w"):
+                return True
+            self.cmd_reg(" ".join(parts[1:]))
+        elif cmd in ("set", "w"):
             if len(parts) < 3:
                 self._warn("用法: set <name> <value>  例: set sp 0x8000")
-            else:
-                self.cmd_set(parts[1], parts[2])
-            return True
-
+                return True
+            self.cmd_set(parts[1], parts[2])
         # CSR
-        if cmd == "csr":
+        elif cmd == "csr":
             if len(parts) >= 2:
                 self.cmd_csr(" ".join(parts[1:]))
                 return True
@@ -124,101 +114,78 @@ class DispatchMixin(SharedMixinAttrs):
                 "  例: csr mscratch, mepc, pmpcfg0, pmpaddr0\n"
                 "  例: csr list"
             )
-            return True
-        if cmd == "csrw":
+        elif cmd == "csrw":
             if len(parts) < 3:
                 self._warn(
                     "用法: csrw <name> <value>  例: csrw mtvec 0x80000001"
                 )
-            else:
-                self.cmd_csrw(parts[1], parts[2])
-            return True
-
+                return True
+            self.cmd_csrw(parts[1], parts[2])
         # 状态/内存
-        if cmd == "pc":
-            self.cmd_pc(parts[1] if len(parts) > 1 else None)
-            return True
-        if cmd == "mode":
+        elif cmd == "pc":
+            self.cmd_pc(self._dispatch_aux(parts, 1))
+        elif cmd == "mode":
             self.cmd_mode()
-            return True
-        if cmd == "mstatus":
+        elif cmd == "mstatus":
             self.cmd_mstatus()
-            return True
-        if cmd == "show":
-            self._dispatch_show(parts[1] if len(parts) > 1 else "")
-            return True
-        if cmd == "tlb":
-            self.cmd_tlb(parts[1] if len(parts) > 1 else None)
-            return True
-        if cmd == "tlbflush":
-            self.cmd_tlbflush(parts[1] if len(parts) > 1 else None)
-            return True
-        if cmd == "cache":
-            self.cmd_cache(parts[1] if len(parts) > 1 else None)
-            return True
-        if cmd == "mem":
+        elif cmd == "show":
+            self._dispatch_show(self._dispatch_aux(parts, 1, ""))
+        elif cmd == "tlb":
+            self.cmd_tlb(self._dispatch_aux(parts, 1))
+        elif cmd == "tlbflush":
+            self.cmd_tlbflush(self._dispatch_aux(parts, 1))
+        elif cmd == "cache":
+            self.cmd_cache(self._dispatch_aux(parts, 1))
+        elif cmd == "mem":
             if len(parts) < 2:
                 self._warn("用法: mem <addr> [size]  例: mem 0x80000000 64")
-            else:
-                self.cmd_mem(parts[1], parts[2] if len(parts) > 2 else "64")
-            return True
-        if cmd == "vmem":
+                return True
+            self.cmd_mem(parts[1], self._dispatch_aux(parts, 2, "64"))
+        elif cmd == "vmem":
             if len(parts) < 2:
                 self._warn("用法: vmem <vaddr> [size]  例: vmem sepc 256")
-            else:
-                self.cmd_vmem(parts[1], parts[2] if len(parts) > 2 else "64")
-            return True
-        if cmd == "disasm":
+                return True
+            self.cmd_vmem(parts[1], self._dispatch_aux(parts, 2, "64"))
+        elif cmd == "disasm":
             if len(parts) < 2:
                 self._warn(
                     "用法: disasm <addr> [count]  例: disasm 0x80000000 32"
                 )
-            else:
-                self.cmd_disasm(
-                    parts[1], parts[2] if len(parts) > 2 else "16"
-                )
-            return True
-        if cmd == "vdisasm":
+                return True
+            self.cmd_disasm(
+                parts[1], self._dispatch_aux(parts, 2, "16")
+            )
+        elif cmd == "vdisasm":
             if len(parts) < 2:
                 self._warn(
                     "用法: vdisasm <vaddr> [count]  例: vdisasm sepc 16"
                 )
-            else:
-                self.cmd_vdisasm(
-                    parts[1], parts[2] if len(parts) > 2 else "16"
-                )
-            return True
-        if cmd == "pt":
-            self.cmd_pt(parts[1] if len(parts) > 1 else None)
-            return True
-        if cmd in ("status", "info"):
-            self.cmd_status(parts[1] if len(parts) > 1 else None)
-            return True
-        if cmd in ("stack", "bt", "frame", "f"):
-            self.cmd_frame(parts[1] if len(parts) > 1 else None)
-            return True
-
+                return True
+            self.cmd_vdisasm(
+                parts[1], self._dispatch_aux(parts, 2, "16")
+            )
+        elif cmd == "pt":
+            self.cmd_pt(self._dispatch_aux(parts, 1))
+        elif cmd in ("status", "info"):
+            self.cmd_status(self._dispatch_aux(parts, 1))
+        elif cmd in ("stack", "bt", "frame", "f"):
+            self.cmd_frame(self._dispatch_aux(parts, 1))
         # 符号
-        if cmd in ("symbols",):
-            self.cmd_symbols(parts[1] if len(parts) > 1 else "")
+        elif cmd in ("symbols",):
+            self.cmd_symbols(self._dispatch_aux(parts, 1, ""))
         elif cmd == "sym":
-            self.cmd_sym(parts[1] if len(parts) > 1 else "")
-            return True
-
+            self.cmd_sym(self._dispatch_aux(parts, 1, ""))
         # 配置
-        if cmd == "hart":
+        elif cmd == "hart":
             if len(parts) < 2:
                 self._warn(f"用法: hart <id>  当前: {self._hart_id}")
-            else:
-                self.cmd_hart(int(parts[1]))
-            return True
-
+                return True
+            self.cmd_hart(int(parts[1]))
         # 帮助
-        if cmd in ("h", "help", "?"):
+        elif cmd in ("h", "help", "?"):
             self._print_help()
-            return True
-
-        self._err(f"未知命令: {cmd} (输入 'help' 查看帮助)")
+        else:
+            self._err(f"未知命令: {cmd} (输入 'help' 查看帮助)")
         return True
 
     # ----------------------------------------------------------
@@ -293,20 +260,19 @@ class DispatchMixin(SharedMixinAttrs):
     # ----------------------------------------------------------
     #  帮助
     # ----------------------------------------------------------
+    @staticmethod
+    def _section(title: str, rows: list[tuple[str, str]]) -> Table:
+        tab = Table(title=title, border_style="green", show_header=False)
+        tab.add_column("cmd", style="cyan", no_wrap=True)
+        tab.add_column("desc")
+        for cmd, desc in rows:
+            tab.add_row(cmd, desc)
+        return tab
 
     def _print_help(self) -> None:
         """显示帮助 — 使用 Rich Table 以保证中英文混排对齐."""
-
-        def _section(title: str, rows: list[tuple[str, str]]) -> Table:
-            tab = Table(title=title, border_style="green", show_header=False)
-            tab.add_column("cmd", style="cyan", no_wrap=True)
-            tab.add_column("desc")
-            for cmd, desc in rows:
-                tab.add_row(cmd, desc)
-            return tab
-
         sections: list[Table] = [
-            _section("执行控制", [
+            self._section("执行控制", [
                 ("s/step [n]", "单步执行 n 条指令 (默认 1)"),
                 ("c/continue", "连续执行 (直到 Ctrl+C 暂停)"),
                 ("r/run [n]", "执行 n 条指令 (默认 1)"),
@@ -321,7 +287,7 @@ class DispatchMixin(SharedMixinAttrs):
                 ("bp delete <n>", "删除编号为 n 的断点"),
                 ("bp clear", "清除全部断点"),
             ]),
-            _section("读寄存器命令", [
+            self._section("读寄存器命令", [
                 ("regs/gpr", "显示全部 GPR (x0–x31)"),
                 ("reg <name>", "显示指定 GPR (例: reg a0, reg x10)"),
                 ("csr <name>", "显示指定 CSR (例: csr mstatus)"),
@@ -335,13 +301,13 @@ class DispatchMixin(SharedMixinAttrs):
                 ("pt [va]", "Sv39 页表遍历: 逐级显示 PTE 与权限"),
                 ("show-pmp", "显示全部 PMP 条目的保护范围与权限"),
             ]),
-            _section("写寄存器命令", [
+            self._section("写寄存器命令", [
                 ("set/w <name> <val>", "写入 GPR (例: set sp 0x8000)"),
                 ("csrw <name> <val>",
                  "写入 CSR (例: csrw mtvec 0x80000001)"),
                 ("pc <addr>", "设置 PC 并显示反汇编"),
             ]),
-            _section("内存/符号", [
+            self._section("内存/符号", [
                 ("mem <addr> [size]",
                  "hexdump 给定物理地址下的内存 (默认 64 字节)"),
                 ("vmem <addr> [size]",
@@ -352,13 +318,13 @@ class DispatchMixin(SharedMixinAttrs):
                  "对虚拟地址起的 count 条指令做反汇编 (默认 16)"),
                 ("sym/symbols [filt]", "列出符号表 (可选过滤)"),
             ]),
-            _section("状态", [
+            self._section("状态", [
                 ("status/info [hart]", "全部 hart 概览, 或指定 hart 详情"),
                 ("stack/bt", "栈帧情况"),
                 ("frame/f <N>", "切换到第 N 帧"),
             ]),
-            _section("配置", [("hart <id>", "切换活跃 hart")]),
-            _section("其他", [
+            self._section("配置", [("hart <id>", "切换活跃 hart")]),
+            self._section("其他", [
                 ("help/h/?", "显示本帮助"),
                 ("quit/q/exit", "退出调试器"),
             ]),

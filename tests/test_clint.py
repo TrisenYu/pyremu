@@ -7,6 +7,10 @@
 
 import pytest
 
+from pyremu.core.decoder import Hart
+from pyremu.core.hart import MSTATUS_MIE, RiscvMode
+from pyremu.core.mem_check_aux import inject_memory_backend
+from pyremu.core.trap_handler import _update_hw_mip
 from pyremu.interrupt.clint import (
     CLINT,
     CLINT_BASE,
@@ -119,3 +123,146 @@ class TestCLINTBusIntegration:
         assert bus.is_device_addr(CLINT_BASE)
         assert bus.is_device_addr(CLINT_BASE + MSIP_OFFSET)
         assert bus.is_device_addr(CLINT_BASE + MTIME_OFFSET)
+
+
+class TestCLINTMmioPath:
+    """验证 CLINT MSIP 通过 MMIO 存储指令的完整路径.
+
+    固件 (OpenSBI / Linux) 通过 store 指令写 CLINT MSIP 寄存器
+    来发送/清除核间中断。该路径必须正确通过
+    Hart -> mem_write -> Bus.write -> CLINT.write。
+    """
+
+    # RV64 指令编码
+    SW_INSTR = 0x00552023  # sw x5, 0(x10) — 将 x5 的值存入 *x10
+    SD_INSTR = 0x00553023  # sd x5, 0(x10) — 同上 (64-bit)
+    LW_INSTR = 0x00052283  # lw x5, 0(x10)
+    WFI_INSTR = 0x10500073  # wfi
+
+    BASE_REG = 10  # x10 (a0) — 用于 store 指令的基址寄存器
+
+    @staticmethod
+    def _make_hart_with_clint(
+        hart_id: int = 0,
+        num_harts: int = 2,
+    ):
+        """创建带 Bus + CLINT 的 Hart, M-mode."""
+        clint = CLINT(num_harts=num_harts)
+        clint.base_addr = CLINT_BASE
+        bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
+        bus.add_device(CLINT_BASE, clint)
+
+        h = Hart(id=hart_id)
+        h.pc = 0x80000000
+        h.mode = RiscvMode.M
+        h.mstatus_val = MSTATUS_MIE
+        h.csrs["mtvec"].val = 0x80000100
+        h.csrs["mie"].val = 1 << 3  # MSIE
+        h.interrupt_ctrl = clint
+        inject_memory_backend(h, bus.read, bus.write)
+        h.bus = bus
+
+        return h, clint, bus
+
+    def test_store_to_msip_sets_hardware_bit(self):
+        """Store 指令写入 CLINT MSIP -> _msip[hart_id] 置位."""
+        h, clint, bus = self._make_hart_with_clint()
+
+        # 设置 store 目标地址 = CLINT MSIP[hart0]
+        msip_addr = CLINT_BASE + MSIP_OFFSET
+        h.write_gpr(self.BASE_REG, msip_addr)  # rs1 (base addr reg)
+        h.write_gpr(5, 1)  # rs2 (value = 1)
+
+        # 将 SW 指令写入 RAM
+        bus.write(0x80000000, self.SW_INSTR.to_bytes(4, "little"))
+
+        # 执行 store
+        h.exec_instr(self.SW_INSTR)
+
+        # 验证 CLINT _msip 已置位
+        assert clint._msip[0] == 1, (
+            f"MMIO store 应置位 _msip[0], 实际={clint._msip[0]}"
+        )
+        has_pending, mip, src = clint.check_interrupt(0)
+        assert has_pending, "check_interrupt 应返回 pending"
+        assert src is not None and src.name == "MSI", f"中断源应为 MSI, 实际={src}"
+
+    def test_store_zero_to_msip_clears_hardware_bit(self):
+        """Store 指令写 0 到 CLINT MSIP -> _msip[hart_id] 清零."""
+        h, clint, bus = self._make_hart_with_clint()
+
+        # 先通过 Python API 置位 MSIP (模拟先前的 IPI)
+        clint.send_ipi(0)
+        assert clint._msip[0] == 1, "send_ipi 应置位 _msip"
+
+        # 现在通过 store 指令清除 MSIP
+        msip_addr = CLINT_BASE + MSIP_OFFSET
+        h.write_gpr(self.BASE_REG, msip_addr)  # rs1
+        h.write_gpr(5, 0)  # rs2 (value = 0)
+
+        bus.write(0x80000000, self.SW_INSTR.to_bytes(4, "little"))
+        h.exec_instr(self.SW_INSTR)
+
+        assert clint._msip[0] == 0, (
+            f"MMIO store 写 0 应清零 _msip[0], 实际={clint._msip[0]}"
+        )
+        has_pending, _, _ = clint.check_interrupt(0)
+        assert not has_pending, "check_interrupt 应返回 no pending"
+
+    def test_store_to_other_hart_msip_sets_correct_bit(self):
+        """Hart 0 store 到 CLINT MSIP[hart1] -> _msip[1] 置位, _msip[0] 不变."""
+        h, clint, bus = self._make_hart_with_clint(hart_id=0, num_harts=4)
+
+        # 目标: CLINT MSIP[hart3] (offset = MSIP_OFFSET + 3 * 4)
+        msip_addr = CLINT_BASE + MSIP_OFFSET + 3 * 4
+        h.write_gpr(self.BASE_REG, msip_addr)  # rs1
+        h.write_gpr(5, 1)  # rs2 (value = 1)
+
+        bus.write(0x80000000, self.SW_INSTR.to_bytes(4, "little"))
+        h.exec_instr(self.SW_INSTR)
+
+        # 验证只有 hart 3 收到 MSIP
+        for hid in range(4):
+            expected = 1 if hid == 3 else 0
+            assert clint._msip[hid] == expected, (
+                f"_msip[{hid}] 应为 {expected}, 实际={clint._msip[hid]}"
+            )
+        has_pending, _, _ = clint.check_interrupt(3)
+        assert has_pending, "hart 3 应有 pending MSIP"
+
+    def test_msip_clear_via_mmio_and_verify_no_pending(self):
+        """MMIO 清零 MSIP 后 mip CSR 通过 _update_hw_mip 反映已清零状态.
+
+        回归: 若只清零 _msip 但 mip CSR 未同步, check_pending_interrupts
+        仍会看到过时的 MSIP=1 -> 虚假中断投递 -> MSIP 风暴.
+        """
+        h, clint, bus = self._make_hart_with_clint(hart_id=0, num_harts=2)
+
+        # Step 1: 通过 MMIO store 置位 MSIP[0]
+        msip_addr = CLINT_BASE + MSIP_OFFSET
+        h.write_gpr(self.BASE_REG, msip_addr)
+        h.write_gpr(5, 1)
+        bus.write(0x80000000, self.SW_INSTR.to_bytes(4, "little"))
+        h.exec_instr(self.SW_INSTR)
+        assert clint._msip[0] == 1
+
+        # Step 2: 同步 mip CSR 从硬件
+        has_pending, mip_bits, _ = clint.check_interrupt(0)
+        _update_hw_mip(h, mip_bits)
+        assert h.mip_val & (1 << 3), "mip.MSIP 应置位"
+
+        # Step 3: 通过 MMIO store 清零 MSIP[0]
+        h.pc = 0x80000004
+        h.write_gpr(self.BASE_REG, msip_addr)  # 重置基址寄存器
+        h.write_gpr(5, 0)  # value = 0
+        bus.write(0x80000004, self.SW_INSTR.to_bytes(4, "little"))
+        h.exec_instr(self.SW_INSTR)
+        assert clint._msip[0] == 0, "MSIP 应已被 MMIO store 清零"
+
+        # Step 4: 重新同步 mip CSR -> MSIP 必须为 0
+        has_pending, mip_bits, _ = clint.check_interrupt(0)
+        _update_hw_mip(h, mip_bits)
+        assert not (h.mip_val & (1 << 3)), (
+            f"清零后 mip.MSIP 必须为 0, 实际 mip={h.mip_val:#x}"
+        )
+        assert not has_pending, "check_interrupt 应返回 no pending"

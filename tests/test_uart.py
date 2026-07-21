@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
+
+"""UART 多 hart 行缓冲 + 每 hart 日志文件 + 控制台回显所有权测试.
+
+锁定:
+- native 并发引擎多核并发写 UART 时, 输出需按 hart 归入各自行缓冲
+  (消除交错乱码), 并可定向到 <log_dir>/hart<N>.log。
+- 单一输出 owner (QEMU chardev 模型): Rust termio 线程运行期间
+  (console_echo=False) Python 行缓冲不重复回显控制台, 仅归档日志。
+- TX 环形缓冲的日志消费者 (tx_log_rd) 与 termio 线程排空索引 (tx_drain)
+  相互独立, Python 不写 tx_drain。
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from pyremu._native import native_available
+from pyremu.emulator import Emulator
+from pyremu.peripheral.uart import UART
+from pyremu.platform import PeripheralConfig, PlatformConfig
+
+TXDATA = 0x00
+
+
+def _make_uart(sink: list[str]) -> UART:
+    return UART(base=0x1000_0000, tx_callback=sink.append)
+
+
+def _write_line(uart: UART, hart_id: int, text: str) -> None:
+    uart.set_writer(hart_id)
+    for b in text.encode():
+        uart.write(TXDATA, bytes([b]))
+
+
+class TestPerHartLineBuffer:
+    """多 hart 行缓冲: 按写者 hart 归行, 换行刷新.
+
+    控制台输出为原始字节 (不加 ``[hart N]`` 前缀, 与 QEMU -nographic 一致);
+    每 hart 输出分流通过 ``set_hart_log_dir()`` 提供的日志文件查看。
+    """
+
+    def test_lines_not_interleaved(self):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        # 交替逐字节写两个 hart, 但各自成整行
+        _write_line(uart, 0, "AAA\n")
+        _write_line(uart, 1, "BBB\n")
+        out = "".join(sink)
+        assert "AAA\n" in out
+        assert "BBB\n" in out
+        # 每行完整, 不出现 A/B 交错
+        assert "AB" not in out and "BA" not in out
+
+    def test_raw_output_no_prefix(self):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        _write_line(uart, 0, "hello\n")
+        _write_line(uart, 1, "world\n")
+        out = "".join(sink)
+        # 控制台输出为原始字节, 不加 [hart N] 前缀
+        assert "[hart" not in out
+        assert "hello\n" in out
+        assert "world\n" in out
+
+    def test_per_hart_log_files_isolate_output(self, tmp_path):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        uart.set_hart_log_dir(str(tmp_path))
+        _write_line(uart, 0, "a\n")
+        _write_line(uart, 0, "b\n")
+        uart.close_logs()
+        # 日志文件按 hart 隔离, 原始文本
+        assert (tmp_path / "hart0.log").read_text() == "a\nb\n"
+        # 控制台无前缀
+        out = "".join(sink)
+        assert "[hart" not in out
+
+
+class TestPerHartLogFiles:
+    """set_hart_log_dir: 各 hart 输出另存 hart<N>.log (原始文本, 无 ANSI 标签)."""
+
+    def test_writes_separate_files(self, tmp_path):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        uart.set_hart_log_dir(str(tmp_path))
+        _write_line(uart, 0, "hello from 0\n")
+        _write_line(uart, 1, "hello from 1\n")
+        uart.close_logs()
+
+        h0 = (tmp_path / "hart0.log").read_text()
+        h1 = (tmp_path / "hart1.log").read_text()
+        assert h0 == "hello from 0\n"
+        assert h1 == "hello from 1\n"
+
+    def test_log_file_has_no_ansi_tag(self, tmp_path):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        uart.set_hart_log_dir(str(tmp_path))
+        _write_line(uart, 0, "clean\n")
+        uart.close_logs()
+        h0 = (tmp_path / "hart0.log").read_text()
+        assert "\033[" not in h0  # 无 ANSI 颜色
+        assert "[hart 0]" not in h0  # 无标签
+
+    def test_dir_created_if_missing(self, tmp_path):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        target = tmp_path / "logs" / "sub"
+        uart.set_hart_log_dir(str(target))
+        _write_line(uart, 3, "deep\n")
+        uart.close_logs()
+        assert (target / "hart3.log").read_text() == "deep\n"
+
+    def test_disable_stops_file_output(self, tmp_path):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        uart.set_hart_log_dir(str(tmp_path))
+        _write_line(uart, 0, "one\n")
+        uart.set_hart_log_dir(None)  # 关闭
+        _write_line(uart, 0, "two\n")
+        uart.close_logs()
+        h0 = (tmp_path / "hart0.log").read_text()
+        assert h0 == "one\n"  # 关闭后不再写文件
+        assert "two" in "".join(sink)  # 但仍走控制台
+
+
+class TestConsoleEchoOwnership:
+    """单一输出 owner: console_echo=False 时行缓冲只归档日志, 不回显控制台.
+
+    锁定: 修复前 Rust termio 线程直写 stdout 的同时, Python 行缓冲 flush
+    仍经 _tx_callback 再写一次 → 所有控制台输出双份。
+    """
+
+    def test_echo_disabled_suppresses_console_callback(self):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        uart.set_console_echo(False)
+        _write_line(uart, 0, "hi\n")
+        assert sink == []  # native termio 线程负责 stdout, Python 不重复回显
+
+    def test_echo_reenabled_restores_console_callback(self):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        uart.set_console_echo(False)
+        _write_line(uart, 0, "hidden\n")
+        uart.set_console_echo(True)
+        _write_line(uart, 0, "visible\n")
+        out = "".join(sink)
+        assert "hidden" not in out
+        assert "visible\n" in out
+
+    def test_echo_disabled_still_writes_hart_logs(self, tmp_path):
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        uart.set_hart_log_dir(str(tmp_path))
+        uart.set_console_echo(False)
+        _write_line(uart, 2, "logged\n")
+        uart.close_logs()
+        assert (tmp_path / "hart2.log").read_text() == "logged\n"
+        assert sink == []
+
+    def test_echo_disabled_gates_writer_less_path(self):
+        """无 set_writer 时的直通回调路径同样受 console_echo 约束."""
+        sink: list[str] = []
+        uart = _make_uart(sink)
+        uart.set_console_echo(False)
+        uart.write(TXDATA, b"X")  # _current_writer is None → 直通回调路径
+        assert sink == []
+
+
+@pytest.mark.skipif(
+    not native_available(), reason="native 加速库不可用, 跳过 native UART 分流测试",
+)
+class TestNativeUartPairRouting:
+    """native ring buffer 的 (hart_id, byte) 二元组按 hart 分流 (drain_tx_logs).
+
+    锁定:
+    - 每条目 [hid, byte], 日志消费者按 set_writer(hid) 归入对应 hart。
+    - 日志消费者持独立读索引 tx_log_rd; tx_drain 归 Rust termio 线程独占,
+      Python 侧绝不写入 (修复前双写者竞争导致条目重放/丢失)。
+    - 索引为单调 u32, 跨 u32 环绕与跨容量环绕时槽位定位均正确
+      (修复前 range(drain, min(tx_wr, tx_cap)) 在 tx_wr 超过容量后失效)。
+    """
+
+    def _make_emu(self, tmp_path) -> Emulator:
+        cfg = PlatformConfig(
+            num_harts=2,
+            ram_size=8 * 1024 * 1024,
+            ram_base=0x8000_0000,
+            prog_cnt=0x8000_0000,
+            periph=PeripheralConfig(),
+        )
+        # TX ring buffer 由 TerminalIO 管理, 仅在启用 native batch 时分配;
+        # 测试默认 PYREMU_NATIVE_BATCH=0, 故构造时临时开启。
+        prev = os.environ.get("PYREMU_NATIVE_BATCH")
+        os.environ["PYREMU_NATIVE_BATCH"] = "1"
+        try:
+            emu = Emulator(cfg)
+        finally:
+            if prev is None:
+                os.environ.pop("PYREMU_NATIVE_BATCH", None)
+            else:
+                os.environ["PYREMU_NATIVE_BATCH"] = prev
+        uart = emu.uart
+        assert uart is not None
+        uart.set_hart_log_dir(str(tmp_path))
+        return emu
+
+    def _push_pair(self, emu: Emulator, hid: int, byte: int) -> None:
+        termio = emu._termio
+        assert termio is not None, "TerminalIO must be initialised (native batch + UART)"
+        ecap = termio.TX_CAP // 2
+        e = termio.tx_wr.value
+        termio.tx_buf[2 * (e % ecap)] = hid
+        termio.tx_buf[2 * (e % ecap) + 1] = byte
+        termio.tx_wr.value = (e + 1) & 0xFFFF_FFFF
+
+    def test_interleaved_pairs_routed_per_hart(self, tmp_path):
+        emu = self._make_emu(tmp_path)
+        uart = emu.uart
+        assert uart is not None
+        # 交错推入: hart0 'H''I''\n', hart1 'Y''O''\n' 逐字节穿插
+        seq = [(0, ord("H")), (1, ord("Y")), (0, ord("I")), (1, ord("O")),
+               (0, ord("\n")), (1, ord("\n"))]
+        for hid, b in seq:
+            self._push_pair(emu, hid, b)
+
+        emu._native_flush_uart()
+        uart.close_logs()
+
+        assert (tmp_path / "hart0.log").read_text() == "HI\n"
+        assert (tmp_path / "hart1.log").read_text() == "YO\n"
+
+    def test_flush_advances_log_index_not_drain(self, tmp_path):
+        """日志消费者只推进 tx_log_rd; tx_drain 归 termio 线程独占, Python 不碰."""
+        emu = self._make_emu(tmp_path)
+        self._push_pair(emu, 0, ord("A"))
+        self._push_pair(emu, 0, ord("\n"))
+        termio = emu._termio
+        assert termio is not None
+        assert termio.tx_log_rd == 0
+        emu._native_flush_uart()
+        # 日志读索引追上写索引 — 所有条目已归档
+        assert termio.tx_log_rd == termio.tx_wr.value
+        # tx_drain 不被 Python 写入 (termio 线程未运行 → 保持 0)
+        assert termio.tx_drain.value == 0
+
+    def test_log_drain_handles_u32_wraparound(self, tmp_path):
+        """索引跨 u32 环绕: rd=0xFFFF_FFFE, wr=2 → 4 个条目正确归档.
+
+        修复前 range(drain, min(tx_wr, tx_cap)) 在此场景下为空区间, 条目全丢。
+        """
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        assert termio is not None
+        ecap = termio.TX_CAP // 2
+        start = 0xFFFF_FFFE
+        termio._tx_log_rd = start
+        termio.tx_wr.value = start
+        for b in b"ok\n\n":
+            self._push_pair(emu, 0, b)
+        assert termio.tx_wr.value == 2  # 已跨 u32 环绕
+        # 槽位按 % ecap 定位 (ecap 为 2 的幂, 整除 2^32, 环绕后仍连续)
+        assert start % ecap == ecap - 2
+
+        emu._native_flush_uart()
+        assert emu.uart is not None
+        emu.uart.close_logs()
+        assert (tmp_path / "hart0.log").read_text() == "ok\n\n"
+        assert termio.tx_log_rd == 2
+
+    def test_log_drain_skips_lapped_entries(self, tmp_path):
+        """生产者超圈 (pending > ecap) 时跳到仍有效的最旧条目, 不重复整圈."""
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        assert termio is not None
+        ecap = termio.TX_CAP // 2
+        # 伪造超圈: 写索引领先读索引 ecap + 4 个条目
+        termio._tx_log_rd = 0
+        termio.tx_wr.value = ecap + 4
+        for i in range(4):
+            termio.tx_buf[2 * i] = 0
+            termio.tx_buf[2 * i + 1] = ord("a") + i
+        emu._native_flush_uart()
+        # 读索引应追平写索引 (只消费最后 ecap 个条目, 未卡死/未重复)
+        assert termio.tx_log_rd == ecap + 4
+
+
+# ============================================================
+#  TX watermark 电平中断 — 回归
+# ============================================================
+
+
+class TestTxWatermarkInterrupt:
+    """TX watermark 电平中断: txcnt>0 时 IP.txwm 恒置位 (FIFO 即时排空模型).
+
+    回归背景: 旧实现 IP.txwm 依赖 Python TXDATA 写路径锁存, 而 Linux 启动后
+    TXDATA 写由 Rust 批量引擎 inline 处理 (不经 Python `_write_reg`) →
+    IP.txwm 恒为 0; sifive 驱动 start_tx 使能 IE.txwm 后永远等不到中断,
+    用户态 tty 输出 (shell 提示符 / 输入回显) 全部滞留内核 TX 环形缓冲,
+    仅内核 printk (轮询 console 路径) 可见。且旧 `_update_plic_rx` 只按
+    RX 状态拉 PLIC 线, IE.txwm 使能从不触发中断。
+    """
+
+    REG_TXCTRL = 0x08
+    REG_IE = 0x10
+    REG_IP = 0x14
+
+    def _read_ip(self, uart: UART) -> int:
+        return int.from_bytes(uart.read(self.REG_IP, 4), "little")
+
+    def test_ip_txwm_set_by_txcnt_without_any_txdata_write(self):
+        """txcnt=1 时 IP.txwm 立即可读为 1 — 无需任何 TXDATA 写经过 Python.
+
+        旧行为 (锁存式) 下本测试失败: 未写过 TXDATA → IP 读 0。
+        """
+        uart = _make_uart([])
+        # Linux sifive 驱动 probe: txctrl = TXEN | (1 << TXCNT_SHIFT)
+        uart.write(self.REG_TXCTRL, (0x1 | (1 << 16)).to_bytes(4, "little"))
+        assert self._read_ip(uart) & UART.IP_TXWM
+
+    def test_ip_txwm_clear_when_txcnt_zero(self):
+        """txcnt=0 → 水位条件永不成立, IP.txwm 读 0."""
+        uart = _make_uart([])
+        uart.write(self.REG_TXCTRL, (0x1).to_bytes(4, "little"))  # 仅 TXEN
+        assert not (self._read_ip(uart) & UART.IP_TXWM)
+
+    def test_ie_txwm_raises_plic_line(self):
+        """IE.txwm 使能且水位满足 → PLIC 中断线拉高 (旧行为: 从不拉高)."""
+        from pyremu.interrupt.plic import PLIC
+
+        plic = PLIC(base_addr=0x0C00_0000, num_sources=4, num_contexts=2)
+        uart = UART(base=0x1000_0000, plic=plic, irq=1)
+        uart.write(self.REG_TXCTRL, (0x1 | (1 << 16)).to_bytes(4, "little"))
+        assert not plic._pending[1], "IE 未使能时不应挂起"
+        uart.write(self.REG_IE, (0x1).to_bytes(4, "little"))  # IE.txwm
+        assert plic._pending[1], "IE.txwm 使能后 PLIC 线必须拉高"
+        # 驱动排空后关闭 IE.txwm → 线拉低
+        uart.write(self.REG_IE, (0x0).to_bytes(4, "little"))
+        assert not plic._pending[1]
+
+    def test_ip_register_is_read_only(self):
+        """SiFive spec: IP 为电平状态只读寄存器, 写入被忽略."""
+        uart = _make_uart([])
+        uart.write(self.REG_TXCTRL, (0x1 | (1 << 16)).to_bytes(4, "little"))
+        uart.write(self.REG_IP, (0xFFFF_FFFF).to_bytes(4, "little"))
+        assert self._read_ip(uart) & UART.IP_TXWM, "IP 写入不得清除水位状态"
+
+    def test_ip_combines_tx_and_rx(self):
+        """TX 水位与 RX 非空同时成立 → IP 两位均置位."""
+        uart = _make_uart([])
+        uart.write(self.REG_TXCTRL, (0x1 | (1 << 16)).to_bytes(4, "little"))
+        uart.preload(b"x")
+        ip = self._read_ip(uart)
+        assert ip & UART.IP_TXWM and ip & UART.IP_RXWM

@@ -54,6 +54,7 @@ class SharedMixinAttrs:
     _sym_ranges_pa: list[tuple[int, int, str]]
     _sym_load_offset: int
     _sym_path: str | None
+    _pa_to_va: dict[int, int]
 
     _running: bool
     _sigint_count: int
@@ -94,6 +95,13 @@ class SharedMixinAttrs:
     _session: PromptSession
 
     _MODE_COLORS: dict[str, str]
+
+    _show_diag: bool
+
+    # UART stdin 转发 (终端 raw mode 管理)
+    _stdin_forward: bool
+    _stdin_fd: int
+    _saved_term_attrs: Any
 
     # ----------------------------------------------------------
     #  __getattr__ — 仅在 TYPE_CHECKING 时存在

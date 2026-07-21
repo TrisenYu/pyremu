@@ -16,9 +16,17 @@ wheels/
 .ruff_cache
 .coverage
 .claude
+vendor/*
 third-party/*
 !third-party/rust_smode_entry/
+!third-party/setup-rootfs/
 !third-party/.linux-config
+
+# Large build artifacts (third-party)
+third-party/setup-rootfs/debootstrap/riscv-sd.ext4
+third-party/setup-rootfs/debootstrap/debian-riscv-initrd.cpio.gz
+third-party/setup-rootfs/debootstrap/tmp-rootfs/
+third-party/setup-rootfs/busybox-1.38.0/
 
 # Native extension build artifacts (platform-specific, not committed)
 *.so
@@ -26,4 +34,7 @@ third-party/*
 *.dylib
 *.pyd
 pyremu/_native/target/
+
+# Hart serial log output
+output/
 

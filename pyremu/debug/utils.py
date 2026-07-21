@@ -11,7 +11,7 @@
 from pathlib import Path
 
 from pyremu.core.decoder import Opc
-from pyremu.core.trap import trap_cause_name as _trap_cause_name_impl
+from pyremu.core.trap_def import trap_cause_name as _trap_cause_name_impl
 
 # ============================================================
 #  节流常量
@@ -36,9 +36,15 @@ _SIZE_UNITS: tuple[tuple[str, int], ...] = (
 )
 
 
-def hex_addr(v: int) -> str:
-    """格式化为 16 位 hex: ``0x0000000080000000``."""
-    return f"0x{(v & 0xFFFF_FFFF_FFFF_FFFF):016x}"
+def hex_addr(v: int, styled: bool = True) -> str:
+    """格式化为 16 位 hex: ``0x0000000080000000``.
+
+    *styled* 为 True 时, 虚地址以蓝色高亮 (Rich tag).
+    """
+    raw = f"0x{(v & 0xFFFF_FFFF_FFFF_FFFF):016x}"
+    if styled:
+        return f"[bright_blue]{raw}[/]"
+    return raw
 
 
 def fmt_size(n: int) -> str:

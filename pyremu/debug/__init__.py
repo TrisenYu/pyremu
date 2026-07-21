@@ -50,7 +50,7 @@ class Debugger(
     """RISC-V 交互式调试器 — 所有功能域通过 mixin 组合."""
 
     # Backward-compatible static helpers — 原始 debugger.py 暴露为类方法.
-    _hex = staticmethod(hex_addr)
+    _hex = staticmethod(lambda v: hex_addr(v, styled=False))
     _fmt_size = staticmethod(fmt_size)
     _fmt_instr_count = staticmethod(fmt_instr_count)
     _hexdump_bytes = staticmethod(TlbCacheMixin._hexdump_bytes)

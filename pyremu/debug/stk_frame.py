@@ -19,9 +19,74 @@ from pyremu.debug.types import StackFrame
 from pyremu.debug.utils import hex_addr
 from pyremu.utils.wrapper import seize_val_err
 
+# 跨特权级 trap 上下文中 RA/FP 保存偏移的常见布局.
+# 当前指令级解析 (_parse_trap_save_offsets) 失败时,
+# 按优先级依次尝试这些 (ra_off, fp_off) 对.  0 表示该偏移未知/不需要.
+_FALLBACK_TRAP_OFFSETS: tuple[tuple[int, int], ...] = (
+    (0, 8),    # 紧凑型: sd x1,0(sp); sd x8,8(sp)
+    (8, 64),   # Linux pt_regs: ra=PT_RA(8), s0=PT_S0(64)
+    (0, 16),   # 稀疏型: sd x1,0(sp); sd x8,16(sp)
+    (8, 16),   # 类型 B: RA 在 gp 之后
+    (8, 24),   # 类型 C
+)
 
 class StackWalkMixin(SharedMixinAttrs):
     """栈帧回溯 (backtrace)."""
+
+    # ----------------------------------------------------------
+    #  调用点推断
+    # ----------------------------------------------------------
+
+    # ---- call instruction encoding constants (RV64) ----
+    # C1 quadrant: bits[1:0]=01, bits[15:13]=funct3
+    # C2 quadrant: bits[1:0]=10, bits[15:13]=funct3
+    #
+    # c.jal  (RV64)  funct3=101  quadrant C1  →  jal  x1, imm     [2 B]
+    # c.jalr           funct3=100  quadrant C2  →  jalr x1, rs1, 0  [2 B]
+    #                                                  bit[12]=0
+    # jal              opcode=110_1111,  rd=x1                    [4 B]
+    # jalr             opcode=110_0111,  funct3=000, rd=x1        [4 B]
+    # ----------------------------------------------------------
+
+    _C_JAL_MASK: int  = 0xE003   # bits[15:13]=101, bits[1:0]=01
+    _C_JAL_MATCH: int = 0x2001
+
+    _C_JALR_MASK: int  = 0xF003  # bits[15:13]=100, bit[12]=0, bits[1:0]=10
+    _C_JALR_MATCH: int = 0x9002
+
+    def _call_site_pc(self, ra: int) -> int:
+        """从返回地址推断调用指令的 PC.
+
+        RISC-V 调用指令的返回地址为 PC+2 (c.jal/c.jalr) 或 PC+4
+        (jal/jalr). 读取 ra 之前的指令字节以判定调用类型; 若无法
+        确定则保守假设 4 字节.
+        """
+        # -- 尝试 ra-2: 16-bit 压缩调用 --
+        if ra >= 2:
+            raw = self._try_read_va(ra - 2, 2)
+            if raw is not None:
+                h = int.from_bytes(raw, "little", signed=False)
+                if (h & 0x3) != 3:                         # compressed quadrant
+                    if (h & self._C_JAL_MASK) == self._C_JAL_MATCH:
+                        return ra - 2                       # c.jal
+                    if (h & self._C_JALR_MASK) == self._C_JALR_MATCH:
+                        return ra - 2                       # c.jalr
+
+        # -- 尝试 ra-4: 32-bit 调用 --
+        if ra >= 4:
+            raw = self._try_read_va(ra - 4, 4)
+            if raw is not None:
+                w = int.from_bytes(raw, "little", signed=False)
+                if ((w >> 7) & 0x1F) != 1:                  # rd ≠ x1 → not a call
+                    return ra - 4 if ra >= 4 else 0
+                opc = w & 0x7F
+                if opc == 0b1101111:                        # jal
+                    return ra - 4
+                if opc == 0b1100111 and ((w >> 12) & 0x7) == 0b000:  # jalr
+                    return ra - 4
+
+        # -- 无法确定: 假设 4-byte 调用 --
+        return ra - 4 if ra >= 4 else 0
 
     # ----------------------------------------------------------
     #  帧链接读取
@@ -49,39 +114,43 @@ class StackWalkMixin(SharedMixinAttrs):
     def _parse_trap_save_offsets(
         self, tvec: int, max_instrs: int = 128
     ) -> tuple[int, int] | None:
-        """解析 trap 入口代码, 提取 RA/FP 相对 trap SP 的保存偏移."""
-        raw = self._emu.bus.try_read(tvec, max_instrs * 4)
+        """从 trap 入口代码中提取 RA / FP 相对 trap 帧 SP 的保存偏移.
+
+        扫描 *tvec* 起最多 *max_instrs* 条指令, 寻找形如
+          sd x1, OFF(sp) / c.sdsp x1, OFF(sp)   →  ra_off = OFF
+          sd x8, OFF(sp) / c.sdsp x8, OFF(sp)   →  fp_off = OFF
+        的寄存器保存操作.  必须至少找到 RA 偏移才视为成功.
+        """
+        raw = self._try_read_va(tvec, max_instrs * 4)
         if raw is None:
             return None
+
         ra_off: int | None = None
         fp_off: int | None = None
         pos = 0
         while pos + 2 <= len(raw) and (ra_off is None or fp_off is None):
             half = int.from_bytes(raw[pos:pos + 2], "little", signed=False)
-            if (half & 0x3) != 3:  # 16-bit compressed
-                decoded = decode_c_sdsp(half)
-                if decoded is not None:
-                    rs2, uimm = decoded
-                    if rs2 == 1 and ra_off is None:
-                        ra_off = uimm
-                    elif rs2 == 8 and fp_off is None:
-                        fp_off = uimm
+            is_compressed = (half & 0x3) != 3
+            if is_compressed:
+                ra_off = ra_off or self._try_match_save(half, 1, decode_c_sdsp)
+                fp_off = fp_off or self._try_match_save(half, 8, decode_c_sdsp)
                 pos += 2
-                continue
-            # 32-bit
-            instr = int.from_bytes(raw[pos:pos + 4], "little", signed=False)
-            decoded = decode_sd_sp(instr)
-            if decoded is not None:
-                rs2, imm = decoded
-                if rs2 == 1 and ra_off is None:
-                    ra_off = imm
-                elif rs2 == 8 and fp_off is None:
-                    fp_off = imm
-            pos += 4
+            else:
+                instr = int.from_bytes(raw[pos:pos + 4], "little", signed=False)
+                ra_off = ra_off or self._try_match_save(instr, 1, decode_sd_sp)
+                fp_off = fp_off or self._try_match_save(instr, 8, decode_sd_sp)
+                pos += 4
 
-        if ra_off is None:
+        return (ra_off, fp_off or 0) if ra_off is not None else None
+
+    @staticmethod
+    def _try_match_save(instr: int, reg: int, decoder) -> int | None:
+        """若 *instr* 是 ``sd x{reg}, OFF(sp)`` 则返回 OFF, 否则 None."""
+        decoded = decoder(instr)
+        if decoded is None:
             return None
-        return ra_off, (fp_off if fp_off is not None else 0)
+        rs2, offset = decoded
+        return offset if rs2 == reg else None
 
     # ----------------------------------------------------------
     #  边界帧解析
@@ -167,7 +236,7 @@ class StackWalkMixin(SharedMixinAttrs):
                 prev_ra = saved_ra
                 if not self._is_valid_code_va(prev_ra):
                     ra_corrupted = True
-            call_site = prev_ra - 4 if prev_ra >= 4 else 0
+            call_site = self._call_site_pc(prev_ra)
             note = "RA 可能已被当前函数覆盖 (非合法代码地址)" if ra_corrupted else ""
 
             if not _seen_lower_mode:
@@ -182,9 +251,40 @@ class StackWalkMixin(SharedMixinAttrs):
             ))
             current_fp = saved_fp
 
+        # 当 FP 链自然终止且最后一帧有有效 RA 时, 由 RA 推断调用者,
+        # 再尝试跨特权级 trap 上下文回溯.  避免 FP 链终止后直接落在
+        # 残留的 trap 上下文上 (如 mepc 指向无关地址), 产生无意义的
+        # "仅 trap PC (栈扫描无匹配)" 帧.
+        #
+        # 单帧链 (FP 链完全无法回溯, 如 Sv39 翻译读不到栈页) 也尝试
+        # 由 live RA 推断一个直接调用者, 避免仅输出孤立的 #01 帧.
+        ra_inferred = None
+        if len(frames) == 1:
+            ra = frames[0].ra
+            if ra != 0 and self._is_valid_code_va(ra):
+                call_site = self._call_site_pc(ra)
+                ra_inferred = StackFrame(
+                    idx=1, fp=0, sp=frames[0].fp,
+                    ra=0, pc=call_site, mode=frames[0].mode,
+                    note="调用者 (FP 链不可达, 由 RA 推断)",
+                )
+                frames.append(ra_inferred)
+        elif len(frames) >= 2:
+            last_ra = frames[-1].ra
+            if last_ra != 0 and self._is_valid_code_va(last_ra):
+                call_site = last_ra - 4 if last_ra >= 4 else 0
+                ra_inferred = StackFrame(
+                    idx=len(frames), fp=0, sp=frames[-1].fp,
+                    ra=0, pc=call_site, mode=frames[-1].mode,
+                    note="调用者 (FP 链终止, 由 RA 推断)",
+                )
+                frames.append(ra_inferred)
+
         effective_mode = frames[-1].mode if len(frames) > 1 else cur_mode
         self._walk_prev_mode_frames(frames, effective_mode, visited)
         return frames
+
+
 
     def _walk_prev_mode_frames(
         self, frames: list[StackFrame], cur_mode: str, visited: set[int]
@@ -207,28 +307,36 @@ class StackWalkMixin(SharedMixinAttrs):
             prev_mode = h.spp
             if prev_mode == RiscvMode.U and trapped_pc >= (1 << 63):
                 prev_mode = RiscvMode.S
-            # M→S mret 后 SPP=U 且 sepc 为裸 RAM 地址 → 残留 sepc
-            if (
-                prev_mode == RiscvMode.U
-                and self._emu.bus.is_ram_addr(trapped_pc)
-            ):
-                return
-            # Sv39 启用时, sepc 不应为裸 RAM 地址 (内核运行在高 VA).
-            # 若 sepc 落在 RAM PA 范围且 MMU 开启, 必为残留值.
+            # 检测残留 sepc: M->S mret 后 SPP=U 且 sepc 为过时 RAM 地址,
+            # 或 Sv39 启用时 sepc 落在 RAM PA 范围 (非规范 VA).
+            # 仅当 MMU 开启或 trapped_pc 高于 RAM 窗口时才认为无效 —
+            # Bare 翻译下 U-mode PA 即 RAM 地址, 属合法 trap 现场.
             # 直接从 satp CSR 读 MODE 字段, 避免依赖缓存 _mmu_mode.
             satp_mode = (h.satp_val >> 60) & 0xF
-            if (
-                satp_mode != 0
-                and self._emu.bus.is_ram_addr(trapped_pc)
-            ):
-                return
+            if self._emu.bus.is_ram_addr(trapped_pc):
+                if satp_mode != 0:
+                    # Sv39 启用 -> 内核/sepc 应为规范高 VA, 残留值
+                    return
+                if prev_mode == RiscvMode.U:
+                    # Bare 翻译下 U-mode trap: RAM 地址合法, 不跳过
+                    pass
+                else:
+                    # Bare 翻译下非 U 模式 (SPP=S): sepc 落在 RAM
+                    # 但 S 模式代码预期在高区 → 残留值
+                    return
             s_trapped_pc = 0
             s_prev_mode = RiscvMode.U
         else:
             return
 
-        if trapped_pc == 0 or prev_mode.value > mode_val or tvec == 0:
+        if trapped_pc == 0 or prev_mode.value >= mode_val or tvec == 0:
             return
+
+        # 若 trapped_pc 已与现有序号帧的 PC 重合 (含 ±4),
+        # 说明该 trap 上下文已被 FP 链覆盖, 不重复添加.
+        for f in frames:
+            if abs(f.pc - trapped_pc) <= 4:
+                return
 
         prev_name = prev_mode.name
         _nested = (
@@ -242,7 +350,19 @@ class StackWalkMixin(SharedMixinAttrs):
             trapped_pc, prev_name
         )
         offsets = self._parse_trap_save_offsets(tvec)
-        if offsets is None:
+
+        if offsets is not None:
+            self._add_prev_mode_frame(
+                frames, trapped_pc, prev_mode, tvec, visited, offsets
+            )
+        elif prev_mode == RiscvMode.U and not _nested:
+            # S→U 边界: 指令解析失败时, 尝试常见 trap 帧布局以恢复
+            # U-mode 的 FP/SP/RA 并继续 U-mode FP 链回溯.
+            self._add_prev_mode_frame_fallback(
+                frames, trapped_pc, prev_mode, tvec, visited,
+                boundary_mode, boundary_note,
+            )
+        else:
             payload = boundary_note
             if not boundary_note and _nested:
                 payload = "M-mode 嵌套 trap (mepc), 寄存器保存布局无法解析"
@@ -254,25 +374,26 @@ class StackWalkMixin(SharedMixinAttrs):
             ))
             if _nested:
                 self._add_prev_mode_frame(
-                    frames, s_trapped_pc, s_prev_mode, h.stvec_val, visited
+                    frames, s_trapped_pc, s_prev_mode, h.stvec_val, visited, offsets
                 )
-            return
-        self._add_prev_mode_frame(
-            frames, trapped_pc, prev_mode, tvec, visited
-        )
 
     def _add_prev_mode_frame(
         self, frames: list[StackFrame], trapped_pc: int,
         prev_mode: RiscvMode, tvec: int, visited: set[int],
+        offsets: tuple[int, int] | None = None,
     ) -> None:
-        """为指定 trap 上下文添加边界帧, 并尝试继续回溯低特权级 FP 链."""
+        """为指定 trap 上下文添加边界帧, 并尝试继续回溯低特权级 FP 链.
+
+        若 *offsets* 为 None, 从 *tvec* 指令流解析 RA/FP 保存偏移.
+        """
         if trapped_pc == 0 or tvec == 0:
             return
         prev_name = prev_mode.name
         boundary_mode, boundary_note = self._resolve_boundary_frame(
             trapped_pc, prev_name
         )
-        offsets = self._parse_trap_save_offsets(tvec)
+        if offsets is None:
+            offsets = self._parse_trap_save_offsets(tvec)
         if offsets is None:
             frames.append(StackFrame(
                 idx=len(frames), fp=0, sp=0, ra=0,
@@ -334,7 +455,7 @@ class StackWalkMixin(SharedMixinAttrs):
                 saved_fp = self._emu.bus.read_u64(trap_sp + fp_off)
             saved_sp = self._emu.bus.read_u64(trap_sp + ra_off + 8)
 
-        call_site = trapped_pc - 4 if trapped_pc >= 4 else 0
+        call_site = trapped_pc
         note = boundary_note
         if saved_fp is None and saved_sp is None and saved_ra is None:
             note = "仅 trap PC (栈扫描无匹配)"
@@ -361,12 +482,48 @@ class StackWalkMixin(SharedMixinAttrs):
             if next_ra == 0:
                 break
             visited.add(next_fp)
-            call_site = next_ra - 4 if next_ra >= 4 else 0
+            call_site = self._call_site_pc(next_ra)
             frames.append(StackFrame(
                 idx=len(frames), fp=next_fp, sp=current_fp,
                 ra=next_ra, pc=call_site, mode=prev_name,
             ))
             current_fp = next_fp
+
+    def _add_prev_mode_frame_fallback(
+        self, frames: list[StackFrame], trapped_pc: int,
+        prev_mode: RiscvMode, tvec: int, visited: set[int],
+        boundary_mode: str, boundary_note: str,
+    ) -> None:
+        """指令解析失败时, 尝试常见 trap 帧布局以恢复低特权级上下文.
+
+        依次尝试 _FALLBACK_TRAP_OFFSETS 中的 (ra_off, fp_off) 对,
+        首个成功恢复 saved_fp 的布局生效并继续 FP 链回溯.
+        全部失败则退回到 "仅 trap PC" 帧.
+        """
+        if trapped_pc == 0 or tvec == 0:
+            return
+        for ra_off, fp_off in _FALLBACK_TRAP_OFFSETS:
+            offsets: tuple[int, int] = (ra_off, fp_off)
+            # 临时试构建 — 捕获是否成功找到 saved_fp
+            trial: list[StackFrame] = []
+            self._add_prev_mode_frame(
+                trial, trapped_pc, prev_mode, tvec, visited, offsets,
+            )
+            if trial and trial[-1].fp != 0:
+                # 成功恢复: 将结果帧合并到正式帧列表并返回
+                frames.extend(trial)
+                # 将 trial 中所有有效 FP 加入 visited 以避免 FP 链循环
+                for f in trial:
+                    if f.fp != 0:
+                        visited.add(f.fp)
+                return
+        # 全部 fallback 失败: 添加仅 PC 帧
+        frames.append(StackFrame(
+            idx=len(frames), fp=0, sp=0, ra=0,
+            pc=trapped_pc,
+            note=(boundary_note or "trap 入口寄存器保存布局无法解析 (仅 PC)"),
+            mode=boundary_mode,
+        ))
 
     # ----------------------------------------------------------
     #  帧标注
@@ -414,20 +571,19 @@ class StackWalkMixin(SharedMixinAttrs):
             color = self._MODE_COLORS.get(f.mode, "")
             mode_tag = f"[{color}]{f.mode}[/]" if color else ""
             where = self._fmt_frame_where(f.pc, color)
+
+            # 寄存器字段: pc 始终显示, sp/fp/ra 仅非零时显示
+            parts = [f"pc={hex_addr(f.pc)}"]
+            if f.sp != 0:
+                parts.append(f"sp={hex_addr(f.sp)}")
+            if f.fp != 0:
+                parts.append(f"fp={hex_addr(f.fp)}")
+            if f.ra != 0:
+                parts.append(f"ra={hex_addr(f.ra)}")
             if f.note:
-                if f.sp != 0:
-                    regs = (
-                        f"pc={hex_addr(f.pc)}  sp={hex_addr(f.sp)}  "
-                        f"fp={hex_addr(f.fp)}  ra={hex_addr(f.ra)}  "
-                        f"[bold magenta]{f.note}[/]"
-                    )
-                else:
-                    regs = f"pc={hex_addr(f.pc)}  [bold magenta]{f.note}[/]"
-            else:
-                regs = (
-                    f"pc={hex_addr(f.pc)}  sp={hex_addr(f.sp)}  "
-                    f"fp={hex_addr(f.fp)}  ra={hex_addr(f.ra)}"
-                )
+                parts.append(f"[bold magenta]{f.note}[/]")
+            regs = "  ".join(parts)
+
             tbl.add_row(f"{tag} {mode_tag}", where, regs)
 
         self._console.print(
@@ -445,7 +601,7 @@ class StackWalkMixin(SharedMixinAttrs):
                 "无有效栈指针 (sp=0), 跳过栈内存显示[/]"
             )
             return
-        # 使用 VA→PA 翻译读取栈内存 (Sv39 等 MMU 模式下 VA 非物理地址)
+        # 使用 VA->PA 翻译读取栈内存 (Sv39 等 MMU 模式下 VA 非物理地址)
         stack_data = self._try_read_va(cur.sp, 64)
         if stack_data is None:
             self._console.print(
@@ -456,22 +612,9 @@ class StackWalkMixin(SharedMixinAttrs):
         self._console.print(
             f"[dim]帧 #{self._current_frame_idx + 1:02d} "
             f"sp={hex_addr(cur.sp)} 栈内存:[/]\n"
-            + _fmt_hexdump(stack_data, cur.sp)
+            + self._emu._fmt_hexdump(cur.sp, stack_data)
         )
 
 
-def _fmt_hexdump(data: bytes, base_addr: int = 0) -> str:
-    """格式化字节为 hexdump 字符串, 地址列 dim 灰, hex 值默认亮色, ASCII 区 dim 灰."""
-    lines = []
-    for i in range(0, len(data), 16):
-        chunk = data[i:i + 16]
-        hex_bytes = " ".join(f"{b:02x}" for b in chunk)
-        ascii_chars = "".join(
-            chr(b) if 32 <= b < 127 else "." for b in chunk
-        )
-        lines.append(
-            f"  [dim]{hex_addr(base_addr + i)}[/]  "
-            f"{hex_bytes:<48s}  "
-            f"[dim]|{ascii_chars}|[/]"
-        )
-    return "\n".join(lines)
+# fmt_hexdump 复用自 Emulator._fmt_hexdump，无需重复定义.
+# Arg order: (addr: int, data: bytes) — 与 mem 命令使用同一实现, 颜色一致.

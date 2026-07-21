@@ -46,13 +46,23 @@ from __future__ import annotations
 
 import os
 import struct
+import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from pyremu.memory.bus import Device
 
 if TYPE_CHECKING:
-    pass
+    from pyremu.interrupt.plic import PLIC
+
+# 诊断日志开关 (PYREMU_DIAG_VERBOSE=1): 打印每个 virtqueue 请求与 IRQ 拉高/拉低,
+# 用于排查块设备 I/O 完成中断是否正确投递到 hart。
+_DIAG = os.environ.get("PYREMU_DIAG_VERBOSE") == "1"
+
+
+def _diag(msg: str) -> None:
+    if _DIAG:
+        print(f"[virtio] {msg}", file=sys.stderr, flush=True)
 
 # ============================================================
 #  MMIO 寄存器偏移
@@ -105,16 +115,26 @@ VIRTIO_STATUS_FAILED = 0x80
 
 VIRTIO_F_VERSION_1 = 1 << 32
 VIRTIO_F_RING_INDIRECT_DESC = 1 << 28
+# VIRTIO_F_RING_EVENT_IDX (bit 29) — 刻意不声明.
+# 若声明此 feature, 客机驱动走 event-index 通知抑制路径:
+#   needs_kick = vring_need_event(avail_event, new, old)
+# 但 device 侧从未更新 used ring 的 avail_event 字段 (始终为 0),
+# 导致第二个及之后的 buffer 不再写 QueueNotify → 内核永远等不到 I/O 完成.
+# 不声明此 feature 时驱动退回到 flags 模式 (检查 VRING_USED_F_NO_NOTIFY),
+# 该 flag 我们也从不置位, 因此每次添加 buffer 都会 kick.
 VIRTIO_F_RING_EVENT_IDX = 1 << 29
 VIRTIO_BLK_F_SIZE_MAX = 1 << 1
 VIRTIO_BLK_F_SEG_MAX = 1 << 2
 VIRTIO_BLK_F_BLK_SIZE = 1 << 6
 
 # 本设备支持的 feature (64-bit)
+# VIRTIO_F_RING_INDIRECT_DESC (bit 28) —
+# 若声明, 客机驱动可用 indirect 描述符 (一层跳转), 但 _process_descriptor_chain
+# 未实现 indirect 表遍历, 遇到 INDIRECT flag 的 desc 会因缺失 NEXT flag 而 return
+# False — 内核拿不到 ext4 superblock → VFS panic.
+# 与 VIRTIO_F_RING_EVENT_IDX 同模式: 声明 feature 但未实现 → 误引导客机 → 移除以退避.
 _DEVICE_FEATURES = (
     VIRTIO_F_VERSION_1
-    | VIRTIO_F_RING_INDIRECT_DESC
-    | VIRTIO_F_RING_EVENT_IDX
 )
 
 # ============================================================
@@ -152,6 +172,12 @@ _VRING_DESC_SIZE = 16
 
 SECTOR_SIZE = 512
 
+# ============================================================
+#  PLIC 中断源号 (对齐 QEMU virt: virtio-mmio 设备 IRQ 从 1 起)
+# ============================================================
+
+VIRTIO_BLK_IRQ = 1
+
 
 class VirtIOBlock(Device):
     """virtio-blk MMIO 块设备.
@@ -175,16 +201,33 @@ class VirtIOBlock(Device):
         mem_read: Callable[[int, int], bytes],
         mem_write: Callable[[int, bytes], None],
         queue_size_max: int = 256,
+        plic: PLIC | None = None,
+        irq: int = 0,
+        read_only: bool = False,
     ) -> None:
         self.base_addr = 0
         self.size = VIRTIO_MMIO_SIZE
 
-        # 打开磁盘镜像 (不存在则创建)
+        # 打开磁盘镜像 (不存在则创建)。
+        # 只读回退: 显式 read_only 或对无写权限的镜像 (如 root 所有的 ext4),
+        # 以 O_RDONLY 打开并置 _read_only; 写请求将被静默忽略 (见 _do_write)。
         if not os.path.exists(image_path):
             with open(image_path, "wb") as f:
                 f.truncate(0)
-        self._fd = os.open(image_path, os.O_RDWR)
+        self._read_only = read_only
+        if read_only:
+            self._fd = os.open(image_path, os.O_RDONLY)
+        else:
+            try:
+                self._fd = os.open(image_path, os.O_RDWR)
+            except PermissionError:
+                self._fd = os.open(image_path, os.O_RDONLY)
+                self._read_only = True
         self._disk_size = os.lseek(self._fd, 0, os.SEEK_END)
+
+        # PLIC 集成: 完成中断经 plic.set_irq(irq, True) 投递 (irq=0 时不接 PLIC)。
+        self._plic = plic
+        self._irq = irq
 
         # 内存访问回调 — 用于读写 Guest 物理内存中的 virtqueue 描述符
         self._mem_read = mem_read
@@ -293,6 +336,7 @@ class VirtIOBlock(Device):
 
         elif offset == VIRTIO_MMIO_INTERRUPT_ACK:
             self._interrupt_status &= ~val
+            self._lower_irq_if_idle()
 
         elif offset == VIRTIO_MMIO_STATUS:
             # 写 0 -> 设备重置
@@ -334,21 +378,31 @@ class VirtIOBlock(Device):
 
     # ---- virtqueue 处理 ----
 
-    def _process_queue(self) -> None:
-        """处理 virtqueue 中的待处理请求."""
+    def _process_queue(self, max_descriptors: int = 0) -> bool:
+        """处理 virtqueue 中的待处理请求.
+
+        Args:
+            max_descriptors: 单次最多处理的描述符数 (0=无限制, 用于拆批以响应 Ctrl+C).
+
+        Returns:
+            True 如果还有未处理的描述符 (调用方应在检查中断标志后再次调用).
+        """
         qnum = self._queue_num
         if qnum == 0 or self._queue_desc == 0 or \
         self._queue_driver == 0 or self._queue_device == 0:
-            return
+            return False
 
         # 读取可用环结构
         # [0] flags (u16), [2] idx (u16), [4+] ring (qnum * u16)
         self._read_u16(self._queue_driver)
         avail_idx = self._read_u16(self._queue_driver + 2)
 
-        # 处理所有新的可用描述符
+        # 处理可用描述符 (受 max_descriptors 限制, 避免长时间阻塞 Python 线程)
         processed = 0
         while self._last_avail_idx != avail_idx:
+            if max_descriptors > 0 and processed >= max_descriptors:
+                break
+
             # 可用环条目: offset 4 + self._last_avail_idx % qnum * 2
             ring_off = 4 + (self._last_avail_idx % qnum) * 2
             desc_head = self._read_u16(self._queue_driver + ring_off)
@@ -368,8 +422,24 @@ class VirtIOBlock(Device):
         if processed > 0:
             # 更新 used ring 的 idx
             self._write_u16(self._queue_device + 2, self._last_avail_idx)
-            # 置中断状态位 (bit 0: used buffer notification)
+            # 置中断状态位 (bit 0: used buffer notification) 并向 PLIC 拉高中断线
             self._interrupt_status |= 1
+            self._raise_irq()
+            _diag(f"processed {processed} req(s), used_idx={self._last_avail_idx}, "
+                  f"int_status={self._interrupt_status:#x} -> raise_irq")
+
+        return self._last_avail_idx != avail_idx  # 仍有未处理? 调用方需再次调用
+
+    def _raise_irq(self) -> None:
+        """向 PLIC 拉高本设备中断源 (完成通知)。irq=0 或无 PLIC 时为空操作。"""
+        if self._plic is not None and self._irq:
+            self._plic.set_irq(self._irq, True)
+
+    def _lower_irq_if_idle(self) -> None:
+        """中断已被 Guest ACK 且无残留状态位时, 向 PLIC 拉低中断源。"""
+        if self._interrupt_status == 0 and self._plic is not None and self._irq:
+            self._plic.set_irq(self._irq, False)
+            _diag("lower_irq (acked, int_status=0)")
 
     def _process_descriptor_chain(self, head: int) -> bool:
         """处理一个描述符链: header -> data -> status."""
@@ -397,8 +467,10 @@ class VirtIOBlock(Device):
 
         # 执行 I/O
         if req_type == VIRTIO_BLK_T_IN:
+            _diag(f"REQ read  sector={sector} len={desc_len}")
             ok = self._do_read(sector, desc_addr, desc_len)
         elif req_type == VIRTIO_BLK_T_OUT:
+            _diag(f"REQ write sector={sector} len={desc_len}")
             ok = self._do_write(sector, desc_addr, desc_len)
         elif req_type == VIRTIO_BLK_T_FLUSH:
             # FLUSH: 把文件内容刷到磁盘
@@ -429,6 +501,10 @@ class VirtIOBlock(Device):
 
     def _do_write(self, sector: int, buf_pa: int, buf_len: int) -> bool:
         """从 Guest 物理地址 *buf_pa* 写入数据到扇区 *sector*."""
+        # 只读镜像: 静默忽略写 (返回成功避免内核报 I/O 错)。
+        # 用户已确认暂不支持写磁盘 (root=/dev/vda ro 不会写数据块)。
+        if self._read_only:
+            return True
         data = self._mem_read(buf_pa, buf_len)
         offset = sector * SECTOR_SIZE
         os.pwrite(self._fd, data, offset)
@@ -439,6 +515,8 @@ class VirtIOBlock(Device):
 
     def _do_flush(self) -> bool:
         """将文件内容同步到磁盘."""
+        if self._read_only:
+            return True
         try:
             os.fsync(self._fd)
         except OSError:
@@ -490,3 +568,4 @@ class VirtIOBlock(Device):
         self._queue_driver = 0
         self._queue_device = 0
         self._last_avail_idx = 0
+        self._lower_irq_if_idle()

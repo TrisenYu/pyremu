@@ -37,7 +37,7 @@ class IntSource(Enum):
 
 # 中断源 -> mip/sip 位掩码映射
 INT_SOURCE_MIP_MASK: dict[IntSource, int] = {
-    IntSource.MEI: 1 << 11,  # MEIP
+    IntSource.MEI: 1 << 11, # MEIP
     IntSource.MSI: 1 << 3,  # MSIP
     IntSource.MTI: 1 << 7,  # MTIP
     IntSource.SEI: 1 << 9,  # SEIP

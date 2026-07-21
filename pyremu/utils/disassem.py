@@ -91,7 +91,7 @@ def _dis_rtype(instr: int) -> str:
     mnemonic = _R_FUNCT3_MAP.get(f3, {}).get(f7)
     if mnemonic is None:
         return _UNKNOWN
-    return f"{mnemonic:<7} {_rd(instr)}, {_rs1(instr)}, {_rs2(instr)}"
+    return f"{mnemonic:<12} {_rd(instr)}, {_rs1(instr)}, {_rs2(instr)}"
 
 
 # ============================================================
@@ -116,14 +116,14 @@ def _dis_itype(instr: int) -> str:
         if parse_func6(instr) != 0:
             return _UNKNOWN
         shamt = (instr >> 20) & 0x3F
-        return f"slli    {_rd(instr)}, {_rs1(instr)}, {shamt}"
+        return f"slli         {_rd(instr)}, {_rs1(instr)}, {shamt}"
     if f3 == 0b101:  # SRLI / SRAI
         shamt = (instr >> 20) & 0x3F
         f6 = parse_func6(instr)
         if f6 == 0x00:  # SRLI (funct6=0b000000)
-            return f"srli    {_rd(instr)}, {_rs1(instr)}, {shamt}"
+            return f"srli         {_rd(instr)}, {_rs1(instr)}, {shamt}"
         if f6 == 0x10:  # SRAI (funct6=0b010000)
-            return f"srai    {_rd(instr)}, {_rs1(instr)}, {shamt}"
+            return f"srai         {_rd(instr)}, {_rs1(instr)}, {shamt}"
         return _UNKNOWN
 
     parse_func7(instr)  # 非 shift I-type 才使用 funct7
@@ -132,7 +132,7 @@ def _dis_itype(instr: int) -> str:
     if mnemonic is None:
         return _UNKNOWN
     imm = parse_imm12_se(instr)
-    return f"{mnemonic:<7} {_rd(instr)}, {_rs1(instr)}, {_fmt_imm(imm)}"
+    return f"{mnemonic:<12} {_rd(instr)}, {_rs1(instr)}, {_fmt_imm(imm)}"
 
 
 # ============================================================
@@ -158,7 +158,7 @@ def _dis_op32(instr: int) -> str:
     mnemonic = _OP32_FUNCT3_MAP.get(f3, {}).get(f7)
     if mnemonic is None:
         return _UNKNOWN
-    return f"{mnemonic:<7} {_rd(instr)}, {_rs1(instr)}, {_rs2(instr)}"
+    return f"{mnemonic:<12} {_rd(instr)}, {_rs1(instr)}, {_rs2(instr)}"
 
 
 def _dis_op_imm32(instr: int) -> str:
@@ -167,18 +167,18 @@ def _dis_op_imm32(instr: int) -> str:
     f7 = parse_func7(instr)
     if f3 == 0b000:
         imm = parse_imm12_se(instr)
-        return f"addiw   {_rd(instr)}, {_rs1(instr)}, {_fmt_imm(imm)}"
+        return f"addiw        {_rd(instr)}, {_rs1(instr)}, {_fmt_imm(imm)}"
     if f3 == 0b001:
         if f7 != 0:
             return _UNKNOWN
         shamt = (instr >> 20) & 0x1F
-        return f"slliw   {_rd(instr)}, {_rs1(instr)}, {shamt}"
+        return f"slliw        {_rd(instr)}, {_rs1(instr)}, {shamt}"
     if f3 == 0b101:
         shamt = (instr >> 20) & 0x1F
         if f7 == 0x00:
-            return f"srliw   {_rd(instr)}, {_rs1(instr)}, {shamt}"
+            return f"srliw        {_rd(instr)}, {_rs1(instr)}, {shamt}"
         if f7 == 0x20:
-            return f"sraiw   {_rd(instr)}, {_rs1(instr)}, {shamt}"
+            return f"sraiw        {_rd(instr)}, {_rs1(instr)}, {shamt}"
     return _UNKNOWN
 
 
@@ -204,7 +204,7 @@ def _dis_load(instr: int) -> str:
     if mnemonic is None:
         return _UNKNOWN
     offset = parse_imm12_se(instr)
-    return f"{mnemonic:<7} {_rd(instr)}, {_fmt_imm(offset)}({_rs1(instr)})"
+    return f"{mnemonic:<12} {_rd(instr)}, {_fmt_imm(offset)}({_rs1(instr)})"
 
 
 def _dis_store(instr: int) -> str:
@@ -215,7 +215,7 @@ def _dis_store(instr: int) -> str:
     except ValueError:
         return _UNKNOWN
     offset = parse_imm_s(instr)
-    return f"{mnemonic:<7} {_rs2(instr)}, {_fmt_imm(offset)}({_rs1(instr)})"
+    return f"{mnemonic:<12} {_rs2(instr)}, {_fmt_imm(offset)}({_rs1(instr)})"
 
 
 # ============================================================
@@ -232,7 +232,7 @@ def _dis_branch(instr: int, pc: int) -> str:
         return _UNKNOWN
     offset = parse_imm_b(instr)
     target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
-    return f"{mnemonic:<7} {_rs1(instr)}, {_rs2(instr)}, {_fmt_addr(target)}"
+    return f"{mnemonic:<12} {_rs1(instr)}, {_rs2(instr)}, {_fmt_addr(target)}"
 
 
 # ============================================================
@@ -244,13 +244,13 @@ def _dis_jal(instr: int, pc: int) -> str:
     """JAL: mnemonic rd, target_addr."""
     offset = parse_imm_j(instr)
     target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
-    return f"jal     {_rd(instr)}, {_fmt_addr(target)}"
+    return f"jal          {_rd(instr)}, {_fmt_addr(target)}"
 
 
 def _dis_jalr(instr: int) -> str:
     """JALR: mnemonic rd, offset(rs1)."""
     offset = parse_imm12_se(instr)
-    return f"jalr    {_rd(instr)}, {_fmt_imm(offset)}({_rs1(instr)})"
+    return f"jalr         {_rd(instr)}, {_fmt_imm(offset)}({_rs1(instr)})"
 
 
 # ============================================================
@@ -261,13 +261,13 @@ def _dis_jalr(instr: int) -> str:
 def _dis_lui(instr: int) -> str:
     # LUI 的 20-bit 立即数为地址高位常量 (实际值 = imm << 12), 用 hex 更直观
     imm = parse_imm20_raw(instr)
-    return f"lui     {_rd(instr)}, {_fmt_addr(imm)}"
+    return f"lui          {_rd(instr)}, {_fmt_addr(imm)}"
 
 
 def _dis_auipc(instr: int) -> str:
     # AUIPC 同上, upper immediate 用 hex 表示
     imm = parse_imm20_raw(instr)
-    return f"auipc   {_rd(instr)}, {_fmt_addr(imm)}"
+    return f"auipc        {_rd(instr)}, {_fmt_addr(imm)}"
 
 
 # ============================================================
@@ -301,8 +301,8 @@ def _dis_csr(instr: int) -> str:
     rd_name = _rd(instr)
     if f3 & 0b100:  # immediate 形式
         uimm = parse_rs1(instr)
-        return f"{mnemonic:<7} {rd_name}, {csr}, {uimm}"
-    return f"{mnemonic:<7} {rd_name}, {csr}, {_rs1(instr)}"
+        return f"{mnemonic:<12} {rd_name}, {csr}, {uimm}"
+    return f"{mnemonic:<12} {rd_name}, {csr}, {_rs1(instr)}"
 
 
 _PRIV_MNEMONIC: dict[int, str] = {
@@ -360,7 +360,7 @@ def _dis_amo(instr: int) -> str:
         mnemonic = base + suffix
     else:
         mnemonic = "amo" + base + suffix
-    return f"{mnemonic:<7} {_rd(instr)}, {_rs2(instr)}, ({_rs1(instr)})"
+    return f"{mnemonic:<12} {_rd(instr)}, {_rs2(instr)}, ({_rs1(instr)})"
 
 
 # ============================================================
@@ -407,23 +407,33 @@ def _dis_compressed(
                 return f"c.?    0x{c16:04x}  # C.ADDI4SPN nzuimm=0 (reserved)"
             return f"c.addi4spn {rd_p}, sp, {uimm}"
 
+        if funct3 == 0b001:  # C.FLD (RV64DC)
+            uimm = ((c16 >> 5) & 0b11) << 6 | ((c16 >> 10) & 0b111) << 3
+            fpr_rd = 8 + ((c16 >> 2) & 0b111)
+            return f"c.fld        f{fpr_rd}, {uimm}({rs1_p})"
+
         if funct3 == 0b010:  # C.LW
             uimm = ((c16 >> 5) & 1) << 6 | ((c16 >> 10) & 0b111) << 3 | ((c16 >> 6) & 1) << 2
-            return f"c.lw    {rd_p}, {uimm}({rs1_p})"
+            return f"c.lw         {rd_p}, {uimm}({rs1_p})"
 
         if funct3 == 0b011:  # C.LD (RV64)
             uimm = ((c16 >> 5) & 0b11) << 6 | ((c16 >> 10) & 0b111) << 3
-            return f"c.ld    {rd_p}, {uimm}({rs1_p})"
+            return f"c.ld         {rd_p}, {uimm}({rs1_p})"
+
+        if funct3 == 0b101:  # C.FSD (RV64DC)
+            uimm = ((c16 >> 5) & 0b11) << 6 | ((c16 >> 10) & 0b111) << 3
+            fpr_rs2 = 8 + ((c16 >> 2) & 0b111)
+            return f"c.fsd        f{fpr_rs2}, {uimm}({rs1_p})"
 
         if funct3 == 0b110:  # C.SW
             rs2_p = _c_x8(c16 >> 2)
             uimm = ((c16 >> 5) & 1) << 6 | ((c16 >> 10) & 0b111) << 3 | ((c16 >> 6) & 1) << 2
-            return f"c.sw    {rs2_p}, {uimm}({rs1_p})"
+            return f"c.sw         {rs2_p}, {uimm}({rs1_p})"
 
         if funct3 == 0b111:  # C.SD (RV64)
             rs2_p = _c_x8(c16 >> 2)
             uimm = ((c16 >> 5) & 0b11) << 6 | ((c16 >> 10) & 0b111) << 3
-            return f"c.sd    {rs2_p}, {uimm}({rs1_p})"
+            return f"c.sd         {rs2_p}, {uimm}({rs1_p})"
 
         return f"c.?    0x{c16:04x}"
 
@@ -437,13 +447,13 @@ def _dis_compressed(
         if funct3 == 0b000:  # C.NOP / C.ADDI
             if imm6 == 0 and ((c16 >> 7) & 0x1F) == 0:  # rd=x0, imm=0 -> C.NOP
                 return "c.nop"
-            return f"c.addi  {rd_name}, {imm6_se}"
+            return f"c.addi       {rd_name}, {imm6_se}"
 
         if funct3 == 0b001:  # C.ADDIW (RV64)
             return f"c.addiw {rd_name}, {imm6_se}"
 
         if funct3 == 0b010:  # C.LI
-            return f"c.li    {rd_name}, {imm6_se}"
+            return f"c.li         {rd_name}, {imm6_se}"
 
         if funct3 == 0b011:  # C.LUI (rd≠{0,2}) / C.ADDI16SP (rd=2)
             rd_raw = (c16 >> 7) & 0x1F
@@ -470,7 +480,7 @@ def _dis_compressed(
                 return f"c.?    0x{c16:04x}  # C.LUI nzuimm=0 (reserved)"
             # Show the actual value (after << 12), keep compact
             val = nzuimm  # already shifted
-            return f"c.lui   {rd_name}, 0x{(val >> 12) & 0x3F:x}"
+            return f"c.lui        {rd_name}, 0x{(val >> 12) & 0x3F:x}"
 
         if funct3 == 0b100:  # misc ALU: SRLI / SRAI / ANDI / SUB/XOR/OR/AND
             rd_p = _c_x8(c16 >> 7)
@@ -480,16 +490,16 @@ def _dis_compressed(
             imm6_se_alt = (imm6_se_alt & 0x20) and (imm6_se_alt | ~0x3F) or imm6_se_alt
 
             if b11_10 == 0b00:  # C.SRLI (RV64C: shamt[5] must be 0 for RV32)
-                return f"c.srli  {rd_p}, {uimm}"
+                return f"c.srli       {rd_p}, {uimm}"
             if b11_10 == 0b01:  # C.SRAI
-                return f"c.srai  {rd_p}, {uimm}"
+                return f"c.srai       {rd_p}, {uimm}"
             if b11_10 == 0b10:  # C.ANDI
-                return f"c.andi  {rd_p}, {imm6_se_alt}"
+                return f"c.andi       {rd_p}, {imm6_se_alt}"
             if b11_10 == 0b11:  # register ops
                 b6_5 = (c16 >> 5) & 0b11
                 rs2_p = _c_x8(c16 >> 2)
                 mn = {0b00: "c.sub", 0b01: "c.xor", 0b10: "c.or", 0b11: "c.and"}[b6_5]
-                return f"{mn:<7} {rd_p}, {rs2_p}"
+                return f"{mn:<12} {rd_p}, {rs2_p}"
 
             return f"c.?    0x{c16:04x}"
 
@@ -509,7 +519,7 @@ def _dis_compressed(
             if offset & (1 << 11):
                 offset |= ~((1 << 12) - 1)
             target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
-            return f"c.j     {_fmt_addr(target)}"
+            return f"c.j          {_fmt_addr(target)}"
 
         if funct3 == 0b110:  # C.BEQZ
             offset = (
@@ -521,7 +531,7 @@ def _dis_compressed(
             if offset & (1 << 8):
                 offset |= ~((1 << 9) - 1)
             target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
-            return f"c.beqz  {rs1_p}, {_fmt_addr(target)}"
+            return f"c.beqz       {rs1_p}, {_fmt_addr(target)}"
 
         if funct3 == 0b111:  # C.BNEZ
             offset = (
@@ -533,7 +543,7 @@ def _dis_compressed(
             if offset & (1 << 8):
                 offset |= ~((1 << 9) - 1)
             target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
-            return f"c.bnez  {rs1_p}, {_fmt_addr(target)}"
+            return f"c.bnez       {rs1_p}, {_fmt_addr(target)}"
 
         return f"c.?    0x{c16:04x}"
 
@@ -548,7 +558,15 @@ def _dis_compressed(
             shamt = ((c16 >> 2) & 0x1F) | ((c16 >> 12) & 1) << 5
             if rd_q2 == 0:
                 return f"c.?    0x{c16:04x}  # C.SLLI rd=0 (HINT)"
-            return f"c.slli  {rd_name_q2}, {shamt}"
+            return f"c.slli       {rd_name_q2}, {shamt}"
+
+        if funct3 == 0b001:  # C.FLDSP (RV64DC)
+            uimm = (
+                ((c16 >> 2) & 0b111) << 6 | ((c16 >> 12) & 1) << 5 | ((c16 >> 5) & 0b11) << 3
+            )
+            if rd_q2 == 0:
+                return f"c.?    0x{c16:04x}  # C.FLDSP rd=0 (reserved)"
+            return f"c.fldsp      f{rd_q2}, {uimm}(sp)"
 
         if funct3 == 0b010:  # C.LWSP
             # offset = {inst[6:5], inst[12], inst[4:2], 00} (4 字节对齐)
@@ -557,7 +575,7 @@ def _dis_compressed(
             )
             if rd_q2 == 0:
                 return f"c.?    0x{c16:04x}  # C.LWSP rd=0 (reserved)"
-            return f"c.lwsp  {rd_name_q2}, {uimm}(sp)"
+            return f"c.lwsp       {rd_name_q2}, {uimm}(sp)"
 
         if funct3 == 0b011:  # C.LDSP (RV64)
             # offset = {inst[4:2], inst[12], inst[6:5], 000} (8 字节对齐)
@@ -566,7 +584,7 @@ def _dis_compressed(
             )
             if rd_q2 == 0:
                 return f"c.?    0x{c16:04x}  # C.LDSP rd=0 (reserved)"
-            return f"c.ldsp  {rd_name_q2}, {uimm}(sp)"
+            return f"c.ldsp       {rd_name_q2}, {uimm}(sp)"
 
         if funct3 == 0b100:  # C.JR / C.JALR / C.MV / C.EBREAK / C.ADD
             # C.EBREAK: rd=0, rs2=0 (both bit12=0 and bit12=1 are common)
@@ -574,30 +592,140 @@ def _dis_compressed(
                 return "c.ebreak"
             if b12 == 0:
                 if rs2_q2 == 0 and rd_q2 != 0:
-                    return f"c.jr    {rd_name_q2}"
+                    return f"c.jr         {rd_name_q2}"
                 if rs2_q2 != 0 and rd_q2 != 0:
-                    return f"c.mv    {rd_name_q2}, {rs2_name}"
+                    return f"c.mv         {rd_name_q2}, {rs2_name}"
                 return f"c.?    0x{c16:04x}"
             # b12 == 1
             if rs2_q2 == 0 and rd_q2 != 0:
-                return f"c.jalr  {rd_name_q2}"
+                return f"c.jalr       {rd_name_q2}"
             if rs2_q2 != 0 and rd_q2 != 0:
-                return f"c.add   {rd_name_q2}, {rs2_name}"
+                return f"c.add        {rd_name_q2}, {rs2_name}"
             return f"c.?    0x{c16:04x}"
+
+        if funct3 == 0b101:  # C.FSDSP (RV64DC)
+            uimm = ((c16 >> 7) & 0b111) << 6 | ((c16 >> 10) & 0b111) << 3
+            return f"c.fsdsp      f{rs2_q2}, {uimm}(sp)"
 
         if funct3 == 0b110:  # C.SWSP
             # offset = {inst[8:7], inst[12:9], 00}  (4-byte aligned)
             uimm = ((c16 >> 7) & 0b11) << 6 | ((c16 >> 9) & 0b1111) << 2
-            return f"c.swsp  {rs2_name}, {uimm}(sp)"
+            return f"c.swsp       {rs2_name}, {uimm}(sp)"
 
         if funct3 == 0b111:  # C.SDSP (RV64)
             # offset = {inst[9:7], inst[12:10], 000}  (8-byte aligned)
             uimm = ((c16 >> 7) & 0b111) << 6 | ((c16 >> 10) & 0b111) << 3
-            return f"c.sdsp  {rs2_name}, {uimm}(sp)"
+            return f"c.sdsp       {rs2_name}, {uimm}(sp)"
 
         return f"c.?    0x{c16:04x}"
 
     return f"c.?    0x{c16:04x}"
+
+
+# ============================================================
+#  F/D floating-point disassembly
+# ============================================================
+
+_FP_LOAD_MNEMONIC = {0b010: "flw", 0b011: "fld"}
+_FP_STORE_MNEMONIC = {0b010: "fsw", 0b011: "fsd"}
+# OP-FP funct7[6:2] → 助记符基名 (S/D 后缀由 fmt 决定)
+_FP_ARITH = {0x00: "fadd", 0x01: "fsub", 0x02: "fmul", 0x03: "fdiv"}
+_FP_SGNJ = {0: "fsgnj", 1: "fsgnjn", 2: "fsgnjx"}
+_FP_MINMAX = {0: "fmin", 1: "fmax"}
+_FP_CMP = {0: "fle", 1: "flt", 2: "feq"}
+_FP_FMA_MNEMONIC = {
+    0b10000_11: "fmadd",
+    0b10001_11: "fmsub",
+    0b10010_11: "fnmsub",
+    0b10011_11: "fnmadd",
+}
+
+
+def _fpr_name(idx: int) -> str:
+    return f"f{idx}"
+
+
+def _fsuffix(fmt: int) -> str:
+    return "d" if fmt == 1 else "s"
+
+
+def _dis_fp_load(instr: int) -> str:
+    """FLW / FLD: mnemonic frd, offset(rs1)."""
+    m = _FP_LOAD_MNEMONIC.get(parse_func3(instr))
+    if m is None:
+        return _UNKNOWN
+    off = parse_imm12_se(instr)
+    return f"{m:<12} {_fpr_name(parse_rd(instr))}, {_fmt_imm(off)}({_rs1(instr)})"
+
+
+def _dis_fp_store(instr: int) -> str:
+    """FSW / FSD: mnemonic frs2, offset(rs1)."""
+    m = _FP_STORE_MNEMONIC.get(parse_func3(instr))
+    if m is None:
+        return _UNKNOWN
+    off = parse_imm_s(instr)
+    return f"{m:<12} {_fpr_name(parse_rs2(instr))}, {_fmt_imm(off)}({_rs1(instr)})"
+
+
+def _dis_fp_fma(instr: int) -> str:
+    """FMADD/FMSUB/FNMSUB/FNMADD: mnemonic.fmt frd, frs1, frs2, frs3."""
+    base = _FP_FMA_MNEMONIC.get(parse_opcode(instr))
+    if base is None:
+        return _UNKNOWN
+    fmt = (instr >> 25) & 0x3
+    rs3 = (instr >> 27) & 0x1F
+    m = f"{base}.{_fsuffix(fmt)}"
+    return (
+        f"{m:<12} {_fpr_name(parse_rd(instr))}, {_fpr_name(parse_rs1(instr))}, "
+        f"{_fpr_name(parse_rs2(instr))}, {_fpr_name(rs3)}"
+    )
+
+
+def _dis_fp_op(instr: int) -> str:
+    """OP-FP: 算术/转换/比较/符号/分类/移动."""
+    funct7 = parse_func7(instr)
+    funct3 = parse_func3(instr)
+    rs2 = parse_rs2(instr)
+    fmt = funct7 & 0x3
+    op5 = funct7 >> 2
+    sfx = _fsuffix(fmt)
+    frd, frs1, frs2 = (
+        _fpr_name(parse_rd(instr)),
+        _fpr_name(parse_rs1(instr)),
+        _fpr_name(rs2),
+    )
+    if op5 in _FP_ARITH:
+        return f"{_FP_ARITH[op5] + '.' + sfx:<12} {frd}, {frs1}, {frs2}"
+    if op5 == 0x0B:  # FSQRT
+        return f"{'fsqrt.' + sfx:<12} {frd}, {frs1}"
+    if op5 == 0x04:  # FSGNJ*
+        m = _FP_SGNJ.get(funct3, "fsgnj?")
+        return f"{m + '.' + sfx:<12} {frd}, {frs1}, {frs2}"
+    if op5 == 0x05:  # FMIN/FMAX
+        m = _FP_MINMAX.get(funct3, "fmin?")
+        return f"{m + '.' + sfx:<12} {frd}, {frs1}, {frs2}"
+    if op5 == 0x14:  # FCMP → GPR rd
+        m = _FP_CMP.get(funct3, "fcmp?")
+        return f"{m + '.' + sfx:<12} {_rd(instr)}, {frs1}, {frs2}"
+    if op5 == 0x18:  # FCVT float→int (GPR rd)
+        w = {0: "w", 1: "wu", 2: "l", 3: "lu"}.get(rs2, "?")
+        return f"{'fcvt.' + w + '.' + sfx:<12} {_rd(instr)}, {frs1}"
+    if op5 == 0x1A:  # FCVT int→float (GPR rs1)
+        w = {0: "w", 1: "wu", 2: "l", 3: "lu"}.get(rs2, "?")
+        return f"{'fcvt.' + sfx + '.' + w:<12} {frd}, {_rs1(instr)}"
+    if op5 == 0x08:  # FCVT.S.D / FCVT.D.S
+        m = "fcvt.d.s" if fmt == 1 else "fcvt.s.d"
+        return f"{m:<12} {frd}, {frs1}"
+    if op5 == 0x1C:  # FMV.X.* / FCLASS → GPR rd
+        if funct3 == 0:
+            m = "fmv.x.w" if fmt == 0 else "fmv.x.d"
+        else:
+            m = "fclass.s" if fmt == 0 else "fclass.d"
+        return f"{m:<12} {_rd(instr)}, {frs1}"
+    if op5 == 0x1E:  # FMV.*.X (GPR rs1 → FPR)
+        m = "fmv.w.x" if fmt == 0 else "fmv.d.x"
+        return f"{m:<12} {frd}, {_rs1(instr)}"
+    return _UNKNOWN
 
 
 # ============================================================
@@ -662,5 +790,13 @@ def disasm(
         return _dis_fence(instr)
     if opc == Opc.amo:
         return _dis_amo(instr)
+    if opc == Opc.opfp:
+        return _dis_fp_load(instr)
+    if opc == Opc.stfp:
+        return _dis_fp_store(instr)
+    if opc == Opc.opFp:
+        return _dis_fp_op(instr)
+    if opc in (Opc.fmadd, Opc.fmsub, Opc.fnmsub, Opc.fnmadd):
+        return _dis_fp_fma(instr)
 
     return _UNKNOWN

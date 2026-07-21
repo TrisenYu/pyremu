@@ -1,10 +1,10 @@
 # Pyremu — RISC-V 64 位模拟器
 
-|缩略 |含义       |
-|:--:|:--------:|
-|Py  | python   |
-|r   | riscv    |
-|emu | emulator |
+|缩略 |含义        |
+|:--:|:---------:|
+|Py  | python    |
+|r   | riscv/rust|
+|emu | emulator  |
 
 Pyremu 是一个用 Python (CPython 3.14) 编写的本地 **RISC-V 指令集模拟器与交互式调试器**，
 面向固件调试、TEE开发、操作系统调试等场景
@@ -34,7 +34,7 @@ python examples/demo_emulator.py
 
 | 模块 | 内容 |
 |------|------|
-| **指令集** | RV64 I (基础整数), M (乘除), A (原子操作 LR/SC/AMO), C (压缩指令), Zicsr |
+| **指令集** | RV64 GC (IMAFD + Zicsr + C), 含 FP 算术/转换/比较/乘加 + 压缩 FP (c.fld/c.fsd/c.fldsp/c.fsdsp) |
 | **特权级** | U/S/H/M/D 五级, ECALL/EBREAK/MRET/SRET, WFI (TW 检查, 中断唤醒) |
 | **虚拟内存** | Sv39 页表遍历 (4 KiB 页 + 2 MiB 超级页), TLB (全相联 FIFO/LRU) |
 | **内存保护** | PMP (NAPOT/NA4/TOR, L 位锁定, 最多 64 条), PMA 可配置 |
@@ -189,7 +189,43 @@ cargo test --manifest-path pyremu/_native/Cargo.toml   # sizeof/align
 uv run pytest tests/test_emulator.py::TestNativeBatchLayout   # Python 侧
 ```
 
-## 开发命令
+## 注意事项
+
+### Linux 内核 FPU 配置
+
+模拟器支持 **F/D 浮点扩展**（RV64GC）。载入的 Linux 内核必须开启 `CONFIG_FPU=y`，
+否则内核的 trap handler 无法识别 FP 指令的懒切换陷态（mstatus.FS=Off → IllegalInstr），
+会直接向用户态进程投递 SIGILL，导致 ld-linux 等硬浮点 ABI（lp64d）程序无法启动。
+
+验证内核 config:
+```bash
+grep CONFIG_FPU .config    # 必须是 CONFIG_FPU=y
+```
+
+### 压缩浮点指令
+
+**rv64gc**（含 C + F + D 扩展）会生成 16-bit 压缩浮点指令:
+
+| 指令 | 编码 | quadrant | 说明 |
+|------|------|----------|------|
+| `c.fld`  | C0 funct3=001 | 00 | 从 rs1'+uimm 加载 8 字节到 FPR rd' |
+| `c.fsd`  | C0 funct3=101 | 00 | 将 FPR rd' 的 8 字节存入 rs1'+uimm |
+| `c.fldsp` | C2 funct3=001 | 10 | 从 sp+uimm 加载 8 字节到 FPR rd |
+| `c.fsdsp` | C2 funct3=101 | 10 | 将 FPR rs2 的 8 字节存入 sp+uimm |
+
+硬浮点（lp64d）Debian/Ubuntu 用户态大量使用这些指令（如 ld-linux 保存/恢复 FP 寄存器）。
+确认内核开启 `CONFIG_FPU=y` + `CONFIG_RISCV_ISA_F=y` + `CONFIG_RISCV_ISA_D=y`。
+
+### 跨页取指与数据访问
+
+RISC-V 指令取指固定 4 字节，当 PC 处于页末（offset ≥ 0xFFE）时，取指跨越两个 VA 页。
+Sv39 页表下这两个 VA 页可能映射到**非连续**物理页，模拟器对每个 VA 页独立做 MMU 翻译后
+拼接结果。非对齐数据 load/store 跨越页边界时同理。
+
+此机制对正确运行 ld-linux 等动态链接器至关重要——动态链接器常在页边界附近执行代码，
+链接后的 .plt/.got 等段跨越 VA 页时，物理页不连续会导致取指拼接错误。
+
+### 开发命令
 
 ```bash
 make cov-test                     # 带覆盖率的测试

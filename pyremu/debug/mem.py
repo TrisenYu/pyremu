@@ -16,7 +16,7 @@ from pyremu._native import decode_fields
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import translate_addr
 from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
-from pyremu.core.trap import trap_cause_name
+from pyremu.core.trap_def import trap_cause_name
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.utils import MAX_INSTR_COUNT, check_rv64_addr, hex_addr
 from pyremu.memory.mmu import sv39_walk
@@ -34,6 +34,15 @@ _GPR_ALIASES = frozenset({
 _BRANCH_JUMP_MNEMONICS = frozenset({
     "beq", "bne", "blt", "bge", "bltu", "bgeu",
     "jal", "jalr", "j", "jr", "ret",
+    # Compressed jump/branch mnemonics
+    "c.j", "c.jr", "c.jalr", "c.beqz", "c.bnez",
+})
+_LOAD_STORE_MNEMONICS = frozenset({
+    "ld", "lw", "lh", "lb", "lwu", "lhu", "lbu",
+    "sd", "sw", "sh", "sb",
+    # Compressed load/store mnemonics
+    "c.ld", "c.ldsp", "c.lw", "c.lwsp",
+    "c.sd", "c.sdsp", "c.sw", "c.swsp",
 })
 _FENCE_AMO_MNEMONICS = frozenset({
     "fence", "fence.i", "sfence.vma",
@@ -135,8 +144,11 @@ class MemoryMixin(SharedMixinAttrs):
     # ----------------------------------------------------------
 
     def _fetch_and_disasm(self, pc: int) -> tuple[str, str] | None:
-        """从 pc 取指并反汇编一条指令, 返回 (hex_str, asm_str)."""
-        raw = self._try_read_pa(pc, 4)
+        """从 pc 取指并反汇编一条指令, 返回 (hex_str, asm_str).
+
+        MMU 启用时 PC 为虚拟地址, 需经 VA->PA 翻译后读取.
+        """
+        raw = self._try_read_va(pc, 4)
         if raw is None:
             return None
         instr = int.from_bytes(raw.ljust(4, b"\x00"), "little", signed=False)
@@ -163,10 +175,9 @@ class MemoryMixin(SharedMixinAttrs):
             return f"[green]{mnemonic}[/] {rest}".rstrip()
         if mnemonic in _FENCE_AMO_MNEMONICS:
             return f"[yellow]{mnemonic}[/] {rest}".rstrip()
-        if mnemonic in {"ecall", "ebreak", "mret", "sret", "wfi"}:
+        if mnemonic in {"ecall", "ebreak", "mret", "sret", "wfi", "c.ebreak"}:
             return f"[red]{mnemonic}[/] {rest}".rstrip()
-        if mnemonic in {"ld", "lw", "lh", "lb", "lwu", "lhu", "lbu",
-                        "sd", "sw", "sh", "sb"}:
+        if mnemonic in _LOAD_STORE_MNEMONICS:
             return f"[cyan]{mnemonic}[/] {rest}".rstrip()
         if rest:
             return f"{mnemonic} {rest}".rstrip()
@@ -453,17 +464,16 @@ class MemoryMixin(SharedMixinAttrs):
         past_term = self._disasm_past_terminator
         next_base = base
         lines: list[str] = []
-        prefix_w = 5
         last_scope: str | None = None
         for i, (pc_addr, raw_hex, asm, ctrl) in enumerate(instrs):
             step = base + i
             at_ref = pc_addr == ref_pc
-            prefix = ""
             if at_ref:
-                prefix = "pc ->"
+                prefix = "pc -> "
             elif step > 0 and not past_term:
-                prefix = f"+{step}"
-                prefix_w = max(prefix_w, len(prefix))
+                prefix = f"+{step:<5d}"
+            else:
+                prefix = "      "
             link_addr = pc_addr - self._load_offset
             sym_name = self._resolve_any_symbol_name(pc_addr)
             seg = self._find_segment(link_addr)
@@ -479,14 +489,14 @@ class MemoryMixin(SharedMixinAttrs):
                 lines.append(f"  {scope}")
             asm_colored = self._colorize_asm(asm)
             lines.append(
-                f"  {prefix:<{prefix_w}}  [blue]{hex_addr(pc_addr)}[/]"
-                f"  [bright_black]{raw_hex:<8s}[/]  {asm_colored}"
+                f"{prefix}    [blue]{hex_addr(pc_addr)}[/]    "
+                f"[bright_black]{raw_hex:>8s}[/]    {asm_colored}"
             )
             if ctrl in (
                     "jal", "jalr", "ecall", "ebreak",
                     "mret", "sret", "wfi", "branch",
                 ):
-                lines.append(f"  {'─' * (prefix_w + 70)}")
+                lines.append(f"  {'─' * 80}")
                 if not past_term and step >= 0:
                     past_term = True
             if not past_term:
@@ -518,6 +528,12 @@ class MemoryMixin(SharedMixinAttrs):
         if self.hart.mmu_mode == 0:
             self._err("satp 未使能 (Bare 模式), vdisasm 无可用翻译; 请用 disasm")
             return
+        # _resolve_sym_addr 在 Sv39 模式下返回 PA (经 translate_addr),
+        # 但 vdisasm 需要 VA 才能做页表遍历. 通过 _pa_to_va 反查回 VA.
+        if va is not None and self._pa_to_va:
+            maybe_va = self._pa_to_va.get(va)
+            if maybe_va is not None:
+                va = maybe_va
         if va & 1:
             orig = va
             va &= ~1
@@ -528,18 +544,22 @@ class MemoryMixin(SharedMixinAttrs):
             self._err("内存后端未挂载")
             return
         root_ppn = self.hart.satp_val & ((1 << 44) - 1)
-        ok, _pa, _, _ = sv39_walk(root_ppn, va, self.hart._mem_read_phy)
+        ok, ppn, _perm, page_size = sv39_walk(root_ppn, va, self.hart._mem_read_phy)
         if not ok:
             self._err(
                 f"VA [yellow]{hex_addr(va)}[/] 页表翻译失败 (缺页);"
                 f" satp root PPN=0x{root_ppn:x}"
             )
             return
-        result = self._try_read_va_forced(va, inst_count * 4)
-        if result is None:
+        # sv39_walk 返回 PPN (非 PA); 用页大小计算完整物理地址.
+        # 注: 不走 _try_read_va_forced — 后者在 M-mode 下会将 VA 当作
+        # PA (Bare 翻译) 返回, 对 S-mode 内核 VA 会读到错误物理地址.
+        page_mask = page_size - 1
+        first_pa = ((ppn << 12) | (va & page_mask)) & 0xFFFF_FFFF_FFFF_FFFF
+        raw = self._emu.bus.try_read(first_pa, inst_count * 4)
+        if raw is None:
             self._err(f"VA [yellow]{hex_addr(va)}[/] 翻译后物理读取失败")
             return
-        first_pa, raw = result
 
         instrs: list[tuple[int, str, str, str, int]] = []
         offset = 0
@@ -577,12 +597,9 @@ class MemoryMixin(SharedMixinAttrs):
 
         ref_pc = self.hart.pc
         last_scope: str | None = None
-        va_w = max(len(hex_addr(pc_va)) for pc_va, _, _, _, _ in instrs)
-        pa_w = max(len(hex_addr(pc_pa)) for _, _, _, _, pc_pa in instrs)
-        header_va = "VA".center(va_w)
-        header_pa = "PA".center(pa_w)
         lines: list[str] = [
-            f"  {'':5}  {header_va}  {header_pa}  {'raw':8}  asm"
+            # pc ->的长度与4空格间距
+            f"{' '*(5+4)}VA{' '*(16+4)}PA{' '*(16+8+1)}raw    asm"
         ]
         for pc_va, raw_hex, asm, ctrl, pc_pa in instrs:
             link_addr = pc_va - self._load_offset
@@ -597,15 +614,16 @@ class MemoryMixin(SharedMixinAttrs):
             )
             if scope and scope != last_scope:
                 last_scope = scope
-                lines.append(f"  {scope}")
+                lines.append(f"{scope}")
             va_str = hex_addr(pc_va)
             pa_str = hex_addr(pc_pa)
             at_ref = pc_va == ref_pc
-            prefix = "pc ->" if at_ref else ""
+            prefix_fixed = "pc ->" if at_ref else " "*5
             asm_colored = self._colorize_asm(asm)
             lines.append(
-                f"  {prefix:<5}  [dim]{va_str}[/]  [bright_black]{pa_str}[/]"
-                f"  [bright_black]{raw_hex:>8s}[/]  {asm_colored}"
+                f"{prefix_fixed}    [dim]{va_str}[/]    "
+                f"[bright_black]{pa_str}[/]    "
+                f"[bright_black]{raw_hex:>8s}[/]    {asm_colored}"
             )
             if ctrl in (
                 "jal", "jalr", "ecall", "ebreak", "mret", "sret", "wfi", "branch",
@@ -689,6 +707,12 @@ class MemoryMixin(SharedMixinAttrs):
         if self.hart.mmu_mode == 0:
             self._err("satp 未使能 (Bare 模式), vmem 无可用翻译; 请用 mem")
             return
+        # _resolve_sym_addr 在 Sv39 模式下返回 PA (经 translate_addr),
+        # 但 vmem 需要 VA 才能做页表遍历. 通过 _pa_to_va 反查回 VA.
+        if va is not None and self._pa_to_va:
+            maybe_va = self._pa_to_va.get(va)
+            if maybe_va is not None:
+                va = maybe_va
         if self.hart._mem_read_phy is None:
             self._err("内存后端未挂载")
             return

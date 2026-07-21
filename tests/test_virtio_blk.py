@@ -24,9 +24,11 @@ from pathlib import Path
 
 import pytest
 
+from pyremu.interrupt.plic import PLIC
 from pyremu.peripheral.virtio_blk import (
     _VRING_DESC_SIZE,
     SECTOR_SIZE,
+    VIRTIO_BLK_IRQ,
     VIRTIO_BLK_S_OK,
     VIRTIO_BLK_S_UNSUPP,
     VIRTIO_BLK_T_DISCARD,
@@ -277,6 +279,25 @@ def _set_avail_idx(guest_ram: bytearray, idx: int, driver_pa: int | None = None)
     guest_ram[off : off + 2] = struct.pack("<H", idx)
 
 
+def _submit_avail(
+    vblk: VirtIOBlock,
+    guest_ram: bytearray,
+    desc_head: int = 0,
+    ring_idx: int = 0,
+    avail_idx: int | None = None,
+) -> None:
+    """提交描述符链并触发队列处理: avail ring 挂链头 -> 更新 idx -> QueueNotify.
+
+    测试中最常见的三连操作 (写 avail 条目 / 置 avail idx / 敲门铃) 的组合;
+    desc_head 默认为 0 (与 `_setup_blk_request` 的返回值一致 — 链头始终是
+    描述符表第 0 项); avail_idx 默认为 ring_idx + 1 (连续提交场景).
+    """
+    _write_avail_entry(guest_ram, ring_idx, desc_head)
+    idx = avail_idx if avail_idx is not None else ring_idx + 1
+    _set_avail_idx(guest_ram, idx)
+    _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+
+
 def _configure_queue(vblk: VirtIOBlock, qnum: int, desc_pa: int, driver_pa: int, device_pa: int) -> None:
     """完整配置一个 virtqueue."""
     _mmio_write(vblk, VIRTIO_MMIO_QUEUE_SEL, 0)
@@ -295,26 +316,23 @@ def _configure_queue(vblk: VirtIOBlock, qnum: int, desc_pa: int, driver_pa: int,
 class TestMmioRegisters:
     """MMIO 寄存器读写测试."""
 
-    def test_magic_value(self, vblk):
-        assert _mmio_read(vblk, VIRTIO_MMIO_MAGIC_VALUE) == 0x74726976
-
-    def test_version(self, vblk):
-        assert _mmio_read(vblk, VIRTIO_MMIO_VERSION) == 0x2
-
-    def test_device_id(self, vblk):
-        assert _mmio_read(vblk, VIRTIO_MMIO_DEVICE_ID) == 0x2  # block
-
-    def test_vendor_id(self, vblk):
-        assert _mmio_read(vblk, VIRTIO_MMIO_VENDOR_ID) == 0x0
-
-    def test_queue_num_max(self, vblk):
-        assert _mmio_read(vblk, VIRTIO_MMIO_QUEUE_NUM_MAX) > 0
-
-    def test_default_status_zero(self, vblk):
-        assert _mmio_read(vblk, VIRTIO_MMIO_STATUS) == 0
-
-    def test_default_config_generation_zero(self, vblk):
-        assert _mmio_read(vblk, VIRTIO_MMIO_CONFIG_GENERATION) == 0
+    @pytest.mark.parametrize(
+        "reg, expect", [
+            (VIRTIO_MMIO_MAGIC_VALUE, 0x74726976),  # "virt" LE
+            (VIRTIO_MMIO_VERSION, 0x2),
+            (VIRTIO_MMIO_DEVICE_ID, 0x2),  # block
+            (VIRTIO_MMIO_VENDOR_ID, 0x0),
+            (VIRTIO_MMIO_QUEUE_NUM_MAX, 256),  # 构造默认 queue_size_max
+            (VIRTIO_MMIO_STATUS, 0x0),  # 复位默认
+            (VIRTIO_MMIO_CONFIG_GENERATION, 0x0),
+        ],
+        ids=[
+            "magic_value", "version", "device_id", "vendor_id",
+            "queue_num_max", "default_status", "default_config_generation",
+        ],
+    )
+    def test_meta_logic(self, vblk, reg, expect: int):
+        assert _mmio_read(vblk, reg) == expect
 
 
 class TestFeatures:
@@ -323,16 +341,16 @@ class TestFeatures:
     def test_device_features_page0(self, vblk):
         _mmio_write(vblk, VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0)
         features = _mmio_read(vblk, VIRTIO_MMIO_DEVICE_FEATURES)
-        # Page 0: VIRTIO_F_RING_INDIRECT_DESC (bit 28) | VIRTIO_F_RING_EVENT_IDX (bit 29)
-        expected = (1 << 28) | (1 << 29)
-        assert features == expected
+        # Page 0: currently no features advertised in lower 32 bits.
+        # When VIRTIO_F_RING_INDIRECT_DESC / VIRTIO_F_RING_EVENT_IDX
+        # support is added to VirtIOBlock._DEVICE_FEATURES, update here.
+        assert features == 0
 
     def test_device_features_page1(self, vblk):
         _mmio_write(vblk, VIRTIO_MMIO_DEVICE_FEATURES_SEL, 1)
         features = _mmio_read(vblk, VIRTIO_MMIO_DEVICE_FEATURES)
-        # Page 1: VIRTIO_F_VERSION_1 | VIRTIO_F_RING_INDIRECT_DESC | VIRTIO_F_RING_EVENT_IDX
-        expected = ((VIRTIO_F_VERSION_1 >> 32) & 0xFFFF_FFFF)
-        assert features == expected
+        # Page 1: VIRTIO_F_VERSION_1 (bit 32) → bits [31:0] of page 1
+        assert features == (VIRTIO_F_VERSION_1 >> 32) & 0xFFFF_FFFF
 
     def test_driver_features_write(self, vblk):
         _mmio_write(vblk, VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0)
@@ -346,27 +364,22 @@ class TestFeatures:
 class TestStatusRegister:
     """设备状态寄存器测试."""
 
-    def test_acknowledge(self, vblk):
-        _mmio_write(vblk, VIRTIO_MMIO_STATUS, VIRTIO_STATUS_ACKNOWLEDGE)
-        assert _mmio_read(vblk, VIRTIO_MMIO_STATUS) == VIRTIO_STATUS_ACKNOWLEDGE
-
-    def test_driver(self, vblk):
-        _mmio_write(vblk, VIRTIO_MMIO_STATUS,
-                     VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER)
-        assert _mmio_read(vblk, VIRTIO_MMIO_STATUS) == (
-            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
-        )
-
-    def test_features_ok(self, vblk):
-        _mmio_write(vblk, VIRTIO_MMIO_STATUS,
-                     VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
-        assert _mmio_read(vblk, VIRTIO_MMIO_STATUS) & VIRTIO_STATUS_FEATURES_OK
-
-    def test_driver_ok(self, vblk):
-        _mmio_write(vblk, VIRTIO_MMIO_STATUS,
-                     VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
-                     | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK)
-        assert _mmio_read(vblk, VIRTIO_MMIO_STATUS) & VIRTIO_STATUS_DRIVER_OK
+    @pytest.mark.parametrize(
+        "status", [
+            VIRTIO_STATUS_ACKNOWLEDGE,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK,
+            (VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
+             | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK),
+        ],
+        ids=[
+            "acknowledge", "driver", "features_ok", "driver_ok",
+        ],
+    )
+    def test_incremental(self, vblk, status: int):
+        """逐步协商状态 — 写入值完整读回."""
+        _mmio_write(vblk, VIRTIO_MMIO_STATUS, status)
+        assert _mmio_read(vblk, VIRTIO_MMIO_STATUS) == status
 
     def test_reset_clears_all(self, vblk):
         """写 Status=0 应重置全部寄存器."""
@@ -374,7 +387,6 @@ class TestStatusRegister:
         _mmio_write(vblk, VIRTIO_MMIO_DEVICE_FEATURES_SEL, 1)
         _mmio_write(vblk, VIRTIO_MMIO_QUEUE_SEL, 0)
         _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NUM, 16)
-
         # 重置
         _mmio_write(vblk, VIRTIO_MMIO_STATUS, 0)
 
@@ -406,15 +418,11 @@ class TestConfigSpace:
         off = _to_offset(data_pa)
         guest_ram[off : off + SECTOR_SIZE] = test_data
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_OUT, sector=0,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-
-        # 触发队列处理
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         # 容量至少应该 >= 1 扇区
         cap_lo = _mmio_read(vblk, 0x100)
@@ -443,14 +451,11 @@ class TestVirtqueueProcessing:
         off = _to_offset(data_pa)
         guest_ram[off : off + SECTOR_SIZE] = b"\xFF" * SECTOR_SIZE
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_IN, sector=0,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         # 空磁盘的 read 应返回全零
         result = bytes(guest_ram[off : off + SECTOR_SIZE])
@@ -469,13 +474,11 @@ class TestVirtqueueProcessing:
         off = _to_offset(data_pa)
         guest_ram[off : off + len(test_data)] = test_data
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_OUT, sector=0,
             data_pa=data_pa, data_len=len(test_data), status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         # 检查状态字节
         status_off = _to_offset(status_pa)
@@ -486,13 +489,11 @@ class TestVirtqueueProcessing:
         guest_ram[off : off + SECTOR_SIZE] = b"\x00" * SECTOR_SIZE
 
         # available idx 推进到 2
-        head2 = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_IN, sector=0,
             data_pa=data_pa, data_len=len(test_data), status_pa=status_pa + 1,
         )
-        _write_avail_entry(guest_ram, 1, head2)
-        _set_avail_idx(guest_ram, 2)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram, ring_idx=1)
 
         # 读回的数据应与写入的一致
         result = bytes(guest_ram[off : off + len(test_data)])
@@ -511,25 +512,21 @@ class TestVirtqueueProcessing:
         off = _to_offset(data_pa)
         guest_ram[off : off + len(test_data)] = test_data
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_OUT, sector=0,
             data_pa=data_pa, data_len=len(test_data), status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         assert guest_ram[_to_offset(status_pa)] == VIRTIO_BLK_S_OK
 
         # 读取第 2 个扇区 (sector=1)
         guest_ram[off : off + SECTOR_SIZE] = b"\x00" * SECTOR_SIZE
-        head2 = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_IN, sector=1,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa + 1,
         )
-        _write_avail_entry(guest_ram, 1, head2)
-        _set_avail_idx(guest_ram, 2)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram, ring_idx=1)
 
         result = bytes(guest_ram[off : off + SECTOR_SIZE])
         assert result == test_data[SECTOR_SIZE : 2 * SECTOR_SIZE]
@@ -542,13 +539,11 @@ class TestVirtqueueProcessing:
         data_pa = _make_gpa(0x4000)
         status_pa = _make_gpa(0x5000)
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_IN, sector=0,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         # InterruptStatus bit 0 应为 1
         assert _mmio_read(vblk, VIRTIO_MMIO_INTERRUPT_STATUS) & 1 == 1
@@ -561,13 +556,11 @@ class TestVirtqueueProcessing:
         data_pa = _make_gpa(0x4000)
         status_pa = _make_gpa(0x5000)
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_IN, sector=0,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         # 确认中断置位
         assert _mmio_read(vblk, VIRTIO_MMIO_INTERRUPT_STATUS) & 1 == 1
@@ -592,13 +585,11 @@ class TestVirtqueueProcessing:
         # 预置状态为非零
         guest_ram[_to_offset(status_pa)] = 0xFF
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_IN, sector=0,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         # 状态不应该被修改 (队列未激活)
         assert guest_ram[_to_offset(status_pa)] == 0xFF
@@ -617,13 +608,11 @@ class TestBlkStatus:
         data_pa = _make_gpa(0x4000)
         status_pa = _make_gpa(0x5000)
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_IN, sector=0,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         assert guest_ram[_to_offset(status_pa)] == VIRTIO_BLK_S_OK
 
@@ -635,13 +624,11 @@ class TestBlkStatus:
         data_pa = _make_gpa(0x4000)
         status_pa = _make_gpa(0x5000)
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_DISCARD, sector=0,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         assert guest_ram[_to_offset(status_pa)] == VIRTIO_BLK_S_UNSUPP
 
@@ -655,9 +642,7 @@ class TestBlkStatus:
         _write_descriptor(guest_ram, 0, data_pa, 4, flags=0, next_idx=0)
         # desc[0].len=4 < 16 (outhdr 最小长度) -> 应失败
 
-        _write_avail_entry(guest_ram, 0, 0)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         # used ring entry 0 的 len 字段应该是非零 (表示出错)
         used_entry_off = _to_offset(device_pa) + 4 + 0 * 8
@@ -689,13 +674,11 @@ class TestFlush:
         # 实际上 virtio-blk flush 请求仍然有 3 个描述符, data 可以为空
         data_pa = _make_gpa(0x4000)
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_FLUSH, sector=0,
             data_pa=data_pa, data_len=0, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         assert guest_ram[_to_offset(status_pa)] == VIRTIO_BLK_S_OK
 
@@ -717,13 +700,11 @@ class TestDiskPersistence:
         off = _to_offset(data_pa)
         guest_ram[off : off + SECTOR_SIZE] = test_data
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_OUT, sector=5,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk1, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk1, guest_ram)
 
         assert guest_ram[_to_offset(status_pa)] == VIRTIO_BLK_S_OK
 
@@ -748,13 +729,11 @@ class TestDiskPersistence:
         # 清零读取缓冲区
         guest_ram2[_to_offset(data_pa2) : _to_offset(data_pa2) + SECTOR_SIZE] = b"\x00" * SECTOR_SIZE
 
-        head2 = _setup_blk_request(
+        _setup_blk_request(
             guest_ram2, VIRTIO_BLK_T_IN, sector=5,
             data_pa=data_pa2, data_len=SECTOR_SIZE, status_pa=status_pa2,
         )
-        _write_avail_entry(guest_ram2, 0, head2)
-        _set_avail_idx(guest_ram2, 1)
-        _mmio_write(vblk2, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk2, guest_ram2)
 
         assert guest_ram2[_to_offset(status_pa2)] == VIRTIO_BLK_S_OK
         result = bytes(guest_ram2[_to_offset(data_pa2) : _to_offset(data_pa2) + SECTOR_SIZE])
@@ -762,7 +741,6 @@ class TestDiskPersistence:
 
     def test_disk_size_grows_on_write(self, disk_image, mem_read, mem_write, guest_ram):
         """写入新区域后磁盘镜像文件应增长."""
-        import os as _os
         vblk = VirtIOBlock(image_path=disk_image, mem_read=mem_read, mem_write=mem_write)
         desc_pa, driver_pa, device_pa = _setup_virtqueue(guest_ram)
         _configure_queue(vblk, 8, desc_pa, driver_pa, device_pa)
@@ -774,14 +752,99 @@ class TestDiskPersistence:
         off = _to_offset(data_pa)
         guest_ram[off : off + SECTOR_SIZE] = test_data
 
-        head = _setup_blk_request(
+        _setup_blk_request(
             guest_ram, VIRTIO_BLK_T_OUT, sector=100,
             data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
         )
-        _write_avail_entry(guest_ram, 0, head)
-        _set_avail_idx(guest_ram, 1)
-        _mmio_write(vblk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        _submit_avail(vblk, guest_ram)
 
         # 文件大小应 >= 101 个扇区
-        file_size = _os.path.getsize(disk_image)
+        file_size = os.path.getsize(disk_image)
         assert file_size >= 101 * SECTOR_SIZE
+
+
+class TestPlicInterrupt:
+    """virtio 完成中断经 PLIC 投递 (set_irq 拉高 / ACK 拉低)."""
+
+    def _submit_read(self, vblk, guest_ram):
+        desc_pa, driver_pa, device_pa = _setup_virtqueue(guest_ram)
+        _configure_queue(vblk, 8, desc_pa, driver_pa, device_pa)
+        _setup_blk_request(
+            guest_ram, VIRTIO_BLK_T_IN, sector=0,
+            data_pa=_make_gpa(0x4000), data_len=SECTOR_SIZE,
+            status_pa=_make_gpa(0x5000),
+        )
+        _submit_avail(vblk, guest_ram)
+
+    def test_completion_raises_plic_irq(self, disk_image, mem_read, mem_write, guest_ram):
+        plic = PLIC(num_sources=128, num_contexts=2)
+        vblk = VirtIOBlock(
+            image_path=disk_image, mem_read=mem_read, mem_write=mem_write,
+            plic=plic, irq=VIRTIO_BLK_IRQ,
+        )
+        assert plic._pending[VIRTIO_BLK_IRQ] is False
+        self._submit_read(vblk, guest_ram)
+        # 处理完成 -> PLIC 源 VIRTIO_BLK_IRQ 被拉高
+        assert plic._pending[VIRTIO_BLK_IRQ] is True
+
+    def test_ack_lowers_plic_irq(self, disk_image, mem_read, mem_write, guest_ram):
+        plic = PLIC(num_sources=128, num_contexts=2)
+        vblk = VirtIOBlock(
+            image_path=disk_image, mem_read=mem_read, mem_write=mem_write,
+            plic=plic, irq=VIRTIO_BLK_IRQ,
+        )
+        self._submit_read(vblk, guest_ram)
+        assert plic._pending[VIRTIO_BLK_IRQ] is True
+        # Guest ACK 清 InterruptStatus -> PLIC 源被拉低
+        _mmio_write(vblk, VIRTIO_MMIO_INTERRUPT_ACK, 1)
+        assert plic._pending[VIRTIO_BLK_IRQ] is False
+
+    def test_no_plic_no_crash(self, vblk, guest_ram):
+        # 无 PLIC (irq=0) 时完成不应报错, InterruptStatus 仍照常置位
+        self._submit_read(vblk, guest_ram)
+        assert _mmio_read(vblk, VIRTIO_MMIO_INTERRUPT_STATUS) & 1 == 1
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="root 绕过文件权限位, 无法验证只读回退",
+)
+class TestReadOnly:
+    """只读磁盘打开 (无写权限镜像自动回退 O_RDONLY, 写请求静默忽略)."""
+
+    def test_explicit_read_only_flag(self, disk_image, mem_read, mem_write):
+        vblk = VirtIOBlock(
+            image_path=disk_image, mem_read=mem_read, mem_write=mem_write,
+            read_only=True,
+        )
+        assert vblk._read_only is True
+
+    def test_fallback_when_no_write_permission(self, disk_image, mem_read, mem_write):
+        os.chmod(disk_image, 0o444)  # 去写权限 -> O_RDWR EACCES -> 回退 O_RDONLY
+        try:
+            vblk = VirtIOBlock(
+                image_path=disk_image, mem_read=mem_read, mem_write=mem_write,
+            )
+            assert vblk._read_only is True
+        finally:
+            os.chmod(disk_image, 0o644)
+
+    def test_write_request_silently_ignored(
+        self, disk_image, mem_read, mem_write, guest_ram,
+    ):
+        vblk = VirtIOBlock(
+            image_path=disk_image, mem_read=mem_read, mem_write=mem_write,
+            read_only=True,
+        )
+        desc_pa, driver_pa, device_pa = _setup_virtqueue(guest_ram)
+        _configure_queue(vblk, 8, desc_pa, driver_pa, device_pa)
+        status_pa = _make_gpa(0x5000)
+        data_pa = _make_gpa(0x4000)
+        guest_ram[_to_offset(data_pa):_to_offset(data_pa) + SECTOR_SIZE] = b"Y" * SECTOR_SIZE
+        _setup_blk_request(
+            guest_ram, VIRTIO_BLK_T_OUT, sector=10,
+            data_pa=data_pa, data_len=SECTOR_SIZE, status_pa=status_pa,
+        )
+        _submit_avail(vblk, guest_ram)
+        # 写被忽略但返回成功; 文件未增长 (仍为空)
+        assert guest_ram[_to_offset(status_pa)] == VIRTIO_BLK_S_OK
+        assert os.path.getsize(disk_image) == 0

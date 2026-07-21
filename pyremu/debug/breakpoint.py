@@ -24,6 +24,17 @@ class BreakpointMixin(SharedMixinAttrs):
     """断点管理."""
 
     # ----------------------------------------------------------
+    #  断点缓存 (性能 — 避免每批次 Python 侧冗余检查)
+    # ----------------------------------------------------------
+
+    def _refresh_bp_cache(self) -> None:
+        """更新断点性能缓存标志; 所有修改 _breakpoints 的路径均需调用."""
+        self._has_non_addr_bps = any(
+            bp.kind != "addr" or bp.cond_type  # cond breakpoint on addr still needs Python eval
+            for bp in self._breakpoints
+        )
+
+    # ----------------------------------------------------------
     #  条件断点预过滤
     # ----------------------------------------------------------
 
@@ -170,6 +181,7 @@ class BreakpointMixin(SharedMixinAttrs):
         """Append an address breakpoint and print the confirmation line."""
         bp = Breakpoint(kind="addr", value=addr, desc=f"{name} ({hex_addr(addr)})")
         self._breakpoints.append(bp)
+        self._refresh_bp_cache()
         asm_info = self._fetch_and_disasm(addr)
         asm_str = f"  {asm_info[1]}" if asm_info else ""
         self._console.print(
@@ -260,6 +272,7 @@ class BreakpointMixin(SharedMixinAttrs):
                 cond_val=cond_val,
             )
             self._breakpoints.append(bp)
+            self._refresh_bp_cache()
             asm_info = self._fetch_and_disasm(addr)
             asm_str = f"  {asm_info[1]}" if asm_info else ""
             cond_str = (
@@ -282,6 +295,7 @@ class BreakpointMixin(SharedMixinAttrs):
             return
         bp = Breakpoint(kind="instr", value=_INSTR_BP_NAMES[name], desc=name)
         self._breakpoints.append(bp)
+        self._refresh_bp_cache()
         self._console.print(
             f"  [green]断点 {len(self._breakpoints)}[/]  [yellow]{name}[/]"
         )
@@ -299,6 +313,7 @@ class BreakpointMixin(SharedMixinAttrs):
             return
         bp = Breakpoint(kind="opcode", value=val, desc=f"opcode 0x{val:02x}")
         self._breakpoints.append(bp)
+        self._refresh_bp_cache()
         self._console.print(
             f"  [green]断点 {len(self._breakpoints)}[/]  [yellow]opcode 0x{val:02x}[/]"
         )
@@ -326,12 +341,14 @@ class BreakpointMixin(SharedMixinAttrs):
             )
             return
         removed = self._breakpoints.pop(idx)
+        self._refresh_bp_cache()
         self._console.print(f"  [dim]已删除断点 [yellow]{removed.desc}[/][/]")
 
     def cmd_bp_clear(self) -> None:
         """清除全部断点."""
         count = len(self._breakpoints)
         self._breakpoints.clear()
+        self._refresh_bp_cache()
         self._console.print(f"  [dim]已清除 {count} 个断点[/]")
 
     def cmd_bp_mode(self, arg: str | None = None) -> None:
@@ -374,6 +391,7 @@ class BreakpointMixin(SharedMixinAttrs):
                 cond_type=ct, cond_reg=cr, cond_op=co, cond_val=cv,
             )
             self._breakpoints.append(bp)
+            self._refresh_bp_cache()
             self._console.print(
                 f"  [green]条件断点 {len(self._breakpoints)}[/]  "
                 f"[yellow]{desc}[/]"

@@ -6,6 +6,7 @@
 mod call;
 mod constants;
 mod context;
+mod attest;
 mod csr;
 mod elf;
 mod hang;
@@ -90,6 +91,16 @@ pub unsafe extern "C" fn rust_main_before_mmu(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_main_after_mmu() {
     let (payload_pa, payload_size, argc) = call::enclave_call_suspend(0);
+
+    // 完整性证明: 执行载荷前先验证其尾部 ECDSA 签名。
+    // 载荷布局 [ bare | 64 字节签名 ]; 对 bare 做 SHA-256 后验签。
+    // ATTEST_ENABLE=false 时跳过 (签名流水线未就绪, 保持启动畅通)。
+    if ATTEST_ENABLE {
+        if !attest::attest_payload(payload_pa, payload_size) {
+            hang::hang_with_msg("[enclave] attestation failed — refusing to run payload");
+        }
+        println!("[enclave] attestation passed\n");
+    }
 
     let argv_pa = payload_pa + memory::page_up(payload_size) + PAGE_SIZE;
     let pool_start = memory::chunk_2m_down(argv_pa);

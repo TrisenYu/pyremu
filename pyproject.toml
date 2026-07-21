@@ -62,9 +62,13 @@ ignore=[
 max-nested-blocks = 4
 
 [tool.ruff.lint.isort]
+order-by-type = false
 force-single-line = false
 combine-as-imports = true
+force-sort-within-sections = true
+# 多行导入也按字典序排
 split-on-trailing-comma = true
+# 分组划分（标准库 / 第三方 / 本地项目 / 相对导入）
 
 [tool.ruff.format]
 skip-magic-trailing-comma = false
@@ -72,8 +76,8 @@ skip-magic-trailing-comma = false
 [tool.pytest.ini_options]
 # setup for pytest
 pythonpath = "."
-timeout = 120
-timeout_func_only = true
+timeout = 10
+# timeout_func_only = true
 testpaths = ["tests"]
 norecursedirs = ["third-party", ".git", "__pycache__", ".venv"]
 

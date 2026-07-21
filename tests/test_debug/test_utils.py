@@ -22,16 +22,16 @@ from pyremu.debug.utils import (
 
 class TestHexAddr:
     def test_basic(self):
-        assert hex_addr(0) == "0x0000000000000000"
-        assert hex_addr(0x80000000) == "0x0000000080000000"
+        assert hex_addr(0, styled=False) == "0x0000000000000000"
+        assert hex_addr(0x80000000, styled=False) == "0x0000000080000000"
 
     def test_mask_upper_bits(self):
         """Python int 无位宽限制, 超出 64-bit 的部分应被掩码清除."""
-        assert hex_addr(0x1_0000_0000_0000_0001) == "0x0000000000000001"
+        assert hex_addr(0x1_0000_0000_0000_0001, styled=False) == "0x0000000000000001"
 
     def test_negative_value(self):
         """负值在补码下转换为 64-bit 无符号."""
-        assert hex_addr(-1) == "0xffffffffffffffff"
+        assert hex_addr(-1, styled=False) == "0xffffffffffffffff"
 
 
 class TestFmtSize:

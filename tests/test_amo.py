@@ -444,7 +444,7 @@ class TestReservationInvalidation:
         assert h.reservation_valid
         deliver_trap(
             h,
-            __import__("pyremu.core.trap", fromlist=["TrapType"]).TrapType.IllInstr,
+            __import__("pyremu.core.trap_def", fromlist=["TrapType"]).TrapType.IllInstr,
             is_interrupt=False,
         )
         assert not h.reservation_valid

@@ -313,6 +313,46 @@ class TestHardwareAPI:
 
 
 # ============================================================
+#  Tests: 标准双 context/hart (2h=M-context/MEIP, 2h+1=S-context/SEIP)
+# ============================================================
+
+
+class TestDualContext:
+    """每 hart 两个 context: 偶=M(MEIP bit11), 奇=S(SEIP bit9)。
+
+    fixture num_contexts=4 -> hart0: ctx0(M)/ctx1(S); hart1: ctx2(M)/ctx3(S)。
+    """
+
+    def test_s_context_returns_seip(self, plic):
+        # 源使能于 hart0 的 S-context (ctx 1) -> SEIP, 而非 MEIP
+        _write_u32(plic, _priority_offset(10), 3)
+        _write_u32(plic, _enable_offset(1, 0), 1 << 10)
+        plic.set_irq(10, True)
+        assert plic.get_pending_mip(0) == (1 << 9)  # SEIP
+
+    def test_m_context_returns_meip(self, plic):
+        _write_u32(plic, _priority_offset(10), 3)
+        _write_u32(plic, _enable_offset(0, 0), 1 << 10)
+        plic.set_irq(10, True)
+        assert plic.get_pending_mip(0) == (1 << 11)  # MEIP
+
+    def test_both_contexts_set_both_bits(self, plic):
+        _write_u32(plic, _priority_offset(10), 3)
+        _write_u32(plic, _enable_offset(0, 0), 1 << 10)  # hart0 M
+        _write_u32(plic, _enable_offset(1, 0), 1 << 10)  # hart0 S
+        plic.set_irq(10, True)
+        assert plic.get_pending_mip(0) == ((1 << 11) | (1 << 9))
+
+    def test_hart1_s_context_isolated(self, plic):
+        # hart1 的 S-context = ctx 3; hart0 未使能 -> 仅 hart1 得 SEIP
+        _write_u32(plic, _priority_offset(7), 2)
+        _write_u32(plic, _enable_offset(3, 0), 1 << 7)
+        plic.set_irq(7, True)
+        assert plic.get_pending_mip(1) == (1 << 9)  # SEIP
+        assert plic.get_pending_mip(0) == 0
+
+
+# ============================================================
 #  Tests: 多源竞争
 # ============================================================
 
@@ -332,3 +372,37 @@ class TestMultiSource:
         assert (pending0 >> 3) & 1 == 1
         assert (pending0 >> 5) & 1 == 1
         assert (pending0 >> 8) & 1 == 0  # claimed
+
+
+# ============================================================
+#  Tests: 电平中断 gateway — complete 重挂起
+# ============================================================
+
+
+class TestLevelRetrigger:
+    """complete 时设备电平仍高 → pending 重新置位 (QEMU sifive_plic gateway 语义).
+
+    回归背景: UART TX watermark 为电平中断; sifive 驱动 ISR 每次仅发送
+    FIFO 深度 (8) 个字符, 期间 TXDATA 写由 Rust inline 处理, 不再有任何
+    Python 侧设备访问调用 set_irq。旧行为 claim 清 pending 后无人重新拉线
+    → complete 后中断永久丢失, 剩余 TX 数据滞留内核环形缓冲。
+    """
+
+    def test_complete_reraises_when_level_still_high(self, plic):
+        plic.set_irq(7, True)
+        _write_u32(plic, _priority_offset(7), 3)
+        _write_u32(plic, _enable_offset(0, 0), 1 << 7)
+        assert _read_u32(plic, _context_claim_offset(0)) == 7
+        assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) == 0
+        # 设备未拉低电平 (还有待发送数据), complete 必须重新挂起
+        _write_u32(plic, _context_claim_offset(0), 7)
+        assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) != 0
+
+    def test_complete_idle_when_level_lowered(self, plic):
+        plic.set_irq(7, True)
+        _write_u32(plic, _priority_offset(7), 3)
+        _write_u32(plic, _enable_offset(0, 0), 1 << 7)
+        assert _read_u32(plic, _context_claim_offset(0)) == 7
+        plic.set_irq(7, False)  # ISR 内设备已拉低 (如 IE 关闭 / RX 读空)
+        _write_u32(plic, _context_claim_offset(0), 7)
+        assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) == 0

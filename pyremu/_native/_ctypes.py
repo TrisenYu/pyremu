@@ -34,6 +34,8 @@ class DecodedFields(ctypes.Structure):
         ("rs2", ctypes.c_uint8),
         ("func7", ctypes.c_uint8),
         ("is_compressed", ctypes.c_uint8),
+        ("rs3", ctypes.c_uint8),
+        ("fmt", ctypes.c_uint8),
     ]
 
 
@@ -65,10 +67,27 @@ class CompressedFields(ctypes.Structure):
 
 
 class Alu64(ctypes.Structure):
-    """ALU result with trap flag (0=ok, 1=invalid encoding → IllInstr)."""
+    """ALU result with trap flag (0=ok, 1=invalid encoding -> IllInstr)."""
 
     _fields_ = [
         ("value", ctypes.c_uint64),
+        ("trap", ctypes.c_uint8),
+    ]
+
+
+class FpOut(ctypes.Structure):
+    """浮点运算结果 — mirrors Rust ``fpu::FpOut``.
+
+    value: 结果 bits (FPR NaN-boxed / GPR 整数/布尔/分类掩码).
+    fflags: 累积异常标志 (RISC-V fflags 位序).
+    to_gpr: 1 = 写 rd 的 GPR, 0 = 写 rd 的 FPR.
+    trap: 1 = 非法编码 -> IllInstr.
+    """
+
+    _fields_ = [
+        ("value", ctypes.c_uint64),
+        ("fflags", ctypes.c_uint8),
+        ("to_gpr", ctypes.c_uint8),
         ("trap", ctypes.c_uint8),
     ]
 

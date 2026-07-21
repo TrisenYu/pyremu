@@ -9,8 +9,12 @@ Python equivalents transparently.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from loguru import logger
@@ -21,7 +25,7 @@ from loguru import logger
 
 _EXT = {"linux": ".so", "darwin": ".dylib", "win32": ".dll"}.get(sys.platform, ".so")
 _NATIVE_DIR = Path(__file__).resolve().parent
-_LIB_PATH = _NATIVE_DIR / f"libdecode{_EXT}"
+_LIB_PATH = _NATIVE_DIR / f"libdecode{_EXT}" # 单独留在外部，好减少SIGBUS/SIGSEGM一类的错误
 
 # ============================================================
 #  ctypes type definitions (must match Rust #[repr(C)] layout)
@@ -31,6 +35,7 @@ from pyremu._native._ctypes import (  # noqa: E402, F401 — re-export
     Alu64,
     CompressedFields,
     DecodedFields,
+    FpOut,
     PteFields,
     Sv39Vpn,
 )
@@ -40,8 +45,49 @@ from pyremu._native._ctypes import (  # noqa: E402, F401 — re-export
 # ============================================================
 
 _lib = None
+_tmp_so_path: str | None = None
+
+def _load_lib_safe(lib_path: Path) -> ctypes.CDLL | None:
+    """Load the native shared library from a temporary copy.
+
+    ctypes.CDLL uses dlopen() which mmap's the file.  Rebuilding (cargo build)
+    overwrites the original .so, and with cp the old inode is truncated,
+    causing SIGBUS in the running process.  Copying to a temp file first
+    isolates the running process from subsequent rebuilds.
+    """
+    global _tmp_so_path  # noqa: PLW0603 — intentional module-level tracking
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".so", prefix="libdecode_")
+        os.close(fd)
+        shutil.copy2(str(lib_path), tmp_path)
+        _tmp_so_path = tmp_path
+        atexit.register(_cleanup_tmp_so)
+        return ctypes.CDLL(tmp_path)
+    except (OSError, IOError) as exc:
+        logger.warning("Failed to create temp copy of {}: {}", lib_path, exc)
+        # Fall back to loading directly (may crash on rebuild)
+        try:
+            return ctypes.CDLL(str(lib_path))
+        except OSError:
+            return None
+
+
+def _cleanup_tmp_so() -> None:
+    """Remove the temporary .so copy, ignoring errors (best-effort)."""
+    if _tmp_so_path is None:
+        return
+    try:
+        os.unlink(_tmp_so_path)
+    except OSError:
+        pass
+
+
+_lib: ctypes.CDLL | None = None
+
 try:
-    _lib = ctypes.CDLL(str(_LIB_PATH))
+    _lib = _load_lib_safe(_LIB_PATH)
+    if _lib is None:
+        raise OSError(f"无法加载 {_LIB_PATH.name}")
 
     # Phase 1: instruction decode
     _lib.decode_fields.argtypes = [ctypes.c_uint32]
@@ -109,6 +155,27 @@ try:
     ]
     _lib.exec_op_imm32.restype = Alu64
 
+    # F/D floating point compute (return FpOut)
+    _lib.fp_exec_op.argtypes = [
+        ctypes.c_uint8,   # funct7
+        ctypes.c_uint8,   # funct3
+        ctypes.c_uint8,   # rs2
+        ctypes.c_uint64,  # rs1_bits
+        ctypes.c_uint64,  # rs2_bits
+        ctypes.c_uint8,   # frm
+    ]
+    _lib.fp_exec_op.restype = FpOut
+    _lib.fp_exec_fma.argtypes = [
+        ctypes.c_uint8,   # opcode
+        ctypes.c_uint8,   # rm (funct3)
+        ctypes.c_uint8,   # fmt
+        ctypes.c_uint64,  # rs1
+        ctypes.c_uint64,  # rs2
+        ctypes.c_uint64,  # rs3
+        ctypes.c_uint8,   # frm
+    ]
+    _lib.fp_exec_fma.restype = FpOut
+
     # Phase 3: RAM direct read/write (zero-allocation fast path)
     _lib.bus_read_ram.argtypes = [
         ctypes.c_void_p,  # ram_ptr: *const u8
@@ -137,32 +204,39 @@ try:
     _lib.run_batch.argtypes = [
         ctypes.c_void_p,   # states: *mut HartState
         ctypes.c_uint32,   # num_harts
-        ctypes.c_void_p,   # ram: *mut u8
-        ctypes.c_uint64,   # ram_size
-        ctypes.c_uint64,   # ram_base
-        ctypes.c_uint64,   # shadow_base
-        ctypes.c_uint64,   # shadow_size
         ctypes.c_uint64,   # max_instrs
         ctypes.c_void_p,   # result: *mut BatchResult
-        # PMP state
-        ctypes.c_void_p,   # pmp_cfg: *const u8
-        ctypes.c_void_p,   # pmp_addr: *const u64
-        ctypes.c_uint8,    # pmp_num
-        ctypes.c_uint8,    # pmpsplit_val
-        # CLINT state
-        ctypes.c_uint64,   # mtime
-        ctypes.c_void_p,   # mtimecmp: *const u64
-        ctypes.c_void_p,   # msip: *const u8
-        # Device MMIO ranges
-        ctypes.c_void_p,   # dev_bases: *const u64
-        ctypes.c_void_p,   # dev_ends: *const u64
-        ctypes.c_uint8,    # num_devices
+        ctypes.c_void_p,   # mem: *const MemCtx
+        ctypes.c_void_p,   # pmp: *const FfiPmpCtx
+        ctypes.c_void_p,   # clint: *const FfiClintCtx
+        ctypes.c_void_p,   # dev: *const FfiDevCtx
+        ctypes.c_void_p,   # virtio: *const FfiVirtIOCtx
+        ctypes.c_void_p,   # bp_addrs: *const u64
+        ctypes.c_uint32,   # bp_count
     ]
     _lib.run_batch.restype = None
 
+    # Phase 5: concurrent thread-per-hart execution engine
+    _lib.run_parallel.argtypes = [
+        ctypes.c_void_p,   # states: *mut HartState
+        ctypes.c_uint32,   # num_harts
+        ctypes.c_uint64,   # max_instrs
+        ctypes.c_void_p,   # result: *mut BatchResult
+        ctypes.c_void_p,   # mem: *const MemCtx
+        ctypes.c_void_p,   # pmp: *const FfiPmpCtx
+        ctypes.c_void_p,   # clint: *const FfiClintCtx
+        ctypes.c_void_p,   # dev: *const FfiDevCtx
+        ctypes.c_void_p,   # uart: *const FfiUartCtx
+        ctypes.c_void_p,   # virtio: *const FfiVirtIOCtx
+        ctypes.c_void_p,   # bp_addrs: *const u64
+        ctypes.c_uint32,   # bp_count
+        ctypes.c_void_p,   # stop_flag: *const u8
+    ]
+    _lib.run_parallel.restype = None
+
 except OSError as exc:
     logger.warning(
-        "无法加载 native 加速库 ({}): {} — 降级为纯 Python 实现, 性能会下降",
+        "无法加载 native 加速库 ({}): {} — 降级为性能较低的纯 Python 实现",
         _LIB_PATH.name,
         exc,
     )
@@ -202,6 +276,9 @@ def _decode_fields_py(instr: int) -> DecodedFields:
     f.func7 = (instr >> 25) & 0x7F
     f.func12 = (instr >> 20) & 0xFFF
     f.is_compressed = 1 if (instr & 0x3) != 3 else 0
+    # F/D: rs3 = bits[31:27], fmt = bits[26:25]
+    f.rs3 = (instr >> 27) & 0x1F
+    f.fmt = (instr >> 25) & 0x3
 
     # Immediates
     f.imm12_se = _sext12((instr >> 20) & 0xFFF)
@@ -691,6 +768,33 @@ def exec_op_imm32(funct3: int, funct7: int, v1: int, imm: int) -> Alu64:
 
 
 # ============================================================
+#  F/D floating point compute (native-only — no pure-Python FPU)
+# ============================================================
+
+
+def fp_exec_op(
+    funct7: int, funct3: int, rs2: int, rs1_bits: int, rs2_bits: int, frm: int
+) -> FpOut:
+    """OP-FP compute via native softfloat.  Requires the native library.
+
+    Raises NotImplementedError if ``.so`` is unavailable (caller converts
+    to IllInstr) — there is no pure-Python floating-point fallback.
+    """
+    if _lib is None:
+        raise NotImplementedError("FPU requires native library (libdecode.so)")
+    return _lib.fp_exec_op(funct7, funct3, rs2, rs1_bits, rs2_bits, frm)
+
+
+def fp_exec_fma(
+    opcode: int, rm: int, fmt: int, rs1: int, rs2: int, rs3: int, frm: int
+) -> FpOut:
+    """FMA compute via native softfloat.  Requires the native library."""
+    if _lib is None:
+        raise NotImplementedError("FPU requires native library (libdecode.so)")
+    return _lib.fp_exec_fma(opcode, rm, fmt, rs1, rs2, rs3, frm)
+
+
+# ============================================================
 #  Phase 3: RAM direct read/write (zero-allocation fast path)
 # ============================================================
 
@@ -753,6 +857,233 @@ def bus_write_ram(
 
 
 # ============================================================
+#  FFI context structs — ctypes layouts matching Rust #[repr(C)]
+# ============================================================
+
+
+class MemCtx(ctypes.Structure):
+    """Memory context — matches Rust ``MemCtx``."""
+    _fields_ = [
+        ("ram", ctypes.c_void_p),
+        ("ram_size", ctypes.c_uint64),
+        ("ram_base", ctypes.c_uint64),
+        ("shadow_base", ctypes.c_uint64),
+        ("shadow_size", ctypes.c_uint64),
+    ]
+
+
+class FfiPmpCtx(ctypes.Structure):
+    """PMP context — matches Rust ``FfiPmpCtx``."""
+    _fields_ = [
+        ("cfg", ctypes.c_void_p),
+        ("addr", ctypes.c_void_p),
+        ("num", ctypes.c_uint8),
+        ("pmpsplit", ctypes.c_uint8),
+    ]
+
+
+class FfiClintCtx(ctypes.Structure):
+    """CLINT context — matches Rust ``FfiClintCtx``."""
+    _fields_ = [
+        ("mtime", ctypes.c_void_p),
+        ("mtimecmp", ctypes.c_void_p),
+        ("msip", ctypes.c_void_p),
+        ("base", ctypes.c_uint64),
+    ]
+
+
+class FfiDevCtx(ctypes.Structure):
+    """Device MMIO context — matches Rust ``FfiDevCtx``."""
+    _fields_ = [
+        ("bases", ctypes.c_void_p),
+        ("ends", ctypes.c_void_p),
+        ("num", ctypes.c_uint8),
+    ]
+
+
+class FfiUartCtx(ctypes.Structure):
+    """UART context — matches Rust ``FfiUartCtx``."""
+    _fields_ = [
+        ("base", ctypes.c_uint64),
+        ("tx_buf", ctypes.c_void_p),
+        ("tx_cap", ctypes.c_uint32),
+        ("tx_wr", ctypes.c_void_p),
+        ("ie", ctypes.c_uint32),          # IE 寄存器影子 (offset 0x10)
+        ("txctrl", ctypes.c_uint32),      # TXCTRL 影子 (offset 0x08)
+        ("rxctrl", ctypes.c_uint32),      # RXCTRL 影子 (offset 0x0C)
+        ("rx_fifo_len", ctypes.c_uint32), # RX FIFO 近似填充量
+        ("_pad", ctypes.c_uint32),        # 对齐填充
+    ]
+
+
+class FfiVirtIOCtx(ctypes.Structure):
+    """virtio-blk MMIO inline context — matches Rust ``FfiVirtIoCtx``."""
+    _fields_ = [
+        ("base", ctypes.c_uint64),
+        ("capacity", ctypes.c_uint64),
+        ("queue_num_max", ctypes.c_uint32),
+        ("device_features_sel", ctypes.c_uint32),
+        ("driver_features_sel", ctypes.c_uint32),
+        ("driver_features", ctypes.c_uint64),
+        ("queue_sel", ctypes.c_uint32),
+        ("queue_num", ctypes.c_uint32),
+        ("queue_ready", ctypes.c_uint8),
+        ("queue_desc", ctypes.c_uint64),
+        ("queue_driver", ctypes.c_uint64),
+        ("queue_device", ctypes.c_uint64),
+        ("status", ctypes.c_uint32),
+        ("interrupt_status", ctypes.c_uint32),
+        ("notify_pending", ctypes.c_uint8),
+        ("irq_maybe_lower", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 6),
+    ]
+
+
+# ============================================================
+#  Context info classes — Python-side helpers to build FFI structs
+# ============================================================
+
+
+class PmpInfo:
+    """PMP configuration for a batch.
+
+    ``cfg`` and ``addr`` accept either Python bytes/list (copied to
+    ctypes arrays) or pre-built ctypes arrays (used directly, enabling
+    Rust to mutate the underlying memory).
+    """
+    __slots__ = ("cfg", "addr", "num", "pmpsplit")
+
+    def __init__(self, cfg=None, addr=None, pmpsplit: int = 0, hart_num: int = 1):
+        # Normalise cfg to a ctypes array if it isn't one already.
+        if cfg is None or isinstance(cfg, (bytes, bytearray)):
+            raw = cfg if cfg else b""
+            _cfg = (ctypes.c_uint8 * max(len(raw), 1))()
+            if raw:
+                ctypes.memmove(_cfg, raw, len(raw))
+            self.cfg = _cfg
+        else:
+            self.cfg = cfg  # already a ctypes array
+        # Normalise addr similarly.
+        if addr is None:
+            self.addr = (ctypes.c_uint64 * 0)()
+        elif isinstance(addr, (list, tuple)):
+            _addr = (ctypes.c_uint64 * max(len(addr), 1))()
+            for i, v in enumerate(addr):
+                _addr[i] = int(v)
+            self.addr = _addr
+        else:
+            self.addr = addr  # already a ctypes array (or array.array)
+        self.pmpsplit = pmpsplit
+        # ``num`` 是 *每 hart* 的 PMP 条目数, 而非扁平缓冲总长。
+        # 多 hart 时 cfg/addr 为 64*hart_num 连续数组 (每 hart 独占 64 项切片),
+        # 若误把总长写入 FfiPmpCtx.num (c_uint8) 会在 hart_num>=4 时溢出:
+        # 64*4=256 → 256 & 0xFF = 0 → PMP 被静默禁用。故按 hart_num 反算每 hart 值。
+        total = (
+            min(len(self.cfg), len(self.addr))
+            if len(self.cfg) > 0 and len(self.addr) > 0
+            else 0
+        )
+        hn = hart_num if hart_num > 0 else 1
+        self.num = total // hn
+        if self.num > 0xFF:
+            raise ValueError(
+                f"per-hart PMP num={self.num} 超出 FfiPmpCtx.num (u8) 范围"
+            )
+
+
+class ClintInfo:
+    """CLINT state for a batch."""
+    __slots__ = ("mtime", "mtimecmp", "msip", "base")
+
+    def __init__(
+        self,
+        mtime: int = 0,
+        mtimecmp=None,
+        msip=None,
+        base: int = 0,
+    ):
+        self.mtime = mtime
+        self.mtimecmp = mtimecmp  # list or ctypes array
+        self.msip = msip          # list or ctypes array
+        self.base = base
+
+
+class DevInfo:
+    """Device MMIO ranges for a batch."""
+    __slots__ = ("bases", "ends")
+
+    def __init__(self, bases=None, ends=None):
+        self.bases = bases  # ctypes array of uint64
+        self.ends = ends    # ctypes array of uint64
+
+
+class UartInfo:
+    """UART context for a batch — lets Rust buffer sbi_printf output inline
+    and handle IE/IP/TXCTRL register reads without batch exits."""
+    __slots__ = ("base", "tx_buf", "tx_wr", "ie", "txctrl", "rxctrl", "rx_fifo_len")
+
+    def __init__(self, base: int = 0, tx_buf=None, tx_wr=None,
+                 ie: int = 0, txctrl: int = 0, rxctrl: int = 0, rx_fifo_len: int = 0):
+        self.base = base
+        self.tx_buf = tx_buf          # ctypes byte array
+        self.tx_wr = tx_wr            # ctypes uint32
+        self.ie = ie                  # IE register value
+        self.txctrl = txctrl          # TXCTRL register value
+        self.rxctrl = rxctrl          # RXCTRL register value
+        self.rx_fifo_len = rx_fifo_len  # approx RX FIFO fill
+
+
+class VirtIOInfo:
+    """virtio-blk inline context for a batch — Rust handles all MMIO register
+    accesses inline; only QueueNotify exits to Python.
+
+    Carries the full runtime state of the virtio-blk MMIO register file
+    across batches.  Without this, dynamic state written by the guest
+    (queue descriptors, feature negotiation, InterruptStatus, etc.) is
+    silently reset to zero on every batch, and the guest sees a dead device.
+    """
+    __slots__ = (
+        "base", "capacity", "queue_num_max",
+        "device_features_sel", "driver_features_sel", "driver_features",
+        "queue_sel", "queue_num", "queue_ready",
+        "queue_desc", "queue_driver", "queue_device",
+        "status", "interrupt_status",
+    )
+
+    def __init__(
+        self,
+        base: int = 0,
+        capacity: int = 0,
+        queue_num_max: int = 256,
+        device_features_sel: int = 0,
+        driver_features_sel: int = 0,
+        driver_features: int = 0,
+        queue_sel: int = 0,
+        queue_num: int = 0,
+        queue_ready: bool = False,
+        queue_desc: int = 0,
+        queue_driver: int = 0,
+        queue_device: int = 0,
+        status: int = 0,
+        interrupt_status: int = 0,
+    ):
+        self.base = base
+        self.capacity = capacity
+        self.queue_num_max = queue_num_max
+        self.device_features_sel = device_features_sel
+        self.driver_features_sel = driver_features_sel
+        self.driver_features = driver_features
+        self.queue_sel = queue_sel
+        self.queue_num = queue_num
+        self.queue_ready = queue_ready
+        self.queue_desc = queue_desc
+        self.queue_driver = queue_driver
+        self.queue_device = queue_device
+        self.status = status
+        self.interrupt_status = interrupt_status
+
+
+# ============================================================
 #  Phase 4: batch execution bridge
 # ============================================================
 
@@ -767,65 +1098,379 @@ def run_batch(
     shadow_size: int,
     max_instrs: int,
     result,
-    pmp_cfg=b"",
-    pmp_addr=None,          # list of int or array('Q') or ctypes array
-    pmpsplit: int = 0,
-    mtime: int = 0,
-    mtimecmp=None,           # list of int or ctypes array
-    msip=None,               # list of int or ctypes array
-    dev_bases=None,          # ctypes array of uint64
-    dev_ends=None,           # ctypes array of uint64
+    pmp: PmpInfo | None = None,
+    clint: ClintInfo | None = None,
+    dev: DevInfo | None = None,
+    virtio: VirtIOInfo | None = None,
+    bp_addrs: list[int] | None = None,
 ) -> None:
-    """Execute up to *max_instrs* instructions across all harts in Rust."""
+    """Execute up to *max_instrs* instructions across all harts in Rust.
+
+    *bp_addrs* is an optional list of PC addresses that trigger
+    ``EXIT_BREAKPOINT`` when matched after instruction execution.
+    """
     if _lib is None:
         return
 
-    # --- PMP conversion ---
-    pmp_num = 0
+    # --- MemCtx ---
+    mem = MemCtx()
+    mem.ram = ctypes.cast(ram_buf, ctypes.c_void_p).value or 0
+    mem.ram_size = ram_size
+    mem.ram_base = ram_base
+    mem.shadow_base = shadow_base
+    mem.shadow_size = shadow_size
+
+    # --- FfiPmpCtx ---
+    # PmpInfo already normalises cfg/addr to ctypes arrays.  When they
+    # were built with ``from_buffer`` in ``_step_native``, writing through
+    # these pointers mutates the Python PMP object directly.
     _pmp_cfg_buf = None
     _pmp_addr_buf = None
-    if pmp_cfg and pmp_addr is not None:
-        pmp_num = min(len(pmp_cfg), len(pmp_addr))
-        if pmp_num > 0:
-            # Convert bytes → c_uint8 array
-            _pmp_cfg_buf = (ctypes.c_uint8 * len(pmp_cfg)).from_buffer_copy(pmp_cfg)
-            # Convert list/array → c_uint64 array
-            _pmp_addr_buf = (ctypes.c_uint64 * len(pmp_addr))()
-            for i, v in enumerate(pmp_addr):
-                _pmp_addr_buf[i] = int(v)
+    if pmp is not None and pmp.num > 0:
+        # Use existing ctypes arrays — no copy needed.
+        _pmp_cfg_buf = pmp.cfg
+        _pmp_addr_buf = pmp.addr
 
-    # --- CLINT conversion ---
+    pmp_ffi = FfiPmpCtx()
+    pmp_ffi.cfg = ctypes.cast(_pmp_cfg_buf, ctypes.c_void_p).value if _pmp_cfg_buf else 0
+    pmp_ffi.addr = ctypes.cast(_pmp_addr_buf, ctypes.c_void_p).value if _pmp_addr_buf else 0
+    pmp_ffi.num = pmp.num if pmp is not None else 0
+    pmp_ffi.pmpsplit = pmp.pmpsplit if pmp is not None else 0
+
+    # --- FfiClintCtx ---
     nh = max(int(num_harts), 1)
     _mtc_buf = (ctypes.c_uint64 * nh)()
-    if mtimecmp is not None:
-        for i in range(min(nh, len(mtimecmp))):
-            _mtc_buf[i] = int(mtimecmp[i])
+    _msip_buf = (ctypes.c_uint8 * nh)()
+    _mtime_val = ctypes.c_uint64(0)
+    if clint is not None:
+        _mtime_val.value = clint.mtime
+        if clint.mtimecmp is not None:
+            for i in range(min(nh, len(clint.mtimecmp))):
+                _mtc_buf[i] = int(clint.mtimecmp[i])
+        else:
+            for i in range(nh):
+                _mtc_buf[i] = 0xFFFF_FFFF_FFFF_FFFF
+        if clint.msip is not None:
+            for i in range(min(nh, len(clint.msip))):
+                _msip_buf[i] = int(clint.msip[i])
     else:
         for i in range(nh):
             _mtc_buf[i] = 0xFFFF_FFFF_FFFF_FFFF
 
-    _msip_buf = (ctypes.c_uint8 * nh)()
-    if msip is not None:
-        for i in range(min(nh, len(msip))):
-            _msip_buf[i] = int(msip[i])
+    clint_ffi = FfiClintCtx()
+    clint_ffi.mtime = ctypes.addressof(_mtime_val)
+    clint_ffi.mtimecmp = ctypes.cast(_mtc_buf, ctypes.c_void_p).value
+    clint_ffi.msip = ctypes.cast(_msip_buf, ctypes.c_void_p).value
+    clint_ffi.base = clint.base if clint is not None else 0
 
-    # --- Device MMIO: pass-through if ctypes arrays ---
-    ndev = 0
-    if dev_bases is not None and dev_ends is not None:
-        ndev = min(len(dev_bases), len(dev_ends))
+    # --- FfiDevCtx ---
+    dev_ffi = FfiDevCtx()
+    if dev is not None and dev.bases is not None and dev.ends is not None:
+        dev_ffi.bases = ctypes.cast(dev.bases, ctypes.c_void_p).value
+        dev_ffi.ends = ctypes.cast(dev.ends, ctypes.c_void_p).value
+        dev_ffi.num = len(dev.bases)
+
+    # --- FfiVirtIOCtx ---
+    _virtio_ffi = FfiVirtIOCtx()
+    _virtio_ffi_ptr = None
+    if virtio is not None and virtio.base != 0:
+        _virtio_ffi.base = virtio.base
+        _virtio_ffi.capacity = virtio.capacity
+        _virtio_ffi.queue_num_max = virtio.queue_num_max
+        _virtio_ffi.device_features_sel = virtio.device_features_sel
+        _virtio_ffi.driver_features_sel = virtio.driver_features_sel
+        _virtio_ffi.driver_features = virtio.driver_features
+        _virtio_ffi.queue_sel = virtio.queue_sel
+        _virtio_ffi.queue_num = virtio.queue_num if virtio.queue_num else virtio.queue_num_max
+        _virtio_ffi.queue_ready = 1 if virtio.queue_ready else 0
+        _virtio_ffi.queue_desc = virtio.queue_desc
+        _virtio_ffi.queue_driver = virtio.queue_driver
+        _virtio_ffi.queue_device = virtio.queue_device
+        _virtio_ffi.status = virtio.status
+        _virtio_ffi.interrupt_status = virtio.interrupt_status
+        _virtio_ffi_ptr = ctypes.pointer(_virtio_ffi)
+
+    # Breakpoint addresses — build a ctypes array if any provided
+    _bp_arr = None
+    if bp_addrs:
+        _bp_arr = (ctypes.c_uint64 * len(bp_addrs))()
+        for i, addr in enumerate(bp_addrs):
+            _bp_arr[i] = addr & 0xFFFF_FFFF_FFFF_FFFF
 
     _lib.run_batch(
-        states, num_harts,
-        ram_buf, ram_size, ram_base, shadow_base, shadow_size,
-        max_instrs,
-        ctypes.byref(result),
-        ctypes.cast(_pmp_cfg_buf, ctypes.c_void_p) if _pmp_cfg_buf else ctypes.c_void_p(0),
-        ctypes.cast(_pmp_addr_buf, ctypes.c_void_p) if _pmp_addr_buf else ctypes.c_void_p(0),
-        pmp_num, pmpsplit,
-        mtime,
-        ctypes.cast(_mtc_buf, ctypes.c_void_p),
-        ctypes.cast(_msip_buf, ctypes.c_void_p),
-        ctypes.cast(dev_bases, ctypes.c_void_p) if dev_bases is not None else ctypes.c_void_p(0),
-        ctypes.cast(dev_ends, ctypes.c_void_p) if dev_ends is not None else ctypes.c_void_p(0),
-        ndev,
+        states, num_harts, max_instrs, ctypes.byref(result),
+        ctypes.byref(mem), ctypes.byref(pmp_ffi),
+        ctypes.byref(clint_ffi), ctypes.byref(dev_ffi),
+        _virtio_ffi_ptr or ctypes.c_void_p(0),
+        ctypes.cast(_bp_arr, ctypes.c_void_p) if _bp_arr else ctypes.c_void_p(0),
+        len(bp_addrs) if bp_addrs else 0,
     )
+
+    # Sync mtime back from Rust (it may have advanced during the batch).
+    # Also sync MSIP and MTIMECMP — Rust CLINT inline handling may have
+    # modified the *local* ctypes buffers directly; we must copy those
+    # modifications back to the caller's ClintInfo so that the emulator's
+    # CLINT sync path picks them up.  Without this, inline MSIP writes
+    # (cross-hart IPI) and MTIMECMP updates are silently lost.
+    if clint is not None:
+        clint.mtime = _mtime_val.value
+        if clint.msip is not None:
+            for i in range(min(nh, len(clint.msip))):
+                clint.msip[i] = int(_msip_buf[i])
+        if clint.mtimecmp is not None:
+            for i in range(min(nh, len(clint.mtimecmp))):
+                clint.mtimecmp[i] = int(_mtc_buf[i])
+
+    # Return the virtio FFI struct so the caller can read back changed fields
+    # (interrupt_status, notify_pending, etc.) after the batch.
+    return _virtio_ffi if virtio is not None else None
+
+
+# ============================================================
+#  Phase 5: concurrent execution bridge
+# ============================================================
+
+
+def run_parallel(
+    states,  # ctypes array of HartState
+    num_harts: int,
+    ram_buf,
+    ram_size: int,
+    ram_base: int,
+    shadow_base: int,
+    shadow_size: int,
+    max_instrs: int,
+    result,
+    pmp: PmpInfo | None = None,
+    clint: ClintInfo | None = None,
+    dev: DevInfo | None = None,
+    uart: UartInfo | None = None,
+    virtio: VirtIOInfo | None = None,
+    bp_addrs: list[int] | None = None,
+    stop_flag=None,  # ctypes.c_uint8 or None — shared stop flag for Ctrl+C
+) -> None:
+    """Execute instructions concurrently (thread-per-hart) in Rust.
+
+    Each non-halted hart runs in its own OS thread with a full
+    fetch-decode-execute loop.  AMO instructions use real CPU atomics
+    (AtomicU32/AtomicU64).  All harts run until a stop condition is hit.
+
+    *bp_addrs* is an optional list of PC addresses that trigger
+    ``EXIT_BREAKPOINT`` when matched after instruction execution.
+    """
+    if _lib is None:
+        return
+
+    # --- MemCtx ---
+    mem = MemCtx()
+    mem.ram = ctypes.cast(ram_buf, ctypes.c_void_p).value or 0
+    mem.ram_size = ram_size
+    mem.ram_base = ram_base
+    mem.shadow_base = shadow_base
+    mem.shadow_size = shadow_size
+
+    # --- FfiPmpCtx ---
+    _pmp_cfg_buf = None
+    _pmp_addr_buf = None
+    if pmp is not None and pmp.num > 0:
+        _pmp_cfg_buf = pmp.cfg
+        _pmp_addr_buf = pmp.addr
+
+    pmp_ffi = FfiPmpCtx()
+    pmp_ffi.cfg = ctypes.cast(_pmp_cfg_buf, ctypes.c_void_p).value if _pmp_cfg_buf else 0
+    pmp_ffi.addr = ctypes.cast(_pmp_addr_buf, ctypes.c_void_p).value if _pmp_addr_buf else 0
+    pmp_ffi.num = pmp.num if pmp is not None else 0
+    pmp_ffi.pmpsplit = pmp.pmpsplit if pmp is not None else 0
+
+    # --- FfiClintCtx ---
+    nh = max(int(num_harts), 1)
+    _mtc_buf = (ctypes.c_uint64 * nh)()
+    _msip_buf = (ctypes.c_uint8 * nh)()
+    _mtime_val = ctypes.c_uint64(0)
+    if clint is not None:
+        _mtime_val.value = clint.mtime
+        if clint.mtimecmp is not None:
+            for i in range(min(nh, len(clint.mtimecmp))):
+                _mtc_buf[i] = int(clint.mtimecmp[i])
+        else:
+            for i in range(nh):
+                _mtc_buf[i] = 0xFFFF_FFFF_FFFF_FFFF
+        if clint.msip is not None:
+            for i in range(min(nh, len(clint.msip))):
+                _msip_buf[i] = int(clint.msip[i])
+    else:
+        for i in range(nh):
+            _mtc_buf[i] = 0xFFFF_FFFF_FFFF_FFFF
+
+    clint_ffi = FfiClintCtx()
+    clint_ffi.mtime = ctypes.addressof(_mtime_val)
+    clint_ffi.mtimecmp = ctypes.cast(_mtc_buf, ctypes.c_void_p).value
+    clint_ffi.msip = ctypes.cast(_msip_buf, ctypes.c_void_p).value
+    clint_ffi.base = clint.base if clint is not None else 0
+
+    # --- FfiDevCtx ---
+    dev_ffi = FfiDevCtx()
+    if dev is not None and dev.bases is not None and dev.ends is not None:
+        dev_ffi.bases = ctypes.cast(dev.bases, ctypes.c_void_p).value
+        dev_ffi.ends = ctypes.cast(dev.ends, ctypes.c_void_p).value
+        dev_ffi.num = len(dev.bases)
+
+    # --- FfiUartCtx ---
+    uart_ffi = FfiUartCtx()
+    _tx_buf = None
+    _tx_wr = None
+    if uart is not None:
+        uart_ffi.base = uart.base
+        if uart.tx_buf is not None:
+            _tx_buf = uart.tx_buf
+            uart_ffi.tx_buf = ctypes.cast(_tx_buf, ctypes.c_void_p).value
+            uart_ffi.tx_cap = len(_tx_buf)
+        if uart.tx_wr is not None:
+            _tx_wr = uart.tx_wr
+            uart_ffi.tx_wr = ctypes.addressof(_tx_wr)
+        uart_ffi.ie = uart.ie
+        uart_ffi.txctrl = uart.txctrl
+        uart_ffi.rxctrl = uart.rxctrl
+        uart_ffi.rx_fifo_len = uart.rx_fifo_len
+
+    # --- FfiVirtIOCtx ---
+    _virtio_ffi = FfiVirtIOCtx()
+    _virtio_ffi_ptr = None
+    if virtio is not None and virtio.base != 0:
+        _virtio_ffi.base = virtio.base
+        _virtio_ffi.capacity = virtio.capacity
+        _virtio_ffi.queue_num_max = virtio.queue_num_max
+        _virtio_ffi.device_features_sel = virtio.device_features_sel
+        _virtio_ffi.driver_features_sel = virtio.driver_features_sel
+        _virtio_ffi.driver_features = virtio.driver_features
+        _virtio_ffi.queue_sel = virtio.queue_sel
+        _virtio_ffi.queue_num = virtio.queue_num if virtio.queue_num else virtio.queue_num_max
+        _virtio_ffi.queue_ready = 1 if virtio.queue_ready else 0
+        _virtio_ffi.queue_desc = virtio.queue_desc
+        _virtio_ffi.queue_driver = virtio.queue_driver
+        _virtio_ffi.queue_device = virtio.queue_device
+        _virtio_ffi.status = virtio.status
+        _virtio_ffi.interrupt_status = virtio.interrupt_status
+        _virtio_ffi_ptr = ctypes.pointer(_virtio_ffi)
+
+    # Breakpoint addresses — build a ctypes array if any provided
+    _bp_arr = None
+    if bp_addrs:
+        _bp_arr = (ctypes.c_uint64 * len(bp_addrs))()
+        for i, addr in enumerate(bp_addrs):
+            _bp_arr[i] = addr & 0xFFFF_FFFF_FFFF_FFFF
+
+    _lib.run_parallel(
+        states, num_harts, max_instrs, ctypes.byref(result),
+        ctypes.byref(mem), ctypes.byref(pmp_ffi),
+        ctypes.byref(clint_ffi), ctypes.byref(dev_ffi),
+        ctypes.byref(uart_ffi),
+        _virtio_ffi_ptr or ctypes.c_void_p(0),
+        ctypes.cast(_bp_arr, ctypes.c_void_p) if _bp_arr else ctypes.c_void_p(0),
+        len(bp_addrs) if bp_addrs else 0,
+        # stop_flag is a ctypes.c_uint8 — pass its address as *const u8
+        ctypes.cast(ctypes.pointer(stop_flag), ctypes.c_void_p) if stop_flag is not None else ctypes.c_void_p(0),
+    )
+
+    # Sync mtime back from Rust (advanced by per-instruction AtomicU64 ops).
+    # Also sync MSIP and MTIMECMP — concurrent CLINT inline handling may have
+    # modified the shared atomic arrays; copy modifications back to the
+    # caller's ClintInfo so the emulator's CLINT sync path picks them up.
+    if clint is not None:
+        clint.mtime = _mtime_val.value
+        if clint.msip is not None:
+            for i in range(min(nh, len(clint.msip))):
+                clint.msip[i] = int(_msip_buf[i])
+        if clint.mtimecmp is not None:
+            for i in range(min(nh, len(clint.mtimecmp))):
+                clint.mtimecmp[i] = int(_mtc_buf[i])
+
+    # Return the virtio FFI struct so the caller can read back changed fields.
+    return _virtio_ffi if virtio is not None else None
+
+
+# ============================================================
+#  libtermio.so — Terminal I/O background thread (独立于 CPU 模拟)
+# ============================================================
+
+_TERMIO_LIB_PATH = _NATIVE_DIR / f"libtermio{_EXT}"
+_termio_lib: ctypes.CDLL | None = None
+
+
+class TermIoHandle(ctypes.Structure):
+    """termio 线程共享状态 — 必须与 Rust ``#[repr(C)] TermIoHandle`` 布局一致.
+
+    Rust 侧 ``test_handle_layout_locked`` 锁定 sizeof=80 及各字段偏移;
+    修改任一侧字段必须同步另一侧。
+
+    由 :class:`pyremu.peripheral.termio.TerminalIO` 构建并持有: 指针字段指向
+    其 ctypes 缓冲区。``terminal_io_start`` 在 Rust 侧复制全部字段后立即返回,
+    结构体本身无需长期存活, 但指针指向的缓冲区必须存活至线程退出。
+    """
+    _fields_ = [
+        ("stdin_fd", ctypes.c_int32),      # RawFd for stdin
+        ("stdout_fd", ctypes.c_int32),     # RawFd for stdout
+        ("rx_buf", ctypes.c_void_p),       # *mut u8 — shared RX ring buffer
+        ("rx_cap", ctypes.c_uint32),       # capacity of rx_buf (power of two)
+        ("rx_wr", ctypes.c_void_p),        # *mut AtomicU32 — write index (I/O thread)
+        ("rx_rd", ctypes.c_void_p),        # *mut AtomicU32 — read index (Python, 背压)
+        ("tx_buf", ctypes.c_void_p),       # *mut u8 — shared TX ring buffer
+        ("tx_cap", ctypes.c_uint32),       # entry capacity (= byte capacity / 2)
+        ("tx_wr", ctypes.c_void_p),        # *mut AtomicU32 — write index (hart threads)
+        ("tx_drain", ctypes.c_void_p),     # *mut AtomicU32 — drain index (I/O thread 独占)
+        ("stop_flag", ctypes.c_void_p),    # *mut AtomicU8 — stop request flag
+    ]
+
+
+try:
+    _termio_lib = _load_lib_safe(_TERMIO_LIB_PATH)
+    if _termio_lib is None:
+        raise OSError(f"无法加载 {_TERMIO_LIB_PATH.name}")
+
+    _termio_lib.terminal_io_start.argtypes = [ctypes.POINTER(TermIoHandle)]
+    _termio_lib.terminal_io_start.restype = ctypes.c_int32
+
+    _termio_lib.terminal_io_stop.argtypes = []
+    _termio_lib.terminal_io_stop.restype = None
+
+    _termio_lib.terminal_io_is_running.argtypes = []
+    _termio_lib.terminal_io_is_running.restype = ctypes.c_int32
+
+except OSError as exc:
+    logger.warning(
+        "无法加载 terminal I/O 加速库 ({}): {} — 降级为 Python 轮询 stdin",
+        _TERMIO_LIB_PATH.name,
+        exc,
+    )
+
+
+def termio_available() -> bool:
+    """Return ``True`` if the terminal I/O library (libtermio.so) is loaded."""
+    return _termio_lib is not None
+
+
+def termio_start(handle: TermIoHandle) -> int:
+    """Start the terminal I/O background thread in Rust.
+
+    *handle* 由调用方 (TerminalIO) 构建; 其指针字段指向的缓冲区必须
+    存活至线程退出。
+
+    Returns 0 on success, -1 on error (thread already running or stdin
+    is not a TTY), -2 if libtermio.so is not available.
+    """
+    if _termio_lib is None:
+        return -2  # not available
+    return _termio_lib.terminal_io_start(ctypes.byref(handle))
+
+
+def termio_stop() -> None:
+    """Signal the I/O thread to stop and wait for it to exit."""
+    if _termio_lib is not None:
+        _termio_lib.terminal_io_stop()
+
+
+def termio_is_running() -> bool:
+    """Return True if the terminal I/O thread is currently running."""
+    if _termio_lib is not None:
+        return _termio_lib.terminal_io_is_running() != 0
+    return False

@@ -27,22 +27,22 @@ from loguru import logger
 from rich.panel import Panel
 
 from pyremu._native import decode_fields
-from pyremu.core.decoder import (
-    Hart,
-)
+from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend
-from pyremu.core.trap import TrapType
+from pyremu.core.trap_def import TrapType
 from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.types import HartSnapshot, MemWriteTracker
 from pyremu.debug.utils import hex_addr
-from pyremu.emulator import Emulator, _yield_cpu
+from pyremu.emulator import Emulator
 from pyremu.env_inject import Preloader
 from pyremu.utils.parse_bin import FirmwareImage
+from pyremu.utils.tick import yield_cpu
 
 _YIELD_EVERY = 500_000
 _YIELD_INTERVAL = 0.001
+_DEFAULT_TIMEOUT = 3600.0
 
 
 class ExecutionMixin(SharedMixinAttrs):
@@ -75,6 +75,7 @@ class ExecutionMixin(SharedMixinAttrs):
     _disasm_ref_pc: int | None
     _disasm_base_step: int
     _disasm_past_terminator: bool
+    _consecutive_stalls: int
     _stack_frames: list[StackFrame]
     _current_frame_idx: int
     _last_command: str | None
@@ -141,7 +142,8 @@ class ExecutionMixin(SharedMixinAttrs):
             raw = self._try_read_va(h.pc, 4)
             if raw is None:
                 deliver_trap(
-                    h, TrapType.InstrPageFault, tval=h.pc, is_interrupt=False
+                    h, TrapType.InstrPageFault,
+                    tval=h.pc, is_interrupt=False
                 )
                 return
             instr = int.from_bytes(raw, "little", signed=False)
@@ -157,6 +159,8 @@ class ExecutionMixin(SharedMixinAttrs):
             if advance != 0 and h.pc == pc_before:
                 h.pc = (h.pc + advance) & 0xFFFF_FFFF_FFFF_FFFF
                 h._consecutive_traps = 0
+            elif advance == 0 and h.pc == pc_before:
+                h._consecutive_traps += 1
             if h._consecutive_traps >= self._emu._TRAP_LOOP_THRESHOLD:
                 dump = self._emu._dump_hart_state(h)
                 self._console.print(
@@ -214,7 +218,14 @@ class ExecutionMixin(SharedMixinAttrs):
     #  运行循环
     # ----------------------------------------------------------
 
-    _DEFAULT_TIMEOUT = 3600.0
+
+    def _tail_stage_for_updating_pc(self) -> int:
+        if self._check_multi_hart_bp():
+            return 1
+        self._instr_count += 1
+        if self._instr_count % _YIELD_EVERY == 0:
+            yield_cpu(_YIELD_INTERVAL)
+        return 0
 
     def _run_loop(
         self,
@@ -224,6 +235,10 @@ class ExecutionMixin(SharedMixinAttrs):
     ) -> None:
         """运行循环: 每个周期所有 hart 各执行一条指令 (round-robin).
 
+        断点通过 Rust native batch 内联检查: 每次 ``emu.step()`` 前将 addr
+        类型断点的 PC 传给 ``emu._bp_addrs``, Rust 逐指令比对后以
+        ``EXIT_BREAKPOINT`` 退出, 在此处由 ``_check_multi_hart_bp`` 报告.
+
         Args:
             cycles: 最大周期数, None 表示无限.
             timeout: 墙钟超时秒数, 默认 3600 (1 小时). 设为 0 禁用.
@@ -232,15 +247,30 @@ class ExecutionMixin(SharedMixinAttrs):
         self._paused = False
         self._terminated = False
         self._sigint_count = 0
+        self._bp_hit_this_run.clear()
         self._enter_run_mode()
-
-        if timeout is None:
-            timeout = self._DEFAULT_TIMEOUT
+        timeout = _DEFAULT_TIMEOUT if timeout is None else timeout
         deadline = time.monotonic() + timeout if timeout > 0 else None
 
-        multi = self._emu.num_harts > 1
-
         _instr_start = self._instr_count
+
+        # Push addr breakpoints to the emulator so Rust checks them inline.
+        # For kernel symbols resolved to physical addresses, also include the
+        # VA counterparts so Rust inline matching works when MMU is enabled.
+        _bp_addrs: list[int] = []
+        for bp in self._breakpoints:
+            if bp.kind != "addr":
+                continue
+            _bp_addrs.append(bp.value)
+            va = self._pa_to_va.get(bp.value)
+            if va is not None:
+                _bp_addrs.append(va)
+        self._emu._bp_addrs = _bp_addrs
+
+        # Snapshot hart PCs for stall detection: CSR_EXIT loops cause
+        # cnt == 0 even though harts are making progress; we distinguish
+        # genuine stalls (PC unchanged) from CSR-explosion (PC advancing).
+        _prev_pcs: dict[int, int] = {id(h): h.pc for h in self._emu.harts}
 
         while not self._terminated and not self._paused:
             if cycles is not None and (self._instr_count - _instr_start) >= cycles:
@@ -261,21 +291,61 @@ class ExecutionMixin(SharedMixinAttrs):
                 self._show_trap_context(self.hart)
                 break
 
+            # 每批次前将可用 stdin 字节转发到 UART RX,
+            # 确保用户输入在本轮批次内被客机处理 (而非等到下轮),
+            # 消除键入与回显之间的一批次延迟。
+            self._feed_uart_stdin()
+
             try:
-                if multi:
-                    self._emu.step()
-                    self._check_multi_hart_bp()
-                    self._instr_count += 1
-                else:
-                    self.step_one()
+                cnt = self._emu.step()
             except Exception:
                 logger.opt(exception=True).error("step 执行异常")
                 self._err("指令执行异常, 运行中止")
                 self._terminated = True
                 break
 
-            if self._instr_count % _YIELD_EVERY == 0:
-                _yield_cpu(_YIELD_INTERVAL)
+            # 每批次后刷新 UART 行缓冲中不以 \\n 结尾的部分行,
+            # 保证 shell 提示符 (# ) 和字符回显即时到达 stdout.
+            # _native_finalize 内部已调用 flush_all, 此处为兜底
+            # (纯 Python 路径或局部行在 WFI 轮询期间到达).
+            self._flush_uart_if_present()
+
+            if cnt != 0:
+                self._consecutive_stalls = 0
+                if self._tail_stage_for_updating_pc() > 0:
+                    break
+                continue
+
+            # cnt == 0 can mean:
+            #   (a) all active harts are WFI-idle — normal, wait for interrupts
+            #   (b) CSR_EXIT loops — harts execute but CSR ops aren't counted
+            #       (batch exits on unhandled CSR without incrementing count)
+            #   (c) genuine stall — hart is "running" but PC frozen
+            # Track PC deltas to distinguish (b) from (c).
+            all_idle = all(
+                h._halted or h._waiting for h in self._emu.harts
+            )
+            if all_idle:
+                # 全部 WFI 空闲: _native_finalize 中的 WFI 轮询已负责
+                # stdin 转发与 TX 刷新, 此处仅复位 stall 计数器.
+                self._consecutive_stalls = 0
+                if self._tail_stage_for_updating_pc() > 0:
+                    break
+            any_pc_changed = any(
+                not (h._halted or h._waiting)
+                and h.pc != _prev_pcs.get(id(h), 0)
+                for h in self._emu.harts
+            )
+            _prev_pcs = {id(h): h.pc for h in self._emu.harts}
+            if any_pc_changed:
+                self._consecutive_stalls = 0
+            else:
+                self._consecutive_stalls += 1
+                if self._consecutive_stalls >= 3:
+                    self._warn("连续 3 次无指令执行 (非 WFI) — 强制暂停")
+                    break
+            if self._tail_stage_for_updating_pc() > 0:
+                break
 
         if self._terminated:
             self._console.print("[dim]模拟循环已终止[/]")
@@ -293,13 +363,35 @@ class ExecutionMixin(SharedMixinAttrs):
         """单步或多步执行.
 
         step       — 执行 1 条指令, 显示 PC 及反汇编
-        step <n>   — 执行 n 条指令, 仅显示最终状态
+        step <n>   — 执行 n 条指令, 仅显示最终状态.
+
+        对于 count > 1 且 native batch 可用的情况, 委托给 ``emu.step()``,
+        避免纯 Python 逐条执行的 FFI 开销 (单条 step_one 约慢 10-50 倍).
         """
         if count <= 0:
             self._err("步数须 > 0")
             return
         self._paused = False
         self._hart_paused.clear()
+
+        # Native fast path: delegate multi-step to the batch engine.
+        # Breakpoints are checked by Rust inline; WFI / trap are handled
+        # by the batch exit path in ``_step_native``.
+        if count > 1 and self._emu._native_batch:
+            saved_max = self._emu._native_max_instrs
+            self._emu._native_max_instrs = count
+            try:
+                real_cnt = self._emu.step()
+            finally:
+                self._emu._native_max_instrs = saved_max
+            self._instr_count += real_cnt
+            if not self.hart._halted:
+                self.cmd_pc()
+            else:
+                self._show_trap_context(self.hart)
+            return
+
+        # Pure-Python path for single-step or when native is disabled
         for _ in range(count):
             self.step_one()
             if not self.hart._halted:
@@ -310,6 +402,45 @@ class ExecutionMixin(SharedMixinAttrs):
 
     def cmd_continue(self) -> None:
         self._console.print("[dim]继续执行 (Ctrl+C 暂停)...[/]")
+        # 若任一 hart 的 PC 恰好落在地址断点上, 先步进越过该断点,
+        # 否则 run_batch 的 pre-execution 检查会立即再次命中同一断点.
+        # 必须遍历全部 hart (不仅是当前 hart), 因为断点可能命中的是
+        # 用户当前未选中的 hart.
+        bps_to_skip: list = []
+        bp_values_to_skip: set[int] = set()
+        for h in self._emu.harts:
+            if h._halted or h._waiting:
+                continue
+            for bp in self._breakpoints:
+                if not (bp.kind == "addr"
+                        and self._bp_match_pc(h, h.pc, bp.value)):
+                    continue
+                if bp not in bps_to_skip:
+                    bps_to_skip.append(bp)
+                    bp_values_to_skip.add(bp.value)
+                break
+        if bps_to_skip:
+            for bp in bps_to_skip:
+                self._breakpoints.remove(bp)
+            # 同步更新 _bp_addrs, 否则 Rust batch 仍会命中已移除的断点
+            saved_bp_addrs = self._emu._bp_addrs
+            self._emu._bp_addrs = [
+                a for a in saved_bp_addrs if a not in bp_values_to_skip
+            ]
+            # 使用纯 Python 单步路径跳过断点 (而非 native batch).
+            # native batch (run_parallel) 可执行最多 100k 条指令; 若断点处
+            # 指令为自跳转循环 (j .), batch 会在此自旋 100k 次仍不推进 PC,
+            # 恢复断点后立即再次命中 → 表现为 "c 原地踏步".
+            # 纯 Python 路径每 hart 仅执行一条指令, 确保精确跳过.
+            saved_native_batch = self._emu._native_batch
+            self._emu._native_batch = False
+            try:
+                self._emu.step()
+            finally:
+                self._breakpoints.extend(bps_to_skip)
+                self._refresh_bp_cache()
+                self._emu._bp_addrs = saved_bp_addrs
+                self._emu._native_batch = saved_native_batch
         self._run_loop()
 
     def cmd_run(self, n: int = 1) -> None:
@@ -333,10 +464,23 @@ class ExecutionMixin(SharedMixinAttrs):
             inject_memory_backend(h, emu.bus.read, emu.bus.write)
             h.bus = emu.bus
             h.interrupt_ctrl = emu.clint
+            h.plic = emu.plic
             emu.harts.append(h)
 
         for h in emu.harts:
             h.all_harts = emu.harts
+
+        # 清除 native batch 侧断点地址 (旧 harts 已销毁, 地址可能变化)
+        emu._bp_addrs.clear()
+
+        # 若 emu.__init__ 后 hart 数量未变, _native_states 仍有效;
+        # 标记 _native_stop_flag 重置以防上一轮 Ctrl+C 未清理.
+        emu._native_stop_flag.value = 0
+
+        # 确保终端恢复 + SIGINT 设为 REPL 处理器;
+        # 前次运行若异常退出 (未执行 _enter_repl_mode) 会残留
+        # cbreak 模式与 _sigint_run handler, 导致 Ctrl+C 失灵.
+        self._enter_repl_mode()
 
         if self._image is not None:
             emu.load_firmware(self._image, load_offset=self._load_offset)
@@ -445,9 +589,21 @@ class ExecutionMixin(SharedMixinAttrs):
         self._report_bp_hit(bp, h, h.pc)
         return None
 
-    def _check_multi_hart_bp(self) -> None:
-        """多 hart 执行后检查断点."""
+    def _check_multi_hart_bp(self) -> bool:
+        """多 hart 执行后检查断点 (仅检查需要 Python 侧求值的类型).
+
+        addr (无条件) — 由 Rust 内联检查, 此处跳过.
+        instr/opcode/cond/addr_with_cond — 需 Python 侧求值.
+
+        Returns:
+            True if a breakpoint was hit and the caller should pause.
+        """
+        if not self._has_non_addr_bps:
+            return False
         for h in self._emu.harts:
             for bp in self._breakpoints:
+                if bp.kind == "addr" and not bp.cond_type:
+                    continue  # 纯 addr 断点 — Rust 已逐指令比对
                 if self._check_single_bp(h, bp) is None:
-                    return
+                    return True
+        return False

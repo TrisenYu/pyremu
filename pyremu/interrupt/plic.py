@@ -36,7 +36,19 @@ RISC-V Platform-Level Interrupt Controller (PLIC).
 
 from __future__ import annotations
 
+import os
+import sys
+
 from pyremu.memory.bus import Device
+
+# 诊断日志开关 (PYREMU_DIAG_VERBOSE=1): 打印 set_irq / claim / complete,
+# 用于确认外设完成中断是否被正确投递并被 hart claim/complete。
+_DIAG = os.environ.get("PYREMU_DIAG_VERBOSE") == "1"
+
+
+def _diag(msg: str) -> None:
+    if _DIAG:
+        print(f"[plic] {msg}", file=sys.stderr, flush=True)
 
 # PLIC 常量 — 地址空间分区
 PLIC_PRIORITY_BASE = 0x000000
@@ -77,6 +89,14 @@ class PLIC(Device):
         # _pending[i]: source i 是否挂起
         self._pending: list[bool] = [False] * (num_sources + 1)
 
+        # _level[i]: source i 的电平状态 (设备侧最近一次 set_irq 的值)。
+        # PLIC gateway 语义 (对照 QEMU sifive_plic): claim 清除 pending,
+        # complete 时若电平仍为高则重新置位 pending — 否则电平中断在
+        # "claim 后无任何设备寄存器访问" 的窗口内会永久丢失 (如 UART TX
+        # watermark: ISR 每次仅发 FIFO 深度个字符, TXDATA 写由 Rust inline
+        # 处理不经 Python, complete 后无人再拉 set_irq).
+        self._level: list[bool] = [False] * (num_sources + 1)
+
         # _enable[c][i]: context c 启用 source i
         self._enable: list[list[bool]] = [
             [False] * (num_sources + 1) for _ in range(num_contexts)
@@ -99,23 +119,28 @@ class PLIC(Device):
     # ---- 硬件集成 API (供模拟器其他组件调用) ----
 
     def set_irq(self, source: int, pending: bool) -> None:
-        """由设备模型调用: 设置中断源挂起状态."""
+        """由设备模型调用: 设置中断源电平与挂起状态."""
         if 0 < source <= self._num_sources:
+            self._level[source] = pending
             self._pending[source] = pending
 
     def get_pending_mip(self, hart_id: int) -> int:
         """返回该 hart 的待处理外部中断 mip 位.
 
-        若 PLIC 中有优先级 > 阈值且使能且挂起的中断源,
-        返回 MEIP (bit 11); 否则返回 0.
-
-        暂不区分 M/S 模式 — 统一返回 MEIP.
+        标准双 context 布局: context 2*hart_id 为 M 模式, 2*hart_id+1 为 S 模式。
+        分别检查两个 context 是否有优先级 > 阈值且使能且挂起的中断源:
+        - M-context 命中 -> MEIP (bit 11)
+        - S-context 命中 -> SEIP (bit 9)
+        两者可同时置位。
         """
-        if hart_id >= self._num_contexts:
-            return 0
-        if self._find_highest(hart_id) > 0:
-            return 1 << 11  # MEIP
-        return 0
+        m_ctx = 2 * hart_id
+        s_ctx = m_ctx + 1
+        mip = 0
+        if m_ctx < self._num_contexts and self._find_highest(m_ctx) > 0:
+            mip |= 1 << 11  # MEIP (M-context)
+        if s_ctx < self._num_contexts and self._find_highest(s_ctx) > 0:
+            mip |= 1 << 9  # SEIP (S-context)
+        return mip
 
     # ---- 中断仲裁 ----
 
@@ -130,9 +155,7 @@ class PLIC(Device):
         best_prio = 0
 
         for i in range(1, self._num_sources + 1):
-            if not self._pending[i]:
-                continue
-            if not self._enable[context][i]:
+            if not self._pending[i] or not self._enable[context][i]:
                 continue
             # 该源已在该 context 上被 claim 但尚未 complete — 跳过
             if self._claimed[context] == i:
@@ -238,20 +261,28 @@ class PLIC(Device):
         if src > 0:
             self._pending[src] = False
             self._claimed[context] = src
+        _diag(f"claim ctx={context} -> src={src}")
         return src
 
     def _do_complete(self, context: int, src: int) -> None:
-        """Complete: 标记中断处理完成, 允许再次触发."""
+        """Complete: 标记中断处理完成, 允许再次触发.
+
+        电平语义: 若设备电平仍为高 (claim 后设备未拉低 set_irq),
+        complete 时重新置位 pending, 使中断再次投递 (QEMU sifive_plic 同款).
+        """
         if 0 < src <= self._num_sources and self._claimed[context] == src:
             self._claimed[context] = 0
+            if self._level[src]:
+                self._pending[src] = True
+            _diag(f"complete ctx={context} src={src} relevel={self._level[src]}")
 
     # ---- 位数组辅助 ----
 
     def _read_pending_word(self, word_idx: int) -> int:
         result = 0
-        base = word_idx * 32
+        word_idx <<= 5
         for i in range(32):
-            src = base + i
+            src = word_idx + i
             if src <= self._num_sources and self._pending[src]:
                 result |= 1 << i
         return result
@@ -260,9 +291,9 @@ class PLIC(Device):
         if context >= self._num_contexts:
             return 0
         result = 0
-        base = word_idx * 32
+        word_idx <<= 5
         for i in range(32):
-            src = base + i
+            src = word_idx + i
             if src <= self._num_sources and self._enable[context][src]:
                 result |= 1 << i
         return result
@@ -270,8 +301,9 @@ class PLIC(Device):
     def _write_enable_word(self, context: int, word_idx: int, val: int) -> None:
         if context >= self._num_contexts:
             return
-        base = word_idx * 32
+        word_idx <<= 5
         for i in range(32):
-            src = base + i
-            if 1 <= src <= self._num_sources:
-                self._enable[context][src] = (val >> i) & 1 != 0
+            src = word_idx + i
+            if src < 1 or src > self._num_sources:
+                continue
+            self._enable[context][src] = (val >> i) & 1 != 0
