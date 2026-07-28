@@ -2,15 +2,15 @@
 # -*- coding: utf-8 -*-
 """Terminal I/O 后台线程 — QEMU chardev-stdio 模型 (Rust libtermio.so 实现).
 
-独立于 CPU 模拟批次循环, 以 Rust 后台线程持续转发 stdin→RX 环形缓冲和
-TX 环形缓冲→stdout。对照 QEMU ``vendor/qemu-10.2.0/chardev/char-stdio.c``:
+独立于 CPU 模拟批次循环, 以 Rust 后台线程持续转发 stdin->RX 环形缓冲和
+TX 环形缓冲->stdout。对照 QEMU ``vendor/qemu-10.2.0/chardev/char-stdio.c``:
 
 - **单一 owner**: 线程运行期间, Rust 线程是唯一的控制台写者 (对照
   ``fd_chr_write`` 是唯一 TX 出口)。UART 行缓冲仅归档 hart 日志文件,
   控制台回显经 ``UART.set_console_echo(False)`` 关闭, 消除双写 stdout。
 - **单写者索引**: ``tx_drain`` 由 Rust 线程独占; Python 日志消费者维护
   独立的 ``_tx_log_rd``; ``rx_wr`` 由 Rust 写, ``rx_rd`` 由 Python 写
-  (发布消费进度, Rust 据此背压 — 缓冲满时停读 stdin)。
+  (发布消费进度, Rust 据此容量控制 — 缓冲满时停读 stdin)。
 - **终端属性**: Rust 侧保存/设置/恢复 termios + fcntl 阻塞标志 (对照
   term_init/term_exit), Ctrl+Z 挂起恢复经 SIGCONT handler 重设 raw。
 
@@ -20,8 +20,8 @@ cbreak 由 Debugger 负责)。
 Usage:
     term = TerminalIO(uart, wake_event, stdin_fd, stdout_fd)
     native = term.start()  # True: Rust 线程接管终端; False: Python 回退
-    term.drain_rx()        # RX 环形缓冲 → UART RX buffer (每批次前调用)
-    term.drain_tx_logs()   # TX 环形缓冲 → UART 行缓冲/日志 (每批次后调用)
+    term.drain_rx()        # RX 环形缓冲 ->UART RX buffer (每批次前调用)
+    term.drain_tx_logs()   # TX 环形缓冲 ->UART 行缓冲/日志 (每批次后调用)
     term.stop()            # 停止线程 + 恢复终端 + 排空残留
 """
 
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import atexit
 import ctypes
+import fcntl
 import os
 import select
 import threading
@@ -38,9 +39,9 @@ if TYPE_CHECKING:
     from pyremu.peripheral.uart import UART
 
 from pyremu._native import (
+    termio_attach,
     termio_available,
     termio_is_running,
-    termio_start,
     termio_stop,
     TermIoHandle,
 )
@@ -80,10 +81,11 @@ class TerminalIO:
         # RX 环形缓冲 — Rust termio 线程写入 (stdin 读取), Python drain_rx 排空。
         self._rx_buf = (ctypes.c_uint8 * self.RX_CAP)()
         self._rx_wr = ctypes.c_uint32(0)  # 写索引 (Rust termio 线程独占)
-        self._rx_rd = ctypes.c_uint32(0)  # 读索引 (Python 独占; Rust 读之背压)
+        self._rx_rd = ctypes.c_uint32(0)  # 读索引 (Python 独占; Rust 读之容量控制)
 
-        # 共享停止标志 — Python 置 1 → Rust 线程退出
+        # 共享停止标志 — Python 置 1 ->Rust 线程退出
         self._stop_flag = ctypes.c_uint8(0)
+        self._pause_flag = ctypes.c_uint8(0)  # 调试器暂停/恢复
 
         # 运行状态
         self._native_active = False           # Rust 线程是否接管了终端
@@ -92,6 +94,30 @@ class TerminalIO:
         # Python 轮询回退 (libtermio.so 不可用时启用)
         self._fallback_thread: threading.Thread | None = None
         self._fallback_running = False
+
+        # TX 事件驱动排空: Rust 每写一个 TX 字节到 ring buffer 后
+        # 写 1 字节到 _tx_notify_w -> daemon 线程被 select 唤醒 ->
+        # drain_tx_logs() -> UART 回调 -> TermProxy -> stdout.
+        self._tx_notify_r, self._tx_notify_w = os.pipe()
+        # 写端非阻塞: 管道满时 Rust 不卡死, 通知丢失可接受
+        # (daemon 会在下次 drain 时追上).
+        fl_w = fcntl.fcntl(self._tx_notify_w, fcntl.F_GETFL)
+        fcntl.fcntl(self._tx_notify_w, fcntl.F_SETFL, fl_w | os.O_NONBLOCK)
+        # 读端阻塞: daemon 线程 select 等待
+        self._tx_drain_lock = threading.Lock()
+        self._tx_drain_running = False
+        self._tx_drain_thread: threading.Thread | None = None
+
+        # TX 归档 daemon — 异步将 ring buffer 写入 hart 日志, 与批次循环解耦
+        self._tx_archive_running = False
+        self._tx_archive_thread: threading.Thread | None = None
+
+    @property
+    def tx_notify_w(self) -> int:
+        """TX 通知管道写端 fd, 传给 Rust (UartInfo.tx_notify_fd).
+        Rust 每写一个 TX 字节后写 1 字节到此 fd 唤醒 Python daemon.
+        """
+        return self._tx_notify_w
 
     # ----------------------------------------------------------
     #  公开接口
@@ -134,10 +160,11 @@ class TerminalIO:
             return self._native_active
 
         self._stop_flag.value = 0
-        if termio_available() and termio_start(self._build_handle()) == 0:
+        self._pause_flag.value = 0
+        # terminal_io_attach: 终端模式由 Python cbreak 管理, Rust 只做 I/O
+        if termio_available() and termio_attach(self._build_handle()) == 0:
             self._native_active = True
-            # 单一 owner: Rust 线程独占 stdout 回显, 关闭 Python 行缓冲的
-            # 控制台输出 (行缓冲仍归档 hart 日志文件)。
+            # 单一 owner: Rust 线程独占 stdout, Python 不重复输出
             self._uart.set_console_echo(False)
             if not self._atexit_registered:
                 # 进程异常退出时恢复终端 (对照 QEMU atexit(term_exit))
@@ -152,10 +179,13 @@ class TerminalIO:
     def stop(self) -> None:
         """停止后台 I/O 线程, 恢复终端属性, 排空残留数据.
 
-        顺序敏感: Rust 线程退出前会最终排空 TX→stdout (tx_drain 追平 tx_wr),
+        顺序敏感: Rust 线程退出前会最终排空 TX->stdout (tx_drain 追平 tx_wr),
         故残留条目须先以"回显关闭"状态归档日志 (避免重复输出), 最后才把
         控制台回显交还给 Python 行缓冲。
         """
+        # 先停归档 daemon — 线程退出后最终排空由 stop_tx_archive_thread 完成
+        self.stop_tx_archive_thread()
+
         if termio_is_running():
             self._stop_flag.value = 1
             self._wake_event.set()
@@ -169,21 +199,28 @@ class TerminalIO:
         # 排空 RX 与 TX 日志中尚未处理的数据
         self.drain_rx()
         self.drain_tx_logs()
-        if self._uart is not None:
-            self._uart.flush_all()
         if self._native_active:
             self._native_active = False
             self._uart.set_console_echo(True)
 
+    def pause(self) -> None:
+        """暂停 I/O 线程 (调试器断点)."""
+        if self._native_active:
+            self._pause_flag.value = 1
+
+    def resume(self) -> None:
+        """恢复 I/O 线程."""
+        self._pause_flag.value = 0
+
     def drain_rx(self) -> bool:
         """将 Rust 线程写入的 RX 环形缓冲数据转移到 Python UART 模型.
 
-        对照 QEMU ``fd_chr_read_poll → qemu_chr_fe_can_read → chr_read`` 流控:
+        对照 QEMU ``fd_chr_read_poll ->qemu_chr_fe_can_read ->chr_read`` 流控:
         - 先查 ``uart.can_rx()`` (FIFO 有空位才接收)
         - 逐字节 preload, 每字节检查 can_rx; FIFO 满即停止
         - 未被消费的字节保留在 ring buffer 中 (rd 不推进),
           且因 rx_rd 未更新, Rust 端 ``free = cap - (wr - rd)`` 变小
-          → termio 线程自然背压停止读 stdin (对照 QEMU fd_chr_read_poll)
+          ->termio 线程自然容量控制停止读 stdin (对照 QEMU fd_chr_read_poll)
 
         Returns:
             True 若有新数据被 preload (可触发 WFI 唤醒).
@@ -209,20 +246,53 @@ class TerminalIO:
             self._uart.preload(bytes([b]))
             drained += 1
             had_input = True
-        self._rx_rd.value = rd  # 发布消费进度 (Rust 背压依据)
+        self._rx_rd.value = rd  # 发布消费进度 (Rust 容量控制依据)
         self._wake_event.set()
         return had_input
 
     def drain_tx_logs(self) -> None:
         """把 CPU 引擎写入 TX 环形缓冲的 (hart, byte) 条目归入 UART 行缓冲.
 
-        本消费者维护独立读索引 ``_tx_log_rd``, 与 Rust 线程的 ``tx_drain``
-        互不干涉 (广播式环形缓冲, 各消费者独立追赶 tx_wr — 消除旧实现中
-        两个消费者共写 tx_drain 的重放/丢失竞争)。
+        本消费者维护独立读索引 ``_tx_log_rd``; 控制台是否回显由
+        ``UART._console_echo`` 决定。
 
-        控制台是否回显由 ``UART._console_echo`` 决定: native 线程运行期间
-        为 False (Rust 已直写 stdout), 其余时刻为 True (行缓冲负责回显)。
+        线程安全: 持有 ``_tx_drain_lock``, 允许 TX drain daemon 线程与
+        主线程 (``_native_flush_uart``) 并发调用。
         """
+        with self._tx_drain_lock:
+            self._drain_tx_logs_locked()
+
+    def drain_tx_logs_archive_only(self) -> None:
+        """排空 TX ring buffer, 仅归档 hart 日志, 不触发 _tx_callback->stdout.
+
+        用于 Rust libc::write 已即时输出到 stdout 的场景; 此处只保证
+        ring buffer 不溢出 + hart 日志完整, 不重复输出到控制台。
+        """
+        if self._uart is None:
+            return
+        with self._tx_drain_lock:
+            ecap = self.TX_CAP // 2
+            wr = self._tx_wr.value
+            pending = (wr - self._tx_log_rd) & 0xFFFF_FFFF
+            if pending == 0:
+                return
+            if pending > ecap:
+                self._tx_log_rd = (wr - ecap) & 0xFFFF_FFFF
+                pending = ecap
+            rd = self._tx_log_rd
+            uart = self._uart
+            for _ in range(pending):
+                idx = rd % ecap
+                hid = self._tx_buf[2 * idx]
+                byte = self._tx_buf[2 * idx + 1]
+                log_f = uart._hart_log_file(hid)
+                if log_f is not None:
+                    log_f.write(chr(byte))
+                rd = (rd + 1) & 0xFFFF_FFFF
+            self._tx_log_rd = rd
+
+    def _drain_tx_logs_locked(self) -> None:
+        """drain_tx_logs 的锁内实现."""
         if self._uart is None:
             return
         ecap = self.TX_CAP // 2
@@ -231,17 +301,117 @@ class TerminalIO:
         if pending == 0:
             return
         if pending > ecap:
-            # 生产者超圈: 最旧条目已被覆盖, 跳到仍有效的最旧条目
             self._tx_log_rd = (wr - ecap) & 0xFFFF_FFFF
             pending = ecap
         rd = self._tx_log_rd
         uart = self._uart
         for _ in range(pending):
             idx = rd % ecap
-            uart.set_writer(self._tx_buf[2 * idx])
-            uart.write(0, bytes([self._tx_buf[2 * idx + 1]]))
+            hid = self._tx_buf[2 * idx]
+            byte = self._tx_buf[2 * idx + 1]
+            # Hart 日志文件: 直接从 ring buffer 写入, 不经 UART 行缓冲
+            log_f = uart._hart_log_file(hid)
+            if log_f is not None:
+                log_f.write(chr(byte))
+            # UART MMIO 写 — 触发 _tx_callback → 控制台即时输出
+            uart.write(0, bytes([byte]))
             rd = (rd + 1) & 0xFFFF_FFFF
         self._tx_log_rd = rd
+
+    # ----------------------------------------------------------
+    #  TX 归档 daemon 线程 — 异步将 ring buffer 写入 hart 日志文件,
+    # 不依赖批次边界, 与指令执行循环完全解耦.
+    # ----------------------------------------------------------
+
+    def start_tx_archive_thread(self) -> None:
+        """启动 TX 归档 daemon: 事件驱动地将 ring buffer 写入 hart 日志."""
+        if self._tx_archive_running:
+            return
+        self._tx_archive_running = True
+        self._tx_archive_thread = threading.Thread(
+            target=self._tx_archive_loop, daemon=True,
+        )
+        self._tx_archive_thread.start()
+
+    def stop_tx_archive_thread(self) -> None:
+        """停止 TX 归档 daemon, 最终排空残留."""
+        self._tx_archive_running = False
+        if self._tx_archive_thread is not None:
+            self._tx_archive_thread.join(timeout=1.0)
+            self._tx_archive_thread = None
+        self.drain_tx_logs_archive_only()
+
+    def _tx_archive_loop(self) -> None:
+        """TX 归档 daemon 入口: select 等待 Rust notify → 归档 hart 日志.
+        与批次循环完全异步, 仅在 Rust 写入 ring buffer 后触发."""
+        notify_r = self._tx_notify_r
+        while self._tx_archive_running:
+            try:
+                ready, _, _ = select.select([notify_r], [], [], 0.2)
+            except (ValueError, OSError):
+                break
+            if not self._tx_archive_running:
+                break
+            # 排空通知管道
+            try:
+                while True:
+                    os.read(notify_r, 256)
+            except BlockingIOError:
+                pass
+            except OSError:
+                break
+            self.drain_tx_logs_archive_only()
+
+    # ----------------------------------------------------------
+    #  TX 即时排空 daemon 线程
+    # ----------------------------------------------------------
+
+    def start_tx_drain_thread(self) -> None:
+        """启动 TX drain daemon 线程: 每 ~1ms 检查 ring buffer,
+        有新数据则经 UART 行缓冲 -> _tx_callback -> TermProxy writer -> stdout.
+        """
+        if self._tx_drain_running:
+            return
+        self._tx_drain_running = True
+        self._tx_drain_thread = threading.Thread(
+            target=self._tx_drain_loop, daemon=True,
+        )
+        self._tx_drain_thread.start()
+
+    def stop_tx_drain_thread(self) -> None:
+        """停止 TX drain daemon 线程, 并最终排空残留."""
+        self._tx_drain_running = False
+        if self._tx_drain_thread is not None:
+            self._tx_drain_thread.join(timeout=1.0)
+            self._tx_drain_thread = None
+        # 最终排空: 线程停止后可能还有残留
+        self.drain_tx_logs()
+
+    def _tx_drain_loop(self) -> None:
+        """TX drain daemon 线程入口: 阻塞等待 Rust 通知 -> 排空 ring buffer.
+
+        Rust 每写一个 TX 字节后写 1 字节到 _tx_notify_w -> select 唤醒 ->
+        drain_tx_logs() 走完整 UART 回调链 -> TermProxy writer -> stdout.
+        零轮询, 完全事件驱动.
+        """
+        notify_r = self._tx_notify_r
+        while self._tx_drain_running:
+            try:
+                ready, _, _ = select.select([notify_r], [], [])
+            except (ValueError, OSError):
+                break
+            if not self._tx_drain_running:
+                break
+            # 排空通知管道中的全部字节 (可能积压了多次通知)
+            try:
+                while True:
+                    os.read(notify_r, 256)
+            except BlockingIOError:
+                pass
+            except OSError:
+                break
+            # 排空 ring buffer -> UART 回调 -> TermProxy -> stdout
+            self.drain_tx_logs()
 
     # ----------------------------------------------------------
     #  Rust native 路径
@@ -257,7 +427,7 @@ class TerminalIO:
         h.stdin_fd = self._stdin_fd
         h.stdout_fd = self._stdout_fd
         h.rx_buf = ctypes.cast(self._rx_buf, ctypes.c_void_p).value or 0
-        h.rx_cap = self.RX_CAP
+        h.rx_cap = 0  # RX 由 Python 直读 stdin, Rust 线程仅做 TX drain
         h.rx_wr = ctypes.addressof(self._rx_wr)
         h.rx_rd = ctypes.addressof(self._rx_rd)
         h.tx_buf = ctypes.cast(self._tx_buf, ctypes.c_void_p).value or 0
@@ -265,6 +435,7 @@ class TerminalIO:
         h.tx_wr = ctypes.addressof(self._tx_wr)
         h.tx_drain = ctypes.addressof(self._tx_drain)
         h.stop_flag = ctypes.addressof(self._stop_flag)
+        h.pause_flag = ctypes.addressof(self._pause_flag)
         return h
 
     # ----------------------------------------------------------
@@ -285,7 +456,6 @@ class TerminalIO:
             return False
         self._uart.preload(data)
         self._wake_event.set()
-        self._uart.flush_all()
         return True
 
     def _fallback_poll_loop(self) -> None:

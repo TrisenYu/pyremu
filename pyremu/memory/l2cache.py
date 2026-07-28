@@ -423,10 +423,12 @@ class L2Cache(CacheBase):
         return count
 
     def invalidate_all(self) -> int:
-        """使全部缓存行失效, 脏行先回写 RAM.
+        """使全部缓存行失效 (不写回).
 
-        用于 native batch 执行后: Rust 可能直接修改了 bytearray,
-        而 L2 中对应地址的旧缓存行已过时, 必须丢弃。
+        用于 native batch 执行后: Rust 已直接修改 bytearray,
+        L2 中的旧缓存行 (包括脏行) 全部过时, 必须无条件丢弃。
+        脏行数据已在 pre-batch flush_all() 中回写, 此处再写回会
+        覆盖 Rust batch 对同一 PA 的修改 -> 页表/栈数据污染。
 
         Returns:
             失效的缓存行数.
@@ -435,9 +437,6 @@ class L2Cache(CacheBase):
         for e in self._entries:
             if not e.valid:
                 continue
-            if e.mesi == MESIState.MODIFIED and self._ram_write is not None:
-                pa = e.tag << self._line_shift
-                self._ram_write(pa, e.data)  # bytearray 直接写入, 避免 bytes() 拷贝
             e.valid = False
             e.mesi = MESIState.INVALID
             e.dirty = False

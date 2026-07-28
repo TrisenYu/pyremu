@@ -36,6 +36,7 @@ from typing import Any
 from pyremu._native import (
     ClintInfo,
     DevInfo,
+    icount_flush,
     native_available,
     PmpInfo,
     run_parallel,
@@ -74,16 +75,28 @@ from pyremu.utils.parse_bin import FirmwareImage
 from pyremu.utils.tick import yield_cpu
 
 
-def _uart_tx_flush(text: str) -> None:
-    """UART TX 回调: 写 stdout 并立即刷新, 确保字符回显即时可见.
+def _wrap_phy_write_for_uart(
+    hart_id: int,
+    uart,  # UART | None
+    orig_write,  # (pa: int, data: bytes) -> None
+):
+    """包装物理写回调: hart 写入 UART MMIO 范围时自动标记写者身份.
 
-    Python stdout 默认行缓冲, ``sys.stdout.write()`` 不自动刷新,
-    导致 shell 的回显字符 (单字符, 无 ``\\n``) 滞留在缓冲区中直到
-    下一行输出或下一个按键才批量刷出 — 表现为"输一个字母, 需再输
-    下一个字母前一个才显示"。此回调每次写后无条件 flush。
+    UART 据此将 TXDATA 字节归入 hart 日志文件 (set_hart_log_dir).
+    不做行缓冲 — 仅用于多 hart 输出分流归档.
     """
-    sys.stdout.write(text)
-    sys.stdout.flush()
+    if uart is None:
+        return orig_write
+    uart_base = uart.base_addr
+    uart_end = uart.base_addr + uart.size
+
+    def _write(pa: int, data: bytes) -> None:
+        if uart_base <= pa < uart_end:
+            uart._current_writer = hart_id
+        return orig_write(pa, data)
+
+    return _write
+
 
 
 # virtio 单次 _process_queue 最多处理描述符数,
@@ -134,12 +147,14 @@ class Emulator:
         # 调试用途 (日后需要详细内核日志时取消下面注释即可):
         #   "printk.devkmsg=on loglevel=8 debug ignore_loglevel "
         #   "dyndbg=\"file *sbi* +p; file *smp* +p; file *tlb* +p; file *cpu* +p\""
+        self._dtb_addr: int | None = None  # 最近一次 load_dtb 的地址
         self._bootargs = (
             bootargs
             if bootargs is not None
             else (
                 "earlycon=sbi console=ttySIF0 "
-                "random.trust_bootloader=on"
+                "random.trust_bootloader=on "
+                "ro init=/bin/zsh TERM=vt100"
             )
         )
         self._cycle = 0
@@ -195,7 +210,6 @@ class Emulator:
         if p.uart_base:
             self.uart = UART(
                 base=p.uart_base,
-                tx_callback=_uart_tx_flush,
                 plic=self.plic,
                 irq=UART_IRQ,
             )
@@ -243,7 +257,10 @@ class Emulator:
         for i in range(config.num_harts):
             h = Hart(id=i, pmp_entries=config.pmp_entries)
             h.pc = config.prog_cnt
-            inject_memory_backend(h, self.bus.read, self.bus.write)
+            inject_memory_backend(
+                h, self.bus.read,
+                _wrap_phy_write_for_uart(h.id, self.uart, self.bus.write),
+            )
             h.bus = self.bus
             h.interrupt_ctrl = self.clint
             h.plic = self.plic
@@ -287,9 +304,13 @@ class Emulator:
 
         num_harts = len(self.harts)
         self._native_states = (HartState * num_harts)()
+        # TLB generation counter — persists across batches so SFENCE.VMA
+        # broadcast semantics (gen increment) survive FFI call boundaries.
+        self._tlb_gen = ctypes.c_uint64(0)
+        self._tlb_gen_per_hart = (ctypes.c_uint64 * num_harts)()
 
         # Per-hart MSIP edge counters — Python CLINT writes only set the
-        # level bit; we track 0→1 transitions and encode them as edge
+        # level bit; we track 0->1 transitions and encode them as edge
         # increments so Rust's sync_msip can detect cross-batch MSIP.
         self._clint_msip_edge: list[int] = [0] * num_harts
         self._clint_msip_prev: list[int] = [0] * num_harts
@@ -299,7 +320,7 @@ class Emulator:
         self._native_ram_buf = (ctypes.c_uint8 * len(ram)).from_buffer(ram)  # type: ignore[attr-defined]
 
         # Terminal I/O 管理器 — 封装 Rust termio 后台线程 (或 Python 回退)
-        # 独立于 CPU 批次循环, 持续转发 stdin→UART RX 和 UART TX→stdout.
+        # 独立于 CPU 批次循环, 持续转发 stdin->UART RX 和 UART TX->stdout.
         # 创建时机: _init_native_batch (仅在 native batch 可用时).
         # UART 此时已构造完毕 (见 __init__ 顺序), 可安全注入。
         if self.uart is not None and self._termio is None:
@@ -309,12 +330,16 @@ class Emulator:
                 stdin_fd=sys.stdin.fileno(),
                 stdout_fd=sys.stdout.fileno(),
             )
-            self.uart._termio = self._termio
+            self.uart.termio = self._termio
+            # 启动 TX 归档 daemon — 异步将 ring buffer 写入 hart 日志,
+            # 与批次循环完全解耦, 不依赖 _native_flush_uart.
+            self._termio.start_tx_archive_thread()
 
         # 默认 WFI 空闲轮询回调: 用于无调试器直连 run() 的场景 (如
         # make emu-linux-jump)。调试器 _enter_run_mode 会按需覆盖此回调。
-        if self._termio is not None and self._idle_poll_cb is None:
-            self._idle_poll_cb = self._default_idle_poll
+
+        # if self._termio is not None and self._idle_poll_cb is None:
+        #     self._idle_poll_cb = self._default_idle_poll
 
         # _step_native marshal/unmarshal 之间传递的临时缓冲 (每批次重建)。
         self._pmp_num: int = 0
@@ -389,10 +414,8 @@ class Emulator:
         addr: int,
         dtb: bytes,
     ) -> None:
-        """将 *dtb* 写入 RAM 的 *addr*, 并设所有 hart 的 a1.
-
-        供 load_dtb / load_dtb_file 共用.
-        """
+        """将 *dtb* 写入 RAM 的 *addr*, 并设所有 hart 的 a1."""
+        self._dtb_addr = addr
         self.load_code(addr, dtb)
         for hart in self.harts:
             hart.write_gpr(11, addr)
@@ -526,8 +549,10 @@ class Emulator:
     # ----------------------------------------------------------
 
     def request_native_stop(self) -> None:
-        """由调试器信号处理器调用, 请求 Rust batch engine 尽快退出."""
+        """由调试器信号处理器调用, 请求 Rust batch engine 尽快退出.
+        同时设置 _wake_event 打断任何 idle sleep (WFI 轮询)."""
         self._native_stop_flag.value = 1
+        self._wake_event.set()
 
     def _step_native(self, active: list[Hart]) -> int:
         # 重置共享停止标志 (上一轮可能已被 Ctrl+C 设置)
@@ -539,6 +564,10 @@ class Emulator:
 
         # Marshal ALL harts (including halted): Rust needs every state
         # for total_instrs summation and active_hart_num counting.
+        # 每轮批次前转发 stdin (不只在 WFI idle 时) — 消除 1 字符输入延迟:
+        # TermIO reader 线程异步写入 ring buffer, 此处同步 preload 到 UART.
+        if self._termio is not None:
+            self._termio.drain_rx()
         # 先把 PLIC 外部中断 (MEIP/SEIP) 同步进各 hart 的 mip —— native 引擎内部
         # 只同步 CLINT (MSIP/MTIP), 不感知 PLIC, 否则 virtio 等外设中断永远到不了 hart。
         self._native_sync_plic_mip()
@@ -576,6 +605,8 @@ class Emulator:
             virtio=virtio_info,
             bp_addrs=self._bp_addrs if self._bp_addrs else None,
             stop_flag=self._native_stop_flag,
+            tlb_gen=self._tlb_gen,
+            tlb_gen_per_hart=self._tlb_gen_per_hart,
         )
 
         result = self._native_result
@@ -586,7 +617,7 @@ class Emulator:
         # 但 Python TLB 不参与 marshal/unmarshal (hart.py:904-907,
         # "Python TLB is ground truth") — 旧条目不被写回, 但旧条目的
         # 失效也不会传播到 Python 侧。下一轮 Python 模式的内存访问
-        # 可能命中已在 Rust 侧被刷掉的陈旧 VA→PA 映射, 导致:
+        # 可能命中已在 Rust 侧被刷掉的陈旧 VA->PA 映射, 导致:
         #   1. 读到错误数据 (如把 7 当作指针) -> 计算错误地址
         #   2. SIGSEGV at nonsense VA (如 0x33d = NULL+0x33d)
         # 解决方案: 每轮 batch 后无条件刷掉全部 hart 的 itlb/dtlb。
@@ -601,7 +632,8 @@ class Emulator:
         self.bus.invalidate_l2()
 
         self._native_unmarshal_pmp()
-        self._native_flush_uart()
+        # TX ring buffer 归档由 _tx_archive daemon 异步处理,
+        # 不在此处同步调用 — UART I/O 与批次循环完全解耦.
         self._native_unmarshal_clint(clint_info)
 
         # Rust 引擎投递 MSIP 后清除 state.mip.MSIP 以匹配 Python 侧
@@ -610,7 +642,7 @@ class Emulator:
         # 清零, 且 CLINT MSIP 在 batch 前就已是 1 (旧 MSIP 已投递), 则同步
         # 清除 Python CLINT._msip。若 MSIP 在 batch 期间新到达 (_pre_batch_msip=0),
         # 则保留 CLINT._msip 不清理 — 否则在 batch 内由 hart A 写入、hart B
-        # 尚未来得及由 sync_msip 检测到的跨核 IPI 会被永久丢弃 → TLB-shootdown 死锁。
+        # 尚未来得及由 sync_msip 检测到的跨核 IPI 会被永久丢弃 ->TLB-shootdown 死锁。
         for hid in range(len(self.harts)):
             if (
                 (self.harts[hid].mip_val & (1 << 3)) == 0
@@ -620,29 +652,10 @@ class Emulator:
                 self.clint._msip[hid] = 0
                 self.clint._notify_state_change()
 
-        # 如果 Rust 因 virtio QueueNotify exit, 则 _native_unmarshal_virtio
-        # 已调用 _process_queue() 处理完毕; 无需再让 Python exec_instr 重执行
-        # 那条 store 指令。记录标志以跳过 MMIO exit 处理。
-        was_virtio_notify = bool(
-            virtio_ffi is not None and virtio_ffi.notify_pending
-        )
         self._native_unmarshal_virtio(virtio_ffi)
 
         all_exec_cnt = result.total_instrs
-        if was_virtio_notify and result.exit_reason == EXIT_MMIO:
-            # Rust 已 inline 处理了所有非 QueueNotify 的 virtio MMIO 访问;
-            # QueueNotify 本身由 _native_unmarshal_virtio 中的 _process_queue
-            # 完成。跳过正常的 MMIO exit 重执行路径。
-            # 关键: native 引擎在 EXIT_SENTINEL 时不会推进 PC, 因此必须在此
-            # 手动跳过 QueueNotify 指令, 否则下轮 batch 会在同一 PC 重复执行
-            # 同一条 store, 形成死循环。
-            exit_hart = self.harts[result.exit_hart_id]
-            instr = result.exit_instr
-            advance = 2 if (instr & 0x3) != 3 else 4
-            exit_hart.pc = (exit_hart.pc + advance) & 0xFFFF_FFFF_FFFF_FFFF
-            all_exec_cnt += 1
-        else:
-            all_exec_cnt = self._native_handle_exit(result, all_exec_cnt)
+        all_exec_cnt = self._native_handle_exit(result, all_exec_cnt)
         return self._native_finalize(all_exec_cnt, result, clint_info)
 
     # ---- _step_native 分解: marshal-in / unmarshal-out / 收尾 ----
@@ -749,13 +762,23 @@ class Emulator:
 
         Python CLINT MSIP 仅维护 level bit (0/1); Rust sync_msip 需要
         edge-counter (bits 7:1) 来检测跨 batch 的 MSIP 变化。此处检测
-        0→1 跳变并递增 edge counter, 编码为 ``level | (edge << 1)``.
+        0->1 跳变并递增 edge counter, 编码为 ``level | (edge << 1)``.
         """
         clint = self.clint
         total = len(self.harts)
         self._clint_mtimecmp_arr = (ctypes.c_uint64 * total)()
         self._clint_msip_arr = (ctypes.c_uint8 * total)()
         if clint is not None:
+            # Sync stimecmp -> CLINT mtimecmp BEFORE marshaling.
+            # Python-side CSR writes (e.g. during MMIO/ECALL handling) update
+            # the hart's stimecmp but NOT CLINT._mtimecmp.  If we marshal
+            # the stale CLINT value, Rust's sync_mtip / wfi_check_all_idle
+            # see an expired or wrong deadline -> timer-interrupt storm that
+            # saturates the batch budget without forward progress.
+            for hart in self.harts:
+                st_val = hart._csr_read_raw("stimecmp")
+                if st_val > 0 and hart.id < len(clint._mtimecmp):
+                    clint._mtimecmp[hart.id] = st_val
             for hid in range(total):
                 if hid < len(clint._mtimecmp):
                     self._clint_mtimecmp_arr[hid] = clint._mtimecmp[hid]
@@ -805,10 +828,11 @@ class Emulator:
                 clint._mtimecmp[hart.id] = st_val
 
     def _native_marshal_uart(self) -> UartInfo:
-        """UART info — 让 Rust inline 缓冲 sbi_printf + IE/IP/TXCTRL 寄存器访问.
+        """UART info — 让 Rust inline 处理 TXDATA + IE/IP/TXCTRL 寄存器访问.
 
-        TX 缓冲区和写索引由 TerminalIO 提供并共享给 Rust termio 线程排空。
-        寄存器的影子拷贝使 Rust 可在不退出批次的情况下响应内核轮询。
+        TX 环形缓冲和写索引由 TerminalIO 提供。tx_notify_fd 是 TX 通知管道
+        的写端, Rust 每写一个 TXDATA 字节后写 1 字节到此 fd, 唤醒 Python
+        TX drain daemon -> 零轮询事件驱动 TX 排空。
         """
         if self._termio is None:
             return UartInfo(base=0)
@@ -821,18 +845,18 @@ class Emulator:
             txctrl=uart._txctrl if uart is not None else 0,
             rxctrl=uart._rxctrl if uart is not None else 0,
             rx_fifo_len=len(uart._rx_fifo) if uart is not None else 0,
+            tx_notify_fd=self._termio.tx_notify_w,
         )
 
     def _native_flush_uart(self) -> None:
-        """把 TX 环形缓冲中新产生的条目按 hart 归入 Python UART 行缓冲/日志.
+        """TX ring buffer -> hart 日志归档.
 
-        委托给 TerminalIO.drain_tx_logs(): 日志消费者持独立读索引, 不触碰
-        Rust termio 线程独占的 tx_drain。控制台回显由 UART._console_echo
-        决定 (native 线程运行期间 Rust 已直写 stdout, Python 不重复输出)。
+        Rust libc::write 已即时输出, 此处仅消费 ring buffer 防止溢出,
+        不触发 _tx_callback->stdout (避免双重输出).
         """
         if self.uart is None or self._termio is None:
             return
-        self._termio.drain_tx_logs()
+        self._termio.drain_tx_logs_archive_only()
 
     # ---- virtio-blk inline marshal / unmarshal ----
 
@@ -869,9 +893,9 @@ class Emulator:
 
         Rust 批量执行期间 inline 处理了 MMIO 寄存器读写,
         批次结束后同步 changed fields:
-        - QueueNotify pending → 调用 _process_queue
-        - irq_maybe_lower → 调用 _lower_irq_if_idle
-        - 寄存器状态 → 同步回 VirtIOBlock
+        - QueueNotify pending ->调用 _process_queue
+        - irq_maybe_lower ->调用 _lower_irq_if_idle
+        - 寄存器状态 ->同步回 VirtIOBlock
         """
         vblk = self.virtio_blk
         if vblk is None or virtio_ffi is None:
@@ -890,7 +914,16 @@ class Emulator:
         vblk._status = virtio_ffi.status
         vblk._interrupt_status = virtio_ffi.interrupt_status
 
-        # QueueNotify: Rust 设置 notify_pending=1 → Python 处理 virtqueue.
+        # InterruptACK 清空所有中断位 ->拉低 PLIC IRQ.
+        # 必须在 notify_pending 之前处理: 若两者在同一批次内触发,
+        # 先降低 IRQ 电平再处理新队列, 避免 _lower_irq_if_idle 看到
+        # _process_queue 刚写入的 _interrupt_status 而跳过降电平,
+        # 导致 _do_complete 时 level 仍为高 ->无限 re-level.
+        if virtio_ffi.irq_maybe_lower:
+            virtio_ffi.irq_maybe_lower = 0
+            vblk._lower_irq_if_idle()
+
+        # QueueNotify: Rust 设置 notify_pending=1 ->Python 处理 virtqueue.
         # 分批处理 (每批最多 _VIRTIO_PROCESS_BATCH 个描述符), 循环直到全部完成.
         # 每批之间 Python 可响应 ctrl+C; _max_batches 防止异常情况下的死循环.
         if virtio_ffi.notify_pending:
@@ -905,11 +938,6 @@ class Emulator:
                     break
             virtio_ffi.interrupt_status = vblk._interrupt_status
 
-        # InterruptACK 清空所有中断位 → 拉低 PLIC IRQ
-        if virtio_ffi.irq_maybe_lower:
-            virtio_ffi.irq_maybe_lower = 0
-            vblk._lower_irq_if_idle()
-
     def _native_handle_exit(self, result: BatchResult, all_exec_cnt: int) -> int:
         """处理 native 批次退出原因 (ECALL/MMIO/TRAP/BREAKPOINT)."""
         total_harts = len(self.harts)
@@ -917,8 +945,6 @@ class Emulator:
             return all_exec_cnt
         exit_hart = self.harts[result.exit_hart_id]
         if result.exit_reason in (EXIT_ECALL, EXIT_MMIO):
-            if self.uart is not None:
-                self.uart.set_writer(exit_hart.id)
             all_exec_cnt += self._handle_native_sys_exit(exit_hart, result.exit_instr)
         elif result.exit_reason == EXIT_TRAP:
             if exit_hart._consecutive_traps >= self._TRAP_LOOP_THRESHOLD:
@@ -927,6 +953,8 @@ class Emulator:
         elif result.exit_reason == EXIT_BREAKPOINT:
             # Breakpoint hit in Rust — PC 已核对 bp_addrs, 匹配指令已执行并计数;
             # debugger 的 _check_multi_hart_bp 会据 h.pc == 断点地址上报命中。
+            # Dump accumulated instruction counters once for the user to inspect.
+            # icount_flush()  # temporarily disabled — focus on per-instruction diagnostics
             pass
         return all_exec_cnt
 
@@ -937,13 +965,6 @@ class Emulator:
         clint_info: ClintInfo,
     ) -> int:
         """推进计数器 -> WFI 唤醒 -> 空闲休眠 -> 看门狗/PC-stall 检测."""
-        # 每批次结束后无条件刷新 UART 行缓冲, 确保不以 \\n 结尾的
-        # 部分行 (如 shell 提示符 "# "、字符回显) 即时可见, 与 QEMU
-        # ``-nographic`` 行为一致。多核启动时各行以 \\n 结尾, 已在
-        # _write_reg 中通过 \\n 触发刷新, 此处的 flush_all 为空操作。
-        if self.uart is not None:
-            self.uart.flush_all()
-
         clint = self.clint
         # Advance mtime / CSR counters BEFORE WFI wakeup checks so that timer
         # interrupts (MTIP/STIP) that matured during the batch are visible to
@@ -987,8 +1008,8 @@ class Emulator:
         # 上文 _wfi_sleep_if_idle 可能在 WFI 轮询期间通过 _idle_poll_cb
         # 把 stdin 字节 preload 到了 UART RX 并置位了 PLIC 中断, 但此时
         # hart.mip 尚未同步 (SEIP/MEIP 仍为 0)。立即同步 PLIC 并重试
-        # WFI 唤醒, 避免等待到下轮 _step_native() → _native_sync_plic_mip(),
-        # 匹配 QEMU 的事件驱动模型: stdin → UART RX → 中断 → 即时唤醒。
+        # WFI 唤醒, 避免等待到下轮 _step_native() ->_native_sync_plic_mip(),
+        # 匹配 QEMU 的事件驱动模型: stdin ->UART RX ->中断 ->即时唤醒。
         self._native_sync_plic_mip()
         _recheck = 0
         for hart in self.harts:
@@ -1061,17 +1082,14 @@ class Emulator:
     # ----------------------------------------------------------
 
     def _default_idle_poll(self) -> bool:
-        """默认 WFI 空闲轮询回调 — 刷新 UART 部分行缓冲.
+        """默认 WFI 空闲轮询回调.
 
-        无调试器直连 ``run()`` 场景中 stdin 转发由
-        ``_native_flush_uart`` → ``drain_tx_logs`` 的 TX 路径处理;
-        此处仅保证 shell 提示符和字符回显不回滞在行缓冲中。
+        TX ring buffer 归档由 _tx_archive daemon 异步处理,
+        stdin 转发由 TermIO reader 线程异步处理.
 
         Returns:
             False — 当前不引入新输入, 唤醒由其他路径触发.
         """
-        if self.uart is not None:
-            self.uart.flush_all()
         return False
 
     # ----------------------------------------------------------
@@ -1124,12 +1142,8 @@ class Emulator:
             # remaining == 0: timer just expired, no need to sleep
             sleep_sec = 0.0
         else:
-            # No timer set for any hart.  Behaviour differs:
-            #   - Debugger attached (_idle_poll_cb set): use short-poll loop to
-            #     forward stdin, otherwise user input is never read and the
-            #     emulator spins in a tight batch→WFI→batch loop burning CPU.
-            #   - No debugger (e.g. test suite): skip sleep to avoid blocking
-            #     tests that call step() after firmware completion.
+            # 无定时器 — WFI 唤醒由看门狗保证: 空闲时 watchdog.tick()
+            # 递减计数器, 归零时注入 MSIP 唤醒全部 WFI hart.
             if self._idle_poll_cb is not None:
                 self._wfi_poll_stdin_loop(active, 0.05)
             return
@@ -1155,17 +1169,19 @@ class Emulator:
     def _wfi_poll_stdin_loop(self, active: list, sleep_sec: float) -> None:
         """以短间隔轮询 idle-poll 回调, 推进 mtime 以反映经过的墙钟时间.
 
-        从 ``_wfi_sleep_if_idle`` 的 debugger 路径提取, 消除重复代码.
+        Rust termio 线程异步写 RX ring buffer, Python 侧不感知.
+        用独立短间隔 (2ms) 检查 ring buffer, 避免被长定时器 (如 zsh
+        的 100ms 轮询) 拉伸导致的输入延迟 — 消除"回车需额外按键触发"。
         """
-        poll_interval = min(sleep_sec, 0.05)  # 50ms max polling interval
+        # 固定 2ms 间隔检查 RX ring buffer — Rust termio 异步写,
+        # 不依赖定时器周期, 消除"回车需额外按键触发"的延迟
+        _rx_check_interval = 0.002
         start = time.monotonic()
         deadline = start + sleep_sec
         while time.monotonic() < deadline:
             if self._idle_poll_cb():
-                # 回调返回 True → stdin 有数据已 preload,
-                # 立即退出让 Python 侧同步 PLIC 并重启 batch.
                 break
-            remain = min(deadline - time.monotonic(), poll_interval)
+            remain = min(deadline - time.monotonic(), _rx_check_interval)
             if remain > 0:
                 if self._wake_event.wait(timeout=remain):
                     self._wake_event.clear()
@@ -1174,6 +1190,15 @@ class Emulator:
         elapsed_real = max(1, int((time.monotonic() - start) / (self._WFI_TICK_US * 1e-6)))
         if self.clint is not None:
             self.clint.tick(elapsed_real - 1)  # -1 因为 step() 末尾还会 tick(1)
+        # 看门狗按墙钟时间推进 (1 tick/ms, 上限防大循环阻塞 SIGINT)
+        _wdog_ticks = min(
+            max(1, int((time.monotonic() - start) * 1000)),
+            200,
+        )
+        for _ in range(_wdog_ticks):
+            self.watchdog.tick()
+            if self._native_stop_flag.value != 0:
+                break
 
     # ----------------------------------------------------------
     #  执行
@@ -1233,16 +1258,15 @@ class Emulator:
             return self._step_native(active)
 
         # ---- Pure-Python path (fallback / .so not loaded) ----
+        # 每轮 step 前转发 stdin — 与 _step_native 行为一致
+        if self._termio is not None:
+            self._termio.drain_rx()
         if len(active) > 1:
             random.shuffle(active)
 
         all_exec_cnt = 0
         wfi_waiting = 0
         for hart in active:
-            # 声明当前 UART 写者 hart (多 hart 输出不交错)
-            if self.uart is not None:
-                self.uart.set_writer(hart.id)
-
             # 设置 L2 缓存的当前域标记, 分配/命中行时自动打上 hart 的 mdid
             if self.bus._l2 is not None:
                 self.bus._l2.current_mdid = hart.mdid_val

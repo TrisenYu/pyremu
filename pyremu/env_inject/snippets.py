@@ -17,6 +17,8 @@ RISC-V 机器码片段 (shellcode) — 预定义的短指令序列.
 
 from dataclasses import dataclass
 
+from pyremu.utils.mask import mask32
+
 
 @dataclass
 class AsmSnippet:
@@ -185,8 +187,8 @@ def imm64(rd: int, value: int) -> AsmSnippet:
             _i_type(16, rd, _F3_LD, rd, _LD),  # ld rd, 16(rd)
             _j_type(16, _ZERO),  # jal zero, 16
             _i_type(0, _ZERO, _F3_ADDI, _ZERO, _OP_IMM),  # nop (addi x0, x0, 0)
-            value & 0xFFFFFFFF,  # 数据低 32 位
-            (value >> 32) & 0xFFFFFFFF,  # 数据高 32 位
+            mask32(value),  # 数据低 32 位
+            mask32(value >> 32),  # 数据高 32 位
         ],
         desc=f"load x{rd} ← 0x{value:016x}",
     )

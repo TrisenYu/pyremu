@@ -12,5 +12,6 @@ default = []
 diagnostic = []
 
 [dependencies]
+libc = "0.2"
 rand = "0.10.2"
 softfloat_pure = { git = "https://github.com/HarryR/softfloat-pure.git" }

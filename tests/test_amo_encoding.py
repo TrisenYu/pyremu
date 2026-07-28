@@ -1,6 +1,6 @@
 """验证 amoadd.w.aqrl — OpenSBI atomic_sub_return 的底层指令.
 
-tlb_entry_process() 用 atomic_sub_return() → amoadd.w.aqrl 递减 tlb_sync.
+tlb_entry_process() 用 atomic_sub_return() ->amoadd.w.aqrl 递减 tlb_sync.
 若 .aq/.rl 位导致 funct5 提取错误, 则 AMO 操作会被错误路由或产生非法指令陷态.
 """
 
@@ -113,7 +113,7 @@ class TestAmoaddWExecution:
         hart.gprs[11] = 0xFFFFFFFF  # -1
         hart.gprs[5] = 0
         hart.pc = 0x80000000
-        # 第一次: tlb_sync 从 2 → 1
+        # 第一次: tlb_sync 从 2 ->1
         emu.bus.write(pa, struct.pack("<I", 2))
         hart.gprs[10] = pa
         hart.exec_instr(instr)
@@ -121,7 +121,7 @@ class TestAmoaddWExecution:
         r1 = hart.gprs[5] & 0xFFFFFFFF
         assert v1 == 1, f"after 1st: expected 1, got {v1}"
         assert r1 == 2, f"rd 1st: expected 2, got {r1}"
-        # 第二次: 从 1 → 0 (不重置内存)
+        # 第二次: 从 1 ->0 (不重置内存)
         hart.gprs[10] = pa
         hart.exec_instr(instr)
         v2 = struct.unpack("<I", emu.bus.read(pa, 4))[0]
@@ -177,7 +177,7 @@ class TestAmoaddWFaultHandling:
     def test_amo_to_device_detected(self, _m_mode_hart):
         """对 MMIO 地址 (如 CLINT) 的 AMO 在 Python 路径下走 Bus 直通路径.
 
-        Python decoder 中的 handle_amo → mem_write/read 最终走 Bus.write/read,
+        Python decoder 中的 handle_amo ->mem_write/read 最终走 Bus.write/read,
         对 device MMIO 直接读写设备寄存器 (而非触发 trap).
         这与原生 batch 不同 (原生 batch 中 device AMO 触发 EXIT_MMIO).
         此处仅验证 device 访问不会 panic/crash.

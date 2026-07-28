@@ -1,4 +1,4 @@
-"""Regression: L2 cache → bytearray coherence for native batch.
+"""Regression: L2 cache ->bytearray coherence for native batch.
 
 Verifies that data written through the Python L2 cache path is correctly
 visible to the Rust native batch engine, and vice versa.
@@ -58,7 +58,7 @@ def test_l2_flush_preserves_full_64bit_pointer():
         # Write through L2
         emu.bus.write(pa, data)
 
-        # Flush → invalidate cycle (simulates one batch)
+        # Flush ->invalidate cycle (simulates one batch)
         emu.bus.flush_l2()
         emu.bus.invalidate_l2()
 

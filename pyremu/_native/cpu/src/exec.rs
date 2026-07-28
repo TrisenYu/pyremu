@@ -344,6 +344,10 @@ fn run_hart_slice(
         shadow_base: mem.shadow_base,
         shadow_size: mem.shadow_size,
         tlb_gen: std::ptr::null(),
+        itlb_hand: Cell::new(0),
+        dtlb_hand: Cell::new(0),
+        lr_reserved: std::ptr::null_mut(),
+        num_harts: 1,
     };
 
     // The round-robin loop above already splits the batch budget fairly

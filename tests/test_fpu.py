@@ -254,7 +254,7 @@ class TestFpLoadStore:
 
 class TestFsGatingAndFcsr:
     def test_fp_traps_when_fs_off(self, hart):
-        # 关闭 FS → FADD 应触发 IllInstr 陷态 (PC 跳转到 mtvec)。
+        # 关闭 FS ->FADD 应触发 IllInstr 陷态 (PC 跳转到 mtvec)。
         hart.mstatus_val = hart.mstatus_val & ~(0b11 << 13)
         hart.csrs["mtvec"].val = 0x8000_0000
         hart._fpr_bits[1] = _boxf(S1_0)
@@ -271,7 +271,7 @@ class TestFsGatingAndFcsr:
         assert (hart.mstatus_val >> 13) & 0b11 == 0b11
 
     def test_inexact_flag_accumulates(self, hart):
-        # 1.0 / 3.0 不精确 → NX (fflags bit 0)。
+        # 1.0 / 3.0 不精确 ->NX (fflags bit 0)。
         s0_333 = 0x3EAA_AAAB
         hart._fpr_bits[1] = _boxf(S1_0)
         hart._fpr_bits[2] = _boxf(S3_0)

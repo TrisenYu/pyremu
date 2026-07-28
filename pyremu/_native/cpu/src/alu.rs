@@ -290,6 +290,151 @@ mod tests {
     #[test] fn test_alu_ill_funct7(){ assert!(trap(exec_alu_op(0, 0x0F, 10, 5))); }
     #[test] fn test_alu_ill_funct3(){ assert!(trap(exec_alu_op(0xFF, 0, 10, 5))); }
 
+    // ---- REM 64-bit: verify full-width operands are NOT truncated ----
+    #[test] fn test_rem_positive_large() {
+        // 0x3FD9CEF920 fits in 33 bits; REM must use full 64-bit, not 32-bit.
+        assert_eq!(v(exec_alu_op(6, 1, 0x3FD9CEF920, 7)), 5);
+    }
+    #[test] fn test_rem_negative() {
+        // -10 % 3 = -1 in RISC-V (truncated division)
+        assert_eq!(v(exec_alu_op(6, 1, (-10i64) as u64, 3)),
+                   (-1i64) as u64);
+    }
+    #[test] fn test_rem_negative_divisor() {
+        assert_eq!(v(exec_alu_op(6, 1, 20, (-6i64) as u64)), 2);
+    }
+    #[test] fn test_rem_by_zero() {
+        // REM by zero: dividend is returned
+        assert_eq!(v(exec_alu_op(6, 1, 42, 0)), 42);
+    }
+    #[test] fn test_rem_overflow() {
+        // i64::MIN % -1 = 0
+        assert_eq!(v(exec_alu_op(6, 1, i64::MIN as u64, (-1i64) as u64)), 0);
+    }
+    #[test] fn test_remu_large() {
+        assert_eq!(v(exec_alu_op(7, 1, 0x3FD9CEF920, 7)), 5);
+    }
+    #[test] fn test_remu_by_zero() {
+        assert_eq!(v(exec_alu_op(7, 1, 42, 0)), 42);
+    }
+
+    // ---- REMW: 32-bit signed remainder with sign extension ----
+    #[test] fn test_remw_positive() {
+        assert_eq!(v(exec_op32(6, 1, 20, 6)), 2);
+    }
+    #[test] fn test_remw_negative_dividend() {
+        // -10 (as i32) % 3 = -1 -> sign-extended
+        assert_eq!(v(exec_op32(6, 1, (-10i64) as u64, 3)),
+                   (-1i64) as u64);
+    }
+    #[test] fn test_remw_sign_extend_negative_result() {
+        // w1 = 0xD9CEF920 as i32 = -640747232, w2 = 7
+        // -640747232 / 7 = -91535318.857 -> q=-91535318 (truncated)
+        // r = -640747232 - (-91535318 * 7) = -6
+        // Sign-extended to 0xFFFF_FFFF_FFFF_FFFA
+        assert_eq!(v(exec_op32(6, 1, 0x3FD9CEF920, 7)),
+                   0xFFFF_FFFF_FFFF_FFFAu64);
+    }
+    #[test] fn test_remw_by_zero() {
+        assert_eq!(v(exec_op32(6, 1, 42, 0)), 42);
+    }
+    #[test] fn test_remw_overflow() {
+        // i32::MIN % -1 = 0 -> sign-extended (i.e. 0)
+        assert_eq!(v(exec_op32(6, 1, i32::MIN as u64, (-1i64) as u64)), 0);
+    }
+
+    // ---- REMUW: 32-bit unsigned remainder, zero-extended ----
+    #[test] fn test_remuw_positive() {
+        assert_eq!(v(exec_op32(7, 1, 20, 6)), 2);
+    }
+    #[test] fn test_remuw_large_u32() {
+        // u1 = 0xD9CEF920 = 3654220064, u2 = 7
+        // 3654220064 / 7 = 522031437.714...
+        // 7 * 522031437 = 3654220059
+        // 3654220064 - 3654220059 = 5
+        assert_eq!(v(exec_op32(7, 1, 0x3FD9CEF920, 7)), 5);
+    }
+    #[test] fn test_remuw_by_zero() {
+        assert_eq!(v(exec_op32(7, 1, 42, 0)), 42);
+    }
+
+    // ---- Cross-validation: REM ≠ REMW for the crash-pattern value ----
+    #[test] fn test_rem_vs_remw_crash_value() {
+        let v1 = 0x3FD9CEF920u64; // the crash-pattern pointer from the stack
+        let v2 = 7u64;
+        let r64 = v(exec_alu_op(6, 1, v1, v2)); // REM: full 64-bit -> 5
+        let r32 = v(exec_op32(6, 1, v1, v2));   // REMW: lower 32-bit = 0xD9CEF920 = -640747232 -> -6 sext
+        assert_eq!(r64, 5);
+        assert_eq!(r32, 0xFFFF_FFFF_FFFF_FFFAu64);
+        // They MUST differ — if equal, the emulator confuses 32-bit and 64-bit ops
+        assert_ne!(r64, r32, "REM and REMW MUST differ for this operand — bit-width confusion?");
+    }
+
+    // ---- REM boundary: bit63=1 operands ----
+    #[test] fn test_rem_bit63_1_mod_positive() {
+        // -1 (all bits 1) % 3 = -1
+        assert_eq!(v(exec_alu_op(6, 1, u64::MAX, 3)), u64::MAX); // -1
+    }
+    #[test] fn test_rem_bit63_1_mod_negative() {
+        // -1 % -3 = -1
+        assert_eq!(v(exec_alu_op(6, 1, u64::MAX, (-3i64) as u64)), u64::MAX);
+    }
+    #[test] fn test_rem_positive_mod_negative() {
+        // 20 % -6 = 2
+        assert_eq!(v(exec_alu_op(6, 1, 20, (-6i64) as u64)), 2);
+    }
+    #[test] fn test_rem_negative_mod_negative() {
+        // -20 % -6 = -2
+        assert_eq!(v(exec_alu_op(6, 1, (-20i64) as u64, (-6i64) as u64)),
+                   (-2i64) as u64);
+    }
+
+    // ---- REMU boundary ----
+    #[test] fn test_remu_bit63_1() {
+        // u64::MAX % 3 = 0 (since u64::MAX = 2^64-1, and 2^64-1 % 3 = 0)
+        // Actually: u64::MAX = 0xFFFFFFFFFFFFFFFF = 18446744073709551615
+        // This is divisible by 3. Let me verify: 2^64 = 1 mod 3, so 2^64-1 = 0 mod 3. Yes.
+        assert_eq!(v(exec_alu_op(7, 1, u64::MAX, 3)), 0);
+    }
+
+    // ---- REMW boundary: bit31=1 in lower 32-bit ----
+    #[test] fn test_remw_bit31_1_mod_positive() {
+        // w1 = 0x80000000 = i32::MIN = -2147483648
+        // -2147483648 % 3 = -2 -> 0xFFFFFFFFFFFFFFFE
+        assert_eq!(v(exec_op32(6, 1, 0x8000_0000u64, 3)),
+                   0xFFFF_FFFF_FFFF_FFFEu64);
+    }
+    #[test] fn test_remw_bit31_1_mod_negative() {
+        // -2147483648 % -3 = -2
+        assert_eq!(v(exec_op32(6, 1, 0x8000_0000u64, (-3i64) as u64)),
+                   0xFFFF_FFFF_FFFF_FFFEu64);
+    }
+    #[test] fn test_remw_bit31_0_mod_negative() {
+        // w1 = 10 (bit31=0), -3 -> 10 % -3 = 1
+        assert_eq!(v(exec_op32(6, 1, 10, (-3i64) as u64)), 1);
+    }
+    #[test] fn test_remw_bit31_0_sign_extend_positive() {
+        // w1 = 0x7FFFFFFF (i32::MAX), w2 = 3
+        // 2147483647 % 3 = 1 -> stays as 1 (no sign extension needed)
+        assert_eq!(v(exec_op32(6, 1, 0x7FFF_FFFFu64, 3)), 1);
+    }
+
+    // ---- REMUW boundary: bit31=1 treated as unsigned ----
+    #[test] fn test_remuw_bit31_1() {
+        // u1 = 0x80000000u32 = 2147483648, u2 = 3
+        // 2147483648 % 3 = 2  -> result = 2 (zero-extended)
+        assert_eq!(v(exec_op32(7, 1, 0x8000_0000u64, 3)), 2);
+    }
+    #[test] fn test_remuw_contrast_remw_bit31_1() {
+        // Same lower 32 bits, but REMUW (unsigned) ≠ REMW (signed)
+        let v1 = 0x8000_0000u64;
+        let remw_r  = v(exec_op32(6, 1, v1, 3)); // signed:   -2147483648 % 3 = -2
+        let remuw_r = v(exec_op32(7, 1, v1, 3)); // unsigned:  2147483648 % 3 = 2
+        assert_eq!(remw_r,  0xFFFF_FFFF_FFFF_FFFEu64); // sign-extended -2
+        assert_eq!(remuw_r, 2);                          // zero-extended 2
+        assert_ne!(remw_r, remuw_r, "REMW ≠ REMUW for bit31=1 operand");
+    }
+
     #[test] fn test_addi()          { assert_eq!(v(exec_op_imm(0, 0, 10, 5)), 15); }
     #[test] fn test_addi_negative() { assert_eq!(v(exec_op_imm(0, 0, 10, (-2i64) as u64)), 8); }
     #[test] fn test_slti()          { assert_eq!(v(exec_op_imm(2, 0, 5, 10)), 1); }

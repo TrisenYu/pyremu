@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import os
 from array import array as _array
+from collections.abc import MutableMapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from loguru import logger
 
@@ -26,6 +27,7 @@ from pyremu._native import (
     native_available,
     pmp_check as _native_pmp_check,
 )
+from pyremu.utils.mask import mask64
 
 # PMP 配置位 (每 8-bit 条目中的位偏移)
 PMP_R = 0b0000_0001
@@ -75,7 +77,7 @@ def decode_napot(pmpaddr_val: int) -> tuple[int, int]:
         return (val >> 0) << 2, 8
     size = 1 << (trailing + 3)
     mask = (1 << trailing) - 1  # trailing 个 1
-    base = ((val & ~mask) << 2) & 0xFFFF_FFFF_FFFF_FFFF
+    base = mask64(((val & ~mask) << 2))
     return base, size
 
 
@@ -94,8 +96,8 @@ def _addr_in_range(addr: int, size: int, base: int, rsize: int) -> bool:
     """检查 [addr, addr+size) 是否完全落在 [base, base+rsize) 内."""
     if rsize == 0:
         return False
-    end = (addr + size - 1) & 0xFFFF_FFFF_FFFF_FFFF
-    rend = (base + rsize - 1) & 0xFFFF_FFFF_FFFF_FFFF
+    end = mask64((addr + size - 1))
+    rend = mask64((base + rsize - 1))
     return addr >= base and end <= rend
 
 
@@ -139,7 +141,7 @@ class Pmp:
 
     def __init__(
         self,
-        csrs: Mapping[str, Any],
+        csrs: MutableMapping[str, Any],
         num_entries: int = 16,
     ) -> None:
         self._csrs = csrs
@@ -309,7 +311,7 @@ class Pmp:
         reg_name = f"pmpaddr{idx}"
         if reg_name not in self._csrs:
             return 0
-        return self._csrs[reg_name].val & 0xFFFF_FFFF_FFFF_FFFF
+        return mask64(self._csrs[reg_name].val)
 
     def _match(
         self,

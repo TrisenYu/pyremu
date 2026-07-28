@@ -5,10 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "annotated-types==0.7.0",
+    "annotated-types==0.8.0",
     "coverage==7.15.0",
     "iniconfig==2.3.0",
-    "lief==0.17.6",
+    "lief==1.0.0",
     "loguru==0.7.3",
     "markdown-it-py==4.2.0",
     "mdurl==0.1.2",
@@ -28,7 +28,7 @@ dependencies = [
     "rich==15.0.0",
     "pytest-timeout==2.4.0",
     "ruff==0.15.20",
-    "typing-extensions==4.15.0",
+    "typing-extensions==4.16.0",
     "typing-inspection==0.4.2",
     "wcwidth==0.8.1",
 ]

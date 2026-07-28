@@ -24,7 +24,7 @@ endif
 NATIVE_SRC     = $(shell find $(NATIVE_DIR)/cpu $(NATIVE_DIR)/termio -type f -name '*.rs') \
                  $(NATIVE_DIR)/Cargo.toml $(NATIVE_DIR)/cpu/Cargo.toml $(NATIVE_DIR)/termio/Cargo.toml
 # ---- 路径配置 ----
-hart_num       = 4
+hart_num       = 2
 zsbl_fsbl      = $(firm_dir)/zsbl_fsbl_stub_cold_asm.bin
 fw_payload     = $(elf_dir)/custom_opensbi_fw_payload.elf
 fw_jump        = $(elf_dir)/custom_opensbi_fw_jump.elf
@@ -90,11 +90,28 @@ INITRD     ?=
 DISK       ?= $(third_party)/setup-rootfs/debootstrap/riscv-sd.ext4
 # ram / rdinit 可覆盖; 挂载 initramfs 时建议加大 RAM (全量驻留内存)。
 ram        ?= 2G
-rdinit     ?= /bin/sh
-# INITRD 非空时追加 --initrd 与 root=/dev/ram rdinit 引导参数。
-initrd_args = $(if $(INITRD),--initrd=$(INITRD) --bootargs="earlycon=sbi console=ttySIF0 keep_bootcon root=/dev/ram0 rw rdinit=$(rdinit)")
-# DISK 指向的镜像存在时追加 --disk (CLI 自动设置 root=/dev/vda ro 默认 bootargs)。
-disk_args   = $(if $(wildcard $(DISK)),--disk=$(DISK))
+rdinit     ?= /bin/bash
+# Rust native 引擎编译期配置
+TLB_ENTRIES ?= 256
+# ---- Kernel bootargs ----
+# dyndbg: dynamic debug 控制 (内核 pr_debug/dev_dbg), 可覆盖.
+#   +p 启用全部, func NAME +p 按函数, file PATH +p 按文件, 留空关闭.
+dyndbg         ?=
+# func run_init_process +p
+init           ?= /bin/zsh
+bootargs_extra ?=
+# norandmaps
+# nokaslr norandmaps
+_bootargs   = earlycon=sbi console=ttySIF0 nokaslr norandmaps
+# _bootargs  += dyndbg="$(dyndbg)"
+_bootargs  += root=/dev/vda rw
+_bootargs  += $(if $(init),init=$(init))
+_bootargs  += $(if $(INITRD),rdinit=$(rdinit)) $(bootargs_extra)
+bootargs_arg    = --bootargs='$(_bootargs)'
+# INITRD 非空时追加 --initrd (rdinit 已在 bootargs 中).
+initrd_args     = $(if $(INITRD),--initrd=$(INITRD))
+# DISK 指向的镜像存在时追加 --disk.
+disk_args       = $(if $(wildcard $(DISK)),--disk=$(DISK))
 
 # ---- 工具链参考 (供手动使用) ----
 opt-cc      = /opt/custom-llvm/bin/clang

@@ -1,8 +1,8 @@
 """验证跨核 TLB shootdown 同步 — tlb_sync 递增/递减原子模式.
 
-模拟 OpenSBI tlb_update → tlb_sync → tlb_entry_process 链:
-  - Hart 1 (发起者): amoadd 递增共享计数器 → MSIP → 自旋直到计数器归零
-  - Hart 0 (接收者): WFI 唤醒 → amoadd 递减同一计数器 → 回 WFI
+模拟 OpenSBI tlb_update ->tlb_sync ->tlb_entry_process 链:
+  - Hart 1 (发起者): amoadd 递增共享计数器 ->MSIP ->自旋直到计数器归零
+  - Hart 0 (接收者): WFI 唤醒 ->amoadd 递减同一计数器 ->回 WFI
   - 验证 Hart 1 最终看到计数器=0 且不会死锁
 
 这是 SMP boot 死锁 (ticket spinlock in sbi_fifo.qlock) 的简化版复现.
@@ -73,7 +73,7 @@ class TestTlbSyncCounter:
                     emu.bus.write(addr, wfi_raw)
 
     # ================================================================
-    #  Test 1: 基本场景 — H1 amoadd +1 → H0 amoadd -1
+    #  Test 1: 基本场景 — H1 amoadd +1 ->H0 amoadd -1
     # ================================================================
 
     def test_basic_amo_cross_hart_visibility(self):
@@ -115,7 +115,7 @@ class TestTlbSyncCounter:
     # ================================================================
 
     def test_wfi_wake_then_amo(self):
-        """Hart 0 WFI → Hart 1 写 MSIP → Hart 0 醒来执行 AMO → 验证结果."""
+        """Hart 0 WFI ->Hart 1 写 MSIP ->Hart 0 醒来执行 AMO ->验证结果."""
         cfg = PlatformConfig(num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024)
         emu = Emulator(cfg, bootargs="")
         h0, h1 = emu.harts
@@ -173,19 +173,19 @@ class TestTlbSyncCounter:
     def test_tlb_sync_simulation(self, use_native):
         """完整模拟 tlb_sync 协议在两个路径下.
 
-        H0 的代码布局: WFI → amoadd -1 → wfi
+        H0 的代码布局: WFI ->amoadd -1 ->wfi
         陷阱 handler 在 mtvec: mret (回到 WFI 的下一条 = amoadd)
 
         流程:
-          1. H0 执行 WFI → waiting
+          1. H0 执行 WFI ->waiting
           2. H1 通过 Bus.write 设置 MSIP[0] (模拟 sbi_ipi_send_many)
-          3. emu.step() → H0 醒来 → 陷阱 → mret → 执行 amoadd → 递减共享变量
-          4. H1 读共享变量 → 应为 0 (被 H0 递减后)
+          3. emu.step() ->H0 醒来 ->陷阱 ->mret ->执行 amoadd ->递减共享变量
+          4. H1 读共享变量 ->应为 0 (被 H0 递减后)
 
         NOTE: native 路径暂跳过 — Rust 批量引擎未实现 MSIP 投递后自动清零
         CLINT._msip (Python 路径在 _trap_deliver_mmode 中处理, 见
         trap_handler.py:285-300)。批量模式中 MSIP 在同一批次内重复触发,
-        导致 amoadd 被多次执行 → 计数器被错误递减。
+        导致 amoadd 被多次执行 ->计数器被错误递减。
         待 Rust 引擎同步 MSIP 自清零行为后重新启用。
         """
         if use_native:
@@ -206,13 +206,13 @@ class TestTlbSyncCounter:
             # tlb_sync 原始值 = 1 (模拟 H1 的 tlb_update 递增后)
             emu.bus.write(self.SHARED_ADDR, struct.pack("<I", 1))
 
-            # H0 代码: wfi → amoadd -1 → wfi
+            # H0 代码: wfi ->amoadd -1 ->wfi
             instr_dec = _encode_amoadd_w(rd=5, rs1=10, rs2=11)
             emu.bus.write(self.H0_BASE, struct.pack("<I", _encode_wfi()))     # +0
             emu.bus.write(self.H0_BASE + 4, struct.pack("<I", instr_dec))     # +4
             emu.bus.write(self.H0_BASE + 8, struct.pack("<I", _encode_wfi())) # +8
 
-            # H1 代码: nop → wfi
+            # H1 代码: nop ->wfi
             emu.bus.write(self.H1_BASE, struct.pack("<I", _encode_nop()))
             emu.bus.write(self.H1_BASE + 4, struct.pack("<I", _encode_wfi()))
 
@@ -231,8 +231,8 @@ class TestTlbSyncCounter:
 
             # --- 阶段 2: H1 发送 MSIP[0] (模拟 sbi_ipi_send_many) ---
             emu.bus.write(CLINT_BASE, struct.pack("<I", 1))
-            # 并发模型: H0 的 WFI 被 MSIP 唤醒 → 陷阱到 mtvec →
-            # mret → 回到 amoadd (+4) → 执行 amoadd → 下一个 wfi (+8)
+            # 并发模型: H0 的 WFI 被 MSIP 唤醒 ->陷阱到 mtvec →
+            # mret ->回到 amoadd (+4) ->执行 amoadd ->下一个 wfi (+8)
             # MSIP 此时必须清除, 否则第二个 wfi 会立即再次唤醒
             for _ in range(10):
                 emu.step()
@@ -310,7 +310,7 @@ class TestTlbSyncCounter:
         emu.step()
         assert struct.unpack("<I", emu.bus.read(self.SHARED_ADDR, 4))[0] == 1
 
-        # 第 2 次 (计数器从 1 → 0)
+        # 第 2 次 (计数器从 1 ->0)
         h0.pc = self.H0_BASE
         h0._waiting = True
         for _ in range(3):

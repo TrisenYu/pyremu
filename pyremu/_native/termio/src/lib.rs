@@ -8,8 +8,8 @@
 //! | `qemu_chr_set_echo_stdio(false)`    | raw-ish 模式: 关 ECHO/ICANON, 保留 OPOST/ISIG |
 //! | `term_exit` (atexit + finalize)     | 线程退出路径恢复 termios + 两个 fd 的阻塞标志  |
 //! | `term_stdio_handler` (SIGCONT)      | `sigcont_handler`: Ctrl+Z 恢复后重设 raw     |
-//! | `fd_chr_read_poll` → `can_write`    | RX 环形缓冲背压: 满时不读 stdin (留内核缓冲)  |
-//! | `fd_chr_write` → 非阻塞 `write(1)`   | TX drain: 块写 stdout, EAGAIN 时 POLLOUT 等待 |
+//! | `fd_chr_read_poll` ->`can_write`    | RX 环形缓冲容量控制: 满时不读 stdin (留内核缓冲)  |
+//! | `fd_chr_write` ->非阻塞 `write(1)`   | TX drain: 块写 stdout, EAGAIN 时 POLLOUT 等待 |
 //! | glib 事件循环 (fd 驱动)              | 5ms `poll` 轮询 (跨 cdylib 无共享 eventfd)   |
 //!
 //! # 单一 owner 原则 (QEMU chardev 的核心不变量)
@@ -49,7 +49,7 @@ pub struct TermIoHandle {
     pub rx_cap: u32,
     /// RX write index — I/O thread exclusive writer (monotonic u32).
     pub rx_wr: *mut AtomicU32,
-    /// RX read index — Python exclusive writer.  背压依据:
+    /// RX read index — Python exclusive writer.  容量控制依据:
     /// 剩余空间 = rx_cap - (rx_wr - rx_rd); 为 0 时线程停止读 stdin,
     /// 数据留在内核 tty 缓冲 (对照 QEMU fd_chr_read_poll 流控).
     pub rx_rd: *mut AtomicU32,
@@ -65,6 +65,8 @@ pub struct TermIoHandle {
     pub tx_drain: *mut AtomicU32,
     /// Stop flag — Python sets to 1 to request thread exit.
     pub stop_flag: *mut AtomicU8,
+    /// Pause flag — Python sets to 1 on debugger break, 0 to resume.
+    pub pause_flag: *mut AtomicU8,
 }
 
 // Safety: 所有指针由 Python (ctypes 数组) 持有并在线程生命周期内保持有效;
@@ -230,13 +232,28 @@ fn drain_tx(h: &TermIoHandle, chunk: &mut [u8]) {
     }
 }
 
+/// Read available data from stdin into RX ring buffer.  Returns false on EOF.
+fn read_stdin_to_rx(h: &TermIoHandle, free: usize, buf: &mut [u8]) -> (bool, usize) {
+    let n = unsafe { libc::read(h.stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, free.min(buf.len())) };
+    if n > 0 {
+        let mut wr = unsafe { &*h.rx_wr }.load(Ordering::Relaxed);
+        let rx = unsafe { std::slice::from_raw_parts_mut(h.rx_buf, h.rx_cap as usize) };
+        for &b in &buf[..n as usize] {
+            rx[(wr % h.rx_cap) as usize] = b;
+            wr = wr.wrapping_add(1);
+        }
+        unsafe { &*h.rx_wr }.store(wr, Ordering::Release);
+        return (true, n as usize);
+    }
+    (n != 0, 0) // n==0 -> EOF; n<0 -> EAGAIN, ignore
+}
+
 // ============================================================
 //  Thread entry point
 // ============================================================
 
 fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
     // QEMU 事件循环由 fd 驱动 (零延迟); 跨 cdylib 无共享 eventfd 可 poll,
-    // 以 5ms 轮询近似 — TX 排空最大延迟 5ms, 人眼不可感知。
     const POLL_MS: libc::c_int = 5;
 
     let stop = unsafe { &*h.stop_flag };
@@ -248,7 +265,7 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
     let mut stdin_eof = false;
 
     while stop.load(Ordering::Acquire) == 0 {
-        // ---- RX 背压 (对照 fd_chr_read_poll → qemu_chr_be_can_write):
+        // ---- RX 容量控制 (对照 fd_chr_read_poll ->qemu_chr_be_can_write):
         // 环形缓冲满时不监听 POLLIN, 数据自然滞留在内核 tty 缓冲。
         let used = rx_wr
             .load(Ordering::Relaxed)
@@ -271,37 +288,15 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
             break;
         }
 
-        // ---- 读 stdin → RX 环形缓冲 (对照 fd_chr_read) ----
-        if nfds == 1 && ret > 0 {
-            if (pfd.revents & libc::POLLIN) != 0 {
-                let want = free.min(stdin_buf.len());
-                let n = unsafe {
-                    libc::read(
-                        h.stdin_fd,
-                        stdin_buf.as_mut_ptr() as *mut libc::c_void,
-                        want,
-                    )
-                };
-                if n > 0 {
-                    let mut wr = rx_wr.load(Ordering::Relaxed);
-                    let rx = unsafe {
-                        std::slice::from_raw_parts_mut(h.rx_buf, rx_cap as usize)
-                    };
-                    for &b in &stdin_buf[..n as usize] {
-                        rx[(wr % rx_cap) as usize] = b;
-                        wr = wr.wrapping_add(1);
-                    }
-                    rx_wr.store(wr, Ordering::Release);
-                } else if n == 0 {
-                    stdin_eof = true; // 管道输入耗尽: 停止监听, 避免 POLLIN 热自旋
-                }
-                // n < 0 (EAGAIN): 非阻塞 stdin 无数据, 忽略
-            } else if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
-                stdin_eof = true;
-            }
+        // ---- read stdin -> RX ring buffer (参照 fd_chr_read) ----
+        if nfds == 1 && ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
+            let (ok, _) = read_stdin_to_rx(&h, free, &mut stdin_buf);
+            stdin_eof = !ok;
+        } else if nfds == 1 && ret > 0 {
+            stdin_eof = true;
         }
 
-        // ---- TX 环形缓冲 → stdout ----
+        // ---- TX 环形缓冲 ->stdout ----
         drain_tx(&h, &mut chunk);
     }
 
@@ -316,15 +311,58 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
     }
 }
 
+/// Simple I/O thread — no terminal setup (Python cbreak manages it).
+/// Supports pause via ``pause_flag`` for debugger break/resume.
+fn termio_thread_simple(h: TermIoHandle) {
+    const POLL_MS: libc::c_int = 5;
+    let stop = unsafe { &*h.stop_flag };
+    let pause: *const AtomicU8 = h.pause_flag;
+    let rx_wr = unsafe { &*h.rx_wr };
+    let rx_rd = unsafe { &*h.rx_rd };
+    let rx_cap = h.rx_cap;
+    let mut stdin_buf = [0u8; 1024];
+    let mut chunk = [0u8; 4096];
+    let mut stdin_eof = false;
+
+    while stop.load(Ordering::Acquire) == 0 {
+        // ---- debugger pause: sleep, skip I/O ----
+        if !pause.is_null() && unsafe { &*pause }.load(Ordering::Acquire) != 0 {
+            std::thread::sleep(std::time::Duration::from_millis(POLL_MS as u64));
+            continue;
+        }
+        // ---- RX backpressure ----
+        let used = rx_wr.load(Ordering::Relaxed).wrapping_sub(rx_rd.load(Ordering::Acquire));
+        let free = rx_cap.saturating_sub(used) as usize;
+        let mut pfd = libc::pollfd { fd: h.stdin_fd, events: libc::POLLIN, revents: 0 };
+        let nfds: libc::nfds_t = if !stdin_eof && free > 0 && rx_cap > 0 { 1 } else { 0 };
+        let ret = unsafe { libc::poll(&mut pfd, nfds, POLL_MS) };
+        if ret < 0 {
+            if unsafe { *libc::__errno_location() } == libc::EINTR { continue; }
+            break;
+        }
+        // ---- read stdin -> RX ring buffer (参照 fd_chr_read) ----
+        if nfds == 1 && ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
+            let (ok, _) = read_stdin_to_rx(&h, free, &mut stdin_buf);
+            stdin_eof = !ok;
+        } else if nfds == 1 && ret > 0 {
+            stdin_eof = true;
+        }
+        // ---- TX ring buffer -> stdout ----
+        drain_tx(&h, &mut chunk);
+    }
+    // final drain
+    drain_tx(&h, &mut chunk);
+}
+
 // ============================================================
 //  FFI entry points
 // ============================================================
 
 /// Start the terminal I/O background thread.
 ///
-/// 对照 `qemu_chr_open_stdio`: 保存 termios/fcntl → stdin/stdout 非阻塞 →
-/// raw-ish 模式 (关 ECHO/ICANON/IEXTEN + ICRNL/IXON, 保留 OPOST 与 ISIG) →
-/// 安装 SIGCONT handler → 启动 I/O 线程。
+/// 对照 `qemu_chr_open_stdio`: 保存 termios/fcntl ->stdin/stdout 非阻塞 ->
+/// raw-ish 模式 (关 ECHO/ICANON/IEXTEN + ICRNL/IXON, 保留 OPOST 与 ISIG) ->
+/// 安装 SIGCONT handler ->启动 I/O 线程。
 ///
 /// Returns 0 on success, -1 if already running or stdin is not a TTY.
 /// Caller must ensure `handle` points to a valid `TermIoHandle` whose
@@ -355,6 +393,7 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
         tx_wr: h.tx_wr,
         tx_drain: h.tx_drain,
         stop_flag: h.stop_flag,
+        pause_flag: h.pause_flag,
     };
 
     // ---- term_init ----
@@ -375,7 +414,7 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
     // raw-ish 模式, 始终从 oldtty 副本重新计算 (幂等, 无漂移):
     // 逐位对照 qemu_chr_set_echo_stdio(echo=false)。
     let mut raw = oldtty;
-    // QEMU 清除 ICRNL (依赖客机 tty 层做 \r→\n 转换), 但在 pyremu
+    // QEMU 清除 ICRNL (依赖客机 tty 层做 \r->\n 转换), 但在 pyremu
     // 客机串口控制台可能未正确初始化 ICRNL (如 dash 作为 PID 1 运行且无
     // devtmpfs 时), 导致 Enter 键的 \r 不被识别为行终止符 — 用户需按两次
     // 回车才能触发命令执行。保留 ICRNL 由宿主机内核完成转换, 消除此问题。
@@ -385,10 +424,10 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
         | libc::ISTRIP
         | libc::INLCR
         | libc::IGNCR
-        // ICRNL 保留: 宿主机将 \r→\n, 客机收到 \n 即可行终止
+        // ICRNL 保留: 宿主机将 \r->\n, 客机收到 \n 即可行终止
         | libc::IXON);
-    raw.c_oflag |= libc::OPOST; // 保留输出后处理: '\n' → CRLF
-    // 保留 ISIG (对照 QEMU stdio 默认 signal=on): Ctrl+C → SIGINT → 调试器暂停回 REPL
+    raw.c_oflag |= libc::OPOST; // 保留输出后处理: '\n' ->CRLF
+    // 保留 ISIG (对照 QEMU stdio 默认 signal=on): Ctrl+C ->SIGINT ->调试器暂停回 REPL
     raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::IEXTEN);
     raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
     raw.c_cflag |= libc::CS8;
@@ -414,6 +453,28 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
     let jh = std::thread::spawn(move || {
         termio_thread(hc, saved);
     });
+    *THREAD_HANDLE.lock().unwrap() = Some(jh);
+    0
+}
+
+/// Attach I/O thread to already-configured fds — no termios changes.
+/// Terminal mode (cbreak) is managed by Python; this just reads/writes.
+#[no_mangle]
+pub extern "C" fn terminal_io_attach(handle: *const TermIoHandle) -> i32 {
+    if handle.is_null() { return -1; }
+    {
+        let guard = THREAD_HANDLE.lock().unwrap();
+        if guard.is_some() { return -1; }
+    }
+    let h = unsafe { &*handle };
+    let hc = TermIoHandle {
+        stdin_fd: h.stdin_fd, stdout_fd: h.stdout_fd,
+        rx_buf: h.rx_buf, rx_cap: h.rx_cap, rx_wr: h.rx_wr, rx_rd: h.rx_rd,
+        tx_buf: h.tx_buf, tx_cap: h.tx_cap, tx_wr: h.tx_wr, tx_drain: h.tx_drain,
+        stop_flag: h.stop_flag, pause_flag: h.pause_flag,
+    };
+    STOP_PTR.store(hc.stop_flag, Ordering::Release);
+    let jh = std::thread::spawn(move || { termio_thread_simple(hc); });
     *THREAD_HANDLE.lock().unwrap() = Some(jh);
     0
 }
@@ -458,7 +519,7 @@ mod tests {
     /// (pyremu/_native/__init__.py)。修改任一侧必须同步另一侧。
     #[test]
     fn test_handle_layout_locked() {
-        assert_eq!(size_of::<TermIoHandle>(), 80);
+        assert_eq!(size_of::<TermIoHandle>(), 88);
         assert_eq!(offset_of!(TermIoHandle, stdin_fd), 0);
         assert_eq!(offset_of!(TermIoHandle, stdout_fd), 4);
         assert_eq!(offset_of!(TermIoHandle, rx_buf), 8);
@@ -470,6 +531,7 @@ mod tests {
         assert_eq!(offset_of!(TermIoHandle, tx_wr), 56);
         assert_eq!(offset_of!(TermIoHandle, tx_drain), 64);
         assert_eq!(offset_of!(TermIoHandle, stop_flag), 72);
+        assert_eq!(offset_of!(TermIoHandle, pause_flag), 80);
     }
 
     #[test]
@@ -489,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_gather_tx_chunk_ring_wrap() {
-        // 索引跨越 ecap 边界: 条目 6,7,8,9 → 槽位 6,7,0,1
+        // 索引跨越 ecap 边界: 条目 6,7,8,9 ->槽位 6,7,0,1
         let ecap = 8u32;
         let mut buf = vec![0u8; (ecap as usize) * 2];
         for (i, ch) in [(6usize, b'w'), (7, b'x'), (0, b'y'), (1, b'z')] {
@@ -503,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_gather_tx_chunk_u32_wraparound() {
-        // 索引跨越 u32 环绕: drain=0xFFFF_FFFE, wr=2 → 4 个条目
+        // 索引跨越 u32 环绕: drain=0xFFFF_FFFE, wr=2 ->4 个条目
         // ecap 为 2 的幂 ⇒ 0xFFFF_FFFE % 8 = 6, 槽位连续 6,7,0,1
         let ecap = 8u32;
         let mut buf = vec![0u8; (ecap as usize) * 2];

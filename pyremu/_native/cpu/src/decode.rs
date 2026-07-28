@@ -233,8 +233,8 @@ fn imm_c2(h: u64, funct3: u8, bit12: u8, bits_6_2: u64) -> (u64, u64) {
             ((h >> 2) & 0x7) << 6 | ((h >> 12) & 0x1) << 5 | ((h >> 5) & 0x3) << 3
         }
         2 => {
-            // C.LWSP: uimm[5|4:2|7:6]
-            ((h >> 5) & 0x3) << 6 | ((h >> 12) & 0x1) << 5 | ((h >> 2) & 0x7) << 2
+            // C.LWSP: uimm[7:6|5|4:2]
+            ((h >> 2) & 0x3) << 6 | ((h >> 12) & 0x1) << 5 | ((h >> 4) & 0x7) << 2
         }
         _ => 0,
     };
@@ -541,6 +541,7 @@ mod tests {
         assert_eq!(f.quadrant, 2);
         assert_eq!(f.funct3, 2); // C.LWSP
         assert_eq!(f.rd, 10);
+        assert_eq!(f.imm, 4);    // offset 4
     }
 
     #[test]
@@ -572,5 +573,580 @@ mod tests {
         assert_eq!(f.rd, 15);
         assert_eq!(f.rs1p, 8);
         assert_eq!(f.imm, 0);
+    }
+
+    // ============================================================
+    //  llvm-mc verified encoding tests — all encodings confirmed
+    //  against /opt/custom-llvm/bin/llvm-mc output.
+    //  These lock down every compressed-instruction immediate decoder
+    //  to prevent regressions like the C.LWSP offset bug.
+    // ============================================================
+
+    // ---- C0 quadrant (00) ----
+
+    #[test]
+    fn c0_addi4spn_16() {
+        // c.addi4spn x8, sp, 16 -> 0x0800
+        let f = decode_compressed(0x0800);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 0);
+        assert_eq!(f.rdp, 8);    // x8 = s0
+        assert_eq!(f.imm, 16);
+    }
+
+    #[test]
+    fn c0_addi4spn_1020() {
+        // c.addi4spn x15, sp, 1020 -> 0x1ffc (max nzuimm)
+        let f = decode_compressed(0x1ffc);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 0);
+        assert_eq!(f.rdp, 15);   // x15 = a5
+        assert_eq!(f.imm, 1020);
+    }
+
+    #[test]
+    fn c0_lw_zero_offset() {
+        // c.lw x8, 0(x10) -> 0x4100
+        let f = decode_compressed(0x4100);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 2);  // C.LW
+        assert_eq!(f.rdp, 8);     // x8
+        assert_eq!(f.rs1p, 10);   // x10 = a0
+        assert_eq!(f.imm, 0);
+    }
+
+    #[test]
+    fn c0_lw_max_offset() {
+        // c.lw x15, 124(x15) -> 0x5ffc (max uimm=124)
+        let f = decode_compressed(0x5ffc);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 2);
+        assert_eq!(f.imm, 124);
+    }
+
+    #[test]
+    fn c0_ld_zero_offset() {
+        // c.ld x8, 0(x10) -> 0x6100
+        let f = decode_compressed(0x6100);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 3);  // C.LD
+        assert_eq!(f.imm, 0);
+    }
+
+    #[test]
+    fn c0_ld_max_offset() {
+        // c.ld x15, 248(x15) -> 0x7ffc (max uimm=248)
+        let f = decode_compressed(0x7ffc);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 3);
+        assert_eq!(f.imm, 248);
+    }
+
+    #[test]
+    fn c0_sw_zero_offset() {
+        // c.sw x8, 0(x10) -> 0xc100
+        let f = decode_compressed(0xc100);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 6);  // C.SW
+        assert_eq!(f.rdp, 8);     // rs2'
+        assert_eq!(f.imm, 0);
+    }
+
+    #[test]
+    fn c0_sw_max_offset() {
+        // c.sw x9, 124(x15) -> 0xdfe4 (max offset)
+        let f = decode_compressed(0xdfe4);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 6);
+        assert_eq!(f.imm, 124);
+    }
+
+    #[test]
+    fn c0_sd_zero_offset() {
+        // c.sd x8, 0(x10) -> 0xe100
+        let f = decode_compressed(0xe100);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 7);  // C.SD
+        assert_eq!(f.imm, 0);
+    }
+
+    #[test]
+    fn c0_sd_max_offset() {
+        // c.sd x9, 248(x15) -> 0xffe4 (max offset)
+        let f = decode_compressed(0xffe4);
+        assert_eq!(f.quadrant, 0);
+        assert_eq!(f.funct3, 7);
+        assert_eq!(f.imm, 248);
+    }
+
+    // ---- C1 quadrant (01) ----
+
+    #[test]
+    fn c1_nop() {
+        // c.nop -> 0x0001
+        let f = decode_compressed(0x0001);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 0);  // C.ADDI rd=0, imm=0
+        assert_eq!(f.rd, 0);
+        assert_eq!(f.imm, 0);
+    }
+
+    #[test]
+    fn c1_addi_pos() {
+        // c.addi x5, 3 -> 0x028d
+        let f = decode_compressed(0x028d);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 0);
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.imm, 3);
+    }
+
+    #[test]
+    fn c1_addi_neg32() {
+        // c.addi x10, -32 -> 0x1501
+        let f = decode_compressed(0x1501);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 0);
+        assert_eq!(f.rd, 10);
+        // -32 as 6-bit sign-extended -> 0xFFFF_FFFF_FFFF_FFE0 as u64
+        assert_eq!(f.imm, 0xFFFF_FFFF_FFFF_FFE0u64);
+    }
+
+    #[test]
+    fn c1_addiw() {
+        // c.addiw x5, -2 -> 0x32f9
+        let f = decode_compressed(0x32f9);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 1);  // C.ADDIW
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.imm, 0xFFFF_FFFF_FFFF_FFFEu64); // -2
+    }
+
+    #[test]
+    fn c1_li_max() {
+        // c.li x5, 31  -> 0x42fd
+        let f = decode_compressed(0x42fd);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 2);  // C.LI
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.imm, 31);
+    }
+
+    #[test]
+    fn c1_li_min() {
+        // c.li x10, -32 -> 0x5501
+        let f = decode_compressed(0x5501);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 2);
+        assert_eq!(f.rd, 10);
+        assert_eq!(f.imm, 0xFFFF_FFFF_FFFF_FFE0u64); // -32
+    }
+
+    #[test]
+    fn c1_lui_1() {
+        // c.lui x5, 1 -> 0x6285
+        let f = decode_compressed(0x6285);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 3);
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.imm, 1);
+    }
+
+    #[test]
+    fn c1_lui_31() {
+        // c.lui x10, 31 -> 0x657d
+        let f = decode_compressed(0x657d);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 3);
+        assert_eq!(f.rd, 10);
+        assert_eq!(f.imm, 31);
+    }
+
+    #[test]
+    fn c1_addi16sp_neg16() {
+        // c.addi16sp sp, -16 -> 0x717d
+        let f = decode_compressed(0x717d);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 3);
+        assert_eq!(f.rd, 2);     // sp
+        assert_eq!(f.imm, 0xFFFF_FFFF_FFFF_FFF0u64); // -16
+    }
+
+    #[test]
+    fn c1_addi16sp_pos496() {
+        // c.addi16sp sp, 496 -> 0x617d
+        let f = decode_compressed(0x617d);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 3);
+        assert_eq!(f.rd, 2);
+        assert_eq!(f.imm, 496);
+    }
+
+    #[test]
+    fn c1_srli() {
+        // c.srli x8, 3 -> 0x800d
+        let f = decode_compressed(0x800d);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 4);  // MISC-ALU
+        assert_eq!(f.sf, 0);      // SRLI
+        assert_eq!(f.rs1p, 8);    // rd' = x8
+        assert_eq!(f.bit12, 0);   // shamt[5]=0
+        // shamt is bit12<<5 | bits[6:2]; imm=0 for funct3=4 (not decoded in imm_c1)
+    }
+
+    #[test]
+    fn c1_srai() {
+        // c.srai x9, 4 -> 0x8491
+        let f = decode_compressed(0x8491);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 4);
+        assert_eq!(f.sf, 1);      // SRAI
+        assert_eq!(f.rs1p, 9);
+    }
+
+    #[test]
+    fn c1_andi() {
+        // c.andi x10, -1 -> 0x997d
+        let f = decode_compressed(0x997d);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 4);
+        assert_eq!(f.sf, 2);      // ANDI
+        assert_eq!(f.rs1p, 10);
+        assert_eq!(f.bit12, 1);   // imm[5]=1 for -1
+    }
+
+    #[test]
+    fn c1_sub() {
+        // c.sub x11, x12 -> 0x8d91
+        let f = decode_compressed(0x8d91);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 4);
+        assert_eq!(f.sf, 3);      // register ops
+        assert_eq!(f.bit12, 0);   // not RV64C
+        assert_eq!(f.bit65, 0);   // SUB
+        assert_eq!(f.rs1p, 11);   // rd' = x11
+        assert_eq!(f.rdp, 12);    // rs2' = x12
+    }
+
+    #[test]
+    fn c1_xor() {
+        // c.xor x11, x12 -> 0x8db1
+        let f = decode_compressed(0x8db1);
+        assert_eq!(f.bit65, 1);   // XOR
+    }
+
+    #[test]
+    fn c1_or() {
+        // c.or x11, x12 -> 0x8dd1
+        let f = decode_compressed(0x8dd1);
+        assert_eq!(f.bit65, 2);   // OR
+    }
+
+    #[test]
+    fn c1_and() {
+        // c.and x11, x12 -> 0x8df1
+        let f = decode_compressed(0x8df1);
+        assert_eq!(f.bit65, 3);   // AND
+    }
+
+    #[test]
+    fn c1_subw() {
+        // c.subw x13, x14 -> 0x9e99
+        let f = decode_compressed(0x9e99);
+        assert_eq!(f.sf, 3);
+        assert_eq!(f.bit12, 1);   // RV64C
+        assert_eq!(f.bit65, 0);   // SUBW
+        assert_eq!(f.rs1p, 13);
+        assert_eq!(f.rdp, 14);
+    }
+
+    #[test]
+    fn c1_addw() {
+        // c.addw x13, x14 -> 0x9eb9
+        let f = decode_compressed(0x9eb9);
+        assert_eq!(f.sf, 3);
+        assert_eq!(f.bit12, 1);
+        assert_eq!(f.bit65, 1);   // ADDW
+    }
+
+    #[test]
+    fn c1_j_forward() {
+        // c.j .+2 -> 0xa001 gives imm=0; real forward jump from objdump is 0xa009
+        let f = decode_compressed(0xa009);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 5);  // C.J
+        assert_eq!(f.imm, 2);     // offset = 2
+    }
+
+    #[test]
+    fn c1_beqz_taken() {
+        // c.beqz x10, .+2 -> 0xc109
+        let f = decode_compressed(0xc109);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 6);  // C.BEQZ
+        assert_eq!(f.rs1p, 10);   // x10 = a0
+    }
+
+    #[test]
+    fn c1_bnez() {
+        // c.bnez x10, .+2 -> 0xe109
+        let f = decode_compressed(0xe109);
+        assert_eq!(f.quadrant, 1);
+        assert_eq!(f.funct3, 7);  // C.BNEZ
+        assert_eq!(f.rs1p, 10);
+    }
+
+    // ---- C2 quadrant (10) ----
+
+    #[test]
+    fn c2_slli_63() {
+        // c.slli x10, 63 -> 0x157e
+        let f = decode_compressed(0x157e);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 0);  // C.SLLI
+        assert_eq!(f.rd, 10);
+        assert_eq!(f.imm, 63);
+    }
+
+    #[test]
+    fn c2_lwsp_regression_zsh_crash() {
+        // c.lwsp x18, 4(sp) -> 0x4912
+        // THIS IS THE ZSH CRASH BUG — the old decoder produced offset 16
+        // instead of 4, loading saved s2 (-560) instead of the correct value.
+        let f = decode_compressed(0x4912);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 2);  // C.LWSP
+        assert_eq!(f.rd, 18);     // x18 = s2
+        assert_eq!(f.imm, 4);     // offset 4 (NOT 16!)
+    }
+
+    #[test]
+    fn c2_lwsp_max_offset() {
+        // c.lwsp x10, 252(sp) -> 0x557e
+        let f = decode_compressed(0x557e);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 2);
+        assert_eq!(f.rd, 10);
+        assert_eq!(f.imm, 252);
+    }
+
+    #[test]
+    fn c2_ldsp_8() {
+        // c.ldsp x5, 8(sp) -> 0x62a2
+        let f = decode_compressed(0x62a2);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 3);  // C.LDSP
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.imm, 8);
+    }
+
+    #[test]
+    fn c2_ldsp_504() {
+        // c.ldsp x10, 504(sp) -> 0x757e (max offset for LDSP)
+        let f = decode_compressed(0x757e);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 3);
+        assert_eq!(f.rd, 10);
+        assert_eq!(f.imm, 504);
+    }
+
+    #[test]
+    fn c2_mv() {
+        // c.mv x5, x10 -> 0x82aa
+        let f = decode_compressed(0x82aa);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 4);
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.rs2, 10);
+        assert_eq!(f.bit12, 0);   // C.MV
+    }
+
+    #[test]
+    fn c2_add() {
+        // c.add x5, x10 -> 0x92aa
+        let f = decode_compressed(0x92aa);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 4);
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.rs2, 10);
+        assert_eq!(f.bit12, 1);   // C.ADD
+    }
+
+    #[test]
+    fn c2_ebreak() {
+        // c.ebreak -> 0x9002
+        let f = decode_compressed(0x9002);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 4);
+        assert_eq!(f.rd, 0);
+        assert_eq!(f.rs2, 0);
+    }
+
+    #[test]
+    fn c2_swsp_zero() {
+        // c.swsp x5, 0(sp) -> 0xc016
+        let f = decode_compressed(0xc016);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 6);  // C.SWSP
+        assert_eq!(f.rs2, 5);
+        assert_eq!(f.imm2, 0);    // store offset in imm2
+    }
+
+    #[test]
+    fn c2_swsp_max_offset() {
+        // c.swsp x10, 252(sp) -> 0xdfaa
+        let f = decode_compressed(0xdfaa);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 6);
+        assert_eq!(f.imm2, 252);
+    }
+
+    #[test]
+    fn c2_sdsp_8() {
+        // c.sdsp x5, 8(sp) -> 0xe416
+        let f = decode_compressed(0xe416);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 7);  // C.SDSP
+        assert_eq!(f.rs2, 5);
+        assert_eq!(f.imm2, 8);
+    }
+
+    #[test]
+    fn c2_sdsp_max_offset() {
+        // c.sdsp x10, 504(sp) -> 0xffaa
+        let f = decode_compressed(0xffaa);
+        assert_eq!(f.quadrant, 2);
+        assert_eq!(f.funct3, 7);
+        assert_eq!(f.imm2, 504);
+    }
+
+    // ---- 32-bit instruction field extractions (llvm-mc verified) ----
+
+    #[test]
+    fn rv32_addw_opcode() {
+        // addw x5, x10, x11 -> 0x00b502bb (opcode 0x3B)
+        let f = decode_fields(0x00b502bb);
+        assert_eq!(f.opcode, 0x3B);
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.func3, 0);
+        assert_eq!(f.func7, 0);  // ADDW func7=0
+    }
+
+    #[test]
+    fn rv32_subw_func7() {
+        // subw x6, x10, x11 -> 0x40b5033b
+        let f = decode_fields(0x40b5033b);
+        assert_eq!(f.opcode, 0x3B);
+        assert_eq!(f.rd, 6);
+        assert_eq!(f.func3, 0);
+        assert_eq!(f.func7, 0x20);  // SUBW func7=0b0100000
+    }
+
+    #[test]
+    fn rv32_addiw_opcode() {
+        // addiw x5, x10, 42 -> 0x02a5029b (opcode 0x1B)
+        let f = decode_fields(0x02a5029b);
+        assert_eq!(f.opcode, 0x1B);
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.func3, 0);
+        assert_eq!(f.imm12_se, 42);
+    }
+
+    #[test]
+    fn rv32_slliw() {
+        // slliw x6, x10, 3 -> 0x0035131b
+        let f = decode_fields(0x0035131b);
+        assert_eq!(f.opcode, 0x1B);
+        assert_eq!(f.func3, 1);  // SLLIW
+        assert_eq!(f.imm12_se, 3);
+    }
+
+    #[test]
+    fn rv32_sraiw() {
+        // sraiw x8, x10, 4 -> 0x4045541b
+        let f = decode_fields(0x4045541b);
+        assert_eq!(f.opcode, 0x1B);
+        assert_eq!(f.func3, 5);  // SRAIW
+    }
+
+    #[test]
+    fn store_sd_neg_offset() {
+        // sd x9, -8(x10) -> 0xfe953c23
+        let f = decode_fields(0xfe953c23);
+        assert_eq!(f.opcode, 0x23);
+        assert_eq!(f.func3, 3);  // SD
+        // imm_s = -8 as sign-extended 12-bit
+        assert_eq!(f.imm_s, 0xFFFF_FFFF_FFFF_FFF8u64);
+    }
+
+    #[test]
+    fn load_ld_neg_offset() {
+        // ld x14, -8(x10) -> 0xff853703
+        let f = decode_fields(0xff853703);
+        assert_eq!(f.opcode, 0x03);
+        assert_eq!(f.func3, 3);  // LD
+        assert_eq!(f.imm12_se, 0xFFFF_FFFF_FFFF_FFF8u64); // -8
+    }
+
+    #[test]
+    fn fence_i_func3() {
+        // fence.i -> 0x0000100f
+        let f = decode_fields(0x0000100f);
+        assert_eq!(f.opcode, 0x0F);
+        assert_eq!(f.func3, 1);  // FENCE.I
+    }
+
+    #[test]
+    fn csr_mstatus_addr() {
+        // csrrw x5, mstatus, x10 -> 0x300512f3
+        let f = decode_fields(0x300512f3);
+        assert_eq!(f.opcode, 0x73);
+        assert_eq!(f.func3, 1);  // CSRRW
+        assert_eq!(f.imm12_se, 0x300);  // mstatus CSR address
+    }
+
+    #[test]
+    fn csr_csrrsi() {
+        // csrrsi x9, mstatus, 0x1f -> 0x300fe4f3
+        let f = decode_fields(0x300fe4f3);
+        assert_eq!(f.func3, 6);  // CSRRSI
+        assert_eq!(f.rd, 9);
+        assert_eq!(f.rs1, 31);   // uimm
+    }
+
+    #[test]
+    fn amo_lrw_fields() {
+        // lr.w x5, (x10) -> 0x100522af
+        let f = decode_fields(0x100522af);
+        assert_eq!(f.opcode, 0x2F);
+        assert_eq!(f.func3, 2);  // .W
+        assert_eq!(f.rd, 5);
+        assert_eq!(f.rs1, 10);
+        assert_eq!(f.func7 >> 2, 0b00010);  // LR funct5
+    }
+
+    #[test]
+    fn amo_amoxor_w() {
+        // amoxor.w x13, x11, (x10) -> 0x20b526af
+        let f = decode_fields(0x20b526af);
+        assert_eq!(f.opcode, 0x2F);
+        assert_eq!(f.func3, 2);
+        assert_eq!(f.func7 >> 2, 0b00100);  // AMOXOR funct5
+    }
+
+    #[test]
+    fn amo_amomaxu_w() {
+        // amomaxu.w x19, x11, (x10) -> 0xe0b529af
+        let f = decode_fields(0xe0b529af);
+        assert_eq!(f.func7 >> 2, 0b11100);  // AMOMAXU funct5
+    }
+
+    #[test]
+    fn amo_amoadd_d() {
+        // amoadd.d x20, x11, (x10) -> 0x00b53a2f
+        let f = decode_fields(0x00b53a2f);
+        assert_eq!(f.opcode, 0x2F);
+        assert_eq!(f.func3, 3);  // .D
+        assert_eq!(f.func7 >> 2, 0b00000);  // AMOADD funct5
     }
 }

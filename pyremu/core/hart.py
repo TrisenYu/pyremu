@@ -30,6 +30,7 @@ from pyremu.core.registers import (
 from pyremu.memory.cache import TLB_SIZE
 from pyremu.memory.pmp import Pmp
 from pyremu.memory.tlb import TLB
+from pyremu.utils.mask import mask64, mask32
 
 if TYPE_CHECKING:
     from pyremu.interrupt.controller import InterruptController
@@ -58,7 +59,7 @@ class GprFile:
     def __setitem__(self, idx: int, val: int) -> None:
         i = idx & 0x1F
         if i != 0:
-            self._r[i] = val & 0xFFFF_FFFF_FFFF_FFFF
+            self._r[i] = mask64(val)
 
     def __iter__(self):
         return iter(self._r)
@@ -277,7 +278,7 @@ class HartWithRegs:
         if csr_name == "time" and self._interrupt_ctrl is not None:
             return self._interrupt_ctrl.get_mtime()
         if csr_name == "timeh" and self._interrupt_ctrl is not None:
-            return (self._interrupt_ctrl.get_mtime() >> 32) & 0xFFFF_FFFF
+            return mask32(self._interrupt_ctrl.get_mtime() >> 32)
         # sstatus 是 mstatus 的受限视图, 读取 sstatus 时返回 mstatus 的对应位
         if csr_name == "sstatus":
             mval = self._csr_read_raw("mstatus")
@@ -305,7 +306,7 @@ class HartWithRegs:
         """
         csr = self.csrs[csr_name]
         assert csr is not None, f"CSR {csr_name!r} not found in hart {self.id}"
-        csr.__dict__["val"] = val & 0xFFFF_FFFF_FFFF_FFFF  # type: ignore[index]  # pydantic MappingProxyType vs runtime dict
+        csr.__dict__["val"] = mask64(val)# type: ignore[index]  # pydantic MappingProxyType vs runtime dict
         if csr_name in self._INT_SENSITIVE_CSRS:
             self._int_state_version += 1
 
@@ -339,10 +340,10 @@ class HartWithRegs:
                 self._interrupt_ctrl.set_mtimecmp(self.id, val)
         elif csr_name == "stimecmph":
             # RV32 only: stimecmp 高 32 位 (RV64 上 stimecmp 已是 64-bit)
-            cur = self._csr_read_raw("stimecmp") & 0xFFFF_FFFF
-            merged = cur | ((val & 0xFFFF_FFFF) << 32)
+            cur = mask32(self._csr_read_raw("stimecmp"))
+            merged = cur | (mask32(val) << 32)
             self._csr_write_raw("stimecmp", merged)
-            self._csr_write_raw(csr_name, val & 0xFFFF_FFFF)
+            self._csr_write_raw(csr_name, mask32(val))
             if self._interrupt_ctrl is not None:
                 self._interrupt_ctrl.set_mtimecmp(self.id, merged)
         elif csr_name == "sstatus":
@@ -560,7 +561,7 @@ class HartWithRegs:
         避免 marshal/unmarshal 边界的冗余冲刷引入副作用.
         """
         v &= ~(0xFFFF << 44)
-        self.csrs["satp"].val = v & 0xFFFF_FFFF_FFFF_FFFF
+        self.csrs["satp"].val = mask64(v)
         new_mode = (v >> 60) & 0xF
         if new_mode != self._mmu_mode:
             self.itlb.flush_all()
@@ -646,7 +647,7 @@ class HartWithRegs:
 
     @mdid_val.setter
     def mdid_val(self, v: int):
-        val = v & 0xFFFF_FFFF_FFFF_FFFF
+        val = mask64(v)
         self._mdid_val = val
         self.csrs["mdid"].val = val
 
@@ -666,7 +667,7 @@ class HartWithRegs:
 
     @pmpsplit_val.setter
     def pmpsplit_val(self, v: int):
-        val = v & 0xFFFF_FFFF_FFFF_FFFF
+        val = mask64(v)
         self._pmpsplit_val = val
         self.csrs["pmpsplit"].val = val
 
@@ -726,7 +727,7 @@ class HartWithRegs:
 
 
 class TlbEntry(ctypes.Structure):
-    """Single TLB entry — must match Rust ``state::TlbEntry`` exactly (24 bytes)."""
+    """Single TLB entry — must match Rust ``state::TlbEntry`` exactly (32 bytes)."""
     _fields_ = [
         ("vpn", ctypes.c_uint64),
         ("ppn", ctypes.c_uint64),
@@ -735,6 +736,9 @@ class TlbEntry(ctypes.Structure):
         ("valid", ctypes.c_uint8),
         ("mdid", ctypes.c_uint8),
         ("tlb_epoch", ctypes.c_uint32),
+        ("dirty", ctypes.c_uint8),
+        ("accessed", ctypes.c_uint8),
+        ("asid", ctypes.c_uint16),
     ]
 
 
@@ -809,8 +813,8 @@ class HartState(ctypes.Structure):
         ("pmpsplit", ctypes.c_uint8),
         ("_pad", ctypes.c_uint8 * 5),
         # ---- Phase B: TLB entries (array-of-structs, 32 × 2) ----
-        ("itlb", TlbEntry * 32),
-        ("dtlb", TlbEntry * 32),
+        ("itlb", TlbEntry * TLB_SIZE),
+        ("dtlb", TlbEntry * TLB_SIZE),
         # ---- Phase C: Extra CSRs ----
         ("mscratch", ctypes.c_uint64),
         ("sscratch", ctypes.c_uint64),

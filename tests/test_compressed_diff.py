@@ -11,7 +11,8 @@
 
 import pytest
 
-from pyremu.core.decoder import Hart, Opc, _sext
+from pyremu.core.decoder import Hart
+from pyremu.utils.disassem import Opc, sext
 from pyremu.core.mem_check_aux import inject_memory_backend
 
 # ============================================================
@@ -179,7 +180,7 @@ class TestCompressedDifferential:
         imm6 = imm & 0x3F
         # C.ADDI: bit[12]=imm[5], bits[6:2]=imm[4:0]
         c_instr = _c1(0b000, rd, ((imm6 & 0x20) << 7) | ((imm6 & 0x1F) << 2))
-        imm12 = _sext(imm, 6) & 0xFFF
+        imm12 = sext(imm, 6) & 0xFFF
         nc_instr = _i_type(Opc.opImm.value, rd, 0b000, rd, imm12)
 
         hc = Hart(id=0)
@@ -208,7 +209,7 @@ class TestCompressedDifferential:
         ram, rf, wf = _make_ram()
         imm6 = imm & 0x3F
         c_instr = _c1(0b001, rd, ((imm6 & 0x20) << 7) | ((imm6 & 0x1F) << 2))
-        imm12 = _sext(imm, 6) & 0xFFF
+        imm12 = sext(imm, 6) & 0xFFF
         nc_instr = _i_type(Opc.opImm32.value, rd, 0b000, rd, imm12)
 
         hc = Hart(id=0)
@@ -234,7 +235,7 @@ class TestCompressedDifferential:
         ram, rf, wf = _make_ram()
         imm6 = imm & 0x3F
         c_instr = _c1(0b010, rd, ((imm6 & 0x20) << 7) | ((imm6 & 0x1F) << 2))
-        imm12 = _sext(imm, 6) & 0xFFF
+        imm12 = sext(imm, 6) & 0xFFF
         nc_instr = _i_type(Opc.opImm.value, rd, 0b000, 0, imm12)
 
         hc = Hart(id=0)
@@ -257,7 +258,7 @@ class TestCompressedDifferential:
         ram, rf, wf = _make_ram()
         val6 = imm6 & 0x3F
         c_instr = _c1(0b011, rd, ((val6 & 0x20) << 7) | ((val6 & 0x1F) << 2))
-        imm20 = _sext(imm6, 6) & 0xFFFFF
+        imm20 = sext(imm6, 6) & 0xFFFFF
         nc_instr = _u_type(Opc.lui.value, rd, imm20)
 
         hc = Hart(id=0)
@@ -436,7 +437,7 @@ class TestCompressedDifferential:
             | ((val6 & 0x20) << 7)          # imm[5] -> bit12
             | ((val6 & 0x1F) << 2)          # imm[4:0] -> bits[6:2]
         )
-        imm12 = _sext(imm6, 6) & 0xFFF
+        imm12 = sext(imm6, 6) & 0xFFF
         nc_instr = _i_type(Opc.opImm.value, rd, 0b111, rd, imm12)
 
         hc = Hart(id=0)
@@ -838,11 +839,11 @@ class TestCompressedDifferential:
         addr = init_sp + uimm
         ram[addr:addr+4] = mem_val.to_bytes(4, 'little')
 
-        # C.LWSP: uimm[7:6]=bits[6:5], uimm[5]=bit12, uimm[4:2]=bits[4:2]
+        # C.LWSP (FIXED): uimm[7:6]=bits[3:2], uimm[5]=bit12, uimm[4:2]=bits[6:4]
         c_instr = _c2(0b010, rd, (
-            ((uimm >> 2) & 0x7) << 2            # uimm[4:2] -> bits[4:2]
+            ((uimm >> 2) & 0x7) << 4            # uimm[4:2] -> bits[6:4]
             | ((uimm >> 5) & 0x1) << 12         # uimm[5] -> bit12
-            | ((uimm >> 6) & 0x3) << 5          # uimm[7:6] -> bits[6:5]
+            | ((uimm >> 6) & 0x3) << 2          # uimm[7:6] -> bits[3:2]
         ))
         nc_instr = _i_type_load(Opc.ld.value, rd, 0b010, 2, uimm & 0xFFF)
 

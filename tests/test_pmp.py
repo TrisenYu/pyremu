@@ -433,6 +433,23 @@ class TestInstrFetchPmp:
         assert ok
         assert pa == 0x8000_1000
 
+    def test_mmode_fetch_ignores_mprv(self, hart):
+        """M 模式取指无视 MPRV (RISC-V spec §3.1.6.3).
+
+        MPRV=1 + MPP=S 时, LOAD/STORE 按 S 模式检查 PMP,
+        但取指始终用当前特权级 (M) 并绕过 PMP.
+        回归: _do_claim 修复前 MPRV=1 导致 M 模式取指被 PMP 拒绝 → halted.
+        """
+        self._setup_napot(hart, 0x8000_1000, 12, r=True, w=True, x=False)
+        hart.mode = RiscvMode.M
+        # MPRV=1, MPP=S (bits[12:11]=01)
+        hart.mstatus_val = (1 << 17) | (1 << 11)
+        ok, pa = check_instruction_fetch(hart, 0x8000_1000)
+        assert ok, (
+            "MPRV=1 不应影响取指 — M 模式取指必须绕过 PMP"
+        )
+        assert pa == 0x8000_1000
+
     def test_fetch_pma_invalid_addr(self, hart):
         """取指地址不在有效内存范围 -> InstrAccessFault."""
         hart.mode = RiscvMode.M

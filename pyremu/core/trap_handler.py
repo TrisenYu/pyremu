@@ -38,6 +38,7 @@ from pyremu.core.hart import (
 from pyremu.core.diag import log_sret_to_u, log_mret_to_u, log_ld_trap, TRACE_SRET_TO_U
 from pyremu.core.trap_def import trap_cause_code, TrapType
 from pyremu.interrupt.controller import INT_SOURCE_MIP_MASK, IntSource
+from pyremu.utils.mask import mask64
 
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
@@ -217,12 +218,7 @@ def _trap_deliver_smode(
     if is_interrupt and exc_code == 3:
         ctrl = hart._interrupt_ctrl
         if ctrl is not None:
-            try:
-                ctrl.clear_ipi(hart.id)
-            except AttributeError:
-                if hasattr(ctrl, '_msip') and hasattr(ctrl, '_notify_state_change'):
-                    ctrl._msip[hart.id] = 0
-                    ctrl._notify_state_change()
+            ctrl.clear_ipi(hart.id)
         hart.mip_val &= ~(1 << 3)
 
 
@@ -290,13 +286,7 @@ def _trap_deliver_mmode(
     if is_interrupt and exc_code == 3:  # MSIP (mcause code 3)
         ctrl = hart._interrupt_ctrl
         if ctrl is not None:
-            try:
-                ctrl.clear_ipi(hart.id)
-            except AttributeError:
-                # 非 CLINT 控制器没有 clear_ipi — 降级为直接操作
-                if hasattr(ctrl, '_msip') and hasattr(ctrl, '_notify_state_change'):
-                    ctrl._msip[hart.id] = 0
-                    ctrl._notify_state_change()
+            ctrl.clear_ipi(hart.id)
         # 同步清零 mip CSR (与 Rust ``state.mip &= !(1 << 3)`` 一致).
         # 硬件源已清除, 但 check_pending_interrupts 中的 _update_hw_mip
         # 在 deliver_trap 之前已执行, mip.MSIP 可能仍为 1.
@@ -360,7 +350,7 @@ def trap_mret(
     hart.mstatus_val = mstatus
 
     # PC ← mepc
-    hart.pc = hart.mepc_val & 0xFFFF_FFFF_FFFF_FFFF
+    hart.pc = mask64(hart.mepc_val)
 
     if TRACE_SRET_TO_U and hart.mode == RiscvMode.U:
         log_mret_to_u(hart)
@@ -401,9 +391,9 @@ def trap_sret(
     hart.mstatus_val = mstatus
 
     # PC ← sepc
-    hart.pc = hart.sepc_val & 0xFFFF_FFFF_FFFF_FFFF
+    hart.pc = mask64(hart.sepc_val)
 
-    # 诊断: 记录 sret→U 的完整寄存器状态 (PC 已更新后再记录)
+    # 诊断: 记录 sret->U 的完整寄存器状态 (PC 已更新后再记录)
     if TRACE_SRET_TO_U and hart.mode == RiscvMode.U:
         log_sret_to_u(hart)
 
@@ -511,7 +501,7 @@ def try_wfi_wakeup(
     has_pending, mip_bits, _ = ctrl.check_interrupt(hart.id)
 
     # CLINT MSIP 直接读取 — 硬件中断线, 不依赖 mie.MSIE.
-    msip_raw = (ctrl._msip[hart.id] & 1) != 0
+    msip_raw = (mip_bits & (1 << 3)) != 0
 
     # SSTC stimecmp -> STIP: S 模式直接写 stimecmp CSR 设定时器,
     # 无需 SBI ecall 往返.  硬件语义: mtime >= stimecmp > 0 ⇒ STIP 置位.
@@ -524,7 +514,7 @@ def try_wfi_wakeup(
     # PLIC 外部中断 (MEIP/SEIP) — CLINT.check_interrupt 不含 PLIC 源位,
     # 但 _update_hw_mip 的 _HW_MIP_MASK 覆盖 MEIP/SEIP (bits 11/9),
     # 若此处不补齐则 _update_hw_mip 会清除 _native_sync_plic_mip() 刚置位的
-    # SEIP/MEIP → WFI 永远无法被 UART/virtio 等外设中断唤醒。
+    # SEIP/MEIP ->WFI 永远无法被 UART/virtio 等外设中断唤醒。
     # 修正: 与 check_pending_interrupts (line 578-584) 相同的 PLIC 合并逻辑.
     plic_mip = 0
     if hart._plic is not None:

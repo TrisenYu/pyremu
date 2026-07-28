@@ -119,7 +119,7 @@ VIRTIO_F_RING_INDIRECT_DESC = 1 << 28
 # 若声明此 feature, 客机驱动走 event-index 通知抑制路径:
 #   needs_kick = vring_need_event(avail_event, new, old)
 # 但 device 侧从未更新 used ring 的 avail_event 字段 (始终为 0),
-# 导致第二个及之后的 buffer 不再写 QueueNotify → 内核永远等不到 I/O 完成.
+# 导致第二个及之后的 buffer 不再写 QueueNotify ->内核永远等不到 I/O 完成.
 # 不声明此 feature 时驱动退回到 flags 模式 (检查 VRING_USED_F_NO_NOTIFY),
 # 该 flag 我们也从不置位, 因此每次添加 buffer 都会 kick.
 VIRTIO_F_RING_EVENT_IDX = 1 << 29
@@ -131,8 +131,8 @@ VIRTIO_BLK_F_BLK_SIZE = 1 << 6
 # VIRTIO_F_RING_INDIRECT_DESC (bit 28) —
 # 若声明, 客机驱动可用 indirect 描述符 (一层跳转), 但 _process_descriptor_chain
 # 未实现 indirect 表遍历, 遇到 INDIRECT flag 的 desc 会因缺失 NEXT flag 而 return
-# False — 内核拿不到 ext4 superblock → VFS panic.
-# 与 VIRTIO_F_RING_EVENT_IDX 同模式: 声明 feature 但未实现 → 误引导客机 → 移除以退避.
+# False — 内核拿不到 ext4 superblock ->VFS panic.
+# 与 VIRTIO_F_RING_EVENT_IDX 同模式: 声明 feature 但未实现 ->误引导客机 ->移除以退避.
 _DEVICE_FEATURES = (
     VIRTIO_F_VERSION_1
 )
@@ -492,10 +492,22 @@ class VirtIOBlock(Device):
         """从扇区 *sector* 读取数据到 Guest 物理地址 *buf_pa*."""
         offset = sector * SECTOR_SIZE
         if offset >= self._disk_size:
-            # 超出磁盘范围 — 返回全零
             data = b"\x00" * buf_len
         else:
             data = os.pread(self._fd, buf_len, offset)
+        # Detect stale PAGE_POISON in target page before write.
+        # A clean kernel zeroes pages on alloc; if we see 0xfe here,
+        # the zeroing was skipped — emulator TLB/MMU bug.
+        try:
+            before = self._mem_read(buf_pa & ~0xFFF, 64)
+        except Exception:
+            before = b""
+        if before[:4].count(0xFE) >= 3:
+            print(
+                f"\n[vblk-poison] pa=0x{buf_pa:x} sector={sector} "
+                f"len={buf_len} page_hex={before[:16].hex()}\n",
+                file=sys.stderr, flush=True,
+            )
         self._mem_write(buf_pa, data)
         return True
 

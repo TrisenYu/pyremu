@@ -7,7 +7,7 @@
 
 import pytest
 
-from pyremu.core.decoder import Hart, Opc
+from pyremu.core.decoder import Hart
 from pyremu.core.hart import (
     MSTATUS_MIE,
     MSTATUS_MPIE,
@@ -36,6 +36,7 @@ from pyremu.interrupt.clint import CLINT
 from pyremu.memory.bus import Bus
 from pyremu.platform import PeripheralConfig, PlatformConfig
 from pyremu.utils.parse_bin import parse_firmware
+from pyremu.utils.disassem import Opc
 
 # ============================================================
 #  trap_cause_code / trap_is_interrupt
@@ -2433,9 +2434,9 @@ class TestStackOverflowSmode:
         ram, _read_fn, _write_fn = ram_ctx
         self._prep_smode(hart, ram)
 
-        # StPageFault is not delegated → trap goes to M-mode mtvec.
+        # StPageFault is not delegated ->trap goes to M-mode mtvec.
         # Set PC = mtvec so the trap entry IS the trapping PC — each
-        # mem_write triggers a new trap at the same address → counter
+        # mem_write triggers a new trap at the same address ->counter
         # increments.
         hart.pc = hart.mtvec_val
         for i in range(5):
@@ -3262,7 +3263,7 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
     """回归: 页错误时 load/store handler 不能覆盖目标寄存器.
 
     修复前 ``mem_read`` / ``mem_write`` 在触发 trap 后返回假数据
-    (b\"\\x00\" * size), handler 继续执行并将 0 写入 rd → 寄存器损坏.
+    (b\"\\x00\" * size), handler 继续执行并将 0 写入 rd ->寄存器损坏.
     修复后 ``mem_read`` / ``mem_write`` 抛出 ``MemoryAccessFault``,
     ``exec_instr`` 捕获并返回 0, 内核 trap handler 看到故障前的寄存器状态.
 
@@ -3305,7 +3306,7 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
     def _setup_sv39_for(
         self, hart, ram: bytearray, valid_va: int, valid_pa: int,
     ):
-        """建立单页 Sv39 映射 (仅 valid_va → valid_pa 可访问)."""
+        """建立单页 Sv39 映射 (仅 valid_va ->valid_pa 可访问)."""
         from pyremu.core.hart import RiscvMode
         vpn0 = (valid_va >> 12) & 0x1FF
         root_ppn = self.L1_BASE >> self.PAGE_SHIFT

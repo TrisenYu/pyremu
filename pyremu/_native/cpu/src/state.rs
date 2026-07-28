@@ -2,11 +2,14 @@
 
 use core::fmt;
 
+include!("config_gen.rs");
+
 // ============================================================
 //  TLB entry
 // ============================================================
 
-/// A single TLB entry — 24 bytes, 8-byte aligned.
+/// A single TLB entry — 32 bytes, 8-byte aligned.
+/// Layout is FFI-locked; must match Python ``TlbEntry`` ctypes definition.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TlbEntry {
@@ -16,9 +19,13 @@ pub struct TlbEntry {
     pub level: u8,
     pub valid: u8,
     pub mdid: u8,
-    /// TLB epoch at insertion time (low 32 bits of global ``tlb_gen``).
-    /// Checked on lookup to detect stale entries from pre-SFENCE.VMA.
     pub tlb_epoch: u32,
+    pub dirty: u8,
+    pub accessed: u8,
+    /// ASID from satp at insertion time.  Lookup must match; different ASID
+    /// (process switch without SFENCE.VMA) is a miss — prevents stale entries
+    /// from leaking across address spaces when the kernel uses ASID-tagged TLBs.
+    pub asid: u16,
 }
 
 impl TlbEntry {
@@ -31,6 +38,9 @@ impl TlbEntry {
             valid: 0,
             mdid: 0,
             tlb_epoch: 0,
+            dirty: 0,
+            accessed: 0,
+            asid: 0,
         }
     }
 }
@@ -77,7 +87,7 @@ pub struct HartState {
     pub reservation_addr: u64,
     /// Value loaded by LR — used as the expected value in SC's CAS.
     /// Without this, SC does a fresh load for the CAS expected value,
-    /// which always equals the current value → SC never fails due to
+    /// which always equals the current value ->SC never fails due to
     /// a concurrent store from another hart (reservation-invalidation
     /// bug: two harts can simultaneously enter the same critical section).
     pub reservation_value: u64,
@@ -95,8 +105,8 @@ pub struct HartState {
     pub _pad: [u8; 5],
 
     // ---- Phase B: TLB entries ----
-    pub itlb: [TlbEntry; 32],
-    pub dtlb: [TlbEntry; 32],
+    pub itlb: [TlbEntry; TLB_ENTRIES],
+    pub dtlb: [TlbEntry; TLB_ENTRIES],
 
     // ---- Phase C: Additional CSRs ----
     pub mscratch: u64,
@@ -285,8 +295,13 @@ pub struct FfiUartCtx {
     pub rxctrl: u32,
     /// Approximate RX FIFO fill level (Python sets during marshal).
     pub rx_fifo_len: u32,
-    /// padding to 8-byte alignment
-    pub _pad: u32,
+    /// Pipe write-end for TX notification: Rust writes 1 byte per TXDATA
+    /// write; Python TX thread select()s the read-end and drains to stdout.
+    /// -1 = disabled.
+    pub tx_notify_fd: i32,
+    /// When 1, Rust writes to ring buffer only (no libc::write).
+    /// Python _tx_callback handles all stdout output.
+    pub no_stdout: u8,
 }
 
 // Safety: Python holds the backing ctypes arrays alive for the FFI call.
@@ -389,7 +404,7 @@ mod tests {
 
     #[test]
     fn tlb_entry_size() {
-        assert_eq!(size_of::<TlbEntry>(), 24);
+        assert_eq!(size_of::<TlbEntry>(), 32);
         assert_eq!(align_of::<TlbEntry>(), 8);
     }
 
@@ -401,7 +416,9 @@ mod tests {
     #[test]
     fn hart_state_size_reasonable() {
         let sz = size_of::<HartState>();
-        assert!(sz < 4096, "HartState size {} should be < 4096", sz);
+        // With TLB_ENTRIES entries per TLB, HartState grows proportionally.
+        // 256 entries × 32 bytes × 2 (itlb+dtlb) = 16384 bytes for TLB alone.
+        assert!(sz < 65536, "HartState size {} should be < 65536", sz);
     }
 
     #[test]
@@ -440,8 +457,8 @@ mod tests {
             mdid: 0,
             pmpsplit: 0,
             _pad: [0; 5],
-            itlb: [TlbEntry::empty(); 32],
-            dtlb: [TlbEntry::empty(); 32],
+            itlb: [TlbEntry::empty(); TLB_ENTRIES],
+            dtlb: [TlbEntry::empty(); TLB_ENTRIES],
             mscratch: 0,
             sscratch: 0,
             mhartid: 0,

@@ -16,29 +16,36 @@
 //!   readable by load instructions.  Does not affect stores or instruction
 //!   fetches.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use crate::mmu::{pte_parse, sv39_decompose_va};
-use crate::state::{riscv_mode, HartState, TlbEntry};
+use crate::state::{riscv_mode, HartState, TlbEntry, TLB_ENTRIES};
 
 // ============================================================
 //  Page-table walk context
 // ============================================================
 
-/// Parameters needed for memory access during page walks.
-/// ``ram`` is ``*mut u8`` so that A/D bit updates can be written back.
+/// Shared context for memory access, TLB management, and LR/SC reservation.
 pub struct WalkCtx {
     pub ram: *mut u8,
     pub ram_size: u64,
     pub ram_base: u64,
     pub shadow_base: u64,
     pub shadow_size: u64,
-    /// Pointer to the global TLB generation counter in ``ModuleState``.
-    /// When non-null, ``translate_va`` reads the current generation directly
-    /// instead of relying on the cached value in ``HartState._mmu_mode_pad``.
-    /// This closes the window where another hart increments the generation
-    /// between the instruction-boundary gen check and the actual load/store
-    /// that uses the TLB.
+    /// Global TLB generation counter.  Hart checks this each instruction
+    /// boundary; on mismatch, it marks its own TLB entries dirty (not flush),
+    /// forcing re-walk on next access.
     pub tlb_gen: *const AtomicU64,
+    /// Clock algorithm: eviction hand for itlb / dtlb.
+    /// Cell provides interior mutability; handlers take ``&WalkCtx``.
+    pub itlb_hand: Cell<u8>,
+    pub dtlb_hand: Cell<u8>,
+    /// Per-hart LR reservation slots (indexed by hart_id).
+    /// LR sets `lr_reserved[hid] = pa`; any store clears all slots.
+    /// Allocated in ``ModuleState``, pointer passed through FFI.
+    pub lr_reserved: *mut AtomicU64,
+    pub num_harts: u32,
 }
 
 /// Result of address translation.
@@ -54,6 +61,124 @@ pub struct TranslateResult {
 pub enum TranslateFault {
     PageFault(u64), // cause code (12=Instr, 13=Load, 15=Store)
     AccessFault,
+}
+
+// ============================================================
+//  LR/SC reservation helpers
+// ============================================================
+
+/// Set this hart's LR reservation.  pa=0 means "no reservation".
+#[inline]
+pub(crate) fn lr_set(ctx: &WalkCtx, hid: u8, pa: u64) {
+    if ctx.lr_reserved.is_null() {
+        return;
+    }
+    unsafe { &*ctx.lr_reserved.add(hid as usize) }.store(pa, Ordering::Release);
+}
+
+/// Check whether this hart still holds a reservation on *pa*.
+#[inline]
+pub(crate) fn lr_check(ctx: &WalkCtx, hid: u8, pa: u64) -> bool {
+    if ctx.lr_reserved.is_null() {
+        return false;
+    }
+    pa != 0 && unsafe { &*ctx.lr_reserved.add(hid as usize) }.load(Ordering::Acquire) == pa
+}
+
+/// Clear ALL harts' reservations.  Called on every store / AMO write.
+#[inline]
+pub(crate) fn lr_clear_all(ctx: &WalkCtx) {
+    if ctx.lr_reserved.is_null() {
+        return;
+    }
+    for i in 0..ctx.num_harts as usize {
+        unsafe { &*ctx.lr_reserved.add(i) }.store(0, Ordering::Release);
+    }
+}
+
+// ============================================================
+//  RAM read/write (with atomic Acquire/Release for multi-hart)
+// ============================================================
+
+/// Read *size* bytes from physical address *pa* in RAM. Little-endian.
+/// Aligned 4- and 8-byte reads use atomic Acquire.
+#[inline]
+pub(crate) fn ram_read(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
+    let off = crate::mem::ram_offset_inline(
+        pa, size as u32,
+        ctx.ram_base, ctx.ram_size, ctx.shadow_base, ctx.shadow_size,
+    );
+    if off.is_none() { return 0; }
+    let ptr = unsafe { ctx.ram.add(off.unwrap() as usize) };
+    match size {
+        1 => unsafe { *ptr as u64 },
+        2 => {
+            let b0 = unsafe { *ptr } as u64;
+            let b1 = unsafe { *ptr.add(1) } as u64;
+            b0 | (b1 << 8)
+        }
+        4 if (pa & 3) == 0 => {
+            let a = unsafe { &*(ptr as *const AtomicU32) };
+            a.load(Ordering::Acquire) as u64
+        }
+        4 => {
+            let b0 = unsafe { *ptr } as u64;
+            let b1 = unsafe { *ptr.add(1) } as u64;
+            let b2 = unsafe { *ptr.add(2) } as u64;
+            let b3 = unsafe { *ptr.add(3) } as u64;
+            b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        }
+        8 if (pa & 7) == 0 => {
+            let a = unsafe { &*(ptr as *const AtomicU64) };
+            a.load(Ordering::Acquire)
+        }
+        8 => {
+            let b = |i: usize| unsafe { *ptr.add(i) } as u64;
+            b(0) | (b(1) << 8) | (b(2) << 16) | (b(3) << 24)
+                | (b(4) << 32) | (b(5) << 40) | (b(6) << 48) | (b(7) << 56)
+        }
+        _ => 0,
+    }
+}
+
+/// Write *size* bytes of *val* to physical address *pa* in RAM. Little-endian.
+/// Aligned 4- and 8-byte writes use atomic Release.  Clears all LR reservations
+/// before the store becomes visible (ABA fix).
+#[inline]
+pub(crate) fn ram_write(ctx: &WalkCtx, pa: u64, val: u64, size: u8) -> bool {
+    let off = crate::mem::ram_offset_inline(
+        pa, size as u32,
+        ctx.ram_base, ctx.ram_size, ctx.shadow_base, ctx.shadow_size,
+    );
+    if off.is_none() { return false; }
+    lr_clear_all(ctx);
+    std::sync::atomic::fence(Ordering::SeqCst);
+    let ptr = unsafe { ctx.ram.add(off.unwrap() as usize) };
+    match size {
+        1 => unsafe { *ptr = val as u8; },
+        2 => unsafe {
+            *ptr = val as u8;
+            *ptr.add(1) = (val >> 8) as u8;
+        },
+        4 if (pa & 3) == 0 => {
+            let a = unsafe { &*(ptr as *const AtomicU32) };
+            a.store(val as u32, Ordering::Release);
+        }
+        4 => unsafe {
+            *ptr = val as u8;
+            for i in 1..4 { *ptr.add(i) = (val >> (i << 3)) as u8; }
+        },
+        8 if (pa & 7) == 0 => {
+            let a = unsafe { &*(ptr as *const AtomicU64) };
+            a.store(val, Ordering::Release);
+        }
+        8 => unsafe {
+            *ptr = val as u8;
+            for i in 1..8 { *ptr.add(i) = (val >> (i << 3)) as u8; }
+        },
+        _ => return false,
+    }
+    true
 }
 
 // ============================================================
@@ -95,7 +220,8 @@ fn read_pte(ctx: &WalkCtx, pa: u64) -> u64 {
     // PTE addresses are always 8-byte aligned in Sv39 (root_ppn << 12 + vpn * 8).
     let ptr = unsafe { ctx.ram.add(off) };
     let a = unsafe { &*(ptr as *const AtomicU64) };
-    a.load(Ordering::Acquire)
+    let raw = a.load(Ordering::Acquire);
+    raw
 }
 
 /// Write a 64-bit raw PTE value to physical memory (A/D bit update).
@@ -237,6 +363,52 @@ fn walk_l0(
 }
 
 // ============================================================
+//  Diagnostic helpers — PTE consistency verification
+// ============================================================
+
+/// VPNs whose page walks are traced in detail (diagnostic builds only).
+/// Set ``PYREMU_TRACE_VPN`` env var (hex, no 0x prefix) at runtime to override.
+#[cfg(feature = "diagnostic")]
+#[allow(dead_code)]
+#[allow(unused)]
+fn is_trace_vpn(vpn: u64) -> bool {
+    static TRACE_VPN: AtomicU64 = AtomicU64::new(u64::MAX);
+    let mut target = TRACE_VPN.load(Ordering::Relaxed);
+    if target == u64::MAX {
+        target = std::env::var("PYREMU_TRACE_VPN")
+            .ok()
+            .and_then(|s| u64::from_str_radix(&s, 16).ok())
+            .unwrap_or(0);
+        TRACE_VPN.store(target, Ordering::Relaxed);
+    }
+    target != 0 && vpn == target
+}
+
+/// Re-read a PTE from *pa* using a plain (non-atomic) pointer dereference
+/// and compare with the atomic read.  If they disagree, log the mismatch.
+/// This catches concurrent modification of page-table memory within a
+/// single walk — impossible under correct single-core semantics.
+#[cfg(feature = "diagnostic")]
+#[allow(dead_code)]
+#[allow(unused)]
+fn verify_pte_stable(ctx: &WalkCtx, pa: u64, atomic_val: u64, level: &str, vpn: u64) {
+    let off = match ram_offset(ctx, pa, 8) {
+        Some(o) => o,
+        None => return,
+    };
+    let plain_val = unsafe {
+        let ptr = ctx.ram.add(off) as *const u64;
+        core::ptr::read_volatile(ptr)
+    };
+    if plain_val != atomic_val {
+        crate::diag::log_line(&format!(
+            "[pte-race] level={} vpn={:#x} pa={:#018x} atomic={:#018x} plain={:#018x}",
+            level, vpn, pa, atomic_val, plain_val,
+        ));
+    }
+}
+
+// ============================================================
 //  Sv39 page-table walk — entry point
 // ============================================================
 
@@ -255,123 +427,168 @@ pub fn sv39_walk(ctx: &WalkCtx, satp: u64, va: u64, is_write: bool) -> Option<Tr
     let (_l2_raw, l2_pte) = walk_l2(ctx, root_ppn, vpn.vpn2)?;
 
     if l2_pte.is_ptr == 0 {
-        return None; // 1 GiB leaf not supported in Sv39
+        return None;
     }
 
     let (l1_raw, l1_pte) = walk_l1(ctx, l2_pte.ppn, vpn.vpn1)?;
 
     if l1_pte.is_leaf != 0 {
-        return walk_l1_leaf(
+        let l1_addr = (l2_pte.ppn << 12).wrapping_add(vpn.vpn1 * 8);
+        let r = walk_l1_leaf(
             ctx,
-            (l2_pte.ppn << 12).wrapping_add(vpn.vpn1 * 8),
+            l1_addr,
             l1_raw,
             l1_pte.ppn,
             l1_pte.perm,
             vpn.vpn0,
             vpn.offset,
             is_write,
-        );
+        )?;
+        return Some(r);
     }
 
-    walk_l0(ctx, l1_pte.ppn, vpn.vpn0, vpn.offset, is_write)
+    let r = walk_l0(ctx, l1_pte.ppn, vpn.vpn0, vpn.offset, is_write)?;
+    Some(r)
 }
 
 // ============================================================
 //  TLB operations
 // ============================================================
 
-/// TLB epoch layout inside ``HartState._mmu_mode_pad``:
-///
-///   Bits [4:0]   = dtlb FIFO insert index (0–31)
-///   Bits [12:8]  = itlb FIFO insert index (0–31)
-///   Bits [44:13] = tlb_epoch — low 32 bits of the global ``tlb_gen``
-///                  counter stored by ``hart_worker`` after each flush
-///
-/// The epoch is *not* synchronised with the global gen atomically —
-/// it is only written after the TLB is flushed, so it is always
-/// monotonically non-decreasing for the local hart.  A TLB entry
-/// inserted under epoch *E* is valid iff the current epoch still
-/// equals *E*, i.e. no SFENCE.VMA has been observed since the entry
-/// was populated.
-const TLB_EPOCH_SHIFT: u64 = 13;
-const TLB_EPOCH_MASK: u64 = 0xFFFF_FFFF; // 32 bits
-
-#[inline]
-fn get_tlb_epoch(state: &HartState) -> u32 {
-    ((state._mmu_mode_pad >> TLB_EPOCH_SHIFT) & TLB_EPOCH_MASK) as u32
-}
-
-/// Advance the local TLB epoch to *epoch*, forcing all previously
-/// cached entries to be treated as stale on the next lookup.
-#[inline]
-pub fn set_tlb_epoch(state: &mut HartState, epoch: u32) {
-    let fifo_bits = state._mmu_mode_pad & 0x1FFF;
-    state._mmu_mode_pad = fifo_bits | ((epoch as u64) << TLB_EPOCH_SHIFT);
-}
-
-/// Get the current TLB epoch from the global generation counter
-/// (low 32 bits).  Must be called AFTER the Acquire load of
-/// ``ModuleState.tlb_gen`` so the happens-before edge is established.
-#[inline]
-pub fn tlb_epoch_from_gen(gen: u64) -> u32 {
-    (gen & TLB_EPOCH_MASK) as u32
-}
-
 #[inline]
 const fn tlb_sz() -> usize {
-    32
+    TLB_ENTRIES
 }
 
-/// Find a TLB entry matching *vpn* AND *epoch*.  Returns index or None.
-///
-/// Entries populated before the most recent SFENCE.VMA (i.e. whose
-/// ``tlb_epoch`` differs from the requested *epoch*) are silently
-/// skipped — the caller will fall through to a page walk, which reads
-/// the current PTE from RAM.
+// ============================================================
+//  Clock algorithm (second-chance LRU approximation)
+// ============================================================
+
+/// Find a victim for eviction using the clock algorithm.
+/// Prefers invalid entries; otherwise scans for accessed==0.
 #[inline]
-pub fn tlb_lookup(tlb: &[TlbEntry; 32], vpn: u64, epoch: u32) -> Option<usize> {
+fn clock_victim(tlb: &mut [TlbEntry], hand: &mut u8) -> usize {
+    let sz = tlb_sz();
+    // First pass: prefer invalid entries
+    for _ in 0..sz {
+        let idx = *hand as usize;
+        if tlb[idx].valid == 0 {
+            *hand = ((idx + 1) % sz) as u8;
+            return idx;
+        }
+        *hand = ((idx + 1) % sz) as u8;
+    }
+    // Second pass: clock algorithm — find unaccessed entry
+    for _ in 0..sz {
+        let idx = *hand as usize;
+        if tlb[idx].accessed == 0 {
+            *hand = ((idx + 1) % sz) as u8;
+            return idx;
+        }
+        // Give a second chance: clear accessed, advance hand
+        let e = unsafe { &mut *tlb.as_mut_ptr().add(idx) };
+        e.accessed = 0;
+        *hand = ((idx + 1) % sz) as u8;
+    }
+    // All entries accessed — evict current hand position
+    let idx = *hand as usize;
+    *hand = ((idx + 1) % sz) as u8;
+    idx
+}
+
+// ============================================================
+//  TLB operations
+// ============================================================
+
+/// Result of a TLB lookup.
+pub enum TlbResult {
+    /// Clean entry found — ready to use.
+    Hit(usize),
+    /// Dirty entry found at this index — needs re-walk, but caller should
+    /// re-insert the new translation at the same index to avoid wasting a slot.
+    DirtyReuse(usize),
+    /// No matching entry.
+    Miss,
+}
+
+/// Find a TLB entry matching *vpn*.  Returns:
+/// - ``Hit(idx)`` for a clean match (accessed bit already set).
+/// - ``DirtyReuse(idx)`` for a stale match — caller must re-walk and insert
+///   at this index to avoid leaking the slot.
+/// - ``Miss`` if no entry matches.
+#[inline]
+pub fn tlb_lookup(tlb: &mut [TlbEntry], vpn: u64, asid: u16) -> TlbResult {
     for i in 0..tlb_sz() {
-        if tlb[i].valid != 0 && tlb[i].vpn == vpn && tlb[i].tlb_epoch == epoch {
-            return Some(i);
+        if tlb[i].valid != 0 && tlb[i].vpn == vpn {
+            // ASID-tagged: different address space -> miss.
+            // asid=0 (Bare mode) matches any entry (no tag).
+            if asid != 0 && tlb[i].asid != 0 && tlb[i].asid != asid {
+                continue;
+            }
+            if tlb[i].dirty != 0 {
+                return TlbResult::DirtyReuse(i);
+            }
+            tlb[i].accessed = 1;
+            return TlbResult::Hit(i);
         }
     }
-    None
+    TlbResult::Miss
 }
 
-/// Insert a translation into the TLB (FIFO replacement).
+/// Insert or update a translation at *prefer_idx* (if valid) or via clock
+/// eviction.  ``prefer_idx`` should be the index from a prior ``DirtyReuse``.
 #[inline]
 pub fn tlb_insert(
-    tlb: &mut [TlbEntry; 32],
-    ins_idx: &mut usize,
+    tlb: &mut [TlbEntry],
+    hand: &mut u8,
+    prefer_idx: Option<usize>,
     vpn: u64,
     ppn: u64,
     perm: u8,
     level: u8,
     mdid: u8,
-    epoch: u32,
+    asid: u16,
 ) {
-    let idx = *ins_idx;
+    let idx = match prefer_idx {
+        Some(i) if i < tlb_sz() => i,
+        _ => clock_victim(tlb, hand),
+    };
     tlb[idx].vpn = vpn;
     tlb[idx].ppn = ppn;
     tlb[idx].perm = perm;
     tlb[idx].level = level;
     tlb[idx].valid = 1;
     tlb[idx].mdid = mdid;
-    tlb[idx].tlb_epoch = epoch;
-    *ins_idx = (idx + 1) % tlb_sz();
+    tlb[idx].dirty = 0;
+    tlb[idx].accessed = 1;
+    tlb[idx].asid = asid;
+    tlb[idx].tlb_epoch = 0;
 }
 
-/// Flush the entire TLB (SFENCE.VMA).
+/// Mark all valid TLB entries as dirty (called when tlb_gen changes).
+/// The next lookup will re-walk and refresh the PPN.
 #[inline]
-pub fn tlb_flush_all(tlb: &mut [TlbEntry; 32]) {
+pub fn tlb_mark_all_dirty(tlb: &mut [TlbEntry]) {
+    for e in tlb.iter_mut() {
+        if e.valid != 0 {
+            e.dirty = 1;
+        }
+    }
+}
+
+/// Flush the entire TLB (invalidate all entries).
+#[inline]
+pub fn tlb_flush_all(tlb: &mut [TlbEntry]) {
     for e in tlb.iter_mut() {
         e.valid = 0;
+        e.dirty = 0;
+        e.accessed = 0;
     }
 }
 
 /// Flush a specific VPN from the TLB.
 #[inline]
-pub fn tlb_flush_vpn(tlb: &mut [TlbEntry; 32], vpn: u64) {
+pub fn tlb_flush_vpn(tlb: &mut [TlbEntry], vpn: u64) {
     for e in tlb.iter_mut() {
         if e.valid != 0 && e.vpn == vpn {
             e.valid = 0;
@@ -511,31 +728,51 @@ pub fn translate_va(
     };
 
     let vpn = va >> 12;
-    let tlb = if is_execute { &state.itlb } else { &state.dtlb };
-    // Use the *current* global generation as the epoch, not the cached
-    // copy in HartState.  The cached copy is only refreshed at instruction
-    // boundaries, but SFENCE.VMA on another hart can happen between the
-    // boundary check and this lookup.  Reading the global counter directly
-    // closes that window — a stale TLB entry inserted at a previous
-    // generation will have a mismatched epoch and be treated as a miss.
-    let epoch = if !ctx.tlb_gen.is_null() {
-        tlb_epoch_from_gen(unsafe { (*ctx.tlb_gen).load(Ordering::Acquire) })
+    let (tlb, hand) = if is_execute {
+        (&mut state.itlb, &ctx.itlb_hand)
     } else {
-        get_tlb_epoch(state)
+        (&mut state.dtlb, &ctx.dtlb_hand)
+    };
+
+    // ---- TLB bypass (PYREMU_NO_TLB=1) ----
+    // Force page walk on every translation, identical to NO_L2 for L2 cache.
+    static NO_TLB: AtomicU64 = AtomicU64::new(u64::MAX);
+    let no_tlb = {
+        let v = NO_TLB.load(Ordering::Relaxed);
+        if v == u64::MAX {
+            let val: u64 = std::env::var("PYREMU_NO_TLB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            NO_TLB.store(val, Ordering::Relaxed);
+            val
+        } else {
+            v
+        }
     };
 
     // ---- TLB lookup ----
-    if let Some(idx) = tlb_lookup(tlb, vpn, epoch) {
-        let e = &tlb[idx];
-        if !check_pte_perm(e.perm, eff_mode, state.mstatus, is_write, is_execute) {
-            return Err(TranslateFault::PageFault(fault_code(is_execute, is_write)));
+    let asid = ((state.satp >> 44) & 0xFFFF) as u16;
+    let reuse_idx = if no_tlb != 0 {
+        None
+    } else {
+        match tlb_lookup(tlb, vpn, asid) {
+            TlbResult::Hit(idx) => {
+                let e = &tlb[idx];
+                if !check_pte_perm(e.perm, eff_mode, state.mstatus, is_write, is_execute) {
+                    return Err(TranslateFault::PageFault(fault_code(is_execute, is_write)));
+                }
+                let pa = reconstruct_tlb_pa(e, va);
+                return Ok(TranslateResult {
+                    pa,
+                    perm: e.perm,
+                    level: e.level,
+                });
+            }
+            TlbResult::DirtyReuse(idx) => Some(idx),
+            TlbResult::Miss => None,
         }
-        return Ok(TranslateResult {
-            pa: reconstruct_tlb_pa(e, va),
-            perm: e.perm,
-            level: e.level,
-        });
-    }
+    };
 
     // ---- Page-table walk ----
     let result = sv39_walk(ctx, state.satp, va, is_write)
@@ -551,24 +788,19 @@ pub fn translate_va(
     } else {
         &mut state.dtlb
     };
-    // Extract the FIFO insert index from _mmu_mode_pad.
-    // Bits [4:0]   = dtlb insert index
-    // Bits [12:8]  = itlb insert index
-    let shift = if is_execute { 8 } else { 0 };
-    let mut ins_idx = ((state._mmu_mode_pad >> shift) & 0x1F) as usize;
+    let mut h = hand.get();
     tlb_insert(
         tlb_mut,
-        &mut ins_idx,
+        &mut h,
+        reuse_idx,
         vpn,
         result.ppn_for_tlb(vpn),
         result.perm,
         result.level,
         state.mdid,
-        epoch,
+        asid,
     );
-    // Store the updated index back so the FIFO advances across calls.
-    let mask: u64 = !(0x1F << shift);
-    state._mmu_mode_pad = (state._mmu_mode_pad & mask) | ((ins_idx as u64 & 0x1F) << shift);
+    hand.set(h);
 
     Ok(result)
 }
@@ -618,68 +850,123 @@ mod tests {
         satp
     }
 
-    const TEST_EPOCH: u32 = 42;
-
     #[test]
     fn tlb_lookup_miss() {
-        let tlb: [TlbEntry; 32] = [TlbEntry::empty(); 32];
-        assert_eq!(tlb_lookup(&tlb, 0x100, TEST_EPOCH), None);
+        let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
+        assert!(matches!(tlb_lookup(&mut tlb, 0x100, 0), TlbResult::Miss));
     }
 
     #[test]
     fn tlb_insert_and_lookup() {
-        let mut tlb: [TlbEntry; 32] = [TlbEntry::empty(); 32];
-        let mut ins_idx: usize = 0;
-        tlb_insert(&mut tlb, &mut ins_idx, 0x1000, 0x80000, 0xF, 0, 0, TEST_EPOCH);
-        let hit = tlb_lookup(&tlb, 0x1000, TEST_EPOCH);
-        assert!(hit.is_some());
-        let e = &tlb[hit.unwrap()];
+        let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
+        let mut hand: u8 = 0;
+        tlb_insert(&mut tlb, &mut hand, None, 0x1000, 0x80000, 0xF, 0, 0, 0);
+        let idx = match tlb_lookup(&mut tlb, 0x1000, 0) {
+            TlbResult::Hit(i) => i,
+            _ => panic!("expected clean hit"),
+        };
+        let e = &tlb[idx];
         assert_eq!(e.ppn, 0x80000);
         assert_eq!(e.perm, 0xF);
         assert_eq!(e.level, 0);
         assert_eq!(e.valid, 1);
-        // Stale epoch -> miss
-        assert_eq!(tlb_lookup(&tlb, 0x1000, TEST_EPOCH + 1), None);
+        assert_eq!(e.dirty, 0);
+        // Mark dirty -> returns DirtyReuse, not Miss
+        tlb[idx].dirty = 1;
+        let reuse = match tlb_lookup(&mut tlb, 0x1000, 0) {
+            TlbResult::DirtyReuse(i) => i,
+            other => panic!(
+                "expected DirtyReuse, got {:?}",
+                match other {
+                    TlbResult::Hit(_) => "Hit",
+                    TlbResult::Miss => "Miss",
+                    TlbResult::DirtyReuse(_) => unreachable!(),
+                }
+            ),
+        };
+        assert_eq!(reuse, idx);
+        // Re-insert at the dirty slot
+        tlb_insert(&mut tlb, &mut hand, Some(reuse), 0x1000, 0x90000, 0xF, 0, 0, 0);
+        assert!(matches!(tlb_lookup(&mut tlb, 0x1000, 0), TlbResult::Hit(_)));
+        assert_eq!(tlb[reuse].ppn, 0x90000);
     }
 
     #[test]
     fn test_tlb_flush_all() {
-        let mut tlb: [TlbEntry; 32] = [TlbEntry::empty(); 32];
-        let mut ins_idx: usize = 0;
-        tlb_insert(&mut tlb, &mut ins_idx, 0x1000, 0x80000, 0xF, 0, 0, TEST_EPOCH);
+        let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
+        let mut hand: u8 = 0;
+        tlb_insert(&mut tlb, &mut hand, None, 0x1000, 0x80000, 0xF, 0, 0, 0);
         crate::translate::tlb_flush_all(&mut tlb);
-        assert_eq!(tlb_lookup(&tlb, 0x1000, TEST_EPOCH), None);
+        assert!(matches!(tlb_lookup(&mut tlb, 0x1000, 0), TlbResult::Miss));
     }
 
     #[test]
     fn test_tlb_flush_vpn() {
-        let mut tlb: [TlbEntry; 32] = [TlbEntry::empty(); 32];
-        let mut ins_idx: usize = 0;
-        tlb_insert(&mut tlb, &mut ins_idx, 0x1000, 0x80000, 0xF, 0, 0, TEST_EPOCH);
-        tlb_insert(&mut tlb, &mut ins_idx, 0x2000, 0x90000, 0xF, 0, 0, TEST_EPOCH);
+        let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
+        let mut hand: u8 = 0;
+        tlb_insert(&mut tlb, &mut hand, None, 0x1000, 0x80000, 0xF, 0, 0, 0);
+        tlb_insert(&mut tlb, &mut hand, None, 0x2000, 0x90000, 0xF, 0, 0, 0);
         crate::translate::tlb_flush_vpn(&mut tlb, 0x1000);
-        assert_eq!(tlb_lookup(&tlb, 0x1000, TEST_EPOCH), None);
-        assert!(tlb_lookup(&tlb, 0x2000, TEST_EPOCH).is_some());
+        assert!(matches!(tlb_lookup(&mut tlb, 0x1000, 0), TlbResult::Miss));
+        assert!(matches!(tlb_lookup(&mut tlb, 0x2000, 0), TlbResult::Hit(_)));
     }
 
     #[test]
-    fn tlb_fifo_wraps() {
-        let mut tlb: [TlbEntry; 32] = [TlbEntry::empty(); 32];
-        let mut ins_idx: usize = 0;
-        for i in 0..33 {
+    fn tlb_clock_evicts() {
+        let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
+        let mut hand: u8 = 0;
+        for i in 0..TLB_ENTRIES {
             tlb_insert(
                 &mut tlb,
-                &mut ins_idx,
+                &mut hand,
+                None,
                 i as u64,
                 i as u64 * 0x1000,
                 0xF,
                 0,
-                0,
-                TEST_EPOCH,
+                0, 0,
             );
         }
-        assert_eq!(tlb_lookup(&tlb, 0, TEST_EPOCH), None, "entry 0 should be evicted");
-        assert!(tlb_lookup(&tlb, 32, TEST_EPOCH).is_some(), "entry 32 should be present");
+        assert!(matches!(tlb_lookup(&mut tlb, 0, 0), TlbResult::Hit(_)));
+        tlb_insert(
+            &mut tlb,
+            &mut hand,
+            None,
+            TLB_ENTRIES as u64,
+            0xA000,
+            0xF,
+            0,
+            0, 0,
+        );
+        let valid_count = tlb.iter().filter(|e| e.valid != 0).count();
+        assert_eq!(valid_count, TLB_ENTRIES);
+    }
+
+    #[test]
+    fn tlb_dirty_reuse() {
+        let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
+        let mut hand: u8 = 0;
+        // Fill all entries clean
+        for i in 0..TLB_ENTRIES {
+            tlb_insert(
+                &mut tlb,
+                &mut hand,
+                None,
+                i as u64,
+                i as u64 * 0x1000,
+                0xF,
+                0,
+                0, 0,
+            );
+        }
+        // Mark entry 5 dirty
+        tlb[5].dirty = 1;
+        // Re-insert at dirty slot — should reuse slot 5, not evict another
+        tlb_insert(&mut tlb, &mut hand, Some(5), 0x1000, 0x90000, 0xF, 0, 0, 0);
+        assert_eq!(tlb[5].ppn, 0x90000);
+        assert_eq!(tlb[5].dirty, 0);
+        let valid_count = tlb.iter().filter(|e| e.valid != 0).count();
+        assert_eq!(valid_count, TLB_ENTRIES); // no extra entry leaked
     }
 
     #[test]
@@ -693,6 +980,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
         let result = sv39_walk(&ctx, satp, 0x1000, false);
@@ -713,6 +1004,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
         let result = sv39_walk(&ctx, satp, 0x2000, true);
@@ -737,6 +1032,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
         let _result = sv39_walk(&ctx, satp, 0x3000, false);
@@ -768,6 +1067,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
         let result = translate_va(&mut state, &ctx, 0x8000_1000, false, false);
@@ -796,6 +1099,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
         let result = translate_va(&mut state, &ctx, 0x8000_1000, false, false);
@@ -823,10 +1130,17 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
         let result = translate_va(&mut state, &ctx, 0x8000_1000, false, false);
-        assert!(result.is_ok(), "D-mode must use Bare translation (bypass Sv39)");
+        assert!(
+            result.is_ok(),
+            "D-mode must use Bare translation (bypass Sv39)"
+        );
         let tr = result.unwrap();
         assert_eq!(tr.pa, 0x8000_1000, "D-mode VA must equal PA");
     }
@@ -847,11 +1161,17 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
-        let pa = crate::hart_sched::translate_fetch_pc_concurrent(
-            &mut state, &ctx, 0x8000_2000,
+        let pa = crate::hart_sched::translate_fetch_pc_concurrent(&mut state, &ctx, 0x8000_2000);
+        assert_eq!(
+            pa,
+            Some(0x8000_2000),
+            "D-mode fetch must bypass Sv39 (VA==PA)"
         );
-        assert_eq!(pa, Some(0x8000_2000), "D-mode fetch must bypass Sv39 (VA==PA)");
     }
 }

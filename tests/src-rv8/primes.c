@@ -12,7 +12,7 @@ int main() {
 #define set(p) (primes[p >> 6] |= 1 << (p & 0x3f))
 #define is_prime(p) !test(p)
 	int64_t p = 2, sqrt_limit = (int64_t)sqrt(limit);
-	while (p <= limit >> 1) {
+	while (p <= 2 * sqrt_limit) {
 		for (int64_t n = 2 * p; n <= limit; n += p) {
 			if (!test(n)) {
 				set(n);

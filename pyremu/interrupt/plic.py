@@ -256,7 +256,12 @@ class PLIC(Device):
     # ---- Claim / Complete ----
 
     def _do_claim(self, context: int) -> int:
-        """Claim: 返回最高优先级待处理源, 清除 pending 位."""
+        """Claim: 返回最高优先级待处理源, 清除 pending 位.
+
+        RISC-V PLIC 规范: claim 仅清除 pending, 不修改 level.
+        level 由设备侧 set_irq 独占控制 — 设备降电平后 complete
+        不会重挂 pending, 设备保持高电平时 complete 立即重挂.
+        """
         src = self._find_highest(context)
         if src > 0:
             self._pending[src] = False

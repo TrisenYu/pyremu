@@ -10,8 +10,9 @@
 
 from pathlib import Path
 
-from pyremu.core.decoder import Opc
 from pyremu.core.trap_def import trap_cause_name as _trap_cause_name_impl
+from pyremu.utils.mask import mask64
+from pyremu.utils.disassem import Opc
 
 # ============================================================
 #  节流常量
@@ -41,7 +42,7 @@ def hex_addr(v: int, styled: bool = True) -> str:
 
     *styled* 为 True 时, 虚地址以蓝色高亮 (Rich tag).
     """
-    raw = f"0x{(v & 0xFFFF_FFFF_FFFF_FFFF):016x}"
+    raw = f"0x{mask64(v):016x}"
     if styled:
         return f"[bright_blue]{raw}[/]"
     return raw

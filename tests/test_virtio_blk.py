@@ -349,7 +349,7 @@ class TestFeatures:
     def test_device_features_page1(self, vblk):
         _mmio_write(vblk, VIRTIO_MMIO_DEVICE_FEATURES_SEL, 1)
         features = _mmio_read(vblk, VIRTIO_MMIO_DEVICE_FEATURES)
-        # Page 1: VIRTIO_F_VERSION_1 (bit 32) → bits [31:0] of page 1
+        # Page 1: VIRTIO_F_VERSION_1 (bit 32) ->bits [31:0] of page 1
         assert features == (VIRTIO_F_VERSION_1 >> 32) & 0xFFFF_FFFF
 
     def test_driver_features_write(self, vblk):

@@ -15,13 +15,14 @@ pub(crate) const TRAP_LOOP_THRESHOLD: u8 = 3;
 pub(crate) fn wfi_sync_and_check(state: &mut HartState, clint: &ConcurrentClintCtx) -> (bool, bool) {
     sync_mtip(state, clint);
     sync_msip(state, clint);
-    // For WFI wake-up we only require that an interrupt is pending
-    // (mip & mie ≠ 0), NOT that MIE is set — WFI wakes on any pending
-    // interrupt regardless of global enable.  The trap delivery check
-    // (check_pending_interrupts) applies MIE gating later.
-    let pending = state.mip & state.mie;
-    let msip_set = (pending & (1 << 3)) != 0;
-    (pending != 0, msip_set)
+    // WFI wake-up: any enabled interrupt (mip & mie), OR MSIP pending
+    // even when mie.MSIE=0.  MSIP is used by OpenSBI for cross-hart TLB
+    // shootdown / IPI — the receiver may have interrupts disabled (mie=0
+    // in cpu_do_idle) yet must still wake to acknowledge the request.
+    // Python's try_wfi_wakeup has the same MSIP exception.
+    let msip_pending = (state.mip & (1 << 3)) != 0;
+    let other_pending = (state.mip & state.mie) != 0;
+    (other_pending || msip_pending, msip_pending)
 }
 
 /// All-idle check: if there's a pending timer deadline, fast-forward
@@ -30,7 +31,7 @@ pub(crate) fn wfi_sync_and_check(state: &mut HartState, clint: &ConcurrentClintC
 ///
 /// Without a cap, a single fast-forward can jump mtime by billions of
 /// ticks (e.g. the kernel's ``deferred_probe_timeout=10`` sets a
-/// 10-second timer → 100M ticks at 10 MHz).  The kernel sees this as a
+/// 10-second timer ->100M ticks at 10 MHz).  The kernel sees this as a
 /// multi-second wall-clock jump — kernel log timestamps go from 0.6 s
 /// to 5766 s between adjacent printks.
 ///
@@ -80,7 +81,17 @@ pub(crate) fn wfi_check_all_idle(
 
     if !msip_pending {
         // No timer and no pending MSIP — truly idle.
+        // After sync_msip, re-check: an MSIP may have arrived between
+        // the caller's wfi_sync_and_check and this point.  Exiting the
+        // batch would discard the trap and leave the sender spinning in
+        // OpenSBI waiting for acknowledgment ->TLB-shootdown deadlock.
         sync_msip(state, clint);
+        if (state.mip & (1 << 3)) != 0 {
+            state.waiting = 0;
+            state.wfi_woken = 1;
+            diag::wfi_wake_reason(&mut state.diag, state.mip & state.mie, true);
+            return Some(true); // wake — trap will be delivered on re-entry
+        }
         module.request_stop(StopInfo {
             reason: exit_reason::WFI_WAIT,
             hart_id: hart_id as u8,

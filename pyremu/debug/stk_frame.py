@@ -41,8 +41,8 @@ class StackWalkMixin(SharedMixinAttrs):
     # C1 quadrant: bits[1:0]=01, bits[15:13]=funct3
     # C2 quadrant: bits[1:0]=10, bits[15:13]=funct3
     #
-    # c.jal  (RV64)  funct3=101  quadrant C1  →  jal  x1, imm     [2 B]
-    # c.jalr           funct3=100  quadrant C2  →  jalr x1, rs1, 0  [2 B]
+    # c.jal  (RV64)  funct3=101  quadrant C1  -> jal  x1, imm     [2 B]
+    # c.jalr           funct3=100  quadrant C2  -> jalr x1, rs1, 0  [2 B]
     #                                                  bit[12]=0
     # jal              opcode=110_1111,  rd=x1                    [4 B]
     # jalr             opcode=110_0111,  funct3=000, rd=x1        [4 B]
@@ -54,6 +54,25 @@ class StackWalkMixin(SharedMixinAttrs):
     _C_JALR_MASK: int  = 0xF003  # bits[15:13]=100, bit[12]=0, bits[1:0]=10
     _C_JALR_MATCH: int = 0x9002
 
+    @staticmethod
+    def _is_plausible_ra(ra: int) -> bool:
+        """快速拒绝明显无效的返回地址.
+
+        返回 False 的值:
+          - 0 (空指针)
+          - 0xFFFFFFFFFFFFFFFF (未初始化/哨兵/函数破坏 x1)
+          - < 4 (无法安全 ra-4)
+          - 地址落在 64-bit 空间最高 64 KiB 内 (> 0xFFFF_FFFF_FFFF_0000).
+            内核/用户代码的实际映射地址都远低于此边界.
+        """
+        if ra == 0 or ra == 0xFFFF_FFFF_FFFF_FFFF:
+            return False
+        if ra < 4:
+            return False
+        if ra > 0xFFFF_FFFF_FFFF_0000:
+            return False
+        return True
+
     def _call_site_pc(self, ra: int) -> int:
         """从返回地址推断调用指令的 PC.
 
@@ -61,32 +80,33 @@ class StackWalkMixin(SharedMixinAttrs):
         (jal/jalr). 读取 ra 之前的指令字节以判定调用类型; 若无法
         确定则保守假设 4 字节.
         """
+        if not self._is_plausible_ra(ra):
+            return 0
+
         # -- 尝试 ra-2: 16-bit 压缩调用 --
-        if ra >= 2:
-            raw = self._try_read_va(ra - 2, 2)
-            if raw is not None:
-                h = int.from_bytes(raw, "little", signed=False)
-                if (h & 0x3) != 3:                         # compressed quadrant
-                    if (h & self._C_JAL_MASK) == self._C_JAL_MATCH:
-                        return ra - 2                       # c.jal
-                    if (h & self._C_JALR_MASK) == self._C_JALR_MATCH:
-                        return ra - 2                       # c.jalr
+        raw = self._try_read_va(ra - 2, 2)
+        if raw is not None:
+            h = int.from_bytes(raw, "little", signed=False)
+            if (h & 0x3) != 3:
+                if (h & self._C_JAL_MASK) == self._C_JAL_MATCH:
+                    return ra - 2
+                if (h & self._C_JALR_MASK) == self._C_JALR_MATCH:
+                    return ra - 2
 
         # -- 尝试 ra-4: 32-bit 调用 --
-        if ra >= 4:
-            raw = self._try_read_va(ra - 4, 4)
-            if raw is not None:
-                w = int.from_bytes(raw, "little", signed=False)
-                if ((w >> 7) & 0x1F) != 1:                  # rd ≠ x1 → not a call
-                    return ra - 4 if ra >= 4 else 0
-                opc = w & 0x7F
-                if opc == 0b1101111:                        # jal
-                    return ra - 4
-                if opc == 0b1100111 and ((w >> 12) & 0x7) == 0b000:  # jalr
-                    return ra - 4
+        raw = self._try_read_va(ra - 4, 4)
+        if raw is not None:
+            w = int.from_bytes(raw, "little", signed=False)
+            if ((w >> 7) & 0x1F) != 1:
+                return ra - 4
+            opc = w & 0x7F
+            if opc == 0b1101111:
+                return ra - 4
+            if opc == 0b1100111 and ((w >> 12) & 0x7) == 0b000:
+                return ra - 4
 
         # -- 无法确定: 假设 4-byte 调用 --
-        return ra - 4 if ra >= 4 else 0
+        return ra - 4
 
     # ----------------------------------------------------------
     #  帧链接读取
@@ -117,8 +137,8 @@ class StackWalkMixin(SharedMixinAttrs):
         """从 trap 入口代码中提取 RA / FP 相对 trap 帧 SP 的保存偏移.
 
         扫描 *tvec* 起最多 *max_instrs* 条指令, 寻找形如
-          sd x1, OFF(sp) / c.sdsp x1, OFF(sp)   →  ra_off = OFF
-          sd x8, OFF(sp) / c.sdsp x8, OFF(sp)   →  fp_off = OFF
+          sd x1, OFF(sp) / c.sdsp x1, OFF(sp)   -> ra_off = OFF
+          sd x8, OFF(sp) / c.sdsp x8, OFF(sp)   -> fp_off = OFF
         的寄存器保存操作.  必须至少找到 RA 偏移才视为成功.
         """
         raw = self._try_read_va(tvec, max_instrs * 4)
@@ -131,15 +151,14 @@ class StackWalkMixin(SharedMixinAttrs):
         while pos + 2 <= len(raw) and (ra_off is None or fp_off is None):
             half = int.from_bytes(raw[pos:pos + 2], "little", signed=False)
             is_compressed = (half & 0x3) != 3
-            if is_compressed:
-                ra_off = ra_off or self._try_match_save(half, 1, decode_c_sdsp)
-                fp_off = fp_off or self._try_match_save(half, 8, decode_c_sdsp)
+            choice = decode_c_sdsp
+            pos += 2
+            if not is_compressed:
+                choice = decode_sd_sp
+                half = int.from_bytes(raw[pos-2:pos+2], "little", signed=False)
                 pos += 2
-            else:
-                instr = int.from_bytes(raw[pos:pos + 4], "little", signed=False)
-                ra_off = ra_off or self._try_match_save(instr, 1, decode_sd_sp)
-                fp_off = fp_off or self._try_match_save(instr, 8, decode_sd_sp)
-                pos += 4
+            ra_off = ra_off or self._try_match_save(half, 1, choice)
+            fp_off = fp_off or self._try_match_save(half, 8, choice)
 
         return (ra_off, fp_off or 0) if ra_off is not None else None
 
@@ -180,9 +199,7 @@ class StackWalkMixin(SharedMixinAttrs):
         if self._image is None:
             return default_mode
         h = self.hart
-        if h.mode.name != "S":
-            return default_mode
-        if h.mpp.value >= h.mode.value:
+        if h.mode.name != "S" or h.mpp.value >= h.mode.value:
             return default_mode
         seg = self._find_segment(pc - self._load_offset)
         if seg is not None and seg.name is not None:
@@ -194,16 +211,94 @@ class StackWalkMixin(SharedMixinAttrs):
     #  FP 链回溯
     # ----------------------------------------------------------
 
+    @staticmethod
+    def _is_invalid_link(
+        saved_fp: int,
+        saved_ra: int,
+        current_fp: int,
+        *,
+        fp0: int,
+        visited: set[int],
+    ) -> bool:
+        """返回 True 表示帧链接无效, 应终止 FP 链回溯.
+
+        无效条件:
+          - saved_fp 为零、不回退 (<= current_fp)、或未 8-byte 对齐
+          - saved_ra 为零 (无返回地址)
+          - saved_fp 已出现在已访问集合中 (含初始帧 fp0), 防死循环
+        """
+        if saved_fp == 0:
+            return True
+        if saved_fp <= current_fp:
+            return True
+        if (saved_fp & 0x7) != 0:
+            return True
+        if saved_ra == 0:
+            return True
+        if saved_fp == fp0 or saved_fp in visited:
+            return True
+        return False
+
+    def _resolve_prev_ra(
+        self, frames: list[StackFrame], saved_ra: int
+    ) -> tuple[int, bool]:
+        """解析当前帧的调用者 RA.
+
+        帧 #1 (len(frames)==1): 优先当前 hart 的 live x1 (ra);
+          若已被函数破坏则降级为栈上 *saved_ra*; 两者均无效时设
+          ra_corrupted=True 并返回最佳猜测值 (供 call_site 推算).
+        更深帧: 直接使用栈上 *saved_ra*.
+
+        Returns (prev_ra, ra_corrupted).
+        """
+        # -- 更深帧: 直接使用栈上 saved_ra --
+        if len(frames) != 1:
+            ok = (
+                saved_ra != 0
+                and self._is_plausible_ra(saved_ra)
+                and self._is_valid_code_va(saved_ra)
+            )
+            return saved_ra, (not ok)
+
+        # -- 帧 #1: 优先 live ra, 再 fallback 到栈上 saved_ra --
+        live_ra = frames[0].ra
+        if live_ra != 0 and self._is_plausible_ra(live_ra) and self._is_valid_code_va(live_ra):
+            return live_ra, False
+        if saved_ra != 0 and self._is_plausible_ra(saved_ra) and self._is_valid_code_va(saved_ra):
+            return saved_ra, False
+        # 两者均无效: 用 live_ra (或 saved_ra) 作为最佳猜测
+        guess = live_ra if live_ra != 0 else saved_ra
+        return guess, True
+
+    def _append_ra_inferred_frames(self, frames: list[StackFrame]) -> None:
+        """FP 链终止后, 从最后有效 RA 推断额外调用者帧."""
+        if len(frames) == 1:
+            ra = frames[0].ra
+            if ra != 0 and self._is_plausible_ra(ra) and self._is_valid_code_va(ra):
+                frames.append(StackFrame(
+                    idx=1, fp=0, sp=frames[0].fp, ra=0,
+                    pc=self._call_site_pc(ra), mode=frames[0].mode,
+                    note="调用者 (FP 链不可达, 由 RA 推断)",
+                ))
+        elif len(frames) >= 2:
+            last_ra = frames[-1].ra
+            if last_ra != 0 and self._is_plausible_ra(last_ra) and self._is_valid_code_va(last_ra):
+                frames.append(StackFrame(
+                    idx=len(frames), fp=0, sp=frames[-1].fp, ra=0,
+                    pc=self._call_site_pc(last_ra), mode=frames[-1].mode,
+                    note="调用者 (FP 链终止, 由 RA 推断)",
+                ))
+
     def _walk_frame_chain(self) -> list[StackFrame]:
         """沿 FP 链遍历调用栈, 返回 StackFrame 列表."""
         h = self.hart
         current_fp: int = h.gprs[8]  # s0/fp
-        visited: set[int] = {current_fp}
         cur_mode = h.mode.name
         frames: list[StackFrame] = [StackFrame(
             idx=0, fp=current_fp, sp=h.gprs[2], ra=h.gprs[1],
             pc=h.pc, mode=cur_mode,
         )]
+        visited: set[int] = {current_fp}
         _seen_lower_mode = False
 
         while True:
@@ -213,29 +308,15 @@ class StackWalkMixin(SharedMixinAttrs):
             if link is None:
                 break
             saved_ra, saved_fp = link
-            if saved_fp == 0:
-                break
-            if saved_fp <= current_fp or (saved_fp & 0x7) or saved_fp in visited:
-                break
-            if saved_fp == frames[0].fp:
-                break
-            if saved_ra == 0:
+
+            if self._is_invalid_link(
+                saved_fp, saved_ra, current_fp,
+                fp0=frames[0].fp, visited=visited,
+            ):
                 break
             visited.add(saved_fp)
-            # 帧 #1 优先使用 live x1; 若 live x1 被当前函数用作临时寄存器
-            # (如 blake2s G 宏), 降级使用栈上保存的 RA
-            ra_corrupted = False
-            if len(frames) == 1:
-                prev_ra = frames[0].ra if frames[0].ra != 0 else saved_ra
-                if not self._is_valid_code_va(prev_ra):
-                    if saved_ra != 0 and self._is_valid_code_va(saved_ra):
-                        prev_ra = saved_ra
-                    else:
-                        ra_corrupted = True
-            else:
-                prev_ra = saved_ra
-                if not self._is_valid_code_va(prev_ra):
-                    ra_corrupted = True
+
+            prev_ra, ra_corrupted = self._resolve_prev_ra(frames, saved_ra)
             call_site = self._call_site_pc(prev_ra)
             note = "RA 可能已被当前函数覆盖 (非合法代码地址)" if ra_corrupted else ""
 
@@ -245,41 +326,15 @@ class StackWalkMixin(SharedMixinAttrs):
                     _seen_lower_mode = True
             else:
                 fmode = frames[-1].mode
+
             frames.append(StackFrame(
                 idx=len(frames), fp=saved_fp, sp=current_fp,
                 ra=saved_ra, pc=call_site, mode=fmode, note=note,
             ))
             current_fp = saved_fp
 
-        # 当 FP 链自然终止且最后一帧有有效 RA 时, 由 RA 推断调用者,
-        # 再尝试跨特权级 trap 上下文回溯.  避免 FP 链终止后直接落在
-        # 残留的 trap 上下文上 (如 mepc 指向无关地址), 产生无意义的
-        # "仅 trap PC (栈扫描无匹配)" 帧.
-        #
-        # 单帧链 (FP 链完全无法回溯, 如 Sv39 翻译读不到栈页) 也尝试
-        # 由 live RA 推断一个直接调用者, 避免仅输出孤立的 #01 帧.
-        ra_inferred = None
-        if len(frames) == 1:
-            ra = frames[0].ra
-            if ra != 0 and self._is_valid_code_va(ra):
-                call_site = self._call_site_pc(ra)
-                ra_inferred = StackFrame(
-                    idx=1, fp=0, sp=frames[0].fp,
-                    ra=0, pc=call_site, mode=frames[0].mode,
-                    note="调用者 (FP 链不可达, 由 RA 推断)",
-                )
-                frames.append(ra_inferred)
-        elif len(frames) >= 2:
-            last_ra = frames[-1].ra
-            if last_ra != 0 and self._is_valid_code_va(last_ra):
-                call_site = last_ra - 4 if last_ra >= 4 else 0
-                ra_inferred = StackFrame(
-                    idx=len(frames), fp=0, sp=frames[-1].fp,
-                    ra=0, pc=call_site, mode=frames[-1].mode,
-                    note="调用者 (FP 链终止, 由 RA 推断)",
-                )
-                frames.append(ra_inferred)
-
+        # FP 链终止后的 RA 推断 + 跨特权级回溯
+        self._append_ra_inferred_frames(frames)
         effective_mode = frames[-1].mode if len(frames) > 1 else cur_mode
         self._walk_prev_mode_frames(frames, effective_mode, visited)
         return frames
@@ -322,7 +377,7 @@ class StackWalkMixin(SharedMixinAttrs):
                     pass
                 else:
                     # Bare 翻译下非 U 模式 (SPP=S): sepc 落在 RAM
-                    # 但 S 模式代码预期在高区 → 残留值
+                    # 但 S 模式代码预期在高区 ->残留值
                     return
             s_trapped_pc = 0
             s_prev_mode = RiscvMode.U
@@ -356,7 +411,7 @@ class StackWalkMixin(SharedMixinAttrs):
                 frames, trapped_pc, prev_mode, tvec, visited, offsets
             )
         elif prev_mode == RiscvMode.U and not _nested:
-            # S→U 边界: 指令解析失败时, 尝试常见 trap 帧布局以恢复
+            # S->U 边界: 指令解析失败时, 尝试常见 trap 帧布局以恢复
             # U-mode 的 FP/SP/RA 并继续 U-mode FP 链回溯.
             self._add_prev_mode_frame_fallback(
                 frames, trapped_pc, prev_mode, tvec, visited,
@@ -509,14 +564,16 @@ class StackWalkMixin(SharedMixinAttrs):
             self._add_prev_mode_frame(
                 trial, trapped_pc, prev_mode, tvec, visited, offsets,
             )
-            if trial and trial[-1].fp != 0:
-                # 成功恢复: 将结果帧合并到正式帧列表并返回
-                frames.extend(trial)
-                # 将 trial 中所有有效 FP 加入 visited 以避免 FP 链循环
-                for f in trial:
-                    if f.fp != 0:
-                        visited.add(f.fp)
-                return
+            if not trial or trial[-1].fp == 0:
+                continue
+            # 成功恢复: 将结果帧合并到正式帧列表并返回
+            frames.extend(trial)
+            # 将 trial 中所有有效 FP 加入 visited 以避免 FP 链循环
+            for f in trial:
+                if f.fp == 0:
+                    continue
+                visited.add(f.fp)
+            return
         # 全部 fallback 失败: 添加仅 PC 帧
         frames.append(StackFrame(
             idx=len(frames), fp=0, sp=0, ra=0,
@@ -614,7 +671,3 @@ class StackWalkMixin(SharedMixinAttrs):
             f"sp={hex_addr(cur.sp)} 栈内存:[/]\n"
             + self._emu._fmt_hexdump(cur.sp, stack_data)
         )
-
-
-# fmt_hexdump 复用自 Emulator._fmt_hexdump，无需重复定义.
-# Arg order: (addr: int, data: bytes) — 与 mem 命令使用同一实现, 颜色一致.

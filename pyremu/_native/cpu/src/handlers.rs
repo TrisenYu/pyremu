@@ -4,102 +4,28 @@
 //! context; it returns the PC advance (0, 2, or 4) or ``EXIT_SENTINEL`` to
 //! signal that Python must take over.
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
-
-#[cfg(feature = "diagnostic")]
-use crate::diag;
-
 
 use crate::csr;
 use crate::decode::{decode_compressed, CompressedFields, DecodedFields};
+#[cfg(feature = "diagnostic")]
+use crate::diag;
+use crate::peripheral::is_device_addr;
 use crate::state::{exit_reason, riscv_mode, BatchResult, HartState};
-use crate::translate::{translate_va, TranslateFault, WalkCtx};
+use crate::translate::{translate_va, TranslateFault, TranslateResult, WalkCtx};
 use crate::trap::{deliver_illegal_instruction, deliver_trap, exc_code, mcause_val};
 
-// ============================================================
-//  CLINT inline context (passed through the dispatch chain)
-// ============================================================
-
-// ============================================================
-//  Context structs — keep handler signatures compact
-// ============================================================
-
-/// PMP (Physical Memory Protection) configuration for the batch.
-pub struct PmpCtx {
-    pub cfg: *mut u8,
-    pub addr: *mut u64,
-    pub num: u8,
-}
-
-/// Device MMIO address ranges (base + end per device).
-pub struct DevCtx {
-    pub bases: *const u64,
-    pub ends: *const u64,
-    pub num: u8,
-    /// virtio-blk MMIO base address (0 = no virtio device).
-    pub virtio_base: u64,
-    /// Mutable pointer to the FFI virtio-blk state that Rust updates inline.
-    /// Valid for the duration of one ``run_batch`` / ``run_parallel`` call.
-    pub virtio_raw: *mut crate::state::FfiVirtIoCtx,
-}
-
-impl DevCtx {
-    /// 检查是否有设备将工作延迟到 Python 侧处理 (如 virtio QueueNotify
-    /// 仅设 notify_pending=1, 实际 virtqueue 处理在 batch 退出后进行)。
-    ///
-    /// 返回 true 时, hart 调度器应在进入 WFI 自旋前主动退出 batch,
-    /// 否则 ``wfi_check_all_idle`` 的 timer fast-forward 会反复唤醒
-    /// hart 处理定时器, virtqueue 永远得不到处理 → 客机 I/O 永久挂起。
-    pub fn has_pending_python_work(&self) -> bool {
-        if !self.virtio_raw.is_null() {
-            let notify = unsafe { (*self.virtio_raw).notify_pending };
-            if notify != 0 {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-/// Bundled CLINT state for inline MMIO handling.
-///
-/// Carries mutable pointers to the per-hart ``msip`` and ``mtimecmp`` arrays
-/// shared with Python, plus a pointer to all ``HartState`` s so that MSIP
-/// writes targeting a different hart can immediately update that hart's
-/// ``mip`` field.
-pub struct ClintCtx {
-    pub base: u64,
-    pub mtime: *mut u64,
-    pub mtimecmp: *mut u64,
-    pub msip: *mut u8,
-    pub states: *mut HartState,
-    pub num_harts: u32,
-    /// Set when a hart writes MSIP=1 to a *different* hart.  The dispatch
-    /// loop checks this flag and yields the current hart's slice early so
-    /// the target hart can respond to the IPI within the same batch round.
-    ///
-    /// For multi-target broadcasts (``sbi_ipi_send_many`` with N>1 targets),
-    /// the sender yields after the first MSIP write, then resumes in the
-    /// next round-robin round to send the remaining MSIPs.  This is correct
-    /// because OpenSBI's hartmask is progressively cleared — no target is
-    /// lost.  N targets may take N rounds, but each round consumes ~1
-    /// instruction on the sender instead of the full 512-instr spin-wait.
-    pub yield_for_ipi: Cell<bool>,
-    /// Hart ID of the most recent cross-hart MSIP sender; this hart receives
-    /// short slices so the receiver can complete IPI-triggered work (TLB
-    /// flush, sync counter decrement) before the sender's spin-wait resumes.
-    pub ipi_sender_hart: Cell<u8>,
-    /// Remaining rounds of short slices for *ipi_sender_hart*.  Decremented
-    /// once per round-robin round until zero, then the sender resumes full
-    /// slices.  Reset to a fresh count each time a new MSIP is sent.
-    pub ipi_sender_rounds: Cell<u8>,
-}
+// Re-export moved items for backward compatibility
+pub use crate::interrupt::clint::ClintCtx;
+pub(crate) use crate::interrupt::clint::{clint_write_msip, try_handle_clint};
+pub use crate::peripheral::virtio::try_handle_virtio;
+pub use crate::peripheral::DevCtx;
+pub use crate::pmp::{pmp_ok, PmpCtx};
+pub(crate) use crate::translate::{lr_check, lr_clear_all, lr_set, ram_read, ram_write};
 
 // Re-export from csr.rs
 pub use crate::csr::EXIT_SENTINEL;
-
 // ============================================================
 //  SBI extension / function IDs (RISC-V SBI spec v2.0)
 // ============================================================
@@ -173,176 +99,33 @@ fn c1_alu_reg_op(v1: u64, v2: u64, bit12: u8, bit65: u8) -> Option<u64> {
     }
 }
 
-// ============================================================
-//  Memory read/write helpers
-// ============================================================
-
-/// Read *size* bytes from physical address *pa* in RAM. Little-endian.
+/// Execute one C1 ALU operation per the ``sf`` field.
+/// Returns ``None`` for illegal encodings (caller delivers IllInstr).
 #[inline]
-fn ram_read(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
-    let off = super::mem::ram_offset_inline(
-        pa,
-        size as u32,
-        ctx.ram_base,
-        ctx.ram_size,
-        ctx.shadow_base,
-        ctx.shadow_size,
-    );
-    if off.is_none() {
-        return 0;
+fn exec_c1_alu(
+    state: &HartState,
+    cf: &CompressedFields,
+) -> Option<u64> {
+    let v1 = read_gpr(state, cf.rs1p);
+    match cf.sf {
+        0b00 => {
+            let shamt = ((cf.bit12 as u64) << 5) | (cf.rs2 as u64 & 0x1F);
+            Some(v1 >> shamt)
+        }
+        0b01 => {
+            let shamt = ((cf.bit12 as u64) << 5) | (cf.rs2 as u64 & 0x1F);
+            Some(((v1 as i64) >> shamt) as u64)
+        }
+        0b10 => {
+            let imm = sext(((cf.bit12 as u64) << 5) | (cf.rs2 as u64 & 0x1F), 6);
+            Some(v1 & imm)
+        }
+        0b11 => {
+            let v2 = read_gpr(state, cf.rdp);
+            c1_alu_reg_op(v1, v2, cf.bit12, cf.bit65)
+        }
+        _ => None,
     }
-    let ptr = ctx.ram as *mut u8;
-    let ptr = unsafe { ptr.add(off.unwrap() as usize) };
-    match size {
-        1 => unsafe { *ptr as u64 },
-        2 => {
-            let b0 = unsafe { *ptr } as u64;
-            let b1 = unsafe { *ptr.add(1) } as u64;
-            b0 | (b1 << 8)
-        }
-        4 if (pa & 3) == 0 => {
-            // Aligned 4-byte: atomic Acquire load pairs with Release stores
-            // from other hart threads (ram_write / ram_write_raw).
-            let a = unsafe { &*(ptr as *const AtomicU32) };
-            a.load(Ordering::Acquire) as u64
-        }
-        4 => {
-            let b0 = unsafe { *ptr } as u64;
-            let b1 = unsafe { *ptr.add(1) } as u64;
-            let b2 = unsafe { *ptr.add(2) } as u64;
-            let b3 = unsafe { *ptr.add(3) } as u64;
-            b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-        }
-        8 if (pa & 7) == 0 => {
-            // Aligned 8-byte: atomic Acquire load pairs with Release stores
-            // from other hart threads.
-            let a = unsafe { &*(ptr as *const AtomicU64) };
-            a.load(Ordering::Acquire)
-        }
-        8 => {
-            let b0 = unsafe { *ptr } as u64;
-            let b1 = unsafe { *ptr.add(1) } as u64;
-            let b2 = unsafe { *ptr.add(2) } as u64;
-            let b3 = unsafe { *ptr.add(3) } as u64;
-            let b4 = unsafe { *ptr.add(4) } as u64;
-            let b5 = unsafe { *ptr.add(5) } as u64;
-            let b6 = unsafe { *ptr.add(6) } as u64;
-            let b7 = unsafe { *ptr.add(7) } as u64;
-            b0 | (b1 << 8)
-                | (b2 << 16)
-                | (b3 << 24)
-                | (b4 << 32)
-                | (b5 << 40)
-                | (b6 << 48)
-                | (b7 << 56)
-        }
-        _ => 0,
-    }
-}
-
-/// Write *size* bytes of *val* to physical address *pa* in RAM. Little-endian.
-///
-/// Aligned 4- and 8-byte writes use atomic stores with Release ordering so
-/// that loads on other hart threads (which use Acquire loads via
-/// ``ram_read`` / ``ram_read_raw``) are guaranteed to see the full write.
-/// Without this, concurrent compressed-store + regular-load pairs on the
-/// same address can observe torn writes.
-#[inline]
-fn ram_write(ctx: &WalkCtx, pa: u64, val: u64, size: u8) -> bool {
-    let off = super::mem::ram_offset_inline(
-        pa,
-        size as u32,
-        ctx.ram_base,
-        ctx.ram_size,
-        ctx.shadow_base,
-        ctx.shadow_size,
-    );
-    if off.is_none() {
-        return false;
-    }
-    let ptr = ctx.ram as *mut u8;
-    let ptr = unsafe { ptr.add(off.unwrap() as usize) };
-    match size {
-        1 => unsafe {
-            *ptr = val as u8;
-        },
-        2 => {
-            unsafe {
-                *ptr = val as u8;
-            }
-            unsafe {
-                *ptr.add(1) = (val >> 8) as u8;
-            }
-        }
-        4 if (pa & 3) == 0 => {
-            // Aligned 4-byte: atomic Release store pairs with Acquire
-            // loads from other hart threads.
-            let a = unsafe { &*(ptr as *const AtomicU32) };
-            a.store(val as u32, Ordering::Release);
-        }
-        4 => {
-            unsafe {
-                *ptr = val as u8;
-            }
-            unsafe {
-                *ptr.add(1) = (val >> 8) as u8;
-            }
-            unsafe {
-                *ptr.add(2) = (val >> 16) as u8;
-            }
-            unsafe {
-                *ptr.add(3) = (val >> 24) as u8;
-            }
-        }
-        8 if (pa & 7) == 0 => {
-            // Aligned 8-byte: atomic Release store pairs with Acquire
-            // loads from other hart threads.
-            let a = unsafe { &*(ptr as *const AtomicU64) };
-            a.store(val, Ordering::Release);
-        }
-        8 => {
-            unsafe {
-                *ptr = val as u8;
-            }
-            unsafe {
-                *ptr.add(1) = (val >> 8) as u8;
-            }
-            unsafe {
-                *ptr.add(2) = (val >> 16) as u8;
-            }
-            unsafe {
-                *ptr.add(3) = (val >> 24) as u8;
-            }
-            unsafe {
-                *ptr.add(4) = (val >> 32) as u8;
-            }
-            unsafe {
-                *ptr.add(5) = (val >> 40) as u8;
-            }
-            unsafe {
-                *ptr.add(6) = (val >> 48) as u8;
-            }
-            unsafe {
-                *ptr.add(7) = (val >> 56) as u8;
-            }
-        }
-        _ => return false,
-    }
-    true
-}
-
-/// Check if an address falls within a device MMIO range.
-/// Returns true if the address should be handled by Python.
-#[inline]
-fn is_device_addr(pa: u64, dev: &DevCtx) -> bool {
-    for i in 0..dev.num as usize {
-        let base = unsafe { *dev.bases.add(i) };
-        let end = unsafe { *dev.ends.add(i) };
-        if pa >= base && pa < end {
-            return true;
-        }
-    }
-    false
 }
 
 // ============================================================
@@ -357,15 +140,15 @@ fn is_device_addr(pa: u64, dev: &DevCtx) -> bool {
 /// ``is_write``: 0 = read, 1 = write.
 #[repr(C)]
 #[allow(dead_code)]
-struct MemAccess {
-    pa: u64,
-    is_write: u64,
-    write_data: u64,
-    size: u64,
+pub(crate) struct MemAccess {
+    pub(crate) pa: u64,
+    pub(crate) is_write: u64,
+    pub(crate) write_data: u64,
+    pub(crate) size: u64,
 }
 
 impl MemAccess {
-    fn read(pa: u64, size: u8) -> Self {
+    pub(crate) fn read(pa: u64, size: u8) -> Self {
         Self {
             pa,
             is_write: 0,
@@ -373,7 +156,7 @@ impl MemAccess {
             size: size as u64,
         }
     }
-    fn write(pa: u64, size: u8, data: u64) -> Self {
+    pub(crate) fn write(pa: u64, size: u8, data: u64) -> Self {
         Self {
             pa,
             is_write: 1,
@@ -388,358 +171,6 @@ impl MemAccess {
 ///
 /// Shared by ``try_handle_clint`` and the SBI IPI fast path so that
 /// yield-for-IPI logic is in one place.
-#[inline]
-fn clint_write_msip(clint: &ClintCtx, target: usize, current: usize, val: u8) {
-    if target >= clint.num_harts as usize {
-        return;
-    }
-    // In concurrent mode the msip pointer was transmuted from *const AtomicU8.
-    // Use an atomic store so release semantics are visible to the target
-    // hart's sync_msip acquire load.
-    if clint.states.is_null() {
-        unsafe {
-            let atomic_msip = clint.msip as *const AtomicU8;
-            (*atomic_msip.add(target)).store(val, Ordering::Release);
-        }
-        return;
-    }
-    unsafe {
-        *clint.msip.add(target) = val;
-    }
-    let ts = unsafe { &mut *clint.states.add(target) };
-    if val == 0 {
-        ts.mip &= !(1 << 3);
-        ts.diag.clint_msip_clr = ts.diag.clint_msip_clr.wrapping_add(1);
-		return;
-    }
-	ts.mip |= 1 << 3;
-	ts.diag.clint_msip_set = ts.diag.clint_msip_set.wrapping_add(1);
-	// Cross-hart IPI: request early slice yield so the target can
-	// respond within the same round-robin round instead of forcing the
-	// sender to spin-wait (e.g. tlb_sync) for the full 512-instr slice.
-	if target != current {
-		clint.yield_for_ipi.set(true);
-		// Give the sender short slices for several rounds so the
-		// receiver gets proportionally more CPU time to complete
-		// the IPI-triggered work (e.g., TLB flush + sync decrement)
-		// before the sender resumes its spin-wait.
-		clint.ipi_sender_hart.set(current as u8);
-		clint.ipi_sender_rounds.set(16);
-	}
-}
-
-/// Try to handle a CLINT MMIO access inline inside the native batch engine.
-///
-/// Returns:
-/// - ``Some(data)`` for a successful read (caller writes *data* to the
-///   destination register).
-/// - ``Some(0)`` for a successful write.
-/// - ``None`` if *pa* is not within the CLINT address range (caller falls
-///   through to the normal ``is_device_addr`` / MMIO-exit path).
-fn try_handle_clint(access: &MemAccess, state: &HartState, clint: &ClintCtx) -> Option<u64> {
-    // Snapshot fields to locals before any operation — defensive copy
-    // in case writes through clint.states could alias with the caller's
-    // stack temporary.
-    let pa = access.pa;
-    let is_write = access.is_write;
-    let write_data = access.write_data;
-
-    if clint.base == 0 {
-        return None;
-    }
-    let offset = pa.wrapping_sub(clint.base);
-
-    if offset < 0x4000 {
-        let hart_id = (offset / 4) as usize;
-        if hart_id >= clint.num_harts as usize {
-            return Some(0);
-        }
-        if is_write == 0 {
-            let val = unsafe { *clint.msip.add(hart_id) } as u64 & 1;
-            return Some(val);
-        }
-        clint_write_msip(
-            clint,
-            hart_id,
-            state.mhartid as usize,
-            (write_data & 1) as u8,
-        );
-        return Some(0);
-    } else if offset < 0xBFF8 {
-        let hart_id = usize::try_from((offset - 0x4000) / 8).unwrap_or(usize::MAX);
-        if hart_id >= clint.num_harts as usize {
-            return Some(0);
-        }
-        if is_write == 0 {
-            return Some(unsafe { *clint.mtimecmp.add(hart_id) });
-        }
-        unsafe {
-            *clint.mtimecmp.add(hart_id) = write_data;
-        }
-        if hart_id < clint.num_harts as usize && !clint.states.is_null() {
-            let t = unsafe { &mut *clint.states.add(hart_id) };
-            t.diag.clint_mtc_wr = t.diag.clint_mtc_wr.wrapping_add(1);
-        }
-        return Some(0);
-    } else if offset < 0xC000 && is_write == 0 {
-        return Some(unsafe { *clint.mtime });
-    }
-    None
-}
-
-// ============================================================
-//  virtio-blk inline MMIO handler
-// ============================================================
-
-/// Device features advertised by the virtio-blk device (64-bit).
-///
-/// VIRTIO_F_RING_EVENT_IDX (bit 29) and VIRTIO_F_RING_INDIRECT_DESC (bit 28)
-/// are deliberately NOT advertised: the Python-side virtqueue processor
-/// (_process_descriptor_chain) does not implement avail_event writes or
-/// indirect-descriptor-table traversal.  Advertising either feature causes
-/// the guest driver to take code paths that break on our device.
-/// Without them the driver falls back to flags-based notification
-/// (VRING_USED_F_NO_NOTIFY) and direct descriptor chains — both of which
-/// work correctly.
-const VIRTIO_DEVICE_FEATURES: u64 = 1u64 << 32; // VIRTIO_F_VERSION_1
-
-/// Try to handle a virtio-blk MMIO access inline inside the native batch engine.
-///
-/// The virtio base address and mutable state pointer are embedded in ``DevCtx``
-/// so that no additional parameters need to be threaded through the handler
-/// call chain.  Returns:
-/// - ``Some(data)`` for a successful read (caller writes *data* to the
-///   destination register).
-/// - ``Some(0)`` for a successful write.
-/// - ``None`` if *pa* is not within the virtio MMIO range, or if the access
-///   requires Python-side handling (``QueueNotify`` → ``notify_pending=1``,
-///   processed at the next natural batch boundary).
-pub fn try_handle_virtio(
-    pa: u64,
-    is_write: bool,
-    write_data: u64,
-    _size: u8,
-    dev: &DevCtx,
-) -> Option<u64> {
-    if dev.virtio_base == 0 {
-        return None;
-    }
-    let offset = pa.wrapping_sub(dev.virtio_base);
-    if offset >= 0x200 {
-        return None;
-    }
-    if is_write {
-        virtio_write(offset, write_data, dev.virtio_raw)
-    } else {
-        virtio_read(offset, dev.virtio_raw)
-    }
-}
-
-/// Handle virtio-blk MMIO writes inline.  See ``try_handle_virtio`` for the
-/// return-value contract.
-fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::state::FfiVirtIoCtx) -> Option<u64> {
-    match offset {
-        // DeviceFeaturesSel (0x014) — page selector
-        0x014 => unsafe {
-            (*raw).device_features_sel = write_data as u32;
-            Some(0)
-        },
-        // DriverFeatures (0x020) — guest features for selected page
-        0x020 => unsafe {
-            let sel = (*raw).driver_features_sel;
-            let mask = (write_data as u64 & 0xFFFF_FFFF) << (sel * 32);
-            (*raw).driver_features =
-                ((*raw).driver_features & !(0xFFFF_FFFFu64 << (sel * 32))) | mask;
-            Some(0)
-        },
-        // DriverFeaturesSel (0x024) — page selector
-        0x024 => unsafe {
-            (*raw).driver_features_sel = write_data as u32;
-            Some(0)
-        },
-        // QueueSel (0x030)
-        0x030 => unsafe {
-            (*raw).queue_sel = write_data as u32;
-            Some(0)
-        },
-        // QueueNum (0x038) — capped at queue_num_max
-        0x038 => unsafe {
-            (*raw).queue_num = core::cmp::min(write_data as u32, (*raw).queue_num_max);
-            Some(0)
-        },
-        // QueueReady (0x044)
-        0x044 => unsafe {
-            (*raw).queue_ready = if write_data != 0 { 1 } else { 0 };
-            Some(0)
-        },
-        // QueueNotify (0x050) — set notify_pending so Python processes
-        // the queue at the next *natural* batch boundary (max-instrs
-        // or all-idle WFI) instead of forcing an immediate MMIO exit.
-        // The virtqueue descriptors live in guest RAM and are still
-        // valid when Python eventually reads them.
-        0x050 => {
-            unsafe {
-                (*raw).notify_pending = 1;
-            }
-            Some(0) // inline-handled: do NOT exit batch
-        }
-        // InterruptStatus (0x060) — writing sets bits (unusual, but handle inline)
-        0x060 => unsafe {
-            (*raw).interrupt_status |= write_data as u32;
-            Some(0)
-        },
-        // InterruptACK (0x064) — clear bits; flag PLIC lowering if all zero
-        0x064 => unsafe {
-            let old = (*raw).interrupt_status;
-            (*raw).interrupt_status = old & !(write_data as u32);
-            if (*raw).interrupt_status == 0 && old != 0 {
-                (*raw).irq_maybe_lower = 1;
-            }
-            Some(0)
-        },
-        // Status (0x070) — writing 0 resets the device
-        0x070 => {
-            if write_data != 0 {
-                unsafe {
-                    (*raw).status = write_data as u32;
-                }
-                return Some(0);
-            }
-            unsafe {
-                (*raw).status = 0;
-                (*raw).device_features_sel = 0;
-                (*raw).driver_features_sel = 0;
-                (*raw).driver_features = 0;
-                (*raw).queue_sel = 0;
-                (*raw).queue_ready = 0;
-                (*raw).interrupt_status = 0;
-                (*raw).queue_desc = 0;
-                (*raw).queue_driver = 0;
-                (*raw).queue_device = 0;
-            }
-            Some(0)
-        }
-        // QueueDescLow / High (0x080 / 0x084)
-        0x080 => unsafe {
-            (*raw).queue_desc =
-                ((*raw).queue_desc & 0xFFFF_FFFF_0000_0000) | (write_data as u64 & 0xFFFF_FFFF);
-            Some(0)
-        },
-        0x084 => unsafe {
-            (*raw).queue_desc =
-                ((*raw).queue_desc & 0xFFFF_FFFF) | ((write_data as u64 & 0xFFFF_FFFF) << 32);
-            Some(0)
-        },
-        // QueueDriverLow / High (0x090 / 0x094)
-        0x090 => unsafe {
-            (*raw).queue_driver =
-                ((*raw).queue_driver & 0xFFFF_FFFF_0000_0000) | (write_data as u64 & 0xFFFF_FFFF);
-            Some(0)
-        },
-        0x094 => unsafe {
-            (*raw).queue_driver =
-                ((*raw).queue_driver & 0xFFFF_FFFF) | ((write_data as u64 & 0xFFFF_FFFF) << 32);
-            Some(0)
-        },
-        // QueueDeviceLow / High (0x0A0 / 0x0A4)
-        0x0A0 => unsafe {
-            (*raw).queue_device =
-                ((*raw).queue_device & 0xFFFF_FFFF_0000_0000) | (write_data as u64 & 0xFFFF_FFFF);
-            Some(0)
-        },
-        0x0A4 => unsafe {
-            (*raw).queue_device =
-                ((*raw).queue_device & 0xFFFF_FFFF) | ((write_data as u64 & 0xFFFF_FFFF) << 32);
-            Some(0)
-        },
-        // Config space (0x100+) — read-only in hardware; writes are ignored.
-        // Other undefined offsets — ignored (writes have no effect).
-        _ => Some(0),
-    }
-}
-
-/// Handle virtio-blk MMIO reads inline.  See ``try_handle_virtio`` for the
-/// return-value contract.
-fn virtio_read(offset: u64, raw: *mut crate::state::FfiVirtIoCtx) -> Option<u64> {
-    match offset {
-        // MagicValue (0x000)
-        0x000 => Some(0x74726976),
-        // Version (0x004)
-        0x004 => Some(0x2),
-        // DeviceID (0x008) — 2 = block device
-        0x008 => Some(0x2),
-        // VendorID (0x00C)
-        0x00C => Some(0x0),
-        // DeviceFeatures (0x010) — page-selected
-        0x010 => {
-            let sel = unsafe { (*raw).device_features_sel };
-            Some((VIRTIO_DEVICE_FEATURES >> (sel * 32)) & 0xFFFF_FFFF)
-        }
-        // QueueNumMax (0x034)
-        0x034 => unsafe { Some((*raw).queue_num_max as u64) },
-        // InterruptStatus (0x060)
-        0x060 => unsafe { Some((*raw).interrupt_status as u64) },
-        // Status (0x070)
-        0x070 => unsafe { Some((*raw).status as u64) },
-        // ConfigGeneration (0x0FC)
-        0x0FC => Some(0),
-        // Config space (0x100+)
-        off if off >= 0x100 => {
-            let local = off - 0x100;
-            match local {
-                // Capacity (u64, low 32 at 0x000, high 32 at 0x004)
-                0x000 => unsafe { Some((*raw).capacity & 0xFFFF_FFFF) },
-                0x004 => unsafe { Some(((*raw).capacity >> 32) & 0xFFFF_FFFF) },
-                _ => Some(0),
-            }
-        }
-        _ => Some(0),
-    }
-}
-
-// ============================================================
-//  PMP check stub
-// ============================================================
-
-/// Check PMP for a physical address access.
-/// Returns true if access is allowed.
-#[inline]
-pub(crate) fn pmp_ok(
-    state: &HartState,
-    pa: u64,
-    size: u32,
-    is_write: bool,
-    is_execute: bool,
-    pmp: &PmpCtx,
-) -> bool {
-    // If no PMP entries, any mode can access any physical address.
-    // RISC-V spec: PMP with zero entries imposes no restrictions.
-    if pmp.num == 0 {
-        return true;
-    }
-    // Quick check: M-mode with MPRV=0 bypasses PMP
-    if state.mode == riscv_mode::M {
-        let mprv = (state.mstatus >> 17) & 1;
-        if mprv == 0 {
-            return true;
-        }
-    }
-    // Delegate to the full PMP check function
-    crate::pmp::pmp_check(
-        pmp.cfg,
-        pmp.addr,
-        pmp.num,
-        pa,
-        size,
-        if is_write { 1 } else { 0 },
-        if is_execute { 1 } else { 0 },
-        state.mode,
-        state.mstatus,
-        state.pmpsplit,
-        state.mdid,
-    ) != 0
-}
-
 // ============================================================
 //  Load handlers
 // ============================================================
@@ -1149,6 +580,88 @@ pub fn handle_fp_store(
 //  System instruction handler
 // ============================================================
 
+/// Try SBI_TIME set_timer fast path (a7=0x54494D45, a6=0).
+/// Returns ``Some(advance)`` on success, ``None`` if this is not a TIME call.
+#[inline]
+fn try_sbi_time_set_timer(state: &mut HartState, clint: &ClintCtx) -> Option<u64> {
+    if read_gpr(state, 17) != sbi_eid::TIME || read_gpr(state, 16) != sbi_fid_time::SET_TIMER {
+        return None;
+    }
+    let stime_val = read_gpr(state, 10); // a0
+    let hid = state.mhartid as usize;
+    if hid < clint.num_harts as usize {
+        unsafe {
+            *clint.mtimecmp.add(hid) = stime_val;
+        }
+    }
+    state.stimecmp = stime_val;
+    state.gprs[10] = 0; // SBI_SUCCESS
+    Some(4)
+}
+
+/// Try SBI_IPI send_ipi fast path (a7=0x735049, a6=0, mask_base==0).
+/// Returns ``Some(advance)`` on success, ``Some(EXIT_SENTINEL)`` for
+/// mask_base != 0 (delegates to Python), ``None`` if this is not an IPI call.
+#[inline]
+fn try_sbi_ipi_send_ipi(
+    state: &mut HartState,
+    instr: u32,
+    result: &mut BatchResult,
+    clint: &ClintCtx,
+) -> Option<u64> {
+    if read_gpr(state, 17) != sbi_eid::IPI || read_gpr(state, 16) != sbi_fid_ipi::SEND_IPI {
+        return None;
+    }
+    let hart_mask = read_gpr(state, 10); // a0
+    let mask_base = read_gpr(state, 11); // a1
+    if mask_base != 0 {
+        // mask_base != 0: fall through to Python.
+        result.exit_reason = exit_reason::ECALL;
+        result.exit_instr = instr;
+        return Some(EXIT_SENTINEL);
+    }
+    // mask_base == 0 is the common case (Linux uses simple bitmap).
+    let cur = state.mhartid as usize;
+    for t in 0..clint.num_harts as u64 {
+        if hart_mask & (1u64 << t) == 0 {
+            continue;
+        }
+        clint_write_msip(clint, t as usize, cur, 1);
+    }
+    state.gprs[10] = 0; // SBI_SUCCESS
+    Some(4)
+}
+
+/// Handle ECALL inline: fast-path SBI calls, or deliver trap in-batch.
+///
+/// SBI calling convention: a7=x17=EID, a6=x16=FID.  ``SBI_TIME set_timer``
+/// and ``SBI_IPI send_ipi`` are handled directly; everything else is
+/// delivered as a privilege trap without leaving the Rust batch.
+#[inline]
+fn handle_ecall_inline(
+    state: &mut HartState,
+    instr: u32,
+    result: &mut BatchResult,
+    clint: &ClintCtx,
+) -> u64 {
+    // ---- SBI fast paths ----
+    if let Some(advance) = try_sbi_time_set_timer(state, clint) {
+        return advance;
+    }
+    if let Some(advance) = try_sbi_ipi_send_ipi(state, instr, result, clint) {
+        return advance;
+    }
+
+    // ---- Generic ECALL — deliver trap inline, stay in batch ----
+    let ecall_cause = match state.mode {
+        riscv_mode::U => mcause_val(exc_code::ECALL_UMODE, false),
+        riscv_mode::S => mcause_val(exc_code::ECALL_SMODE, false),
+        _ => mcause_val(exc_code::ECALL_MMODE, false),
+    };
+    deliver_trap(state, ecall_cause, 0, result);
+    0
+}
+
 /// Dispatch privileged instructions: ECALL, EBREAK, MRET, SRET, WFI, SFENCE.VMA.
 /// Called from ``handle_system`` when func3 == 0b000.
 #[inline]
@@ -1161,69 +674,7 @@ fn dispatch_privileged(
     ctx: &WalkCtx,
 ) -> u64 {
     match func12 {
-        0 => {
-            // ---- SBI fast paths (avoid ECALL -> Python round-trip) ----
-            // SBI calling convention: a7=x17=EID, a6=x16=FID.
-            let a7 = read_gpr(state, 17);
-            let a6 = read_gpr(state, 16);
-
-            // SBI_TIME set_timer: write stime_value -> mtimecmp.
-            if a7 == sbi_eid::TIME && a6 == sbi_fid_time::SET_TIMER {
-                let stime_val = read_gpr(state, 10); // a0
-                let hid = state.mhartid as usize;
-                if hid < clint.num_harts as usize {
-                    unsafe {
-                        *clint.mtimecmp.add(hid) = stime_val;
-                    }
-                }
-                state.stimecmp = stime_val;
-                state.gprs[10] = 0; // SBI_SUCCESS
-                return 4;
-            }
-
-            // SBI_IPI send_ipi: write MSIP to each target hart in hart_mask.
-            if a7 == sbi_eid::IPI && a6 == sbi_fid_ipi::SEND_IPI {
-                let hart_mask = read_gpr(state, 10); // a0
-                let mask_base = read_gpr(state, 11); // a1
-                if mask_base != 0 {
-                    // mask_base != 0: fall through to Python.
-                    result.exit_reason = exit_reason::ECALL;
-                    result.exit_instr = instr;
-                    return EXIT_SENTINEL;
-                }
-                // mask_base == 0 is the common case (Linux uses simple bitmap).
-                let cur = state.mhartid as usize;
-                for t in 0..clint.num_harts as u64 {
-                    if hart_mask & (1u64 << t) == 0 {
-                        continue;
-                    }
-                    clint_write_msip(clint, t as usize, cur, 1);
-                }
-                state.gprs[10] = 0; // SBI_SUCCESS
-                return 4;
-            }
-
-            // ---- Generic ECALL — deliver trap inline, stay in batch ----
-            // Instead of exiting to Python (one FFI round-trip per SBI call),
-            // deliver the trap inline and let the M-mode handler execute within
-            // the same batch.  CLINT is already inlined, and MRET/SRET return
-            // the hart to the original mode.  This eliminates the dominant batch-
-            // exit cause during Linux boot, where hart 0 makes thousands of SBI
-            // ecalls (TIME, IPI, RFENCE, DBCN, etc.).
-            //
-            // Set PYREMU_INLINE_ECALL=0 to restore the old exit-to-Python
-            // behaviour for differential testing.
-            let ecall_cause = match state.mode {
-                riscv_mode::U => mcause_val(exc_code::ECALL_UMODE, false),
-                riscv_mode::S => mcause_val(exc_code::ECALL_SMODE, false),
-                _ => mcause_val(exc_code::ECALL_MMODE, false),
-            };
-            deliver_trap(state, ecall_cause, 0, result);
-            // deliver_trap sets PC -> mtvec/stvec and mode -> M/S.
-            // Return 0 so the dispatch loop continues execution from the
-            // trap handler entry point, all within the same batch.
-            0
-        }
+        0 => handle_ecall_inline(state, instr, result, clint),
         1 => {
             // EBREAK — if this is a semihosting sequence, handle it inline;
             // otherwise treat as NOP (no external debugger attached).
@@ -1394,6 +845,114 @@ pub fn handle_system(
 // All trap codes now imported directly from crate::trap::exc_code
 
 // ============================================================
+//  AMO fetch-op helpers — width-specific AtomicU32 / AtomicU64 dispatch
+// ============================================================
+
+/// Execute one AMO fetch-op on a 32-bit value.  ``funct5`` and ``rs2_val``
+/// come from the decoded instruction; the signed-min/max variants interpret
+/// the operand as ``i32``.
+#[inline]
+fn amo_fetch_u32(a: &AtomicU32, funct5: u8, rs2_val: u64) -> u32 {
+    let rs2_u32 = rs2_val as u32;
+    match funct5 {
+        0b00001 => a.swap(rs2_u32, Ordering::AcqRel),
+        0b00000 => a.fetch_add(rs2_u32, Ordering::AcqRel),
+        0b00100 => a.fetch_xor(rs2_u32, Ordering::AcqRel),
+        0b01100 => a.fetch_and(rs2_u32, Ordering::AcqRel),
+        0b01000 => a.fetch_or(rs2_u32, Ordering::AcqRel),
+        0b10000 => a
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+                let s = (prev as i32).min(rs2_val as i32);
+                Some(s as u32)
+            })
+            .unwrap(),
+        0b10100 => a
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+                let s = (prev as i32).max(rs2_val as i32);
+                Some(s as u32)
+            })
+            .unwrap(),
+        0b11000 => a.fetch_min(rs2_u32, Ordering::AcqRel),
+        0b11100 => a.fetch_max(rs2_u32, Ordering::AcqRel),
+        _ => unreachable!(),
+    }
+}
+
+/// Execute one AMO fetch-op on a 64-bit value.
+#[inline]
+fn amo_fetch_u64(a: &AtomicU64, funct5: u8, rs2_val: u64) -> u64 {
+    match funct5 {
+        0b00001 => a.swap(rs2_val, Ordering::AcqRel),
+        0b00000 => a.fetch_add(rs2_val, Ordering::AcqRel),
+        0b00100 => a.fetch_xor(rs2_val, Ordering::AcqRel),
+        0b01100 => a.fetch_and(rs2_val, Ordering::AcqRel),
+        0b01000 => a.fetch_or(rs2_val, Ordering::AcqRel),
+        0b10000 => a
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+                Some((prev as i64).min(rs2_val as i64) as u64)
+            })
+            .unwrap(),
+        0b10100 => a
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+                Some((prev as i64).max(rs2_val as i64) as u64)
+            })
+            .unwrap(),
+        0b11000 => a.fetch_min(rs2_val, Ordering::AcqRel),
+        0b11100 => a.fetch_max(rs2_val, Ordering::AcqRel),
+        _ => unreachable!(),
+    }
+}
+
+/// AMO arithmetic (AMOSWAP/AMOADD/AMOXOR/AMOAND/AMOOR/AMOMIN/AMOMAX/AMOMINU/AMOMAXU).
+/// Performs the atomic fetch-op on the bytearray at ``tr.pa``, clears
+/// reservations, and writes the old value to ``rd``.
+#[inline]
+fn handle_amo_arithmetic(
+    state: &mut HartState,
+    funct5: u8,
+    rd: u8,
+    rs2_val: u64,
+    width: u8,
+    va: u64,
+    tr: &TranslateResult,
+    result: &mut BatchResult,
+    ctx: &WalkCtx,
+) -> u64 {
+    let off = super::mem::ram_offset_inline(
+        tr.pa,
+        width as u32,
+        ctx.ram_base,
+        ctx.ram_size,
+        ctx.shadow_base,
+        ctx.shadow_size,
+    );
+    if off.is_none() {
+        deliver_trap(
+            state,
+            mcause_val(exc_code::LD_ACCESS_FAULT, false),
+            va,
+            result,
+        );
+        return 0;
+    }
+    let ptr = unsafe { ctx.ram.add(off.unwrap() as usize) };
+    let loaded: u64 = match width {
+        4 => {
+            let a = unsafe { &*(ptr as *const AtomicU32) };
+            amo_fetch_u32(a, funct5, rs2_val) as u64
+        }
+        8 => {
+            let a = unsafe { &*(ptr as *const AtomicU64) };
+            amo_fetch_u64(a, funct5, rs2_val)
+        }
+        _ => unreachable!(),
+    };
+    lr_clear_all(ctx);
+    write_gpr(state, rd, if width == 4 { sext32(loaded) } else { loaded });
+    4
+}
+
+// ============================================================
 //  AMO handler (Phase D)
 // ============================================================
 
@@ -1461,16 +1020,15 @@ pub fn handle_amo(
         return 0;
     }
 
-    // virtio-blk inline check — AMO to virtio MMIO is nonsensical
-    // but handle it inline to avoid unnecessary exits.
     let rd = f.rd;
     let rs2_val = read_gpr(state, f.rs2);
 
+    // virtio-blk inline check
     if let Some(_) = try_handle_virtio(tr.pa, true, rs2_val, width, dev) {
         return 4;
     }
 
-    // MMIO check - AMO to MMIO exits to Python
+    // MMIO check
     if is_device_addr(tr.pa, dev) {
         result.exit_reason = exit_reason::MMIO;
         result.exit_instr = instr;
@@ -1481,6 +1039,7 @@ pub fn handle_amo(
         0b00010 => {
             // LR.W / LR.D
             let loaded = ram_read(ctx, tr.pa, width);
+            lr_set(ctx, state.mhartid as u8, tr.pa);
             state.reservation_valid = 1;
             state.reservation_addr = tr.pa;
             write_gpr(state, rd, if width == 4 { sext32(loaded) } else { loaded });
@@ -1488,7 +1047,9 @@ pub fn handle_amo(
         }
         0b00011 => {
             // SC.W / SC.D
-            if state.reservation_valid == 0 || state.reservation_addr != tr.pa {
+            let has_reservation = lr_check(ctx, state.mhartid as u8, tr.pa)
+                || (state.reservation_valid != 0 && state.reservation_addr == tr.pa);
+            if !has_reservation {
                 write_gpr(state, rd, 1);
             } else {
                 ram_write(ctx, tr.pa, rs2_val, width);
@@ -1498,38 +1059,7 @@ pub fn handle_amo(
             4
         }
         0b00001 | 0b00000 | 0b00100 | 0b01100 | 0b01000 | 0b10000 | 0b10100 | 0b11000 | 0b11100 => {
-            // AMOSWAP/AMOADD/AMOXOR/AMOAND/AMOOR/AMOMIN/AMOMAX/AMOMINU/AMOMAXU
-            let loaded = ram_read(ctx, tr.pa, width);
-            let signed_ld = if width == 4 {
-                sext32(loaded) as i64
-            } else {
-                loaded as i64
-            };
-            let signed_rs2 = if width == 4 {
-                sext32(rs2_val) as i64
-            } else {
-                rs2_val as i64
-            };
-
-            let result_val: u64 = match funct5 {
-                0b00001 => rs2_val,                            // AMOSWAP
-                0b00000 => loaded.wrapping_add(rs2_val),       // AMOADD
-                0b00100 => loaded ^ rs2_val,                   // AMOXOR
-                0b01100 => loaded & rs2_val,                   // AMOAND
-                0b01000 => loaded | rs2_val,                   // AMOOR
-                0b10000 => (signed_ld.min(signed_rs2)) as u64, // AMOMIN
-                0b10100 => (signed_ld.max(signed_rs2)) as u64, // AMOMAX
-                0b11000 => loaded.min(rs2_val),                // AMOMINU
-                0b11100 => loaded.max(rs2_val),                // AMOMAXU
-                _ => {
-                    deliver_illegal_instruction(state, instr as u64, result);
-                    return 0;
-                }
-            };
-
-            ram_write(ctx, tr.pa, result_val, width);
-            write_gpr(state, rd, if width == 4 { sext32(loaded) } else { loaded });
-            4
+            handle_amo_arithmetic(state, funct5, rd, rs2_val, width, va, &tr, result, ctx)
         }
         _ => {
             deliver_illegal_instruction(state, instr as u64, result);
@@ -1607,7 +1137,6 @@ fn handle_c0(
         0b010 => {
             // C.LW: rd' = mem[rs1' + uimm]
             let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
-            crate::diag::diag_small_addr_access(state, addr, read_gpr(state, cf.rs1p), cf.rs1p, instr_word, false, 4);
             let prev_mode = state.mode;
             let val = load_mem_compressed(
                 state, ctx, addr, 4, false, instr_word, result, pmp, dev, clint,
@@ -1625,7 +1154,6 @@ fn handle_c0(
         0b011 => {
             // C.LD: rd' = mem[rs1' + uimm]
             let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
-            crate::diag::diag_small_addr_access(state, addr, read_gpr(state, cf.rs1p), cf.rs1p, instr_word, false, 8);
             let prev_mode = state.mode;
             let val = load_mem_compressed(
                 state, ctx, addr, 8, false, instr_word, result, pmp, dev, clint,
@@ -1728,39 +1256,16 @@ fn handle_c1(
         }
         0b100 => {
             // C1 ALU: SRLI / SRAI / ANDI / SUB/XOR/OR/AND / SUBW/ADDW
-            let rd_rs1 = cf.rs1p; // creg-mapped rd/rs1
-            let v1 = read_gpr(state, rd_rs1);
-            let sf = cf.sf;
-            let r: u64 = match sf {
-                0b00 => {
-                    let shamt = ((cf.bit12 as u64) << 5) | (cf.rs2 as u64 & 0x1F);
-                    v1 >> shamt
+            match exec_c1_alu(state, cf) {
+                Some(r) => {
+                    write_gpr(state, cf.rs1p, r);
+                    2
                 }
-                0b01 => {
-                    let shamt = ((cf.bit12 as u64) << 5) | (cf.rs2 as u64 & 0x1F);
-                    ((v1 as i64) >> shamt) as u64
-                }
-                0b10 => {
-                    let imm = sext(((cf.bit12 as u64) << 5) | (cf.rs2 as u64 & 0x1F), 6);
-                    v1 & imm
-                }
-                0b11 => {
-                    let v2 = read_gpr(state, cf.rdp);
-                    match c1_alu_reg_op(v1, v2, cf.bit12, cf.bit65) {
-                        Some(val) => val,
-                        None => {
-                            deliver_illegal_instruction(state, instr_word as u64, result);
-                            return 0;
-                        }
-                    }
-                }
-                _ => {
+                None => {
                     deliver_illegal_instruction(state, instr_word as u64, result);
-                    return 0;
+                    0
                 }
-            };
-            write_gpr(state, rd_rs1, r);
-            2
+            }
         }
         0b101 => {
             // C.J: pc += offset
@@ -1824,7 +1329,6 @@ fn handle_c2(
         0b010 => {
             // C.LWSP: rd = mem[sp + uimm]
             let addr = state.gprs[2].wrapping_add(cf.imm);
-            crate::diag::diag_small_addr_access(state, addr, state.gprs[2], 2, instr_word, false, 4);
             let prev_mode = state.mode;
             let val = load_mem_compressed(
                 state, ctx, addr, 4, false, instr_word, result, pmp, dev, clint,
@@ -1842,7 +1346,6 @@ fn handle_c2(
         0b011 => {
             // C.LDSP: rd = mem[sp + uimm]
             let addr = state.gprs[2].wrapping_add(cf.imm);
-            crate::diag::diag_small_addr_access(state, addr, state.gprs[2], 2, instr_word, false, 8);
             let prev_mode = state.mode;
             let val = load_mem_compressed(
                 state, ctx, addr, 8, false, instr_word, result, pmp, dev, clint,
@@ -2243,6 +1746,7 @@ pub fn try_semihosting(state: &mut HartState, ctx: &WalkCtx, ebreak_pc: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::mem;
 
     #[test]
@@ -2421,6 +1925,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
         let result = try_semihosting(&mut state, &ctx, ebreak_pc);
@@ -2465,6 +1973,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
         let result = try_semihosting(&mut state, &ctx, ebreak_pc);
@@ -2497,6 +2009,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
 
         let result = try_semihosting(&mut state, &ctx, ebr_addr);

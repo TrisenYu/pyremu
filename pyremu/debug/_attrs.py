@@ -48,7 +48,7 @@ class SharedMixinAttrs:
     _kernel_path: str | None
     _kernel_addr: int
 
-    _sym_symbols: dict[str, int]
+    _sym_symbols: dict[str, int] | None
     _sym_symbols_pa: dict[str, int]
     _sym_ranges: list[tuple[int, int, str]]
     _sym_ranges_pa: list[tuple[int, int, str]]

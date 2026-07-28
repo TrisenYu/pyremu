@@ -13,6 +13,7 @@ from rich.table import Table
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.utils import fmt_size, hex_addr
 from pyremu.memory.mmu import pte_flags_str, sv39_decompose_va
+from pyremu.utils.mask import mask64
 from pyremu.memory.pmp import (
     PMP_A_MASK,
     PMP_A_NA4,
@@ -87,20 +88,20 @@ class MmuViewMixin(SharedMixinAttrs):
 
             a_mode = cfg & PMP_A_MASK
             addr_name = f"pmpaddr{i}"
-            addr_field = (
+            addr_field = mask64(
                 h.csrs[addr_name].val if addr_name in h.csrs else 0
-            ) & 0xFFFF_FFFF_FFFF_FFFF
+            )
 
             base, size = 0, 0
             if a_mode == PMP_A_TOR:
-                prev = (
+                prev = mask64(
                     h.csrs[f"pmpaddr{i - 1}"].val
                     if i > 0 and f"pmpaddr{i - 1}" in h.csrs
                     else 0
-                ) & 0xFFFF_FFFF_FFFF_FFFF
+                )
                 lo = 0 if i == 0 else (prev << 2)
                 hi = addr_field << 2
-                base, size = lo, (hi - lo) & 0xFFFF_FFFF_FFFF_FFFF
+                base, size = lo, mask64((hi - lo))
             elif a_mode == PMP_A_NA4:
                 base = addr_field << 2
                 size = 4
@@ -122,7 +123,7 @@ class MmuViewMixin(SharedMixinAttrs):
                 end_s = "0x0000000000000000"
                 size_s = "-"
                 if size > 0:
-                    end_s = f"0x{(base + size) & 0xFFFF_FFFF_FFFF_FFFF:016x}"
+                    end_s = f"0x{mask64(base + size):016x}"
                     size_s = fmt_size(size)
 
             tbl.add_row(

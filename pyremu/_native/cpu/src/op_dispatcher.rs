@@ -298,16 +298,6 @@ pub fn handle_br(
         }
     };
 
-    // Diagnostic: trace BNE exit for ld-linux inner loop (s2 != s4 at 0x3b06).
-    // s2=x18, s4=x20.  Crash is deterministic with s2=-2 → s2==s4 test failed.
-    #[cfg(feature = "diagnostic")]
-    if f.func3 == 0b001 && f.rs1 == 18 && f.rs2 == 20 {
-        crate::diag::log_line(&format!(
-            "[bne-diag] pc={:#018x} s2={} s4={} taken={}",
-            state.pc, v1 as i64, v2 as i64, taken,
-        ));
-    }
-
     if taken {
         state.pc = state.pc.wrapping_add(f.imm_b);
         0
@@ -324,7 +314,7 @@ pub fn handle_br(
 // memory barriers.  OpenSBI relies on ``fence ow,ow`` (wmb) and
 // ``fence ir,ir`` (rmb) for lock-free FIFO enqueue/dequeue between
 // harts.  Without real barriers the compiler and CPU may reorder
-// stores/loads across the fence → FIFO corruption → TLB-shootdown
+// stores/loads across the fence ->FIFO corruption ->TLB-shootdown
 // deadlocks (sender spins in tlb_update retry because the remote
 // FIFO appears full / head pointer is never observed advancing).
 
@@ -629,7 +619,7 @@ mod tests {
     fn addi_rd_equals_rs1_uses_old_value() {
         let mut s = new_state();
         s.gprs[5] = 10;
-        // addi x5, x5, 42  →  x5 = 10 + 42 = 52
+        // addi x5, x5, 42  -> x5 = 10 + 42 = 52
         let instr: u32 = (42u32 << 20) | (5u32 << 15) | (0u32 << 12) | (5u32 << 7) | 0x13;
         let f = decode_fields(instr);
         let mut r = new_result();
@@ -643,7 +633,7 @@ mod tests {
     fn slli_rd_equals_rs1_uses_old_value() {
         let mut s = new_state();
         s.gprs[10] = 3;
-        // slli x10, x10, 4  →  x10 = 3 << 4 = 48
+        // slli x10, x10, 4  -> x10 = 3 << 4 = 48
         let instr: u32 = (0u32 << 25) | (4u32 << 20) | (10u32 << 15) | (1u32 << 12) | (10u32 << 7) | 0x13;
         let f = decode_fields(instr);
         let mut r = new_result();
@@ -658,7 +648,7 @@ mod tests {
         let mut s = new_state();
         s.gprs[5] = 20;
         s.gprs[6] = 7;
-        // add x5, x5, x6  →  x5 = 20 + 7 = 27
+        // add x5, x5, x6  -> x5 = 20 + 7 = 27
         let instr: u32 = (0u32 << 25) | (6u32 << 20) | (5u32 << 15) | (0u32 << 12) | (5u32 << 7) | 0x33;
         let f = decode_fields(instr);
         let mut r = new_result();
@@ -673,7 +663,7 @@ mod tests {
         let mut s = new_state();
         s.pc = 0x8000_1000;
         s.gprs[1] = 0x8000_2000; // ra = target
-        // jalr ra, ra, 0  →  rd=1, rs1=1
+        // jalr ra, ra, 0  -> rd=1, rs1=1
         let instr: u32 = (0u32 << 20) | (1u32 << 15) | (0u32 << 12) | (1u32 << 7) | 0x67;
         let f = decode_fields(instr);
         let adv = handle_jalr(&mut s, &f);
@@ -688,7 +678,7 @@ mod tests {
 
     /// bltz at 0x3ab6: with s2=-1, branch MUST be taken to skip the loop.
     /// If this fails, the loop body executes with s2=-1 and accesses
-    /// base + (-1)*0xa0 = base - 0xa0 → .dynamic section → reads d_tag=7.
+    /// base + (-1)*0xa0 = base - 0xa0 ->.dynamic section ->reads d_tag=7.
     #[test]
     fn ldlinux_bltz_skip_loop_on_counter_zero() {
         let mut s = new_state();

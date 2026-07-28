@@ -2154,7 +2154,7 @@ class TestUmodeBacktrace:
         h._mmu_mode = 0
         h.pc = 0x80001000
         h.gprs[1] = 0x80002000  # ra — 有效返回地址
-        h.gprs[8] = 0  # fp = 0 → FP 链不可达
+        h.gprs[8] = 0  # fp = 0 ->FP 链不可达
 
         frames = dbg._walk_frame_chain()
         assert len(frames) == 2, (
@@ -2233,7 +2233,7 @@ class TestUmodeBacktrace:
         h = dbg.hart
         bus = dbg._emu.bus
 
-        # S-mode 当前状态 (fp=0 → FP 链立即终止)
+        # S-mode 当前状态 (fp=0 ->FP 链立即终止)
         h.mode = RiscvMode.S
         h._mmu_mode = 0
         h.pc = 0x80010000
@@ -2291,7 +2291,7 @@ class TestUmodeBacktrace:
         h.csrs["stvec"].val = tvec_addr
         bus.write(tvec_addr, (0x00008067).to_bytes(4, "little"))
 
-        # 不写任何 trap 帧数据 → 所有 fallback 布局在栈扫描中找不到 trapped PC
+        # 不写任何 trap 帧数据 ->所有 fallback 布局在栈扫描中找不到 trapped PC
         # _add_prev_mode_frame_fallback 捕获此情况并回退到仅 PC 帧
 
         frames = dbg._walk_frame_chain()

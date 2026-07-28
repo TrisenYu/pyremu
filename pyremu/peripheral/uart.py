@@ -28,47 +28,52 @@ RX: 可通过 preload() 预填入数据; RXDATA 读取返回队首字节;
 from __future__ import annotations
 
 import os
+import threading
 from typing import IO
 
 from pyremu.memory.bus import Device
 
 # PLIC 中断源编号 (对齐 QEMU virt 平台, 与 DTB 中 serial@.../interrupts-extended 一致)
 UART_IRQ = 10
+# 寄存器偏移
+REG_TXDATA = 0x00
+REG_RXDATA = 0x04
+REG_TXCTRL = 0x08
+REG_RXCTRL = 0x0C
+REG_IE = 0x10
+REG_IP = 0x14
+REG_DIV = 0x18
+
+# IP 位
+IP_TXWM = 1 << 0  # TX FIFO 占用 < txcnt (对照 QEMU SIFIVE_UART_IP_TXWM)
+IP_RXWM = 1 << 1  # RX FIFO 占用 > rxcnt (对照 QEMU SIFIVE_UART_IP_RXWM)
+
+# RX FIFO 固定大小 (对照 QEMU SIFIVE_UART_RX_FIFO_SIZE = 8)
+RX_FIFO_SIZE = 8
+
+# RXDATA 状态位 (SiFive 硬件兼容)
+UART_RXFIFO_EMPTY = 1 << 31  # RX FIFO 空标志 (bit31=1 表示无数据)
+
 
 class UART(Device):
-    """SiFive 风格 UART 外设 — 支持多 hart 行缓冲输出.
+    """SiFive 风格 UART 外设 — 纯被动 MMIO 设备.
 
     寄存器行为对照 QEMU ``hw/char/sifive_uart.c`` 实现:
     - RX FIFO 固定 8 字节 (``SIFIVE_UART_RX_FIFO_SIZE``)
-    - preload() 受 ``can_rx()`` 背压: FIFO 满时拒绝新数据
+    - preload() 受 ``can_rx()`` 控制: FIFO 满时拒绝新数据
     - RXDATA 读取后调用 ``_accept_input()`` 通知 termio 可继续接收
     - IP 按 FIFO 实际占用 vs 水位 (rxcnt) 计算, 非简单非空判断
+
+    TXDATA 写入即自动输出 (无 hart 耦合): 每字节经 _tx_callback (若设置)
+    即时输出, 不依赖外部 set_writer / flush_all.
     """
 
-    # 寄存器偏移
-    REG_TXDATA = 0x00
-    REG_RXDATA = 0x04
-    REG_TXCTRL = 0x08
-    REG_RXCTRL = 0x0C
-    REG_IE = 0x10
-    REG_IP = 0x14
-    REG_DIV = 0x18
-
-    # IP 位
-    IP_TXWM = 1 << 0  # TX FIFO 占用 < txcnt (对照 QEMU SIFIVE_UART_IP_TXWM)
-    IP_RXWM = 1 << 1  # RX FIFO 占用 > rxcnt (对照 QEMU SIFIVE_UART_IP_RXWM)
-
-    # RX FIFO 固定大小 (对照 QEMU SIFIVE_UART_RX_FIFO_SIZE = 8)
-    RX_FIFO_SIZE = 8
-
-    # RXDATA 状态位 (SiFive 硬件兼容)
-    UART_RXFIFO_EMPTY = 1 << 31  # RX FIFO 空标志 (bit31=1 表示无数据)
 
     def __init__(
         self,
         base: int = 0x1000_0000,
         size: int = 0x1000,
-        tx_callback=None,  # (str) -> None: 每输出一行时调用 (含换行)
+        tx_callback=None,  # (str) -> None: TXDATA 每字节回调 (默认直接 os.write stdout)
         plic=None,  # PLIC: 用于 RX 中断通知 (None = 无中断)
         irq: int = 0,  # PLIC 中断源编号
     ) -> None:
@@ -88,40 +93,35 @@ class UART(Device):
         self._tx_buf: list[int] = []  # 已发送字节 (调试用)
         # RX FIFO — 固定 8 字节, 对照 QEMU s->rx_fifo[8] + s->rx_fifo_len
         self._rx_fifo: list[int] = []  # 待接收字节 (len ≤ RX_FIFO_SIZE)
+        self._rx_lock = threading.Lock()  # daemon reader 线程与主线程共享 _rx_fifo
 
-        # 多 hart 行缓冲: {hart_id: [bytes]}
-        self._line_bufs: dict[int, list[int]] = {}
+        # 当前 MMIO 写者 hart ID — 由 _wrap_phy_write_for_uart 在 hart
+        # 写 UART MMIO 地址时自动标记, 仅用于 hart 日志文件分流归档.
         self._current_writer: int | None = None
 
         # Terminal I/O 反向引用 — 由 Emulator._init_native_batch 注入,
         # 用于调试器/模拟器直连路径管理终端所有权。
-        self._termio: object | None = None
+        self.termio: object | None = None
 
         # 控制台回显开关 — 单一输出 owner 原则 (QEMU chardev 模型):
-        # native termio 线程运行期间为 False (Rust 已直写 stdout, 行缓冲
-        # 仅归档日志), 其余时刻为 True (行缓冲 flush 经 _tx_callback 回显)。
+        # native termio 线程运行期间为 False (Rust 已直写 stdout),
+        # 其余时刻为 True (_tx_callback 负责回显)。
         self._console_echo: bool = True
 
         # 每 hart 日志文件 (可选): set_hart_log_dir 后各 hart 输出另存 hart<N>.log
         self._hart_log_dir: str | None = None
         self._hart_log_files: dict[int, IO] = {}
 
-    # ---- 多 hart 行缓冲 ----
+    # ---- 控制台回显 ----
 
     def set_console_echo(self, enabled: bool) -> None:
         """控制台回显开关.
 
         TerminalIO 在 Rust termio 线程接管终端时关闭 (线程直写 stdout,
-        避免行缓冲 flush 时经 _tx_callback 重复输出), 线程停止后恢复。
+        避免 _tx_callback 重复输出), 线程停止后恢复。
         关闭期间 hart 日志文件仍正常写入。
         """
         self._console_echo = enabled
-
-    def set_writer(self, hart_id: int) -> None:
-        """声明当前写者 hart (不刷新, 仅切换缓冲区)."""
-        self._current_writer = hart_id
-        if hart_id not in self._line_bufs:
-            self._line_bufs[hart_id] = []
 
     def set_hart_log_dir(self, log_dir: str | None) -> None:
         """启用每 hart 日志文件: 各 hart 的输出另存 <log_dir>/hart<N>.log (原始文本)。
@@ -153,36 +153,7 @@ class UART(Device):
             self._hart_log_files[hart_id] = f
         return f
 
-    def flush_all(self) -> None:
-        """刷新所有 hart 的未完成 (不以 \\n 结尾的) 行缓冲."""
-        for hid in list(self._line_bufs.keys()):
-            self._flush_hart(hid)
-
-    def _flush_hart(self, hart_id: int) -> None:
-        """将 hart_id 的缓冲字节拼接为文本, 回调输出并写入日志文件.
-
-        控制台输出为原始字节 (不加 ``[hart N]`` 前缀, 与 QEMU ``-nographic``
-        行为一致)。多 hart 调试信息通过 ``set_hart_log_dir()`` 提供的每 hart
-        日志文件获取。
-        """
-        buf = self._line_bufs.get(hart_id, [])
-        if not buf:
-            return
-        text = bytes(buf).decode("utf-8", errors="replace")
-        self._line_bufs[hart_id] = []
-        if not text:
-            return
-        # 每 hart 日志文件: 写原始文本 (无 ANSI 颜色/标签)。
-        log_f = self._hart_log_file(hart_id)
-        if log_f is not None:
-            log_f.write(text)
-        # 控制台: 直接输出原始字节, 不加前缀。
-        # _console_echo=False (native termio 线程运行中) 时跳过 — Rust 侧
-        # 已直写 stdout, 此处再回调会双写控制台。
-        if self._tx_callback and self._console_echo:
-            self._tx_callback(text)
-
-    # ---- QEMU 风格背压接口 (对照 sifive_uart_can_rx / sifive_uart_rx) ----
+    # ---- QEMU 风格容量控制接口 (对照 sifive_uart_can_rx / sifive_uart_rx) ----
 
     def can_rx(self) -> bool:
         """RX FIFO 是否有空闲槽位 (对照 QEMU ``sifive_uart_can_rx``).
@@ -190,7 +161,8 @@ class UART(Device):
         termio 的 ``drain_rx()`` 在 preload 前调用此方法; FIFO 满时不读
         stdin, 数据滞留内核 tty 缓冲 (对照 QEMU ``fd_chr_read_poll`` 流控).
         """
-        return len(self._rx_fifo) < self.RX_FIFO_SIZE
+        with self._rx_lock:
+            return len(self._rx_fifo) < RX_FIFO_SIZE
 
     def _accept_input(self) -> None:
         """RXDATA 读取后调用 — 通知 termio 可继续接收数据.
@@ -201,7 +173,6 @@ class UART(Device):
         此钩子保留供未来 termio 唤醒优化 (如读后立即触发一次 stdin poll).
         """
 
-    # ---- 公开方法 ----
 
     def _ip_value(self) -> int:
         """动态计算 IP 寄存器值 (对照 QEMU ``sifive_uart_ip``).
@@ -216,10 +187,11 @@ class UART(Device):
         """
         ip = 0
         if ((self._txctrl >> 16) & 0x7) > 0:
-            ip |= self.IP_TXWM
+            ip |= IP_TXWM
         rxcnt = self._rxctrl & 0x7
-        if len(self._rx_fifo) > rxcnt:
-            ip |= self.IP_RXWM
+        with self._rx_lock:
+            if len(self._rx_fifo) > rxcnt:
+                ip |= IP_RXWM
         return ip
 
     def _update_plic_irq(self) -> None:
@@ -233,19 +205,22 @@ class UART(Device):
             return
         self._plic.set_irq(self._irq, bool(self._ip_value() & self._ie))
 
+    # ---- 公开方法 ----
     def preload(self, data: bytes) -> int:
-        """向 RX FIFO 预填入数据, 受 ``can_rx()`` 背压 (对照 QEMU ``sifive_uart_rx``).
+        """向 RX FIFO 预填入数据, 受 ``can_rx()`` 控制 (对照 QEMU ``sifive_uart_rx``).
 
         Returns:
             实际接受的字节数 (FIFO 满时可能少于 ``len(data)``).
             调用方应检查返回值以决定是否保留剩余数据在 ring buffer 中。
         """
         accepted = 0
-        for b in data:
-            if len(self._rx_fifo) >= self.RX_FIFO_SIZE:
-                break
-            self._rx_fifo.append(b)
-            accepted += 1
+        with self._rx_lock:
+            for b in data:
+                if len(self._rx_fifo) >= RX_FIFO_SIZE:
+                    # TODO: 问题在于有可能是队列事先已经满了，而不是从空变到满
+                    break
+                self._rx_fifo.append(b)
+                accepted += 1
         if accepted > 0:
             self._update_plic_irq()
         return accepted
@@ -256,7 +231,8 @@ class UART(Device):
         用于固件启动完成后、shell 接管终端前丢弃用户误敲入的字符,
         避免预启动输入污染 shell 的 termios 初始化。
         """
-        self._rx_fifo.clear()
+        with self._rx_lock:
+            self._rx_fifo.clear()
         self._update_plic_irq()
 
     def tx_data(self) -> bytes:
@@ -287,68 +263,65 @@ class UART(Device):
         self._write_reg(offset, val)
 
     def _read_reg(self, offset: int) -> int:
-        if offset == self.REG_RXDATA:
-            if not self._rx_fifo:
-                return self.UART_RXFIFO_EMPTY
-            b = self._rx_fifo.pop(0)
-            # 读走一个字节后通知 termio 可继续接收 (对照 QEMU
-            # sifive_uart_read -> qemu_chr_fe_accept_input)
+        if offset == REG_RXDATA:
+            with self._rx_lock:
+                if not self._rx_fifo:
+                    return UART_RXFIFO_EMPTY
+                b = self._rx_fifo.pop(0)
             self._accept_input()
-            # 读后总是同步 PLIC: FIFO 空时拉低中断线;
-            # FIFO 仍有数据时检查水位是否仍需挂起 (level-triggered)
             self._update_plic_irq()
             return b
-        if offset == self.REG_TXDATA:
+        if offset == REG_TXDATA:
             return 0  # TXDATA 只写; full 位 (bit31) 恒 0 — FIFO 即时排空
-        if offset == self.REG_TXCTRL:
+        if offset == REG_TXCTRL:
             return self._txctrl
-        if offset == self.REG_RXCTRL:
+        if offset == REG_RXCTRL:
             return self._rxctrl
-        if offset == self.REG_IE:
+        if offset == REG_IE:
             return self._ie
-        if offset == self.REG_IP:
+        if offset == REG_IP:
             # 电平语义: 按 FIFO 水位状态动态计算, 不依赖写入路径锁存
             # (TXDATA 写可能被 Rust 引擎 inline 处理, 绕过 Python).
             return self._ip_value()
-        if offset == self.REG_DIV:
+        if offset == REG_DIV:
             return self._div
         return 0
 
     def _write_reg(self, offset: int, val: int) -> None:
-        if offset == self.REG_TXDATA:
+        if offset == REG_TXDATA:
             val &= 0xFF
             self._tx_buf.append(val)
-            # 多 hart 行缓冲: 按当前写者 hart 累积, 遇换行则刷新.
-            # 控制台输出不加 [hart N] 前缀 (与 QEMU -nographic 一致);
-            # 多 hart 调试信息通过 set_hart_log_dir() 提供的日志文件获取.
-            if self._current_writer is not None:
-                hid = self._current_writer
-                if hid not in self._line_bufs:
-                    self._line_bufs[hid] = []
-                self._line_bufs[hid].append(val)
-                if val == 0x0A:  # '\n'
-                    self._flush_hart(hid)
-            elif self._tx_callback and self._console_echo:
+            # 自动即时输出: _tx_callback 受 _console_echo 约束 (避免 Rust+Python
+            # 双写 stdout), os.write 不受约束 — UART 始终自动输出.
+            if self._tx_callback is not None and self._console_echo:
                 self._tx_callback(chr(val))
+            if self._tx_callback is None or not self._console_echo:
+                os.write(1, bytes([val]))
+            # Hart 日志分流: 若 _current_writer 已标记 (由 _wrap_phy_write_for_uart
+            # 在 MMIO 写时自动设置), 同步写入该 hart 的日志文件.
+            if self._current_writer is not None:
+                log_f = self._hart_log_file(self._current_writer)
+                if log_f is not None:
+                    log_f.write(chr(val))
             return
-        if offset == self.REG_TXCTRL:
+        if offset == REG_TXCTRL:
             self._txctrl = val
             # txcnt (bits[18:16]) 变化影响 txwm 水位条件 — 若 IE.txwm 已使能,
             # 此处需立即拉高/拉低 PLIC (驱动 probe 先写 txcnt 后开中断,
             # 但顺序不可假设).
             self._update_plic_irq()
             return
-        if offset == self.REG_RXCTRL:
+        if offset == REG_RXCTRL:
             self._rxctrl = val
             return
-        if offset == self.REG_IE:
+        if offset == REG_IE:
             self._ie = val & 3
             self._update_plic_irq()
             return
-        if offset == self.REG_IP:
+        if offset == REG_IP:
             # SiFive spec: IP 只读 (水位条件电平语义), 写入忽略.
             return
-        if offset == self.REG_DIV:
+        if offset == REG_DIV:
             self._div = val & 0xFFFF
             return
         # 忽略未定义偏移的写入

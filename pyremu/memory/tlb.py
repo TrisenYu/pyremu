@@ -16,7 +16,10 @@ TLB 缓存最近使用的虚拟页号 (VPN) -> 物理页号 (PPN) 映射,
 
 from dataclasses import dataclass
 
-from pyremu.memory.cache_base import CacheBase, CacheLineBase, ReplacementPolicy
+from pyremu.memory.cache_base import (
+    CacheBase, CacheLineBase,
+    ReplacementPolicy
+)
 
 
 @dataclass
@@ -27,11 +30,13 @@ class TLBLine(CacheLineBase):
     ppn  = 物理页号
     perm = 权限位 (R|W|X|U 的组合)
     level = 页表级数 (0=4 KiB, 1=2 MiB, 2=1 GiB)
+    asid = 地址空间 ID (0=全局/Bare, 非零时 lookup 需匹配)
     """
 
     ppn: int = 0
     perm: int = 0
     level: int = 0
+    asid: int = 0
 
 
 class TLB(CacheBase):
@@ -76,20 +81,17 @@ class TLB(CacheBase):
     #  公共接口 (保持向后兼容)
     # ----------------------------------------------------------
 
-    def lookup(self, vpn: int) -> tuple:
-        """在 TLB 中查找 vpn.  O(1) 快速路径 via _tag_to_idx dict.
+    def lookup(self, vpn: int, asid: int = 0) -> tuple:
+        """在 TLB 中查找 vpn.
 
-        Args:
-            vpn: 虚拟页号.
-
-        Returns:
-            (hit: bool, ppn: int, perm: int)
-            hit=True 表示命中, ppn 和 perm 为缓存的值.
-            hit=False 表示未命中, ppn 和 perm 均为 0.
+        ASID 非零时仅匹配相同 ASID 的条目 — 不同的地址空间不共享映射,
+        进程切换换 ASID 后无需 SFENCE.VMA (ASID-tagged TLB 语义).
         """
         entry = self._find_by_tag(vpn)
         if entry is not None:
             e: TLBLine = entry  # type: ignore
+            if asid != 0 and e.asid != 0 and e.asid != asid:
+                return False, 0, 0
             return True, e.ppn, e.perm
         return False, 0, 0
 
@@ -100,21 +102,11 @@ class TLB(CacheBase):
         perm: int,
         level: int = 0,
         mdid: int = 0,
+        asid: int = 0,
     ) -> None:
-        """将一条映射插入 TLB.  O(1) 查重 via _tag_to_idx dict.
-
-        若 vpn 已存在则原地更新; 否则按 FIFO/LRU 逐出旧条目.
-
-        Args:
-            vpn: 虚拟页号.
-            ppn: 物理页号.
-            perm: 权限位 (R|W|X|U 的组合).
-            level: 页表级数 (0=4 KiB, 1=2 MiB, 2=1 GiB).
-            mdid: 内存域 ID (来自 hart.mdid, 供 mfence.did 按域刷新).
-        """
+        """将一条映射插入 TLB.  若 vpn 已存在则原地更新."""
         self._clock += 1
 
-        # 查重 — 原地更新 (O(1))
         existing_idx = self._tag_to_idx.get(vpn)
         if existing_idx is not None:
             e: TLBLine = self._entries[existing_idx]  # type: ignore
@@ -123,22 +115,22 @@ class TLB(CacheBase):
                 e.perm = perm
                 e.level = level
                 e.mdid = mdid
+                e.asid = asid
                 e.last_access = self._clock
                 return
 
-        # 选择 victim 并逐出
         idx = self._pick_victim()
         victim: TLBLine = self._entries[idx]  # type: ignore
         if victim.valid:
             self._tag_to_idx.pop(victim.tag, None)
             self._on_evict(victim)
 
-        # 写入新条目
         victim.tag = vpn
         victim.ppn = ppn
         victim.perm = perm
         victim.level = level
         victim.mdid = mdid
+        victim.asid = asid
         victim.valid = True
         victim.dirty = False
         victim.last_access = self._clock

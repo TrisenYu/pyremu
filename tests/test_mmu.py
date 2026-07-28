@@ -789,9 +789,9 @@ class TestSatpAsidHardwiredZero:
     """satp.ASID (bits[59:44]) 必须写入即被清零 (WARL 读回 0).
 
     回归背景: TLB (Python 与 Rust 批量引擎) 查找均不带 ASID 标签。旧行为
-    原样存储 ASID → Linux 探测到 ASID 支持 → 启用 ASID 分配器 → 上下文
-    切换仅改写 satp.ASID 而不执行 sfence.vma → 前一地址空间的 TLB 表项
-    残留命中 → 用户进程读脏数据 SIGSEGV (实测: ls 崩于 ld.so, 现场
+    原样存储 ASID ->Linux 探测到 ASID 支持 ->启用 ASID 分配器 ->上下文
+    切换仅改写 satp.ASID 而不执行 sfence.vma ->前一地址空间的 TLB 表项
+    残留命中 ->用户进程读脏数据 SIGSEGV (实测: ls 崩于 ld.so, 现场
     satp=0x8000100000082f1b 即 ASID=1 证明分配器已激活)。
     """
 

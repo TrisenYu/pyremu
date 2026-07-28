@@ -380,12 +380,12 @@ class TestMultiSource:
 
 
 class TestLevelRetrigger:
-    """complete 时设备电平仍高 → pending 重新置位 (QEMU sifive_plic gateway 语义).
+    """complete 时设备电平仍高 ->pending 重新置位 (QEMU sifive_plic gateway 语义).
 
     回归背景: UART TX watermark 为电平中断; sifive 驱动 ISR 每次仅发送
     FIFO 深度 (8) 个字符, 期间 TXDATA 写由 Rust inline 处理, 不再有任何
     Python 侧设备访问调用 set_irq。旧行为 claim 清 pending 后无人重新拉线
-    → complete 后中断永久丢失, 剩余 TX 数据滞留内核环形缓冲。
+    ->complete 后中断永久丢失, 剩余 TX 数据滞留内核环形缓冲。
     """
 
     def test_complete_reraises_when_level_still_high(self, plic):
@@ -405,4 +405,59 @@ class TestLevelRetrigger:
         assert _read_u32(plic, _context_claim_offset(0)) == 7
         plic.set_irq(7, False)  # ISR 内设备已拉低 (如 IE 关闭 / RX 读空)
         _write_u32(plic, _context_claim_offset(0), 7)
+        assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) == 0
+
+    def test_tx_style_multi_cycle_no_intermediate_set_irq(self, plic):
+        """TX 中断场景: 电平持续高, 多次 claim+complete 均自动重挂.
+
+        设备侧仅在上电/配置时 set_irq(True), 后续 claim/complete 循环
+        中设备电平始终保持高 (如 UART TXWM=1). 旧 _do_claim 清除 _level
+        导致 complete 后 pending 丢失, 第二轮 claim 返回 0 (中断永久丢失).
+        """
+        plic.set_irq(7, True)  # 设备初始拉高 (如驱动 enable txwm)
+        _write_u32(plic, _priority_offset(7), 3)
+        _write_u32(plic, _enable_offset(0, 0), 1 << 7)
+
+        # 第一轮 claim+complete
+        assert _read_u32(plic, _context_claim_offset(0)) == 7
+        _write_u32(plic, _context_claim_offset(0), 7)
+        # complete 时电平仍高 ->pending 必须重挂
+        assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) != 0, (
+            "第一轮 complete: 电平仍高但 pending 未重挂 — "
+            "TX 中断在第一批 8 字符后永久丢失"
+        )
+
+        # 第二轮 claim+complete (中间无 set_irq 调用, 模拟 TXDATA Rust inline)
+        assert _read_u32(plic, _context_claim_offset(0)) == 7, (
+            "第二轮 claim 失败 — 电平仍高但找不到中断源, "
+            "旧 _do_claim 错误清除了 _level"
+        )
+        _write_u32(plic, _context_claim_offset(0), 7)
+        assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) != 0, (
+            "第二轮 complete: pending 必须再次重挂"
+        )
+
+        # 第三轮
+        assert _read_u32(plic, _context_claim_offset(0)) == 7
+        _write_u32(plic, _context_claim_offset(0), 7)
+        assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) != 0
+
+    def test_claim_preserves_level_independent_of_pending(self, plic):
+        """_do_claim 不得修改 _level, level 仅由 set_irq 控制."""
+        plic.set_irq(7, True)
+        _write_u32(plic, _priority_offset(7), 3)
+        _write_u32(plic, _enable_offset(0, 0), 1 << 7)
+
+        # claim -> 验证 pending 清但 level 保留
+        assert _read_u32(plic, _context_claim_offset(0)) == 7
+        # 不做任何 set_irq, 直接 complete -> level 仍高 -> pending 重挂
+        _write_u32(plic, _context_claim_offset(0), 7)
+        assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) != 0
+
+        # 重挂的中断应该可以再次 claim
+        assert _read_u32(plic, _context_claim_offset(0)) == 7
+        # 现在设备拉低电平 (如 UART IE 关闭)
+        plic.set_irq(7, False)
+        _write_u32(plic, _context_claim_offset(0), 7)  # complete
+        # level 已为低 -> pending 必须保持低
         assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) == 0

@@ -4,6 +4,55 @@
 //! Handles M-mode bypass (MPRV-aware), enclave pmpsplit partitioning, and
 //! the standard priority-based matching rules.
 
+use crate::state::{riscv_mode, HartState};
+
+/// PMP (Physical Memory Protection) configuration for the batch.
+pub struct PmpCtx {
+    pub cfg: *mut u8,
+    pub addr: *mut u64,
+    pub num: u8,
+}
+
+/// Check PMP for a physical address access.  Returns true if access is allowed.
+#[inline]
+pub fn pmp_ok(
+    state: &HartState,
+    pa: u64,
+    size: u32,
+    is_write: bool,
+    is_execute: bool,
+    pmp: &PmpCtx,
+) -> bool {
+    if pmp.num == 0 {
+        return true;
+    }
+    if state.mode == riscv_mode::M {
+        let mprv = (state.mstatus >> 17) & 1;
+        if mprv == 0 {
+            return true;
+        }
+        // MPRV=1: PMP uses effective mode = MPP.
+        // If MPP=M, effective mode is still M → PMP bypass.
+        let mpp = (state.mstatus >> 11) & 0x3;
+        if mpp == riscv_mode::M as u64 {
+            return true;
+        }
+    }
+    pmp_check(
+        pmp.cfg,
+        pmp.addr,
+        pmp.num,
+        pa,
+        size,
+        if is_write { 1 } else { 0 },
+        if is_execute { 1 } else { 0 },
+        state.mode,
+        state.mstatus,
+        state.pmpsplit,
+        state.mdid,
+    ) != 0
+}
+
 // ============================================================
 //  PMP configuration constants
 // ============================================================
@@ -107,6 +156,10 @@ pub extern "C" fn pmp_check(
                 1 => 1,
                 _ => 3,
             };
+            // MPRV=1 but MPP=M → effective mode is still M → PMP bypass
+            if eff_mode == _MODE_M {
+                return 1;
+            }
         } else {
             // M-mode with MPRV=0: PMP does not apply
             return 1;
@@ -286,6 +339,29 @@ mod tests {
         let cfg = [PMP_A_OFF];
         let addr: [u64; 0] = [];
         assert_eq!(check(&cfg, &addr, 0, 0x8000_0000, 1, 0, 3, 0, 0, 0), 1);
+    }
+
+    #[test]
+    fn test_mmode_mprv1_mpp_m_bypasses_even_if_matched() {
+        // MPRV=1, MPP=M(3) → effective mode is M → PMP bypass.
+        // Entry 0 matches PA 0x8000_0000 with no R/W/X — but should be ignored.
+        let cfg = [PMP_A_NAPOT | 0x00]; // NAPOT, no R/W/X
+        let addr = [0x2000_01FFu64]; // 4K NAPOT covering 0x80000000
+        let mstatus = (1u64 << 17) | (3u64 << 11); // MPRV=1, MPP=3(M)
+        // Execute at 0x80000000 — PMP entry matches but should bypass
+        assert_eq!(check(&cfg, &addr, 1, 0x8000_0000, 0, 1, 3, mstatus, 0, 0), 1);
+        // Write at 0x80000000 — same, should bypass
+        assert_eq!(check(&cfg, &addr, 1, 0x8000_0000, 1, 0, 3, mstatus, 0, 0), 1);
+    }
+
+    #[test]
+    fn test_mmode_mprv1_mpp_s_enforces_pmp() {
+        // MPRV=1, MPP=S(1) → effective mode is S → PMP enforced.
+        // Entry 0 matches PA 0x8000_0000 with no R/W/X → DENY.
+        let cfg = [PMP_A_NAPOT | 0x00]; // NAPOT, no R/W/X
+        let addr = [0x2000_01FFu64];
+        let mstatus = (1u64 << 17) | (1u64 << 11); // MPRV=1, MPP=1(S)
+        assert_eq!(check(&cfg, &addr, 1, 0x8000_0000, 0, 1, 3, mstatus, 0, 0), 0);
     }
 
     // ---------------------------------------------------------------

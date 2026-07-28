@@ -1,5 +1,5 @@
 use crate::concurrent::{ModuleState, StopInfo};
-use crate::handlers::{pmp_ok, try_handle_virtio, DevCtx, PmpCtx, EXIT_SENTINEL};
+use crate::handlers::{lr_check, lr_clear_all, lr_set, pmp_ok, try_handle_virtio, DevCtx, PmpCtx, EXIT_SENTINEL};
 use crate::hart_sched::{ram_offset, read_gpr};
 use crate::peripheral::is_device_addr;
 use crate::state::{exit_reason, HartState};
@@ -89,10 +89,7 @@ pub(crate) fn handle_amo_concurrent(
         0b00010 => {
             // LR.W / LR.D
             // RISC-V spec §8.2: LR.W sign-extends the loaded 32-bit value to
-            // 64 bits on RV64.  Zero-extension (``as u64``) corrupts any value
-            // with bit 31 set — glibc internal locks / CAS loops that use LR.W
-            // on signed words get wrong values → critical sections overlap →
-            // data-structure corruption → crashes in _dl_fini / getpwuid / …
+            // 64 bits on RV64.
             let loaded: u64 = if width == 4 {
                 let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
                 let raw = atomic.load(Ordering::Acquire);
@@ -104,25 +101,26 @@ pub(crate) fn handle_amo_concurrent(
             state.reservation_valid = 1;
             state.reservation_addr = pa;
             state.reservation_value = loaded;
+            // Register this reservation so other harts' stores will clear it.
+            lr_set(ctx, state.mhartid as u8, pa);
             state.gprs[rd as usize] = if rd != 0 { loaded } else { 0 };
             4
         }
         0b00011 => {
             // SC.W / SC.D
-            if state.reservation_valid == 0 || state.reservation_addr != pa {
+            let shared_ok = lr_check(ctx, state.mhartid as u8, pa);
+            if !shared_ok || state.reservation_valid == 0 || state.reservation_addr != pa {
+                state.reservation_valid = 0;
                 if rd != 0 {
                     state.gprs[rd as usize] = 1;
                 }
-                state.reservation_valid = 0;
                 return 4;
             }
-            // Per RISC-V spec §8.2, SC must fail if the reservation has been
-            // invalidated by a store from *any* hart since the last LR.
-            // Use the value loaded by LR (not a fresh load) as the CAS
-            // expected value — a fresh load always equals the current
-            // value, making SC succeed even after a concurrent store
-            // (ABA aside), which lets two harts enter the same critical
-            // section → FIFO corruption → sbi_fifo_dequeue deadlock.
+            // Clear ALL reservations BEFORE the CAS, with SeqCst fence,
+            // so other harts see the clear before (or with) the new value.
+            lr_clear_all(ctx);
+            std::sync::atomic::fence(Ordering::SeqCst);
+            // CAS with the LR-loaded value as expected.
             let success = if width == 4 {
                 let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
                 atomic
@@ -152,6 +150,9 @@ pub(crate) fn handle_amo_concurrent(
         }
         // AMOSWAP / AMOADD / AMOXOR / AMOAND / AMOOR / AMOMIN / AMOMAX / AMOMINU / AMOMAXU
         0b00001 | 0b00000 | 0b00100 | 0b01100 | 0b01000 | 0b10000 | 0b10100 | 0b11000 | 0b11100 => {
+            // Clear reservations BEFORE the atomic write (ABA fix).
+            lr_clear_all(ctx);
+            std::sync::atomic::fence(Ordering::SeqCst);
             let old: u64 = if width == 4 {
                 let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
                 let rv = rs2_val as u32;
@@ -181,6 +182,15 @@ pub(crate) fn handle_amo_concurrent(
                 } else {
                     old
                 };
+            }
+            #[cfg(feature = "diagnostic")]
+            if funct5 == 0b00001 || funct5 == 0b00100 {
+                // AMOSWAP / AMOXOR — rare in normal userspace
+                let name = if funct5 == 0b00001 { "AMOSWAP" } else { "AMOXOR" };
+                crate::diag::log_line(&format!(
+                    "[{}] pc={:#018x} pa={:#018x} w={} rd=x{} rs2={:#018x} old={:#018x}",
+                    name, state.pc, pa, width, rd, rs2_val, old,
+                ));
             }
             4
         }

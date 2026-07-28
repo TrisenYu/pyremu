@@ -89,6 +89,8 @@ pub fn msie_forced(_diag: &mut HartDiag) {
 /// WFI-wake-without-trap counter.  Called once per hart_worker
 /// iteration after ``check_and_deliver_interrupt``.
 #[inline(always)]
+#[allow(dead_code)]
+#[allow(unused)]
 pub fn msip_post_wfi(
     _diag: &mut HartDiag,
     _mip: u64,
@@ -149,6 +151,8 @@ pub fn trap_msip(_diag: &mut HartDiag, _delegated: bool) {
 
 /// Track a direct CLINT MSIP MMIO write.
 #[inline(always)]
+#[allow(dead_code)]
+#[allow(unused)]
 pub fn clint_msip_write(_diag: &mut HartDiag, _target: u64, _self_hartid: u64, _val_one: bool) {
     #[cfg(feature = "diagnostic")]
     {
@@ -226,7 +230,7 @@ fn read_user_stack_from_sp(
     for i in 0..64u64 {
         let va = sp.wrapping_add(i * 8);
         let pa = if _state.mmu_mode == 8 {
-            // Sv39: translate VA→PA (read-only, non-execute page walk)
+            // Sv39: translate VA->PA (read-only, non-execute page walk)
             match crate::translate::sv39_walk(_ctx, _state.satp, va, false) {
                 Some(t) => t.pa,
                 None => continue,
@@ -460,5 +464,177 @@ pub fn diag_small_store(
             _state.gprs[2], _state.gprs[1],
             _state.satp, _state.mode,
         ));
+    }
+}
+
+// ============================================================
+//  Instruction frequency counters (diagnostic builds only)
+// ============================================================
+
+use crate::decode::{CompressedFields, DecodedFields};
+
+#[cfg(feature = "diagnostic")]
+use std::sync::atomic::AtomicU64;
+
+/// Mnemonic table — index -> human-readable instruction name.
+#[cfg(feature = "diagnostic")]
+static INSTR_NAMES: &[&str] = &[
+    // 0-7: LOAD (funct3)
+    "LB","LH","LW","LD","LBU","LHU","LWU","LD?",
+    // 8-15: STORE (funct3)
+    "SB","SH","SW","SD","ST?","ST?","ST?","ST?",
+    // 16-23: OP (funct7=0)
+    "ADD","SLL","SLT","SLTU","XOR","SRL","OR","AND",
+    // 24-31: OP (funct7=0x20 or M)
+    "SUB","SRA","MUL","MULH","MULHSU","MULHU","DIV","DIVU",
+    // 32-33: OP M cont
+    "REM","REMU",
+    // 34-41: OP-IMM (funct3)
+    "ADDI","SLLI","SLTI","SLTIU","XORI","SRLI","ORI","ANDI",
+    // 42: SRAI
+    "SRAI",
+    // 43-46: OP-IMM-32
+    "ADDIW","SLLIW","SRLIW","SRAIW",
+    // 47-54: OP-32
+    "ADDW","SUBW","SLLW","SRLW","SRAW","MULW","DIVW","DIVUW",
+    // 55-56
+    "REMW","REMUW",
+    // 57-60
+    "LUI","AUIPC","JAL","JALR",
+    // 61-66: BRANCH
+    "BEQ","BNE","BLT","BGE","BLTU","BGEU",
+    // 67-69: FENCE
+    "FENCE","FENCE_I","SFENCE_VMA",
+    // 70-77: SYSTEM (func3 0)
+    "ECALL","EBREAK","MRET","SRET","WFI","CSRRW","CSRRS","CSRRC",
+    // 78-81: SYSTEM cont
+    "CSRRWI","CSRRSI","CSRRCI","SYSTEM?",
+    // 82-93: AMO
+    "LR","SC","AMOSWAP","AMOADD","AMOXOR","AMOAND","AMOOR",
+    "AMOMIN","AMOMAX","AMOMINU","AMOMAXU","AMO?",
+    // 94-97: FP
+    "FLW","FLD","FSW","FSD",
+    // 98-99: FP compute
+    "FP-OP","FP-FMA",
+    // 100-127: COMPRESSED
+    "C.ADDI4SPN","C.LW","C.LD","C.SW","C.SD","C.FLD","C.FSD","C0?",
+    "C.ADDI","C.JAL","C.LI","C.LUI","C.ARITH","C.J","C.BEQZ","C.BNEZ",
+    "C.SLLI","C.LWSP","C.LDSP","C.JR/MV","C.JALR/ADD","C.SWSP","C.SDSP","C2?",
+    "C.FLDSP","C.FSDSP","C.FLWSP","C.FSWSP","C.EBREAK","C.ILLEGAL",
+    // 128-129
+    "ILLEGAL","UNKNOWN",
+];
+
+#[cfg(feature = "diagnostic")]
+const N_COUNTERS: usize = INSTR_NAMES.len();
+
+#[cfg(feature = "diagnostic")]
+static ICOUNT: [AtomicU64; N_COUNTERS] = {
+    const Z: AtomicU64 = AtomicU64::new(0);
+    [Z; N_COUNTERS]
+};
+
+#[cfg(feature = "diagnostic")]
+fn iclass_32(f: &DecodedFields) -> usize {
+    match f.opcode {
+        0b00000_11 => f.func3.min(7) as usize,
+        0b01000_11 => 8 + f.func3.min(7) as usize,
+        0b01100_11 => {
+            if f.func7 & 0x20 == 0 { 16 + f.func3.min(7) as usize }
+            else if f.func7 == 0x20 { if f.func3==0 {24} else if f.func3==5 {25} else {129} }
+            else if f.func7 == 0x01 { 26 + f.func3.min(7) as usize }
+            else { 129 }
+        }
+        0b00100_11 => {
+            if f.func3 == 5 && f.func7 == 0x20 { 42 }
+            else if f.func3 <= 7 { 34 + f.func3 as usize }
+            else { 129 }
+        }
+        0b00110_11 => match f.func3 {
+            0 => 43, 1 => 44,
+            5 if f.func7==0 => 45, 5 if f.func7==0x20 => 46,
+            _ => 129,
+        }
+        0b01110_11 => {
+            if f.func7 == 0x00 { match f.func3 { 0=>47,1=>49,5=>50, _=>129 } }
+            else if f.func7 == 0x20 { match f.func3 { 0=>48,5=>51, _=>129 } }
+            else if f.func7 == 0x01 { match f.func3 { 0=>52,4=>53,5=>54,6=>55,7=>56, _=>129 } }
+            else { 129 }
+        }
+        0b01101_11 => 57, 0b00101_11 => 58,
+        0b11011_11 => 59, 0b11001_11 => 60,
+        0b11000_11 => 61 + f.func3.min(5) as usize,
+        0b00011_11 => match f.func3 { 0 => 67, 1 => 68, _ => 69, }
+        0b11100_11 => match f.func3 {
+            0b000 => match f.func12 { 0x000=>70, 0x001=>71, 0x302=>72, 0x102=>73, 0x105=>74, _=>81 }
+            0b001 => 75, 0b010 => 76, 0b011 => 77,
+            0b101 => 78, 0b110 => 79, 0b111 => 80,
+            _ => 81,
+        }
+        0b01011_11 => match (f.func7 >> 2) & 0x1F {
+            0b00010=>82, 0b00011=>83, 0b00001=>84, 0b00000=>85,
+            0b00100=>86, 0b01100=>87, 0b01000=>88, 0b10000=>89,
+            0b10100=>90, 0b11000=>91, 0b11100=>92, _=>93,
+        }
+        0b00001_11 => 94 + f.func3.min(1) as usize,
+        0b01001_11 => 96 + f.func3.min(1) as usize,
+        0b10100_11 => 98,
+        0b10000_11..=0b10011_11 => 99,
+        _ => 128,
+    }
+}
+
+#[cfg(feature = "diagnostic")]
+fn iclass_c(c: &CompressedFields) -> usize {
+    match c.quadrant {
+        0 => match c.funct3 {
+            0=>100, 2=>101, 3=>102, 6=>103, 7=>104, 1=>105, 5=>106, _=>107,
+        }
+        1 => match c.funct3 {
+            0=>108, 1=>109, 2=>110, 3=>111, 4=>112, 5=>113, 6=>114, 7=>115, _=>127,
+        }
+        2 => match c.funct3 {
+            0=>116, 2=>117, 3=>118,
+            4 => if c.bit12==0 {119} else {120},
+            6=>121, 7=>122, 1=>123, 5=>125, _=>126,
+        }
+        _ => 127,
+    }
+}
+
+#[inline]
+#[allow(unused)]
+pub fn icount_32(_f: &DecodedFields, _instr: u32) {
+    #[cfg(feature = "diagnostic")]
+    {
+        let i = iclass_32(_f);
+        if i < N_COUNTERS { ICOUNT[i].fetch_add(1, Ordering::Relaxed); }
+        let _ = _instr;
+    }
+}
+
+#[inline]
+#[allow(unused)]
+pub fn icount_c(_c: &CompressedFields) {
+    #[cfg(feature = "diagnostic")]
+    {
+        let i = iclass_c(_c);
+        if i < N_COUNTERS { ICOUNT[i].fetch_add(1, Ordering::Relaxed); }
+    }
+}
+
+/// Dump non-zero instruction counters to the diagnostic log, then reset all.
+pub fn icount_dump() {
+    #[cfg(feature = "diagnostic")]
+    {
+        let mut v: Vec<(usize, u64)> = (0..N_COUNTERS)
+            .map(|i| (i, ICOUNT[i].swap(0, Ordering::Relaxed)))
+            .filter(|(_, c)| *c > 0)
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (idx, cnt) in &v {
+            let name = INSTR_NAMES.get(*idx).unwrap_or(&"?");
+            log_line(&format!("[icount] {} {}", name, cnt));
+        }
     }
 }

@@ -478,21 +478,31 @@ class TestL2AutoMdid:
         assert entries[0].mdid == 2, f"命中后 mdid 应刷新为 2, 实际 {entries[0].mdid}"
 
     def test_l2_write_hit_updates_mdid(self):
-        """写命中时 L2 条目 mdid 更新为当前 hart 的 mdid."""
+        """CPU store (≤8B) 命中 L2 时更新 mdid.
+
+        DMA (>8B, RAM 地址) 直写 bytearray 绕过 L2, 匹配硬件语义:
+        设备 DMA 不经过 CPU cache, 只有 CPU 访存才填充缓存行.
+        因此用 8-byte store 测试 L2 mdid 行为.
+        """
         emu = Emulator(PlatformConfig.qemu_virt())
         l2 = emu.bus._l2
         assert l2 is not None
         addr = 0x80001000
 
+        # 先触发一次读以将缓存行加载到 L2
+        _ = emu.bus.read(addr, 8)
+        entries = [e for e in l2.entries if e.valid and e.tag == (addr >> l2._line_shift)]
+        assert len(entries) > 0, "读取应填充 L2"
+
         l2.current_mdid = 1
-        emu.bus.write(addr, b"Y" * 64)
+        emu.bus.write(addr, b"Y" * 8)
 
         entries = [e for e in l2.entries if e.valid and e.tag == (addr >> l2._line_shift)]
         assert entries[0].mdid == 1
 
-        # 切换 mdid, 写命中
+        # 切换 mdid, CPU store 命中
         l2.current_mdid = 3
-        emu.bus.write(addr, b"Z" * 64)
+        emu.bus.write(addr, b"Z" * 8)
         entries = [e for e in l2.entries if e.valid and e.tag == (addr >> l2._line_shift)]
         assert entries[0].mdid == 3, f"写命中后 mdid 应刷新为 3, 实际 {entries[0].mdid}"
 

@@ -7,7 +7,7 @@
 # ================================================================
 
 [build]
-target = "riscv64imac-unknown-none-elf"
+target = "riscv64imacfd-unknown-none-elf"
 
 [target.riscv64imac-unknown-none-elf]
 linker = "/opt/custom-llvm/bin/ld.lld"

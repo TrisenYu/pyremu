@@ -17,6 +17,7 @@ from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.utils import group_order
 from pyremu.memory.mmu import sv39_canonical_va
 from pyremu.utils.parse_bin import FirmwareSegment, parse_firmware
+from pyremu.utils.mask import MASK64, mask64
 
 
 class SymbolMixin(SharedMixinAttrs):
@@ -84,7 +85,7 @@ class SymbolMixin(SharedMixinAttrs):
             # 地址在 ranges 覆盖范围外 -> 回退最近前驱
 
         # 4) 无 ranges / ranges 覆盖范围外: 最近前驱
-        best_name, best_dist = None, 0xFFFF_FFFF_FFFF_FFFF
+        best_name, best_dist = None, MASK64
         for name, a in symbols.items():
             if name.startswith("$") or name.startswith(".L"):
                 continue
@@ -111,7 +112,7 @@ class SymbolMixin(SharedMixinAttrs):
             base_pa = self._emu._cfg.ram_base + 0x200000
 
         min_vaddr = sym_image.entry_point
-        load_offset = (base_pa - min_vaddr) & 0xFFFF_FFFF_FFFF_FFFF
+        load_offset = mask64((base_pa - min_vaddr))
 
         self._sym_symbols = sym_image.symbols
         self._sym_ranges = sym_image.symbol_ranges
@@ -122,12 +123,12 @@ class SymbolMixin(SharedMixinAttrs):
         self._sym_ranges_pa.clear()
         self._pa_to_va = {}
         for name, va in self._sym_symbols.items():
-            pa = (va + load_offset) & 0xFFFF_FFFF_FFFF_FFFF
+            pa = mask64((va + load_offset))
             self._sym_symbols_pa[name] = pa
             self._pa_to_va[pa] = va
         for start, end, name in self._sym_ranges:
-            pa_start = (start + load_offset) & 0xFFFF_FFFF_FFFF_FFFF
-            pa_end = (end + load_offset) & 0xFFFF_FFFF_FFFF_FFFF
+            pa_start = mask64((start + load_offset))
+            pa_end = mask64((end + load_offset))
             self._sym_ranges_pa.append((pa_start, pa_end, name))
         self._sym_ranges_pa.sort(key=lambda r: r[0])
 
@@ -145,7 +146,7 @@ class SymbolMixin(SharedMixinAttrs):
             return None
         hart = self.hart
         if hart.mmu_mode == 0:
-            return (va_like + self._sym_load_offset) & 0xFFFF_FFFF_FFFF_FFFF
+            return mask64((va_like + self._sym_load_offset))
         ok, pa = translate_addr(hart, va_like)
         return pa if ok else va_like
 

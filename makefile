@@ -22,22 +22,28 @@ include configs.mk
 # 设为非零/非空值时启用 --features diagnostic, 否则不启用).
 # 若仅依赖 $(NATIVE_SRC) 时间戳, 修改环境变量后 make 不会重建 → 旧的
 # (不含 diagnostic) .so 被继续使用 → 诊断日志静默缺失.
-NATIVE_FLAG_STAMP = $(NATIVE_DIR)/.cargo_flags_stamp
+NATIVE_CONFIG_GEN = $(NATIVE_DIR)/cpu/src/config_gen.rs
 
-$(NATIVE_FLAG_STAMP): FORCE
-	@echo "$(CARGO_FLAGS)" | cmp -s - $@ 2>/dev/null || echo "$(CARGO_FLAGS)" > $@
+# 由 configs.mk 生成 Rust 常量定义 — 照搬 rust_smode_entry/Makefile 模式.
+$(NATIVE_CONFIG_GEN): configs.mk makefile
+	@echo '// generated from configs.mk by Makefile — do not edit' > $@
+	@echo 'pub const TLB_ENTRIES: usize = $(TLB_ENTRIES);' >> $@
 
-$(NATIVE_SO) $(TERMIO_SO): $(NATIVE_SRC) $(NATIVE_FLAG_STAMP)
+$(NATIVE_SO) $(TERMIO_SO): $(NATIVE_SRC) $(NATIVE_CONFIG_GEN)
 	cargo build --release --manifest-path $(NATIVE_DIR)/Cargo.toml --workspace $(CARGO_FLAGS)
 	install -m 755 $(NATIVE_DIR)/target/release/libdecode.so $(NATIVE_SO)
 	install -m 755 $(NATIVE_DIR)/target/release/libtermio.so $(TERMIO_SO)
 	@echo "libdecode.so + libtermio.so 已构建"
 
-build-native: $(NATIVE_SO) $(TERMIO_SO)
+build-native: $(NATIVE_CONFIG_GEN)
+	cargo build --release --manifest-path $(NATIVE_DIR)/Cargo.toml --workspace $(CARGO_FLAGS)
+	install -m 755 $(NATIVE_DIR)/target/release/libdecode.so $(NATIVE_SO)
+	install -m 755 $(NATIVE_DIR)/target/release/libtermio.so $(TERMIO_SO)
+	@echo "libdecode.so + libtermio.so 已构建"
 phony += build-native
 
 clean-native:
-	rm -f $(NATIVE_SO) $(TERMIO_SO) $(NATIVE_FLAG_STAMP)
+	rm -f $(NATIVE_SO) $(TERMIO_SO)
 	rm -rf $(NATIVE_DIR)/target
 phony += clean-native
 
@@ -121,26 +127,16 @@ emu-linux: $(zsbl_fsbl) $(fw_jump_elf) build-native $(if $(INITRD),$(INITRAMFS))
 	python -m pyremu.debugger \
 		--hart-logs=output/ --ram-base=0x80000000 --ram $(ram) --preload=$(zsbl_fsbl) \
 		--kernel=$(LINUX_IMG) --sym=$(LINUX_VMLINUX) \
-		$(initrd_args) $(disk_args) \
+		$(initrd_args) $(disk_args) $(bootargs_arg) \
 		--harts=$(hart_num) $(fw_jump_elf)
 phony += emu-linux
 
-# 调试模式 — 显示 MSIP/WFI 诊断计数器
-emu-linux-diag: $(zsbl_fsbl) $(fw_jump_elf) build-native
-	python -m pyremu.debugger \
-		--hart-logs=output/ --ram-base=0x80000000 --ram $(ram) --preload=$(zsbl_fsbl) \
-		--kernel=$(LINUX_IMG) --sym=$(LINUX_VMLINUX) \
-		$(disk_args) \
-		--harts=$(hart_num) $(fw_jump_elf)
-phony += emu-linux-diag
-
-# init=/bin/sh 诊断 — 最小 init 验证内核能否走到执行 init 阶段
+# 最小 init 验证内核能否走到执行 init 阶段
 emu-linux-sh: $(zsbl_fsbl) $(fw_jump_elf) build-native
-	python -m pyremu.debugger \
+	PYTHON_GIL=0 python -m pyremu.debugger \
 		--hart-logs=output/ --ram-base=0x80000000 --ram $(ram) --preload=$(zsbl_fsbl) \
-		--kernel=$(LINUX_IMG) --sym=$(LINUX_VMLINUX) \
-		$(disk_args) \
-		--bootargs="earlycon=sbi console=ttySIF0 root=/dev/vda ro init=/bin/dash -i norandmaps random.trust_bootloader=on deferred_probe_timeout=10" \
+		--kernel=$(LINUX_IMG) --sym=$(LINUX_VMLINUX) --fdt -1 \
+		$(disk_args) $(initrd_args) $(bootargs_arg) \
 		--harts=$(hart_num) $(fw_jump_elf)
 phony += emu-linux-sh
 
@@ -158,11 +154,11 @@ phony += build-initramfs
 
 # ---- 测试 ----
 test:
-	pytest -x
+	PYTHON_GIL=0 pytest -x
 phony += test
 
 cov-test:
-	pytest -x --cov=. --cov-report=term --full-trace
+	PYTHON_GIL=0 pytest -x --cov=. --cov-report=term --full-trace
 phony += cov-test
 
 .PHONY: $(phony)

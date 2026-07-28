@@ -1,0 +1,20 @@
+# 模拟器 host 端编译优化标志。
+# 仅影响本机编译的 cdylib (libdecode.so + libtermio.so); riscv64
+# 交叉编译的 crate (rust_smode_entry) 有独立的 .cargo/config.toml。
+#
+# target-cpu=native: 启用本机 CPU 的所有 ISA 扩展。
+#   预期收益: 解释循环 10-20% 吞吐提升 (免费, 无代码改动).
+#
+#   x86-64 (raptorlake 等):
+#     - BMI2 (andn/blsi/bzhi): 位操作, 加速 RISC-V 指令字段提取
+#     - AVX2 (vpaddq/vpbroadcast): 自动向量化 memcpy/循环展开
+#
+#   aarch64 (Apple M1/M2, AWS Graviton, 树莓派5 等):
+#     - NEON (Advanced SIMD): 128-bit 向量, 循环展开/内联 memcpy
+#     - FEAT_LSE: 低开销原子指令 (CAS/LDADD), 加速 AtomicU64 操作
+#     - CRC/PMULL: 校验和与多项式乘
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]

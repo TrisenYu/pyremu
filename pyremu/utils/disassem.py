@@ -11,35 +11,322 @@ RISC-V RV64 反汇编器.
 将 32-bit / 16-bit 指令字翻译为可读汇编字符串。
 覆盖 RV64 I + M + Zicsr + AMO, 与 decoder.py 的 Hart 执行单元对齐。
 """
+from enum import Enum
 
-from pyremu.core.decoder import (
-    AmoFunct5,
-    AmoWidth,
-    Opc,
-    brFn3,
-    parse_compressed,
-    parse_func3,
-    parse_func6,
-    parse_func7,
-    parse_imm12_se,
-    parse_imm20_raw,
-    parse_imm_b,
-    parse_imm_j,
-    parse_imm_s,
-    parse_opcode,
-    parse_rd,
-    parse_rs1,
-    parse_rs2,
-    stFn3,
-)
+from pyremu.utils.mask import mask64
 from pyremu.core.registers import check_csr, gpr_name
 
 _UNKNOWN = "<unknown opcode>"
 
+# ============================================================
+#  Bit-manipulation helpers for sign extension
+# ============================================================
+
+
+def sext(val: int, bits: int) -> int:
+    """Sign-extend *val* from *bits* width to a canonical 64-bit unsigned Python int.
+
+    Python's arbitrary-precision integers behave differently from finite-width
+    hardware in bitwise operations (|, &, ^, <<, >>) when values are negative.
+    Canonicalizing to [0, 2^64) ensures consistent behaviour regardless of
+    whether the value was built via sign-extend, zero-extend, or arithmetic.
+    """
+    sign_bit = 1 << (bits - 1)
+    result = (val & (sign_bit - 1)) - (val & sign_bit)
+    # Normalize to 64-bit unsigned representation for consistent bitwise semantics.
+    if bits <= 64:
+        result &= (1 << 64) - 1
+    return result
+
+
+# 热路径特化: 为最常见的位宽预计算 sign-extend, 避免 sext() 的
+# 通用分支和函数调用开销 (~0.14s 节省)
+def sext8(val: int) -> int:
+    """Sign-extend from 8 bits -> canonical 64-bit unsigned."""
+    return (val & 0x7F) - (val & 0x80) & 0xFFFF_FFFF_FFFF_FFFF
+
+
+def sext12(val: int) -> int:
+    """Sign-extend from 12 bits -> canonical 64-bit unsigned."""
+    return (val & 0x7FF) - (val & 0x800) & 0xFFFF_FFFF_FFFF_FFFF
+
+
+def sext16(val: int) -> int:
+    """Sign-extend from 16 bits -> canonical 64-bit unsigned."""
+    return (val & 0x7FFF) - (val & 0x8000) & 0xFFFF_FFFF_FFFF_FFFF
+
+
+def sext32(val: int) -> int:
+    """Sign-extend from 32 bits -> canonical 64-bit unsigned."""
+    return (val & 0x7FFF_FFFF) - (val & 0x8000_0000) & 0xFFFF_FFFF_FFFF_FFFF
+
+
+# ============================================================
+#  Opcodes
+# ============================================================
+
+
+class Opc(Enum):
+    """
+    如果是压缩指令，低两位不是11,而可能是00,01,10
+    然后长度按照16位来解析
+    """
+
+    ld = 0b00000_11  # 载入
+    opfp = 0b00001_11  # 浮点载入 (FLW/FLD) — LOAD-FP
+    fence = 0b00011_11  # 内存/执行流屏障
+    opImm = 0b00100_11  # 立即数 ALU (32-bit)
+    opImm32 = 0b00110_11  # RV64 32-bit 立即数 ALU
+    auipc = 0b00101_11  # 累加 pc
+    st = 0b01000_11  # 写入
+    stfp = 0b01001_11  # 浮点存储 (FSW/FSD) — STORE-FP
+    amo = 0b01011_11  # 原子
+    fmadd = 0b10000_11  # 融合乘加 FMADD
+    fmsub = 0b10001_11  # 融合乘减 FMSUB
+    fnmsub = 0b10010_11  # 负融合乘减 FNMSUB
+    fnmadd = 0b10011_11  # 负融合乘加 FNMADD
+    opFp = 0b10100_11  # 浮点算术/转换/比较 OP-FP
+    op = 0b01100_11  # ALU (R-type)
+    lui = 0b01101_11  # 立即数载入
+    op32 = 0b01110_11  # RV64 32-bit 操作
+    br = 0b11000_11  # 有条件跳转
+    jalr = 0b11001_11  # 无条件跳转 (寄存器)
+    jal = 0b11011_11  # 无条件跳转
+    sys = 0b11100_11  # ecall/ebreak/sfence.vma / CSR
+
+
+# ============================================================
+#  Funct3 / Funct7 enumerations
+# ============================================================
+
+aluOp = Enum(
+    "aluOp",
+    (
+        "add",
+        "sub",
+        "mul",
+        "mulh",
+        "mulhu",
+        "mulhsu",
+        "div",
+        "divu",
+        "rem",
+        "remu",
+        "andi",
+        "ori",
+        "xor",
+        "sll",
+        "srl",
+        "sra",
+        "slti",
+        "sltiu",
+        "slt",
+        "sltu",
+    ),
+)
+
+sysOp = Enum(
+    "sysOp",
+    (
+        "ecall",
+        "ebreak",
+        "csrrc",
+        "csrrci",
+        "csrrw",
+        "csrrwi",
+        "csrrs",
+        "csrrsi",
+        "mret",
+        "sret",
+        "wfi",
+        "sfence_vma",
+    ),
+)
+
+
+class brFn3(Enum):
+    beq = 0b000
+    bne = 0b001
+    blt = 0b100
+    bge = 0b101
+    bltu = 0b110
+    bgeu = 0b111
+
+
+class ldFn3(Enum):
+    lb = 0b000
+    lh = 0b001
+    lw = 0b010
+    ld = 0b011
+    lbu = 0b100
+    lhu = 0b101
+    lwu = 0b110
+
+
+class stFn3(Enum):
+    sb = 0b000
+    sh = 0b001
+    sw = 0b010
+    sd = 0b011
+
+
+class sysFn12(Enum):
+    ecall = 0
+    ebreak = 1
+
+
+# AMO funct5 编码 (bits 31:27), funct3 区分 32/64-bit
+class AmoFunct5(Enum):
+    LR = 0b00010
+    SC = 0b00011
+    SWAP = 0b00001
+    ADD = 0b00000
+    XOR = 0b00100
+    AND = 0b01100
+    OR = 0b01000
+    MIN = 0b10000
+    MAX = 0b10100
+    MINU = 0b11000
+    MAXU = 0b11100
+
+
+class AmoWidth(Enum):
+    W = 0b010  # 32-bit
+    D = 0b011  # 64-bit
+
+
+# 热路径优化: 预建 dict 查找表替代 Enum() 构造调用 (~0.10s 节省)
+# Enum.__call__ 内部做线性搜索, dict.get 是 O(1) 哈希查找
+BRFN3_MAP: dict[int, brFn3] = {
+    v.value: v for v in brFn3  # type: ignore[var-annotated]
+}
+LDFN3_MAP: dict[int, ldFn3] = {
+    v.value: v for v in ldFn3  # type: ignore[var-annotated]
+}
+STFN3_MAP: dict[int, stFn3] = {
+    v.value: v for v in stFn3  # type: ignore[var-annotated]
+}
+AMOF5_MAP: dict[int, AmoFunct5] = {
+    v.value: v for v in AmoFunct5  # type: ignore[var-annotated]
+}
+AMOW_MAP: dict[int, AmoWidth] = {
+    v.value: v for v in AmoWidth  # type: ignore[var-annotated]
+}
+
+# ============================================================
+#  Instruction-field extractors
+# ============================================================
+
+def parse_opcode(x: int) -> int:
+    return x & 0b111_1111
+
+def parse_rd(x: int) -> int:
+    return (x >> 7) & 0b1_1111
+
+def parse_func3(x: int) -> int:
+    return (x >> 12) & 0b0111
+
+def parse_rs1(x: int) -> int:
+    return (x >> 15) & 0b1_1111
+
+def parse_rs2(x: int) -> int:
+    return (x >> 20) & 0b1_1111
+
+def parse_func7(x: int) -> int:
+    return (x >> 25) & 0b111_1111
+
+def parse_func6(x: int) -> int:
+    """ for SLLI/SRLI/SRAI (I-type shifts) """
+    return (x >> 26) & 0x3F
+
+def parse_func12(x: int) -> int:
+    """I-type funct12 (bits[31:20]) — CSR / ECALL / EBREAK / etc."""
+    return (x >> 20) & 0xFFF
+
+# 立即数解析
+def parse_imm12_raw(x: int) -> int:
+    """I-type"""
+    return (x >> 20) & 0xFFF
+
+def parse_imm12_se(x: int) -> int:
+    return sext12((x >> 20) & 0xFFF)
+
+def parse_imm20_raw(x: int) -> int:
+    """U-type"""
+    return (x >> 12) & 0xF_FFFF
+
+def parse_imm_s(instr: int) -> int:
+    """S-type 12-bit immediate, sign-extended."""
+    imm = ((instr >> 25) & 0x7F) << 5  # imm[11:5]
+    imm |= (instr >> 7) & 0x1F  # imm[4:0]  -- from rd field
+    return sext12(imm)
+
+def parse_imm_b(instr: int) -> int:
+    """B-type 13-bit immediate, sign-extended (byte-address diff)."""
+    imm = ((instr >> 31) & 1) << 12  # imm[12]
+    imm |= ((instr >> 25) & 0x3F) << 5  # imm[10:5]
+    imm |= ((instr >> 8) & 0xF) << 1  # imm[4:1]
+    imm |= ((instr >> 7) & 1) << 11  # imm[11]
+    return sext(imm, 13)
+
+def parse_imm_j(instr: int) -> int:
+    """J-type 21-bit immediate, sign-extended (byte-address diff)."""
+    imm = ((instr >> 31) & 1) << 20  # imm[20]
+    imm |= ((instr >> 21) & 0x3FF) << 1  # imm[10:1]
+    imm |= ((instr >> 20) & 1) << 11  # imm[11]
+    imm |= ((instr >> 12) & 0xFF) << 12  # imm[19:12]
+    return sext(imm, 21)
+
+def parse_compressed(instr: int) -> bool:
+    return (instr & 0x3) != 3
+# 可能会有指令别名，不过那是反编译器关心的事情
+
+
+def decode_c_sdsp(half: int) -> tuple[int, int] | None:
+    """If *half* is ``c.sdsp rs2, uimm(sp)``, return ``(rs2, uimm)``; else None.
+
+    C.SDSP encoding (C2 quadrant, RV64 only):
+        bits[1:0]   = 10
+        bits[4:2]   = rs2 (x8--x15 in standard, but we also accept x1)
+        bits[6:5]   = uimm[5:3] lower bits
+        bits[12:10] = uimm[5:3]
+        bits[9:7]   = uimm[8:6]
+        bits[15:13] = 111 (funct3)
+    The uimm is assembled from {bits[9:7], bits[12:10]} << 3, i.e. 8-byte aligned.
+    """
+    if (half & 0xE003) != 0xE002:  # bits[15:13]=111, bits[1:0]=10
+        return None
+    rs2 = (half >> 2) & 0x1F
+    uimm = ((half >> 7) & 0x7) << 6   # bits[9:7]  -> uimm[8:6]
+    uimm |= ((half >> 10) & 0x7) << 3  # bits[12:10] -> uimm[5:3]
+    return rs2, uimm
+
+
+def decode_sd_sp(instr: int) -> tuple[int, int] | None:
+    """If *instr* is ``sd rs2, imm(sp)``, return ``(rs2, imm)``; else None.
+
+    S-type encoding:
+        opcode (bits[6:0])   = 0b0100011 (STORE)
+        funct3 (bits[14:12]) = 0b011     (SD / doubleword store)
+        rs1    (bits[19:15]) = 2         (sp)
+        rs2    (bits[24:20]) = source register
+        imm[4:0]  at bits[11:7], imm[11:5] at bits[31:25]
+    """
+    if (instr & 0x7F) != 0b0100011:
+        return None
+    if ((instr >> 12) & 0x7) != 0b011:  # funct3 = SD
+        return None
+    if ((instr >> 15) & 0x1F) != 2:     # rs1 = sp
+        return None
+    rs2 = (instr >> 20) & 0x1F
+    imm = ((instr >> 25) << 5) | ((instr >> 7) & 0x1F)
+    imm = (imm << 52) >> 52  # sign-extend 12-bit
+    return rs2, imm
+
 
 def _fmt_imm(val: int) -> str:
     """格式化指令立即数: 有符号十进制 (处理 64-bit 规范化值)."""
-    # _sext 规范化后, 负立即数以 64-bit 无符号形式传入.
+    # sext 规范化后, 负立即数以 64-bit 无符号形式传入.
     # 若 bit 63 置位则还原为有符号显示 (例如 0xFF…F0 -> -16).
     if val >= (1 << 63):
         val = val - (1 << 64)
@@ -48,7 +335,7 @@ def _fmt_imm(val: int) -> str:
 
 def _fmt_addr(val: int) -> str:
     """格式化绝对地址: hex."""
-    return f"0x{val & 0xFFFF_FFFF_FFFF_FFFF:x}"
+    return f"0x{mask64(val):x}"
 
 
 # ============================================================
@@ -231,7 +518,7 @@ def _dis_branch(instr: int, pc: int) -> str:
     except ValueError:
         return _UNKNOWN
     offset = parse_imm_b(instr)
-    target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
+    target = mask64((pc + offset))
     return f"{mnemonic:<12} {_rs1(instr)}, {_rs2(instr)}, {_fmt_addr(target)}"
 
 
@@ -243,7 +530,7 @@ def _dis_branch(instr: int, pc: int) -> str:
 def _dis_jal(instr: int, pc: int) -> str:
     """JAL: mnemonic rd, target_addr."""
     offset = parse_imm_j(instr)
-    target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
+    target = mask64((pc + offset))
     return f"jal          {_rd(instr)}, {_fmt_addr(target)}"
 
 
@@ -518,7 +805,7 @@ def _dis_compressed(
             # sign extend from bit 11
             if offset & (1 << 11):
                 offset |= ~((1 << 12) - 1)
-            target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
+            target = mask64((pc + offset))
             return f"c.j          {_fmt_addr(target)}"
 
         if funct3 == 0b110:  # C.BEQZ
@@ -530,7 +817,7 @@ def _dis_compressed(
             )
             if offset & (1 << 8):
                 offset |= ~((1 << 9) - 1)
-            target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
+            target = mask64((pc + offset))
             return f"c.beqz       {rs1_p}, {_fmt_addr(target)}"
 
         if funct3 == 0b111:  # C.BNEZ
@@ -542,7 +829,7 @@ def _dis_compressed(
             )
             if offset & (1 << 8):
                 offset |= ~((1 << 9) - 1)
-            target = (pc + offset) & 0xFFFF_FFFF_FFFF_FFFF
+            target = mask64((pc + offset))
             return f"c.bnez       {rs1_p}, {_fmt_addr(target)}"
 
         return f"c.?    0x{c16:04x}"
@@ -628,7 +915,7 @@ def _dis_compressed(
 
 _FP_LOAD_MNEMONIC = {0b010: "flw", 0b011: "fld"}
 _FP_STORE_MNEMONIC = {0b010: "fsw", 0b011: "fsd"}
-# OP-FP funct7[6:2] → 助记符基名 (S/D 后缀由 fmt 决定)
+# OP-FP funct7[6:2] ->助记符基名 (S/D 后缀由 fmt 决定)
 _FP_ARITH = {0x00: "fadd", 0x01: "fsub", 0x02: "fmul", 0x03: "fdiv"}
 _FP_SGNJ = {0: "fsgnj", 1: "fsgnjn", 2: "fsgnjx"}
 _FP_MINMAX = {0: "fmin", 1: "fmax"}
@@ -704,25 +991,25 @@ def _dis_fp_op(instr: int) -> str:
     if op5 == 0x05:  # FMIN/FMAX
         m = _FP_MINMAX.get(funct3, "fmin?")
         return f"{m + '.' + sfx:<12} {frd}, {frs1}, {frs2}"
-    if op5 == 0x14:  # FCMP → GPR rd
+    if op5 == 0x14:  # FCMP ->GPR rd
         m = _FP_CMP.get(funct3, "fcmp?")
         return f"{m + '.' + sfx:<12} {_rd(instr)}, {frs1}, {frs2}"
-    if op5 == 0x18:  # FCVT float→int (GPR rd)
+    if op5 == 0x18:  # FCVT float->int (GPR rd)
         w = {0: "w", 1: "wu", 2: "l", 3: "lu"}.get(rs2, "?")
         return f"{'fcvt.' + w + '.' + sfx:<12} {_rd(instr)}, {frs1}"
-    if op5 == 0x1A:  # FCVT int→float (GPR rs1)
+    if op5 == 0x1A:  # FCVT int->float (GPR rs1)
         w = {0: "w", 1: "wu", 2: "l", 3: "lu"}.get(rs2, "?")
         return f"{'fcvt.' + sfx + '.' + w:<12} {frd}, {_rs1(instr)}"
     if op5 == 0x08:  # FCVT.S.D / FCVT.D.S
         m = "fcvt.d.s" if fmt == 1 else "fcvt.s.d"
         return f"{m:<12} {frd}, {frs1}"
-    if op5 == 0x1C:  # FMV.X.* / FCLASS → GPR rd
+    if op5 == 0x1C:  # FMV.X.* / FCLASS ->GPR rd
         if funct3 == 0:
             m = "fmv.x.w" if fmt == 0 else "fmv.x.d"
         else:
             m = "fclass.s" if fmt == 0 else "fclass.d"
         return f"{m:<12} {_rd(instr)}, {frs1}"
-    if op5 == 0x1E:  # FMV.*.X (GPR rs1 → FPR)
+    if op5 == 0x1E:  # FMV.*.X (GPR rs1 ->FPR)
         m = "fmv.w.x" if fmt == 0 else "fmv.d.x"
         return f"{m:<12} {frd}, {_rs1(instr)}"
     return _UNKNOWN

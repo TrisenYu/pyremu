@@ -218,21 +218,14 @@ try:
 
     # Phase 5: concurrent thread-per-hart execution engine
     _lib.run_parallel.argtypes = [
-        ctypes.c_void_p,   # states: *mut HartState
-        ctypes.c_uint32,   # num_harts
-        ctypes.c_uint64,   # max_instrs
-        ctypes.c_void_p,   # result: *mut BatchResult
-        ctypes.c_void_p,   # mem: *const MemCtx
-        ctypes.c_void_p,   # pmp: *const FfiPmpCtx
-        ctypes.c_void_p,   # clint: *const FfiClintCtx
-        ctypes.c_void_p,   # dev: *const FfiDevCtx
-        ctypes.c_void_p,   # uart: *const FfiUartCtx
-        ctypes.c_void_p,   # virtio: *const FfiVirtIOCtx
-        ctypes.c_void_p,   # bp_addrs: *const u64
-        ctypes.c_uint32,   # bp_count
-        ctypes.c_void_p,   # stop_flag: *const u8
+        ctypes.c_void_p,   # hart: *const FfiHartCtx
+        ctypes.c_void_p,   # ffi: *const FfiPeriphCtx
+        ctypes.c_void_p,   # bp: *const FfiBpCtx
+        ctypes.c_void_p,   # tlb: *mut FfiTlbCtx
     ]
     _lib.run_parallel.restype = None
+    _lib.icount_flush.argtypes = []
+    _lib.icount_flush.restype = None
 
 except OSError as exc:
     logger.warning(
@@ -912,7 +905,8 @@ class FfiUartCtx(ctypes.Structure):
         ("txctrl", ctypes.c_uint32),      # TXCTRL 影子 (offset 0x08)
         ("rxctrl", ctypes.c_uint32),      # RXCTRL 影子 (offset 0x0C)
         ("rx_fifo_len", ctypes.c_uint32), # RX FIFO 近似填充量
-        ("_pad", ctypes.c_uint32),        # 对齐填充
+        ("tx_notify_fd", ctypes.c_int32), # pipe write-end: Rust 通知 TX 线程
+        ("no_stdout", ctypes.c_uint8),    # 1=Rust 不写 stdout, Python TX 统一输出
     ]
 
 
@@ -936,6 +930,45 @@ class FfiVirtIOCtx(ctypes.Structure):
         ("notify_pending", ctypes.c_uint8),
         ("irq_maybe_lower", ctypes.c_uint8),
         ("_pad", ctypes.c_uint8 * 6),
+    ]
+
+
+class FfiHartCtx(ctypes.Structure):
+    """Grouped hart execution context — matches Rust ``FfiHartCtx``."""
+    _fields_ = [
+        ("states", ctypes.c_void_p),
+        ("num_harts", ctypes.c_uint32),
+        ("max_instrs", ctypes.c_uint64),
+        ("result", ctypes.c_void_p),
+        ("stop_flag", ctypes.c_void_p),
+    ]
+
+
+class FfiPeriphCtx(ctypes.Structure):
+    """Grouped peripheral / memory context — matches Rust ``FfiPeriphCtx``."""
+    _fields_ = [
+        ("mem", ctypes.c_void_p),
+        ("pmp", ctypes.c_void_p),
+        ("clint", ctypes.c_void_p),
+        ("dev", ctypes.c_void_p),
+        ("uart", ctypes.c_void_p),
+        ("virtio", ctypes.c_void_p),
+    ]
+
+
+class FfiBpCtx(ctypes.Structure):
+    """Grouped breakpoint context — matches Rust ``FfiBpCtx``."""
+    _fields_ = [
+        ("addrs", ctypes.c_void_p),
+        ("count", ctypes.c_uint32),
+    ]
+
+
+class FfiTlbCtx(ctypes.Structure):
+    """Grouped TLB generation context — matches Rust ``FfiTlbCtx``."""
+    _fields_ = [
+        ("gen", ctypes.c_void_p),
+        ("gen_per_hart", ctypes.c_void_p),
     ]
 
 
@@ -977,7 +1010,7 @@ class PmpInfo:
         # ``num`` 是 *每 hart* 的 PMP 条目数, 而非扁平缓冲总长。
         # 多 hart 时 cfg/addr 为 64*hart_num 连续数组 (每 hart 独占 64 项切片),
         # 若误把总长写入 FfiPmpCtx.num (c_uint8) 会在 hart_num>=4 时溢出:
-        # 64*4=256 → 256 & 0xFF = 0 → PMP 被静默禁用。故按 hart_num 反算每 hart 值。
+        # 64*4=256 ->256 & 0xFF = 0 ->PMP 被静默禁用。故按 hart_num 反算每 hart 值。
         total = (
             min(len(self.cfg), len(self.addr))
             if len(self.cfg) > 0 and len(self.addr) > 0
@@ -1020,17 +1053,21 @@ class DevInfo:
 class UartInfo:
     """UART context for a batch — lets Rust buffer sbi_printf output inline
     and handle IE/IP/TXCTRL register reads without batch exits."""
-    __slots__ = ("base", "tx_buf", "tx_wr", "ie", "txctrl", "rxctrl", "rx_fifo_len")
+    __slots__ = ("base", "tx_buf", "tx_wr", "ie", "txctrl", "rxctrl",
+                 "rx_fifo_len", "tx_notify_fd", "no_stdout")
 
     def __init__(self, base: int = 0, tx_buf=None, tx_wr=None,
-                 ie: int = 0, txctrl: int = 0, rxctrl: int = 0, rx_fifo_len: int = 0):
+                 ie: int = 0, txctrl: int = 0, rxctrl: int = 0, rx_fifo_len: int = 0,
+                 tx_notify_fd: int = -1, no_stdout: int = 0):
         self.base = base
-        self.tx_buf = tx_buf          # ctypes byte array
-        self.tx_wr = tx_wr            # ctypes uint32
-        self.ie = ie                  # IE register value
-        self.txctrl = txctrl          # TXCTRL register value
-        self.rxctrl = rxctrl          # RXCTRL register value
-        self.rx_fifo_len = rx_fifo_len  # approx RX FIFO fill
+        self.tx_buf = tx_buf
+        self.tx_wr = tx_wr
+        self.ie = ie
+        self.txctrl = txctrl
+        self.rxctrl = rxctrl
+        self.rx_fifo_len = rx_fifo_len
+        self.tx_notify_fd = tx_notify_fd
+        self.no_stdout = no_stdout
 
 
 class VirtIOInfo:
@@ -1103,7 +1140,7 @@ def run_batch(
     dev: DevInfo | None = None,
     virtio: VirtIOInfo | None = None,
     bp_addrs: list[int] | None = None,
-) -> None:
+) -> FfiVirtIOCtx | None:
     """Execute up to *max_instrs* instructions across all harts in Rust.
 
     *bp_addrs* is an optional list of PC addresses that trigger
@@ -1248,6 +1285,8 @@ def run_parallel(
     virtio: VirtIOInfo | None = None,
     bp_addrs: list[int] | None = None,
     stop_flag=None,  # ctypes.c_uint8 or None — shared stop flag for Ctrl+C
+    tlb_gen=None,  # ctypes.c_uint64 — persistent TLB generation counter
+    tlb_gen_per_hart=None,  # ctypes array of c_uint64 — per-hart last-seen gen
 ) -> None:
     """Execute instructions concurrently (thread-per-hart) in Rust.
 
@@ -1332,6 +1371,8 @@ def run_parallel(
         uart_ffi.txctrl = uart.txctrl
         uart_ffi.rxctrl = uart.rxctrl
         uart_ffi.rx_fifo_len = uart.rx_fifo_len
+        uart_ffi.tx_notify_fd = uart.tx_notify_fd
+        uart_ffi.no_stdout = uart.no_stdout
 
     # --- FfiVirtIOCtx ---
     _virtio_ffi = FfiVirtIOCtx()
@@ -1360,16 +1401,43 @@ def run_parallel(
         for i, addr in enumerate(bp_addrs):
             _bp_arr[i] = addr & 0xFFFF_FFFF_FFFF_FFFF
 
+    # --- Build grouped FFI structs ---
+    _hart_ctx = FfiHartCtx()
+    _hart_ctx.states = ctypes.cast(states, ctypes.c_void_p).value or 0
+    _hart_ctx.num_harts = num_harts
+    _hart_ctx.max_instrs = max_instrs
+    _hart_ctx.result = ctypes.cast(ctypes.byref(result), ctypes.c_void_p).value or 0
+    _hart_ctx.stop_flag = (
+        ctypes.cast(ctypes.pointer(stop_flag), ctypes.c_void_p).value
+        if stop_flag is not None else 0
+    )
+
+    _periph_ctx = FfiPeriphCtx()
+    _periph_ctx.mem = ctypes.addressof(mem)
+    _periph_ctx.pmp = ctypes.addressof(pmp_ffi)
+    _periph_ctx.clint = ctypes.addressof(clint_ffi)
+    _periph_ctx.dev = ctypes.addressof(dev_ffi)
+    _periph_ctx.uart = ctypes.addressof(uart_ffi)
+    _periph_ctx.virtio = (
+        ctypes.cast(_virtio_ffi_ptr, ctypes.c_void_p).value
+        if _virtio_ffi_ptr else 0
+    )
+
+    _bp_ctx = FfiBpCtx()
+    _bp_ctx.addrs = ctypes.cast(_bp_arr, ctypes.c_void_p).value if _bp_arr else 0
+    _bp_ctx.count = len(bp_addrs) if bp_addrs else 0
+
+    _tlb_ctx = FfiTlbCtx()
+    _tlb_ctx.gen = ctypes.addressof(tlb_gen) if tlb_gen is not None else 0
+    _tlb_ctx.gen_per_hart = (
+        ctypes.addressof(tlb_gen_per_hart) if tlb_gen_per_hart is not None else 0
+    )
+
     _lib.run_parallel(
-        states, num_harts, max_instrs, ctypes.byref(result),
-        ctypes.byref(mem), ctypes.byref(pmp_ffi),
-        ctypes.byref(clint_ffi), ctypes.byref(dev_ffi),
-        ctypes.byref(uart_ffi),
-        _virtio_ffi_ptr or ctypes.c_void_p(0),
-        ctypes.cast(_bp_arr, ctypes.c_void_p) if _bp_arr else ctypes.c_void_p(0),
-        len(bp_addrs) if bp_addrs else 0,
-        # stop_flag is a ctypes.c_uint8 — pass its address as *const u8
-        ctypes.cast(ctypes.pointer(stop_flag), ctypes.c_void_p) if stop_flag is not None else ctypes.c_void_p(0),
+        ctypes.byref(_hart_ctx),
+        ctypes.byref(_periph_ctx),
+        ctypes.byref(_bp_ctx),
+        ctypes.byref(_tlb_ctx),
     )
 
     # Sync mtime back from Rust (advanced by per-instruction AtomicU64 ops).
@@ -1413,12 +1481,13 @@ class TermIoHandle(ctypes.Structure):
         ("rx_buf", ctypes.c_void_p),       # *mut u8 — shared RX ring buffer
         ("rx_cap", ctypes.c_uint32),       # capacity of rx_buf (power of two)
         ("rx_wr", ctypes.c_void_p),        # *mut AtomicU32 — write index (I/O thread)
-        ("rx_rd", ctypes.c_void_p),        # *mut AtomicU32 — read index (Python, 背压)
+        ("rx_rd", ctypes.c_void_p),        # *mut AtomicU32 — read index (Python, 容量控制)
         ("tx_buf", ctypes.c_void_p),       # *mut u8 — shared TX ring buffer
         ("tx_cap", ctypes.c_uint32),       # entry capacity (= byte capacity / 2)
         ("tx_wr", ctypes.c_void_p),        # *mut AtomicU32 — write index (hart threads)
         ("tx_drain", ctypes.c_void_p),     # *mut AtomicU32 — drain index (I/O thread 独占)
         ("stop_flag", ctypes.c_void_p),    # *mut AtomicU8 — stop request flag
+        ("pause_flag", ctypes.c_void_p),   # *mut AtomicU8 — pause (debugger break)
     ]
 
 
@@ -1435,6 +1504,9 @@ try:
 
     _termio_lib.terminal_io_is_running.argtypes = []
     _termio_lib.terminal_io_is_running.restype = ctypes.c_int32
+
+    _termio_lib.terminal_io_attach.argtypes = [ctypes.POINTER(TermIoHandle)]
+    _termio_lib.terminal_io_attach.restype = ctypes.c_int32
 
 except OSError as exc:
     logger.warning(
@@ -1469,8 +1541,25 @@ def termio_stop() -> None:
         _termio_lib.terminal_io_stop()
 
 
+def termio_attach(handle: TermIoHandle) -> int:
+    """Attach I/O thread to already-configured fds (no termios changes)."""
+    if _termio_lib is None:
+        return -2
+    return _termio_lib.terminal_io_attach(ctypes.byref(handle))
+
+
 def termio_is_running() -> bool:
     """Return True if the terminal I/O thread is currently running."""
     if _termio_lib is not None:
         return _termio_lib.terminal_io_is_running() != 0
     return False
+
+
+def icount_flush() -> None:
+    """Dump accumulated Rust instruction frequency counters to the diag log.
+
+    Safe to call from the debugger REPL (``icount_flush()``) or from
+    ``Emulator._step_native`` when a terminal breakpoint is hit.
+    """
+    if _lib is not None:
+        _lib.icount_flush()

@@ -365,9 +365,15 @@ class TestL2FlushAll:
         assert len(l2) == 0
 
     def test_invalidate_all_writes_back_dirty(self, l2):
-        """invalidate_all 在失效前回写脏行到 RAM."""
+        """flush_all 回写脏行到 RAM, invalidate_all 仅丢弃 (不写回).
+
+        invalidate_all 用于 native batch 后: Rust 已直接修改 bytearray,
+        再写回会覆盖 Rust 的修改。脏行回写由 pre-batch flush_all 负责。
+        """
         l2.read(0x1000, 8)
         l2.write(0x1000, b"\xc0\xff\xee\x00\x00\x00\x00\x00")
+        # flush_all: 写回脏行 M→E; invalidate_all: 丢弃 E 行 (无回写)
+        assert l2.flush_all() == 1
         l2.invalidate_all()
 
         ram_data = l2._ram_read(0x1000, 8)

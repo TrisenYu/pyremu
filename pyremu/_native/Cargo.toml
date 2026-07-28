@@ -2,3 +2,18 @@
 members = ["cpu", "termio"]
 resolver = "2"
 
+# 模拟器 host 端 release 构建优化。
+#   仅影响 --release (make build-native 使用的 profile), dev 构建不受影响.
+#
+#   lto = "fat": 跨 crate 边界做 link-time optimization.
+#     将 cpu + termio + 依赖 crate 的 IR 合并为一个编译单元,
+#     使热点 (decode_fields -> 各 handler -> ALU) 跨 crate 内联,
+#     消除虚函数/间接调用的栈帧开销. 代价: 链接时间增加 ~20-30%.
+#
+#   codegen-units = 1: 单个代码生成单元.
+#     并行编译变为串行, 但允许 LLVM 在全程序范围内优化寄存器分配
+#     和指令调度. 与 lto=fat 配合可进一步减少解释循环的热路径指令数.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+

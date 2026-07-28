@@ -65,6 +65,7 @@ dependencies = [
 name = "pyremu-native"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rand",
  "softfloat_pure",
 ]

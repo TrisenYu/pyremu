@@ -22,6 +22,7 @@ from pyremu.debug.utils import MAX_INSTR_COUNT, check_rv64_addr, hex_addr
 from pyremu.memory.mmu import sv39_walk
 from pyremu.utils.disassem import disasm
 from pyremu.utils.wrapper import seize_val_err
+from pyremu.utils.mask import mask64
 
 # 反汇编着色常量
 _GPR_ALIASES = frozenset({
@@ -119,7 +120,7 @@ class MemoryMixin(SharedMixinAttrs):
             return self.hart.pc
         idx = self._find_gpr(arg)
         if idx is not None:
-            return self.hart.gprs[idx] & 0xFFFF_FFFF_FFFF_FFFF
+            return mask64(self.hart.gprs[idx])
         v = self._read_csr_by_name(arg)
         if v != 0 or csr_addr_from_name(arg) is not None:
             return v
@@ -555,7 +556,7 @@ class MemoryMixin(SharedMixinAttrs):
         # 注: 不走 _try_read_va_forced — 后者在 M-mode 下会将 VA 当作
         # PA (Bare 翻译) 返回, 对 S-mode 内核 VA 会读到错误物理地址.
         page_mask = page_size - 1
-        first_pa = ((ppn << 12) | (va & page_mask)) & 0xFFFF_FFFF_FFFF_FFFF
+        first_pa = mask64(((ppn << 12) | (va & page_mask)))
         raw = self._emu.bus.try_read(first_pa, inst_count * 4)
         if raw is None:
             self._err(f"VA [yellow]{hex_addr(va)}[/] 翻译后物理读取失败")

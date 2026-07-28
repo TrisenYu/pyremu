@@ -37,6 +37,8 @@ from pyremu._native import (
 # touches ctypes from_buffer() objects, which segfault the GC.
 _ram_native_ptrs: dict[int, int] = {}  # id(bytearray) -> raw pointer
 
+from pyremu.core.diag import NO_L2
+
 
 class Device(ABC):
     """内存映射设备基类.
@@ -334,33 +336,50 @@ class Bus:
     # ----------------------------------------------------------
 
     def read(self, addr: int, size: int) -> bytes:
-        """总线读: 设备 (直通) -> L2 缓存 -> RAM.
-
-        设备地址绕过 L2, 直接读设备寄存器 (有副作用).
-        """
-        # 设备地址: 直通, 不走缓存
+        """总线读: 设备 (直通) -> L2 缓存 -> RAM."""
         dev, offset = self._find_device(addr)
         if dev is not None:
             return dev.read(offset, size)
 
-        # L2 缓存 (仅缓存 RAM 地址)
+        if self.is_ram_addr(addr) and NO_L2:
+            return self._ram_read_direct(addr, size)
+
         if self._l2 is not None:
             return self._l2.bus_read(addr, size)
 
         return self._ram_read_direct(addr, size)
 
-    def write(self, addr: int, data: bytes) -> None:
-        """总线写: 设备 (直通) -> L2 缓存 -> RAM.
+    # 最大 CPU store 大小 (RISC-V: sd = 8 bytes).
+    # 超过此阈值的写入必定是 DMA/批量传输, 应绕过 L2 直写 bytearray,
+    # 避免缓存行逐出覆盖 Rust batch 的直接写入.
+    _MAX_CPU_STORE = 8
 
-        设备地址绕过 L2, 直接写设备寄存器 (有副作用).
+    def _ram_bypass_l2(self, addr: int, data_len: int) -> bool:
+        """RAM 地址是否应绕过 L2 缓存, 直写 bytearray.
+
+        Rust batch 直接修改 bytearray, 不经过 L2。若 Python 侧 L2 缓存行
+        覆盖同一 PA 的字节 (写命中合并旧数据 -> flush 回写), 会污染 Rust
+        的修改, 表现为页表 PTE 或栈数据被覆写为旧值。
+
+        绕过条件:
+          - PYREMUNO_L2=1: 排查专用, 全旁路 L2 以隔离问题。
+          - data_len > 8: DMA/批量传输不经过 CPU 缓存。
         """
-        # 设备地址: 直通, 不走缓存
+        if not self.is_ram_addr(addr):
+            return False
+        return NO_L2 or data_len > self._MAX_CPU_STORE
+
+    def write(self, addr: int, data: bytes) -> None:
+        """总线写: 设备 (直通) -> L2 缓存 -> RAM."""
         dev, offset = self._find_device(addr)
         if dev is not None:
             dev.write(offset, data)
             return
 
-        # L2 缓存 (仅缓存 RAM 地址)
+        if self._ram_bypass_l2(addr, len(data)):
+            self._ram_write_direct(addr, data)
+            return
+
         if self._l2 is not None:
             self._l2.bus_write(addr, data)
             return

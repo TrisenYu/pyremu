@@ -58,10 +58,15 @@ static inline void swapfunc(char *, char *, int, int, int);
 																				  : 1;
 
 static inline void swapfunc(
-	char *a, char *b, int n, int swaptype_long, int swaptype_int) {
+	char *a, char *b, int n,
+    int swaptype_long, int swaptype_int
+) {
 	if (swaptype_long <= 1) {
-		swapcode(long, a, b, n) else if (swaptype_int <= 1)
-			swapcode(int, a, b, n) else swapcode(char, a, b, n)
+		swapcode(long, a, b, n);
+	} else if (swaptype_int <= 1) {
+		swapcode(int, a, b, n);
+	} else {
+		swapcode(char, a, b, n);
 	}
 }
 

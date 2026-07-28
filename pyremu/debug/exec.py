@@ -39,6 +39,7 @@ from pyremu.emulator import Emulator
 from pyremu.env_inject import Preloader
 from pyremu.utils.parse_bin import FirmwareImage
 from pyremu.utils.tick import yield_cpu
+from pyremu.utils.mask import mask64
 
 _YIELD_EVERY = 500_000
 _YIELD_INTERVAL = 0.001
@@ -157,7 +158,7 @@ class ExecutionMixin(SharedMixinAttrs):
                 deliver_trap(h, TrapType.IllInstr, tval=instr, is_interrupt=False)
                 advance = 0
             if advance != 0 and h.pc == pc_before:
-                h.pc = (h.pc + advance) & 0xFFFF_FFFF_FFFF_FFFF
+                h.pc = mask64((h.pc + advance))
                 h._consecutive_traps = 0
             elif advance == 0 and h.pc == pc_before:
                 h._consecutive_traps += 1
@@ -246,7 +247,6 @@ class ExecutionMixin(SharedMixinAttrs):
         self._running = True
         self._paused = False
         self._terminated = False
-        self._sigint_count = 0
         self._bp_hit_this_run.clear()
         self._enter_run_mode()
         timeout = _DEFAULT_TIMEOUT if timeout is None else timeout
@@ -304,10 +304,7 @@ class ExecutionMixin(SharedMixinAttrs):
                 self._terminated = True
                 break
 
-            # 每批次后刷新 UART 行缓冲中不以 \\n 结尾的部分行,
-            # 保证 shell 提示符 (# ) 和字符回显即时到达 stdout.
-            # _native_finalize 内部已调用 flush_all, 此处为兜底
-            # (纯 Python 路径或局部行在 WFI 轮询期间到达).
+            # UART TXDATA 写入已自动即时输出, 无需手动刷新
             self._flush_uart_if_present()
 
             if cnt != 0:
@@ -352,8 +349,6 @@ class ExecutionMixin(SharedMixinAttrs):
 
         self._running = False
         self._enter_repl_mode()
-        if self._emu.uart is not None:
-            self._emu.uart.flush_all()
 
     # ----------------------------------------------------------
     #  运行命令
@@ -430,7 +425,7 @@ class ExecutionMixin(SharedMixinAttrs):
             # 使用纯 Python 单步路径跳过断点 (而非 native batch).
             # native batch (run_parallel) 可执行最多 100k 条指令; 若断点处
             # 指令为自跳转循环 (j .), batch 会在此自旋 100k 次仍不推进 PC,
-            # 恢复断点后立即再次命中 → 表现为 "c 原地踏步".
+            # 恢复断点后立即再次命中 ->表现为 "c 原地踏步".
             # 纯 Python 路径每 hart 仅执行一条指令, 确保精确跳过.
             saved_native_batch = self._emu._native_batch
             self._emu._native_batch = False
@@ -485,8 +480,15 @@ class ExecutionMixin(SharedMixinAttrs):
         if self._image is not None:
             emu.load_firmware(self._image, load_offset=self._load_offset)
 
-        if self._fdt_addr is not None:
+        # 重建 DTB: 用原始 bootargs + 完整设备树 (含 virtio-blk)
+        # 写入 emulator 记录的 DTB 地址, 固件 ELF 可能已覆写该区域.
+        if emu._dtb_addr is not None:
+            emu.load_dtb(emu._dtb_addr)
+        elif self._fdt_addr is not None:
             emu.load_dtb(self._fdt_addr)
+        elif emu._bootargs is not None:
+            _dtb_addr = emu._cfg.ram_base + emu._cfg.ram_size - 0x10000
+            emu.load_dtb(_dtb_addr)
 
         if self._kernel_path is not None:
             kernel_data = _Path(self._kernel_path).read_bytes()

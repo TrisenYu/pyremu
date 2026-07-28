@@ -1,7 +1,7 @@
 Language: Cpp
 
 AlignConsecutiveAssignments: true
-AlignEscapedNewlines: Right          # 宏换行 \ 对齐
+AlignEscapedNewlines: Right # 宏换行 \ 对齐
 AlignTrailingComments: true
 AlignConsecutiveMacros: Consecutive
 AllowShortFunctionsOnASingleLine: Empty
@@ -18,7 +18,7 @@ BraceWrapping:
   IndentBraces: false
 BreakBeforeBinaryOperators: NonAssignment
 
-ContinuationIndentWidth: 4            # 宏续行缩进宽度
+ContinuationIndentWidth: 4 # 宏续行缩进宽度
 Cpp11BracedListStyle: true
 
 IndentWidth: 4

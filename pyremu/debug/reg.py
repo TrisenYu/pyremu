@@ -15,6 +15,7 @@ from pyremu.core.trap_def import trap_cause_name
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.utils import hex_addr
 from pyremu.utils.wrapper import seize_val_err
+from pyremu.utils.mask import mask64
 
 
 class RegisterMixin(SharedMixinAttrs):
@@ -89,7 +90,7 @@ class RegisterMixin(SharedMixinAttrs):
         if idx is None:
             self._err(f"未知寄存器: {name}")
             return
-        v = int(value, 0) & 0xFFFF_FFFF_FFFF_FFFF
+        v = mask64(int(value, 0))
         old = h.gprs[idx]
         h.gprs[idx] = v
         self._console.print(
@@ -150,7 +151,7 @@ class RegisterMixin(SharedMixinAttrs):
         if name not in h.csrs:
             self._err(f"未知 CSR: {name} (用 'csr list' 查看可用列表)")
             return
-        v = int(value, 0) & 0xFFFF_FFFF_FFFF_FFFF
+        v = mask64(int(value, 0))
         csr = h.csrs[name]
         old, csr.val = csr.val, v
         self._console.print(

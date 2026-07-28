@@ -100,12 +100,6 @@ pub fn deliver_trap(
         false
     };
 
-    // Diagnostic: count MSIP deliveries
-	#[cfg(feature = "diagnostic")]
-    if is_interrupt && exc_code == 3 {
-        crate::diag::trap_msip(&mut state.diag, delegate);
-    }
-
     if delegate {
         deliver_trap_smode(state, code, tval, result)
     } else {
@@ -182,8 +176,8 @@ pub fn deliver_trap_smode(
 
     // MSIP delivered to S-mode: clear mip.MSIP so the hardware source
     // (CLINT MSIP) is acknowledged.  Matches Python ``_trap_deliver_smode``
-    // lines 217-226 in trap_handler.py.  Without this, sret→S-mode sees
-    // mip.MSIP still set and re-enters the trap handler → infinite loop.
+    // lines 217-226 in trap_handler.py.  Without this, sret->S-mode sees
+    // mip.MSIP still set and re-enters the trap handler ->infinite loop.
     if is_interrupt && exc_code == 3 {
         state.mip &= !(1u64 << 3);
     }

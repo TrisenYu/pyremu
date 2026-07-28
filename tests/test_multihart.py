@@ -115,7 +115,7 @@ class TestNativeBatchShortSlice:
         """原生 batch 多核启动不会因 MSIP 风暴导致 halted.
 
         回归: 若 short-slice 机制缺失, Hart 0 发送 MSIP 后自旋消耗全部
-        时间片, Hart 1 无法响应 → MSIP 重复投递 → 连续 trap 检测触发 halted.
+        时间片, Hart 1 无法响应 ->MSIP 重复投递 ->连续 trap 检测触发 halted.
         """
         old_val = os.environ.get("PYREMU_NATIVE_BATCH")
         os.environ["PYREMU_NATIVE_BATCH"] = "1"

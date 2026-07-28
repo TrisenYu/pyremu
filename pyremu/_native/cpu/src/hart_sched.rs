@@ -8,7 +8,8 @@ use crate::decode::decode_fields;
 use crate::diag;
 use crate::fpu::{handle_fp_load_concurrent, handle_fp_store_concurrent};
 use crate::handlers::{
-    handle_compressed, pmp_ok, try_handle_virtio, ClintCtx, DevCtx, PmpCtx, EXIT_SENTINEL,
+    handle_compressed, lr_clear_all, pmp_ok, try_handle_virtio, ClintCtx, DevCtx, PmpCtx,
+    EXIT_SENTINEL,
 };
 use crate::interrupt::{
     check_and_deliver_interrupt_concurrent,
@@ -21,12 +22,12 @@ use crate::op_dispatcher::{
 };
 use crate::peripheral::{is_device_addr, uart::try_handle_uart_concurrent};
 use crate::state::{exit_reason, riscv_mode, BatchResult, FfiUartCtx, HartState, MemCtx};
-use crate::translate::{translate_va, TranslateFault, WalkCtx, set_tlb_epoch, tlb_epoch_from_gen};
+use crate::translate::{tlb_flush_all, tlb_mark_all_dirty, translate_va, TranslateFault, WalkCtx};
 use crate::trap::{
     deliver_illegal_instruction, deliver_trap, exc_code, mcause_val, priv_ecall_concurrent,
     priv_mret_concurrent, priv_sret_concurrent, priv_wfi_concurrent,
 };
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{self, AtomicU32, AtomicU64, Ordering};
 
 pub(crate) fn ram_offset(
     pa: u64,
@@ -345,10 +346,6 @@ pub(crate) fn handle_load_concurrent(
 ) -> u64 {
     let base = read_gpr(state, f.rs1);
     let va = base.wrapping_add(f.imm12_se);
-    // Diagnostic: log when a small value is used as a load address.
-    crate::diag::diag_small_addr_access(
-        state, va, base, f.rs1, instr, false, 0, /* filled below */
-    );
     let (size, signed) = match f.func3 {
         0b000 => (1u8, true),
         0b001 => (2, true),
@@ -538,22 +535,12 @@ pub(crate) fn handle_store_concurrent(
     };
     // Diagnostic: log when a small value (1..0xFF) is stored — catches
     // tag values like DT_RELA=7 being written to data structures.
-	crate::diag::diag_small_addr_access(state, va, base, f.rs1, instr, true, size);
-	crate::diag::diag_small_store(state, va, read_gpr(state, f.rs2), size, f.rs2, instr);
 
     let aligned = va & (size as u64 - 1) == 0;
 
     let tr = match translate_va(state, ctx, va, true, false) {
         Ok(t) => t,
         Err(TranslateFault::PageFault(cause)) => {
-            // 诊断: 低地址 store page fault — dump 寄存器定位野指针来源
-			#[cfg(feature = "diagnostic")]
-			if va < 0x100000 {
-				// let src_val = read_gpr(state, f.rs2);
-				diag::store_pagefault_diag(
-					state, ctx, va, instr, base, read_gpr(state, f.rs2), f.rs1, f.rs2, f.imm_s,
-				);
-			}
             let mut dummy = unsafe { std::mem::zeroed() };
             deliver_trap(state, mcause_val(cause, false), va, &mut dummy);
             return 0;
@@ -662,21 +649,25 @@ pub(crate) fn ram_read_raw(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
     };
     let ptr = ctx.ram as *mut u8;
     match size {
-        1 => unsafe { *ptr.add(off) as u64 },
+        1 => {
+            // Acquire fence before raw byte read: pairs with Release
+            // fence (or atomic store) on other hart threads, ensuring
+            // the byte value is visible across harts (real-hardware TSO).
+            atomic::fence(Ordering::Acquire);
+            unsafe { *ptr.add(off) as u64 }
+        }
         2 => {
+            atomic::fence(Ordering::Acquire);
             let b0 = unsafe { *ptr.add(off) } as u64;
             let b1 = unsafe { *ptr.add(off + 1) } as u64;
             b0 | (b1 << 8)
         }
         4 if (pa & 3) == 0 => {
-            // Aligned 4-byte: use atomic load to avoid tearing
-            // when another hart thread is doing AMO on the same word.
-            // Acquire ordering pairs with Release stores from other harts
-            // (including AMO operations), providing visibility guarantees.
             let a = unsafe { &*(ptr.add(off) as *const AtomicU32) };
             a.load(Ordering::Acquire) as u64
         }
         4 => {
+            atomic::fence(Ordering::Acquire);
             let b0 = unsafe { *ptr.add(off) } as u64;
             let b1 = unsafe { *ptr.add(off + 1) } as u64;
             let b2 = unsafe { *ptr.add(off + 2) } as u64;
@@ -684,13 +675,12 @@ pub(crate) fn ram_read_raw(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
             b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
         }
         8 if (pa & 7) == 0 => {
-            // Aligned 8-byte: use atomic load to avoid tearing
-            // (OpenSBI atomic_t / FIFO entries are 8-byte aligned).
-            // Acquire ordering for visibility of stores from other harts.
             let a = unsafe { &*(ptr.add(off) as *const AtomicU64) };
-            a.load(Ordering::Acquire)
+            let val = a.load(Ordering::Acquire);
+            val
         }
         8 => {
+            atomic::fence(Ordering::Acquire);
             let b0 = unsafe { *ptr.add(off) } as u64;
             let b1 = unsafe { *ptr.add(off + 1) } as u64;
             let b2 = unsafe { *ptr.add(off + 2) } as u64;
@@ -699,13 +689,14 @@ pub(crate) fn ram_read_raw(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
             let b5 = unsafe { *ptr.add(off + 5) } as u64;
             let b6 = unsafe { *ptr.add(off + 6) } as u64;
             let b7 = unsafe { *ptr.add(off + 7) } as u64;
-            b0 | (b1 << 8)
+            let val = b0 | (b1 << 8)
                 | (b2 << 16)
                 | (b3 << 24)
                 | (b4 << 32)
                 | (b5 << 40)
                 | (b6 << 48)
-                | (b7 << 56)
+                | (b7 << 56);
+            val
         }
         _ => 0,
     }
@@ -723,12 +714,25 @@ pub(crate) fn ram_write_raw(ctx: &WalkCtx, pa: u64, val: u64, size: u8) {
         Some(o) => o as usize,
         None => return,
     };
+    // RISC-V spec §8.2: invalidate all LR reservations BEFORE the
+    // store becomes visible.  With SeqCst ordering, observers see
+    // the reservation clear before (or at the same time as) the new
+    // value, closing the ABA window where reservation B sees old
+    // value V -> store writes new value U -> store from third hart
+    // writes back V -> SC on B succeeds (should have failed).
+    lr_clear_all(ctx);
+    atomic::fence(Ordering::SeqCst);
+
     let ptr = ctx.ram as *mut u8;
     match size {
-        1 => unsafe { *ptr.add(off) = val as u8 },
+        1 => {
+            unsafe { *ptr.add(off) = val as u8 };
+            atomic::fence(Ordering::Release);
+        }
         2 => {
             unsafe { *ptr.add(off) = val as u8 };
             unsafe { *ptr.add(off + 1) = (val >> 8) as u8 };
+            atomic::fence(Ordering::Release);
         }
         4 if (pa & 3) == 0 => {
             let a = unsafe { &*(ptr.add(off) as *const AtomicU32) };
@@ -739,6 +743,7 @@ pub(crate) fn ram_write_raw(ctx: &WalkCtx, pa: u64, val: u64, size: u8) {
             unsafe { *ptr.add(off + 1) = (val >> 8) as u8 };
             unsafe { *ptr.add(off + 2) = (val >> 16) as u8 };
             unsafe { *ptr.add(off + 3) = (val >> 24) as u8 };
+            atomic::fence(Ordering::Release);
         }
         8 if (pa & 7) == 0 => {
             let a = unsafe { &*(ptr.add(off) as *const AtomicU64) };
@@ -753,9 +758,56 @@ pub(crate) fn ram_write_raw(ctx: &WalkCtx, pa: u64, val: u64, size: u8) {
             unsafe { *ptr.add(off + 5) = (val >> 40) as u8 };
             unsafe { *ptr.add(off + 6) = (val >> 48) as u8 };
             unsafe { *ptr.add(off + 7) = (val >> 56) as u8 };
+            atomic::fence(Ordering::Release);
         }
         _ => {}
     }
+}
+
+/// Handle CSR instructions (func3 ≠ 0b000) within the concurrent batch engine.
+///
+/// Builds a temporary serial ``ClintCtx`` from the concurrent one so that the
+/// shared ``csr::handle_csr`` path remains unchanged.  Also syncs stimecmp to
+/// CLINT mtimecmp after CSR writes for Sstc correctness.
+fn handle_csr_concurrent(
+    state: &mut HartState,
+    f: &crate::decode::DecodedFields,
+    instr: u32,
+    hart_id: u8,
+    clint: &ConcurrentClintCtx,
+    pmp: &PmpCtx,
+) -> u64 {
+    let cur_mtime = unsafe { &*clint.mtime }.load(Ordering::Relaxed);
+    let hid = state.mhartid as usize;
+
+    // Build a temporary serial ClintCtx for the CSR handler
+    let _serial_clint = ClintCtx {
+        base: clint.base,
+        mtime: clint.mtime as *mut u64,
+        mtimecmp: clint.mtimecmp as *mut u64,
+        msip: clint.msip as *mut u8,
+        states: std::ptr::null_mut(),
+        num_harts: clint.num_harts,
+        yield_for_ipi: Cell::new(false),
+        ipi_sender_hart: Cell::new(0),
+        ipi_sender_rounds: Cell::new(0),
+    };
+
+    let msie_before = (state.mie >> 3) & 1;
+    let mut dummy = unsafe { std::mem::zeroed() };
+    let advance = crate::csr::handle_csr(
+        state, f.rd, f.rs1, f.func12, f.func3, instr, &mut dummy, hart_id, cur_mtime, pmp,
+    );
+    if msie_before != 0 && ((state.mie >> 3) & 1) == 0 {
+        diag::msie_cleared_at(&mut state.diag, state.pc);
+    }
+
+    // Sync stimecmp -> CLINT mtimecmp after CSR write to stimecmp (Sstc).
+    if f.func12 == 0x14D && hid < clint.num_harts as usize {
+        unsafe { &*clint.mtimecmp.add(hid) }.store(state.stimecmp, Ordering::Release);
+    }
+
+    advance
 }
 
 pub(crate) fn handle_system_concurrent(
@@ -769,82 +821,7 @@ pub(crate) fn handle_system_concurrent(
     module: &ModuleState,
 ) -> u64 {
     if f.func3 != 0b000 {
-        // CSR instructions — delegate to the existing handler with a serial ClintCtx.
-        // CSR writes that touch CLINT (mip, sip, stimecmp) are per-hart and safe.
-        // mtime reads go through the AtomicU64 in ConcurrentClintCtx.
-        let cur_mtime = unsafe { &*clint.mtime }.load(Ordering::Relaxed);
-        let hid = state.mhartid as usize;
-
-        // Build a temporary serial ClintCtx for the CSR handler
-        let _serial_clint = ClintCtx {
-            base: clint.base,
-            mtime: clint.mtime as *mut u64, // transmute back for existing handler
-            mtimecmp: clint.mtimecmp as *mut u64,
-            msip: clint.msip as *mut u8,
-            states: std::ptr::null_mut(),
-            num_harts: clint.num_harts,
-            yield_for_ipi: Cell::new(false),
-            ipi_sender_hart: Cell::new(0),
-            ipi_sender_rounds: Cell::new(0),
-        };
-
-        let msie_before = (state.mie >> 3) & 1;
-        let mut dummy = unsafe { std::mem::zeroed() };
-        let advance = crate::csr::handle_csr(
-            state, f.rd, f.rs1, f.func12, f.func3, instr, &mut dummy, hart_id, cur_mtime, pmp,
-        );
-        // Track when MSIE is explicitly cleared via CSR write
-        if msie_before != 0 && ((state.mie >> 3) & 1) == 0 {
-            diag::msie_cleared_at(&mut state.diag, state.pc);
-        }
-
-        // Sync stimecmp -> CLINT mtimecmp after CSR write to stimecmp (Sstc).
-        // The SBI_TIME set_timer fast path (priv_ecall_concurrent) updates
-        // both stimecmp and CLINT mtimecmp atomically within the function.
-        // The direct-CSR-write path (csrw stimecmp, 0x14D) used by kernels
-        // with Sstc only writes state.stimecmp — the CLINT mtimecmp stays
-        // at the *previous* tick's deadline.  Once the timer fires and the
-        // handler sets the next stimecmp, sync_mtip still sees the old
-        // expired mtimecmp -> MTIP/STIP re-asserted -> trap handler runs
-        // again -> mret -> same stale mtimecmp -> tight timer-interrupt loop
-        // that saturates the batch budget without making forward progress.
-        // Syncing stimecmp -> CLINT mtimecmp here keeps the two in lockstep
-        // so sync_mtip, check_pending_interrupts, and the WFI all-idle
-        // timer deadline scan all see the correct next-tick value.
-        if f.func12 == 0x14D {
-            // 0x14D = stimecmp CSR (Sstc extension)
-            if hid < clint.num_harts as usize {
-                unsafe { &*clint.mtimecmp.add(hid) }.store(state.stimecmp, Ordering::Release);
-            }
-        }
-
-        // Sync MIP.MSIP ↔ CLINT msip on MIP / SIP CSR writes.
-        //
-        // MSIP in the ``mip`` CSR is a read-only bit (RISC-V Privileged
-        // Spec §3.1.9): software writes to mip.MSIP are ignored in
-        // hardware; the only way to set or clear MSIP is via the CLINT
-        // MMIO register.  We keep a one-way fallback, though:
-        //
-        // * mip.MSIP=0, CLINT MSIP=1 -> clear CLINT MSIP.
-        //   This handles the (hardware-incorrect but benign) case where
-        //   the kernel acknowledges an MSIP by writing 0 to mip.MSIP via
-        //   CSR instead of clearing the CLINT register directly.
-        //
-        // * mip.MSIP=1, CLINT MSIP=0 -> clear state.mip.MSIP (stale bit).
-        //   The trap handler first does ``sw x0, CLINT_MSIP`` (clearing
-        //   the hardware register), then later writes to mip for *other*
-        //   bits (e.g. ``csrs mip, SSIP`` inside ``sbi_ipi_process_smode``).
-        //   At that point state.mip.MSIP is still 1 from the last
-        //   ``sync_msip`` call — if we synced bidirectionally and *set*
-        //   CLINT MSIP from this stale bit we would re-arm the just-cleared
-        //   interrupt -> infinite MSIP storm after MRET.
-        //
-        // The "set CLINT from stale mip" direction is intentionally
-        // omitted for this reason.
-        // NOTE: We intentionally do NOT sync mip.MSIP ↔ CLINT MSIP on
-        // MIP/SIP CSR writes.  The edge-counter-based detection in
-        // ``sync_msip`` is sufficient for correctness:
-        return advance;
+        return handle_csr_concurrent(state, f, instr, hart_id, clint, pmp);
     }
 
     // func3 == 0b000: privileged instructions
@@ -877,18 +854,15 @@ pub(crate) fn handle_system_concurrent(
             // ``lock xadd`` — a full hardware barrier that makes all prior
             // PTE stores globally visible before the generation change is
             // observed by other harts.  Paired with the Acquire load in the
-            // per-instruction gen check, this provides the necessary
-            // happens-before edge for TLB coherency.
-            for e in state.itlb.iter_mut() {
-                e.valid = 0;
-            }
-            for e in state.dtlb.iter_mut() {
-                e.valid = 0;
-            }
-            let new_gen = module.tlb_gen.fetch_add(1, std::sync::atomic::Ordering::Release)
+            // Mark this hart's own TLB entries dirty; other harts
+            // will detect the gen change and mark their own entries
+            // dirty at the next instruction boundary.
+            tlb_flush_all(&mut state.itlb);
+            tlb_flush_all(&mut state.dtlb);
+            let new_gen = module
+                .tlb_gen
+                .fetch_add(1, std::sync::atomic::Ordering::Release)
                 .wrapping_add(1);
-            let epoch = tlb_epoch_from_gen(new_gen);
-            set_tlb_epoch(state, epoch);
             module.tlb_gen_per_hart[hart_id as usize]
                 .store(new_gen, std::sync::atomic::Ordering::Relaxed);
             diag::log_line(&format!(
@@ -990,10 +964,10 @@ pub(crate) fn post_instr_checks(
 ) -> bool {
     // Per-instruction mtime increment causes timer-interrupt storms in
     // multi-core mode: N harts each increment the shared mtime on every
-    // instruction → mtime advances N× too fast → the kernel's next-tick
-    // deadline is already in the past by the time the handler returns →
-    // immediate re-trigger → hart spends 1B+ instructions spinning in
-    // the timer handler (riscv_clocksource_rdtime → ktime_get →
+    // instruction ->mtime advances N× too fast ->the kernel's next-tick
+    // deadline is already in the past by the time the handler returns ->
+    // immediate re-trigger ->hart spends 1B+ instructions spinning in
+    // the timer handler (riscv_clocksource_rdtime ->ktime_get ->
     // tick_nohz_handler …).
     //
     // Fix: throttle mtime to advance every MTIME_DIVISOR instructions
@@ -1001,10 +975,14 @@ pub(crate) fn post_instr_checks(
     // each adding 64 ticks / 256 instrs, the *total* mtime rate stays
     // at 1 tick / instr regardless of hart count.
     const MTIME_DIVISOR: u64 = 256;
+    const HZ_RATIO: u64 = 1; // CPU freq ≈ HZ_RATIO × timer freq (10 MHz)
+                             // Reduced from 100: the emulator runs at ~1.4 MHz, not 1 GHz.
+                             // HZ_RATIO=100 made mtime advance at 0.1% real speed, stretching
+                             // a 10s deferred_probe_timeout to ~3 hours.  1 gives ~14% speed.
     state.total_instrs = state.total_instrs.wrapping_add(1);
     if state.total_instrs & (MTIME_DIVISOR - 1) == 0 {
-        let harts = core::cmp::max(clint.num_harts as u64, 1);
-        let inc = core::cmp::max(MTIME_DIVISOR / harts, 1);
+        let n = core::cmp::max(clint.num_harts as u64, 1) * HZ_RATIO;
+        let inc = core::cmp::max(MTIME_DIVISOR / n, 1);
         unsafe { &*clint.mtime }.fetch_add(inc, Ordering::Relaxed);
     }
 
@@ -1080,28 +1058,264 @@ fn fetch_instr_word(
     pmp: &PmpCtx,
     hart_id: u8,
 ) -> Option<u32> {
-	if page_offset < 0xFFE {
-		return fetch_instr_safe(state, mem, fetch_pa, pc_before, hart_id);
-	}
+    if page_offset < 0xFFE {
+        return fetch_instr_safe(state, mem, fetch_pa, pc_before, hart_id);
+    }
     // 2 bytes on first page, 2 bytes on second page.
-	let fetch_pa2 =
-		translate_fetch_pc_concurrent(state, ctx, pc_before.wrapping_add(2))?;
-	// PMP check on the second page as well.
-	if !pmp_ok(state, fetch_pa2, 4, false, true, pmp) {
-		let mut dummy = unsafe { std::mem::zeroed() };
-		deliver_trap(
-			state,
-			mcause_val(exc_code::INSTR_ACCESS_FAULT, false),
-			pc_before,
-			&mut dummy,
-		);
-		return None;
-	}
-	// Read 2 bytes from each physical page and combine (little-endian).
-	let lo = ram_read_raw(ctx, fetch_pa, 2) as u32;
-	let hi = ram_read_raw(ctx, fetch_pa2, 2) as u32;
-	return Some(lo | (hi << 16));
+    let fetch_pa2 = translate_fetch_pc_concurrent(state, ctx, pc_before.wrapping_add(2))?;
+    // PMP check on the second page as well.
+    if !pmp_ok(state, fetch_pa2, 4, false, true, pmp) {
+        let mut dummy = unsafe { std::mem::zeroed() };
+        deliver_trap(
+            state,
+            mcause_val(exc_code::INSTR_ACCESS_FAULT, false),
+            pc_before,
+            &mut dummy,
+        );
+        return None;
+    }
+    // Read 2 bytes from each physical page and combine (little-endian).
+    let lo = ram_read_raw(ctx, fetch_pa, 2) as u32;
+    let hi = ram_read_raw(ctx, fetch_pa2, 2) as u32;
+    return Some(lo | (hi << 16));
 }
+
+// ============================================================
+//  hart_worker pipeline helpers
+// ============================================================
+
+/// Main-loop control flow sentinel.
+enum Step {
+    /// Advance to the next pipeline stage.
+    Next,
+    /// Jump back to the top of the main loop.
+    Continue,
+    /// Exit the worker function immediately.
+    Exit,
+}
+
+/// Reconstruct local context structs from the `Send`-safe FFI wrappers.
+fn make_contexts(
+    mem: SharedMemCtx,
+    pmp: SharedPmpCtx,
+    dev: SharedDevCtx,
+    module: &ModuleState,
+) -> (MemCtx, PmpCtx, DevCtx, WalkCtx) {
+    let mem_val = MemCtx {
+        ram: mem.ram,
+        ram_size: mem.ram_size,
+        ram_base: mem.ram_base,
+        shadow_base: mem.shadow_base,
+        shadow_size: mem.shadow_size,
+    };
+    let pmp_val = PmpCtx {
+        cfg: pmp.cfg,
+        addr: pmp.addr,
+        num: pmp.num,
+    };
+    let dev_val = DevCtx {
+        bases: dev.bases,
+        ends: dev.ends,
+        num: dev.num,
+        virtio_base: dev.virtio_base,
+        virtio_raw: dev.virtio_raw,
+    };
+    let walk = WalkCtx {
+        ram: mem_val.ram,
+        ram_size: mem_val.ram_size,
+        ram_base: mem_val.ram_base,
+        shadow_base: mem_val.shadow_base,
+        shadow_size: mem_val.shadow_size,
+        tlb_gen: &module.tlb_gen as *const AtomicU64,
+        itlb_hand: Cell::new(0),
+        dtlb_hand: Cell::new(0),
+        lr_reserved: mem.lr_reserved,
+        num_harts: module.wfi_flags.len() as u32,
+    };
+    (mem_val, pmp_val, dev_val, walk)
+}
+
+/// Mark this hart's TLB entries dirty if another hart executed SFENCE.VMA.
+/// Dirty entries are re-walked on next access rather than flushed — this
+/// preserves cached translations that are still valid.
+fn mark_tlb_dirty_if_stale(state: &mut HartState, module: &ModuleState, hart_id: u8) {
+    let global_gen = module.tlb_gen.load(Ordering::Acquire);
+    let my_gen = module.tlb_gen_per_hart[hart_id as usize].load(Ordering::Relaxed);
+    if my_gen == global_gen {
+        return;
+    }
+    tlb_mark_all_dirty(&mut state.itlb);
+    tlb_mark_all_dirty(&mut state.dtlb);
+    module.tlb_gen_per_hart[hart_id as usize].store(global_gen, Ordering::Relaxed);
+}
+
+/// Handle WFI wait / wake.  Returns ``(Step, just_woke)``.
+fn handle_wfi_state(
+    state: &mut HartState,
+    hart_id: u8,
+    clint: &ConcurrentClintCtx,
+    dev: &DevCtx,
+    module: &ModuleState,
+    stop_flag: *const u8,
+) -> (Step, bool) {
+    if state.waiting == 0 {
+        return (Step::Next, false);
+    }
+    // Deferred Python-side work (e.g. virtio QueueNotify): exit batch so
+    // Python gets a chance to process I/O before we re-enter WFI spin.
+    if dev.has_pending_python_work() {
+        module.request_stop(StopInfo {
+            reason: exit_reason::WFI_WAIT,
+            hart_id,
+            pc: state.pc,
+            ..StopInfo::empty()
+        });
+        return (Step::Exit, false);
+    }
+    if !wfi_spin(state, hart_id as usize, clint, module, stop_flag) {
+        // Batch exit from WFI: flush TLB in case another hart did
+        // SFENCE.VMA while we were spinning.
+        mark_tlb_dirty_if_stale(state, module, hart_id);
+        return (Step::Exit, false);
+    }
+    state.consecutive_traps = 0;
+    diag::log_line(&format!(
+        "[wfi-wake] hart={} pc={:#018x} mode={} mstatus={:#018x} mip={:#010x} mie={:#010x} s4={:#x} s5={:#x}",
+        hart_id, 0u64, 0u8, state.mstatus, state.mip, state.mie,
+        state.gprs[20], state.gprs[21],
+    ));
+    (Step::Next, true)
+}
+
+/// Synchronise hardware interrupt lines and deliver the highest-priority
+/// pending interrupt.  Returns ``true`` when a trap was delivered (caller
+/// should ``continue`` the main loop).
+fn step_interrupts(
+    state: &mut HartState,
+    hart_id: u8,
+    clint: &ConcurrentClintCtx,
+    _just_woke_from_wfi: bool,
+) -> bool {
+    let _ = hart_id; // used only in #[cfg(feature = "diagnostic")] block
+    sync_mtip(state, clint);
+    // Always sync MSIP — even when just woke from WFI.
+    // The WFI wake's wfi_sync_and_check already called sync_msip and
+    // auto-cleared the CLINT level bit, but the initiating hart may
+    // send additional MSIPs in a tight loop (e.g. tlb_sync re-sending
+    // while spinning).  Skipping sync_msip here would miss those
+    // subsequent edges and leave the target hart parked in WFI despite
+    // pending IPIs -> TLB-shootdown deadlock.
+    sync_msip(state, clint);
+    let msip_was_pending = (state.mip & (1 << 3)) != 0;
+    if msip_was_pending && (state.mie & (1 << 3)) == 0 {
+        diag::msie_forced(&mut state.diag);
+        state.mie |= 1 << 3;
+    }
+    if check_and_deliver_interrupt_concurrent(state, clint) {
+        return true;
+    }
+    false
+}
+
+/// Instruction fetch pipeline: translate VA, PMP execute check, read RAM,
+/// breakpoint match.  Returns ``Ok(pc_before, instr_word)`` on success or
+/// ``Err(step)`` when a trap was delivered / bp hit.
+fn step_fetch_instr(
+    state: &mut HartState,
+    hart_id: u8,
+    ctx: &WalkCtx,
+    pmp: &PmpCtx,
+    mem: &MemCtx,
+    clint: &ConcurrentClintCtx,
+    module: &ModuleState,
+    breakpoints: &[u64],
+    instr_count: &mut u64,
+) -> Result<(u64, u32), Step> {
+    let pc_before = state.pc;
+    let page_offset = pc_before & 0xFFF;
+
+    // -- VA -> PA translation --
+    let fetch_pa: u64 = match translate_fetch_pc_concurrent(state, ctx, pc_before) {
+        Some(pa) => pa,
+        None => {
+            if state.pc == pc_before {
+                state.consecutive_traps = state.consecutive_traps.saturating_add(1);
+            }
+            *instr_count += 1;
+            let step = if post_instr_checks(state, hart_id, clint, module, breakpoints) {
+                Step::Continue
+            } else {
+                Step::Exit
+            };
+            return Err(step);
+        }
+    };
+
+    // -- PMP execute check --
+    if !pmp_ok(state, fetch_pa, 4, false, true, pmp) {
+        let mut dummy = unsafe { std::mem::zeroed() };
+        deliver_trap(
+            state,
+            mcause_val(exc_code::INSTR_ACCESS_FAULT, false),
+            pc_before,
+            &mut dummy,
+        );
+        if state.pc == pc_before {
+            state.consecutive_traps = state.consecutive_traps.saturating_add(1);
+        }
+        *instr_count += 1;
+        let step = if post_instr_checks(state, hart_id, clint, module, breakpoints) {
+            Step::Continue
+        } else {
+            Step::Exit
+        };
+        return Err(step);
+    }
+
+    // -- Read instruction word (cross-page aware) --
+    let instr_word = match fetch_instr_word(
+        state,
+        ctx,
+        mem,
+        pc_before,
+        page_offset,
+        fetch_pa,
+        pmp,
+        hart_id,
+    ) {
+        Some(w) => w,
+        None => {
+            if state.pc == pc_before {
+                state.consecutive_traps = state.consecutive_traps.saturating_add(1);
+            }
+            *instr_count += 1;
+            let step = if post_instr_checks(state, hart_id, clint, module, breakpoints) {
+                Step::Continue
+            } else {
+                Step::Exit
+            };
+            return Err(step);
+        }
+    };
+
+    // -- Breakpoint --
+    if check_bp_hit(pc_before, breakpoints, Some(fetch_pa)) {
+        module.request_stop(StopInfo {
+            reason: exit_reason::BREAKPOINT,
+            hart_id,
+            pc: pc_before,
+            instr: instr_word,
+            ..StopInfo::empty()
+        });
+        return Err(Step::Exit);
+    }
+
+    Ok((pc_before, instr_word))
+}
+
+// ============================================================
+//  Main per-hart worker
+// ============================================================
 
 pub(crate) fn hart_worker(
     state: &mut HartState,
@@ -1116,51 +1330,27 @@ pub(crate) fn hart_worker(
     max_instrs_per_hart: u64,
     stop_flag: *const u8,
 ) {
-    // Reconstruct original context types from the Send-safe wrappers.
-    let _mem_val = MemCtx {
-        ram: mem.ram,
-        ram_size: mem.ram_size,
-        ram_base: mem.ram_base,
-        shadow_base: mem.shadow_base,
-        shadow_size: mem.shadow_size,
-    };
-    let _pmp_val = PmpCtx {
-        cfg: pmp.cfg,
-        addr: pmp.addr,
-        num: pmp.num,
-    };
-    let _dev_val = DevCtx {
-        bases: dev.bases,
-        ends: dev.ends,
-        num: dev.num,
-        virtio_base: dev.virtio_base,
-        virtio_raw: dev.virtio_raw,
-    };
+    let (_mem_val, _pmp_val, _dev_val, ctx) = make_contexts(mem, pmp, dev, module);
     let mem = &_mem_val;
     let pmp = &_pmp_val;
     let dev = &_dev_val;
 
-    let ctx = WalkCtx {
-        ram: mem.ram,
-        ram_size: mem.ram_size,
-        ram_base: mem.ram_base,
-        shadow_base: mem.shadow_base,
-        shadow_size: mem.shadow_size,
-        tlb_gen: &module.tlb_gen as *const AtomicU64,
-    };
+    // HartState persists across FFI calls — stale TLB entries from a
+    // previous batch with epoch=0 would match the fresh ModuleState's
+    // tlb_gen=0, producing incorrect VA->PA hits and memory corruption
+    // (garbage inode metadata -> "Permission denied" / ENOTDIR in ext4).
+    tlb_flush_all(&mut state.itlb);
+    tlb_flush_all(&mut state.dtlb);
 
     let mut instr_count: u64 = 0;
     loop {
-        // ---- Stop flag ----
+        // ---- Guards ----
         if module.stop_flag.load(Ordering::Acquire) {
             return;
         }
-        // External stop (Python Ctrl+C / debugger pause)
         if !stop_flag.is_null() && unsafe { *stop_flag != 0 } {
             return;
         }
-
-        // ---- Budget exhausted ----
         if instr_count >= max_instrs_per_hart {
             if !module.stop_flag.swap(true, Ordering::Release) {
                 if let Ok(mut guard) = module.stop_info.lock() {
@@ -1169,198 +1359,48 @@ pub(crate) fn hart_worker(
             }
             return;
         }
-
-        // ---- Halted ----
         if state.halted != 0 {
             std::hint::spin_loop();
             continue;
         }
 
         // ---- WFI ----
-        let mut just_woke_from_wfi = false;
-        if state.waiting != 0 {
-            // 若有设备将工作延迟到 Python 侧 (如 virtio QueueNotify
-            // 仅设 notify_pending=1, 实际 I/O 处理需退出 batch 后由
-            // Python 完成), 立即退出 batch 而非进入 WFI 自旋。
-            // 否则 wfi_check_all_idle 的 timer fast-forward 会反复
-            // 唤醒 hart 处理定时器, 设备 I/O 永远轮不到 Python 处理
-            // → 客机永久挂起在 cpu_do_idle WFI 中。
-            if dev.has_pending_python_work() {
-                module.request_stop(StopInfo {
-                    reason: exit_reason::WFI_WAIT,
-                    hart_id: hart_id as u8,
-                    pc: state.pc,
-                    ..StopInfo::empty()
-                });
-                return;
-            }
-            if !wfi_spin(state, hart_id as usize, clint, module, stop_flag) {
-                // Batch exit from WFI: flush TLB if another hart did
-                // SFENCE.VMA while we were spinning.  Without this check
-                // the stale TLB entries are unmarshaled to Python, causing
-                // wrong virtual→physical translations (e.g. VA 0x33d →
-                // PA 0x33d → access fault on a PMA hole).
-                let global_gen = module.tlb_gen.load(std::sync::atomic::Ordering::Acquire);
-                let my_gen = module.tlb_gen_per_hart[hart_id as usize]
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if my_gen != global_gen {
-                    for e in state.itlb.iter_mut() {
-                        e.valid = 0;
-                    }
-                    for e in state.dtlb.iter_mut() {
-                        e.valid = 0;
-                    }
-                    let epoch = tlb_epoch_from_gen(global_gen);
-                    set_tlb_epoch(state, epoch);
-                    module.tlb_gen_per_hart[hart_id as usize]
-                        .store(global_gen, std::sync::atomic::Ordering::Relaxed);
-                }
-                return;
-            }
-            state.consecutive_traps = 0;
-            just_woke_from_wfi = true;
-            diag::log_line(&format!(
-                "[wfi-wake] hart={} pc={:#018x} mode={} mstatus={:#018x} mip={:#010x} mie={:#010x} s4={:#x} s5={:#x}",
-                hart_id, state.pc, state.mode, state.mstatus, state.mip, state.mie,
-                state.gprs[20], state.gprs[21],
-            ));
+        let (wfi_step, just_woke_from_wfi) =
+            handle_wfi_state(state, hart_id, clint, dev, module, stop_flag);
+        match wfi_step {
+            Step::Exit => return,
+            Step::Continue => continue,
+            Step::Next => {}
         }
 
-        // ---- Interrupt pending ----
-        sync_mtip(state, clint);
-        // After WFI wake, wfi_sync_and_check already called sync_msip
-        // which set mip.MSIP and auto-cleared the CLINT level bit.
-        // Calling sync_msip again here would see level=0 and (before
-        // the fix) would clear mip.MSIP, losing the interrupt.
-        // Even with the fix (no clear on level=0), skipping the
-        // redundant call is cleaner: the state is already correct
-        // from the WFI wake path, and we avoid any window where a
-        // new MSIP write between here and check_and_deliver could be
-        // auto-cleared before the trap fires.
-        if !just_woke_from_wfi {
-            sync_msip(state, clint);
-        }
-        // Safety net: if MSIP is pending but MSIE isn't enabled in
-        // mie, force it.  Under normal operation OpenSBI keeps MSIE
-        // set, but a spurious CSR write or uninitialised mie could
-        // leave it at 0, silently dropping machine-level IPIs.
-        let msip_was_pending = (state.mip & (1 << 3)) != 0;
-        if msip_was_pending && (state.mie & (1 << 3)) == 0 {
-            diag::msie_forced(&mut state.diag);
-            state.mie |= 1 << 3;
-        }
-        if check_and_deliver_interrupt_concurrent(state, clint) {
-            continue;
-        }
-        #[cfg(feature = "diagnostic")]
-        if msip_was_pending && (state.mip & (1 << 3)) != 0 {
-            diag::log_line(&format!(
-                "[msip-no-trap] hart={} pc={:#018x} mode={} mstatus={:#018x} mip={:#010x} mie={:#010x} mideleg={:#010x}",
-                hart_id, state.pc, state.mode, state.mstatus, state.mip, state.mie, state.mideleg,
-            ));
-        }
-        diag::msip_post_wfi(
-            &mut state.diag,
-            state.mip,
-            state.mie,
-            state.mode,
-            state.mhartid,
-            clint.msip as *const u8,
-            clint.num_harts,
-            msip_was_pending,
-            false,
-        );
-
-        // ---- TLB coherency: broadcast SFENCE.VMA ----
-        // Check whether another hart has executed SFENCE.VMA since we last
-        // looked.  If so, flush our own TLB before the next fetch/load/store
-        // to avoid using a stale virtual→physical mapping.
-        // We also advance the *local TLB epoch* so that per-entry validation
-        // in ``tlb_lookup`` rejects any entry inserted before this flush.
-        let global_gen = module.tlb_gen.load(std::sync::atomic::Ordering::Acquire);
-        let my_gen = module.tlb_gen_per_hart[hart_id as usize]
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if my_gen != global_gen {
-            for e in state.itlb.iter_mut() {
-                e.valid = 0;
-            }
-            for e in state.dtlb.iter_mut() {
-                e.valid = 0;
-            }
-            let epoch = tlb_epoch_from_gen(global_gen);
-            set_tlb_epoch(state, epoch);
-            module.tlb_gen_per_hart[hart_id as usize]
-                .store(global_gen, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // ---- Fetch: translate -> PMP execute -> read RAM -> bp ----
-        let pc_before = state.pc;
-        let page_offset = pc_before & 0xFFF;
-
-        let fetch_pa: u64 = match translate_fetch_pc_concurrent(state, &ctx, pc_before) {
-            Some(pa) => pa,
-            None => {
-                if state.pc == pc_before {
-                    state.consecutive_traps = state.consecutive_traps.saturating_add(1);
-                }
-                instr_count += 1;
-                if !post_instr_checks(state, hart_id, clint, module, breakpoints) {
-                    return;
-                }
-                continue;
-            }
-        };
-
-        if !pmp_ok(state, fetch_pa, 4, false, true, pmp) {
-            let mut dummy = unsafe { std::mem::zeroed() };
-            deliver_trap(
-                state,
-                mcause_val(exc_code::INSTR_ACCESS_FAULT, false),
-                pc_before,
-                &mut dummy,
-            );
-            if state.pc == pc_before {
-                state.consecutive_traps = state.consecutive_traps.saturating_add(1);
-            }
-            instr_count += 1;
-            if !post_instr_checks(state, hart_id, clint, module, breakpoints) {
-                return;
-            }
+        // ---- Interrupts ----
+        if step_interrupts(state, hart_id, clint, just_woke_from_wfi) {
             continue;
         }
 
-        // ---- Fetch instruction word (handles cross-page case) ----
-        let instr_word = match fetch_instr_word(
-            state, &ctx, mem, pc_before, page_offset, fetch_pa, pmp, hart_id,
+        // ---- TLB coherency (broadcast SFENCE.VMA) ----
+        mark_tlb_dirty_if_stale(state, module, hart_id);
+
+        // ---- Fetch ----
+        let (pc_before, instr_word) = match step_fetch_instr(
+            state,
+            hart_id,
+            &ctx,
+            pmp,
+            mem,
+            clint,
+            module,
+            breakpoints,
+            &mut instr_count,
         ) {
-            Some(w) => w,
-            None => {
-                // Trap already delivered by the fetch helper.
-                if state.pc == pc_before {
-                    state.consecutive_traps = state.consecutive_traps.saturating_add(1);
-                }
-                instr_count += 1;
-                if !post_instr_checks(state, hart_id, clint, module, breakpoints) {
-                    return;
-                }
-                continue;
-            }
+            Ok(v) => v,
+            Err(Step::Continue) => continue,
+            Err(Step::Exit) => return,
+            Err(Step::Next) => unreachable!(),
         };
-
-        if check_bp_hit(pc_before, breakpoints, Some(fetch_pa)) {
-            module.request_stop(StopInfo {
-                reason: exit_reason::BREAKPOINT,
-                hart_id,
-                pc: pc_before,
-                instr: instr_word,
-                ..StopInfo::empty()
-            });
-            return;
-        }
 
         // ---- Decode & execute ----
         let f = decode_fields(instr_word);
-        // Compressed: delegate to serial handler + post-instr checks
         if f.is_compressed != 0 {
             if !exec_compressed_concurrent(
                 state,
@@ -1379,15 +1419,10 @@ pub(crate) fn hart_worker(
             instr_count += 1;
             continue;
         }
-        // 32-bit: use concurrent dispatcher
         let advance = dispatch_concurrent(
             state, &f, instr_word, &ctx, hart_id, pmp, dev, clint, uart, module,
         );
-
         if advance == EXIT_SENTINEL {
-            // Safety net: if a handler returned EXIT_SENTINEL without
-            // calling request_stop, set the stop flag now so other
-            // hart threads can see it and exit cleanly.
             if !module.stop_flag.load(Ordering::Acquire) {
                 module.request_stop(StopInfo {
                     reason: exit_reason::MMIO,
@@ -1410,12 +1445,6 @@ pub(crate) fn hart_worker(
         if !post_instr_checks(state, hart_id, clint, module, breakpoints) {
             return;
         }
-        // RISC-V auto-clear on trap entry (deliver_trap_mmode) +
-        // edge detection in sync_msip make the old cooldown
-        // mechanism unnecessary.  After trap entry clears mip.MSIP,
-        // sync_msip won't re-assert it until CLINT MSIP transitions
-        // 0->1 again — the return instruction naturally gets to
-        // execute before the next MSIP.
         instr_count += 1;
     }
 }
@@ -1480,7 +1509,7 @@ mod tests {
     /// VA is naturally aligned (the aligned path must NOT be taken for
     /// cross-page accesses).
     ///
-    /// Maps VA 0x1000→PA 0x1000 and VA 0x2000→PA 0x3000 (non-consecutive,
+    /// Maps VA 0x1000->PA 0x1000 and VA 0x2000->PA 0x3000 (non-consecutive,
     /// skipping PA 0x2000).  A misaligned 8-byte read at VA 0x1FFC (aligned
     /// to 4 but not to 8, crossing into VA 0x2000) must return the bytes from
     /// PA 0x1FFC-0x1FFF concatenated with PA 0x3000-0x3003.
@@ -1501,8 +1530,8 @@ mod tests {
         );
 
         // Write pattern: 0xAA bytes at end of first PA page, 0xBB at start of second.
-        // VA 0x1FFC → PA 0x1FFC (bytes_first = 4, on page A)
-        // VA 0x2000 → PA 0x3000 (bytes 4-7 of the 8-byte read, on page B)
+        // VA 0x1FFC ->PA 0x1FFC (bytes_first = 4, on page A)
+        // VA 0x2000 ->PA 0x3000 (bytes 4-7 of the 8-byte read, on page B)
         for i in 0x1FFC..0x2000 {
             ram[i] = 0xAA;
         }
@@ -1511,7 +1540,7 @@ mod tests {
         }
 
         let mut state: HartState = unsafe { std::mem::zeroed() };
-        state.mode = riscv_mode::U; // U-mode → page walk + PMP bypass (num=0)
+        state.mode = riscv_mode::U; // U-mode ->page walk + PMP bypass (num=0)
         state.mmu_mode = 8; // Sv39
         state.satp = satp;
         // Init dtlb as invalid to force page walk.
@@ -1526,6 +1555,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
         // PMP with zero entries — no restrictions (pmp_ok short-circuits on num==0).
         let mut _pmp_cfg = vec![0u8; 64];
@@ -1580,6 +1613,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
         let mut _pmp_cfg = vec![0u8; 64];
         let mut _pmp_addr = vec![0u64; 64];
@@ -1627,6 +1664,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
         let mut _pmp_cfg = vec![0u8; 1];
         let mut _pmp_addr = vec![0u64; 1];
@@ -1664,15 +1705,17 @@ mod tests {
             txctrl: 0,
             rxctrl: 0,
             rx_fifo_len: 0,
-            _pad: 0,
+            tx_notify_fd: -1,
+            no_stdout: 0,
         };
         let _wfi_flags: Vec<std::sync::atomic::AtomicU8> = (0..1)
             .map(|_| std::sync::atomic::AtomicU8::new(0))
             .collect();
         let _wfi_threads: Vec<std::sync::Mutex<Option<std::thread::Thread>>> =
             (0..1).map(|_| std::sync::Mutex::new(None)).collect();
-        let _tlb_gen: Vec<std::sync::atomic::AtomicU64> =
-            (0..1).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let _tlb_gen: Vec<std::sync::atomic::AtomicU64> = (0..1)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         let module = ModuleState {
             stop_flag: std::sync::atomic::AtomicBool::new(false),
             stop_info: std::sync::Mutex::new(StopInfo::empty()),
@@ -1682,6 +1725,7 @@ mod tests {
             active_hart_num: 1,
             tlb_gen: std::sync::atomic::AtomicU64::new(0),
             tlb_gen_per_hart: _tlb_gen.into_boxed_slice(),
+            lr_reserved: Box::new([]),
         };
         // opcode=0000011, rd=15, func3=101(LHU), rs1=15, imm=0x336
         let instr: u32 = 0x3367d783u32; // lhu a5, 0x336(a5)
@@ -1709,13 +1753,13 @@ mod tests {
     #[test]
     fn load_rd_equals_rs1_preserves_rd_on_pagefault() {
         let mut state: HartState = unsafe { std::mem::zeroed() };
-        state.mode = riscv_mode::U; // U-mode → Sv39 active
+        state.mode = riscv_mode::U; // U-mode ->Sv39 active
         state.mmu_mode = 8; // Sv39
         state.satp = 8u64 << 60; // Sv39, root PPN=0
         state.stvec = 0x80000400; // S-mode trap vector
         state.medeleg = 1 << 13; // Delegate LdPageFault to S-mode
         state.gprs[15] = 7; // a5 = 7 (the DT_RELA crash value)
-                            // Empty RAM → any page walk will fail (PTE.V=0)
+                            // Empty RAM ->any page walk will fail (PTE.V=0)
         let mut ram = vec![0u8; 0x1000];
         let ctx = WalkCtx {
             ram: ram.as_mut_ptr(),
@@ -1724,6 +1768,10 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
             tlb_gen: std::ptr::null(),
+            itlb_hand: Cell::new(0),
+            dtlb_hand: Cell::new(0),
+            lr_reserved: std::ptr::null_mut(),
+            num_harts: 1,
         };
         let mut _pmp_cfg = vec![0u8; 1];
         let mut _pmp_addr = vec![0u64; 1];
@@ -1760,15 +1808,17 @@ mod tests {
             txctrl: 0,
             rxctrl: 0,
             rx_fifo_len: 0,
-            _pad: 0,
+            tx_notify_fd: -1,
+            no_stdout: 0,
         };
         let _wfi_flags: Vec<std::sync::atomic::AtomicU8> = (0..1)
             .map(|_| std::sync::atomic::AtomicU8::new(0))
             .collect();
         let _wfi_threads: Vec<std::sync::Mutex<Option<std::thread::Thread>>> =
             (0..1).map(|_| std::sync::Mutex::new(None)).collect();
-        let _tlb_gen: Vec<std::sync::atomic::AtomicU64> =
-            (0..1).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let _tlb_gen: Vec<std::sync::atomic::AtomicU64> = (0..1)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         let module = ModuleState {
             stop_flag: std::sync::atomic::AtomicBool::new(false),
             stop_info: std::sync::Mutex::new(StopInfo::empty()),
@@ -1778,6 +1828,7 @@ mod tests {
             active_hart_num: 1,
             tlb_gen: std::sync::atomic::AtomicU64::new(0),
             tlb_gen_per_hart: _tlb_gen.into_boxed_slice(),
+            lr_reserved: Box::new([]),
         };
 
         let instr: u32 = 0x3367d783u32; // lhu a5, 0x336(a5)
@@ -1786,7 +1837,7 @@ mod tests {
         let adv = handle_load_concurrent(
             &mut state, &f, instr, &ctx, &pmp, &dev, &clint, &uart, &module,
         );
-        // Page fault delivered, PC redirected → advance = 0
+        // Page fault delivered, PC redirected ->advance = 0
         assert_eq!(adv, 0, "page fault must return 0 (PC already redirected)");
         // a5 MUST retain its original value (7), NOT be overwritten
         assert_eq!(
@@ -1815,7 +1866,7 @@ mod tests {
             addr: std::ptr::null_mut(),
             num: 0,
         };
-        // CSRRW a5, stvec, a5  →  funct3=001, rd=15, rs1=15, csr=0x105
+        // CSRRW a5, stvec, a5  -> funct3=001, rd=15, rs1=15, csr=0x105
         let adv = crate::csr::handle_csr(&mut state, 15, 15, 0x105, 1, 0, &mut result, 0, 0, &pmp);
         assert_eq!(adv, 4);
         // a5 should now hold old stvec (0x80001000), not 0xDEADBEEF
@@ -1830,7 +1881,7 @@ mod tests {
         );
     }
 
-    /// CSRRS with rd==rs1: rs1 bits are set in CSR, old CSR value → rd.
+    /// CSRRS with rd==rs1: rs1 bits are set in CSR, old CSR value ->rd.
     #[test]
     fn csrrs_rd_equals_rs1_sets_bits_correctly() {
         let mut state: HartState = unsafe { std::mem::zeroed() };
@@ -1844,7 +1895,7 @@ mod tests {
             addr: std::ptr::null_mut(),
             num: 0,
         };
-        // CSRRS a0, mie, a0  →  funct3=010, rd=10, rs1=10, csr=0x304
+        // CSRRS a0, mie, a0  -> funct3=010, rd=10, rs1=10, csr=0x304
         let adv = crate::csr::handle_csr(&mut state, 10, 10, 0x304, 2, 0, &mut result, 0, 0, &pmp);
         assert_eq!(adv, 4);
         // a0 should hold old MIE value (0x88), not the mask

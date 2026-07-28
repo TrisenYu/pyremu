@@ -12,7 +12,7 @@ CLINT_BASE = 0x02000000
 
 
 class TestWFIMsipWakeup:
-    """H0 写 MSIP → H1 从 WFI 唤醒."""
+    """H0 写 MSIP ->H1 从 WFI 唤醒."""
 
     @pytest.fixture
     def emu_two_harts(self):
@@ -51,7 +51,7 @@ class TestWFIMsipWakeup:
         """原生 batch 路径: MSIP 唤醒 WFI hart.
 
         验证:
-        1. H1 进入 WFI → state.waiting = 1
+        1. H1 进入 WFI ->state.waiting = 1
         2. H0 写 CLINT MSIP[1] = 1
         3. 下一个 step() 后 H1 不再 waiting, 且已处理中断
         """

@@ -6,11 +6,11 @@
 |r   | riscv/rust|
 |emu | emulator  |
 
-Pyremu 是一个用 Python (CPython 3.14) 编写的本地 **RISC-V 指令集模拟器与交互式调试器**，
-面向固件调试、TEE开发、操作系统调试等场景
+Pyremu 是一个用 Python (CPython 3.14) 编写的 **RISC-V 指令集模拟器与交互式调试器**，
+面向固件调试、TEE 开发、操作系统调试等场景。
 
-模拟多 hart，支持 RV64 **IMAC** 指令扩展、特权级 (U/S/H/M/D)、
-Sv39 虚拟内存、L2 缓存 MESI 一致性协议、CLINT 时钟/核间中断。
+模拟多 hart，支持 RV64 **IMAC** 指令扩展 (F/D/Zfh 暂未实现)、五级特权级 (U/S/H/M/D)、
+Sv39 虚拟内存、L2 缓存 MESI 一致性协议、PLIC 平台级中断控制器、CLINT 时钟/核间中断。
 
 ## 快速上手
 
@@ -34,14 +34,15 @@ python examples/demo_emulator.py
 
 | 模块 | 内容 |
 |------|------|
-| **指令集** | RV64 GC (IMAFD + Zicsr + C), 含 FP 算术/转换/比较/乘加 + 压缩 FP (c.fld/c.fsd/c.fldsp/c.fsdsp) |
-| **特权级** | U/S/H/M/D 五级, ECALL/EBREAK/MRET/SRET, WFI (TW 检查, 中断唤醒) |
+| **指令集** | RV64 IMAC + Zicsr + C, M 扩展 (mul/div/rem) 和 A 扩展 (LR/SC/AMO), F/D/Zfh 暂未实现 |
+| **特权级** | U/S/H/M/D 五级, ECALL/EBREAK/MRET/SRET (含 medeleg/mideleg 委派), WFI (TW 检查, 中断唤醒) |
 | **虚拟内存** | Sv39 页表遍历 (4 KiB 页 + 2 MiB 超级页), TLB (全相联 FIFO/LRU) |
-| **内存保护** | PMP (NAPOT/NA4/TOR, L 位锁定, 最多 64 条), PMA 可配置 |
+| **内存保护** | PMP (NAPOT/NA4/TOR, L 位锁定, 最多 64 条, MPRV 感知), PMA 可配置 |
 | **缓存** | 共享 L2 缓存, MESI 一致性协议, 按 hart 的 mdid 域标记 |
-| **中断** | CLINT (mtime 定时器 + MSIP 软件中断), 委派 (medeleg/mideleg) |
-| **外设** | UART (16550 风格), SPI, I2C, GPIO |
+| **中断** | CLINT (mtime 定时器 + MSIP IPI), PLIC (平台级中断控制器, 电平语义, M/S 双 context) |
+| **外设** | UART (SiFive 16550 子集), virtio-blk, SPI, I2C, GPIO, Hart Watchdog |
 | **平台** | FDT 设备树生成, PlatformConfig 预设 (qemu_virt / sifive_u54) |
+
 
 ## 交互式调试器 (rvdb)
 
@@ -61,40 +62,24 @@ rvdbg[0] undo            # 快照回滚
 
 ```
 pyremu/
-  emulator.py          # 多 hart 执行循环 (round-robin, trap 检测)
-  debugger.py           # rvdb 交互式调试器
-  platform.py           # PlatformConfig 平台描述
-  core/                 # Hart, 解码器, trap 处理, 寄存器模型
-  memory/               # MMU, TLB, L2 缓存, PMP, 总线
-  peripheral/           # UART, SPI, I2C, GPIO
-  interrupt/            # CLINT, 中断控制器抽象
-  utils/                # 反汇编器, FDT 生成, ELF 解析
-  env_inject/           # 预加载 shellcode 注入
-tests/                  # 1130 条测试 (15 套件)
-examples/               # 编程式使用示例
-third-party/            # 第三方固件 & S-mode 运行时
+  emulator.py            # 多 hart 执行循环, native batch 调度
+  platform.py            # PlatformConfig 平台描述
+  core/                  # Hart, 解码器, trap 处理, 寄存器模型
+  memory/                # MMU, TLB, L2 缓存, PMP, 总线
+  peripheral/            # UART, virtio-blk, SPI, I2C, GPIO, watchdog, TermIO
+  interrupt/             # CLINT, PLIC, 中断控制器抽象, AIA
+  debug/                 # rvdb 交互式调试器 (prompt_toolkit + rich)
+  utils/                 # 反汇编器, FDT 生成, ELF 解析
+  env_inject/            # 预加载 shellcode 注入
+  _native/               # Rust 批量执行引擎 (libdecode.so)
+tests/                   # ~800 条测试
+examples/                # 编程式使用示例
+third-party/             # 第三方固件 & S-mode 运行时
 ```
 
 ## 测试
 
-14 个测试套件，834 条用例，覆盖指令执行、内存翻译、异常/中断、外设、调试器命令等模块：
-
-| 套件 | 内容 |
-|------|------|
-| `test_emulator.py` (55) | 多 hart 执行循环, 固件加载, PMP, WFI, UART 输出 |
-| `test_trap.py` (99) | trap 编解码, M/S 投递, 委派, 各种异常/中断 |
-| `test_debugger.py` (220) | 调试器 REPL, 反汇编, 断点, 栈回溯 |
-| `test_disasm.py` (59) | 全部指令格式反汇编 |
-| `test_mmu.py` (37) | Sv39 页表遍历, PTE 标志, 超级页 |
-| `test_compressed.py` (19) | C 扩展全部已实现指令 |
-| `test_amo.py` (17) | LR/SC/AMO 原子操作 |
-| `test_pmp.py` (25) | PMP 编解码与匹配 |
-| `test_tlb.py` (15) | TLB 插入/命中/驱逐 |
-| `test_l2cache.py` (10) | L2 缓存 MESI 状态转换 |
-| `test_bus.py` (14) | 总线读写, 设备路由, PMA |
-| `test_clint.py` (12) | 定时器与软件中断 |
-| `test_parse_elf.py` (14) | ELF/PE/raw 格式解析 |
-
+覆盖指令执行、内存翻译、异常/中断、外设、调试器命令、压缩指令差分验证等模块。
 运行: `make test` 或 `uv run pytest tests/`
 
 ## 第三方代码
@@ -109,21 +94,10 @@ fetch-decode-execute 循环从 Python 移入 Rust，单次 FFI 调用批量执�
 
 ### 工作原理
 
-```
-Python                              Rust (libdecode.so)
-  │                                     │
-  │  flush_l2()                         │
-  │  marshal HartState ──────────────→  │
-  │  run_batch() ────────────────────→  │  for hart in harts:
-  │                                     │    for instr in 0..max_instrs:
-  │                                     │      fetch → decode → execute
-  │                                     │      if ecall/csr/mmio → exit
-  │                                     │
-  │  ←──────────────────────────── return BatchResult
-  │  invalidate_l2()                    │
-  │  handle EXIT_SYS / EXIT_TRAP       │
-  │                                     │
-```
+Python 侧通过 `marshal_hart()` 将全部 hart 的寄存器文件序列化为 `#[repr(C)]` FFI 结构体,
+与 RAM buffer / PMP / CLINT / UART / virtio 上下文一起传入 Rust 引擎 (`run_parallel`)。
+Rust 以 thread-per-hart 模型并发执行 fetch-decode-execute 循环, 通过共享原子变量同步
+CLINT 中断与 `tlb_gen` 计数器 (SFENCE.VMA 广播)。batch 结束后 `unmarshal_hart()` 恢复状态。
 
 每条 batch 边界执行 `flush_l2()`（将 Python 侧的 L2 脏行回写到 `bytearray`）和
 `invalidate_l2()`（丢弃 Rust 直接写入 `bytearray` 后 L2 中的过时行），确保两条
@@ -132,16 +106,16 @@ Python                              Rust (libdecode.so)
 ### 构建
 
 ```bash
-# Debug 构建（带符号，便于 gdb/lldb 调试）
-cargo build --manifest-path pyremu/_native/Cargo.toml
-cp pyremu/_native/target/debug/libdecode.so pyremu/_native/libdecode.so
+make build-native     # Release 构建 + 复制到 pyremu/_native/libdecode.so
+```
 
-# Release 构建（优化，生产使用）
+也可以手动构建:
+
+```bash
 cargo build --release --manifest-path pyremu/_native/Cargo.toml
 cp pyremu/_native/target/release/libdecode.so pyremu/_native/libdecode.so
 
-# 运行 Rust 侧单元测试（~148 条）
-cargo test --manifest-path pyremu/_native/Cargo.toml
+cargo test --manifest-path pyremu/_native/Cargo.toml   # Rust 侧单元测试
 ```
 
 构建依赖: Rust 工具链 (edition 2021), 无需 `maturin`/`setuptools-rust`——输出为标准
@@ -190,31 +164,6 @@ uv run pytest tests/test_emulator.py::TestNativeBatchLayout   # Python 侧
 ```
 
 ## 注意事项
-
-### Linux 内核 FPU 配置
-
-模拟器支持 **F/D 浮点扩展**（RV64GC）。载入的 Linux 内核必须开启 `CONFIG_FPU=y`，
-否则内核的 trap handler 无法识别 FP 指令的懒切换陷态（mstatus.FS=Off → IllegalInstr），
-会直接向用户态进程投递 SIGILL，导致 ld-linux 等硬浮点 ABI（lp64d）程序无法启动。
-
-验证内核 config:
-```bash
-grep CONFIG_FPU .config    # 必须是 CONFIG_FPU=y
-```
-
-### 压缩浮点指令
-
-**rv64gc**（含 C + F + D 扩展）会生成 16-bit 压缩浮点指令:
-
-| 指令 | 编码 | quadrant | 说明 |
-|------|------|----------|------|
-| `c.fld`  | C0 funct3=001 | 00 | 从 rs1'+uimm 加载 8 字节到 FPR rd' |
-| `c.fsd`  | C0 funct3=101 | 00 | 将 FPR rd' 的 8 字节存入 rs1'+uimm |
-| `c.fldsp` | C2 funct3=001 | 10 | 从 sp+uimm 加载 8 字节到 FPR rd |
-| `c.fsdsp` | C2 funct3=101 | 10 | 将 FPR rs2 的 8 字节存入 sp+uimm |
-
-硬浮点（lp64d）Debian/Ubuntu 用户态大量使用这些指令（如 ld-linux 保存/恢复 FP 寄存器）。
-确认内核开启 `CONFIG_FPU=y` + `CONFIG_RISCV_ISA_F=y` + `CONFIG_RISCV_ISA_D=y`。
 
 ### 跨页取指与数据访问
 

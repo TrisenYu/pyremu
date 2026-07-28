@@ -3,6 +3,7 @@
 # SPDX-LICENSE-IDENTIFIER: GPL2.0
 
 """测试 pyremu.debug.mmu_view — PMP/SATP/页表."""
+from rich.console import Console
 
 from pyremu.debug.mmu_view import MmuViewMixin
 from pyremu.emulator import Emulator
@@ -14,14 +15,12 @@ from pyremu.emulator import Emulator
 
 class _TestMmuDbg(MmuViewMixin):
     """最小聚合类供 MmuViewMixin 测试."""
-
     def __init__(self, emu, hart_id=0):
-        from rich.console import Console
         self._emu = emu
         self._hart_id = hart_id
         self._console = Console(highlight=False)
-        self._warn = lambda msg: None
-        self._err = lambda msg: None
+        self._warn = lambda _s: None
+        self._err = lambda _s: None
 
     @property
     def hart(self):
@@ -34,8 +33,8 @@ class _TestMmuDbg(MmuViewMixin):
             return None
 
 
-def _make_mmudbg():
-    emu = Emulator(prog_cnt=0x1000)
+def _make_mmudbg(**kwargs):
+    emu = Emulator(prog_cnt=0x1000, **kwargs)
     emu.load_code(0x1000, b"\x13\x00\x00\x00")  # NOP
     return _TestMmuDbg(emu)
 
@@ -81,8 +80,7 @@ class TestCmdPmp:
 
     def test_no_pmp(self):
         """无 PMP 条目时显示提示."""
-        dbg = _make_mmudbg()
-        dbg.hart._pmp = None
+        dbg = _make_mmudbg(pmp_entries=0)
         dbg.cmd_pmp()
 
     def test_with_pmp_entries(self):

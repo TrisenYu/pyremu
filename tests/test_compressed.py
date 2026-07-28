@@ -450,9 +450,9 @@ class TestCompressedC2:
         """C.LWSP x10, 8 -> 从 sp+8 加载 32-bit."""
         test_val = 0x12345678
         hart._mem_write_phy(0x8008, test_val.to_bytes(4, "little"))
-        # C.LWSP: funct3=010, uimm=8, rd=10
-        # bit[12]=0(uimm[5]), bits[6:5]=00(uimm[7:6]), bits[4:2]=010(uimm[4:2])
-        instr = (0b010 << 13) | (0 << 12) | (10 << 7) | (0b010 << 2) | 0b10
+        # C.LWSP x10, 8(sp): encoding 0x4522 (llvm-mc verified)
+        # Spec: uimm[7:6]=instr[3:2], uimm[5]=instr[12], uimm[4:2]=instr[6:4]
+        instr = 0x4522
         hart.exec_instr(instr)
         assert hart.gprs[10] == test_val
 
@@ -494,10 +494,9 @@ class TestCompressedC2:
         """C.LWSP x10, 40(sp) — uimm[5]=1 验证 imm[5] 位位置."""
         test_val = 0x12345678
         hart._mem_write_phy(0x8000 + 40, test_val.to_bytes(4, "little"))
-        # C.LWSP: funct3=010, uimm=40, rd=10
-        # bit[15:13]=010, bit[12]=1(uimm[5]), bits[11:7]=01010,
-        # bits[6:5]=00(uimm[7:6]), bits[4:2]=010(uimm[4:2])
-        instr = (0b010 << 13) | (1 << 12) | (10 << 7) | (0b010 << 2) | 0b10
+        # C.LWSP x10, 40(sp): encoding 0x5522 (llvm-mc verified)
+        # Spec: instr[3:2]=uimm[7:6]=00, instr[12]=uimm[5]=1, instr[6:4]=uimm[4:2]=010
+        instr = 0x5522
         hart.exec_instr(instr)
         assert hart.gprs[10] == test_val, (
             f"偏移 40 的 C.LWSP: 期望 0x{test_val:08x}, 得到 0x{hart.gprs[10]:08x}"
@@ -533,8 +532,8 @@ class TestCompressedC2:
         """C.LWSP 与 C.LDSP 同 bit pattern 应解码为不同偏移."""
         test_val_lw = 0x42
         hart._mem_write_phy(0x8000 + 40, test_val_lw.to_bytes(4, "little"))
-        # C.LWSP: 偏移 40 的编码 (见 test_c_lwsp_large_offset)
-        instr_lwsp = (0b010 << 13) | (1 << 12) | (10 << 7) | (0b010 << 2) | 0b10
+        # C.LWSP x10, 40(sp): encoding 0x5522 (llvm-mc verified)
+        instr_lwsp = 0x5522
         hart.exec_instr(instr_lwsp)
         assert hart.gprs[10] == 0x42, "C.LWSP 偏移 40 应读取正确值"
 

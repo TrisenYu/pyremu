@@ -20,6 +20,7 @@ from pyremu.core.trap_def import TrapType
 from pyremu.core.trap_handler import deliver_trap
 from pyremu.memory.mmu import PTE_R, PTE_U, PTE_X, PAGE_SIZE, SATP_MODE_BARE, translate_va
 from pyremu.memory.pmp import PmpAccessInfo
+from pyremu.utils.mask import mask64
 
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
@@ -190,7 +191,7 @@ def translate_addr(
     # 所指示的特权级进行地址翻译和 PMP 检查. 这是 sbi_unpriv 系列 API
     # (sbi_get_insn 等) 能够读取 S/U-mode 虚拟地址的基础.
     if mode == SATP_MODE_BARE:
-        return True, va & 0xFFFF_FFFF_FFFF_FFFF
+        return True, mask64(va)
 
     # 计算有效特权级 — MPRV=1 时 M 模式使用 MPP 作为翻译特权级
     effective_mode = hart.mode.value
@@ -198,18 +199,19 @@ def translate_addr(
         mprv = (hart.mstatus_val >> 17) & 1
         mpp = (hart.mstatus_val >> 11) & 0x3
         if not mprv or mpp == RiscvMode.M.value:
-            return True, va & 0xFFFF_FFFF_FFFF_FFFF
+            return True, mask64(va)
         # MPP 为 S 或 U 模式 — 继续走 MMU 翻译 + PMP 检查
         effective_mode = mpp
 
-    # TLB 查找
+    # TLB 查找 (ASID-tagged: Bare 模式 asid=0 匹配全部)
     vpn = va >> 12
     tlb: TLB = hart.dtlb
-    hit, ppn, perm = tlb.lookup(vpn)
+    _asid = (hart.satp_val >> 44) & 0xFFFF if hart.mmu_mode != SATP_MODE_BARE else 0
+    hit, ppn, perm = tlb.lookup(vpn, asid=_asid)
     if hit:
         # _check_pte_perm 需等 TLB 存储真实 PTE 权限 (非硬编码 0xF) 后启用
         offset = va & (PAGE_SIZE - 1)
-        pa = (ppn << 12 | offset) & 0xFFFF_FFFF_FFFF_FFFF
+        pa = mask64((ppn << 12 | offset))
         return True, pa
 
     # TLB miss — 执行页表遍历
@@ -224,7 +226,7 @@ def translate_addr(
     # _check_pte_perm 需等 TLB 存储真实 PTE 权限 (非硬编码 0xF) 后启用。
     # 当前 perm 虽由 translate_va 正确传入, 但与 TLB 命中路径 (perm=0xF)
     # 不一致 — 同一页首次访问受检而后续不受检会使 bug 更隐蔽。 待全链
-    # (translate_va → translate_addr → tlb.insert) 统一传递真实 perm 后,
+    # (translate_va ->translate_addr ->tlb.insert) 统一传递真实 perm 后,
     # 两路径同步启用 _check_pte_perm。
 
     # MMIO 地址不可缓存 — 跳过 TLB 插入
@@ -236,7 +238,8 @@ def translate_addr(
     # 将翻译结果插入 TLB 缓存 (标记当前 hart 的 mdid, 供 mfence.did 按域刷新)
     new_vpn = va >> 12
     new_ppn = pa >> 12
-    tlb.insert(new_vpn, new_ppn, perm=0xF, level=0, mdid=hart.mdid_val)
+    tlb.insert(new_vpn, new_ppn, perm=0xF, level=0,
+               mdid=hart.mdid_val, asid=_asid)
 
     return True, pa
 
@@ -271,7 +274,7 @@ def mem_read(
         raise AlignmentFault
 
     # 跨页边界检查: M/D 模式与 Bare 模式下 VA==PA, 无需拆分.
-    # 仅 S/U 模式且 MMU 使能时 VA→PA 映射可能不连续.
+    # 仅 S/U 模式且 MMU 使能时 VA->PA 映射可能不连续.
     _mmu_active = (
         hart.mode not in (RiscvMode.M, RiscvMode.D)
         and hart.mmu_mode != SATP_MODE_BARE
@@ -377,6 +380,7 @@ def mem_write(
             )):
                 deliver_trap(hart, TrapType.StAccessFault, tval=addr, is_interrupt=False)
                 raise AccessFault
+        hart.clear_reservation()
         hart._mem_write_phy(pa1, data[:first_size])
         hart._mem_write_phy(pa2, data[first_size:])
         return
@@ -402,6 +406,11 @@ def mem_write(
         deliver_trap(hart, TrapType.StAccessFault, tval=addr, is_interrupt=False)
         raise AccessFault
 
+    # RISC-V spec §8.2: any store by any hart invalidates all LR reservations
+    # on that hart.  Without this, an LR in Python mode followed by a store
+    # (to any address) would leave the reservation intact, allowing a subsequent
+    # SC to succeed when it should fail.
+    hart.clear_reservation()
     hart._mem_write_phy(pa, data)
 
 
@@ -425,10 +434,11 @@ def _translate_instruction_addr(
         (ok, pa, perm) — perm 供调用方做 SUM 权限检查.
     """
     vpn = va >> 12
-    hit, ppn, perm = tlb.lookup(vpn)
+    _asid = (hart.satp_val >> 44) & 0xFFFF if hart.mmu_mode != SATP_MODE_BARE else 0
+    hit, ppn, perm = tlb.lookup(vpn, asid=_asid)
     if hit:
         offset = va & (PAGE_SIZE - 1)
-        pa = (ppn << 12 | offset) & 0xFFFF_FFFF_FFFF_FFFF
+        pa = mask64((ppn << 12 | offset))
         return True, pa, perm
 
     # itlb miss — 执行页表遍历
@@ -448,7 +458,8 @@ def _translate_instruction_addr(
     # 跳过 MMIO 地址的缓存 (与 dtlb 策略一致)
     bus: Bus | None = hart._bus
     if bus is None or not bus.is_device_addr(pa):
-        tlb.insert(new_vpn, new_ppn, perm=perm, level=0, mdid=hart.mdid_val)
+        tlb.insert(new_vpn, new_ppn, perm=perm, level=0,
+                   mdid=hart.mdid_val, asid=_asid)
     return True, pa, perm
 
 
@@ -474,7 +485,7 @@ def check_instruction_fetch(
     mode = hart.mmu_mode
     # RISC-V 规范: M 模式取指始终走物理地址 (MPRV 不影响取指)
     if mode == SATP_MODE_BARE or hart.mode == RiscvMode.M:
-        pa = va & 0xFFFF_FFFF_FFFF_FFFF
+        pa = mask64(va)
     else:
         ok, pa, perm = _translate_instruction_addr(hart, va, hart.itlb)
         if not ok:
@@ -482,16 +493,19 @@ def check_instruction_fetch(
         # S 模式不能从 U=1 的页取指 (此乃 RISC-V 基础规则, 非 SUM 扩展).
         # 需等 TLB 存储真实 PTE 权限 (非硬编码 0xF) 后才能启用此检查,
         # 否则所有页均被误判为用户页.
-        # TODO: 待 translate_va→translate_addr 完整传递 PTE perm 后启用.
+        # TODO: 待 translate_va->translate_addr 完整传递 PTE perm 后启用.
         # is_user_page = (perm & PTE_U) != 0
         # if hart.mode == RiscvMode.S and is_user_page:
         #     deliver_trap(hart, TrapType.InstrPageFault, tval=va, is_interrupt=False)
         #     return False, 0
 
     # PMP 检查 — 所有模式均需通过, is_execute=True
+    # RISC-V spec §3.1.6.3: 取指无视 MPRV, 始终用当前特权级.
+    # 清除 MPRV 位确保 M 模式取指绕过 PMP (无需关心 MPP).
     pmp: Pmp = hart._pmp
+    _fetch_mstatus = hart.mstatus_val & ~(1 << 17)  # MPRV=0 for instruction fetch
     if not pmp.check(PmpAccessInfo(
-        pa=pa, size=4, mode_val=hart.mode.value, mstatus_val=hart.mstatus_val,
+        pa=pa, size=4, mode_val=hart.mode.value, mstatus_val=_fetch_mstatus,
         is_execute=True, pmpsplit=hart.pmpsplit_val, mdid=hart.mdid_val,
     )):
         deliver_trap(

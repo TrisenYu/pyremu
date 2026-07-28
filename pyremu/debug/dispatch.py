@@ -54,8 +54,6 @@ class DispatchMixin(SharedMixinAttrs):
         self._hart_id = hart_id
         self._snapshot = None
         self._mem_changes = []
-        if self._emu.uart is not None:
-            self._emu.uart.flush_all()
         self._console.print(f"[dim]切换到 Hart {hart_id}[/]")
 
     # ----------------------------------------------------------
@@ -220,6 +218,9 @@ class DispatchMixin(SharedMixinAttrs):
             except KeyboardInterrupt:
                 self._console.print()
                 continue
+            except OSError:
+                self._console.print("[dim]终端断开, 退出[/]")
+                break
             except EOFError:
                 self._console.print("[dim]退出[/]")
                 break
