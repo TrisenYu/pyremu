@@ -257,6 +257,12 @@ def _trap_deliver_mmode(
     _mpp_map = {RiscvMode.U: 0, RiscvMode.S: 1, RiscvMode.M: 3}
     mpp_code = _mpp_map.get(hart.mode, 0)
     mstatus = (mstatus & ~MSTATUS_MPP) | (mpp_code << 11)
+
+    # RISC-V spec: MPRV is cleared on trap entry to M-mode so the
+    # handler can safely access its own stack/data without going
+    # through the MMU translation of the previous privilege mode.
+    mstatus &= ~(1 << 17)  # clear MPRV
+
     hart.mstatus_val = mstatus
 
     # 切换到 M 模式

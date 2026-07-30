@@ -99,7 +99,7 @@ pub(crate) fn wfi_check_all_idle(
             ..StopInfo::empty()
         });
         module.wfi_flags[hart_id].store(0, Ordering::Release);
-        module.wfi_count.fetch_sub(1, Ordering::Relaxed);
+        module.wfi_count.fetch_sub(1, Ordering::Release);
         return Some(false); // exit batch
     }
     // MSIP pending but no timer — keep spinning.
@@ -114,19 +114,13 @@ pub(crate) fn wfi_spin(
     stop_flag: *const u8,
 ) -> bool {
     module.wfi_flags[hart_id].store(1, Ordering::Release);
-    module.wfi_count.fetch_add(1, Ordering::Relaxed);
+    module.wfi_count.fetch_add(1, Ordering::Release);
 
-    // Multi-stage back-off (QEMU-style):
-    //  1. Hot-spin  (64 iter)  — catch IPI right after WFI, no syscall
-    //  2. Yield     (up to 512) — let sender thread run
-    //  3. Park      (> 512)    — park_timeout with thread handle registered
-    //     so clint_write_msip_concurrent -> unpark() wakes us immediately.
-    //     Timeout tightens from 100 µs to 1 ms after 2k iterations.
-    //
-    // No fixed-iteration safety valve that exits the batch — the
-    // sender is in the same batch and must be given time to reach
-    // its CLINT MSIP store.  Batch exit only happens via all-idle
-    // detection or external stop flag.
+    // Pure event-driven spin: no sleep, no timer-based back-off.
+    // The sender (another hart thread in the same process) writes
+    // MSIP via the atomic channel; this hart detects it on the next
+    // iteration of wfi_sync_and_check.  yield_now() lets the OS
+    // schedule the sender thread so the MSIP arrives promptly.
     let mut spin_count: u64 = 0;
     loop {
         spin_count += 1;
@@ -140,17 +134,17 @@ pub(crate) fn wfi_spin(
             break;
         }
 
-        // ---- stop flag ----
+        // ---- stop flag (debugger pause / batch exit) ----
         if module.stop_flag.load(Ordering::Acquire) {
             sync_msip(state, clint);
             module.wfi_flags[hart_id].store(0, Ordering::Release);
-            module.wfi_count.fetch_sub(1, Ordering::Relaxed);
+            module.wfi_count.fetch_sub(1, Ordering::Release);
             return false;
         }
         if !stop_flag.is_null() && unsafe { *stop_flag != 0 } {
             sync_msip(state, clint);
             module.wfi_flags[hart_id].store(0, Ordering::Release);
-            module.wfi_count.fetch_sub(1, Ordering::Relaxed);
+            module.wfi_count.fetch_sub(1, Ordering::Release);
             return false;
         }
 
@@ -163,43 +157,15 @@ pub(crate) fn wfi_spin(
             }
         }
 
-        // ---- staged back-off ----
+        // ---- back-off (no sleep — purely CPU yield) ----
         if spin_count < 64 {
             std::hint::spin_loop();
-        } else if spin_count < 512 {
-            std::thread::yield_now();
         } else {
-            // Park with timeout — clint_write_msip_concurrent calls
-            // unpark() to wake us immediately when an MSIP arrives.
-            // We register the thread handle BEFORE parking so that
-            // unpark() works for BOTH the light-sleep (100 µs) and
-            // deep-park (1 ms) phases — the sender doesn't know which
-            // stage we're in and must be able to interrupt us in any
-            // case.  Without this, light-sleep used std::thread::sleep
-            // which ignores unpark(), adding up to ~150 ms of latency
-            // per TLB shootdown.
-            //
-            // The mutex is per-hart (wfi_threads[hart_id]) and only
-            // contended when the sender writes to the same CLINT MSIP
-            // concurrently — a single lock/unlock pair is ~10 ns.
-            {
-                let mut slot = module.wfi_threads[hart_id].lock().unwrap();
-                *slot = Some(std::thread::current());
-            }
-            let timeout = if spin_count < 2000 {
-                std::time::Duration::from_micros(100)
-            } else {
-                std::time::Duration::from_millis(1)
-            };
-            std::thread::park_timeout(timeout);
-            {
-                let mut slot = module.wfi_threads[hart_id].lock().unwrap();
-                *slot = None;
-            }
+            std::thread::yield_now();
         }
     }
 
     module.wfi_flags[hart_id].store(0, Ordering::Release);
-    module.wfi_count.fetch_sub(1, Ordering::Relaxed);
+    module.wfi_count.fetch_sub(1, Ordering::Release);
     true
 }

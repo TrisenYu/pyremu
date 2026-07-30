@@ -2,7 +2,7 @@ use std::cell::Cell;
 // use std::time::Instant;
 use crate::atom_instr::handle_amo_concurrent_dispatch;
 use crate::concurrent::{
-    ConcurrentClintCtx, ModuleState, SharedDevCtx, SharedMemCtx, SharedPmpCtx, StopInfo,
+    ConcurrentClintCtx, FfiExtIrqCtx, ModuleState, SharedDevCtx, SharedMemCtx, SharedPmpCtx, StopInfo,
 };
 use crate::decode::decode_fields;
 use crate::diag;
@@ -20,7 +20,10 @@ use crate::op_dispatcher::{
     handle_alu, handle_auipc, handle_br, handle_fence, handle_fp_fma, handle_fp_op, handle_jal,
     handle_jalr, handle_lui, handle_op32, handle_op_imm, handle_op_imm32,
 };
-use crate::peripheral::{is_device_addr, uart::try_handle_uart_concurrent};
+use crate::peripheral::{
+	is_device_addr,
+	uart::try_handle_uart_concurrent,
+};
 use crate::state::{exit_reason, riscv_mode, BatchResult, FfiUartCtx, HartState, MemCtx};
 use crate::translate::{tlb_flush_all, tlb_mark_all_dirty, translate_va, TranslateFault, WalkCtx};
 use crate::trap::{
@@ -56,6 +59,10 @@ pub(crate) fn fetch_instr(ram: *const u8, ram_size: u64, ram_base: u64, pa: u64)
         return None;
     }
     let ptr = unsafe { ram.add(offset as usize) };
+    // Acquire fence pairs with Release stores in ram_write_raw so this hart
+    // observes instruction bytes written by another hart (e.g. store instruction
+    // writing to a page that is later made executable).
+    atomic::fence(Ordering::Acquire);
     let b0 = unsafe { *ptr } as u32;
     let b1 = unsafe { *ptr.add(1) } as u32;
     let b2 = unsafe { *ptr.add(2) } as u32;
@@ -1327,8 +1334,9 @@ pub(crate) fn hart_worker(
     uart: &FfiUartCtx,
     module: &ModuleState,
     breakpoints: &[u64],
-    max_instrs_per_hart: u64,
+    _max_instrs_per_hart: u64,
     stop_flag: *const u8,
+    ext_irq: *mut FfiExtIrqCtx,
 ) {
     let (_mem_val, _pmp_val, _dev_val, ctx) = make_contexts(mem, pmp, dev, module);
     let mem = &_mem_val;
@@ -1351,13 +1359,19 @@ pub(crate) fn hart_worker(
         if !stop_flag.is_null() && unsafe { *stop_flag != 0 } {
             return;
         }
-        if instr_count >= max_instrs_per_hart {
-            if !module.stop_flag.swap(true, Ordering::Release) {
-                if let Ok(mut guard) = module.stop_info.lock() {
-                    *guard = StopInfo::empty();
-                }
+        // External interrupt (UART, VirtIO, …): daemon set pending after
+        // injecting data into UART RX FIFO.  Raise SEIP/MEIP inline so the
+        // guest's trap handler processes the interrupt within this batch.
+        // The batch exits naturally when the guest's PLIC driver reads
+        // claim/complete MMIO registers — no forced exit needed.
+        if !ext_irq.is_null() && unsafe { (*ext_irq).pending != 0 } {
+            unsafe { (*ext_irq).pending = 0; }
+            if state.mie & (1 << 9) != 0 {
+                state.mip |= 1 << 9;  // SEIP
             }
-            return;
+            if state.mie & (1 << 11) != 0 {
+                state.mip |= 1 << 11; // MEIP
+            }
         }
         if state.halted != 0 {
             std::hint::spin_loop();
@@ -1423,15 +1437,16 @@ pub(crate) fn hart_worker(
             state, &f, instr_word, &ctx, hart_id, pmp, dev, clint, uart, module,
         );
         if advance == EXIT_SENTINEL {
-            if !module.stop_flag.load(Ordering::Acquire) {
-                module.request_stop(StopInfo {
-                    reason: exit_reason::MMIO,
-                    hart_id,
-                    pc: pc_before,
-                    instr: instr_word,
-                    ..StopInfo::empty()
-                });
+            if module.stop_flag.load(Ordering::Acquire) {
+               return;
             }
+			module.request_stop(StopInfo {
+				reason: exit_reason::MMIO,
+				hart_id,
+				pc: pc_before,
+				instr: instr_word,
+				..StopInfo::empty()
+			});
             return;
         }
 
@@ -1460,6 +1475,17 @@ mod tests {
     use crate::handlers::{DevCtx, PmpCtx};
     use crate::state::{riscv_mode, FfiUartCtx, HartState, TlbEntry};
     use crate::translate::WalkCtx;
+
+    /// Build a permissive PMP context: single TOR entry covering all of
+    /// memory with R/W/X.  Needed because pmp_ok per RISC-V spec §3.7.1
+    /// denies S/U access when num_entries==0.
+    fn make_permissive_pmp(cfg: &mut [u8], addr: &mut [u64]) -> PmpCtx {
+        // TOR entry: covers [0, addr[0]) = [0, u64::MAX) — entire address space.
+        // PMP_R(1) | PMP_W(2) | PMP_X(4) | PMP_A_TOR(8)
+        cfg[0] = 0x0F;
+        addr[0] = u64::MAX;
+        PmpCtx { cfg: cfg.as_mut_ptr(), addr: addr.as_mut_ptr(), num: 1 }
+    }
 
     /// Build a minimal 4K-page Sv39 page table inside RAM.
     /// Places L2 at PA 0x5000, L1 at 0x6000, L0 at 0x7000.
@@ -1563,11 +1589,7 @@ mod tests {
         // PMP with zero entries — no restrictions (pmp_ok short-circuits on num==0).
         let mut _pmp_cfg = vec![0u8; 64];
         let mut _pmp_addr = vec![0u64; 64];
-        let pmp = PmpCtx {
-            cfg: _pmp_cfg.as_mut_ptr(),
-            addr: _pmp_addr.as_mut_ptr(),
-            num: 0,
-        };
+        let pmp = make_permissive_pmp(&mut _pmp_cfg, &mut _pmp_addr);
 
         // 8-byte read at VA 0x1FFC — crosses page boundary.
         let (val, ok) = read_ram_cross_page(&mut state, &ctx, 0x1FFC, 0x1FFC, 8, &pmp);
@@ -1620,11 +1642,7 @@ mod tests {
         };
         let mut _pmp_cfg = vec![0u8; 64];
         let mut _pmp_addr = vec![0u64; 64];
-        let pmp = PmpCtx {
-            cfg: _pmp_cfg.as_mut_ptr(),
-            addr: _pmp_addr.as_mut_ptr(),
-            num: 0,
-        };
+        let pmp = make_permissive_pmp(&mut _pmp_cfg, &mut _pmp_addr);
 
         // Write 0xCCCCCCCC_DDDDDDDD at VA 0x1FFC (4 bytes to each page).
         let val: u64 = 0xCCCC_CCCC_DDDD_DDDD;
@@ -1671,11 +1689,7 @@ mod tests {
         };
         let mut _pmp_cfg = vec![0u8; 1];
         let mut _pmp_addr = vec![0u64; 1];
-        let pmp = PmpCtx {
-            cfg: _pmp_cfg.as_mut_ptr(),
-            addr: _pmp_addr.as_mut_ptr(),
-            num: 0,
-        };
+        let pmp = make_permissive_pmp(&mut _pmp_cfg, &mut _pmp_addr);
         let dev = DevCtx {
             bases: std::ptr::null(),
             ends: std::ptr::null(),
@@ -1693,6 +1707,8 @@ mod tests {
             mtimecmp: &_mtimecmp,
             msip: &_msip,
             num_harts: 1,
+            states: std::ptr::null_mut(),
+            msip_pending: Cell::new(std::ptr::null()),
         };
         let _tx_buf = [0u8; 16];
         let _tx_wr = std::sync::atomic::AtomicU32::new(0);
@@ -1711,9 +1727,10 @@ mod tests {
         let _wfi_flags: Vec<std::sync::atomic::AtomicU8> = (0..1)
             .map(|_| std::sync::atomic::AtomicU8::new(0))
             .collect();
-        let _wfi_threads: Vec<std::sync::Mutex<Option<std::thread::Thread>>> =
-            (0..1).map(|_| std::sync::Mutex::new(None)).collect();
-        let _tlb_gen: Vec<std::sync::atomic::AtomicU64> = (0..1)
+                let _tlb_gen: Vec<std::sync::atomic::AtomicU64> = (0..1)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        let _msip_pending: Vec<std::sync::atomic::AtomicU64> = (0..1)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
         let module = ModuleState {
@@ -1721,11 +1738,11 @@ mod tests {
             stop_info: std::sync::Mutex::new(StopInfo::empty()),
             wfi_count: std::sync::atomic::AtomicU32::new(0),
             wfi_flags: _wfi_flags.into_boxed_slice(),
-            wfi_threads: _wfi_threads.into_boxed_slice(),
-            active_hart_num: 1,
+                        active_hart_num: 1,
             tlb_gen: std::sync::atomic::AtomicU64::new(0),
             tlb_gen_per_hart: _tlb_gen.into_boxed_slice(),
             lr_reserved: Box::new([]),
+            msip_pending: _msip_pending.into_boxed_slice(),
         };
         // opcode=0000011, rd=15, func3=101(LHU), rs1=15, imm=0x336
         let instr: u32 = 0x3367d783u32; // lhu a5, 0x336(a5)
@@ -1775,11 +1792,7 @@ mod tests {
         };
         let mut _pmp_cfg = vec![0u8; 1];
         let mut _pmp_addr = vec![0u64; 1];
-        let pmp = PmpCtx {
-            cfg: _pmp_cfg.as_mut_ptr(),
-            addr: _pmp_addr.as_mut_ptr(),
-            num: 0,
-        };
+        let pmp = make_permissive_pmp(&mut _pmp_cfg, &mut _pmp_addr);
         let dev = DevCtx {
             bases: std::ptr::null(),
             ends: std::ptr::null(),
@@ -1796,6 +1809,8 @@ mod tests {
             mtimecmp: &_mtimecmp,
             msip: &_msip,
             num_harts: 1,
+            states: std::ptr::null_mut(),
+            msip_pending: Cell::new(std::ptr::null()),
         };
         let _tx_buf = [0u8; 16];
         let _tx_wr = std::sync::atomic::AtomicU32::new(0);
@@ -1814,9 +1829,10 @@ mod tests {
         let _wfi_flags: Vec<std::sync::atomic::AtomicU8> = (0..1)
             .map(|_| std::sync::atomic::AtomicU8::new(0))
             .collect();
-        let _wfi_threads: Vec<std::sync::Mutex<Option<std::thread::Thread>>> =
-            (0..1).map(|_| std::sync::Mutex::new(None)).collect();
-        let _tlb_gen: Vec<std::sync::atomic::AtomicU64> = (0..1)
+                let _tlb_gen: Vec<std::sync::atomic::AtomicU64> = (0..1)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+        let _msip_pending: Vec<std::sync::atomic::AtomicU64> = (0..1)
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
         let module = ModuleState {
@@ -1824,11 +1840,11 @@ mod tests {
             stop_info: std::sync::Mutex::new(StopInfo::empty()),
             wfi_count: std::sync::atomic::AtomicU32::new(0),
             wfi_flags: _wfi_flags.into_boxed_slice(),
-            wfi_threads: _wfi_threads.into_boxed_slice(),
-            active_hart_num: 1,
+                        active_hart_num: 1,
             tlb_gen: std::sync::atomic::AtomicU64::new(0),
             tlb_gen_per_hart: _tlb_gen.into_boxed_slice(),
             lr_reserved: Box::new([]),
+            msip_pending: _msip_pending.into_boxed_slice(),
         };
 
         let instr: u32 = 0x3367d783u32; // lhu a5, 0x336(a5)

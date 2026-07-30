@@ -24,6 +24,7 @@ PMA (Physical Memory Attributes):
 """
 
 import ctypes
+import os
 from abc import ABC, abstractmethod
 
 from pyremu._native import (
@@ -37,7 +38,9 @@ from pyremu._native import (
 # touches ctypes from_buffer() objects, which segfault the GC.
 _ram_native_ptrs: dict[int, int] = {}  # id(bytearray) -> raw pointer
 
-from pyremu.core.diag import NO_L2
+# Inlined from pyremu.core.diag to break circular import:
+#   bus → core.diag → core.__init__ → ... → clint → bus
+NO_L2 = os.environ.get("PYREMU_NO_L2") == "1"
 
 
 class Device(ABC):

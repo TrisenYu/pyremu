@@ -13,12 +13,16 @@ pub struct SpinGuard<'a, T> {
 impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
     #[inline]
-    fn deref(&self) -> &T { unsafe { &*self.lock.data.get() } }
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
 }
 
 impl<T> DerefMut for SpinGuard<'_, T> {
     #[inline]
-    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.lock.data.get() } }
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
 }
 
 impl<T> Drop for SpinGuard<'_, T> {
@@ -40,7 +44,10 @@ unsafe impl<T: Send> Sync for SpinLock<T> {}
 impl<T> SpinLock<T> {
     /// 用给定数据创建自旋锁。
     pub const fn new(data: T) -> Self {
-        Self { lock: AtomicI32::new(0), data: UnsafeCell::new(data) }
+        Self {
+            lock: AtomicI32::new(0),
+            data: UnsafeCell::new(data),
+        }
     }
 
     /// 获取锁。自旋直到成功。

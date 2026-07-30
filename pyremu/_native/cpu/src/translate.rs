@@ -227,26 +227,25 @@ fn read_pte(ctx: &WalkCtx, pa: u64) -> u64 {
 /// Write a 64-bit raw PTE value to physical memory (A/D bit update).
 ///
 /// Uses ``AtomicU64::store(Release)`` to pair with the ``Acquire`` load in
-/// ``read_pte`` so that A/D-bit updates made by one hart's walker are visible
-/// to another hart's walker.  Skipping the write when the value is unchanged
-/// is handled by the caller (``write_pte_if_changed``).
+/// CAS-based PTE write-back for A/D bit updates.
+///
+/// Returns ``true`` if the CAS succeeded (PTE was unchanged since *expected*
+/// was read).  On failure another hart modified the PTE concurrently — the
+/// caller must re-read and re-validate to avoid overwriting a concurrent
+/// unmapping/remapping with stale A/D bits.
 #[inline]
-fn write_pte_raw(ctx: &WalkCtx, pa: u64, val: u64) {
+fn write_pte_cas(ctx: &WalkCtx, pa: u64, expected: u64, new_val: u64) -> bool {
+    if new_val == expected {
+        return true;
+    }
     let off = match ram_offset(ctx, pa, 8) {
         Some(o) => o,
-        None => return,
+        None => return false,
     };
     let ptr = unsafe { ctx.ram.add(off) };
-    let a = unsafe { &*(ptr as *mut AtomicU64) };
-    a.store(val, Ordering::Release);
-}
-
-/// Write-back only if *val* differs from the current PTE (spare writes).
-#[inline]
-fn write_pte_if_changed(ctx: &WalkCtx, pa: u64, old: u64, new: u64) {
-    if new != old {
-        write_pte_raw(ctx, pa, new);
-    }
+    let a = unsafe { &*(ptr as *const AtomicU64) };
+    a.compare_exchange(expected, new_val, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 // ============================================================
@@ -278,13 +277,20 @@ fn walk_l2(ctx: &WalkCtx, root_ppn: u64, vpn2: u64) -> Option<(u64, crate::mmu::
         return None;
     }
     if raw & PTE_A == 0 {
-        write_pte_raw(ctx, addr, raw | PTE_A);
+        if !write_pte_cas(ctx, addr, raw, raw | PTE_A) {
+            let raw2 = read_pte(ctx, addr);
+            let pte2 = pte_parse(raw2);
+            if pte2.v == 0 || pte2.is_leaf == 0 && pte2.is_ptr == 0 {
+                return None;
+            }
+            return Some((raw2, pte2));
+        }
     }
     Some((raw, pte))
 }
 
 /// From a valid L2 pointer, read L1; return `(raw, pte)` or `None`.
-/// Sets A bit on the L1 PTE.
+/// Sets A bit atomically on the L1 PTE.
 fn walk_l1(ctx: &WalkCtx, l2_ppn: u64, vpn1: u64) -> Option<(u64, crate::mmu::PteFields)> {
     let addr = (l2_ppn << 12).wrapping_add(vpn1 * 8);
     let raw = read_pte(ctx, addr);
@@ -293,7 +299,14 @@ fn walk_l1(ctx: &WalkCtx, l2_ppn: u64, vpn1: u64) -> Option<(u64, crate::mmu::Pt
         return None;
     }
     if raw & PTE_A == 0 {
-        write_pte_raw(ctx, addr, raw | PTE_A);
+        if !write_pte_cas(ctx, addr, raw, raw | PTE_A) {
+            let raw2 = read_pte(ctx, addr);
+            let pte2 = pte_parse(raw2);
+            if pte2.v == 0 || pte2.is_leaf == 0 && pte2.is_ptr == 0 {
+                return None;
+            }
+            return Some((raw2, pte2));
+        }
     }
     Some((raw, pte))
 }
@@ -313,11 +326,32 @@ fn walk_l1_leaf(
     if perm as u64 & need_perm != need_perm {
         return None;
     }
-    let mut new_raw = l1_raw | PTE_A;
-    if is_write {
-        new_raw |= PTE_D;
+    let want_a = l1_raw & PTE_A == 0;
+    let want_d = is_write && l1_raw & PTE_D == 0;
+    if want_a || want_d {
+        let mut new_raw = l1_raw;
+        if want_a { new_raw |= PTE_A; }
+        if want_d { new_raw |= PTE_D; }
+        if !write_pte_cas(ctx, l1_addr, l1_raw, new_raw) {
+            // CAS failed: another hart modified this PTE concurrently.
+            // Re-read and re-validate to avoid using a stale mapping.
+            let raw2 = read_pte(ctx, l1_addr);
+            let pte2 = pte_parse(raw2);
+            if pte2.v == 0 || pte2.is_leaf == 0 {
+                return None;
+            }
+            if pte2.perm as u64 & need_perm != need_perm {
+                return None;
+            }
+            let ppn2 = (pte2.ppn & 0xFFFF_FFFF_FFFF_FE00u64) | vpn0;
+            let pa2 = (ppn2 << 12) | offset;
+            return Some(TranslateResult {
+                pa: pa2 & 0xFFFF_FFFF_FFFF_FFFF,
+                perm: pte2.perm,
+                level: 1,
+            });
+        }
     }
-    write_pte_if_changed(ctx, l1_addr, l1_raw, new_raw);
 
     // PPN[43:9] from PTE, PPN[8:0] from VA vpn0
     let ppn = (l1_ppn & 0xFFFF_FFFF_FFFF_FE00u64) | vpn0;
@@ -348,11 +382,29 @@ fn walk_l0(
     if pte.perm as u64 & need_perm != need_perm {
         return None;
     }
-    let mut new_raw = raw | PTE_A;
-    if is_write {
-        new_raw |= PTE_D;
+    let want_a = raw & PTE_A == 0;
+    let want_d = is_write && raw & PTE_D == 0;
+    if want_a || want_d {
+        let mut new_raw = raw;
+        if want_a { new_raw |= PTE_A; }
+        if want_d { new_raw |= PTE_D; }
+        if !write_pte_cas(ctx, addr, raw, new_raw) {
+            let raw2 = read_pte(ctx, addr);
+            let pte2 = pte_parse(raw2);
+            if pte2.v == 0 || pte2.is_leaf == 0 {
+                return None;
+            }
+            if pte2.perm as u64 & need_perm != need_perm {
+                return None;
+            }
+            let pa = (pte2.ppn << 12) | offset;
+            return Some(TranslateResult {
+                pa: pa & 0xFFFF_FFFF_FFFF_FFFF,
+                perm: pte2.perm,
+                level: 0,
+            });
+        }
     }
-    write_pte_if_changed(ctx, addr, raw, new_raw);
 
     let pa = (pte.ppn << 12) | offset;
     Some(TranslateResult {
@@ -693,6 +745,58 @@ fn fault_code(is_execute: bool, is_write: bool) -> u64 {
 }
 
 // ============================================================
+//  TLB probe with SFENCE.VMA TOCTOU protection
+// ============================================================
+
+/// Result of probing the TLB with generation-counter TOCTOU protection.
+enum TlbProbeResult {
+    /// Clean TLB hit — return this translation immediately.
+    Hit(TranslateResult),
+    /// TLB hit but permission check failed — return this fault.
+    Fault(TranslateFault),
+    /// Fall through to page walk, optionally reusing this index.
+    Walk(Option<usize>),
+}
+
+/// Probe the TLB for *vpn*, with SFENCE.VMA TOCTOU protection when
+/// ``tlb_gen`` is available (multi-hart concurrent path).  Falls back to a
+/// plain lookup when ``tlb_gen`` is ``None`` (serial path / test setups).
+#[inline]
+fn tlb_probe(
+    tlb: &mut [TlbEntry],
+    vpn: u64,
+    va: u64,
+    asid: u16,
+    tlb_gen: Option<&AtomicU64>,
+    eff_mode: u8,
+    mstatus: u64,
+    is_write: bool,
+    is_execute: bool,
+) -> TlbProbeResult {
+    let gen_before = tlb_gen.map(|g| g.load(Ordering::Acquire));
+    match tlb_lookup(tlb, vpn, asid) {
+        TlbResult::Hit(idx) => {
+            if let Some(g) = tlb_gen {
+                if gen_before != Some(g.load(Ordering::Acquire)) {
+                    tlb[idx].valid = 0; // stale — invalidate, walk
+                    return TlbProbeResult::Walk(None);
+                }
+            }
+            let e = &tlb[idx];
+            if !check_pte_perm(e.perm, eff_mode, mstatus, is_write, is_execute) {
+                return TlbProbeResult::Fault(TranslateFault::PageFault(
+                    fault_code(is_execute, is_write),
+                ));
+            }
+            let pa = reconstruct_tlb_pa(e, va);
+            TlbProbeResult::Hit(TranslateResult { pa, perm: e.perm, level: e.level })
+        }
+        TlbResult::DirtyReuse(idx) => TlbProbeResult::Walk(Some(idx)),
+        TlbResult::Miss => TlbProbeResult::Walk(None),
+    }
+}
+
+// ============================================================
 //  Main translate helper
 // ============================================================
 
@@ -753,24 +857,29 @@ pub fn translate_va(
 
     // ---- TLB lookup ----
     let asid = ((state.satp >> 44) & 0xFFFF) as u16;
+
+    // Record gen before TLB probe so we can detect SFENCE.VMA broadcasts
+    // from other harts that happen DURING the page-table walk.  Without this
+    // re-check, a concurrent SFENCE.VMA after ``tlb_probe`` but before
+    // ``tlb_insert`` would leave a stale entry in the TLB — the next lookup
+    // would hit and return the now-invalid PPN.
+    let gen_before = if ctx.tlb_gen.is_null() {
+        None
+    } else {
+        Some(unsafe { &*ctx.tlb_gen }.load(Ordering::Acquire))
+    };
+
     let reuse_idx = if no_tlb != 0 {
         None
     } else {
-        match tlb_lookup(tlb, vpn, asid) {
-            TlbResult::Hit(idx) => {
-                let e = &tlb[idx];
-                if !check_pte_perm(e.perm, eff_mode, state.mstatus, is_write, is_execute) {
-                    return Err(TranslateFault::PageFault(fault_code(is_execute, is_write)));
-                }
-                let pa = reconstruct_tlb_pa(e, va);
-                return Ok(TranslateResult {
-                    pa,
-                    perm: e.perm,
-                    level: e.level,
-                });
-            }
-            TlbResult::DirtyReuse(idx) => Some(idx),
-            TlbResult::Miss => None,
+        match tlb_probe(
+            tlb, vpn, va, asid,
+            if ctx.tlb_gen.is_null() { None } else { Some(unsafe { &*ctx.tlb_gen }) },
+            eff_mode, state.mstatus, is_write, is_execute,
+        ) {
+            TlbProbeResult::Hit(result) => return Ok(result),
+            TlbProbeResult::Fault(fault) => return Err(fault),
+            TlbProbeResult::Walk(reuse) => reuse,
         }
     };
 
@@ -782,25 +891,40 @@ pub fn translate_va(
         return Err(TranslateFault::PageFault(fault_code(is_execute, is_write)));
     }
 
-    // ---- Insert into TLB ----
-    let tlb_mut = if is_execute {
-        &mut state.itlb
-    } else {
-        &mut state.dtlb
+    // ---- Re-check gen after walk, before TLB insert ----
+    // If another hart executed SFENCE.VMA during our walk, the PTE we just
+    // read may be stale.  Skip the TLB insert — the stale entry won't be
+    // cached, and the next lookup will re-walk with the current PTE.
+    // This closes the TOCTOU window between tlb_probe and tlb_insert.
+    let gen_valid = match gen_before {
+        None => true,
+        Some(gb) => {
+            let ga = unsafe { &*ctx.tlb_gen }.load(Ordering::Acquire);
+            gb == ga
+        }
     };
-    let mut h = hand.get();
-    tlb_insert(
-        tlb_mut,
-        &mut h,
-        reuse_idx,
-        vpn,
-        result.ppn_for_tlb(vpn),
-        result.perm,
-        result.level,
-        state.mdid,
-        asid,
-    );
-    hand.set(h);
+
+    // ---- Insert into TLB (only if gen is still valid) ----
+    if gen_valid {
+        let tlb_mut = if is_execute {
+            &mut state.itlb
+        } else {
+            &mut state.dtlb
+        };
+        let mut h = hand.get();
+        tlb_insert(
+            tlb_mut,
+            &mut h,
+            reuse_idx,
+            vpn,
+            result.ppn_for_tlb(vpn),
+            result.perm,
+            result.level,
+            state.mdid,
+            asid,
+        );
+        hand.set(h);
+    }
 
     Ok(result)
 }

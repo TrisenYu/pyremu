@@ -60,6 +60,8 @@ pub struct EnclaveContext {
     pub enclave_module_load_va: u64,
     /// U-mode 堆顶。
     pub umode_heap_top: u64,
+    /// mmap 匿名映射当前 VA 上限 (从 UMODE_MMAP_BASE 向上增长)。
+    pub umode_mmap_base: u64,
     pub umode_pool: PoolDesc,
     pub smode_pool: PoolDesc,
     #[allow(dead_code)]

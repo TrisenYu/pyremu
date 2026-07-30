@@ -1,3 +1,181 @@
+## 2026-07-30 — 事件驱动执行引擎 + PMP MPRV 修复 + Ctrl+Q 调试器暂停
+
+### PMP MPRV — `clear` 崩溃根因修复 (最关键)
+
+**现象**: OpenSBI `clear` 命令间歇性 `SIGSEGV` (`badaddr=0x80017802`, `cause=1`,
+`epc=0x3ff7ebed74` in libc.so).
+
+**根因**: `pmp_ok` 对 M 模式取指错误应用了 MPRV (RISC-V 规范 §4.1.12 明确规定
+"Instruction access-fault and instruction page-fault exceptions are unaffected by
+MPRV"). OpenSBI 的 `sbi_get_insn` 设 `MPRV=1 (MPP=U)` 后, 其内部的指令取指
+(0x80017802) 被 PMP 以 U 模式权限检查 → `InstrAccessFault` → OpenSBI 将其转发到
+S 模式 → 用户进程触发第二个 trap → 双重故障.
+
+**修复** ([pmp.rs](pyremu/_native/cpu/src/pmp.rs), [trap.rs](pyremu/_native/cpu/src/trap.rs),
+[trap_handler.py](pyremu/core/trap_handler.py)):
+- M 模式取指无条件绕过 PMP (两处: `num==0` 分支 + 主 M 模式 bypass 分支)
+- `deliver_trap_mmode` 在进入 M 模式 handler 时清除 MPRV (bit 17), 防止 handler
+  自身的栈操作使用错误 MMU 翻译 — 两侧 (Rust + Python) 同步修复
+- MPRV 清除确保嵌套中断 (在 OpenSBI `sbi_get_insn` 的 MPRV=1 窗口内) 不会
+  将 M 模式栈地址用 S 模式页表翻译
+
+### PMP `num==0` 语义修正
+
+**现象**: PMP 条目数为 0 时, `pmp_ok` 原返回 `true` (无限制), 违反了规范 §3.7.1:
+"when no PMP entries are implemented, S and U mode accesses are denied."
+
+**修复** ([pmp.rs](pyremu/_native/cpu/src/pmp.rs)): `num==0` 时仅 M 模式允许访问,
+S/U 模式全部拒绝 (M 模式取指无条件允许, MPRV 影响数据访存). 所有测试 PMP context
+改用单条 permissive TOR 条目 (`[0, u64::MAX)`).
+
+### 事件驱动 WFI 自旋 — 移除定时器休眠
+
+完全重写 WFI 自旋逻辑 ([wfi.rs](pyremu/_native/cpu/src/interrupt/wfi.rs)):
+
+- 移除 `park_timeout` + `wfi_threads` 线程注册/唤醒机制
+- 移除三级退避 (hot spin → yield → park)
+- 纯事件驱动: `spin_loop()` (前 64 次) → `yield_now()` (后续)
+- 全部 `fetch_add`/`fetch_sub` 改为 Release/Acquire 序, 修复 `Relaxed` 内存序
+  导致的 wfi_count 不一致
+
+### 跨线程原子 MSIP 投递通道
+
+**根因**: 发送方 hart 直接写 `(*states).mip |= 1<<3` — 非原子 RMW, 与接收方
+`sync_mtip`/`sync_msip` 的并发 mip 修改存在数据竞争.
+
+**修复** ([concurrent.rs](pyremu/_native/cpu/src/concurrent.rs),
+[clint.rs](pyremu/_native/cpu/src/interrupt/clint.rs)):
+- 新增 `ModuleState.msip_pending: Box<[AtomicU64]>` — 每个 hart 独立的原子通知槽
+- `clint_write_msip_concurrent`: 发送方 `fetch_or(1<<3, Release)` 写入目标 hart 的
+  原子槽, 替代直接写 `HartState.mip`
+- `sync_msip`: 接收方先 `swap(0, Acquire)` 排干原子槽, 再合并入 `state.mip`
+- CLINT MSIP level bit 原子 test-and-clear: `fetch_and(0xFE, AcqRel)` 替代
+  load-then-store, 消除 TOCTOU 窗口 (两次 MSIP 写之间 level bit 被误清)
+- 移除 `clint_write_msip_concurrent` 中的 `unpark()` (不再需要 — 无 park)
+- `msip_pending: Cell<*const AtomicU64>` 延迟初始化 (Rust 侧 `ModuleState`
+  创建后才能取到地址)
+
+### 连续执行 — 移除 `max_instrs_per_hart`
+
+**修复** ([hart_sched.rs](pyremu/_native/cpu/src/hart_sched.rs)):
+- 删除 `instr_count >= max_instrs_per_hart` 检查 — harts 持续运行直到
+  `stop_flag` (Ctrl+Q) 或 MMIO 退出 (设备访问回 Python)
+- MMIO 退出逻辑改为: `stop_flag` 已置时不重复设置, 直接 return
+
+### Ctrl+Q 调试器暂停 + Ctrl+C 客机透传
+
+**设计** (QEMU Ctrl+A x 模型, 用户选择 Ctrl+Q 替代):
+
+**终端模式** ([base.py](pyremu/debug/base.py)):
+- ISIG 关闭: Ctrl+C 不生成 SIGINT, 作为 `0x03` 字节透传给客机 (zsh 收到 SIGINT)
+- IXON 关闭: Ctrl+Q/Ctrl+S (XON/XOFF) 透传, 不被终端驱动消费
+- ICRNL 显式开启: `\r` → `\n` 转换, Enter 键正常
+
+**Ctrl+Q 拦截** ([base.py](pyremu/debug/base.py) `_stdin_daemon_loop`):
+- Daemon 检测 `data.find(b'\x11')` → 单次 Ctrl+Q 立即暂停
+- 置 `stop_flag.value = 1` + `_wake_event.set()` → Rust WFI 退出 → 主循环检测
+- Ctrl+Q 之前的待处理字节先注入 UART, 再 return
+
+**主循环检测** ([exec.py](pyremu/debug/exec.py)):
+- `step()` 返回后检查 `_native_stop_flag` ≠ 0 → `_paused = True`, 进入 REPL
+
+**SIGINT 处理** ([base.py](pyremu/debug/base.py)):
+- 运行模式: `signal(SIGINT, SIG_IGN)` — 完全忽略, 避免 Ctrl+C 误入 prompt_toolkit
+
+**`_step_native` stop_flag 保护** ([emulator.py](pyremu/emulator.py)):
+- Daemon 已置 `stop_flag=1` 时不清零 (避免 Ctrl+Q 信号丢失)
+
+### 页表遍历 A/D 位原子更新 (CAS)
+
+**修复** ([translate.rs](pyremu/_native/cpu/src/translate.rs)):
+- `write_pte_if_changed` → `write_pte_cas`: 用 `AtomicU64::compare_exchange(AcqRel, Acquire)`
+  替代盲写 `store(Release)`
+- CAS 失败 (另一 hart 并发修改 PTE) → 调用方重新读取 PTE 并验证, 避免用陈旧
+  A/D 位覆盖并发 unmap/remap 操作
+
+### TLB 代际刷新 (Python 侧)
+
+**修复** ([emulator.py](pyremu/emulator.py), [tlb.py](pyremu/memory/tlb.py)):
+- Python TLB 刷新从无条件 (每 batch 后全刷) 改为 gen 条件: 仅在 `tlb_gen` 实际
+  变化时刷新 — 匹配 QEMU 风格
+- `TLBLine.gen` 字段: 记录插入时的 `tlb_gen`, lookup 时比较, 不匹配则视为失效
+  (SFENCE.VMA 语义)
+- `_tlb_gen_before` 快照: batch 前保存 gen 值, batch 后比较决定是否刷新
+
+### WFI mtime 推进: 无定时器时的回退
+
+**修复** ([emulator.py](pyremu/emulator.py)):
+- WFI + 全部 idle 时, 若无定时器, 仍推进 mtime 1 tick — 真实硬件时间永远流逝
+- 64 位自然截断 (无 cap), 信任硬件 wrap-around 语义
+
+### 访存指令 Acquire fence
+
+**修复** ([hart_sched.rs](pyremu/_native/cpu/src/hart_sched.rs)):
+- `fetch_instr` 在读取指令字节前加 `atomic::fence(Acquire)` — 与 `ram_write_raw`
+  的 Release store 配对, 确保 hart 能观察到另一个 hart 的 store→page 指令字节
+
+### C.LWSP / C.LDSP rd=0 保留编码陷态
+
+**修复** ([handlers.rs](pyremu/_native/cpu/src/handlers.rs), [decoder.py](pyremu/core/decoder.py)):
+- RISC-V 规范: C.LWSP 和 C.LDSP 的 rd=0 (x0) 是保留编码, 必须触发 IllInstr
+- Rust 和 Python 两侧同步修复, 新增回归测试 3 条
+
+### C.FLDSP FS=0 陷态
+
+**修复** ([handlers.rs](pyremu/_native/cpu/src/handlers.rs)):
+- 浮点扩展未启用 (mstatus.FS=0) 时执行 C.FLDSP → IllInstr 陷态
+
+### 反汇编改进
+
+- C.SLLI rd=0: 不再显示 `c.?`, 改为正常显示 `c.slli x0, shamt` (HINT 语义,
+  CPU 执行 NOP, 反汇编展示表观语义)
+- C.FLDSP rd=0: 正常显示 `c.fldsp ft0, ...` (ft0 是合法 FP 目的地)
+
+### 删除 `run_batch` 串行引擎
+
+- 删除 [exec.rs](pyremu/_native/cpu/src/exec.rs) (2,403 行) + `mod exec` + `pub use exec::*`
+- 删除 Python FFI 绑定 (`_lib.run_batch`) + 完整 `run_batch()` 函数 (156 行)
+- `run_parallel` 是唯一执行路径
+
+### Bus 循环导入修复
+
+- `bus.py` 内联 `PYREMU_NO_L2` 环境变量检查, 消除 `bus → core.diag → core.__init__ → ... → bus` 循环
+
+### Rust S-mode 运行时重构
+
+- `call.rs` → 移入 `syscall/` 子目录 (按 ecall 功能拆分为多文件)
+- 新增 `ecall_aux.rs` (辅助 ecall 包装器)
+- `syscall.rs` → 拆分为 `syscall/` 模块
+
+### TEE 内核驱动 + 缓存侧信道 PoC (新增, 未跟踪)
+
+- `third-party/tee_enclave_drv/`: Linux 字符设备驱动 (`/dev/tee_enclave`),
+  ioctl 接口 (ENTER/GET_ID/GET_MEM), SBI ecall 内联
+- `tests/src-sidecache/`: cache side-channel 探测 PoC (flush+reload,
+  TLB leak payload), 待集成测试
+
+### 修复清单
+
+| 修复 | 文件 | 影响 |
+|------|------|------|
+| M 模式取指忽略 MPRV | pmp.rs | `clear` 崩溃根因 |
+| MPRV 清除于 M 模式 trap 入口 | trap.rs, trap_handler.py | 嵌套中断 M 栈损坏 |
+| PMP num==0 拒绝 S/U | pmp.rs | 规范合规 |
+| 事件驱动 WFI (无 sleep) | wfi.rs, concurrent.rs | 并发安全 + 延迟 |
+| 原子 MSIP 通道 | clint.rs, concurrent.rs | 数据竞争消除 |
+| 移除 max_instrs_per_hart | hart_sched.rs, emulator.py | 连续执行 |
+| Ctrl+Q 暂停 + Ctrl+C 透传 | base.py, exec.py, emulator.py | 调试器 UX |
+| Enter 键 (ICRNL) | base.py | 终端 I/O |
+| PTE A/D 原子 CAS | translate.rs | 并发页表安全 |
+| TLB gen 条件刷新 | emulator.py, tlb.py | 性能 |
+| WFI mtime 回退推进 | emulator.py | 时钟单调性 |
+| fetch_instr Acquire fence | hart_sched.rs | 指令可见性 |
+| C.LWSP/C.LDSP rd=0 陷态 | handlers.rs, decoder.py | 规范合规 |
+| C.FLDSP FS=0 陷态 | handlers.rs | 规范合规 |
+| 删除 run_batch 引擎 | exec.rs, __init__.py | 代码清理 |
+| Bus 循环导入 | bus.py | 导入顺序 |
+
+
 ## 2026-07-21 — 多核 TLB/缓存一致性 + 中断投递修复
 
 ### 多核 TLB 一致性: 跨批次 Python TLB 刷新 (最关键修复)

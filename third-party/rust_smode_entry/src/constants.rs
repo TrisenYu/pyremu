@@ -73,6 +73,9 @@ pub const LINEAR_MAP_OFFSET: u64 = 0xFFFF_FFC0_0000_0000;
 pub const UMODE_HEAP_START_ALIGNED: u64 = 0x1_0000_0000;
 pub const UMODE_STACK_TOP_VA: u64 = 0x1_4000_0000;
 
+/// mmap 匿名映射起始 VA, 从高地址向下增长, 避开 heap (0x1_0000_0000) 和 stack.
+pub const UMODE_MMAP_BASE: u64 = 0x2_0000_0000;
+
 // ---------------------------------------------------------------
 //  大小常量
 // ---------------------------------------------------------------

@@ -326,10 +326,12 @@ def _parse_pe(
     # 提取导出符号 (函数/变量名 -> 地址)
     symbols: dict[str, int] = {}
 
-    for exp in binary.get_export().entries:
-        tmp = str(exp.name)
-        if len(tmp) > 0:
-            symbols[tmp] = exp.value
+    exported = binary.get_export()
+    if exported is not None:
+        for exp in exported.entries:
+            tmp = str(exp.name)
+            if len(tmp) > 0:
+                symbols[tmp] = exp.value
 
     return FirmwareImage(
         entry_point=entry_point,

@@ -1311,6 +1311,10 @@ fn handle_c2(
         }
         0b001 => {
             // C.FLDSP: fpr[rd] = mem[sp + uimm] (RV64DC)
+            if (state.mstatus & MSTATUS_FS_LS) == 0 {
+                deliver_illegal_instruction(state, instr_word as u64, result);
+                return 0;
+            }
             let addr = state.gprs[2].wrapping_add(cf.imm);
             let prev_mode = state.mode;
             let val = load_mem_compressed(
@@ -1320,6 +1324,8 @@ fn handle_c2(
                 return 0;
             } // trap delivered
             if val == EXIT_SENTINEL {
+                // load_mem_compressed returns EXIT_SENTINEL only for device
+                // MMIO — not possible for a stack load, but guard anyway.
                 return EXIT_SENTINEL;
             }
             state.fprs[cf.rd as usize] = val;
@@ -1328,6 +1334,10 @@ fn handle_c2(
         }
         0b010 => {
             // C.LWSP: rd = mem[sp + uimm]
+            if cf.rd == 0 {
+                deliver_illegal_instruction(state, instr_word as u64, result);
+                return 0;
+            }
             let addr = state.gprs[2].wrapping_add(cf.imm);
             let prev_mode = state.mode;
             let val = load_mem_compressed(
@@ -1345,6 +1355,10 @@ fn handle_c2(
         }
         0b011 => {
             // C.LDSP: rd = mem[sp + uimm]
+            if cf.rd == 0 {
+                deliver_illegal_instruction(state, instr_word as u64, result);
+                return 0;
+            }
             let addr = state.gprs[2].wrapping_add(cf.imm);
             let prev_mode = state.mode;
             let val = load_mem_compressed(

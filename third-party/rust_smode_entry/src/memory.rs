@@ -7,6 +7,7 @@
 
 use crate::constants::*;
 use crate::context::{self, PoolDesc};
+use crate::ecall_aux;
 use crate::hang;
 use crate::paging;
 
@@ -15,10 +16,14 @@ use crate::paging;
 // ---------------------------------------------------------------
 
 #[inline]
-pub const fn page_up(x: u64) -> u64 { (x + PAGE_SIZE - 1) & !(PAGE_SIZE - 1) }
+pub const fn page_up(x: u64) -> u64 {
+    (x + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+}
 
 #[inline]
-pub const fn page_down(x: u64) -> u64 { x & !(PAGE_SIZE - 1) }
+pub const fn page_down(x: u64) -> u64 {
+    x & !(PAGE_SIZE - 1)
+}
 
 #[inline]
 pub const fn chunk_2m_up(x: u64) -> u64 {
@@ -26,18 +31,28 @@ pub const fn chunk_2m_up(x: u64) -> u64 {
 }
 
 #[inline]
-pub const fn chunk_2m_down(x: u64) -> u64 { x & !(CHUNK_2M_SIZE - 1) }
+pub const fn chunk_2m_down(x: u64) -> u64 {
+    x & !(CHUNK_2M_SIZE - 1)
+}
 
 // ---------------------------------------------------------------
 //  页池初始化
 // ---------------------------------------------------------------
 
 pub fn init_smode_pool(offset: u64, size: u64) {
-    context::ctx_mut().smode_pool = PoolDesc { offset, size, used_pages: 0 };
+    context::ctx_mut().smode_pool = PoolDesc {
+        offset,
+        size,
+        used_pages: 0,
+    };
 }
 
 pub fn init_umode_pool(offset: u64, size: u64) {
-    context::ctx_mut().umode_pool = PoolDesc { offset, size, used_pages: 0 };
+    context::ctx_mut().umode_pool = PoolDesc {
+        offset,
+        size,
+        used_pages: 0,
+    };
 }
 
 // ---------------------------------------------------------------
@@ -47,7 +62,11 @@ pub fn init_umode_pool(offset: u64, size: u64) {
 /// 从指定页池分配 `n` 个物理页，返回物理地址。
 fn pool_alloc(n: u64, is_umode: bool) -> u64 {
     let ctx = context::ctx();
-    let pool = if is_umode { &ctx.umode_pool } else { &ctx.smode_pool };
+    let pool = if is_umode {
+        &ctx.umode_pool
+    } else {
+        &ctx.smode_pool
+    };
 
     let expected = pool.used_pages + n;
     if expected * PAGE_SIZE > pool.size {
@@ -61,15 +80,24 @@ fn pool_alloc(n: u64, is_umode: bool) -> u64 {
     };
     let top = chunk_start + pool.offset + pool.used_pages * PAGE_SIZE;
 
-    let p = if is_umode { &mut context::ctx_mut().umode_pool }
-            else { &mut context::ctx_mut().smode_pool };
+    let p = if is_umode {
+        &mut context::ctx_mut().umode_pool
+    } else {
+        &mut context::ctx_mut().smode_pool
+    };
     p.used_pages = expected;
     top
 }
 
-pub fn alloc_smode_page(n: u64) -> u64 { pool_alloc(n, false) }
-pub fn alloc_umode_page(n: u64) -> u64 { pool_alloc(n, true) }
-pub fn umode_pool_avail() -> u64 { context::ctx().umode_pool.avail_bytes() }
+pub fn alloc_smode_page(n: u64) -> u64 {
+    pool_alloc(n, false)
+}
+pub fn alloc_umode_page(n: u64) -> u64 {
+    pool_alloc(n, true)
+}
+pub fn umode_pool_avail() -> u64 {
+    context::ctx().umode_pool.avail_bytes()
+}
 
 // ---------------------------------------------------------------
 //  段映射
@@ -99,47 +127,47 @@ pub fn map_sections() {
         map_one_section(
             &raw const _text_start as u64,
             &raw const _text_end as u64,
-            va_ofs, PTE_X,
+            va_ofs,
+            PTE_X,
         );
         map_one_section(
             &raw const _rodata_start as u64,
             &raw const _rodata_end as u64,
-            va_ofs, PTE_R,
+            va_ofs,
+            PTE_R,
         );
         map_one_section(
             &raw const _data_start as u64,
             &raw const _data_end as u64,
-            va_ofs, PTE_R | PTE_W,
+            va_ofs,
+            PTE_R | PTE_W,
         );
         map_one_section(
             &raw const _bss_start as u64,
             &raw const _bss_end as u64,
-            va_ofs, PTE_R | PTE_W,
+            va_ofs,
+            PTE_R | PTE_W,
         );
     }
 }
 
 /// 映射单个段：start_pa / end_pa -> VA = PA + va_offset。
-unsafe fn map_one_section(
-    sec_start: u64,
-    sec_end: u64,
-    va_offset: u64,
-    flags: u8,
-) {
-    if sec_start >= sec_end { return; }
+unsafe fn map_one_section(sec_start: u64, sec_end: u64, va_offset: u64, flags: u8) {
+    if sec_start >= sec_end {
+        return;
+    }
     let size = sec_end.wrapping_sub(sec_start);
     // VA = PA + va_offset (sec_start 是 PIE 重定位后的运行时 PA)
     let va = sec_start.wrapping_add(va_offset);
     // DEBUG: trace first page
     let vpn2 = (va >> 30) & 0x1FF;
-    crate::println!(
-        "[map_sec] pa=0x{sec_start:x} va=0x{va:x} vpn2=0x{vpn2:x} flags=0x{flags:x}\n"
-    );
+    crate::println!("[map_sec] pa=0x{sec_start:x} va=0x{va:x} vpn2=0x{vpn2:x} flags=0x{flags:x}\n");
     for i in 0..(page_up(size) >> PAGE_SHIFT) {
         paging::map_page(
             va + i * PAGE_SIZE,
             page_down(sec_start) + i * PAGE_SIZE,
-            flags, LEVEL_PAGE,
+            flags,
+            LEVEL_PAGE,
         );
     }
 }
@@ -155,9 +183,7 @@ pub fn map_smode_page_pool(pool_ofs: u64, pool_size: u64) {
         let first_pa = start_pa;
         let first_va = first_pa.wrapping_add(va_ofs);
         let vpn2 = (first_va >> 30) & 0x1FF;
-        crate::println!(
-            "[map_pool] pa=0x{first_pa:x} va=0x{first_va:x} vpn2=0x{vpn2:x}\n"
-        );
+        crate::println!("[map_pool] pa=0x{first_pa:x} va=0x{first_va:x} vpn2=0x{vpn2:x}\n");
     }
 
     for i in 0..(pool_size >> PAGE_SHIFT) {
@@ -186,7 +212,8 @@ pub fn alloc_map_umode_stack() -> u64 {
         paging::map_page(
             bottom_va + i * PAGE_SIZE,
             bottom_pa + i * PAGE_SIZE,
-            PTE_U | PTE_R | PTE_W, LEVEL_PAGE,
+            PTE_U | PTE_R | PTE_W,
+            LEVEL_PAGE,
         );
     }
     UMODE_STACK_TOP_VA
@@ -234,8 +261,10 @@ pub fn sys_brk_handler(new_brk: u64) -> u64 {
         let pa = alloc_umode_page(take >> PAGE_SHIFT);
         for i in 0..(take >> PAGE_SHIFT) {
             paging::map_page(
-                aligned_old + i * PAGE_SIZE, pa + i * PAGE_SIZE,
-                PTE_U | PTE_R | PTE_W, LEVEL_PAGE,
+                aligned_old + i * PAGE_SIZE,
+                pa + i * PAGE_SIZE,
+                PTE_U | PTE_R | PTE_W,
+                LEVEL_PAGE,
             );
         }
         remain -= take;
@@ -243,30 +272,34 @@ pub fn sys_brk_handler(new_brk: u64) -> u64 {
 
     // 不够再向 M-mode 申请 CHUNK_2M
     if remain <= 0 {
-		context::ctx_mut().umode_heap_top = new_brk;
-    	return new_brk;
+        context::ctx_mut().umode_heap_top = new_brk;
+        return new_brk;
     }
 
-	let chunk_new = chunk_2m_up(aligned_new);
-	let chunk_old = chunk_2m_up(aligned_old);
-	let mut left = chunk_new.saturating_sub(chunk_old);
-	let mut va = chunk_old;
+    let chunk_new = chunk_2m_up(aligned_new);
+    let chunk_old = chunk_2m_up(aligned_old);
+    let mut left = chunk_new.saturating_sub(chunk_old);
+    let mut va = chunk_old;
 
-	while left > 0 {
-		let (allocated, pa) = crate::call::enclave_call_mem_alloc(left / CHUNK_2M_SIZE);
-		let bytes = allocated * CHUNK_2M_SIZE;
-		if bytes == 0 { break; }
-		for i in 0..allocated {
-			paging::map_page(
-				va + i * CHUNK_2M_SIZE, pa + i * CHUNK_2M_SIZE,
-				PTE_U | PTE_R | PTE_W, LEVEL_MEGA,
-			);
-		}
-		left = left.saturating_sub(bytes);
-		va += bytes;
-	}
-	context::ctx_mut().umode_heap_top = new_brk;
-	new_brk
+    while left > 0 {
+        let (allocated, pa) = ecall_aux::enclave_call_mem_alloc(left / CHUNK_2M_SIZE);
+        let bytes = allocated * CHUNK_2M_SIZE;
+        if bytes == 0 {
+            break;
+        }
+        for i in 0..allocated {
+            paging::map_page(
+                va + i * CHUNK_2M_SIZE,
+                pa + i * CHUNK_2M_SIZE,
+                PTE_U | PTE_R | PTE_W,
+                LEVEL_MEGA,
+            );
+        }
+        left = left.saturating_sub(bytes);
+        va += bytes;
+    }
+    context::ctx_mut().umode_heap_top = new_brk;
+    new_brk
 }
 
 // ---------------------------------------------------------------

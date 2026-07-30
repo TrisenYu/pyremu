@@ -661,6 +661,40 @@ class TestCompressedC2:
         # H-bit=1 -> 结果应为 1
         assert hart.gprs[15] == 1, f"H-bit=1 检测失败: 期望 1, 实际 {hart.gprs[15]}"
 
+    # -- C2 reserved encodings (rd=0 for GPR loads) --
+
+    def test_c_fldsp_ft0(self, hart):
+        """C.FLDSP ft0, 280(sp): rd=0 -> ft0 是合法 FP 目标 (非 reserved)."""
+        test_val = 0xFEED_FACE_CAFE_BABE
+        hart._mem_write_phy(0x8000 + 280, test_val.to_bytes(8, "little"))
+        hart.mstatus_val = 0x00006000  # FS=Initial (mstatus.FS=1)
+        # 0x2072: C.FLDSP ft0, 280(sp) — libc 中实际出现的编码
+        advance = hart.exec_instr(0x2072)
+        assert advance == 2, "C.FLDSP ft0 应正常完成, 不应陷态"
+        assert hart._fpr_bits[0] == test_val, (
+            f"C.FLDSP ft0: 期望 0x{test_val:016x}, 得到 0x{hart._fpr_bits[0]:016x}"
+        )
+
+    def test_c_lwsp_rd0_traps(self, hart):
+        """C.LWSP rd=0 是保留编码 (x0 不可做 load 目标), 必须触发 IllInstr 陷态."""
+        hart.csrs["mtvec"].val = 0x80000000
+        # _c2(0b010, 0, 0x22): C.LWSP rd=0, uimm=8
+        instr = _c2(0b010, 0, 0x22)
+        hart.exec_instr(instr)
+        assert hart.mcause_val == 2, (
+            f"C.LWSP rd=0 应投递 IllInstr, 实际 mcause={hart.mcause_val}"
+        )
+
+    def test_c_ldsp_rd0_traps(self, hart):
+        """C.LDSP rd=0 是保留编码，必须触发 IllInstr 陷态."""
+        hart.csrs["mtvec"].val = 0x80000000
+        # _c2(0b011, 0, 0x22): C.LDSP rd=0, uimm=8
+        instr = _c2(0b011, 0, 0x22)
+        hart.exec_instr(instr)
+        assert hart.mcause_val == 2, (
+            f"C.LDSP rd=0 应投递 IllInstr, 实际 mcause={hart.mcause_val}"
+        )
+
 
 # ============================================================
 #  FDT 探测场景测试 — 覆盖 fdt_driver_init_by_offset 中的

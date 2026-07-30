@@ -5,7 +5,7 @@
 //! | QEMU                                | 本实现                                      |
 //! |-------------------------------------|---------------------------------------------|
 //! | `qemu_chr_open_stdio` (term_init)   | `terminal_io_start`: 保存 termios + fcntl   |
-//! | `qemu_chr_set_echo_stdio(false)`    | raw-ish 模式: 关 ECHO/ICANON, 保留 OPOST/ISIG |
+//! | `qemu_chr_set_echo_stdio(false)`    | raw 模式: 关 ECHO/ICANON/ISIG, 保留 OPOST  |
 //! | `term_exit` (atexit + finalize)     | 线程退出路径恢复 termios + 两个 fd 的阻塞标志  |
 //! | `term_stdio_handler` (SIGCONT)      | `sigcont_handler`: Ctrl+Z 恢复后重设 raw     |
 //! | `fd_chr_read_poll` ->`can_write`    | RX 环形缓冲容量控制: 满时不读 stdin (留内核缓冲)  |
@@ -233,14 +233,39 @@ fn drain_tx(h: &TermIoHandle, chunk: &mut [u8]) {
 }
 
 /// Read available data from stdin into RX ring buffer.  Returns false on EOF.
+/// Ctrl+Q (0x11) is intercepted as the debugger escape key:
+///   - single Ctrl+Q: send SIGINT to own process (pause emulator), NOT forwarded
+///   - double Ctrl+Q: forward one 0x11 to the guest (like QEMU Ctrl+A Ctrl+A)
 fn read_stdin_to_rx(h: &TermIoHandle, free: usize, buf: &mut [u8]) -> (bool, usize) {
+    // Track whether the last byte written was Ctrl+Q — used for
+    // double-tap escape to send literal 0x11 to the guest.
+    static LAST_WAS_CTRL_Q: AtomicU8 = AtomicU8::new(0);
     let n = unsafe { libc::read(h.stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, free.min(buf.len())) };
     if n > 0 {
         let mut wr = unsafe { &*h.rx_wr }.load(Ordering::Relaxed);
         let rx = unsafe { std::slice::from_raw_parts_mut(h.rx_buf, h.rx_cap as usize) };
         for &b in &buf[..n as usize] {
-            rx[(wr % h.rx_cap) as usize] = b;
-            wr = wr.wrapping_add(1);
+            if b == 0x11 {
+                // Ctrl+Q — escape key
+                if LAST_WAS_CTRL_Q.swap(1, Ordering::Relaxed) == 1 {
+                    // Double-tap: forward one 0x11 to the guest
+                    rx[(wr % h.rx_cap) as usize] = 0x11;
+                    wr = wr.wrapping_add(1);
+                    LAST_WAS_CTRL_Q.store(0, Ordering::Relaxed);
+                } else {
+                    // Single tap: send SIGINT to pause debugger, don't forward
+                    unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+                }
+            } else {
+                // Any other byte: reset tracking, forward normally
+                if LAST_WAS_CTRL_Q.swap(0, Ordering::Relaxed) == 1 {
+                    // Flush a pending single Ctrl+Q that was NOT followed by
+                    // another Ctrl+Q — it must have been intended as an
+                    // escape, so don't retroactively forward it.
+                }
+                rx[(wr % h.rx_cap) as usize] = b;
+                wr = wr.wrapping_add(1);
+            }
         }
         unsafe { &*h.rx_wr }.store(wr, Ordering::Release);
         return (true, n as usize);
@@ -427,8 +452,9 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
         // ICRNL 保留: 宿主机将 \r->\n, 客机收到 \n 即可行终止
         | libc::IXON);
     raw.c_oflag |= libc::OPOST; // 保留输出后处理: '\n' ->CRLF
-    // 保留 ISIG (对照 QEMU stdio 默认 signal=on): Ctrl+C ->SIGINT ->调试器暂停回 REPL
-    raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::IEXTEN);
+    // 关闭 ISIG: Ctrl+C (0x03) 作为普通字节透传给客机.
+    // Ctrl+Q (0x11) 在 termio 线程中拦截并发送 SIGINT 替代暂停.
+    raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::IEXTEN | libc::ISIG);
     raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
     raw.c_cflag |= libc::CS8;
     raw.c_cc[libc::VMIN] = 1; // 每个按键即时可读

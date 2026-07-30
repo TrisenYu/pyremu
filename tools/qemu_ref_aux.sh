@@ -8,10 +8,12 @@ qemu-system-riscv64 \
   -drive file=third-party/setup-rootfs/debootstrap/riscv-sd.ext4,format=raw,if=none,id=drv0 \
   -device virtio-blk-device,drive=drv0 \
   -append "earlycon=sbi console=ttyS0 root=/dev/vda rw init=/bin/zsh norandmaps" \
-  -nographic -s -S \
-  -monitor tcp:127.0.0.1:5555,server,nowait
+  -nographic
+
+# -s -S \
+#   -monitor tcp:127.0.0.1:5555,server,nowait
 
 # 用 RISC-V GDB 连接
-/opt/custom-llvm/bin/llvm-gdb \
-  -ex "target remote :1234" \
-  third-party/linux/vmlinux
+# /opt/custom-llvm/bin/llvm-gdb \
+#   -ex "target remote :1234" \
+#   third-party/linux/vmlinux

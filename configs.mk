@@ -102,7 +102,7 @@ init           ?= /bin/zsh
 bootargs_extra ?=
 # norandmaps
 # nokaslr norandmaps
-_bootargs   = earlycon=sbi console=ttySIF0 nokaslr norandmaps
+_bootargs   = earlycon=sbi console=ttySIF0
 # _bootargs  += dyndbg="$(dyndbg)"
 _bootargs  += root=/dev/vda rw
 _bootargs  += $(if $(init),init=$(init))

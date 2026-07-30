@@ -89,6 +89,14 @@ pub fn deliver_trap(
     let is_interrupt = (code >> 63) != 0;
     let exc_code = code & 0x7FFF_FFFF_FFFF_FFFF;
 
+    // Diagnostic: trace every InstrAccessFault delivery.
+    if exc_code == exc_code::INSTR_ACCESS_FAULT && !is_interrupt {
+        diag::log_line(&format!(
+            "[trap-deliver] hart={} pc={:#018x} mode={} cause=INSTR_ACCESS_FAULT tval={:#018x}",
+            state.mhartid, state.pc, state.mode, tval,
+        ));
+    }
+
     // M-mode traps are never delegated.
     let delegate = if state.mode != riscv_mode::M {
         if is_interrupt {
@@ -99,6 +107,27 @@ pub fn deliver_trap(
     } else {
         false
     };
+
+    // Diagnostic: trace all non-delegated traps (M-mode delivery).
+    if !delegate {
+        let cause_name = if is_interrupt {
+            match exc_code {
+                3 => "MSI", 7 => "MTI", 11 => "MEI",
+                _ => "?",
+            }
+        } else {
+            match exc_code {
+                1 => "INSTR_ACCESS", 5 => "LD_ACCESS", 7 => "ST_ACCESS",
+                9 => "ECALL_SMODE", 12 => "INSTR_PAGE", 13 => "LD_PAGE",
+                15 => "ST_PAGE",
+                _ => "?",
+            }
+        };
+        diag::log_line(&format!(
+            "[trap-mmode] hart={} pc={:#018x} mode={} cause={} tval={:#018x} mstatus={:#018x}",
+            state.mhartid, state.pc, state.mode, cause_name, tval, state.mstatus,
+        ));
+    }
 
     if delegate {
         deliver_trap_smode(state, code, tval, result)
@@ -245,6 +274,14 @@ pub fn deliver_trap_mmode(
     state.mstatus &= !MSTATUS_MIE;
     state.mstatus = (state.mstatus & !MSTATUS_MPP) | mpp_bits;
 
+    // RISC-V spec: MPRV is cleared on trap entry to M-mode so the
+    // handler can safely access its own stack/data without going
+    // through the MMU translation of the previous privilege mode.
+    // Without this, nested interrupts during OpenSBI's MPRV=1
+    // window (sbi_get_insn) corrupt M-mode stack state because
+    // loads/stores use S-mode page tables for M-mode stack VAs.
+    state.mstatus &= !(1u64 << 17); // clear MPRV
+
     // Switch to M-mode
     state.mode = riscv_mode::M;
 
@@ -352,6 +389,14 @@ pub(crate) fn priv_mret_concurrent(state: &mut HartState, instr: u32) -> u64 {
     }
     state.mstatus |= 1 << 7;
     state.mstatus &= !(0b11 << 11);
+    // Log MRETs that land in OpenSBI's sbi_get_insn area (0x17700-0x17900)
+    // — this is the crash zone for the badaddr=0x80017802 bug.
+    if state.mepc >= 0x80017700 && state.mepc < 0x80017900 {
+        diag::log_line(&format!(
+            "[mret-sbi-get-insn] hart={} mepc={:#018x} mpp={} mstatus={:#018x}",
+            state.mhartid, state.mepc, mpp, state.mstatus,
+        ));
+    }
     state.pc = state.mepc;
     state.waiting = 0;
     state.consecutive_traps = 0; // successful trap completion

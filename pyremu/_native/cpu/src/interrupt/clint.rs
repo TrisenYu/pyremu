@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, Ordering};
+use crate::diag;
 use crate::state::{HartState};
 use crate::concurrent::{ConcurrentClintCtx, ModuleState};
 
@@ -16,8 +17,8 @@ use crate::handlers::MemAccess;
 
 pub(crate) fn sync_mtip(state: &mut HartState, clint: &ConcurrentClintCtx) {
     let hart_id = state.mhartid as usize;
-    let cur_mtime = unsafe { &*clint.mtime }.load(Ordering::Relaxed);
-    let cmp = unsafe { &*clint.mtimecmp.add(hart_id) }.load(Ordering::Relaxed);
+    let cur_mtime = unsafe { &*clint.mtime }.load(Ordering::Acquire);
+    let cmp = unsafe { &*clint.mtimecmp.add(hart_id) }.load(Ordering::Acquire);
     let sstc_cmp = state.stimecmp;
 
     if cmp > 0 && cur_mtime >= cmp {
@@ -55,40 +56,48 @@ pub(crate) fn sync_mtip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 #[inline]
 pub(crate) fn sync_msip(state: &mut HartState, clint: &ConcurrentClintCtx) {
     let hid = state.mhartid as usize;
+    // Atomically drain cross-thread MSIP notifications.
+    let pending_ptr = clint.msip_pending.get();
+    if pending_ptr.is_null() {
+        diag::log_line(&format!(
+            "[sync-msip-null] hart={} msip_pending is NULL — cross-thread MSIP delivery disabled",
+            state.mhartid,
+        ));
+    }
+    if !pending_ptr.is_null() {
+        let cross = unsafe { &*pending_ptr.add(hid) }.swap(0, Ordering::Acquire);
+        if cross != 0 {
+            state.mip |= cross;
+        }
+    }
     if hid >= clint.num_harts as usize {
         return;
     }
-    let raw = unsafe { &*clint.msip.add(hid) }.load(Ordering::Acquire);
+    // Atomic test-and-clear: single fetch_and replaces load-then-fetch_and,
+    // closing the TOCTOU window where a sender could write MSIP=1 between
+    // the load and the clear, silently dropping the second IPI.
+    let raw = unsafe { &*clint.msip.add(hid) }.fetch_and(0xFE, Ordering::AcqRel);
     let level_set = (raw & 1) != 0;
 
     // Level-triggered: mip.MSIP directly follows the CLINT level bit.
-    // - When level=1: set mip.MSIP, force mie.MSIE=1 (WFI wake needs mip&mie≠0),
-    //   auto-clear the CLINT level bit, and increment the diagnostic edge counter.
+    // - When level=1: set mip.MSIP.  Do NOT force mie.MSIE=1 — the
+    //   event-driven path (clint_write_msip_concurrent) deliberately
+    //   avoids it, and wfi_sync_and_check already has an MSIP exception
+    //   that wakes the hart regardless of mie.MSIE.  For interrupt
+    //   delivery, the hart's MIEs govern masking (matching real hardware).
+    //   The level bit was already auto-cleared by fetch_and above.
     // - When level=0: do NOT clear mip.MSIP — deliver_trap_{mmode,smode}
     //   handles that per RISC-V spec §3.1.15.
-    //
-    // Sender sends MSIP with a *single* atomic ``fetch_or(1)`` — no separate
-    // edge-counter increment.  This eliminates a race window where the
-    // receiver's auto-clear (``fetch_and(0xFE)``) could interleave between
-    // the sender's level-set and edge-increment, silently dropping a second
-    // MSIP stored to the same target.
     if level_set {
         state.mip |= 1 << 3;
-        if (state.mie & (1 << 3)) == 0 {
-            state.mie |= 1 << 3;
-        }
         // Diagnostic: count detected MSIP edges locally.
         #[cfg(feature = "diagnostic")] {
-			let prev_level: u8 = (state.diag.msip_last_seen & 1) as u8;
-		}
-        state.diag.msip_last_seen = (state.diag.msip_last_seen & !1) | (1u64);
-		#[cfg(feature = "diagnostic")]
-		if prev_level == 0 {
-			state.diag.clint_msip_set = state.diag.clint_msip_set.wrapping_add(1);
+            let prev_level: u8 = (state.diag.msip_last_seen & 1) as u8;
+            if prev_level == 0 {
+                state.diag.clint_msip_set = state.diag.clint_msip_set.wrapping_add(1);
+            }
         }
-        // Hardware auto-clear: acknowledge the MSIP source so it doesn't
-        // re-trigger after deliver_trap_mmode clears mip.MSIP.
-        unsafe { &*clint.msip.add(hid) }.fetch_and(0xFE, Ordering::Release);
+        state.diag.msip_last_seen = (state.diag.msip_last_seen & !1) | (1u64);
     }
 }
 
@@ -100,15 +109,26 @@ pub(crate) fn clint_write_msip_concurrent(clint: &ConcurrentClintCtx, target: us
     }
     let p = unsafe { &*clint.msip.add(target) };
     if val & 1 != 0 {
-        // Write-1: atomically set the level bit.  Single atomic operation
-        // — no race with the receiver's auto-clear.  The previous two-step
-        // sequence (fetch_or(1) + fetch_add(2)) had a window where the
-        // receiver's fetch_and(0xFE) could interleave and clear a level bit
-        // that was just set by a second sender, silently dropping MSIPs.
+        // Write-1: set the CLINT level bit AND atomically signal the
+        // target hart via the msip_pending channel.  This avoids the
+        // non-atomic RMW on ``(*states).mip`` which raced with the
+        // target's sync_mtip/sync_msip operations on the same u64.
         p.fetch_or(1, Ordering::Release);
+        let pending = clint.msip_pending.get();
+        if pending.is_null() {
+            diag::log_line("[msip-write-null] msip_pending pointer is NULL — cross-thread MSIP delivery disabled");
+        } else {
+            unsafe { &*pending.add(target) }.fetch_or(1 << 3, Ordering::Release);
+        }
     } else {
-        // Write-0: clear level while preserving edge counter.
+        // Write-0: clear only the CLINT level bit.  Do NOT touch
+        // mip.MSIP on the target — deliver_trap already cleared it
+        // when the interrupt was taken, and a second sender may have
+        // asserted a *new* MSIP between the trap handler and this
+        // acknowledgement.  Clearing mip.MSIP here would lose it.
         p.fetch_and(0xFE, Ordering::Release);
+        // sync_msip handles the mip<->level synchronisation for
+        // the edge case where deliver_trap hasn't run (stale MSIP).
     }
 }
 
@@ -119,7 +139,7 @@ pub(crate) fn try_handle_clint_concurrent(
     write_data: u64,
     _state: &mut HartState,
     clint: &ConcurrentClintCtx,
-    module: &ModuleState,
+    _module: &ModuleState,
 ) -> Option<u64> {
     if clint.base == 0 {
         return None;
@@ -138,17 +158,6 @@ pub(crate) fn try_handle_clint_concurrent(
 
         }
 		clint_write_msip_concurrent(clint, target, (write_data & 1) as u8);
-		// If the write sets MSIP (val & 1 == 1), wake a parked
-		// WFI thread on the target hart so it sees the edge
-		// immediately (QEMU-style thread unpark).
-		if (write_data & 1) == 0 {
-			return Some(0);
-		}
-		if let Ok(slot) = module.wfi_threads[target].lock() {
-			if let Some(t) = slot.as_ref() {
-				t.unpark();
-			}
-		}
 		return Some(0);
     } else if offset < 0xBFF8 {
         // MTIMECMP region
@@ -296,7 +305,8 @@ mod tests {
             mtimecmp: &mtimecmp as *const AtomicU64,
             msip: &msip_byte as *const AtomicU8,
             num_harts: 1,
-        };
+                states: std::ptr::null_mut(),
+                msip_pending: Cell::new(std::ptr::null()),};
 
         assert_eq!(msip_byte.load(Ordering::Relaxed) & 1, 1);
         assert_eq!(state.mip & (1 << 3), 0);
@@ -332,7 +342,8 @@ mod tests {
             mtimecmp: &mtimecmp as *const AtomicU64,
             msip: &msip_byte as *const AtomicU8,
             num_harts: 1,
-        };
+                states: std::ptr::null_mut(),
+                msip_pending: Cell::new(std::ptr::null()),};
 
         sync_msip(&mut state, &clint);
 

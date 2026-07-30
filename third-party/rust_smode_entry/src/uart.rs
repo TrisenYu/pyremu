@@ -3,7 +3,7 @@
 //! 全部 I/O 通过 M-mode OpenSBI 代理，飞地自身不直接访问 UART MMIO，
 //! 避免 PMP 权限问题。多 hart 串行化由 M-mode 保证。
 
-use crate::call;
+use crate::ecall_aux;
 
 // /// 使能发送器（空操作 — SBI ecall 无需硬件初始化）。
 // pub fn uart_init() {
@@ -13,7 +13,7 @@ use crate::call;
 /// 发送一个字节。通过 legacy SBI putchar 阻塞输出。
 #[inline]
 pub fn uart_putc(c: u8) {
-    call::sbi_putchar(c);
+    ecall_aux::sbi_putchar(c);
 }
 
 /// 非阻塞接收一个字节。SBI legacy 不支持非阻塞 RX。

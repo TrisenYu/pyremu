@@ -6,6 +6,7 @@
 //!
 //! ``run_parallel`` is the FFI entry point, mirroring ``run_batch``'s signature
 //! so the Python side can switch transparently.
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -103,10 +104,13 @@ pub struct ConcurrentClintCtx {
     pub mtime: *const AtomicU64,
     /// Per-hart mtimecmp registers — indexed by hart_id.
     pub mtimecmp: *const AtomicU64,
-    /// Per-hart MSIP edge counters — indexed by hart_id.
-    /// Incremented (wrapping) on each MSIP=1 write; never decremented.
+    /// Per-hart MSIP level bytes — indexed by hart_id.
     pub msip: *const AtomicU8,
     pub num_harts: u32,
+    /// Per-hart atomic MSIP pending slots (Release write from sender,
+    /// Acquire swap from receiver).  Set after ``ModuleState`` creation.
+    /// ``Cell`` allows late initialisation despite ``&self``.
+    pub msip_pending: Cell<*const AtomicU64>,
 }
 
 // Safety: Python holds the backing ctypes arrays alive for the FFI call.
@@ -129,6 +133,7 @@ impl ConcurrentClintCtx {
             mtimecmp: raw.mtimecmp as *const AtomicU64,
             msip: raw.msip as *const AtomicU8,
             num_harts,
+            msip_pending: Cell::new(std::ptr::null()),
         }
     }
 }
@@ -182,9 +187,6 @@ pub struct ModuleState {
     pub wfi_flags: Box<[AtomicU8]>,
     /// Number of non-halted harts. Set once before threads spawn, read-only after.
     pub active_hart_num: u32,
-    /// Per-hart parked-thread handles.  A WFI hart stores
-    /// ``std::thread::current()`` so MSIP senders can ``unpark()`` it.
-    pub wfi_threads: Box<[Mutex<Option<std::thread::Thread>>]>,
     /// Global TLB generation counter — incremented (Release) by any hart
     /// that executes SFENCE.VMA.  Each hart locally samples this counter
     /// (Acquire) at instruction boundaries and flushes its own TLB when
@@ -205,19 +207,26 @@ pub struct ModuleState {
     /// that hart invalid, and a successful AMO, SC, or store on any other hart
     /// to the reservation set renders any LR on this hart invalid").
     pub lr_reserved: Box<[AtomicU64]>,
+    /// Per-hart cross-thread MSIP notification.  When another hart writes to
+    /// CLINT MSIP for this hart, the bit is set here atomically (Release).
+    /// This hart's ``sync_msip`` reads & clears it with ``swap(0, Acquire)``
+    /// and merges into ``HartState.mip``.  This avoids the non-atomic RMW race
+    /// on ``HartState.mip`` between the sender's direct write and the receiver's
+    /// ``sync_mtip``/``sync_msip`` calls.
+    pub msip_pending: Box<[AtomicU64]>,
 }
 
 impl ModuleState {
     pub fn new(num_harts: u32, active_hart_num: u32, init_tlb_gen: u64) -> Self {
         let mut v = Vec::with_capacity(num_harts as usize);
-        let mut tv = Vec::with_capacity(num_harts as usize);
         let mut gv = Vec::with_capacity(num_harts as usize);
         let mut rv = Vec::with_capacity(num_harts as usize);
+        let mut mv = Vec::with_capacity(num_harts as usize);
         for _ in 0..num_harts {
             v.push(AtomicU8::new(0));
-            tv.push(Mutex::new(None::<std::thread::Thread>));
             gv.push(AtomicU64::new(0));
             rv.push(AtomicU64::new(0));
+            mv.push(AtomicU64::new(0));
         }
         ModuleState {
             stop_flag: AtomicBool::new(false),
@@ -225,10 +234,10 @@ impl ModuleState {
             wfi_count: AtomicU32::new(0),
             wfi_flags: v.into_boxed_slice(),
             active_hart_num,
-            wfi_threads: tv.into_boxed_slice(),
             tlb_gen: AtomicU64::new(init_tlb_gen),
             tlb_gen_per_hart: gv.into_boxed_slice(),
             lr_reserved: rv.into_boxed_slice(),
+            msip_pending: mv.into_boxed_slice(),
         }
     }
 
@@ -255,12 +264,37 @@ impl ModuleState {
 
 /// Hart execution parameters passed across the FFI boundary.
 #[repr(C)]
+/// Shared external-interrupt context owned by Python, polled by Rust.
+///
+/// PLIC and device state lives on the Python side.  When a device raises
+/// (or lowers) an interrupt, Python updates this struct.  Rust checks
+/// ``pending`` periodically inside the hart loop; when set it exits the
+/// batch so Python can call ``_native_sync_plic_mip()`` to update each
+/// hart's ``mip`` with the latest PLIC-driven MEIP/SEIP bits.
+#[repr(C)]
+pub struct FfiExtIrqCtx {
+    /// Non-zero: at least one external interrupt source is asserted and
+    /// the PLIC state may have changed.  Rust exits the batch on next check.
+    pub pending: u8,
+    /// Bitmap of pending interrupt sources.  Bit *i* corresponds to PLIC
+    /// interrupt source *i* (1 = UART, 2 = VirtIO, …).  Updated atomically
+    /// by Python; currently informational, may drive inline delivery later.
+    pub sources: u32,
+    /// Highest priority among currently-pending sources, or 0 if none.
+    /// Rust may skip the batch exit when priority ≤ the current hart's
+    /// PLIC threshold (not yet implemented — always exits when pending≠0).
+    pub max_priority: u8,
+    pub _pad: [u8; 2],
+}
+
+#[repr(C)]
 pub struct FfiHartCtx {
     pub states: *mut HartState,
     pub num_harts: u32,
     pub max_instrs: u64,
     pub result: *mut BatchResult,
     pub stop_flag: *const u8,
+    pub ext_irq: *mut FfiExtIrqCtx,
 }
 
 /// Peripheral / memory contexts passed across the FFI boundary.
@@ -348,6 +382,7 @@ unsafe fn run_harts(
     states: *mut HartState,
     num_harts: u32,
     stop_flag: *const u8,
+    ext_irq: *mut FfiExtIrqCtx,
     shared_mem: SharedMemCtx,
     shared_pmp: SharedPmpCtx,
     shared_dev: SharedDevCtx,
@@ -389,6 +424,7 @@ unsafe fn run_harts(
         let uart_ptr = uart_ref;
         let mph = max_per_hart;
         let stop_ptr = stop_flag as usize;
+        let ext_irq_ptr = ext_irq as usize;
 
         let handle = std::thread::spawn(move || {
             let state = &mut *(state_addr as *mut HartState);
@@ -396,6 +432,7 @@ unsafe fn run_harts(
                 state, hid as u8, mem_send, pmp_send, dev_send,
                 clint_ptr, uart_ptr, &mref, bp_send, mph,
                 stop_ptr as *const u8,
+                ext_irq_ptr as *mut FfiExtIrqCtx,
             );
         });
         handles.push(handle);
@@ -486,6 +523,9 @@ pub unsafe extern "C" fn run_parallel(
     let tlb_gen_per_hart_ptr = if tlb.is_null() { std::ptr::null_mut() } else { unsafe { (*tlb).gen_per_hart } };
     let init_gen = if tlb_gen_ptr.is_null() { 0 } else { unsafe { *tlb_gen_ptr } };
     let module = Arc::new(ModuleState::new(num_harts, active, init_gen));
+    // Wire the msip_pending atomic channel into the CLINT context so
+    // senders can atomically signal the target hart's WFI loop.
+    cc_clint.msip_pending.set(module.msip_pending.as_ptr());
 
     // 4. Build shared contexts
     let virtio_raw: *mut FfiVirtIoCtx = if ffi.virtio.is_null() {
@@ -509,7 +549,7 @@ pub unsafe extern "C" fn run_parallel(
     unsafe {
 		// 5. Spawn & join hart threads
         run_harts(
-            states, num_harts, hart.stop_flag,
+            states, num_harts, hart.stop_flag, hart.ext_irq,
             shared_mem, shared_pmp, shared_dev,
             &cc_clint, ffi.uart, &module,
             build_bps(bp), hart.max_instrs,
@@ -616,12 +656,15 @@ mod tests {
             ends: dev_ends.as_ptr(),
             num: 0,
         };
-        let mut pmp_cfg: [u8; 0] = [];
-        let mut pmp_addr: [u64; 0] = [];
+        // Single TOR entry covering full address space (R/W/X).
+        // pmp_ok per RISC-V spec §3.7.1 denies S/U access when num==0,
+        // so we must provide at least one permissive entry for tests.
+        let mut pmp_cfg: [u8; 1] = [0x0F]; // PMP_R|PMP_W|PMP_X|PMP_A_TOR
+        let mut pmp_addr: [u64; 1] = [u64::MAX];
         let pmp = FfiPmpCtx {
             cfg: pmp_cfg.as_mut_ptr(),
             addr: pmp_addr.as_mut_ptr(),
-            num: 0,
+            num: 1,
             pmpsplit: 0,
         };
         // Allocate per-hart CLINT arrays based on the actual number of harts.
@@ -649,6 +692,7 @@ mod tests {
             std::ptr::null(), // bp_addrs
             0,                // bp_count
             std::ptr::null(), // stop_flag
+            std::ptr::null(), // ext_irq
             std::ptr::null_mut(), std::ptr::null_mut(),
         );
     }
@@ -928,12 +972,15 @@ mod tests {
             shadow_base: 0,
             shadow_size: 0,
         };
-        let mut pmp_cfg: [u8; 0] = [];
-        let mut pmp_addr: [u64; 0] = [];
+        // Single TOR entry covering full address space (R/W/X).
+        // pmp_ok per RISC-V spec §3.7.1 denies S/U access when num==0,
+        // so we must provide at least one permissive entry for tests.
+        let mut pmp_cfg: [u8; 1] = [0x0F]; // PMP_R|PMP_W|PMP_X|PMP_A_TOR
+        let mut pmp_addr: [u64; 1] = [u64::MAX];
         let pmp = FfiPmpCtx {
             cfg: pmp_cfg.as_mut_ptr(),
             addr: pmp_addr.as_mut_ptr(),
-            num: 0,
+            num: 1,
             pmpsplit: 0,
         };
         let nh = 2usize;
@@ -962,6 +1009,7 @@ mod tests {
                 std::ptr::null(), // bp_addrs
                 0,                // bp_count
                 std::ptr::null(), // stop_flag
+            std::ptr::null(), // ext_irq
                 std::ptr::null_mut(), std::ptr::null_mut(),
             );
         }
@@ -1044,12 +1092,15 @@ mod tests {
             ends: dev_ends.as_ptr(),
             num: 0,
         };
-        let mut pmp_cfg: [u8; 0] = [];
-        let mut pmp_addr: [u64; 0] = [];
+        // Single TOR entry covering full address space (R/W/X).
+        // pmp_ok per RISC-V spec §3.7.1 denies S/U access when num==0,
+        // so we must provide at least one permissive entry for tests.
+        let mut pmp_cfg: [u8; 1] = [0x0F]; // PMP_R|PMP_W|PMP_X|PMP_A_TOR
+        let mut pmp_addr: [u64; 1] = [u64::MAX];
         let pmp = FfiPmpCtx {
             cfg: pmp_cfg.as_mut_ptr(),
             addr: pmp_addr.as_mut_ptr(),
-            num: 0,
+            num: 1,
             pmpsplit: 0,
         };
         let nh = num as usize;
@@ -1076,6 +1127,7 @@ mod tests {
             std::ptr::null(), // bp_addrs
             0,                // bp_count
             std::ptr::null(), // stop_flag
+            std::ptr::null(), // ext_irq
             std::ptr::null_mut(), std::ptr::null_mut(),
         );
     }

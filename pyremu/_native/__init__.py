@@ -200,22 +200,6 @@ try:
     ]
     _lib.bus_write_ram.restype = ctypes.c_uint8
 
-    # Phase 4: batch execution engine (Phases A-E: full dispatch)
-    _lib.run_batch.argtypes = [
-        ctypes.c_void_p,   # states: *mut HartState
-        ctypes.c_uint32,   # num_harts
-        ctypes.c_uint64,   # max_instrs
-        ctypes.c_void_p,   # result: *mut BatchResult
-        ctypes.c_void_p,   # mem: *const MemCtx
-        ctypes.c_void_p,   # pmp: *const FfiPmpCtx
-        ctypes.c_void_p,   # clint: *const FfiClintCtx
-        ctypes.c_void_p,   # dev: *const FfiDevCtx
-        ctypes.c_void_p,   # virtio: *const FfiVirtIOCtx
-        ctypes.c_void_p,   # bp_addrs: *const u64
-        ctypes.c_uint32,   # bp_count
-    ]
-    _lib.run_batch.restype = None
-
     # Phase 5: concurrent thread-per-hart execution engine
     _lib.run_parallel.argtypes = [
         ctypes.c_void_p,   # hart: *const FfiHartCtx
@@ -933,6 +917,16 @@ class FfiVirtIOCtx(ctypes.Structure):
     ]
 
 
+class FfiExtIrqCtx(ctypes.Structure):
+    """Shared external-interrupt context — matches Rust ``FfiExtIrqCtx``."""
+    _fields_ = [
+        ("pending", ctypes.c_uint8),
+        ("sources", ctypes.c_uint32),
+        ("max_priority", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 2),
+    ]
+
+
 class FfiHartCtx(ctypes.Structure):
     """Grouped hart execution context — matches Rust ``FfiHartCtx``."""
     _fields_ = [
@@ -941,6 +935,7 @@ class FfiHartCtx(ctypes.Structure):
         ("max_instrs", ctypes.c_uint64),
         ("result", ctypes.c_void_p),
         ("stop_flag", ctypes.c_void_p),
+        ("ext_irq", ctypes.c_void_p),
     ]
 
 
@@ -992,7 +987,7 @@ class PmpInfo:
             raw = cfg if cfg else b""
             _cfg = (ctypes.c_uint8 * max(len(raw), 1))()
             if raw:
-                ctypes.memmove(_cfg, raw, len(raw))
+                ctypes.memmove(_cfg, bytes(raw), len(raw))
             self.cfg = _cfg
         else:
             self.cfg = cfg  # already a ctypes array
@@ -1119,155 +1114,6 @@ class VirtIOInfo:
         self.status = status
         self.interrupt_status = interrupt_status
 
-
-# ============================================================
-#  Phase 4: batch execution bridge
-# ============================================================
-
-
-def run_batch(
-    states,  # ctypes array of HartState
-    num_harts: int,
-    ram_buf,
-    ram_size: int,
-    ram_base: int,
-    shadow_base: int,
-    shadow_size: int,
-    max_instrs: int,
-    result,
-    pmp: PmpInfo | None = None,
-    clint: ClintInfo | None = None,
-    dev: DevInfo | None = None,
-    virtio: VirtIOInfo | None = None,
-    bp_addrs: list[int] | None = None,
-) -> FfiVirtIOCtx | None:
-    """Execute up to *max_instrs* instructions across all harts in Rust.
-
-    *bp_addrs* is an optional list of PC addresses that trigger
-    ``EXIT_BREAKPOINT`` when matched after instruction execution.
-    """
-    if _lib is None:
-        return
-
-    # --- MemCtx ---
-    mem = MemCtx()
-    mem.ram = ctypes.cast(ram_buf, ctypes.c_void_p).value or 0
-    mem.ram_size = ram_size
-    mem.ram_base = ram_base
-    mem.shadow_base = shadow_base
-    mem.shadow_size = shadow_size
-
-    # --- FfiPmpCtx ---
-    # PmpInfo already normalises cfg/addr to ctypes arrays.  When they
-    # were built with ``from_buffer`` in ``_step_native``, writing through
-    # these pointers mutates the Python PMP object directly.
-    _pmp_cfg_buf = None
-    _pmp_addr_buf = None
-    if pmp is not None and pmp.num > 0:
-        # Use existing ctypes arrays — no copy needed.
-        _pmp_cfg_buf = pmp.cfg
-        _pmp_addr_buf = pmp.addr
-
-    pmp_ffi = FfiPmpCtx()
-    pmp_ffi.cfg = ctypes.cast(_pmp_cfg_buf, ctypes.c_void_p).value if _pmp_cfg_buf else 0
-    pmp_ffi.addr = ctypes.cast(_pmp_addr_buf, ctypes.c_void_p).value if _pmp_addr_buf else 0
-    pmp_ffi.num = pmp.num if pmp is not None else 0
-    pmp_ffi.pmpsplit = pmp.pmpsplit if pmp is not None else 0
-
-    # --- FfiClintCtx ---
-    nh = max(int(num_harts), 1)
-    _mtc_buf = (ctypes.c_uint64 * nh)()
-    _msip_buf = (ctypes.c_uint8 * nh)()
-    _mtime_val = ctypes.c_uint64(0)
-    if clint is not None:
-        _mtime_val.value = clint.mtime
-        if clint.mtimecmp is not None:
-            for i in range(min(nh, len(clint.mtimecmp))):
-                _mtc_buf[i] = int(clint.mtimecmp[i])
-        else:
-            for i in range(nh):
-                _mtc_buf[i] = 0xFFFF_FFFF_FFFF_FFFF
-        if clint.msip is not None:
-            for i in range(min(nh, len(clint.msip))):
-                _msip_buf[i] = int(clint.msip[i])
-    else:
-        for i in range(nh):
-            _mtc_buf[i] = 0xFFFF_FFFF_FFFF_FFFF
-
-    clint_ffi = FfiClintCtx()
-    clint_ffi.mtime = ctypes.addressof(_mtime_val)
-    clint_ffi.mtimecmp = ctypes.cast(_mtc_buf, ctypes.c_void_p).value
-    clint_ffi.msip = ctypes.cast(_msip_buf, ctypes.c_void_p).value
-    clint_ffi.base = clint.base if clint is not None else 0
-
-    # --- FfiDevCtx ---
-    dev_ffi = FfiDevCtx()
-    if dev is not None and dev.bases is not None and dev.ends is not None:
-        dev_ffi.bases = ctypes.cast(dev.bases, ctypes.c_void_p).value
-        dev_ffi.ends = ctypes.cast(dev.ends, ctypes.c_void_p).value
-        dev_ffi.num = len(dev.bases)
-
-    # --- FfiVirtIOCtx ---
-    _virtio_ffi = FfiVirtIOCtx()
-    _virtio_ffi_ptr = None
-    if virtio is not None and virtio.base != 0:
-        _virtio_ffi.base = virtio.base
-        _virtio_ffi.capacity = virtio.capacity
-        _virtio_ffi.queue_num_max = virtio.queue_num_max
-        _virtio_ffi.device_features_sel = virtio.device_features_sel
-        _virtio_ffi.driver_features_sel = virtio.driver_features_sel
-        _virtio_ffi.driver_features = virtio.driver_features
-        _virtio_ffi.queue_sel = virtio.queue_sel
-        _virtio_ffi.queue_num = virtio.queue_num if virtio.queue_num else virtio.queue_num_max
-        _virtio_ffi.queue_ready = 1 if virtio.queue_ready else 0
-        _virtio_ffi.queue_desc = virtio.queue_desc
-        _virtio_ffi.queue_driver = virtio.queue_driver
-        _virtio_ffi.queue_device = virtio.queue_device
-        _virtio_ffi.status = virtio.status
-        _virtio_ffi.interrupt_status = virtio.interrupt_status
-        _virtio_ffi_ptr = ctypes.pointer(_virtio_ffi)
-
-    # Breakpoint addresses — build a ctypes array if any provided
-    _bp_arr = None
-    if bp_addrs:
-        _bp_arr = (ctypes.c_uint64 * len(bp_addrs))()
-        for i, addr in enumerate(bp_addrs):
-            _bp_arr[i] = addr & 0xFFFF_FFFF_FFFF_FFFF
-
-    _lib.run_batch(
-        states, num_harts, max_instrs, ctypes.byref(result),
-        ctypes.byref(mem), ctypes.byref(pmp_ffi),
-        ctypes.byref(clint_ffi), ctypes.byref(dev_ffi),
-        _virtio_ffi_ptr or ctypes.c_void_p(0),
-        ctypes.cast(_bp_arr, ctypes.c_void_p) if _bp_arr else ctypes.c_void_p(0),
-        len(bp_addrs) if bp_addrs else 0,
-    )
-
-    # Sync mtime back from Rust (it may have advanced during the batch).
-    # Also sync MSIP and MTIMECMP — Rust CLINT inline handling may have
-    # modified the *local* ctypes buffers directly; we must copy those
-    # modifications back to the caller's ClintInfo so that the emulator's
-    # CLINT sync path picks them up.  Without this, inline MSIP writes
-    # (cross-hart IPI) and MTIMECMP updates are silently lost.
-    if clint is not None:
-        clint.mtime = _mtime_val.value
-        if clint.msip is not None:
-            for i in range(min(nh, len(clint.msip))):
-                clint.msip[i] = int(_msip_buf[i])
-        if clint.mtimecmp is not None:
-            for i in range(min(nh, len(clint.mtimecmp))):
-                clint.mtimecmp[i] = int(_mtc_buf[i])
-
-    # Return the virtio FFI struct so the caller can read back changed fields
-    # (interrupt_status, notify_pending, etc.) after the batch.
-    return _virtio_ffi if virtio is not None else None
-
-
-# ============================================================
-#  Phase 5: concurrent execution bridge
-# ============================================================
-
-
 def run_parallel(
     states,  # ctypes array of HartState
     num_harts: int,
@@ -1284,10 +1130,11 @@ def run_parallel(
     uart: UartInfo | None = None,
     virtio: VirtIOInfo | None = None,
     bp_addrs: list[int] | None = None,
-    stop_flag=None,  # ctypes.c_uint8 or None — shared stop flag for Ctrl+C
+    stop_flag=None,  # ctypes.c_uint8 or None — shared stop flag for Ctrl+Q
+    ext_irq=None,  # FfiExtIrqCtx or None — external interrupt context
     tlb_gen=None,  # ctypes.c_uint64 — persistent TLB generation counter
     tlb_gen_per_hart=None,  # ctypes array of c_uint64 — per-hart last-seen gen
-) -> None:
+) -> FfiVirtIOCtx | None:
     """Execute instructions concurrently (thread-per-hart) in Rust.
 
     Each non-halted hart runs in its own OS thread with a full
@@ -1410,6 +1257,10 @@ def run_parallel(
     _hart_ctx.stop_flag = (
         ctypes.cast(ctypes.pointer(stop_flag), ctypes.c_void_p).value
         if stop_flag is not None else 0
+    )
+    _hart_ctx.ext_irq = (
+        ctypes.cast(ctypes.pointer(ext_irq), ctypes.c_void_p).value
+        if ext_irq is not None else 0
     )
 
     _periph_ctx = FfiPeriphCtx()

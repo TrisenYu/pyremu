@@ -1272,6 +1272,8 @@ class Hart(HartWithRegs):
 
         # C.LWSP: uimm = cf.imm (4-byte aligned)
         if funct3 == 0b010:
+            if rd_rs1 == 0:
+                raise ValueError("C.LWSP rd=0 (reserved)")
             uimm = cf.imm
             addr = mask64((self.gprs[2] + uimm))
             saved_pc = self.pc
@@ -1284,6 +1286,8 @@ class Hart(HartWithRegs):
 
         # C.LDSP: uimm = cf.imm (8-byte aligned)
         if funct3 == 0b011:
+            if rd_rs1 == 0:
+                raise ValueError("C.LDSP rd=0 (reserved)")
             uimm = cf.imm
             addr = mask64((self.gprs[2] + uimm))
             saved_pc = self.pc

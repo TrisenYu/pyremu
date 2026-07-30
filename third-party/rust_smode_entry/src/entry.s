@@ -2,7 +2,7 @@
 # 紧跟 smode_entry/entry.s + ref-emod entry.S 的结构。
 
 # ================================================================
-#  SAVE / RESTORE 宏（264 字节帧：32 GPR + usp 槽）
+#  SAVE / RESTORE 宏（264 字节帧：32 GPR + usp）
 #  必须在使用前定义（LLVM 集成汇编器要求前置声明）。
 # ================================================================
 
@@ -93,7 +93,7 @@ _start:
     mv   s1, a1                 # s1 = base_pa
     mv   s2, a2                 # s2 = payload_size
 
-    # ---- 临时栈 (PC 相对) ----
+    # ---- 设置临时栈 ----
 .L0_tmp_stack:
     auipc sp, %pcrel_hi(tmp_stack_top)
     addi  sp, sp, %pcrel_lo(.L0_tmp_stack)

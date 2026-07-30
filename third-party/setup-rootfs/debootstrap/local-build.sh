@@ -96,7 +96,8 @@ SRC
 
 apt update -y
 apt install -y dialog libterm-readline-perl-perl systemd systemd-sysv \
-	gcc build-essential flex bison vim python3 libc6 zsh git curl wget
+	gcc build-essential flex bison vim python3 libc6 zsh git curl wget \
+		clang llvm lld kmod
 apt clean
 rm -rf /var/cache/apt/archives/*
 
@@ -116,22 +117,19 @@ tmpfs   /tmp    tmpfs   size=64M    0 0
 tmpfs   /var/run tmpfs  defaults    0 0
 FS
 
-# ---- zsh 设为默认 shell ----
+# ---- zsh will be set as default shell ----
 chsh -s /bin/zsh root
 
-# ---- oh-my-zsh 无人值守安装 ----
-# RUNZSH=no   安装后不启动 zsh
-# CHSH=no     不重复改默认 shell (已由上文 chsh 完成)
-# 不能用 sh -c "$(curl ...)" — 安装脚本含函数/换行/转义序列,
-# 经命令替换内联为双引号字符串后会被 bash 错误解析。
-# 管道直传: curl 在 chroot 内下载脚本并 pipe 给 sh, 完整保留脚本结构。
-# 网络: 默认从 GitHub 拉取; 国内可设环境变量改用 Gitee 镜像:
+# ---- oh-my-zsh ----
+# RUNZSH=no   zsh
+# CHSH=no     shell
+# Gitee for Chinese Networking Environment:
 #   OH_MY_ZSH_URL=https://gitee.com/mirrors/oh-my-zsh/raw/master/tools/install.sh
 #   ZSH_PLUGIN_PREFIX=https://gitee.com/mirrors
 OH_MY_ZSH_URL="\${OH_MY_ZSH_URL:-https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh}"
 curl -fsSL "\${OH_MY_ZSH_URL}" | RUNZSH=no CHSH=no sh
 
-# ---- 插件 ----
+# ---- plugins ----
 ZSH_PLUGIN_PREFIX="\${ZSH_PLUGIN_PREFIX:-https://github.com}"
 ZSH_CUSTOM="/root/.oh-my-zsh/custom"
 git clone --depth=1 \
@@ -141,29 +139,25 @@ git clone --depth=1 \
 	"\${ZSH_PLUGIN_PREFIX}/zsh-users/zsh-syntax-highlighting" \
 	"\${ZSH_CUSTOM}/plugins/zsh-syntax-highlighting"
 
-	# 如果 oh-my-zsh 安装脚本未能创建 .zshrc (网络/template 缺失),
-	# 直接从 oh-my-zsh 模板复制; 仍无模板则创建最小配置.
-	if [ ! -f /root/.oh-my-zsh/templates/zshrc.zsh-template ]; then
-		mkdir -p /root/.oh-my-zsh/templates
-		echo "export ZSH=\"/root/.oh-my-zsh\"" > /root/.oh-my-zsh/templates/zshrc.zsh-template
-		echo "ZSH_THEME=\"gentoo\"" >> /root/.oh-my-zsh/templates/zshrc.zsh-template
-		echo "plugins=(git)" >> /root/.oh-my-zsh/templates/zshrc.zsh-template
-		echo "source \$ZSH/oh-my-zsh.sh" >> /root/.oh-my-zsh/templates/zshrc.zsh-template
-	fi
-	cp /root/.oh-my-zsh/templates/zshrc.zsh-template /root/.zshrc
+if [ ! -f /root/.oh-my-zsh/templates/zshrc.zsh-template ]; then
+	mkdir -p /root/.oh-my-zsh/templates
+	echo "export ZSH=\"/root/.oh-my-zsh\"" > /root/.oh-my-zsh/templates/zshrc.zsh-template
+	echo "ZSH_THEME=\"gentoo\"" >> /root/.oh-my-zsh/templates/zshrc.zsh-template
+	echo "plugins=(git)" >> /root/.oh-my-zsh/templates/zshrc.zsh-template
+	echo "source \$ZSH/oh-my-zsh.sh" >> /root/.oh-my-zsh/templates/zshrc.zsh-template
+fi
+cp /root/.oh-my-zsh/templates/zshrc.zsh-template /root/.zshrc
 
-	# 启用插件 (保留默认 git 插件)
-	sed -i "s/^plugins=(git)$/plugins=(git zsh-autosuggestions zsh-syntax-highlighting)/" \
-		/root/.zshrc || true
+sed -i "s/^plugins=(git)$/plugins=(git zsh-autosuggestions zsh-syntax-highlighting)/" \
+	/root/.zshrc || true
 
-	# 默认主题设为 gentoo
-	sed -i "s/^ZSH_THEME=\".*\"$/ZSH_THEME=\"gentoo\"/" /root/.zshrc || true
+sed -i "s/^ZSH_THEME=\".*\"$/ZSH_THEME=\"gentoo\"/" /root/.zshrc || true
 
 EOF
 
-# 7. toy benchmark programs -> /root/toy-progs
+# 7. toy benchmark programs -> /eval/toy-progs
 TOY_SRC="$(cd "$(dirname "$0")/../../../tests/src-rv8" && pwd)"
-TOY_DEST="${ROOTFS_DIR}/root/toy-progs"
+TOY_DEST="${ROOTFS_DIR}/eval/toy-progs"
 mkdir -p "${TOY_DEST}"
 
 CROSS_CC=""
@@ -208,17 +202,67 @@ fi
 echo ">> Toy programs installed:"
 ls -la "${TOY_DEST}"
 
-# 8. cleanup host binary and devices
+# 8. TEE enclave driver + userspace test programs
+echo ">> Building TEE enclave driver & test programs ..."
+TEE_DRV_SRC="$(cd "$(dirname "$0")/../../../third-party/tee_enclave_drv" && pwd)"
+TEE_TEST_SRC="$(cd "$(dirname "$0")/../../../tests/src-sidecache" && pwd)"
+TEE_DEST="${ROOTFS_DIR}/eval/tee-test"
+mkdir -p "${TEE_DEST}"
+
+# Build kernel module (requires linux tree at ../../linux)
+KDIR="$(cd "$(dirname "$0")/../../../third-party/linux" && pwd)"
+CLANG_CC="/opt/custom-llvm/bin/clang"
+if [ -x "${CLANG_CC}" ] && [ -d "${KDIR}" ]; then
+    make -C "${KDIR}" M="${TEE_DRV_SRC}" ARCH=riscv \
+        CC="${CLANG_CC}" LD="${CLANG_CC/clang/ld.lld}" \
+        STRIP="${CLANG_CC/clang/llvm-strip}" modules 2>&1 | tail -3
+    cp -v "${TEE_DRV_SRC}/tee_enclave_drv.ko" "${TEE_DEST}/"
+else
+    echo ">> SKIP driver build: clang=${CLANG_CC} kdir=${KDIR}"
+fi
+
+# Build userspace test programs (static, with riscv64-linux-gnu-gcc)
+GCC_CROSS="riscv64-linux-gnu-gcc"
+if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
+    for prog in tee_test tee_malice; do
+        src="${TEE_TEST_SRC}/${prog}.c"
+        if [ -f "${src}" ]; then
+            ${GCC_CROSS} -static -O2 -Wall -I "${TEE_TEST_SRC}" \
+                "${src}" -o "${TEE_DEST}/${prog}" && \
+                echo "  ${prog}  OK"
+        fi
+    done
+    # Also copy the header for reference
+    cp -v "${TEE_TEST_SRC}/tee_enclave.h" "${TEE_DEST}/"
+    # Copy pre-built enclave payloads
+    for payload in hello_musl victim_musl probe_musl tlb_leak_musl; do
+        [ -f "${TEE_TEST_SRC}/bin/${payload}" ] && \
+            cp -v "${TEE_TEST_SRC}/bin/${payload}" "${TEE_DEST}/${payload}"
+    done
+    # symlink for eval.mk: hello_payload -> hello_musl
+    ln -sf hello_musl "${TEE_DEST}/hello_payload"
+    # Install the eval Makefile to /eval/
+    EVAL_DEST="${ROOTFS_DIR}/eval"
+    mkdir -p "${EVAL_DEST}"
+    cp -v "${TEE_TEST_SRC}/eval.mk" "${EVAL_DEST}/Makefile"
+else
+    echo ">> SKIP test programs: ${GCC_CROSS} not found"
+fi
+
+echo ">> TEE components:"
+ls -la "${TEE_DEST}"
+
+# 9. cleanup host binary and devices
 rm -f "${ROOTFS_DIR}/usr/bin/qemu-riscv64-static"
 cleanup_mount
 
-# 8. cpio for initramfs
 pushd "${ROOTFS_DIR}" >/dev/null
 find . -print0 | cpio --null -ov --format=newc | gzip -9 > "../${CPIO_OUT}"
 popd
+# 10. cpio for initramfs
 echo ">> initramfs: ${CPIO_OUT}"
 
-# 9. ext4 file-system used in block device
+# 11. ext4 file-system used in block device
 dd if=/dev/zero of="${EXT4_IMG_FILE}" bs=1M count="${EXT4_IMG_SIZE_MB}" status=none
 mkfs.ext4 -F "${EXT4_IMG_FILE}"
 
@@ -228,7 +272,7 @@ cp -r "${ROOTFS_DIR}"/* ./mnt-tmp/
 umount ./mnt-tmp
 rmdir mnt-tmp
 
-# 10. 将输出文件的所有权归还给调用 sudo 的原始用户,
+# 12. 将输出文件的所有权归还给调用 sudo 的原始用户,
 #     避免 emulator 以普通用户运行时因 PermissionError
 #     回退到 O_RDONLY ->ext4 journal 无法 replay ->文件系统不可写.
 if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then

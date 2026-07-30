@@ -31,12 +31,15 @@ class TLBLine(CacheLineBase):
     perm = 权限位 (R|W|X|U 的组合)
     level = 页表级数 (0=4 KiB, 1=2 MiB, 2=1 GiB)
     asid = 地址空间 ID (0=全局/Bare, 非零时 lookup 需匹配)
+    gen  = 插入时的 tlb_gen; lookup 时与 TLB._tlb_gen 比较,
+           不匹配表示该条目已被 SFENCE.VMA 失效
     """
 
     ppn: int = 0
     perm: int = 0
     level: int = 0
     asid: int = 0
+    gen: int = 0
 
 
 class TLB(CacheBase):

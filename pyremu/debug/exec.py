@@ -304,6 +304,13 @@ class ExecutionMixin(SharedMixinAttrs):
                 self._terminated = True
                 break
 
+            # Ctrl+Q daemon sets _native_stop_flag directly; check it here
+            # since there's no SIGINT to trigger _sigint_run -> _paused.
+            if self._emu._native_stop_flag.value != 0:
+                self._emu._native_stop_flag.value = 0
+                self._paused = True
+                break
+
             # UART TXDATA 写入已自动即时输出, 无需手动刷新
             self._flush_uart_if_present()
 

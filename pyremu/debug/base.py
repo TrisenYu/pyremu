@@ -201,7 +201,7 @@ class DebuggerBase(SharedMixinAttrs):
         self._emu._idle_poll_cb = None
 
     def _enter_run_mode(self) -> None:
-        """切换到运行模式: SIGINT -> 暂停, cbreak stdin, Rust libc::write TX.
+        """切换到运行模式: Ctrl+Q 暂停, cbreak stdin (ISIG 关, Ctrl+C 透传).
 
         ── TX: QEMU fd_chr_write 模型, 与批次零耦合 ──
         固件写 TXDATA -> Rust inline handler -> libc::write(1, &byte, 1).
@@ -211,7 +211,9 @@ class DebuggerBase(SharedMixinAttrs):
         stdin daemon 独立于处理器执行循环持续读取, 与 WFI 零耦合.
         处理器仅看到 PLIC 外部中断信号 -> try_wfi_wakeup() 自然唤醒.
         """
-        signal.signal(signal.SIGINT, self._sigint_run)
+        # 忽略 SIGINT: ISIG 已关闭, Ctrl+C 作为 0x03 透传给客机.
+        # Ctrl+Q 由 stdin daemon 拦截 -> stop_flag -> REPL.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
         if not self._stdin_forward:
             return
@@ -221,17 +223,15 @@ class DebuggerBase(SharedMixinAttrs):
 
         self._emu._idle_poll_cb = self._idle_poll
 
-        # 终端设为 cbreak (字符即时可读, 不经行缓冲)
+        # cbreak + ISIG/IXON 关闭: Ctrl+C (0x03) 与 Ctrl+Q (0x11) 均透传.
+        # Ctrl+Q 由 stdin daemon 拦截暂停; Ctrl+C 直达客机终端.
         if os.isatty(self._stdin_fd):
             self._saved_term_attrs = termios.tcgetattr(self._stdin_fd)
             tty.setcbreak(self._stdin_fd)
-            # prompt_toolkit 的 raw 模式清除了 ICRNL; setcbreak 只修改 lflag
-            # (ICANON, ECHO), 不会恢复 iflag. 需显式置位, 否则 Enter 键的 \\r
-            # 不会被宿主内核转换为 \\n, 客机 dash 将其视为非终止空白符.
             attrs = list(termios.tcgetattr(self._stdin_fd))
-            if not (attrs[0] & termios.ICRNL):
-                attrs[0] |= termios.ICRNL
-                termios.tcsetattr(self._stdin_fd, termios.TCSANOW, attrs)
+            attrs[0] = (attrs[0] | termios.ICRNL) & ~(termios.IXON)
+            attrs[3] &= ~termios.ISIG          # Ctrl+C → raw 0x03
+            termios.tcsetattr(self._stdin_fd, termios.TCSANOW, attrs)
 
         self._start_stdin_daemon()
 
@@ -266,14 +266,16 @@ class DebuggerBase(SharedMixinAttrs):
         与处理器 WFI 完全解耦: daemon 仅负责把 stdin 字节注入 UART RX FIFO,
         UART 内部的 ``_update_plic_irq()`` 自动置位 PLIC 中断, ``_wake_event``
         唤醒主线程的 WFI 睡眠。处理器看到的是标准的 PLIC 外部中断信号。
+
+        Ctrl+Q (0x11) 立即暂停; 双击 Ctrl+Q 在客机端处理 (发送 0x11 0x11).
         """
         uart = self._emu.uart
         if uart is None:
             return
         stdin_fd = self._stdin_fd
+        stop_flag = self._emu._native_stop_flag
         pending: bytes = b""
         while self._stdin_daemon_running:
-            # 有 pending 时用短超时 select 继续读新 stdin, 避免卡在重试循环中丢弃新输入
             timeout = 0.005 if pending else 0.02
             try:
                 ready, _, _ = select.select([stdin_fd], [], [], timeout)
@@ -281,15 +283,26 @@ class DebuggerBase(SharedMixinAttrs):
                 break
             if not self._stdin_daemon_running:
                 break
-            # 先读新 stdin 数据, 追加到 pending
             if ready:
                 try:
                     data = os.read(stdin_fd, 4096)
                 except OSError:
                     break
-                if data:
-                    pending += data
-            # 再尝试 preload pending
+                # Filter Ctrl+Q before forwarding to guest
+                i = data.find(b'\x11')
+                if i >= 0:
+                    stop_flag.value = 1
+                    self._emu._wake_event.set()
+                    # Forward bytes before the escape, then pause
+                    if i > 0:
+                        pending += data[:i]
+                    if pending:
+                        try:
+                            uart.preload(pending)
+                        except Exception:
+                            pass
+                    return
+                pending += data
             if pending:
                 try:
                     n = uart.preload(pending)
@@ -297,6 +310,7 @@ class DebuggerBase(SharedMixinAttrs):
                     n = 0
                 if n > 0:
                     pending = pending[n:]
+                    self._emu._native_ext_irq.pending = 1
                     self._emu._wake_event.set()
 
     def _start_stdin_daemon(self) -> None:

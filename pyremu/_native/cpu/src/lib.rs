@@ -9,7 +9,6 @@ mod concurrent;
 pub mod csr;
 mod decode;
 mod diag;
-mod exec;
 mod fpu;
 pub mod handlers;
 mod hart_sched;
@@ -25,7 +24,6 @@ mod trap;
 
 pub use alu::*;
 pub use decode::*;
-pub use exec::*;
 pub use mem::*;
 pub use mmu::*;
 pub use pmp::*;

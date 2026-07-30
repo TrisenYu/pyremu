@@ -843,16 +843,14 @@ def _dis_compressed(
 
         if funct3 == 0b000:  # C.SLLI (RV64C: shamt[5] = bit12)
             shamt = ((c16 >> 2) & 0x1F) | ((c16 >> 12) & 1) << 5
-            if rd_q2 == 0:
-                return f"c.?    0x{c16:04x}  # C.SLLI rd=0 (HINT)"
+            # rd=x0 is a HINT (executed as NOP), but display apparent semantics
             return f"c.slli       {rd_name_q2}, {shamt}"
 
         if funct3 == 0b001:  # C.FLDSP (RV64DC)
             uimm = (
                 ((c16 >> 2) & 0b111) << 6 | ((c16 >> 12) & 1) << 5 | ((c16 >> 5) & 0b11) << 3
             )
-            if rd_q2 == 0:
-                return f"c.?    0x{c16:04x}  # C.FLDSP rd=0 (reserved)"
+            # rd=0 -> ft0, valid FP destination (unlike GPR loads where x0 is reserved)
             return f"c.fldsp      f{rd_q2}, {uimm}(sp)"
 
         if funct3 == 0b010:  # C.LWSP

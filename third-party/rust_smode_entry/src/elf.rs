@@ -1,5 +1,6 @@
 //! ELF64 加载。紧跟 third-party/smode_entry/load_elf.c 的结构。
 
+use crate::ecall_aux;
 use crate::constants::*;
 use crate::hang;
 use crate::memory;
@@ -93,7 +94,7 @@ unsafe fn map_one_segment(elf_paddr: u64, prog_header: elf::segment::ProgramHead
     let gap = ed_va_align - ed_va;
 
     if gap > 0 {
-        let (_, gap_pa) = crate::call::enclave_call_mem_alloc(1);
+        let (_, gap_pa) = ecall_aux::enclave_call_mem_alloc(1);
         cfg.vbase = ed_va;
         cfg.pbase = gap_pa + (ed_va % CHUNK_2M_SIZE);
         paging::map_page_in_range(&cfg, gap >> PAGE_SHIFT);
@@ -103,7 +104,7 @@ unsafe fn map_one_segment(elf_paddr: u64, prog_header: elf::segment::ProgramHead
     let mut va = ed_va_align;
 
     while left > 0 {
-        let (n, pa) = crate::call::enclave_call_mem_alloc(left);
+        let (n, pa) = ecall_aux::enclave_call_mem_alloc(left);
         if n == 0 {
             break;
         }

@@ -36,7 +36,7 @@ from typing import Any
 from pyremu._native import (
     ClintInfo,
     DevInfo,
-    icount_flush,
+    FfiExtIrqCtx,
     native_available,
     PmpInfo,
     run_parallel,
@@ -169,8 +169,15 @@ class Emulator:
 
         # 单次 native 批次的指令上限 (可变成员; 调试器按需覆盖)。
         self._native_max_instrs: int = 100000
-        # 共享停止标志 — 由 debugger Ctrl+C 信号处理器写入, Rust batch engine 每指令检查
+        # 共享停止标志 — 由 debugger Ctrl+Q daemon 写入, Rust batch engine 每指令检查
         self._native_stop_flag = ctypes.c_uint8(0)
+
+        # 外部中断共享上下文 — stdin daemon 注入 UART 数据后置 pending=1,
+        # Rust 循环检测到后退出 batch 以便 Python 同步 PLIC 中断到 mip.
+        self._native_ext_irq = FfiExtIrqCtx()
+        self._native_ext_irq.pending = 0
+        self._native_ext_irq.sources = 0
+        self._native_ext_irq.max_priority = 0
 
         # WFI 唤醒事件 — 全部 hart 等待时用于阻塞而非轮询
         self._wake_event = threading.Event()
@@ -308,6 +315,7 @@ class Emulator:
         # broadcast semantics (gen increment) survive FFI call boundaries.
         self._tlb_gen = ctypes.c_uint64(0)
         self._tlb_gen_per_hart = (ctypes.c_uint64 * num_harts)()
+        self._tlb_gen_before: int = 0  # snapshot before native batch; flush TLBs only if changed
 
         # Per-hart MSIP edge counters — Python CLINT writes only set the
         # level bit; we track 0->1 transitions and encode them as edge
@@ -555,8 +563,9 @@ class Emulator:
         self._wake_event.set()
 
     def _step_native(self, active: list[Hart]) -> int:
-        # 重置共享停止标志 (上一轮可能已被 Ctrl+C 设置)
-        self._native_stop_flag.value = 0
+        # 若 daemon 已置 stop_flag=1 (Ctrl+Q), 不清零 — Rust 看到后立即退出.
+        if self._native_stop_flag.value == 0:
+            self._native_stop_flag.value = 0  # was clean, stays clean
 
         # 将 L2 脏行回写到 bytearray, 确保 Rust batch 从 bytearray
         # 直接读取指令/数据时能看到 Python 侧的全部写入.
@@ -605,27 +614,27 @@ class Emulator:
             virtio=virtio_info,
             bp_addrs=self._bp_addrs if self._bp_addrs else None,
             stop_flag=self._native_stop_flag,
+            ext_irq=self._native_ext_irq,
             tlb_gen=self._tlb_gen,
             tlb_gen_per_hart=self._tlb_gen_per_hart,
         )
 
         result = self._native_result
+        # Clear external interrupt flag — PLIC will be synced on next
+        # _step_native entry via _native_sync_plic_mip().
+        self._native_ext_irq.pending = 0
         for hid in range(len(self.harts)):
             unmarshal_hart(self._native_states[hid], self.harts[hid])
 
         # Rust 批量执行期间内核可能修改页表并执行 SFENCE.VMA,
-        # 但 Python TLB 不参与 marshal/unmarshal (hart.py:904-907,
-        # "Python TLB is ground truth") — 旧条目不被写回, 但旧条目的
-        # 失效也不会传播到 Python 侧。下一轮 Python 模式的内存访问
-        # 可能命中已在 Rust 侧被刷掉的陈旧 VA->PA 映射, 导致:
-        #   1. 读到错误数据 (如把 7 当作指针) -> 计算错误地址
-        #   2. SIGSEGV at nonsense VA (如 0x33d = NULL+0x33d)
-        # 解决方案: 每轮 batch 后无条件刷掉全部 hart 的 itlb/dtlb。
-        # 过度失效总是安全的 (至多多几次页表遍历), 热 TLB 会在下轮
-        # Python 执行中快速重建。
-        for hart in self.harts:
-            hart.itlb.flush_all()
-            hart.dtlb.flush_all()
+        # tlb_gen 会递增. 仅在 gen 实际变化时才刷新 Python TLB —
+        # 若批次内无 SFENCE.VMA, 保留已有 TLB 条目 (QEMU-style).
+        tlb_gen_after = self._tlb_gen.value
+        if tlb_gen_after != self._tlb_gen_before:
+            for hart in self.harts:
+                hart.itlb.flush_all()
+                hart.dtlb.flush_all()
+        self._tlb_gen_before = tlb_gen_after
 
         # Rust batch 可能直接修改了 bytearray; 使 L2 全部失效,
         # 强制 Python 侧后续读取从 bytearray 重新加载.
@@ -988,17 +997,21 @@ class Emulator:
         # 当有 hart 处于 WFI 且本批次无指令执行时, mtime 可能停滞不动
         # (Rust 未执行任何指令, py_delta 亦为 0)。主动推进 mtime 到最近定时器
         # 截止值, 确保定时器中断能在下次 try_wfi_wakeup 时被检测到。
+        # 若没有任何定时器 (内核可能尚未设置 mtimecmp), 也至少推进 1 tick —
+        # 真实硬件时间永远流逝, WFI 不能导致 mtime 完全停滞 (QEMU-style).
         if wfi_waiting > 0 and all_exec_cnt == 0 and clint is not None:
             remaining = self._wfi_ticks_until_wake(self.harts)
             if remaining is not None:
                 clint.tick(remaining)
-                clint_info.mtime = clint._mtime
-                for hart in self.harts:
-                    if not hart._waiting or hart._halted:
-                        continue
-                    try_wfi_wakeup(hart)
-                    if not hart._waiting:
-                        wfi_waiting -= 1
+            else:
+                clint.tick(1)  # fallback: no timer set, still advance time
+            clint_info.mtime = clint._mtime
+            for hart in self.harts:
+                if not hart._waiting or hart._halted:
+                    continue
+                try_wfi_wakeup(hart)
+                if not hart._waiting:
+                    wfi_waiting -= 1
             # 始终落到 _wfi_sleep_if_idle + PLIC 重同步;
             # 不在此处 early return — stdin 可能在 sleep 期间到达,
             # 需由下方的 PLIC mip 同步 + WFI 重唤醒处理.

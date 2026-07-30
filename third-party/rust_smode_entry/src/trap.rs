@@ -1,6 +1,6 @@
 //! 陷态分发。紧跟 smode_entry/trap_handler.c + ref-emod trap/exceptions.c。
 
-use crate::call;
+use crate::ecall_aux;
 use crate::constants::*;
 use crate::csr;
 use crate::hang;
@@ -224,7 +224,7 @@ pub unsafe extern "C" fn trap_dispatch(gprs: &mut TrapGprs, sepc: u64, scause: u
 
     // 访问故障：转发到 M-mode
     if scause == 0x5 || scause == 0x7 {
-        call::enclave_call_unmatched_acc_fault(stval);
+        ecall_aux::enclave_call_unmatched_acc_fault(stval);
         return;
     }
 
@@ -273,7 +273,7 @@ fn interrupt_dispatch(cause: u64) {
         // 读取 time CSR (0xC01)
         let now: u64;
         core::arch::asm!("csrr {0}, 0xC01", out(reg) now);
-        call::sbi_set_timer(now + TIMER_INTERVAL);
+        ecall_aux::sbi_set_timer(now + TIMER_INTERVAL);
     }
 	csr::clear_csr!(sip, csr::STI);
 }

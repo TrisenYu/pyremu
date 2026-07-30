@@ -21,6 +21,7 @@ third-party/*
 !third-party/rust_smode_entry/
 !third-party/setup-rootfs/
 !third-party/.linux-config
+!third-party/tee_enclave_drv
 
 # Large build artifacts (third-party)
 third-party/setup-rootfs/debootstrap/riscv-sd.ext4

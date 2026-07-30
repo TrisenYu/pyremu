@@ -23,10 +23,27 @@ pub fn pmp_ok(
     is_execute: bool,
     pmp: &PmpCtx,
 ) -> bool {
+    // RISC-V Privileged Spec §3.7.1: when no PMP entries are implemented,
+    // S and U mode accesses are denied.  Only M-mode is allowed.
     if pmp.num == 0 {
-        return true;
+        if state.mode == riscv_mode::M {
+            // Instruction fetches ignore MPRV (RISC-V spec §4.1.12).
+            if is_execute { return true; }
+            let mprv = (state.mstatus >> 17) & 1;
+            if mprv == 0 { return true; }
+            let mpp = (state.mstatus >> 11) & 0x3;
+            if mpp == riscv_mode::M as u64 { return true; }
+        }
+        return false;
     }
     if state.mode == riscv_mode::M {
+        // RISC-V Privileged Spec §4.1.12: "Instruction access-fault and
+        // instruction page-fault exceptions are unaffected by MPRV."
+        // Instruction fetches always use the current privilege mode (M)
+        // for PMP, so M-mode fetches unconditionally bypass PMP.
+        if is_execute {
+            return true;
+        }
         let mprv = (state.mstatus >> 17) & 1;
         if mprv == 0 {
             return true;

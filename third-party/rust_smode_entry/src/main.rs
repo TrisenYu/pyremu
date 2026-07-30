@@ -3,7 +3,7 @@
 #![no_std]
 #![no_main]
 
-mod call;
+mod ecall_aux;
 mod constants;
 mod context;
 mod attest;
@@ -90,7 +90,7 @@ pub unsafe extern "C" fn rust_main_before_mmu(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_main_after_mmu() {
-    let (payload_pa, payload_size, argc) = call::enclave_call_suspend(0);
+    let (payload_pa, payload_size, argc) = ecall_aux::enclave_call_suspend(0);
 
     // 完整性证明: 执行载荷前先验证其尾部 ECDSA 签名。
     // 载荷布局 [ bare | 64 字节签名 ]; 对 bare 做 SHA-256 后验签。
@@ -116,6 +116,9 @@ pub unsafe extern "C" fn rust_main_after_mmu() {
     memory::map_user_argv(argv_pa, argc);
     let entry = elf::load_elf(payload_pa, payload_size);
 
+    // musl _start 要求 sp → argc 的栈布局 (argc/argv/envp/auxv)
+    let umode_sp = setup_musl_stack(umode_sp, argc);
+
     context::ctx_mut().umode_heap_top = UMODE_HEAP_START_ALIGNED - memory::umode_pool_avail();
 
     let mut sstatus = csr::read_sstatus();
@@ -129,9 +132,52 @@ pub unsafe extern "C" fn rust_main_after_mmu() {
 
     let now: u64;
     unsafe { core::arch::asm!("csrr {0}, time", out(reg) now) };
-    call::sbi_set_timer(now + TIMER_INTERVAL);
+    ecall_aux::sbi_set_timer(now + TIMER_INTERVAL);
 
     println!("[enclave] entry=0x{entry:x} -> sret\n");
+}
+
+// ---------------------------------------------------------------
+//  musl 栈布局: sp → argc | argv[] | NULL | envp[] | NULL | auxv[]
+// ---------------------------------------------------------------
+
+const AT_NULL: u64 = 0;
+const AT_PAGESZ: u64 = 6;
+const AT_UID: u64 = 11;
+const AT_GID: u64 = 13;
+
+/// 向 U-mode 栈写入 musl _start 期望的 argc/argv/envp/auxv 布局。
+/// 返回新的 sp (指向 argc)。
+fn setup_musl_stack(sp_top: u64, _argc: u64) -> u64 {
+    let mut sp = sp_top;
+
+    unsafe fn push_u64(sp: &mut u64, val: u64) {
+        *sp = sp.wrapping_sub(8);
+        unsafe { core::ptr::write_volatile(*sp as *mut u64, val) };
+    }
+
+    // auxv (先写入, 位于栈底)
+    unsafe {
+        push_u64(&mut sp, 0);           // AT_NULL value
+        push_u64(&mut sp, AT_NULL);     // AT_NULL type
+        push_u64(&mut sp, 0);           // AT_GID = 0
+        push_u64(&mut sp, AT_GID);      // AT_GID type
+        push_u64(&mut sp, 0);           // AT_UID = 0
+        push_u64(&mut sp, AT_UID);      // AT_UID type
+        push_u64(&mut sp, 0x1000);      // AT_PAGESZ = 4096
+        push_u64(&mut sp, AT_PAGESZ);   // AT_PAGESZ type
+
+        // envp (空)
+        push_u64(&mut sp, 0);           // envp[0] = NULL
+
+        // argv (空, argc=0)
+        push_u64(&mut sp, 0);           // argv[0] = NULL
+
+        // argc
+        push_u64(&mut sp, 0);           // argc = 0
+    }
+
+    sp
 }
 
 // ---------------------------------------------------------------
