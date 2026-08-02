@@ -1,5 +1,5 @@
 annotated-types==0.8.0
-coverage==7.15.0
+coverage==7.15.2
 iniconfig==2.3.0
 lief==1.0.0
 loguru==0.7.3
