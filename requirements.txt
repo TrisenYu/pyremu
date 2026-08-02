@@ -23,4 +23,4 @@ rich==15.0.0
 ruff==0.15.20
 typing-extensions==4.16.0
 typing-inspection==0.4.2
-wcwidth==0.8.1
+wcwidth==0.8.2
