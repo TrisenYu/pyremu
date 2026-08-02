@@ -9,7 +9,7 @@ packaging==26.2
 pluggy==1.6.0
 prompt-toolkit==3.0.52
 pydantic==2.13.4
-pydantic-core==2.46.4
+pydantic-core==2.47.0
 pydevicetree==0.0.13
 pyfdt==0.3
 pygments==2.20.0
