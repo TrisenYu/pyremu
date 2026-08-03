@@ -557,16 +557,19 @@ class HartWithRegs:
         用户进程读到脏数据随机 SIGSEGV (ld.so 崩溃)。读回 0 则内核走
         no-ASID 路径, 每次 mm 切换显式 local_flush_tlb_all().
 
-        satp 写入只在 MODE 字段变化 (地址空间切换) 时刷新 TLB,
-        避免 marshal/unmarshal 边界的冗余冲刷引入副作用.
+        每次 satp 写入均刷新 TLB — 不仅限 MODE 字段变化.
+        约束: 飞地上下文切换 (alter_hart_ctx_for_enclave) 恢复 host
+        satp 时, host 与飞地均为 Sv39 -> MODE 相同 -> 旧逻辑跳过 flush ->
+        飞地的 TLB 残留 (VPN2=0x180, 与内核 VA 重叠) 毒化内核地址空间 ->
+        缺页异常 + 栈溢出.
         """
         v &= ~(0xFFFF << 44)
         self.csrs["satp"].val = mask64(v)
-        new_mode = (v >> 60) & 0xF
-        if new_mode != self._mmu_mode:
-            self.itlb.flush_all()
-            self.dtlb.flush_all()
-        self._mmu_mode = new_mode
+        # 必须无条件刷新: 两个不同 Sv39 页表之间切换时 MODE 不变,
+        # 但 TLB 中的旧映射 (VPN->PPN) 已失效.
+        self.itlb.flush_all()
+        self.dtlb.flush_all()
+        self._mmu_mode = (v >> 60) & 0xF
 
     # ----------------------------------------------------------
     #  页表遍历模式 (由 satp.MODE 字段驱动)

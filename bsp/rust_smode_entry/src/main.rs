@@ -13,6 +13,7 @@ mod hang;
 mod memory;
 mod paging;
 mod println;
+mod sched;
 mod string;
 mod syscall;
 mod trap;
@@ -128,7 +129,7 @@ pub unsafe extern "C" fn rust_main_after_mmu() {
     csr::write_sstatus(sstatus);
     csr::write_sepc(entry);
     csr::write_sscratch(umode_sp);
-    csr::write_sie(csr::STI);
+    csr::write_sie(csr::STI | csr::SSI);
 
     let now: u64;
     unsafe { core::arch::asm!("csrr {0}, time", out(reg) now) };

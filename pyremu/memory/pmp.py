@@ -15,7 +15,6 @@ RV64 编码: pmpcfgN 覆盖 8 个条目, 仅偶数编号的 pmpcfg 可用.
 
 from __future__ import annotations
 
-import os
 from array import array as _array
 from collections.abc import MutableMapping
 from dataclasses import dataclass
@@ -23,6 +22,7 @@ from typing import Any
 
 from loguru import logger
 
+from pyremu.configs_aux import cfg_bool
 from pyremu._native import (
     native_available,
     pmp_check as _native_pmp_check,
@@ -218,7 +218,7 @@ class Pmp:
 
         # 飞地 split 超限预检 (在所有路径前, 避免无谓的缓存重建)
         if mdid != 0 and pmpsplit > 0 and pmpsplit >= self._num_entries:
-            if os.environ.get("PYREMU_TRACE_PMP", "") == "1":
+            if cfg_bool("PYREMU_TRACE_PMP"):
                 logger.debug(
                     f"[pmp] DENY enclave mdid={mdid} "
                     f"pmpsplit={pmpsplit} >= num_entries={self._num_entries}"
@@ -282,7 +282,7 @@ class Pmp:
                 continue
 
             ok = _check_perm(cfg, is_write, is_execute)
-            if not ok and os.environ.get("PYREMU_TRACE_PMP", "") == "1":
+            if not ok and cfg_bool("PYREMU_TRACE_PMP"):
                 logger.debug(
                     f"[pmp] DENY pa={pa:#018x} size={size} "
                     f"eff_mode={eff_mode} is_write={is_write} "

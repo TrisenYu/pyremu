@@ -108,6 +108,22 @@ pub fn enclave_call_exit(code: u64) -> ! {
     crate::hang::hang()
 }
 
+/// Query M-mode for pending host requests.
+/// Returns a flags bitmask: bit0=SHUTDOWN_REQUESTED.
+#[inline]
+pub fn enclave_call_query_requests() -> u64 {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") ENCLAVE_EXT_ID,
+            in("a6") ENCLAVE_CALL_QUERY_REQUESTS,
+            lateout("a0") ret,
+        );
+    }
+    ret
+}
+
 /// Forward an unmatched access fault to M-mode for diagnosis.
 /// Called when S-mode cannot resolve a load/store access fault (scause 5/7).
 #[inline]

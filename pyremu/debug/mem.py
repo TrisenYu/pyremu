@@ -681,7 +681,7 @@ class MemoryMixin(SharedMixinAttrs):
             return
         size = int(size_str, 0)
         if size <= 0 or size > 4096:
-            self._err("size 需在 1–4096 之间")
+            self._err("size 需在 1-4096 之间")
             return
         if not check_rv64_addr(addr):
             self._err(f"地址 {addr:#x} 超出 RV64 范围")
@@ -700,7 +700,7 @@ class MemoryMixin(SharedMixinAttrs):
             return
         size = int(size_str, 0)
         if size <= 0 or size > 4096:
-            self._err("size 需在 1–4096 之间")
+            self._err("size 需在 1-4096 之间")
             return
         if not check_rv64_addr(va):
             self._err(f"地址 {va:#x} 超出 RV64 范围")

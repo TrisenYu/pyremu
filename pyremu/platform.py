@@ -35,6 +35,8 @@ from typing import Any
 
 import yaml
 
+from pyremu import configs_gen
+
 COMPILE_OPTS: str = "rv64imacfd_sstc_zicsr_zifencei"
 
 @dataclass
@@ -56,7 +58,7 @@ class PlatformConfig:
     """模拟平台完整配置.
 
     字段:
-        num_harts: hart 数量 (1–8).
+        num_harts: hart 数量 (1-8).
         ram_size: 物理 RAM 大小 (字节).
         ram_base: 物理 RAM 起始地址.
         prog_cnt: 程序计数器 — 上电复位入口地址.
@@ -76,6 +78,14 @@ class PlatformConfig:
     timebase_freq: int = 10_000_000  # 10 MHz
     pmp_entries: int = 64  # PMP 条目数 (0=禁用, 8/16/64 常见)
     disk_image: str | None = None  # virtio-blk 磁盘镜像路径, None=不挂载
+
+    # DTB /reserved-memory no-map 区域列表 (base, size).
+    # 默认值由 configs.mk 生成 pyremu/pan_vars.py 注入, 需与 custom-opensbi
+    # Kconfig POOL_BASE/POOL_SIZE 保持同步. 单边修改会导致内核在保留区内分配
+    # 页面, 与固件访问产生冲突.
+    reserved_memory_ranges: list[tuple[int, int]] = field(
+        default_factory=lambda: [(configs_gen.RESERVED_MEM_BASE, configs_gen.RESERVED_MEM_SIZE)]
+    )
 
     periph: PeripheralConfig = field(default_factory=PeripheralConfig)
 

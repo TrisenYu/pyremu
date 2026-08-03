@@ -1,5 +1,7 @@
 use crate::concurrent::{ModuleState, StopInfo};
-use crate::handlers::{lr_check, lr_clear_all, lr_set, pmp_ok, try_handle_virtio, DevCtx, PmpCtx, EXIT_SENTINEL};
+use crate::handlers::{
+    lr_check, lr_clear_all, lr_set, pmp_ok, try_handle_virtio, DevCtx, PmpCtx, EXIT_SENTINEL,
+};
 use crate::hart_sched::{ram_offset, read_gpr};
 use crate::peripheral::is_device_addr;
 use crate::state::{exit_reason, HartState};
@@ -186,7 +188,11 @@ pub(crate) fn handle_amo_concurrent(
             #[cfg(feature = "diagnostic")]
             if funct5 == 0b00001 || funct5 == 0b00100 {
                 // AMOSWAP / AMOXOR — rare in normal userspace
-                let name = if funct5 == 0b00001 { "AMOSWAP" } else { "AMOXOR" };
+                let name = if funct5 == 0b00001 {
+                    "AMOSWAP"
+                } else {
+                    "AMOXOR"
+                };
                 crate::diag::log_line(&format!(
                     "[{}] pc={:#018x} pa={:#018x} w={} rd=x{} rs2={:#018x} old={:#018x}",
                     name, state.pc, pa, width, rd, rs2_val, old,

@@ -3,7 +3,6 @@
 pub mod uart;
 pub mod virtio;
 
-
 use crate::state::FfiVirtIoCtx;
 
 /// Device MMIO address ranges (base + end per device).
@@ -22,13 +21,14 @@ impl DevCtx {
     /// 检查是否有设备将工作延迟到 Python 侧处理 (如 virtio QueueNotify
     /// 仅设 notify_pending=1, 实际 virtqueue 处理在 batch 退出后进行)。
     pub fn has_pending_python_work(&self) -> bool {
-        if !self.virtio_raw.is_null() {
-            let notify = unsafe { (*self.virtio_raw).notify_pending };
-            if notify != 0 {
-                return true;
-            }
+        if self.virtio_raw.is_null() {
+            return false;
         }
-        false
+        let notify = unsafe { (*self.virtio_raw).notify_pending };
+		if notify != 0 {
+			return true;
+		}
+		return false;
     }
 }
 

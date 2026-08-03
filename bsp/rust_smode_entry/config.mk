@@ -5,6 +5,7 @@
 ## Timer 定时器配置
 TIMER_INTERVAL ?= 10000      # 10000 for QEMU, 50000 for VisionFive2
 TIMER_FREQ ?= 10000000       # mtime 递增频率 (Hz): 10 MHz for QEMU, 1 MHz for SiFive
+TIME_QUOTA ?= 0              # 飞地时间配额 (timer interrupt 次数), 0=不限. 1000≈1s @10MHz
 
 ## UART 配置
 UART_BASE ?= 0x10000000      # MMIO 基地址

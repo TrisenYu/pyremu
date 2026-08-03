@@ -26,75 +26,76 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define PUBLIC_DATA     "PUBLIC-DATA-00000000"
-#define SENSITIVE_DATA  "SECRET-KEY-12345678"
-#define PROBE_VA        ((volatile char *)0x20000000UL)
+#define PUBLIC_DATA	   "PUBLIC-DATA-00000000"
+#define SENSITIVE_DATA "SECRET-KEY-12345678"
+#define PROBE_VA	   ((volatile char *)0x20000000UL)
+#define __unused	   __attribute__((unused))
 
-int main(int argc __attribute__((unused)),
-         char **argv __attribute__((unused))) {
-    size_t page_sz = 4096;
+int main(int __unused argc, char __unused **argv) {
+	size_t page_sz = 4096;
 
-    /* 与 victim 完全相同的固定 VA */
-    void *addr = mmap((void *)PROBE_VA, page_sz,
-                      PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                      -1, 0);
-    if (addr == MAP_FAILED) {
-        perror("mmap");
-        return 1;
-    }
+	/* 与 victim 完全相同的固定 VA */
+	void *addr = mmap(
+		(void *)PROBE_VA,
+		page_sz,
+		PROT_READ | PROT_WRITE,
+		MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+		-1,
+		0);
+	if (addr == MAP_FAILED) {
+		perror("mmap failed");
+		return 1;
+	}
 
-    /* 写入自己的公开数据 */
-    strncpy((char *)addr, PUBLIC_DATA, page_sz - 1);
-    printf("[probe]  wrote '%s' at VA=%p\n", PUBLIC_DATA, (void *)addr);
+	/* 写入自己的公开数据 */
+	strncpy((char *)addr, PUBLIC_DATA, page_sz - 1);
+	printf("[probe]  wrote '%s' at VA=%p\n", PUBLIC_DATA, (void *)addr);
 
-    /* ---- 第一次读取 (无强制 TLB flush) ---- */
-    volatile char *p = (volatile char *)addr;
-    char buf_first[64];
-    memcpy(buf_first, (void *)p, sizeof(buf_first) - 1);
-    buf_first[sizeof(buf_first) - 1] = '\0';
-    printf("[probe]  1st read='%s'\n", buf_first);
+	/* ---- 第一次读取 (无强制 TLB flush) ---- */
+	volatile char *p = (volatile char *)addr;
+	char buf_first[64];
+	memcpy(buf_first, (void *)p, sizeof(buf_first) - 1);
+	buf_first[sizeof(buf_first) - 1] = '\0';
+	printf("[probe]  1st read='%s'\n", buf_first);
 
-    /* ---- 全 TLB flush 后再次读取 ---- */
-    __asm__ volatile("sfence.vma zero, zero" ::: "memory");
+	/* ---- 全 TLB flush 后再次读取 ---- */
+	__asm__ volatile("sfence.vma zero, zero" ::: "memory");
 
-    char buf_after[64];
-    memcpy(buf_after, (void *)p, sizeof(buf_after) - 1);
-    buf_after[sizeof(buf_after) - 1] = '\0';
-    printf("[probe]  2nd read (after sfence.vma)='%s'\n", buf_after);
+	char buf_after[64];
+	memcpy(buf_after, (void *)p, sizeof(buf_after) - 1);
+	buf_after[sizeof(buf_after) - 1] = '\0';
+	printf("[probe]  2nd read (after sfence.vma)='%s'\n", buf_after);
 
-    /* ---- 判定 ---- */
-    int leak_first  = (strncmp(buf_first, SENSITIVE_DATA,
-                               strlen(SENSITIVE_DATA)) == 0);
-    int leak_after  = (strncmp(buf_after, SENSITIVE_DATA,
-                               strlen(SENSITIVE_DATA)) == 0);
-    int correct_first = (strncmp(buf_first, PUBLIC_DATA,
-                                 strlen(PUBLIC_DATA)) == 0);
-    int correct_after = (strncmp(buf_after, PUBLIC_DATA,
-                                 strlen(PUBLIC_DATA)) == 0);
+	/* ---- 判定 ---- */
+	int leak_first	  = (strncmp(buf_first, SENSITIVE_DATA, strlen(SENSITIVE_DATA)) == 0);
+	int leak_after	  = (strncmp(buf_after, SENSITIVE_DATA, strlen(SENSITIVE_DATA)) == 0);
+	int correct_first = (strncmp(buf_first, PUBLIC_DATA, strlen(PUBLIC_DATA)) == 0);
+	int correct_after = (strncmp(buf_after, PUBLIC_DATA, strlen(PUBLIC_DATA)) == 0);
 
-    printf("\n[probe] === Result ===\n");
-    printf("[probe]  Before flush: %s\n",
-           leak_first  ? "LEAKED  (victim's data visible!)"
-           : correct_first ? "CORRECT (own data)"
-           : "UNKNOWN (data mismatch)");
-    printf("[probe]  After  flush: %s\n",
-           leak_after  ? "LEAKED  (mfence.did failed)"
-           : correct_after ? "CORRECT (mfence.did effective)"
-           : "UNKNOWN (data mismatch)");
+	puts("\n[probe] === Result ===");
+	printf(
+		"[probe]  Before flush: %s\n",
+		leak_first		? "LEAKED  (victim's data visible!)"
+		: correct_first ? "CORRECT (own data)"
+						: "UNKNOWN (data mismatch)");
+	printf(
+		"[probe]  After  flush: %s\n",
+		leak_after		? "LEAKED  (mfence.did failed)"
+		: correct_after ? "CORRECT (mfence.did effective)"
+						: "UNKNOWN (data mismatch)");
 
-    int exit_code;
-    if (leak_first && correct_after) {
-        printf("[probe] Verdict: TLB leak CONFIRMED, sfence.vma BLOCKED it\n");
-        exit_code = 42;  /* 泄漏确认码 */
-    } else if (correct_first) {
-        printf("[probe] Verdict: No leak — TLB properly isolated\n");
-        exit_code = 0;
-    } else {
-        printf("[probe] Verdict: Unexpected state\n");
-        exit_code = 1;
-    }
+	int exit_code;
+	if (leak_first && correct_after) {
+		puts("[probe] Verdict: TLB leak CONFIRMED, sfence.vma BLOCKED it");
+		exit_code = 42; /* 泄漏确认码 */
+	} else if (correct_first) {
+		puts("[probe] Verdict: No leak — TLB properly isolated");
+		exit_code = 0;
+	} else {
+		puts("[probe] Verdict: Unexpected state");
+		exit_code = 1;
+	}
 
-    munmap(addr, page_sz);
-    return exit_code;
+	munmap(addr, page_sz);
+	return exit_code;
 }

@@ -211,7 +211,7 @@ pub fn csr_read(state: &HartState, addr: u16, _hart_id: u8, mtime: u64, pmp: &Pm
         0x308 /* mvien */ | 0x309 /* mvip */
         | 0x318 /* mvienh */ | 0x319 /* mviph */ => (0, CSR_OK),
 
-        // Debug/trace trigger CSRs (0x7A0–0x7AF) — not implemented.
+        // Debug/trace trigger CSRs (0x7A0-0x7AF) — not implemented.
         // Return 0 rather than IllInstr: OpenSBI does not delegate IllInstr
         // to S-mode, so S-mode trigger probes would trap to M-mode where
         // OpenSBI's handler calls sbi_trap_error -> WFI, stalling the kernel.
@@ -241,7 +241,7 @@ pub fn csr_read(state: &HartState, addr: u16, _hart_id: u8, mtime: u64, pmp: &Pm
                 (0, CSR_OK) // unimplemented entries read as zero
             }
         }
-        // PMP address registers (0x3B0–0x3EF): one per entry, 8 bytes each.
+        // PMP address registers (0x3B0-0x3EF): one per entry, 8 bytes each.
         a if (0x3B0..=0x3EF).contains(&a) => {
             let n = (a - 0x3B0) as usize;
             if n < pmp.num as usize {
@@ -367,7 +367,7 @@ pub fn csr_write(state: &mut HartState, addr: u16, val: u64, pmp: &PmpCtx) -> u8
         0x5C0 => { state.mdid = val as u8; CSR_OK }
         0x5C1 => { state.pmpsplit = val as u8; CSR_OK }
 
-        // Debug/trace trigger CSRs (0x7A0–0x7AF) — not implemented.
+        // Debug/trace trigger CSRs (0x7A0-0x7AF) — not implemented.
         // Writes are silently ignored (WO in some implementations, RW in others;
         // without Sdext they are WARL=0).
         0x7A0..=0x7AF => CSR_OK,
@@ -395,7 +395,7 @@ pub fn csr_write(state: &mut HartState, addr: u16, val: u64, pmp: &PmpCtx) -> u8
             }
             CSR_OK
         }
-        // PMP address registers (0x3B0–0x3EF): one per entry, 8 bytes each.
+        // PMP address registers (0x3B0-0x3EF): one per entry, 8 bytes each.
         a if (0x3B0..=0x3EF).contains(&a) => {
             let n = (a - 0x3B0) as usize;
             if n < pmp.num as usize {
@@ -817,7 +817,7 @@ mod tests {
     fn pmpcfg_write_packs_bytes() {
         let (pmp, cfg, _addr) = test_pmp_real(16);
         let mut s = test_state();
-        // pmpcfg0 (0x3A0) covers entries 0–7.
+        // pmpcfg0 (0x3A0) covers entries 0-7.
         // Write: entry 0 = 0xAB, entry 2 = 0xCD (byte positions 0 and 2).
         let val: u64 = 0xAB | (0xCDu64 << 16);
         let st = csr_write(&mut s, 0x3A0, val, &pmp);

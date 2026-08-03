@@ -208,8 +208,6 @@ try:
         ctypes.c_void_p,   # tlb: *mut FfiTlbCtx
     ]
     _lib.run_parallel.restype = None
-    _lib.icount_flush.argtypes = []
-    _lib.icount_flush.restype = None
 
 except OSError as exc:
     logger.warning(
@@ -298,7 +296,7 @@ def decode_fields(instr: int) -> DecodedFields:
 
 
 def _creg(raw: int) -> int:
-    """3-bit compressed register -> full register (x8–x15)."""
+    """3-bit compressed register -> full register (x8-x15)."""
     return (raw & 0x7) + 8
 
 
@@ -891,6 +889,7 @@ class FfiUartCtx(ctypes.Structure):
         ("rx_fifo_len", ctypes.c_uint32), # RX FIFO 近似填充量
         ("tx_notify_fd", ctypes.c_int32), # pipe write-end: Rust 通知 TX 线程
         ("no_stdout", ctypes.c_uint8),    # 1=Rust 不写 stdout, Python TX 统一输出
+        ("rx_notify", ctypes.c_void_p),   # *mut u8 — TermIO 有新 RX 数据标志
     ]
 
 
@@ -1049,11 +1048,12 @@ class UartInfo:
     """UART context for a batch — lets Rust buffer sbi_printf output inline
     and handle IE/IP/TXCTRL register reads without batch exits."""
     __slots__ = ("base", "tx_buf", "tx_wr", "ie", "txctrl", "rxctrl",
-                 "rx_fifo_len", "tx_notify_fd", "no_stdout")
+                 "rx_fifo_len", "tx_notify_fd", "no_stdout", "rx_notify")
 
     def __init__(self, base: int = 0, tx_buf=None, tx_wr=None,
                  ie: int = 0, txctrl: int = 0, rxctrl: int = 0, rx_fifo_len: int = 0,
-                 tx_notify_fd: int = -1, no_stdout: int = 0):
+                 tx_notify_fd: int = -1, no_stdout: int = 0,
+                 rx_notify=None):
         self.base = base
         self.tx_buf = tx_buf
         self.tx_wr = tx_wr
@@ -1063,6 +1063,7 @@ class UartInfo:
         self.rx_fifo_len = rx_fifo_len
         self.tx_notify_fd = tx_notify_fd
         self.no_stdout = no_stdout
+        self.rx_notify = rx_notify
 
 
 class VirtIOInfo:
@@ -1220,6 +1221,9 @@ def run_parallel(
         uart_ffi.rx_fifo_len = uart.rx_fifo_len
         uart_ffi.tx_notify_fd = uart.tx_notify_fd
         uart_ffi.no_stdout = uart.no_stdout
+        if uart.rx_notify is not None:
+            uart_ffi.rx_notify = ctypes.cast(
+                ctypes.pointer(uart.rx_notify), ctypes.c_void_p).value
 
     # --- FfiVirtIOCtx ---
     _virtio_ffi = FfiVirtIOCtx()
@@ -1319,7 +1323,7 @@ _termio_lib: ctypes.CDLL | None = None
 class TermIoHandle(ctypes.Structure):
     """termio 线程共享状态 — 必须与 Rust ``#[repr(C)] TermIoHandle`` 布局一致.
 
-    Rust 侧 ``test_handle_layout_locked`` 锁定 sizeof=80 及各字段偏移;
+    Rust 侧 ``test_handle_layout_locked`` 锁定 sizeof=104 及各字段偏移;
     修改任一侧字段必须同步另一侧。
 
     由 :class:`pyremu.peripheral.termio.TerminalIO` 构建并持有: 指针字段指向
@@ -1339,6 +1343,8 @@ class TermIoHandle(ctypes.Structure):
         ("tx_drain", ctypes.c_void_p),     # *mut AtomicU32 — drain index (I/O thread 独占)
         ("stop_flag", ctypes.c_void_p),    # *mut AtomicU8 — stop request flag
         ("pause_flag", ctypes.c_void_p),   # *mut AtomicU8 — pause (debugger break)
+        ("rx_notify", ctypes.c_void_p),    # *mut AtomicU8 — new RX data notification
+        ("rx_notify_fd", ctypes.c_int32),  # fd: Rust termio 写 1B 唤醒 RX daemon
     ]
 
 
@@ -1373,7 +1379,7 @@ def termio_available() -> bool:
 
 
 def termio_start(handle: TermIoHandle) -> int:
-    """Start the terminal I/O background thread in Rust.
+    """Start the terminal I/O background thread in Rust (raw mode).
 
     *handle* 由调用方 (TerminalIO) 构建; 其指针字段指向的缓冲区必须
     存活至线程退出。
@@ -1405,12 +1411,3 @@ def termio_is_running() -> bool:
         return _termio_lib.terminal_io_is_running() != 0
     return False
 
-
-def icount_flush() -> None:
-    """Dump accumulated Rust instruction frequency counters to the diag log.
-
-    Safe to call from the debugger REPL (``icount_flush()``) or from
-    ``Emulator._step_native`` when a terminal breakpoint is hit.
-    """
-    if _lib is not None:
-        _lib.icount_flush()

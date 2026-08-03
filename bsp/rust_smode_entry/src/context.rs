@@ -45,14 +45,27 @@ pub struct SharedBuf {
 }
 
 // ---------------------------------------------------------------
+//  页表根 — 独立 static 强制 4 KiB 对齐
+// ---------------------------------------------------------------
+
+/// 页表根（512 项，必须 4 KiB 对齐）。
+///
+/// 独立 wrapper 结构体以 `#[repr(align(4096))]` 强制对齐,
+/// **不依赖 BSS 布局** (BSS 中其他零初始化静态可能破坏
+/// `EnclaveContext` 内嵌字段的 4 KiB 对齐约束, 导致
+/// satp.PPN 指向错误物理页 → MMU 开启后全部取指页错误
+/// → trap loop → hart halt).
+#[repr(align(4096))]
+#[allow(dead_code)]
+pub struct PageTableRoot([Pte; 512]);
+
+static mut PAGE_TABLE_ROOT: PageTableRoot = PageTableRoot([Pte(0); 512]);
+
+// ---------------------------------------------------------------
 //  EnclaveContext
 // ---------------------------------------------------------------
 
-#[repr(align(4096))]
 pub struct EnclaveContext {
-    /// 页表根（512 项，必须 4 KiB 对齐）。
-    #[allow(dead_code)]
-    pub page_table_root: [Pte; 512],
     /// 飞地管理器物理起始地址。
     pub manager_pa_start: u64,
     /// 下一个飞地模块的加载 VA。
@@ -67,6 +80,10 @@ pub struct EnclaveContext {
     #[allow(dead_code)]
     pub shared_buffer: Option<SharedBuf>,
     pub umode_pool_pa_aligned: u64,
+    /// 飞地时间配额 (timer interrupt 次数), 0=不限.
+    pub time_quota: u64,
+    /// 当前时间片内已消耗的 timer interrupt 次数.
+    pub ticks_consumed: u64,
 }
 
 // ---------------------------------------------------------------
@@ -137,12 +154,13 @@ static CTX: OnceCell<EnclaveContext> = OnceCell::new();
 
 /// 初始化 CTX — 逐字段写入, 不依赖任何 memcpy.
 /// CTX 位于 BSS 段, 启动时已全零, 故仅需设置非零字段.
+/// PAGE_TABLE_ROOT 独立于 CTX 以 `#[repr(align(4096))]` 强制对齐.
 pub fn init_context(man_pa_start: u64, enclave_module_load_va: u64) {
     CTX.init_direct(|ptr| unsafe {
-        // page_table_root 已由 BSS 清零, 无需再写
         (*ptr).manager_pa_start = man_pa_start;
         (*ptr).enclave_module_load_va = enclave_module_load_va;
-        // 其余字段 = 0 (umode_heap_top, pools, shared_buffer, ...)
+        (*ptr).time_quota = crate::constants::TIME_QUOTA;
+        // 其余字段 = 0 (umode_heap_top, pools, ticks_consumed, shared_buffer, ...)
         // BSS 已保证全零, 无需显式赋值
     });
 }
@@ -152,17 +170,14 @@ pub fn ctx() -> &'static EnclaveContext {
     CTX.get()
 }
 
-/// 返回 page_table_root 的物理地址。
+/// 返回页表根的物理地址 (始终 4 KiB 对齐).
 ///
-/// 使用裸指针直接取 `CTX.value` 地址, 避免编译器在 `ctx().page_table_root.as_ptr()`
-/// 链路上引入错误的 0x18 偏移.
-///
-/// page_table_root 是 EnclaveContext 第一个字段 (offset 0),
-/// CTX.value (MaybeUninit) 同样位于 OnceCell 起始处,
-/// 故 `CTX.value.get()` 即 page_table_root 物理地址.
+/// `PAGE_TABLE_ROOT` 作为独立 `#[repr(align(4096))]` static,
+/// 不依赖 BSS 内 `EnclaveContext` 的布局, 确保 MMU 使能后
+/// satp.PPN 指向正确的物理页.
 #[inline]
 pub fn root_pa() -> u64 {
-    CTX.value.get() as *const u8 as u64
+    &raw const PAGE_TABLE_ROOT as u64
 }
 
 #[inline]

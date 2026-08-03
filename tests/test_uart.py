@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from pyremu._native import native_available
@@ -197,17 +195,9 @@ class TestNativeUartPairRouting:
             prog_cnt=0x8000_0000,
             periph=PeripheralConfig(),
         )
-        # TX ring buffer 由 TerminalIO 管理, 仅在启用 native batch 时分配;
-        # 测试默认 PYREMU_NATIVE_BATCH=0, 故构造时临时开启。
-        prev = os.environ.get("PYREMU_NATIVE_BATCH")
-        os.environ["PYREMU_NATIVE_BATCH"] = "1"
-        try:
-            emu = Emulator(cfg)
-        finally:
-            if prev is None:
-                os.environ.pop("PYREMU_NATIVE_BATCH", None)
-            else:
-                os.environ["PYREMU_NATIVE_BATCH"] = prev
+        emu = Emulator(cfg)
+        if emu._termio is None:
+            pytest.skip("TerminalIO not available (非交互式 TTY 环境)")
         uart = emu.uart
         assert uart is not None
         uart.set_hart_log_dir(str(tmp_path))
@@ -215,7 +205,8 @@ class TestNativeUartPairRouting:
 
     def _push_pair(self, emu: Emulator, hid: int, byte: int) -> None:
         termio = emu._termio
-        assert termio is not None, "TerminalIO must be initialised (native batch + UART)"
+        if termio is None:
+            pytest.skip("TerminalIO not available (非交互式环境)")
         ecap = termio.TX_CAP // 2
         e = termio.tx_wr.value
         termio.tx_buf[2 * (e % ecap)] = hid

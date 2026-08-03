@@ -13,7 +13,8 @@ import signal
 import sys
 import termios
 import threading
-import time
+
+from pyremu.configs_aux import cfg_bool
 import tty
 from pathlib import Path
 
@@ -99,7 +100,7 @@ class DebuggerBase(SharedMixinAttrs):
         self._stdin_daemon_thread: threading.Thread | None = None
 
         # Diagnostic counters visible only when PYREMU_DIAG_VERBOSE=1
-        self._show_diag: bool = os.environ.get("PYREMU_DIAG_VERBOSE") == "1"
+        self._show_diag: bool = cfg_bool("PYREMU_DIAG_VERBOSE")
 
         # UART stdin 转发 — 终端 raw 模式管理
         self._stdin_forward: bool = True
@@ -211,9 +212,10 @@ class DebuggerBase(SharedMixinAttrs):
         stdin daemon 独立于处理器执行循环持续读取, 与 WFI 零耦合.
         处理器仅看到 PLIC 外部中断信号 -> try_wfi_wakeup() 自然唤醒.
         """
-        # 忽略 SIGINT: ISIG 已关闭, Ctrl+C 作为 0x03 透传给客机.
-        # Ctrl+Q 由 stdin daemon 拦截 -> stop_flag -> REPL.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        # 终端 ISIG 已关闭, 键盘 Ctrl+C (0x03) 作为普通字节透传给客机,
+        # 不经信号路径. 此处的 SIGINT handler 只响应 Rust termio 线程的
+        # Ctrl+Q -> kill(SIGINT), 实现与 Python daemon Ctrl+Q 同等的即时停止.
+        signal.signal(signal.SIGINT, self._sigint_run)
 
         if not self._stdin_forward:
             return
@@ -223,17 +225,37 @@ class DebuggerBase(SharedMixinAttrs):
 
         self._emu._idle_poll_cb = self._idle_poll
 
-        # cbreak + ISIG/IXON 关闭: Ctrl+C (0x03) 与 Ctrl+Q (0x11) 均透传.
-        # Ctrl+Q 由 stdin daemon 拦截暂停; Ctrl+C 直达客机终端.
+        # 完整 raw 模式 (对照 termio/src/lib.rs raw 设置):
+        # - 关 ECHO/ICANON/IEXTEN/ISIG: 所有字符原样透传
+        # - CS8: 8-bit 数据, 不丢高位 (对 backspace 0x7F 等关键)
+        # - ICRNL 保留: \r->\n, 行终止兼容客机控制台
+        # - IXON 关: Ctrl+Q/Ctrl+S 透传
         if os.isatty(self._stdin_fd):
             self._saved_term_attrs = termios.tcgetattr(self._stdin_fd)
-            tty.setcbreak(self._stdin_fd)
-            attrs = list(termios.tcgetattr(self._stdin_fd))
-            attrs[0] = (attrs[0] | termios.ICRNL) & ~(termios.IXON)
-            attrs[3] &= ~termios.ISIG          # Ctrl+C → raw 0x03
+            attrs = termios.tcgetattr(self._stdin_fd)
+            # iflag: 清除输入转换; ICRNL 保留 (客机控制台可能未初始化 \r->\n)
+            attrs[0] = (attrs[0] & ~(
+                termios.IGNBRK | termios.BRKINT | termios.PARMRK
+                | termios.ISTRIP | termios.INLCR | termios.IGNCR
+                | termios.IXON
+            )) | termios.ICRNL
+            # lflag: 清除行编辑/回显/信号生成
+            attrs[3] &= ~(
+                termios.ECHO | termios.ECHONL | termios.ICANON
+                | termios.IEXTEN | termios.ISIG
+            )
+            # cflag: 8-bit 字符
+            attrs[2] = (attrs[2] & ~termios.CSIZE) | termios.CS8
+            # cflag: 关校验
+            attrs[2] &= ~termios.PARENB
+            # cc: 每字节即时可读
+            attrs[6][termios.VMIN] = 1
+            attrs[6][termios.VTIME] = 0
             termios.tcsetattr(self._stdin_fd, termios.TCSANOW, attrs)
 
-        self._start_stdin_daemon()
+        # TermIO daemon 已接管 stdin (native 模式), Python daemon 不需要再读.
+        if self._emu._termio is None or not self._emu._termio.native_active:
+            self._start_stdin_daemon()
 
     def _restore_term(self) -> None:
         """恢复 _enter_run_mode 保存的终端属性."""
@@ -261,57 +283,44 @@ class DebuggerBase(SharedMixinAttrs):
     # ----------------------------------------------------------
 
     def _stdin_daemon_loop(self) -> None:
-        """后台 daemon: select(stdin) -> os.read -> uart.preload() -> PLIC 中断.
-
-        与处理器 WFI 完全解耦: daemon 仅负责把 stdin 字节注入 UART RX FIFO,
-        UART 内部的 ``_update_plic_irq()`` 自动置位 PLIC 中断, ``_wake_event``
-        唤醒主线程的 WFI 睡眠。处理器看到的是标准的 PLIC 外部中断信号。
-
-        Ctrl+Q (0x11) 立即暂停; 双击 Ctrl+Q 在客机端处理 (发送 0x11 0x11).
+        """后台 daemon: 仅 Python 回退时使用 (termio 不可用).
+        select(stdin) -> os.read -> uart.preload() -> PLIC 中断.
+        Ctrl+Q (0x11) 中断执行返回调试器 REPL.
         """
         uart = self._emu.uart
         if uart is None:
             return
         stdin_fd = self._stdin_fd
         stop_flag = self._emu._native_stop_flag
-        pending: bytes = b""
+
         while self._stdin_daemon_running:
-            timeout = 0.005 if pending else 0.02
             try:
-                ready, _, _ = select.select([stdin_fd], [], [], timeout)
+                ready, _, _ = select.select([stdin_fd], [], [], 0.02)
             except (OSError, ValueError):
                 break
             if not self._stdin_daemon_running:
                 break
-            if ready:
+            if not ready:
+                continue
+            try:
+                data = os.read(stdin_fd, 4096)
+            except OSError:
+                break
+            if not data:
+                break
+            # Ctrl+Q -> 停止模拟, 返回 REPL
+            i = data.find(b'\x11')
+            if i >= 0:
+                stop_flag.value = 1
+                self._emu._wake_event.set()
+                self._stdin_daemon_running = False
+                data = data[:i]  # 仅交付 Ctrl+Q 之前的部分
+            if data:
                 try:
-                    data = os.read(stdin_fd, 4096)
-                except OSError:
-                    break
-                # Filter Ctrl+Q before forwarding to guest
-                i = data.find(b'\x11')
-                if i >= 0:
-                    stop_flag.value = 1
-                    self._emu._wake_event.set()
-                    # Forward bytes before the escape, then pause
-                    if i > 0:
-                        pending += data[:i]
-                    if pending:
-                        try:
-                            uart.preload(pending)
-                        except Exception:
-                            pass
-                    return
-                pending += data
-            if pending:
-                try:
-                    n = uart.preload(pending)
+                    uart.preload(data)
                 except Exception:
-                    n = 0
-                if n > 0:
-                    pending = pending[n:]
-                    self._emu._native_ext_irq.pending = 1
-                    self._emu._wake_event.set()
+                    pass
+            self._emu._wake_event.set()
 
     def _start_stdin_daemon(self) -> None:
         """启动 stdin daemon 线程 (在 cbreak 终端设置之后调用)."""
@@ -350,6 +359,14 @@ class DebuggerBase(SharedMixinAttrs):
             had_input = self._emu._termio.drain_rx()
             if had_input:
                 self._emu._wake_event.set()
+            # _rx_notify 由 Rust termio 线程置 1; daemon 搬运数据后不清零
+            # (留给 Rust batch engine 做快速退出信号). 此处 ring buffer 排空后
+            # 清零, 但需防 TOCTOU: 清零与判空之间 Rust 可能写入新数据.
+            termio = self._emu._termio
+            if termio._rx_wr.value == termio._rx_rd.value:
+                termio._rx_notify.value = 0
+                if termio._rx_wr.value != termio._rx_rd.value:
+                    termio._rx_notify.value = 1  # 恢复: 新数据恰在清空间隙到达
             self._flush_uart_if_present()
             return had_input
 
@@ -357,6 +374,25 @@ class DebuggerBase(SharedMixinAttrs):
         if uart is None:
             return False
         had_input = False
+
+        # daemon 线程已在后台持续 select(stdin) -> os.read -> uart.preload;
+        # 主线程不应再从同一 fd 读取, 否则产生竞争且此路径不设 ext_irq.
+        # 仅处理 daemon 未完全消费的 _stdin_pending 残余.
+        if self._stdin_daemon_running:
+            if not self._stdin_pending:
+                return had_input
+            try:
+                accepted = uart.preload(self._stdin_pending)
+            except (ValueError, OSError):
+                return had_input
+            if accepted > 0:
+                had_input = True
+                self._emu._native_ext_irq.pending = 1
+                self._stdin_pending = self._stdin_pending[accepted:]
+            if self._stdin_pending:
+                self._emu._wake_event.set()
+            return had_input
+
         if self._stdin_pending:
             try:
                 accepted = uart.preload(self._stdin_pending)
@@ -387,9 +423,11 @@ class DebuggerBase(SharedMixinAttrs):
             return had_input
         if accepted > 0:
             had_input = True
+            self._emu._native_ext_irq.pending = 1
             if accepted < len(data):
                 self._stdin_pending = data[accepted:]
         if had_input:
+            self._emu._native_ext_irq.pending = 1
             self._emu._wake_event.set()
         return had_input
 
@@ -415,6 +453,10 @@ class DebuggerBase(SharedMixinAttrs):
         had_input = False
         if self._emu._termio is not None:
             had_input = self._emu._termio.drain_rx()
+            # _rx_notify 由 idle poll 在确认 ring buffer 排空后清零
+            termio = self._emu._termio
+            if termio._rx_wr.value == termio._rx_rd.value:
+                termio._rx_notify.value = 0
         self._flush_uart_if_present()
         return had_input
 
@@ -484,7 +526,7 @@ class DebuggerBase(SharedMixinAttrs):
         banner = (
             f"[bold]pyremu rvdb[/] — "
             f"{self._emu.num_harts} hart(s), "
-            f"RAM {hex_addr(self._emu.bus._ram_base)}–"
+            f"RAM {hex_addr(self._emu.bus._ram_base)}-"
             f"{hex_addr(self._emu.bus._ram_end)}, "
             f"固件: {hex_addr(self.hart.pc)}"
         )

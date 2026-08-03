@@ -15,7 +15,6 @@ CPIO_OUT="./debian-riscv-initrd.cpio.gz"
 HOSTNAME="riscv-trixie-sd"
 ROOT_PASSWD="Password..."
 
-# ---- 终端渲染颜色 (用法: echo -e "${RED}error${NC}") ----
 RED='\033[31m'
 GREEN='\033[32m'
 YELLOW='\033[33m'
@@ -30,12 +29,12 @@ cleanup_mount() {
 	echo "unmount done"
 }
 
-# 1. executed by root
+# executed by root
 if [ "$(id -u)" -ne 0 ]; then
 	echo -e "${RED}require root privilege${NC}"
 	exit 1
 fi
-# 2. /etc/os-release and debian
+# /etc/os-release and debian
 if [ ! -f "/etc/os-release" ]; then
     echo -e "${RED}[ERROR] require debian-distribution. /etc/os-release is lacked.${NC}"
     exit 1
@@ -50,7 +49,7 @@ fi
 
 trap cleanup_mount EXIT
 
-# 3. environment setup
+# environment setup
 apt update && apt install -y debootstrap qemu-user-static binfmt-support e2fsprogs util-linux
 if [ -d "${ROOTFS_DIR}" ]; then
     echo ">> clean up pre-existed ${ROOTFS_DIR}"
@@ -58,7 +57,7 @@ if [ -d "${ROOTFS_DIR}" ]; then
 fi
 mkdir -p "${ROOTFS_DIR}"
 
-# 4. compile by standard interpreter and fetch essential dependecies
+# compile by standard interpreter and fetch essential dependecies
 QEMU_BIN="/usr/bin/qemu-riscv64-static"
 if [ ! -f "${QEMU_BIN}" ]; then
     QEMU_BIN="$(which qemu-riscv64-static 2>/dev/null || true)"
@@ -71,23 +70,29 @@ fi
 echo ">> qemu-riscv64-static: ${QEMU_BIN}"
 
 debootstrap --arch=riscv64 --foreign --variant=minbase "${SUITE}" "${ROOTFS_DIR}" "${MIRROR}"
-# 将 qemu 静态二进制放入 debootstrap 创建的目录结构中,
-# 确保 chroot 内可执行 riscv64 二进制.
-# 顺序必须在 debootstrap --foreign 之后 (它创建 base dirs),
-# 在 chroot --second-stage 之前 (它需要 qemu 来运行 riscv 程序).
+# qemu for emulating the basic target environment
 install -D -m755 "${QEMU_BIN}" "${ROOTFS_DIR}/usr/bin/qemu-riscv64-static"
 DEBIAN_FRONTEND=noninteractive LANG=C chroot "${ROOTFS_DIR}" /debootstrap/debootstrap --second-stage
 
-# 5. mount devices in host
+# mount devices in host
 mount -t proc none "${ROOTFS_DIR}/proc"
 mount -t sysfs none "${ROOTFS_DIR}/sys"
 mount --bind /dev "${ROOTFS_DIR}/dev"
 mount --bind /dev/pts "${ROOTFS_DIR}/dev/pts"
 mount --bind /tmp "${ROOTFS_DIR}/tmp"
 
-# 6. setup basic environment
+# setup basic environment
+# ---- replace the deb sources
+# ---- update host sources
+# ---- zsh will be set as default shell
+# ---- install oh-my-zsh
+# ---- plugins ----
+# RUNZSH=no   zsh
+# CHSH=no     shell
+# Gitee for Chinese Networking Environment:
+#   OH_MY_ZSH_URL=https://gitee.com/mirrors/oh-my-zsh/raw/master/tools/install.sh
+#   ZSH_PLUGIN_PREFIX=https://gitee.com/mirrors
 LANG=C DEBIAN_FRONTEND=noninteractive chroot "${ROOTFS_DIR}" /bin/bash <<EOF
-# replace the deb sources.
 cat > /etc/apt/sources.list <<'SRC'
 deb ${MIRROR} trixie main contrib non-free non-free-firmware
 deb ${MIRROR} trixie-updates main contrib non-free non-free-firmware
@@ -117,19 +122,11 @@ tmpfs   /tmp    tmpfs   size=64M    0 0
 tmpfs   /var/run tmpfs  defaults    0 0
 FS
 
-# ---- zsh will be set as default shell ----
 chsh -s /bin/zsh root
 
-# ---- oh-my-zsh ----
-# RUNZSH=no   zsh
-# CHSH=no     shell
-# Gitee for Chinese Networking Environment:
-#   OH_MY_ZSH_URL=https://gitee.com/mirrors/oh-my-zsh/raw/master/tools/install.sh
-#   ZSH_PLUGIN_PREFIX=https://gitee.com/mirrors
 OH_MY_ZSH_URL="\${OH_MY_ZSH_URL:-https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh}"
 curl -fsSL "\${OH_MY_ZSH_URL}" | RUNZSH=no CHSH=no sh
 
-# ---- plugins ----
 ZSH_PLUGIN_PREFIX="\${ZSH_PLUGIN_PREFIX:-https://github.com}"
 ZSH_CUSTOM="/root/.oh-my-zsh/custom"
 git clone --depth=1 \
@@ -155,7 +152,7 @@ sed -i "s/^ZSH_THEME=\".*\"$/ZSH_THEME=\"gentoo\"/" /root/.zshrc || true
 
 EOF
 
-# 7. toy benchmark programs -> /eval/toy-progs
+# toy benchmark programs -> /eval/toy-progs
 TOY_SRC="$(cd "$(dirname "$0")/../../../tests/src-rv8" && pwd)"
 TOY_DEST="${ROOTFS_DIR}/eval/toy-progs"
 mkdir -p "${TOY_DEST}"
@@ -204,13 +201,13 @@ ls -la "${TOY_DEST}"
 
 # 8. TEE enclave driver + userspace test programs
 echo ">> Building TEE enclave driver & test programs ..."
-TEE_DRV_SRC="$(cd "$(dirname "$0")/../../../third-party/tee_enclave_drv" && pwd)"
+TEE_DRV_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_enclave_drv" && pwd)"
 TEE_TEST_SRC="$(cd "$(dirname "$0")/../../../tests/src-sidecache" && pwd)"
 TEE_DEST="${ROOTFS_DIR}/eval/tee-test"
 mkdir -p "${TEE_DEST}"
 
 # Build kernel module (requires linux tree at ../../linux)
-KDIR="$(cd "$(dirname "$0")/../../../third-party/linux" && pwd)"
+KDIR="$(cd "$(dirname "$0")/../../../bsp/linux" && pwd)"
 CLANG_CC="/opt/custom-llvm/bin/clang"
 if [ -x "${CLANG_CC}" ] && [ -d "${KDIR}" ]; then
     make -C "${KDIR}" M="${TEE_DRV_SRC}" ARCH=riscv \
@@ -252,17 +249,17 @@ fi
 echo ">> TEE components:"
 ls -la "${TEE_DEST}"
 
-# 9. cleanup host binary and devices
+# cleanup host binary and devices
 rm -f "${ROOTFS_DIR}/usr/bin/qemu-riscv64-static"
 cleanup_mount
 
+# cpio for initramfs
 pushd "${ROOTFS_DIR}" >/dev/null
 find . -print0 | cpio --null -ov --format=newc | gzip -9 > "../${CPIO_OUT}"
 popd
-# 10. cpio for initramfs
 echo ">> initramfs: ${CPIO_OUT}"
 
-# 11. ext4 file-system used in block device
+# ext4 file-system used in block device
 dd if=/dev/zero of="${EXT4_IMG_FILE}" bs=1M count="${EXT4_IMG_SIZE_MB}" status=none
 mkfs.ext4 -F "${EXT4_IMG_FILE}"
 
@@ -272,9 +269,7 @@ cp -r "${ROOTFS_DIR}"/* ./mnt-tmp/
 umount ./mnt-tmp
 rmdir mnt-tmp
 
-# 12. 将输出文件的所有权归还给调用 sudo 的原始用户,
-#     避免 emulator 以普通用户运行时因 PermissionError
-#     回退到 O_RDONLY ->ext4 journal 无法 replay ->文件系统不可写.
+# set proper privilege via chown
 if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
 	chown "${SUDO_USER}:${SUDO_USER}" "${EXT4_IMG_FILE}" "${CPIO_OUT}"
 	echo ">> ownership of output files returned to ${SUDO_USER}"

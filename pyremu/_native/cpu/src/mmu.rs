@@ -45,7 +45,7 @@ pub struct Sv39Vpn {
 pub struct PteFields {
     /// Physical page number (44 bits).
     pub ppn: u64,
-    /// Permission flags: R|W|X|U (bits 1–4 of raw PTE).
+    /// Permission flags: R|W|X|U (bits 1-4 of raw PTE).
     pub perm: u8,
     /// V (valid) flag.
     pub v: u8,

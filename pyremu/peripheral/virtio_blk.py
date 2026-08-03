@@ -44,12 +44,13 @@ Guest 可通过该设备读写磁盘镜像 (raw 格式).
 
 from __future__ import annotations
 
-import os
 import struct
 import sys
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from pyremu.configs_aux import cfg_bool
 from pyremu.memory.bus import Device
 
 if TYPE_CHECKING:
@@ -57,7 +58,7 @@ if TYPE_CHECKING:
 
 # 诊断日志开关 (PYREMU_DIAG_VERBOSE=1): 打印每个 virtqueue 请求与 IRQ 拉高/拉低,
 # 用于排查块设备 I/O 完成中断是否正确投递到 hart。
-_DIAG = os.environ.get("PYREMU_DIAG_VERBOSE") == "1"
+_DIAG = cfg_bool("PYREMU_DIAG_VERBOSE")
 
 
 def _diag(msg: str) -> None:

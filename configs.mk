@@ -5,11 +5,11 @@
 # 可覆盖项 (?=): hart_num / ram / rdinit / DISK / INITRD / ROOTFS_DIR。
 
 # ---- 公共基础路径 (供下方各定义复用, 避免重复前缀) ----
-third_party = third-party
+bsp_dir = bsp
 bins_dir    = tests/bins
 elf_dir     = $(bins_dir)/elf
 firm_dir    = $(bins_dir)/firm-bin
-linux_dir   = $(third_party)/linux
+linux_dir   = $(bsp_dir)/linux
 
 # ---- Native 加速库 (Rust cdylib -> ctypes) ----
 NATIVE_DIR     = pyremu/_native
@@ -23,6 +23,14 @@ ifneq ($(or $(PYREMU_DIAG_LOG),$(PYREMU_TRACE_SRET)),)
 endif
 NATIVE_SRC     = $(shell find $(NATIVE_DIR)/cpu $(NATIVE_DIR)/termio -type f -name '*.rs') \
                  $(NATIVE_DIR)/Cargo.toml $(NATIVE_DIR)/cpu/Cargo.toml $(NATIVE_DIR)/termio/Cargo.toml
+
+# ---- 保留内存区域 ----
+# 供特定固件代码实现使用, 需与 custom-opensbi Kconfig (POOL_BASE/POOL_SIZE) 保持同步.
+# DTB /reserved-memory no-map 节点据此生成, 确保 Linux 内核线性映射排除该区域,
+# 避免内核分配器与固件在同一物理区间内产生访问冲突.
+RESERVED_MEM_BASE ?= 0x83000000
+RESERVED_MEM_SIZE  ?= 0x10000000  # 256 MiB
+
 # ---- 路径配置 ----
 hart_num       = 2
 zsbl_fsbl      = $(firm_dir)/zsbl_fsbl_stub_cold_asm.bin
@@ -32,8 +40,8 @@ fw_dynamic     = $(elf_dir)/custom_opensbi_fw_dynamic.elf
 
 # custom-opensbi
 # Rust S-mode 可信管理程序 (嵌入到固件 .coffer_enclave_man 段)
-FW_SRC_DIR     = $(third_party)/custom-opensbi
-RUST_SMODE_DIR = $(third_party)/rust_smode_entry
+FW_SRC_DIR     = $(bsp_dir)/custom-opensbi
+RUST_SMODE_DIR = $(bsp_dir)/rust_smode_entry
 FW_BUILD_DIR   = $(FW_SRC_DIR)/build/platform/generic/firmware
 RUST_SMODE_BIN = $(RUST_SMODE_DIR)/rust_smode_entry.bin
 
@@ -60,6 +68,14 @@ fw_basic_flag += PLATFORM_RISCV_XLEN=64
 fw_basic_flag += PLATFORM_RISCV_ABI=lp64
 fw_basic_flag += FW_SKIP_BSS_ZERO=1
 
+# 仅当 configs.mk / 命令行显式定义了保留内存区域时才覆盖 Kconfig 默认值.
+ifdef RESERVED_MEM_BASE
+	fw_basic_flag += CONFIG_POOL_BASE=$(RESERVED_MEM_BASE)
+endif
+ifdef RESERVED_MEM_SIZE
+	fw_basic_flag += CONFIG_POOL_SIZE=$(RESERVED_MEM_SIZE)
+endif
+
 ## ---- fw_payload 构建 (内嵌 payload) ----
 FW_MAKE_FLAGS := $(fw_basic_flag)
 FW_MAKE_FLAGS += FW_PAYLOAD=y
@@ -81,18 +97,33 @@ fw_jump_elf      = $(elf_dir)/custom_opensbi_fw_jump.elf
 # ROOTFS_DIR: debootstrap 输出目录 (打包为 cpio.gz)。
 # INITRD: 传给 emu-linux 的 initramfs 路径 (为空则不挂载 rootfs)。
 #   用法: make emu-linux INITRD=$(INITRAMFS) hart_num=4 ram=2G
-ROOTFS_DIR ?= $(third_party)/rootfs
+ROOTFS_DIR ?= $(bsp_dir)/rootfs
 INITRAMFS   = $(bins_dir)/initramfs.cpio.gz
 INITRD     ?=
 # DISK: virtio-blk 磁盘镜像 (ext4/raw), 挂载为 /dev/vda。默认指向 debootstrap 生成的
 #   rootfs; 文件不存在时自动跳过 (回退到无根文件系统, 即 VFS panic)。root 所有的镜像
 #   自动只读打开。覆盖: make emu-linux DISK=/path/to/other.ext4
-DISK       ?= $(third_party)/setup-rootfs/debootstrap/riscv-sd.ext4
+DISK       ?= $(bsp_dir)/setup-rootfs/debootstrap/riscv-sd.ext4
 # ram / rdinit 可覆盖; 挂载 initramfs 时建议加大 RAM (全量驻留内存)。
 ram        ?= 2G
 rdinit     ?= /bin/bash
-# Rust native 引擎编译期配置
-TLB_ENTRIES ?= 256
+
+
+# ---- 模拟器编译期配置 (Python / Rust 共享) ----
+# 通过 makefile 生成 pyremu/configs_gen.py, 替代各处硬编码与 os.environ.get.
+TLB_ENTRIES        ?= 256    # TLB 条目数
+NATIVE_MAX_INSTRS  ?= 100000 # 单次 native batch 最大指令数
+TRAP_LOOP_THRESHOLD ?= 3     # 连续 trap 超此次数 -> hart halt
+
+# 诊断开关 (可通过环境变量在运行时覆盖)
+PYREMU_NATIVE_BATCH    ?= 1   # 默认启用 native batch; 0 = 纯 Python
+PYREMU_DIAG_LOG        ?= /tmp/sret_py.log
+PYREMU_DIAG_VERBOSE    ?= 0   # 1 = 打印 virqueue 请求等详细诊断
+PYREMU_TRACE_SRET      ?= 0   # 1 = 追踪 SRET 到 U-mode
+PYREMU_TRACE_TRAPS     ?= 0   # 1 = 追踪全部 trap 投递
+PYREMU_TRACE_PMP       ?= 0   # 1 = 追踪 PMP 匹配
+
+
 # ---- Kernel bootargs ----
 # dyndbg: dynamic debug 控制 (内核 pr_debug/dev_dbg), 可覆盖.
 #   +p 启用全部, func NAME +p 按函数, file PATH +p 按文件, 留空关闭.
@@ -112,6 +143,7 @@ bootargs_arg    = --bootargs='$(_bootargs)'
 initrd_args     = $(if $(INITRD),--initrd=$(INITRD))
 # DISK 指向的镜像存在时追加 --disk.
 disk_args       = $(if $(wildcard $(DISK)),--disk=$(DISK))
+
 
 # ---- 工具链参考 (供手动使用) ----
 opt-cc      = /opt/custom-llvm/bin/clang

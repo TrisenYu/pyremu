@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use crate::diag;
 use crate::state::{exit_reason, HartState};
 // use crate::trap::{exc_code, mcause_val, deliver_trap};
-use crate::concurrent::{ConcurrentClintCtx, ModuleState, StopInfo};
+use crate::concurrent::{ConcurrentClintCtx, FfiExtIrqCtx, ModuleState, StopInfo};
 use crate::interrupt::clint::{sync_mtip, sync_msip};
 
 pub(crate) const TRAP_LOOP_THRESHOLD: u8 = 3;
@@ -12,17 +12,29 @@ pub(crate) const TRAP_LOOP_THRESHOLD: u8 = 3;
 /// Check whether any interrupt is pending (including MSIP via level-triggered
 /// CLINT).  Returns ``(woke, msip_pending)``.
 #[inline]
-pub(crate) fn wfi_sync_and_check(state: &mut HartState, clint: &ConcurrentClintCtx) -> (bool, bool) {
+/// Check all interrupt sources and sync into ``mip`` before potential park.
+/// QEMU equivalent: ``qemu_mutex_lock & qemu_cond_wait`` — the I/O thread
+/// updates interrupt state and signals the vCPU thread.  Here the Python
+/// daemon writes ``ext_irq.pending`` and we synchronise it into ``mip``.
+pub(crate) fn wfi_sync_and_check(
+    state: &mut HartState, clint: &ConcurrentClintCtx,
+    uart_rx_notify: *const u8,
+    ext_irq: *mut FfiExtIrqCtx,
+) -> (bool, bool) {
     sync_mtip(state, clint);
     sync_msip(state, clint);
-    // WFI wake-up: any enabled interrupt (mip & mie), OR MSIP pending
-    // even when mie.MSIE=0.  MSIP is used by OpenSBI for cross-hart TLB
-    // shootdown / IPI — the receiver may have interrupts disabled (mie=0
-    // in cpu_do_idle) yet must still wake to acknowledge the request.
-    // Python's try_wfi_wakeup has the same MSIP exception.
+    // Drain ext_irq into mip inline.
+    if !ext_irq.is_null() && unsafe { (*ext_irq).pending != 0 } {
+        if state.mie & (1 << 9) != 0 { state.mip |= 1 << 9; }
+        if state.mie & (1 << 11) != 0 { state.mip |= 1 << 11; }
+    }
+    let rx_ready = !uart_rx_notify.is_null() && unsafe { *uart_rx_notify != 0 };
+    // RX daemon 在 drain 后立即清 _rx_notify, 但 ext_irq.pending 持续置位
+    // 直到 guest 处理完中断. 此处补检 ext_irq 防止 WFI 错过唤醒.
+    let ext_irq_pending = !ext_irq.is_null() && unsafe { (*ext_irq).pending != 0 };
     let msip_pending = (state.mip & (1 << 3)) != 0;
     let other_pending = (state.mip & state.mie) != 0;
-    (other_pending || msip_pending, msip_pending)
+    (other_pending || msip_pending || rx_ready || ext_irq_pending, msip_pending)
 }
 
 /// All-idle check: if there's a pending timer deadline, fast-forward
@@ -112,21 +124,23 @@ pub(crate) fn wfi_spin(
     clint: &ConcurrentClintCtx,
     module: &ModuleState,
     stop_flag: *const u8,
+    uart_rx_notify: *const u8,
+    ext_irq: *mut FfiExtIrqCtx,
 ) -> bool {
     module.wfi_flags[hart_id].store(1, Ordering::Release);
     module.wfi_count.fetch_add(1, Ordering::Release);
 
-    // Pure event-driven spin: no sleep, no timer-based back-off.
-    // The sender (another hart thread in the same process) writes
-    // MSIP via the atomic channel; this hart detects it on the next
-    // iteration of wfi_sync_and_check.  yield_now() lets the OS
-    // schedule the sender thread so the MSIP arrives promptly.
-    let mut spin_count: u64 = 0;
+    // Event-driven park: block the OS thread until a MSIP sender calls
+    // unpark() on this thread (in clint_write_msip_concurrent).  This
+    // matches QEMU's design: vCPU blocks on pthread_cond_wait, I/O thread
+    // signals on data arrival.  Zero CPU usage, zero latency for IPI.
+    //
+    // Timer interrupts are handled by wfi_check_all_idle fast-forwarding
+    // mtime before the park, so we never oversleep past a deadline.
     loop {
-        spin_count += 1;
 
         // ---- sync interrupts + check wake ----
-        let (woke, msip_pending) = wfi_sync_and_check(state, clint);
+        let (woke, msip_pending) = wfi_sync_and_check(state, clint, uart_rx_notify, ext_irq);
         if woke {
             state.waiting = 0;
             state.wfi_woken = 1;
@@ -148,21 +162,34 @@ pub(crate) fn wfi_spin(
             return false;
         }
 
-        // ---- all-idle detection ----
+        // ---- all-idle detection (fast-forwards mtime to nearest deadline) ----
         if module.all_in_wfi() {
             match wfi_check_all_idle(state, hart_id, clint, module, msip_pending) {
                 Some(true) => break,
                 Some(false) => return false,
-                None => {} // re-check after back-off
+                None => {} // MSIP pending, keep spinning
             }
         }
 
-        // ---- back-off (no sleep — purely CPU yield) ----
-        if spin_count < 64 {
-            std::hint::spin_loop();
-        } else {
-            std::thread::yield_now();
+        // ---- park with deadline timeout ----
+        // MSIP: sender calls unpark() -> park returns immediately.
+        // Timer: scan mtimecmp, park until nearest deadline.
+        // No timer: park for 100 µs (responsive to rx_notify / stop_flag).
+        let cur_mtime = unsafe { &*clint.mtime }.load(Ordering::Relaxed);
+        let mut nearest: u64 = u64::MAX;
+        for hid in 0..(clint.num_harts as usize) {
+            let cmp = unsafe { &*clint.mtimecmp.add(hid) }.load(Ordering::Relaxed);
+            if cmp > cur_mtime && cmp < nearest { nearest = cmp; }
         }
+        let park_us: u64 = if nearest != u64::MAX {
+            // ~182 µs per mtime tick, clamp [50, 500] µs.
+            // 500 µs cap prevents multi-second boot slowdown from
+            // accumulated park time across hundreds of WFI cycles.
+            (nearest.wrapping_sub(cur_mtime).saturating_mul(182)).clamp(50, 500)
+        } else {
+            50 // no timer: minimal spin before re-check
+        };
+        std::thread::park_timeout(std::time::Duration::from_micros(park_us));
     }
 
     module.wfi_flags[hart_id].store(0, Ordering::Release);

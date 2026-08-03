@@ -33,6 +33,9 @@ import threading
 import time
 from typing import Any
 
+from pyremu.configs_aux import cfg_is_set, cfg_str
+from pyremu.configs_gen import NATIVE_MAX_INSTRS, TRAP_LOOP_THRESHOLD
+
 from pyremu._native import (
     ClintInfo,
     DevInfo,
@@ -164,11 +167,11 @@ class Emulator:
         # build_dtb 据此写入 /chosen/linux,initrd-start/end。
         self._initrd: dtb.Initrd | None = None
 
-        # Terminal I/O — 后台线程管理 stdin/stdout, 由 _init_native_batch 在 UART 就绪后创建
+        # Terminal I/O — 后台线程管理 stdin/stdout, 由 _init_termio 在 UART 就绪后创建
         self._termio = None
 
         # 单次 native 批次的指令上限 (可变成员; 调试器按需覆盖)。
-        self._native_max_instrs: int = 100000
+        self._native_max_instrs: int = int(NATIVE_MAX_INSTRS)
         # 共享停止标志 — 由 debugger Ctrl+Q daemon 写入, Rust batch engine 每指令检查
         self._native_stop_flag = ctypes.c_uint8(0)
 
@@ -288,7 +291,31 @@ class Emulator:
         # WFI 空闲轮询回调: debugger 设为其 stdin 转发函数, 确保用户输入
         # 能在内核 WFI 等待期间被及时 preload 到 UART RX 并触发中断唤醒。
         self._idle_poll_cb: Any = None  # () -> bool
+        self._init_termio()
         self._init_native_batch()
+
+    def _init_termio(self) -> None:
+        """初始化终端 I/O 管理器 (Terminal I/O).
+
+        无论 batch 模式是否启用都必须调用。封装 Rust termio 后台线程
+        (或 Python 回退), 持续转发 stdin->UART RX 和 UART TX->stdout。
+        UART 此时已构造完毕 (见 __init__ 顺序), 可安全注入。
+        """
+        if self.uart is None or self._termio is not None:
+            return
+        try:
+            stdin_fd = sys.stdin.fileno()
+            stdout_fd = sys.stdout.fileno()
+        except (OSError, ValueError):
+            return
+        self._termio = TerminalIO(
+            uart=self.uart,
+            wake_event=self._wake_event,
+            stdin_fd=stdin_fd,
+            stdout_fd=stdout_fd,
+            ext_irq=self._native_ext_irq,
+        )
+        self.uart.termio = self._termio
 
     def _init_native_batch(self) -> None:
         """Initialise the native batch acceleration infrastructure.
@@ -300,8 +327,13 @@ class Emulator:
         Set ``PYREMU_NATIVE_BATCH=0`` to force pure-Python step for
         differential testing or tests that depend on per-instruction
         ``step()`` semantics.
+        Set ``PYREMU_NATIVE_BATCH=1`` to force-enable even without TTY.
         """
-        if os.environ.get("PYREMU_NATIVE_BATCH") == "0":
+        if cfg_str("PYREMU_NATIVE_BATCH") == "0":
+            return
+        # 隐式禁用: 环境变量未显式设置 且 非交互式 (无 TTY termio)
+        # -> 跳过 native batch, 避免后台线程泄漏 + 内存膨胀.
+        if not cfg_is_set("PYREMU_NATIVE_BATCH") and self._termio is None:
             return
         if not native_available():
             return
@@ -311,45 +343,16 @@ class Emulator:
 
         num_harts = len(self.harts)
         self._native_states = (HartState * num_harts)()
-        # TLB generation counter — persists across batches so SFENCE.VMA
-        # broadcast semantics (gen increment) survive FFI call boundaries.
         self._tlb_gen = ctypes.c_uint64(0)
         self._tlb_gen_per_hart = (ctypes.c_uint64 * num_harts)()
-        self._tlb_gen_before: int = 0  # snapshot before native batch; flush TLBs only if changed
+        self._tlb_gen_before: int = 0
 
-        # Per-hart MSIP edge counters — Python CLINT writes only set the
-        # level bit; we track 0->1 transitions and encode them as edge
-        # increments so Rust's sync_msip can detect cross-batch MSIP.
         self._clint_msip_edge: list[int] = [0] * num_harts
         self._clint_msip_prev: list[int] = [0] * num_harts
 
-        # Wrap the bus RAM bytearray so Rust can read/write it directly
         ram = self.bus._ram  # bytearray
         self._native_ram_buf = (ctypes.c_uint8 * len(ram)).from_buffer(ram)  # type: ignore[attr-defined]
 
-        # Terminal I/O 管理器 — 封装 Rust termio 后台线程 (或 Python 回退)
-        # 独立于 CPU 批次循环, 持续转发 stdin->UART RX 和 UART TX->stdout.
-        # 创建时机: _init_native_batch (仅在 native batch 可用时).
-        # UART 此时已构造完毕 (见 __init__ 顺序), 可安全注入。
-        if self.uart is not None and self._termio is None:
-            self._termio = TerminalIO(
-                uart=self.uart,
-                wake_event=self._wake_event,
-                stdin_fd=sys.stdin.fileno(),
-                stdout_fd=sys.stdout.fileno(),
-            )
-            self.uart.termio = self._termio
-            # 启动 TX 归档 daemon — 异步将 ring buffer 写入 hart 日志,
-            # 与批次循环完全解耦, 不依赖 _native_flush_uart.
-            self._termio.start_tx_archive_thread()
-
-        # 默认 WFI 空闲轮询回调: 用于无调试器直连 run() 的场景 (如
-        # make emu-linux-jump)。调试器 _enter_run_mode 会按需覆盖此回调。
-
-        # if self._termio is not None and self._idle_poll_cb is None:
-        #     self._idle_poll_cb = self._default_idle_poll
-
-        # _step_native marshal/unmarshal 之间传递的临时缓冲 (每批次重建)。
         self._pmp_num: int = 0
         self._pmp_cfg_buf = (ctypes.c_uint8 * 0)()
         self._pmp_addr_buf = (ctypes.c_uint64 * 0)()
@@ -390,6 +393,7 @@ class Emulator:
             plic=self.plic,
             bootargs=self._bootargs,
             initrd=self._initrd,
+            reserved_ranges=self._cfg.reserved_memory_ranges,
         )
 
     def load_dtb(
@@ -524,7 +528,7 @@ class Emulator:
     #  执行
     # ----------------------------------------------------------
 
-    _TRAP_LOOP_THRESHOLD = 3  # 连续 trap 超过此次数视为不可恢复
+    _TRAP_LOOP_THRESHOLD = int(TRAP_LOOP_THRESHOLD)  # 连续 trap 超过此次数视为不可恢复
 
     @staticmethod
     def _handle_native_sys_exit(hart: Hart, instr: int) -> int:
@@ -573,10 +577,8 @@ class Emulator:
 
         # Marshal ALL harts (including halted): Rust needs every state
         # for total_instrs summation and active_hart_num counting.
-        # 每轮批次前转发 stdin (不只在 WFI idle 时) — 消除 1 字符输入延迟:
-        # TermIO reader 线程异步写入 ring buffer, 此处同步 preload 到 UART.
-        if self._termio is not None:
-            self._termio.drain_rx()
+        # RX daemon 线程已在后台持续 drain_rx() -> UART FIFO, 不消费 _rx_notify.
+        # _rx_notify 由 Rust batch engine 检测 -> 快速批次退出 -> idle poll 清零.
         # 先把 PLIC 外部中断 (MEIP/SEIP) 同步进各 hart 的 mip —— native 引擎内部
         # 只同步 CLINT (MSIP/MTIP), 不感知 PLIC, 否则 virtio 等外设中断永远到不了 hart。
         self._native_sync_plic_mip()
@@ -620,9 +622,22 @@ class Emulator:
         )
 
         result = self._native_result
-        # Clear external interrupt flag — PLIC will be synced on next
-        # _step_native entry via _native_sync_plic_mip().
-        self._native_ext_irq.pending = 0
+        # Level-triggered ext_irq: only clear when ring buffer + UART FIFO
+        # are both empty.  Otherwise new data that arrived during the batch
+        # (between drain_rx and Rust's ext_irq check) would be missed.
+        if self._termio is not None:
+            rd = self._termio._rx_rd.value
+            wr = self._termio._rx_wr.value
+            ring_empty = (rd == wr)
+        else:
+            ring_empty = True
+        fifo_empty = (self.uart is not None and len(self.uart._rx_fifo) == 0)
+        if ring_empty and fifo_empty:
+            self._native_ext_irq.pending = 0
+            # _rx_notify 对应已完全消费的数据 (ring buffer + UART FIFO 皆空),
+            # 安全清零避免下轮 batch 的虚假快速退出.
+            if self._termio is not None:
+                self._termio._rx_notify.value = 0
         for hid in range(len(self.harts)):
             unmarshal_hart(self._native_states[hid], self.harts[hid])
 
@@ -855,6 +870,7 @@ class Emulator:
             rxctrl=uart._rxctrl if uart is not None else 0,
             rx_fifo_len=len(uart._rx_fifo) if uart is not None else 0,
             tx_notify_fd=self._termio.tx_notify_w,
+            rx_notify=self._termio._rx_notify,
         )
 
     def _native_flush_uart(self) -> None:
@@ -960,11 +976,7 @@ class Emulator:
                 exit_hart._halted = True
             all_exec_cnt += 1
         elif result.exit_reason == EXIT_BREAKPOINT:
-            # Breakpoint hit in Rust — PC 已核对 bp_addrs, 匹配指令已执行并计数;
-            # debugger 的 _check_multi_hart_bp 会据 h.pc == 断点地址上报命中。
-            # Dump accumulated instruction counters once for the user to inspect.
-            # icount_flush()  # temporarily disabled — focus on per-instruction diagnostics
-            pass
+            pass  # Breakpoint hit in Rust — PC 已核对 bp_addrs
         return all_exec_cnt
 
     def _native_finalize(
@@ -1245,7 +1257,8 @@ class Emulator:
 
     def step(self) -> int:
         """
-        轮询方式让所有 hart 各执行一条指令, 每条指令后检查中断,
+        QEMU-style per-instruction execution: 每个周期让所有 hart 各
+        执行一条指令, 每条指令前转发 stdin->UART RX、每条指令后检查中断,
         每个周期推进 CLINT 时钟.
 
         若 hart 进入不可恢复的陷态 (连续 trap 超过阈值),
@@ -1254,26 +1267,11 @@ class Emulator:
         Returns:
             本轮执行的指令数.
         """
-        # stdin 转发与部分行刷新由调用方负责 (_run_loop 在每批前后
-        # 各调一次 _feed_uart_stdin + _flush_uart_if_present),
-        # step() 不自行 I/O 以免 stdin 数据被多次碎片化读取, 导致客机
-        # 收到乱序输入。
         active = [h for h in self.harts if not h._halted]
 
-        # ---- Native concurrent batch ----
-        # Use the concurrent engine (run_parallel) for multi-hart
-        # correctness.  The serial engine (run_batch) uses round-robin
-        # slices within a single thread, which deadlocks on cross-hart
-        # IPI / TLB-shootdown protocols (sender spins waiting for a
-        # receiver that can't execute until the sender's slice ends).
-        # Concurrent thread-per-hart avoids this fundamental problem.
         if self._native_batch and active:
             return self._step_native(active)
 
-        # ---- Pure-Python path (fallback / .so not loaded) ----
-        # 每轮 step 前转发 stdin — 与 _step_native 行为一致
-        if self._termio is not None:
-            self._termio.drain_rx()
         if len(active) > 1:
             random.shuffle(active)
 
@@ -1407,30 +1405,22 @@ class Emulator:
         do_yield = yield_every > 0
         i = 0
         while i < max_cycles:
-            # Use concurrent native engine for batch execution when available.
-            # The concurrent engine runs all active harts until a stop
-            # condition (ECALL, MMIO, WFI all-idle, BREAKPOINT, or TRAP).
-            # Each batch can execute many cycles; we count them and continue.
             if self._native_batch:
                 active = [h for h in self.harts if not h._halted]
                 if active:
-                    # 每批次前转发 stdin + 刷新部分行 (对照 debugger _run_loop)
                     if self._idle_poll_cb is not None:
                         self._idle_poll_cb()
                     self._step_native(active)
                     i += 1
-                    # 批量后让出 CPU + 检查超时
                     if do_yield and i % yield_every == 0:
                         yield_cpu(yield_interval)
                     if deadline is not None and time.monotonic() >= deadline:
                         raise self.TimeoutError(timeout, i, self.harts[0].pc if self.harts else None)
                     continue
-            # Pure-Python fallback
             chunk = min(yield_every, max_cycles - i) if do_yield else max_cycles - i
             for _ in range(chunk):
                 self.step()
             i += chunk
-            # 批量后让出 CPU + 检查超时
             if do_yield:
                 yield_cpu(yield_interval)
             if deadline is not None and time.monotonic() >= deadline:

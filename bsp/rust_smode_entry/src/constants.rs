@@ -50,6 +50,11 @@ pub const ENCLAVE_CALL_GET_ID: u64 = 407;
 pub const ENCLAVE_CALL_GET_HARTID: u64 = 408;
 pub const ENCLAVE_CALL_GET_AVAILABLE_MEM: u64 = 409;
 pub const ENCLAVE_CALL_UNMATCHED_ACC_FAULT: u64 = 506;
+pub const ENCLAVE_CALL_REQUEST_SHUTDOWN: u64 = 410;
+pub const ENCLAVE_CALL_QUERY_REQUESTS: u64 = 411;
+
+/// QUERY_REQUESTS 返回: host 已申请终止此飞地.
+pub const ENCLAVE_REQ_SHUTDOWN: u64 = 1 << 0;
 
 // ---------------------------------------------------------------
 //  标准 SBI

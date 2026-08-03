@@ -1,5 +1,4 @@
-/* enclave.ld — 飞地 payload 链接脚本
- *
+/*
  * 最小 ELF 布局, 适配 Rust S-mode 运行时的 ELF 加载器:
  *   载荷从 0x10000 开始 (U-mode 低地址区), 与 picolibc 的 libc.a 兼容.
  *

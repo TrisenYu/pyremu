@@ -14,11 +14,11 @@ DRV    = tee_enclave_drv.ko
 TEST   = tee_test
 MALICE = tee_malice
 PAYLOAD = hello_payload
+CONCUR  = tee_concurrent
 
-D = /eval/tee-test
+TEE_BIN_DIR := /eval/tee-test
 
-.PHONY: help install benign uninstall \
-        malice-avail malice-conf malice-integ malice-all
+.PHONY: help install benign uninstall malice-avail malice-conf malice-integ malice-all
 
 help:
 	@echo "=== /eval TEE Test Suite ==="
@@ -39,35 +39,39 @@ install:
 		echo "[eval] driver already loaded (/dev/tee_enclave exists)"; \
 	else \
 		echo "[eval] loading driver..."; \
-		/sbin/insmod $(D)/$(DRV) && echo "[eval] driver loaded. /dev/tee_enclave ready."; \
+		/sbin/insmod "$(TEE_BIN_DIR)/$(DRV)" && echo "[eval] driver loaded. /dev/tee_enclave ready."; \
 	fi
 
 benign: install
 	@echo "=== Benign Enclave Lifecycle Demo ==="
 	@echo ""
-	@echo "  step 1. query memory pool & current mdid"
+	@echo "  step 1. query memory pool and current mdid"
 	@echo "  step 2. create enclave (firmware loads built-in manager)"
 	@echo "  step 3. enter enclave with custom payload"
-	@echo "  step 4. enclave runs -> suspends -> back to host"
-	@echo "  step 5. shutdown enclave (frees slot + memory)"
+	@echo "  step 4. enclave runs, suspends, back to host"
+	@echo "  step 5. shutdown enclave (frees slot and memory)"
 	@echo ""
-	$(D)/$(TEST) $(D)/$(PAYLOAD)
+	"$(TEE_BIN_DIR)/$(TEST)" "$(TEE_BIN_DIR)/$(PAYLOAD)"
 
 malice-avail: install
 	@echo "=== ATTACK: Memory Pool Exhaustion (DoS) ==="
-	$(D)/$(MALICE) avail
+	"$(TEE_BIN_DIR)/$(MALICE)" avail
 
 malice-conf: install
 	@echo "=== ATTACK: TLB Side-Channel Probe ==="
-	$(D)/$(MALICE) conf
+	"$(TEE_BIN_DIR)/$(MALICE)" conf
 
 malice-integ: install
 	@echo "=== ATTACK: Integrity Boundary Probe ==="
-	$(D)/$(MALICE) integ
+	"$(TEE_BIN_DIR)/$(MALICE)" integ
 
 malice-all: install
 	@echo "=== ALL ATTACKS ==="
-	$(D)/$(MALICE) all
+	"$(TEE_BIN_DIR)/$(MALICE)" all
+
+concurrent: install
+	@echo "=== Concurrent Enclave Creation Test ==="
+	"$(TEE_BIN_DIR)/$(CONCUR)" "$(TEE_BIN_DIR)/$(PAYLOAD)" 4
 
 uninstall:
 	@/sbin/rmmod tee_enclave_drv 2>/dev/null && echo "[eval] driver unloaded" || true

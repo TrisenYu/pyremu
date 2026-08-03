@@ -552,7 +552,7 @@ class ExecutionMixin(SharedMixinAttrs):
         size = int(size_str, 0)
         self._watch_ranges.append((addr, addr + size))
         self._console.print(
-            f"  [green]* 写监控[/] {hex_addr(addr)}–{hex_addr(addr + size)}"
+            f"  [green]* 写监控[/] {hex_addr(addr)}-{hex_addr(addr + size)}"
         )
 
     # ----------------------------------------------------------

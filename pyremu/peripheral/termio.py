@@ -33,7 +33,7 @@ import fcntl
 import os
 import select
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pyremu.peripheral.uart import UART
@@ -65,11 +65,13 @@ class TerminalIO:
         wake_event: threading.Event,
         stdin_fd: int = 0,
         stdout_fd: int = 1,
+        ext_irq: Any = None,
     ) -> None:
         self._uart = uart
         self._wake_event = wake_event
         self._stdin_fd = stdin_fd
         self._stdout_fd = stdout_fd
+        self._ext_irq = ext_irq  # FfiExtIrqCtx or None
 
         # TX 环形缓冲 — CPU hart 线程写入 (客机 TXDATA, 条目 = [hart_id, byte]),
         # Rust termio 线程经 tx_drain 排空到 stdout; Python 经 _tx_log_rd 归档日志。
@@ -86,6 +88,7 @@ class TerminalIO:
         # 共享停止标志 — Python 置 1 ->Rust 线程退出
         self._stop_flag = ctypes.c_uint8(0)
         self._pause_flag = ctypes.c_uint8(0)  # 调试器暂停/恢复
+        self._rx_notify = ctypes.c_uint8(0)   # TermIO daemon 写 ring buffer 后置 1
 
         # 运行状态
         self._native_active = False           # Rust 线程是否接管了终端
@@ -106,11 +109,22 @@ class TerminalIO:
         # 读端阻塞: daemon 线程 select 等待
         self._tx_drain_lock = threading.Lock()
         self._tx_drain_running = False
+
+        # RX 事件驱动通知: Rust termio 线程写 ring buffer 后向 _rx_notify_w
+        # 写 1 字节 -> daemon 被 select 唤醒 -> drain_rx() -> UART FIFO.
+        # 消除轮询, 延迟从 500μs 降到内核调度延迟 (~10μs).
+        self._rx_notify_r, self._rx_notify_w = os.pipe()
+        fl_rx = fcntl.fcntl(self._rx_notify_w, fcntl.F_GETFL)
+        fcntl.fcntl(self._rx_notify_w, fcntl.F_SETFL, fl_rx | os.O_NONBLOCK)
         self._tx_drain_thread: threading.Thread | None = None
 
         # TX 归档 daemon — 异步将 ring buffer 写入 hart 日志, 与批次循环解耦
         self._tx_archive_running = False
         self._tx_archive_thread: threading.Thread | None = None
+
+        # RX daemon — 独立线程持续将 ring buffer -> UART FIFO, 与指令执行完全解耦
+        self._rx_daemon_running = False
+        self._rx_daemon_thread: threading.Thread | None = None
 
     @property
     def tx_notify_w(self) -> int:
@@ -161,7 +175,6 @@ class TerminalIO:
 
         self._stop_flag.value = 0
         self._pause_flag.value = 0
-        # terminal_io_attach: 终端模式由 Python cbreak 管理, Rust 只做 I/O
         if termio_available() and termio_attach(self._build_handle()) == 0:
             self._native_active = True
             # 单一 owner: Rust 线程独占 stdout, Python 不重复输出
@@ -170,6 +183,8 @@ class TerminalIO:
                 # 进程异常退出时恢复终端 (对照 QEMU atexit(term_exit))
                 atexit.register(self.stop)
                 self._atexit_registered = True
+            self.start_tx_archive_thread()
+            self.start_rx_daemon()
             return True
 
         # native 启动失败 (库缺失 / stdin 非 TTY) — 回退 Python 轮询
@@ -183,7 +198,9 @@ class TerminalIO:
         故残留条目须先以"回显关闭"状态归档日志 (避免重复输出), 最后才把
         控制台回显交还给 Python 行缓冲。
         """
-        # 先停归档 daemon — 线程退出后最终排空由 stop_tx_archive_thread 完成
+        # 先停 RX daemon — 停止接受新的 stdin 数据
+        self.stop_rx_daemon()
+        # 再停归档 daemon — 线程退出后最终排空由 stop_tx_archive_thread 完成
         self.stop_tx_archive_thread()
 
         if termio_is_running():
@@ -247,6 +264,11 @@ class TerminalIO:
             drained += 1
             had_input = True
         self._rx_rd.value = rd  # 发布消费进度 (Rust 容量控制依据)
+        # _rx_notify 不在此处清零 — RX daemon 抢先 drain 后 Rust batch
+        # engine 仍需看到通知以触发快速批次退出 (hart_sched.rs:1362).
+        # 清零由 idle poll 路径在确认 ring buffer 为空后负责.
+        if had_input and self._ext_irq is not None:
+            self._ext_irq.pending = 1  # 通知 CPU 引擎内联投递 SEIP/MEIP
         self._wake_event.set()
         return had_input
 
@@ -313,7 +335,7 @@ class TerminalIO:
             log_f = uart._hart_log_file(hid)
             if log_f is not None:
                 log_f.write(chr(byte))
-            # UART MMIO 写 — 触发 _tx_callback → 控制台即时输出
+            # UART MMIO 写 — 触发 _tx_callback -> 控制台即时输出
             uart.write(0, bytes([byte]))
             rd = (rd + 1) & 0xFFFF_FFFF
         self._tx_log_rd = rd
@@ -342,7 +364,7 @@ class TerminalIO:
         self.drain_tx_logs_archive_only()
 
     def _tx_archive_loop(self) -> None:
-        """TX 归档 daemon 入口: select 等待 Rust notify → 归档 hart 日志.
+        """TX 归档 daemon 入口: select 等待 Rust notify -> 归档 hart 日志.
         与批次循环完全异步, 仅在 Rust 写入 ring buffer 后触发."""
         notify_r = self._tx_notify_r
         while self._tx_archive_running:
@@ -414,6 +436,60 @@ class TerminalIO:
             self.drain_tx_logs()
 
     # ----------------------------------------------------------
+    #  RX daemon — 独立线程, 与指令执行完全解耦
+    # ----------------------------------------------------------
+
+    def start_rx_daemon(self) -> None:
+        """启动 RX daemon 线程: 持续将 ring buffer -> UART FIFO.
+
+        Rust termio 线程写 stdin 到 ring buffer 后置 _rx_notify=1,
+        daemon 检测到后调用 drain_rx() 搬运到 UART FIFO 并设置中断.
+        指令执行循环完全不需要参与数据搬运.
+        """
+        if self._rx_daemon_running or self._stdin_fd < 0:
+            # dummy fd (测试环境), 无法 poll
+            return
+        self._rx_daemon_running = True
+        self._rx_daemon_thread = threading.Thread(
+            target=self._rx_daemon_loop, daemon=True,
+        )
+        self._rx_daemon_thread.start()
+
+    def stop_rx_daemon(self) -> None:
+        """停止 RX daemon 线程, 最终排空残留."""
+        self._rx_daemon_running = False
+        if self._rx_daemon_thread is not None:
+            self._rx_daemon_thread.join(timeout=1.0)
+            self._rx_daemon_thread = None
+        self.drain_rx()
+
+    def _rx_daemon_loop(self) -> None:
+        """RX daemon 入口: 事件驱动, select 阻塞等待 Rust termio 通知管道.
+
+        Rust termio 线程写 ring buffer 后向 _rx_notify_w 写 1 字节 -> select
+        立即返回 -> drain_rx() 搬运到 UART FIFO。完全零轮询, 延迟仅受内核调度
+        影响 (~10 μs 量级), 远优于此前 500 μs 轮询。
+        """
+        notify_r = self._rx_notify_r
+        while self._rx_daemon_running:
+            try:
+                ready, _, _ = select.select([notify_r], [], [], 0.5)
+            except (ValueError, OSError):
+                break
+            if not self._rx_daemon_running:
+                break
+            # 排空通知管道中积压的字节
+            try:
+                while True:
+                    os.read(notify_r, 256)
+            except BlockingIOError:
+                pass
+            except OSError:
+                break
+            # 搬运 ring buffer -> UART FIFO (可能已积压多个字节)
+            self.drain_rx()
+
+    # ----------------------------------------------------------
     #  Rust native 路径
     # ----------------------------------------------------------
 
@@ -427,7 +503,7 @@ class TerminalIO:
         h.stdin_fd = self._stdin_fd
         h.stdout_fd = self._stdout_fd
         h.rx_buf = ctypes.cast(self._rx_buf, ctypes.c_void_p).value or 0
-        h.rx_cap = 0  # RX 由 Python 直读 stdin, Rust 线程仅做 TX drain
+        h.rx_cap = self.RX_CAP  # Rust termio 线程读取 stdin -> ring buffer
         h.rx_wr = ctypes.addressof(self._rx_wr)
         h.rx_rd = ctypes.addressof(self._rx_rd)
         h.tx_buf = ctypes.cast(self._tx_buf, ctypes.c_void_p).value or 0
@@ -436,6 +512,8 @@ class TerminalIO:
         h.tx_drain = ctypes.addressof(self._tx_drain)
         h.stop_flag = ctypes.addressof(self._stop_flag)
         h.pause_flag = ctypes.addressof(self._pause_flag)
+        h.rx_notify = ctypes.addressof(self._rx_notify)
+        h.rx_notify_fd = self._rx_notify_w
         return h
 
     # ----------------------------------------------------------

@@ -13,52 +13,10 @@ RISC-V RV64 反汇编器.
 """
 from enum import Enum
 
-from pyremu.utils.mask import mask64
-from pyremu.core.registers import check_csr, gpr_name
+from pyremu.utils.mask import mask64, sext, sext8, sext12, sext16, sext32
+from pyremu.utils.regname import check_csr, gpr_name
 
 _UNKNOWN = "<unknown opcode>"
-
-# ============================================================
-#  Bit-manipulation helpers for sign extension
-# ============================================================
-
-
-def sext(val: int, bits: int) -> int:
-    """Sign-extend *val* from *bits* width to a canonical 64-bit unsigned Python int.
-
-    Python's arbitrary-precision integers behave differently from finite-width
-    hardware in bitwise operations (|, &, ^, <<, >>) when values are negative.
-    Canonicalizing to [0, 2^64) ensures consistent behaviour regardless of
-    whether the value was built via sign-extend, zero-extend, or arithmetic.
-    """
-    sign_bit = 1 << (bits - 1)
-    result = (val & (sign_bit - 1)) - (val & sign_bit)
-    # Normalize to 64-bit unsigned representation for consistent bitwise semantics.
-    if bits <= 64:
-        result &= (1 << 64) - 1
-    return result
-
-
-# 热路径特化: 为最常见的位宽预计算 sign-extend, 避免 sext() 的
-# 通用分支和函数调用开销 (~0.14s 节省)
-def sext8(val: int) -> int:
-    """Sign-extend from 8 bits -> canonical 64-bit unsigned."""
-    return (val & 0x7F) - (val & 0x80) & 0xFFFF_FFFF_FFFF_FFFF
-
-
-def sext12(val: int) -> int:
-    """Sign-extend from 12 bits -> canonical 64-bit unsigned."""
-    return (val & 0x7FF) - (val & 0x800) & 0xFFFF_FFFF_FFFF_FFFF
-
-
-def sext16(val: int) -> int:
-    """Sign-extend from 16 bits -> canonical 64-bit unsigned."""
-    return (val & 0x7FFF) - (val & 0x8000) & 0xFFFF_FFFF_FFFF_FFFF
-
-
-def sext32(val: int) -> int:
-    """Sign-extend from 32 bits -> canonical 64-bit unsigned."""
-    return (val & 0x7FFF_FFFF) - (val & 0x8000_0000) & 0xFFFF_FFFF_FFFF_FFFF
 
 
 # ============================================================
@@ -653,11 +611,11 @@ def _dis_amo(instr: int) -> str:
 # ============================================================
 #  压缩指令 (C extension) 反汇编
 # ============================================================
-# 寄存器: x8–x15 使用 3-bit 缩写索引 rd′/rs1′/rs2′.
+# 寄存器: x8-x15 使用 3-bit 缩写索引 rd′/rs1′/rs2′.
 
 
 def _c_x8(idx3: int) -> str:
-    """3-bit 压缩寄存器索引 -> ABI 名 (x8–x15)."""
+    """3-bit 压缩寄存器索引 -> ABI 名 (x8-x15)."""
     return gpr_name(8 + (idx3 & 0b111))
 
 

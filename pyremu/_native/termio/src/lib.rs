@@ -1,16 +1,4 @@
-//! Terminal I/O background thread — QEMU chardev-stdio 模型的 Rust 移植.
-//!
-//! 对照 `vendor/qemu-10.2.0/chardev/char-stdio.c` / `char-fd.c`:
-//!
-//! | QEMU                                | 本实现                                      |
-//! |-------------------------------------|---------------------------------------------|
-//! | `qemu_chr_open_stdio` (term_init)   | `terminal_io_start`: 保存 termios + fcntl   |
-//! | `qemu_chr_set_echo_stdio(false)`    | raw 模式: 关 ECHO/ICANON/ISIG, 保留 OPOST  |
-//! | `term_exit` (atexit + finalize)     | 线程退出路径恢复 termios + 两个 fd 的阻塞标志  |
-//! | `term_stdio_handler` (SIGCONT)      | `sigcont_handler`: Ctrl+Z 恢复后重设 raw     |
-//! | `fd_chr_read_poll` ->`can_write`    | RX 环形缓冲容量控制: 满时不读 stdin (留内核缓冲)  |
-//! | `fd_chr_write` ->非阻塞 `write(1)`   | TX drain: 块写 stdout, EAGAIN 时 POLLOUT 等待 |
-//! | glib 事件循环 (fd 驱动)              | 5ms `poll` 轮询 (跨 cdylib 无共享 eventfd)   |
+//! Terminal I/O background thread
 //!
 //! # 单一 owner 原则 (QEMU chardev 的核心不变量)
 //!
@@ -67,6 +55,12 @@ pub struct TermIoHandle {
     pub stop_flag: *mut AtomicU8,
     /// Pause flag — Python sets to 1 on debugger break, 0 to resume.
     pub pause_flag: *mut AtomicU8,
+    /// RX notification — termio 线程写环形缓冲后置 1,
+    /// CPU 引擎每指令边界检查以触发内联外部中断投递.
+    pub rx_notify: *mut AtomicU8,
+    /// RX notify pipe write-end fd — termio 线程写 ring buffer 后
+    /// 写 1 字节到此 fd 唤醒 Python RX daemon (select 事件驱动, 零轮询).
+    pub rx_notify_fd: RawFd,
 }
 
 // Safety: 所有指针由 Python (ctypes 数组) 持有并在线程生命周期内保持有效;
@@ -232,45 +226,147 @@ fn drain_tx(h: &TermIoHandle, chunk: &mut [u8]) {
     }
 }
 
-/// Read available data from stdin into RX ring buffer.  Returns false on EOF.
-/// Ctrl+Q (0x11) is intercepted as the debugger escape key:
-///   - single Ctrl+Q: send SIGINT to own process (pause emulator), NOT forwarded
-///   - double Ctrl+Q: forward one 0x11 to the guest (like QEMU Ctrl+A Ctrl+A)
-fn read_stdin_to_rx(h: &TermIoHandle, free: usize, buf: &mut [u8]) -> (bool, usize) {
-    // Track whether the last byte written was Ctrl+Q — used for
-    // double-tap escape to send literal 0x11 to the guest.
+// ============================================================
+//  Ctrl+Q double-tap interception
+// ============================================================
+
+/// Intercept Ctrl+Q (0x11): single tap -> SIGINT (debugger break),
+/// double tap -> forward one 0x11 to guest.
+/// Returns the forwarded byte or `None` if the byte was consumed.
+fn intercept_ctrl_q(b: u8) -> Option<u8> {
     static LAST_WAS_CTRL_Q: AtomicU8 = AtomicU8::new(0);
-    let n = unsafe { libc::read(h.stdin_fd, buf.as_mut_ptr() as *mut libc::c_void, free.min(buf.len())) };
-    if n > 0 {
-        let mut wr = unsafe { &*h.rx_wr }.load(Ordering::Relaxed);
-        let rx = unsafe { std::slice::from_raw_parts_mut(h.rx_buf, h.rx_cap as usize) };
-        for &b in &buf[..n as usize] {
-            if b == 0x11 {
-                // Ctrl+Q — escape key
-                if LAST_WAS_CTRL_Q.swap(1, Ordering::Relaxed) == 1 {
-                    // Double-tap: forward one 0x11 to the guest
-                    rx[(wr % h.rx_cap) as usize] = 0x11;
+    if b != 0x11 {
+        LAST_WAS_CTRL_Q.store(0, Ordering::Relaxed);
+        return Some(b);
+    }
+    if LAST_WAS_CTRL_Q.swap(1, Ordering::Relaxed) == 1 {
+        LAST_WAS_CTRL_Q.store(0, Ordering::Relaxed);
+        Some(0x11)
+    } else {
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        None
+    }
+}
+
+// ============================================================
+//  Escape sequence re-assembly
+// ============================================================
+
+/// Accumulates bytes across read() calls to re-assemble fragmented
+/// terminal escape sequences (CSI, SS3).  Only buffers when an ESC
+/// byte is seen; all other bytes pass through immediately.
+struct EscBuf {
+    buf: [u8; 16],
+    len: u8,
+}
+
+impl EscBuf {
+    const fn new() -> Self { Self { buf: [0; 16], len: 0 } }
+
+    /// Feed a byte.  Returns `Some(slice)` when a complete sequence
+    /// (or a non-escape single byte) is ready; `None` while buffering.
+    fn feed(&mut self, b: u8) -> Option<&[u8]> {
+        if self.len == 0 {
+            if b == 0x1b { self.buf[0] = b; self.len = 1; return None; }
+            self.buf[0] = b;
+            return Some(&self.buf[..1]);
+        }
+        // Buffering: non-ESC leading byte of an escape sequence
+        self.buf[self.len as usize] = b;
+        self.len += 1;
+        if self.len == 2 {
+            // After ESC + X, decide: CSI [ -> continue; SS3 O -> continue;
+            // anything else (Alt+key etc.) -> flush immediately
+            if b != b'[' && b != b'O' { return self.flush(); }
+            return None;
+        }
+        // CSI: final byte in 0x40..0x7E
+        if self.buf[1] == b'[' && (0x40..=0x7E).contains(&b) { return self.flush(); }
+        // SS3: always 3 bytes (ESC O X)
+        if self.buf[1] == b'O' { return self.flush(); }
+        // Safety valve: pathological sequence > 15 bytes
+        if self.len >= 15 { return self.flush(); }
+        None
+    }
+
+    fn flush(&mut self) -> Option<&[u8]> {
+        if self.len == 0 { return None; }
+        let n = self.len; self.len = 0;
+        Some(&self.buf[..n as usize])
+    }
+}
+
+// ============================================================
+//  stdin -> RX ring buffer (QEMU fd_chr_read model)
+// ============================================================
+
+/// Read available data from stdin into the RX ring buffer.
+/// fd must be O_NONBLOCK: reads until EAGAIN in a tight loop.
+/// `EscBuf` re-assembles escape sequences that span multiple
+/// read() calls without polling — pure event-driven.
+/// Returns false on EOF.
+fn read_stdin_to_rx(h: &TermIoHandle, free: usize, buf: &mut [u8]) -> (bool, usize) {
+    let max = free.min(buf.len());
+    let mut total: usize = 0;
+
+    loop {
+        if total >= max {
+            break;
+        }
+        let n = unsafe {
+            libc::read(
+                h.stdin_fd,
+                buf.as_mut_ptr().add(total) as *mut libc::c_void,
+                max - total,
+            )
+        };
+        if n > 0 {
+            total += n as usize;
+            continue;
+        }
+        if n == 0 {
+            return (false, total);
+        }
+        // n < 0
+        let err = unsafe { *libc::__errno_location() };
+        if err == libc::EAGAIN || err == libc::EWOULDBLOCK {
+            break;
+        }
+        // Other errors (EINTR etc.): stop what we have
+        break;
+    }
+
+    if total == 0 {
+        return (true, 0);
+    }
+
+    // EscBuf persists across read() calls: when an escape sequence
+    // (\e[1;5D) arrives fragmented, bytes accumulate until complete.
+    // Static is safe — only the termio thread calls this function.
+    static mut ESC_BUF: EscBuf = EscBuf::new();
+    let esc = unsafe { &mut *(&raw mut ESC_BUF) };
+
+    let mut wr = unsafe { &*h.rx_wr }.load(Ordering::Relaxed);
+    let rx = unsafe { std::slice::from_raw_parts_mut(h.rx_buf, h.rx_cap as usize) };
+    for &b in &buf[..total] {
+        if let Some(byte) = intercept_ctrl_q(b) {
+            if let Some(chunk) = esc.feed(byte) {
+                for &c in chunk {
+                    rx[(wr % h.rx_cap) as usize] = c;
                     wr = wr.wrapping_add(1);
-                    LAST_WAS_CTRL_Q.store(0, Ordering::Relaxed);
-                } else {
-                    // Single tap: send SIGINT to pause debugger, don't forward
-                    unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
                 }
-            } else {
-                // Any other byte: reset tracking, forward normally
-                if LAST_WAS_CTRL_Q.swap(0, Ordering::Relaxed) == 1 {
-                    // Flush a pending single Ctrl+Q that was NOT followed by
-                    // another Ctrl+Q — it must have been intended as an
-                    // escape, so don't retroactively forward it.
-                }
-                rx[(wr % h.rx_cap) as usize] = b;
-                wr = wr.wrapping_add(1);
             }
         }
-        unsafe { &*h.rx_wr }.store(wr, Ordering::Release);
-        return (true, n as usize);
     }
-    (n != 0, 0) // n==0 -> EOF; n<0 -> EAGAIN, ignore
+    unsafe { &*h.rx_wr }.store(wr, Ordering::Release);
+    unsafe { &*h.rx_notify }.store(1, Ordering::Release);
+    // 事件驱动唤醒 Python RX daemon — 写 1 字节到通知管道.
+    // fd 由 Python 侧 os.pipe() 创建并设为非阻塞, 管道满时
+    // write 返回 EAGAIN (通知丢失可接受, daemon 靠 drain_rx 追上).
+    if h.rx_notify_fd >= 0 {
+        let _ = unsafe { libc::write(h.rx_notify_fd, &1u8 as *const u8 as *const libc::c_void, 1) };
+    }
+    (true, total)
 }
 
 // ============================================================
@@ -278,9 +374,6 @@ fn read_stdin_to_rx(h: &TermIoHandle, free: usize, buf: &mut [u8]) -> (bool, usi
 // ============================================================
 
 fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
-    // QEMU 事件循环由 fd 驱动 (零延迟); 跨 cdylib 无共享 eventfd 可 poll,
-    const POLL_MS: libc::c_int = 5;
-
     let stop = unsafe { &*h.stop_flag };
     let rx_wr = unsafe { &*h.rx_wr };
     let rx_rd = unsafe { &*h.rx_rd };
@@ -290,8 +383,6 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
     let mut stdin_eof = false;
 
     while stop.load(Ordering::Acquire) == 0 {
-        // ---- RX 容量控制 (对照 fd_chr_read_poll ->qemu_chr_be_can_write):
-        // 环形缓冲满时不监听 POLLIN, 数据自然滞留在内核 tty 缓冲。
         let used = rx_wr
             .load(Ordering::Relaxed)
             .wrapping_sub(rx_rd.load(Ordering::Acquire));
@@ -303,32 +394,20 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
             revents: 0,
         };
         let nfds: libc::nfds_t = if !stdin_eof && free > 0 && rx_cap > 0 { 1 } else { 0 };
-        // nfds == 0 时 poll 退化为纯睡眠 (对照 QEMU 摘除 fd watch 后的空转)
-        let ret = unsafe { libc::poll(&mut pfd, nfds, POLL_MS) };
+        let ret = unsafe { libc::poll(&mut pfd, nfds, -1) };
         if ret < 0 {
-            let err = unsafe { *libc::__errno_location() };
-            if err == libc::EINTR {
-                continue;
-            }
+            if unsafe { *libc::__errno_location() } == libc::EINTR { continue; }
             break;
         }
-
-        // ---- read stdin -> RX ring buffer (参照 fd_chr_read) ----
-        if nfds == 1 && ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
+        if nfds == 1 && (pfd.revents & libc::POLLIN) != 0 {
             let (ok, _) = read_stdin_to_rx(&h, free, &mut stdin_buf);
             stdin_eof = !ok;
-        } else if nfds == 1 && ret > 0 {
+        } else if nfds == 1 {
             stdin_eof = true;
         }
-
-        // ---- TX 环形缓冲 ->stdout ----
         drain_tx(&h, &mut chunk);
     }
-
-    // 退出前最终排空: 保证 tx_drain == tx_wr, 所有已产生输出均已写入 stdout。
     drain_tx(&h, &mut chunk);
-
-    // ---- term_exit (对照 char-stdio.c): 恢复 termios + 两个 fd 的阻塞标志 ----
     unsafe {
         libc::tcsetattr(h.stdin_fd, libc::TCSANOW, &saved.oldtty);
         libc::fcntl(h.stdin_fd, libc::F_SETFL, saved.old_fl0);
@@ -338,8 +417,12 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
 
 /// Simple I/O thread — no terminal setup (Python cbreak manages it).
 /// Supports pause via ``pause_flag`` for debugger break/resume.
+///
+/// Single-fd event-driven poll: blocks on stdin until data arrives.
+/// TX output to stdout is handled inline by the batch engine's
+/// UART TXDATA handler (libc::write), so this thread only handles
+/// stdin -> RX ring buffer forwarding.
 fn termio_thread_simple(h: TermIoHandle) {
-    const POLL_MS: libc::c_int = 5;
     let stop = unsafe { &*h.stop_flag };
     let pause: *const AtomicU8 = h.pause_flag;
     let rx_wr = unsafe { &*h.rx_wr };
@@ -350,32 +433,35 @@ fn termio_thread_simple(h: TermIoHandle) {
     let mut stdin_eof = false;
 
     while stop.load(Ordering::Acquire) == 0 {
-        // ---- debugger pause: sleep, skip I/O ----
         if !pause.is_null() && unsafe { &*pause }.load(Ordering::Acquire) != 0 {
-            std::thread::sleep(std::time::Duration::from_millis(POLL_MS as u64));
+            std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         }
-        // ---- RX backpressure ----
-        let used = rx_wr.load(Ordering::Relaxed).wrapping_sub(rx_rd.load(Ordering::Acquire));
+        let used = rx_wr
+            .load(Ordering::Relaxed)
+            .wrapping_sub(rx_rd.load(Ordering::Acquire));
         let free = rx_cap.saturating_sub(used) as usize;
-        let mut pfd = libc::pollfd { fd: h.stdin_fd, events: libc::POLLIN, revents: 0 };
+
+        let mut pfd = libc::pollfd {
+            fd: h.stdin_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let nfds: libc::nfds_t = if !stdin_eof && free > 0 && rx_cap > 0 { 1 } else { 0 };
-        let ret = unsafe { libc::poll(&mut pfd, nfds, POLL_MS) };
+        let ret = unsafe { libc::poll(&mut pfd, nfds, -1) };
         if ret < 0 {
             if unsafe { *libc::__errno_location() } == libc::EINTR { continue; }
             break;
         }
-        // ---- read stdin -> RX ring buffer (参照 fd_chr_read) ----
-        if nfds == 1 && ret > 0 && (pfd.revents & libc::POLLIN) != 0 {
+        if nfds == 1 && (pfd.revents & libc::POLLIN) != 0 {
             let (ok, _) = read_stdin_to_rx(&h, free, &mut stdin_buf);
             stdin_eof = !ok;
-        } else if nfds == 1 && ret > 0 {
+        } else if nfds == 1 {
             stdin_eof = true;
         }
-        // ---- TX ring buffer -> stdout ----
+        // TX ring buffer -> hart log files (stdout handled by batch engine directly)
         drain_tx(&h, &mut chunk);
     }
-    // final drain
     drain_tx(&h, &mut chunk);
 }
 
@@ -397,6 +483,12 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
     if handle.is_null() {
         return -1;
     }
+    /*
+       ---- 显式作用域: 锁在此块结束时立即释放 ----
+       MutexGuard 在 '}' 处 drop, 避免锁被持有到后续 FFI 操作 (unsafe 解引用
+       handle 指针) 期间。若后续代码 panic, 锁仍可被其他路径获取；若省略外层
+       大括号, guard 存活到整个 if 分支结束才析构 —— 后续代码均持锁运行。
+    */
     {
         let guard = THREAD_HANDLE.lock().unwrap();
         if guard.is_some() {
@@ -419,6 +511,8 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
         tx_drain: h.tx_drain,
         stop_flag: h.stop_flag,
         pause_flag: h.pause_flag,
+        rx_notify: h.rx_notify,
+        rx_notify_fd: h.rx_notify_fd,
     };
 
     // ---- term_init ----
@@ -452,8 +546,8 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
         // ICRNL 保留: 宿主机将 \r->\n, 客机收到 \n 即可行终止
         | libc::IXON);
     raw.c_oflag |= libc::OPOST; // 保留输出后处理: '\n' ->CRLF
-    // 关闭 ISIG: Ctrl+C (0x03) 作为普通字节透传给客机.
-    // Ctrl+Q (0x11) 在 termio 线程中拦截并发送 SIGINT 替代暂停.
+                                // 关闭 ISIG: Ctrl+C (0x03) 作为普通字节透传给客机.
+                                // Ctrl+Q (0x11) 在 termio 线程中拦截并发送 SIGINT 替代暂停.
     raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::IEXTEN | libc::ISIG);
     raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
     raw.c_cflag |= libc::CS8;
@@ -485,22 +579,45 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 
 /// Attach I/O thread to already-configured fds — no termios changes.
 /// Terminal mode (cbreak) is managed by Python; this just reads/writes.
+///
 #[no_mangle]
 pub extern "C" fn terminal_io_attach(handle: *const TermIoHandle) -> i32 {
-    if handle.is_null() { return -1; }
+    if handle.is_null() {
+        return -1;
+    }
     {
         let guard = THREAD_HANDLE.lock().unwrap();
-        if guard.is_some() { return -1; }
+        if guard.is_some() {
+            return -1;
+        }
     }
     let h = unsafe { &*handle };
     let hc = TermIoHandle {
-        stdin_fd: h.stdin_fd, stdout_fd: h.stdout_fd,
-        rx_buf: h.rx_buf, rx_cap: h.rx_cap, rx_wr: h.rx_wr, rx_rd: h.rx_rd,
-        tx_buf: h.tx_buf, tx_cap: h.tx_cap, tx_wr: h.tx_wr, tx_drain: h.tx_drain,
-        stop_flag: h.stop_flag, pause_flag: h.pause_flag,
+        stdin_fd: h.stdin_fd,
+        stdout_fd: h.stdout_fd,
+        rx_buf: h.rx_buf,
+        rx_cap: h.rx_cap,
+        rx_wr: h.rx_wr,
+        rx_rd: h.rx_rd,
+        tx_buf: h.tx_buf,
+        tx_cap: h.tx_cap,
+        tx_wr: h.tx_wr,
+        tx_drain: h.tx_drain,
+        stop_flag: h.stop_flag,
+        pause_flag: h.pause_flag,
+        rx_notify: h.rx_notify,
+        rx_notify_fd: h.rx_notify_fd,
     };
+    // QEMU fd_chr_read model: stdin non-blocking so read() returns all
+    // currently buffered bytes (escape sequences arrive atomically).
+    let old_fl = unsafe { libc::fcntl(hc.stdin_fd, libc::F_GETFL) };
+    if old_fl >= 0 {
+        unsafe { libc::fcntl(hc.stdin_fd, libc::F_SETFL, old_fl | libc::O_NONBLOCK) };
+    }
     STOP_PTR.store(hc.stop_flag, Ordering::Release);
-    let jh = std::thread::spawn(move || { termio_thread_simple(hc); });
+    let jh = std::thread::spawn(move || {
+        termio_thread_simple(hc);
+    });
     *THREAD_HANDLE.lock().unwrap() = Some(jh);
     0
 }
@@ -545,7 +662,7 @@ mod tests {
     /// (pyremu/_native/__init__.py)。修改任一侧必须同步另一侧。
     #[test]
     fn test_handle_layout_locked() {
-        assert_eq!(size_of::<TermIoHandle>(), 88);
+        assert_eq!(size_of::<TermIoHandle>(), 104);
         assert_eq!(offset_of!(TermIoHandle, stdin_fd), 0);
         assert_eq!(offset_of!(TermIoHandle, stdout_fd), 4);
         assert_eq!(offset_of!(TermIoHandle, rx_buf), 8);
@@ -558,6 +675,8 @@ mod tests {
         assert_eq!(offset_of!(TermIoHandle, tx_drain), 64);
         assert_eq!(offset_of!(TermIoHandle, stop_flag), 72);
         assert_eq!(offset_of!(TermIoHandle, pause_flag), 80);
+        assert_eq!(offset_of!(TermIoHandle, rx_notify), 88);
+        assert_eq!(offset_of!(TermIoHandle, rx_notify_fd), 96);
     }
 
     #[test]

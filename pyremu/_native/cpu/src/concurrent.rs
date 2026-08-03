@@ -111,6 +111,10 @@ pub struct ConcurrentClintCtx {
     /// Acquire swap from receiver).  Set after ``ModuleState`` creation.
     /// ``Cell`` allows late initialisation despite ``&self``.
     pub msip_pending: Cell<*const AtomicU64>,
+    /// Per-hart OS thread handles for MSIP unpark wake-up.
+    /// Populated by ``run_harts`` after thread spawn; ``Cell`` enables
+    /// late initialisation via ``&self`` (same pattern as ``msip_pending``).
+    pub hart_threads: Cell<*const std::thread::Thread>,
 }
 
 // Safety: Python holds the backing ctypes arrays alive for the FFI call.
@@ -134,6 +138,7 @@ impl ConcurrentClintCtx {
             msip: raw.msip as *const AtomicU8,
             num_harts,
             msip_pending: Cell::new(std::ptr::null()),
+            hart_threads: Cell::new(std::ptr::null()),
         }
     }
 }
@@ -339,6 +344,7 @@ static EMPTY_UART: FfiUartCtx = FfiUartCtx {
     rx_fifo_len: 0,
     tx_notify_fd: -1,
     no_stdout: 0,
+    rx_notify: std::ptr::null_mut(),
 };
 
 #[inline]
@@ -405,6 +411,7 @@ unsafe fn run_harts(
     };
 
     let mut handles = Vec::with_capacity(num_harts as usize);
+    let mut thread_refs: Vec<std::thread::Thread> = Vec::with_capacity(num_harts as usize);
     for hid in 0..num_harts {
         let mref = Arc::clone(module);
         let mem_send = shared_mem;
@@ -435,8 +442,15 @@ unsafe fn run_harts(
                 ext_irq_ptr as *mut FfiExtIrqCtx,
             );
         });
+        thread_refs.push(handle.thread().clone());
         handles.push(handle);
     }
+
+    // Store thread handles for MSIP unpark: sender calls unpark() on
+    // the receiver's thread to wake it from park_timeout in wfi_spin.
+    let thread_slice: Box<[std::thread::Thread]> = thread_refs.into_boxed_slice();
+    cc_clint.hart_threads.set(thread_slice.as_ptr());
+    std::mem::forget(thread_slice); // pointer valid until run_harts returns
 
     for h in handles {
         let _ = h.join();
@@ -562,12 +576,6 @@ pub unsafe extern "C" fn run_parallel(
     }
 }
 
-/// FFI entry: dump accumulated instruction frequency counters to the
-/// diagnostic log and reset them.  Call once at emulator termination.
-#[no_mangle]
-pub extern "C" fn icount_flush() {
-    crate::diag::icount_dump();
-}
 
 // ============================================================
 //  Tests
@@ -605,11 +613,12 @@ mod tests {
         bp_addrs: *const u64,
         bp_count: u32,
         stop_flag: *const u8,
+        ext_irq: *mut FfiExtIrqCtx,
         tlb_gen: *mut u64,
         tlb_gen_per_hart: *mut u64,
     ) {
         let hart = FfiHartCtx {
-            states, num_harts, max_instrs, result, stop_flag,
+            states, num_harts, max_instrs, result, stop_flag, ext_irq,
         };
         let periph = FfiPeriphCtx {
             mem, pmp, clint, dev, uart, virtio,
@@ -692,7 +701,7 @@ mod tests {
             std::ptr::null(), // bp_addrs
             0,                // bp_count
             std::ptr::null(), // stop_flag
-            std::ptr::null(), // ext_irq
+            std::ptr::null_mut(), // ext_irq
             std::ptr::null_mut(), std::ptr::null_mut(),
         );
     }
@@ -1009,7 +1018,7 @@ mod tests {
                 std::ptr::null(), // bp_addrs
                 0,                // bp_count
                 std::ptr::null(), // stop_flag
-            std::ptr::null(), // ext_irq
+            std::ptr::null_mut(), // ext_irq
                 std::ptr::null_mut(), std::ptr::null_mut(),
             );
         }
@@ -1127,7 +1136,7 @@ mod tests {
             std::ptr::null(), // bp_addrs
             0,                // bp_count
             std::ptr::null(), // stop_flag
-            std::ptr::null(), // ext_irq
+            std::ptr::null_mut(), // ext_irq
             std::ptr::null_mut(), std::ptr::null_mut(),
         );
     }
@@ -1363,7 +1372,7 @@ mod tests {
         unsafe {
             call_run_parallel(&mut state, 1, 10, &mut result, &mem, &pmp, &clint, &dev,
                 std::ptr::null(), std::ptr::null(), std::ptr::null(), 0,
-                std::ptr::null(),
+                std::ptr::null(), std::ptr::null_mut(),
                 std::ptr::null_mut(), std::ptr::null_mut());
         }
 

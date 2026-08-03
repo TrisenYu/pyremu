@@ -48,8 +48,10 @@ REG_DIV = 0x18
 IP_TXWM = 1 << 0  # TX FIFO 占用 < txcnt (对照 QEMU SIFIVE_UART_IP_TXWM)
 IP_RXWM = 1 << 1  # RX FIFO 占用 > rxcnt (对照 QEMU SIFIVE_UART_IP_RXWM)
 
-# RX FIFO 固定大小 (对照 QEMU SIFIVE_UART_RX_FIFO_SIZE = 8)
-RX_FIFO_SIZE = 8
+# RX FIFO 固定大小 (QEMU SIFIVE_UART_RX_FIFO_SIZE = 8, 但 8 字节
+# 不足以容纳完整 vt100 转义序列如 \x1b[1;5D (6 bytes) +
+# 连续键入时的队列缓冲. 32 字节确保转义序列始终原子交付.)
+RX_FIFO_SIZE = 32
 
 # RXDATA 状态位 (SiFive 硬件兼容)
 UART_RXFIFO_EMPTY = 1 << 31  # RX FIFO 空标志 (bit31=1 表示无数据)

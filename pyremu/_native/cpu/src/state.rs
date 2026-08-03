@@ -302,6 +302,10 @@ pub struct FfiUartCtx {
     /// When 1, Rust writes to ring buffer only (no libc::write).
     /// Python _tx_callback handles all stdout output.
     pub no_stdout: u8,
+    /// RX notification — set to 1 by TermIO daemon when new stdin data
+    /// arrives in the ring buffer.  ``hart_worker`` polls this flag and
+    /// wakes WFI / triggers SEIP inline.
+    pub rx_notify: *mut u8,
 }
 
 // Safety: Python holds the backing ctypes arrays alive for the FFI call.
@@ -343,7 +347,7 @@ pub struct FfiVirtIoCtx {
     /// Queue is ready / activated (written at offset 0x044).
     pub queue_ready: u8,
 
-    // ---- Queue addresses (split 64-bit, written at offsets 0x080–0x0A4) ----
+    // ---- Queue addresses (split 64-bit, written at offsets 0x080-0x0A4) ----
     pub queue_desc: u64,
     pub queue_driver: u64,
     pub queue_device: u64,

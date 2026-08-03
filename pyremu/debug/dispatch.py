@@ -289,7 +289,7 @@ class DispatchMixin(SharedMixinAttrs):
                 ("bp clear", "清除全部断点"),
             ]),
             self._section("读寄存器命令", [
-                ("regs/gpr", "显示全部 GPR (x0–x31)"),
+                ("regs/gpr", "显示全部 GPR (x0-x31)"),
                 ("reg <name>", "显示指定 GPR (例: reg a0, reg x10)"),
                 ("csr <name>", "显示指定 CSR (例: csr mstatus)"),
                 ("csr list", "列出所有可用 CSR 名称"),

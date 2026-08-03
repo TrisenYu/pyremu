@@ -1,6 +1,4 @@
-# crt0.S — 飞地 payload 最小启动代码
-#
-# 替代 picolibc 自带 crt0.o, 适配 Rust S-mode 运行时环境:
+# 适配 Rust S-mode 运行时环境:
 #   - Rust 运行时已将 ELF 段加载到 U-mode 地址空间
 #   - 入口 _start, 设好栈后调 main(argc, argv)
 #   - main 返回后调 _exit()

@@ -19,6 +19,8 @@ from functools import partial
 
 from pydantic import BaseModel
 
+from pyremu.utils.regname import init_csr_map, init_gpr_map
+
 # ============================================================
 #  通用寄存器基类
 # ============================================================
@@ -556,3 +558,8 @@ def register_csr():
     """返回所有 CSR 的独立副本 (name -> CSR 对象)."""
     ret = {v.name: v for _, v in _csr_bank.items()}
     return deepcopy(ret)
+
+
+# 向 regname 注入名称映射 — 断开 core.decoder 与 utils.disassem 的循环导入
+init_gpr_map([r.name for r in _gpr], [r.alias for r in _gpr])
+init_csr_map({addr: csr.name for addr, csr in _csr_bank.items()})

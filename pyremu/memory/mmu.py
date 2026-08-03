@@ -8,7 +8,7 @@
 """
 RISC-V 内存管理单元 (MMU): 页表项 (PTE) 定义与 Sv39 页表遍历。
 
-参考: RISC-V Privileged Specification §4.3–§4.5
+参考: RISC-V Privileged Specification §4.3-§4.5
 """
 
 from enum import Enum

@@ -6,6 +6,7 @@ use crate::csr;
 use crate::hang;
 use crate::paging;
 use crate::println;
+use crate::sched;
 use crate::syscall;
 
 // ---------------------------------------------------------------
@@ -265,15 +266,27 @@ fn syscall_dispatch(gprs: &TrapGprs) -> u64 {
 // ---------------------------------------------------------------
 
 fn interrupt_dispatch(cause: u64) {
-    if cause != 5 {
-        return;
-    }
+    match cause {
+        1 => {
+            // 软件中断 (SSIP): M-mode 通过 IPI 注入,
+            // 通知 S-mode 有 host 请求待处理.
+            csr::clear_csr!(sip, csr::SSI);
+            sched::check_pending_requests();
+        }
+        5 => {
+            // 定时器中断
+            unsafe {
+                let now: u64;
+                core::arch::asm!("csrr {0}, 0xC01", out(reg) now);
+                ecall_aux::sbi_set_timer(now + TIMER_INTERVAL);
+            }
+            csr::clear_csr!(sip, csr::STI);
 
-    unsafe {
-        // 读取 time CSR (0xC01)
-        let now: u64;
-        core::arch::asm!("csrr {0}, 0xC01", out(reg) now);
-        ecall_aux::sbi_set_timer(now + TIMER_INTERVAL);
+            // 时间片记账与配额检查 (见 sched.rs).
+            sched::tick_and_check_quota();
+            // 同时检查是否有 host 发来的待处理请求.
+            sched::check_pending_requests();
+        }
+        _ => {}
     }
-	csr::clear_csr!(sip, csr::STI);
 }

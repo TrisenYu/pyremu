@@ -5,7 +5,6 @@ use crate::concurrent::{
     ConcurrentClintCtx, FfiExtIrqCtx, ModuleState, SharedDevCtx, SharedMemCtx, SharedPmpCtx, StopInfo,
 };
 use crate::decode::decode_fields;
-use crate::diag;
 use crate::fpu::{handle_fp_load_concurrent, handle_fp_store_concurrent};
 use crate::handlers::{
     handle_compressed, lr_clear_all, pmp_ok, try_handle_virtio, ClintCtx, DevCtx, PmpCtx,
@@ -106,14 +105,6 @@ pub(crate) fn read_gpr(state: &HartState, rs: u8) -> u64 {
 }
 
 pub(crate) fn write_gpr(state: &mut HartState, rd: u8, val: u64) {
-    // Diagnostic: catch s4 (x20) being clobbered from -1 in U-mode ld-linux.
-    #[cfg(feature = "diagnostic")]
-    if rd == 20 && state.gprs[20] == u64::MAX && val != u64::MAX && state.mode == 0 {
-        crate::diag::log_line(&format!(
-            "[s4-clobber] pc={:#018x} old=-1 new={:#x} sp={:#x} ra={:#x}",
-            state.pc, val, state.gprs[2], state.gprs[1],
-        ));
-    }
     if rd != 0 {
         state.gprs[rd as usize] = val;
     }
@@ -800,14 +791,10 @@ fn handle_csr_concurrent(
         ipi_sender_rounds: Cell::new(0),
     };
 
-    let msie_before = (state.mie >> 3) & 1;
     let mut dummy = unsafe { std::mem::zeroed() };
     let advance = crate::csr::handle_csr(
         state, f.rd, f.rs1, f.func12, f.func3, instr, &mut dummy, hart_id, cur_mtime, pmp,
     );
-    if msie_before != 0 && ((state.mie >> 3) & 1) == 0 {
-        diag::msie_cleared_at(&mut state.diag, state.pc);
-    }
 
     // Sync stimecmp -> CLINT mtimecmp after CSR write to stimecmp (Sstc).
     if f.func12 == 0x14D && hid < clint.num_harts as usize {
@@ -872,10 +859,6 @@ pub(crate) fn handle_system_concurrent(
                 .wrapping_add(1);
             module.tlb_gen_per_hart[hart_id as usize]
                 .store(new_gen, std::sync::atomic::Ordering::Relaxed);
-            diag::log_line(&format!(
-                "[sfence-vma] hart={} pc={:#018x} mode={} gen={}",
-                hart_id, state.pc, state.mode, new_gen,
-            ));
             return 4;
         }
         0x5A0 => {
@@ -1164,6 +1147,8 @@ fn handle_wfi_state(
     dev: &DevCtx,
     module: &ModuleState,
     stop_flag: *const u8,
+    uart: &FfiUartCtx,
+    ext_irq: *mut FfiExtIrqCtx,
 ) -> (Step, bool) {
     if state.waiting == 0 {
         return (Step::Next, false);
@@ -1179,18 +1164,13 @@ fn handle_wfi_state(
         });
         return (Step::Exit, false);
     }
-    if !wfi_spin(state, hart_id as usize, clint, module, stop_flag) {
+    if !wfi_spin(state, hart_id as usize, clint, module, stop_flag, uart.rx_notify, ext_irq) {
         // Batch exit from WFI: flush TLB in case another hart did
         // SFENCE.VMA while we were spinning.
         mark_tlb_dirty_if_stale(state, module, hart_id);
         return (Step::Exit, false);
     }
     state.consecutive_traps = 0;
-    diag::log_line(&format!(
-        "[wfi-wake] hart={} pc={:#018x} mode={} mstatus={:#018x} mip={:#010x} mie={:#010x} s4={:#x} s5={:#x}",
-        hart_id, 0u64, 0u8, state.mstatus, state.mip, state.mie,
-        state.gprs[20], state.gprs[21],
-    ));
     (Step::Next, true)
 }
 
@@ -1215,7 +1195,6 @@ fn step_interrupts(
     sync_msip(state, clint);
     let msip_was_pending = (state.mip & (1 << 3)) != 0;
     if msip_was_pending && (state.mie & (1 << 3)) == 0 {
-        diag::msie_forced(&mut state.diag);
         state.mie |= 1 << 3;
     }
     if check_and_deliver_interrupt_concurrent(state, clint) {
@@ -1365,13 +1344,24 @@ pub(crate) fn hart_worker(
         // The batch exits naturally when the guest's PLIC driver reads
         // claim/complete MMIO registers — no forced exit needed.
         if !ext_irq.is_null() && unsafe { (*ext_irq).pending != 0 } {
-            unsafe { (*ext_irq).pending = 0; }
+            // Level-triggered: Python sets pending=1 when ring buffer or
+            // UART FIFO has data, clears to 0 only when both are empty.
+            // We do NOT clear pending here — Python manages the lifecycle.
             if state.mie & (1 << 9) != 0 {
                 state.mip |= 1 << 9;  // SEIP
             }
             if state.mie & (1 << 11) != 0 {
                 state.mip |= 1 << 11; // MEIP
             }
+        }
+        // TermIO RX notification: stdin bytes arrived in ring buffer.
+        // Force immediate batch exit -> Python drain_rx() moves data
+        // from ring buffer into UART FIFO -> _native_sync_plic_mip
+        // raises SEIP -> guest reads data on next batch without
+        // waiting for PLIC round-trip or batch completion.
+        if !uart.rx_notify.is_null() && unsafe { *uart.rx_notify != 0 } {
+            module.stop_flag.store(true, Ordering::Release);
+            return;
         }
         if state.halted != 0 {
             std::hint::spin_loop();
@@ -1380,7 +1370,7 @@ pub(crate) fn hart_worker(
 
         // ---- WFI ----
         let (wfi_step, just_woke_from_wfi) =
-            handle_wfi_state(state, hart_id, clint, dev, module, stop_flag);
+            handle_wfi_state(state, hart_id, clint, dev, module, stop_flag, uart, ext_irq);
         match wfi_step {
             Step::Exit => return,
             Step::Continue => continue,
@@ -1707,8 +1697,8 @@ mod tests {
             mtimecmp: &_mtimecmp,
             msip: &_msip,
             num_harts: 1,
-            states: std::ptr::null_mut(),
             msip_pending: Cell::new(std::ptr::null()),
+            hart_threads: Cell::new(std::ptr::null()),
         };
         let _tx_buf = [0u8; 16];
         let _tx_wr = std::sync::atomic::AtomicU32::new(0);
@@ -1722,7 +1712,7 @@ mod tests {
             rxctrl: 0,
             rx_fifo_len: 0,
             tx_notify_fd: -1,
-            no_stdout: 0,
+            no_stdout: 0, rx_notify: std::ptr::null_mut(),
         };
         let _wfi_flags: Vec<std::sync::atomic::AtomicU8> = (0..1)
             .map(|_| std::sync::atomic::AtomicU8::new(0))
@@ -1809,8 +1799,8 @@ mod tests {
             mtimecmp: &_mtimecmp,
             msip: &_msip,
             num_harts: 1,
-            states: std::ptr::null_mut(),
             msip_pending: Cell::new(std::ptr::null()),
+            hart_threads: Cell::new(std::ptr::null()),
         };
         let _tx_buf = [0u8; 16];
         let _tx_wr = std::sync::atomic::AtomicU32::new(0);
@@ -1824,7 +1814,7 @@ mod tests {
             rxctrl: 0,
             rx_fifo_len: 0,
             tx_notify_fd: -1,
-            no_stdout: 0,
+            no_stdout: 0, rx_notify: std::ptr::null_mut(),
         };
         let _wfi_flags: Vec<std::sync::atomic::AtomicU8> = (0..1)
             .map(|_| std::sync::atomic::AtomicU8::new(0))

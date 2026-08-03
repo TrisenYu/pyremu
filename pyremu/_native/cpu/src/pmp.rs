@@ -49,7 +49,7 @@ pub fn pmp_ok(
             return true;
         }
         // MPRV=1: PMP uses effective mode = MPP.
-        // If MPP=M, effective mode is still M → PMP bypass.
+        // If MPP=M, effective mode is still M -> PMP bypass.
         let mpp = (state.mstatus >> 11) & 0x3;
         if mpp == riscv_mode::M as u64 {
             return true;
@@ -173,7 +173,7 @@ pub extern "C" fn pmp_check(
                 1 => 1,
                 _ => 3,
             };
-            // MPRV=1 but MPP=M → effective mode is still M → PMP bypass
+            // MPRV=1 but MPP=M -> effective mode is still M -> PMP bypass
             if eff_mode == _MODE_M {
                 return 1;
             }
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_mmode_mprv1_mpp_m_bypasses_even_if_matched() {
-        // MPRV=1, MPP=M(3) → effective mode is M → PMP bypass.
+        // MPRV=1, MPP=M(3) -> effective mode is M -> PMP bypass.
         // Entry 0 matches PA 0x8000_0000 with no R/W/X — but should be ignored.
         let cfg = [PMP_A_NAPOT | 0x00]; // NAPOT, no R/W/X
         let addr = [0x2000_01FFu64]; // 4K NAPOT covering 0x80000000
@@ -373,8 +373,8 @@ mod tests {
 
     #[test]
     fn test_mmode_mprv1_mpp_s_enforces_pmp() {
-        // MPRV=1, MPP=S(1) → effective mode is S → PMP enforced.
-        // Entry 0 matches PA 0x8000_0000 with no R/W/X → DENY.
+        // MPRV=1, MPP=S(1) -> effective mode is S -> PMP enforced.
+        // Entry 0 matches PA 0x8000_0000 with no R/W/X -> DENY.
         let cfg = [PMP_A_NAPOT | 0x00]; // NAPOT, no R/W/X
         let addr = [0x2000_01FFu64];
         let mstatus = (1u64 << 17) | (1u64 << 11); // MPRV=1, MPP=1(S)

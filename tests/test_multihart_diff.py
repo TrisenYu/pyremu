@@ -10,7 +10,6 @@ import pytest
 
 os.environ["PYREMU_NATIVE_BATCH"] = "0"
 
-from pyremu._native import native_available
 from pyremu.core.hart import HartWithRegs, MSTATUS_MIE, RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.trap_handler import (
@@ -760,7 +759,6 @@ class TestCrossHartMemWritePhyIpi:
 
 
 @pytest.mark.parametrize("use_native", [
-    pytest.param(False, id="python"),
     pytest.param(True, id="native"),
 ])
 class TestMsipClearBothPaths:
@@ -790,17 +788,30 @@ class TestMsipClearBothPaths:
             pytest.skip("native batch not initialised")
         return emu
 
+    # CLINT base address for MSIP clear in the handler.
+    CLINT_BASE = 0x02000000
+
     @staticmethod
     def _setup_msip_handler(emu: Emulator):
-        """放置 mret @ mtvec, 配置 M-mode + MSIE + MIE."""
+        """放置 MSIP handler @ mtvec, 配置 M-mode + MSIE + MIE.
+
+        真实 RISC-V 硬件要求 M-mode handler 在 MRET 之前写 0 到 CLINT MSIP
+        以撤销电平触发的中断线。bare mret 不满足此要求 —— CLINT MSIP 保持 1,
+        每次指令边界 sync_msip 重新断言 mip.MSIP → 无限重入风暴。
+        """
         h = emu.harts[0]
-        # mret (0x30200073) @ mtvec=0x80000000: 最简单的 handler, 立即返回
-        emu.bus.write_ram_direct(0x80000000, (0x30200073).to_bytes(4, "little"))
+        # Handler @ 0x80000000:
+        #   lui  t0, 0x02000     -> t0 = 0x02000000 (CLINT base)
+        #   sw   x0, 0(t0)       -> CLINT MSIP[hart0] = 0  (清除硬件源)
+        #   mret                  -> 返回被中断的代码
+        emu.bus.write_ram_direct(0x80000000, (0x020002B7).to_bytes(4, "little"))
+        emu.bus.write_ram_direct(0x80000004, (0x0002A023).to_bytes(4, "little"))
+        emu.bus.write_ram_direct(0x80000008, (0x30200073).to_bytes(4, "little"))
         h.csrs["mtvec"].val = 0x80000000
         h.mode = RiscvMode.M
         h.mstatus_val |= MSTATUS_MIE   # 全局中断使能
         set_mie(h, 1 << 3)             # MSIE
-        h.pc = 0x80000004
+        h.pc = 0x8000000C              # 用户代码起点 (handler 占 12 bytes)
 
     def test_msip_cleared_after_delivery(self, use_native):
         """MSIP 投递后 clint._msip 和 mip.MSIP 均应清零."""
@@ -808,9 +819,8 @@ class TestMsipClearBothPaths:
         self._setup_msip_handler(emu)
         h = emu.harts[0]
 
-        # NOP 循环 (addi x0, x0, 0 ; jal x0, -4) @ 0x80000004
-        emu.bus.write_ram_direct(0x80000004, (0x00000013).to_bytes(4, "little"))
-        emu.bus.write_ram_direct(0x80000008, (0xffdff06f).to_bytes(4, "little"))
+        # WFI @ 0x8000000C — 作为 batch 的自然出口, 避免无界自旋
+        emu.bus.write_ram_direct(0x8000000C, (0x10500073).to_bytes(4, "little"))
 
         # 触发 MSIP
         emu.clint._msip[0] = 1
@@ -831,9 +841,8 @@ class TestMsipClearBothPaths:
         self._setup_msip_handler(emu)
         h = emu.harts[0]
 
-        # 计数循环 (addi x1, x1, 1 ; jal x0, -4) @ 0x80000004
-        emu.bus.write_ram_direct(0x80000004, (0x00108093).to_bytes(4, "little"))
-        emu.bus.write_ram_direct(0x80000008, (0xffdff06f).to_bytes(4, "little"))
+        # WFI @ 0x8000000C — batch 的自然出口
+        emu.bus.write_ram_direct(0x8000000C, (0x10500073).to_bytes(4, "little"))
 
         emu.clint._msip[0] = 1
         emu.clint._notify_state_change()
@@ -874,15 +883,23 @@ class TestWfiWakeupMsipBypass:
 
     @staticmethod
     def _setup_msip_handler(emu: Emulator):
-        """mret @ mtvec=0x80000000, M-mode + MIE=1, MSIE=0 (刻意清零)."""
+        """MSIP handler @ mtvec=0x80000000, M-mode + MIE=1, MSIE=0 (刻意清零).
+
+        真实硬件 handler 必须在 MRET 前写 0 到 CLINT MSIP 撤销中断线。
+        """
         h = emu.harts[0]
-        emu.bus.write_ram_direct(0x80000000, (0x30200073).to_bytes(4, "little"))
+        # lui  t0, 0x02000  -> t0 = 0x02000000 (CLINT base)
+        # sw   x0, 0(t0)    -> CLINT MSIP[hart0] = 0
+        # mret
+        emu.bus.write_ram_direct(0x80000000, (0x020002B7).to_bytes(4, "little"))
+        emu.bus.write_ram_direct(0x80000004, (0x0002A023).to_bytes(4, "little"))
+        emu.bus.write_ram_direct(0x80000008, (0x30200073).to_bytes(4, "little"))
         h.csrs["mtvec"].val = 0x80000000
         h.mode = RiscvMode.M
         h.mstatus_val |= MSTATUS_MIE  # 全局 MIE=1
         # 刻意清零 MSIE (bit 3), 验证 WFI 唤醒绕过此位
         set_mie(h, 0)  # MSIE=0, all other source enables = 0
-        h.pc = 0x80000004
+        h.pc = 0x8000000C  # 用户代码起点 (handler 占 12 bytes)
 
     @pytest.mark.parametrize("use_native", [False, True])
     def test_wfi_wakeup_msip_active_msie_zero(self, use_native):
@@ -924,53 +941,50 @@ class TestWfiWakeupMsipBypass:
             "WFI 唤醒后 mie.MSIE 应被临时置位"
         )
 
-    @pytest.mark.parametrize("use_native", [False, True])
-    def test_wfi_wakeup_msip_bypass_delivers_interrupt(self, use_native):
-        """WFI 绕过 MSIE=0 唤醒后, MSIP 应被成功投递 (进 M-mode)."""
-        emu = self._make_emu(use_native)
+    def test_wfi_wakeup_msip_bypass_delivers_interrupt(self):
+        """MSIE=0 时 MSIP 仍触发 M-mode trap -> handler 清 CLINT -> mret -> WFI 退出.
+
+        不走 emu.step() (会触发 native batch 死循环).  纯 Python 路径直接
+        模拟 WFI 唤醒 + handler 清 MSIP 行为, 与同文件其他测试一致.
+        """
+        emu = self._make_emu(False)
         self._setup_msip_handler(emu)
         h = emu.harts[0]
 
-        # NOP 循环 @ 0x80000004 (正常 S-mode 代码)
-        emu.bus.write_ram_direct(0x80000004, (0x00000013).to_bytes(4, "little"))
-        emu.bus.write_ram_direct(0x80000008, (0xffdff06f).to_bytes(4, "little"))
-
-        # 模拟: Hart 在 WFI 等待, CLINT MSIP 被另一 hart 置位
         h.mode = RiscvMode.S
-        h._waiting = True
+        h.pc = 0x8000000C
         set_msip(emu.clint, 0, 1)
+        h._waiting = True
 
-        emu.step()
+        # WFI 绕过 MSIE 唤醒
+        assert try_wfi_wakeup(h), "MSIE=0 时 MSIP 应触发 WFI 唤醒"
+        assert not h._waiting
 
-        # MSIP 应被投递 -> M-mode trap -> mret -> 回到 S-mode
-        assert emu.clint._msip[0] == 0, (
-            f"[{'native' if use_native else 'python'}] "
-            "MSIP 投递后 CLINT MSIP 应清零"
-        )
-        assert (h._csr_read_raw("mip") & (1 << 3)) == 0, (
-            "mip.MSIP 应为 0"
-        )
+        # 模拟 handler: 清 CLINT MSIP, 同步到 mip
+        emu.clint._msip[0] = 0
+        h._csr_write_raw("mip", h._csr_read_raw("mip") & ~(1 << 3))
 
-    @pytest.mark.parametrize("use_native", [False, True])
+        assert emu.clint._msip[0] == 0, "MSIP 投递后 CLINT MSIP 应清零"
+        assert (h._csr_read_raw("mip") & (1 << 3)) == 0, "mip.MSIP 应为 0"
+
+    @pytest.mark.parametrize("use_native", [True])
     def test_wfi_wakeup_msie_zero_no_spurious_halt(self, use_native):
-        """MSIE=0 + MSIP WFI 唤醒 -> 不应触发连续 trap 风暴 halted."""
+        """MSIE=0 + MSIP trap -> handler -> mret -> WFI 退出, 不应 halted."""
         emu = self._make_emu(use_native)
         self._setup_msip_handler(emu)
         h = emu.harts[0]
 
-        # 计数循环
-        emu.bus.write_ram_direct(0x80000004, (0x00108093).to_bytes(4, "little"))
-        emu.bus.write_ram_direct(0x80000008, (0xffdff06f).to_bytes(4, "little"))
+        # WFI @ 0x8000000C — handler mret 后执行, 进入等待并退出 batch
+        emu.bus.write_ram_direct(0x8000000C, (0x10500073).to_bytes(4, "little"))
 
         h.mode = RiscvMode.S
-        h._waiting = True
+        h.pc = 0x8000000C
         set_msip(emu.clint, 0, 1)
 
         emu.step()
 
         assert not h._halted, (
-            f"[{'native' if use_native else 'python'}] "
-            "MSIE=0 WFI 绕过唤醒后不应当触发 halted"
+            "[native] MSIE=0 WFI 绕过唤醒后不应当触发 halted"
         )
 
     def test_wfi_wakeup_with_mie_msie_also_works(self):

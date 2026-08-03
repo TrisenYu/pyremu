@@ -18,7 +18,7 @@ CROSS_CC ?= $(shell command -v riscv64-linux-gnu-gcc 2>/dev/null || echo riscv64
 CFLAGS  = -static -O2 -Wall
 
 # ---- musl 飞地编译链 ----
-MUSL_DIR   = $(abspath ../../third-party/musl-1.2.6)
+MUSL_DIR   = $(abspath ../../bsp/musl-1.2.6)
 MUSL_CC    = /opt/custom-llvm/bin/clang
 MUSL_TARGET = riscv64-linux-musl
 MUSL_ARCH   = rv64imac
@@ -36,7 +36,7 @@ MUSL_LDLIBS = $(MUSL_DIR)/lib/crt1.o \
               $(LIBGCC)
 
 OUT_DIR    = bin
-PROGRAMS   = flush_reload tee_test
+PROGRAMS   = flush_reload tee_test tee_concurrent
 MUSL_PROGS = hello_musl victim_musl probe_musl tlb_leak_musl
 
 BINS      = $(addprefix $(OUT_DIR)/, $(PROGRAMS))

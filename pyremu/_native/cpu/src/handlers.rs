@@ -1,4 +1,4 @@
-//! Instruction handlers for Phases B–D: Load/Store, System, AMO, Compressed.
+//! Instruction handlers for Phases B-D: Load/Store, System, AMO, Compressed.
 //!
 //! Each handler receives ``&mut HartState``, decoded fields, and memory access
 //! context; it returns the PC advance (0, 2, or 4) or ``EXIT_SENTINEL`` to
@@ -7,10 +7,11 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::csr;
-use crate::decode::{decode_compressed, CompressedFields, DecodedFields};
 #[cfg(feature = "diagnostic")]
 use crate::diag;
+
+use crate::csr;
+use crate::decode::{decode_compressed, CompressedFields, DecodedFields};
 use crate::peripheral::is_device_addr;
 use crate::state::{exit_reason, riscv_mode, BatchResult, HartState};
 use crate::translate::{translate_va, TranslateFault, TranslateResult, WalkCtx};
@@ -102,10 +103,7 @@ fn c1_alu_reg_op(v1: u64, v2: u64, bit12: u8, bit65: u8) -> Option<u64> {
 /// Execute one C1 ALU operation per the ``sf`` field.
 /// Returns ``None`` for illegal encodings (caller delivers IllInstr).
 #[inline]
-fn exec_c1_alu(
-    state: &HartState,
-    cf: &CompressedFields,
-) -> Option<u64> {
+fn exec_c1_alu(state: &HartState, cf: &CompressedFields) -> Option<u64> {
     let v1 = read_gpr(state, cf.rs1p);
     match cf.sf {
         0b00 => {

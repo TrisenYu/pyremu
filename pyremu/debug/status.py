@@ -188,7 +188,7 @@ class StatusMixin(SharedMixinAttrs):
             self._err(f"无效 hart ID: {hart_id_str}")
             return
         if hid < 0 or hid >= self._emu.num_harts:
-            self._err(f"hart ID 超出范围: 0–{self._emu.num_harts - 1}")
+            self._err(f"hart ID 超出范围: 0-{self._emu.num_harts - 1}")
             return
         self._show_hart_detail(hid)
 

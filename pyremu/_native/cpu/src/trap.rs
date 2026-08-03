@@ -389,14 +389,6 @@ pub(crate) fn priv_mret_concurrent(state: &mut HartState, instr: u32) -> u64 {
     }
     state.mstatus |= 1 << 7;
     state.mstatus &= !(0b11 << 11);
-    // Log MRETs that land in OpenSBI's sbi_get_insn area (0x17700-0x17900)
-    // — this is the crash zone for the badaddr=0x80017802 bug.
-    if state.mepc >= 0x80017700 && state.mepc < 0x80017900 {
-        diag::log_line(&format!(
-            "[mret-sbi-get-insn] hart={} mepc={:#018x} mpp={} mstatus={:#018x}",
-            state.mhartid, state.mepc, mpp, state.mstatus,
-        ));
-    }
     state.pc = state.mepc;
     state.waiting = 0;
     state.consecutive_traps = 0; // successful trap completion

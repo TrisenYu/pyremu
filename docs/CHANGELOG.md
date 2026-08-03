@@ -149,7 +149,7 @@ S/U 模式全部拒绝 (M 模式取指无条件允许, MPRV 影响数据访存).
 
 ### TEE 内核驱动 + 缓存侧信道 PoC (新增, 未跟踪)
 
-- `third-party/tee_enclave_drv/`: Linux 字符设备驱动 (`/dev/tee_enclave`),
+- `bsp/tee_enclave_drv/`: Linux 字符设备驱动 (`/dev/tee_enclave`),
   ioctl 接口 (ENTER/GET_ID/GET_MEM), SBI ecall 内联
 - `tests/src-sidecache/`: cache side-channel 探测 PoC (flush+reload,
   TLB leak payload), 待集成测试
@@ -678,7 +678,7 @@ if _instr_counts[hart.pc] > 100000:
 | `rv64imafdc_ztee_zicsr_zifencei` | ✅ 正常 | f/d + zicsr/zifencei 都有 |
 
 **结论**: `zicsr`/`zifencei` 和 `f`/`d` **两者都必须保留**.
-当前 [Makefile:415](third-party/custom-opensbi/Makefile#L415) 使用
+当前 [Makefile:415](bsp/custom-opensbi/Makefile#L415) 使用
 `-march=rv64imafdc_ztee_zicsr_zifencei`.
 
 **根因**: 去掉 zicsr/zifencei 或 f/d 后, 编译器 (LLVM 22 定制版) 生成不同的指令序列,
@@ -727,7 +727,7 @@ if _instr_counts[hart.pc] > 100000:
 但增大了 `.text` 体积, 且 `march` 包含 `f`/`d` 易导致编译器在
 memset/memcpy 等函数中生成 FPU 访存指令 (`fsd`/`fld`).
 
-**修改**: [Makefile:415](third-party/custom-opensbi/Makefile#L415):
+**修改**: [Makefile:415](bsp/custom-opensbi/Makefile#L415):
 `-march=rv64imafdc_ztee` -> `-march=rv64imac_ztee`.
 ABI 保持 `lp64` (soft-float), 编译器不再生成任何 FPU 指令.
 
@@ -928,7 +928,7 @@ MODE 字段提取翻译模式). 然而 CSR 写入指令 (`csrrw` / `csrw` 等) �
 
 ### S-mode 飞地 mepc 循环修复 (C 固件)
 
-[suspend_enclave_handler](third-party/custom-opensbi/lib/enclave_ext/ext_ecall.c) 新增
+[suspend_enclave_handler](bsp/custom-opensbi/lib/enclave_ext/ext_ecall.c) 新增
 `trap_regs->mepc += 4` 推进 host 返回地址越过 ecall 指令, 避免 host 被无限重新执行
 CREATE/ENTER ecall 的 bug.
 

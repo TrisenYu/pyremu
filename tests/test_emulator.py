@@ -1343,7 +1343,7 @@ class TestRunTimeout:
 
     def test_timeout_raises_timeouterror(self):
         """非零 timeout 超时时抛出 TimeoutError."""
-        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0, ram_size=64 * 1024)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10000)
         with pytest.raises(emu.TimeoutError) as exc_info:
             emu.run(max_cycles=10**9, timeout=0.001, yield_every=1000)
@@ -1352,7 +1352,7 @@ class TestRunTimeout:
 
     def test_run_returns_int(self):
         """run() 返回执行的周期数 (int)."""
-        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
+        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0, ram_size=64 * 1024)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 5)
         cycles = emu.run(max_cycles=5, timeout=0)
         assert isinstance(cycles, int)
@@ -1504,9 +1504,9 @@ class TestDeviceTree:
 
     def test_load_dtb_blob_sets_a1(self):
         """load_dtb_blob 写入 DTB 并设置所有 hart 的 a1."""
-        emu = Emulator(num_harts=2, ram_size=128 * 1024 * 1024)
+        emu = Emulator(num_harts=2, ram_size=16 * 1024 * 1024)
         dtb = emu.build_dtb()
-        addr = 0x87FF0000
+        addr = 0x80FF0000
         emu.load_dtb_blob(addr, dtb)
         # 验证写入
         readback = emu.bus.read(addr, len(dtb))

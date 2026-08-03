@@ -200,6 +200,29 @@ def _dtb_cpus(
     return cpu_phandles
 
 
+def _dtb_reserved_memory(
+    sw: libfdt.FdtSw,
+    ranges: list[tuple[int, int]],
+) -> None:
+    """/reserved-memory — 从 Linux 中移除物理区域 (no-map).
+
+    用于 enclave 内存池等需要从内核线性映射中完全移除的区域,
+    与 PMP 隔离策略保持一致: 内核无法访问这些物理地址 -> 不会分配其中页面.
+    """
+    if not ranges:
+        return
+    sw.begin_node("reserved-memory")
+    sw.property_u32("#address-cells", 2)
+    sw.property_u32("#size-cells", 2)
+    sw.property("ranges", b"")
+    for idx, (base, size) in enumerate(ranges):
+        sw.begin_node(f"reserved-{idx}@{base:x}")
+        sw.property("no-map", b"")
+        sw.property("reg", _encode_reg_4mib(base, size))
+        sw.end_node()
+    sw.end_node()  # reserved-memory
+
+
 def _dtb_memory(
     sw: libfdt.FdtSw,
     cfg: PlatformConfig,
@@ -361,6 +384,7 @@ def build_dtb(
     plic: PLIC | None = None,
     bootargs: str | None = None,
     initrd: Initrd | None = None,
+    reserved_ranges: list[tuple[int, int]] | None = None,
 ) -> bytes:
     """基于平台配置和外设映射构建完整的 DTB blob.
 
@@ -373,6 +397,7 @@ def build_dtb(
         virtio_blk: virtio-blk 外设实例.
         plic: PLIC 中断控制器实例.
         bootargs: 内核命令行参数, 写入 /chosen/bootargs.
+        reserved_ranges: (base, size) 列表, 生成 /reserved-memory no-map 子节点.
 
     Returns:
         完整的 DTB blob 字节串, 可直接写入 RAM 供固件使用.
@@ -391,6 +416,7 @@ def build_dtb(
     _dtb_aliases(sw, cfg, uart)
     cpu_phandles = _dtb_cpus(sw, cfg)
     _dtb_memory(sw, cfg)
+    _dtb_reserved_memory(sw, reserved_ranges or [])
 
     # ---- soc simple-bus — 挂载所有 MMIO 外设 ----
     # PLIC phandle 供 soc interrupt-parent 及各外设 interrupts-extended 引用。

@@ -39,7 +39,7 @@ from pyremu._native import (
 _ram_native_ptrs: dict[int, int] = {}  # id(bytearray) -> raw pointer
 
 # Inlined from pyremu.core.diag to break circular import:
-#   bus → core.diag → core.__init__ → ... → clint → bus
+#   bus -> core.diag -> core.__init__ -> ... -> clint -> bus
 NO_L2 = os.environ.get("PYREMU_NO_L2") == "1"
 
 

@@ -18,6 +18,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
+from pyremu.configs_aux import cfg_bool, cfg_str
+
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
 
@@ -97,8 +99,8 @@ class HartDiag:
         self.msip_last_seen = d.msip_last_seen         # type: ignore[attr-defined]
 
 
-TRACE_SRET_TO_U = os.environ.get("PYREMU_TRACE_SRET", "") not in ("", "0")
-_DIAG_FILE = os.environ.get("PYREMU_DIAG_LOG", "/tmp/sret_py.log")
+TRACE_SRET_TO_U = cfg_bool("PYREMU_TRACE_SRET")
+_DIAG_FILE = cfg_str("PYREMU_DIAG_LOG")
 _SRET_DIAG_FILE = os.environ.get("PYREMU_SRET_LOG", _DIAG_FILE)
 
 # 排查开关: 设置 PYREMU_NO_L2=1 后 Bus.read/write 对 RAM 地址完全绕过 L2 缓存.

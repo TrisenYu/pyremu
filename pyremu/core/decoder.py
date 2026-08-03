@@ -55,13 +55,13 @@ from pyremu.core.trap_handler import (
 
 from pyremu.utils.mask import (
     mask32,
-    mask64
-)
-from pyremu.utils.disassem import (
+    mask64,
     sext,
     sext8,
     sext16,
     sext32,
+)
+from pyremu.utils.disassem import (
     brFn3, ldFn3, stFn3,
     AmoFunct5, AmoWidth,
     BRFN3_MAP, LDFN3_MAP, STFN3_MAP, AMOF5_MAP, AMOW_MAP,
@@ -1020,7 +1020,7 @@ class Hart(HartWithRegs):
 
     @staticmethod
     def _creg(n: int) -> int:
-        """3-bit 压缩寄存器号 -> 完整寄存器号 (x8–x15)."""
+        """3-bit 压缩寄存器号 -> 完整寄存器号 (x8-x15)."""
         return (n & 0x7) + 8
 
     # -- C0: Quadrant 0 (低 2 位 = 00) --

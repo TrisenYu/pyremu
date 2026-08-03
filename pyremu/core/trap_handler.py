@@ -20,11 +20,11 @@ Public functions:
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from pyremu.configs_aux import cfg_bool
 from pyremu.core.hart import (
     MSTATUS_MIE,
     MSTATUS_MPIE,
@@ -43,7 +43,7 @@ from pyremu.utils.mask import mask64
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
 
-_TRACE_TRAPS = os.environ.get("PYREMU_TRACE_TRAPS", "") == "1"
+_TRACE_TRAPS = cfg_bool("PYREMU_TRACE_TRAPS")
 
 # 中断优先级列表 (按优先级从高到低排列).
 # 预计算为模块级常量, 避免 check_pending_interrupts

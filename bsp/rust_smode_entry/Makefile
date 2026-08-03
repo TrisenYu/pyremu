@@ -33,6 +33,7 @@ src/config_gen.rs: config.mk Makefile
 	@echo '// generated from config.mk by Makefile — do not edit' > $@
 	@echo 'pub const TIMER_INTERVAL: u64 = $(TIMER_INTERVAL);' >> $@
 	@echo 'pub const TIMER_FREQ: u64 = $(TIMER_FREQ);' >> $@
+	@echo 'pub const TIME_QUOTA: u64 = $(TIME_QUOTA);' >> $@
 	@echo 'pub const UART_BASE: u64 = $(UART_BASE);' >> $@
 	@echo 'pub const UART_TXDATA: u64 = $(UART_TXDATA);' >> $@
 	@echo 'pub const UART_RXDATA: u64 = $(UART_RXDATA);' >> $@

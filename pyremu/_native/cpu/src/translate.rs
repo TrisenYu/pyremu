@@ -436,29 +436,6 @@ fn is_trace_vpn(vpn: u64) -> bool {
     target != 0 && vpn == target
 }
 
-/// Re-read a PTE from *pa* using a plain (non-atomic) pointer dereference
-/// and compare with the atomic read.  If they disagree, log the mismatch.
-/// This catches concurrent modification of page-table memory within a
-/// single walk — impossible under correct single-core semantics.
-#[cfg(feature = "diagnostic")]
-#[allow(dead_code)]
-#[allow(unused)]
-fn verify_pte_stable(ctx: &WalkCtx, pa: u64, atomic_val: u64, level: &str, vpn: u64) {
-    let off = match ram_offset(ctx, pa, 8) {
-        Some(o) => o,
-        None => return,
-    };
-    let plain_val = unsafe {
-        let ptr = ctx.ram.add(off) as *const u64;
-        core::ptr::read_volatile(ptr)
-    };
-    if plain_val != atomic_val {
-        crate::diag::log_line(&format!(
-            "[pte-race] level={} vpn={:#x} pa={:#018x} atomic={:#018x} plain={:#018x}",
-            level, vpn, pa, atomic_val, plain_val,
-        ));
-    }
-}
 
 // ============================================================
 //  Sv39 page-table walk — entry point

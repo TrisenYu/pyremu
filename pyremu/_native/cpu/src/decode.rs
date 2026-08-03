@@ -1,6 +1,6 @@
 //! RISC-V instruction field extraction — batch decode in a single FFI call.
 //!
-//! Replaces 4–6 Python function calls per 32-bit instruction and 5–10 inline
+//! Replaces 4-6 Python function calls per 32-bit instruction and 5-10 inline
 //! bit-extraction expressions per 16-bit compressed instruction with one FFI
 //! call each.
 
@@ -70,14 +70,12 @@ pub extern "C" fn decode_fields(instr: u32) -> DecodedFields {
     DecodedFields {
         // immediates (8-byte aligned)
         imm12_se: sext12((instr >> 20) & 0xFFF),
-        imm_s: sext12(
-            (((instr >> 25) & 0x7F) << 5) | ((instr >> 7) & 0x1F),
-        ),
+        imm_s: sext12((((instr >> 25) & 0x7F) << 5) | ((instr >> 7) & 0x1F)),
         imm_b: sext13(
             ((instr >> 31) & 1) << 12          // imm[12]
                 | ((instr >> 25) & 0x3F) << 5  // imm[10:5]
                 | ((instr >> 8) & 0xF) << 1    // imm[4:1]
-                | ((instr >> 7) & 1) << 11,     // imm[11]
+                | ((instr >> 7) & 1) << 11, // imm[11]
         ),
         imm_j: sext21(
             ((instr >> 31) & 1) << 20          // imm[20]
@@ -121,7 +119,7 @@ pub struct CompressedFields {
     /// | 0 (C0)   | 000    | C.ADDI4SPN nzuimm |
     /// | 0        | 010/110 | C.LW/C.SW uimm |
     /// | 0        | 011/111 | C.LD/C.SD uimm |
-    /// | 1 (C1)   | 000–010  | C.ADDI/C.LI 6-bit signed imm |
+    /// | 1 (C1)   | 000-010  | C.ADDI/C.LI 6-bit signed imm |
     /// | 1        | 011 (rd≠2) | C.LUI 6-bit nzimm (shift-left-12 in caller) |
     /// | 1        | 011 (rd=2) | C.ADDI16SP 10-bit nzimm |
     /// | 1        | 101      | C.J 11-bit offset |
@@ -163,7 +161,7 @@ pub struct CompressedFields {
 }
 
 /// RISC-V ``creg`` mapping for compressed instructions:
-///   rd'/rs1'/rs2'  (3-bit)  ->  x8 + rd'  (i.e. s0–s1, a0–a5).
+///   rd'/rs1'/rs2'  (3-bit)  ->  x8 + rd'  (i.e. s0-s1, a0-a5).
 #[inline(always)]
 fn creg(raw: u8) -> u8 {
     8 + (raw & 0x7)
@@ -257,8 +255,12 @@ fn imm_c2(h: u64, funct3: u8, bit12: u8, bits_6_2: u64) -> (u64, u64) {
 /// Returns ``(imm, imm2)`` where ``imm2`` is only used for C2 stores.
 #[inline]
 fn decode_compressed_immediates(
-    h: u64, quadrant: u8, funct3: u8,
-    bit12: u8, bits_6_2: u64, bits_11_7: u64,
+    h: u64,
+    quadrant: u8,
+    funct3: u8,
+    bit12: u8,
+    bits_6_2: u64,
+    bits_11_7: u64,
 ) -> (u64, u64) {
     match quadrant {
         // -------- C0: quadrant 00 ----------------------------------
@@ -310,25 +312,19 @@ pub extern "C" fn decode_compressed(half: u16) -> CompressedFields {
     let bits_11_7 = (h >> 7) & 0x1F;
 
     // ---- register fields ----
-    let rdp = creg(((h >> 2) & 0x7) as u8);   // C0 rd/rs2, C1-ALU rs2
-    let rs1p = creg(((h >> 7) & 0x7) as u8);  // C0 rs1, C1-ALU rd
+    let rdp = creg(((h >> 2) & 0x7) as u8); // C0 rd/rs2, C1-ALU rs2
+    let rs1p = creg(((h >> 7) & 0x7) as u8); // C0 rs1, C1-ALU rd
     let (rd, rs1, rs2) = if quadrant == 0 {
         (rdp, rs1p, rdp)
     } else {
-        (
-            bits_11_7 as u8,
-            bits_11_7 as u8,
-            bits_6_2 as u8,
-        )
+        (bits_11_7 as u8, bits_11_7 as u8, bits_6_2 as u8)
     };
 
     // ---- C1-ALU sub-fields ----
     let sf = ((h >> 10) & 0x3) as u8;
     let bit65 = ((h >> 5) & 0x3) as u8;
 
-    let (imm, imm2) = decode_compressed_immediates(
-        h, quadrant, funct3, bit12, bits_6_2, bits_11_7,
-    );
+    let (imm, imm2) = decode_compressed_immediates(h, quadrant, funct3, bit12, bits_6_2, bits_11_7);
 
     CompressedFields {
         imm,
@@ -464,8 +460,8 @@ mod tests {
         let f = decode_compressed(0x050D);
         assert_eq!(f.quadrant, 1);
         assert_eq!(f.funct3, 0); // C.ADDI
-        assert_eq!(f.rd, 10);    // x10 = a0
-        assert_eq!(f.imm, 3);    // +3
+        assert_eq!(f.rd, 10); // x10 = a0
+        assert_eq!(f.imm, 3); // +3
     }
 
     #[test]
@@ -486,7 +482,7 @@ mod tests {
         let f = decode_compressed(0x717D);
         assert_eq!(f.quadrant, 1);
         assert_eq!(f.funct3, 3);
-        assert_eq!(f.rd, 2);              // sp
+        assert_eq!(f.rd, 2); // sp
         assert_eq!(f.imm, 0xFFFF_FFFF_FFFF_FFF0); // -16 as u64
     }
 
@@ -509,7 +505,7 @@ mod tests {
         let f = decode_compressed(0xB005); // rough estimate
         assert_eq!(f.quadrant, 1);
         assert_eq!(f.funct3, 5); // C.J
-        // offset should be non-zero
+                                 // offset should be non-zero
         assert!(f.imm > 0);
     }
 
@@ -519,7 +515,7 @@ mod tests {
         let f = decode_compressed(0xC501); // c.beqz a0, +8 (verified)
         assert_eq!(f.quadrant, 1);
         assert_eq!(f.funct3, 6); // C.BEQZ
-        assert_eq!(f.rs1, 10);   // x10 = a0
+        assert_eq!(f.rs1, 10); // x10 = a0
     }
 
     #[test]
@@ -531,7 +527,7 @@ mod tests {
         assert_eq!(f.quadrant, 2);
         assert_eq!(f.funct3, 0); // C.SLLI
         assert_eq!(f.rd, 10);
-        assert_eq!(f.imm, 3);    // shamt
+        assert_eq!(f.imm, 3); // shamt
     }
 
     #[test]
@@ -541,7 +537,7 @@ mod tests {
         assert_eq!(f.quadrant, 2);
         assert_eq!(f.funct3, 2); // C.LWSP
         assert_eq!(f.rd, 10);
-        assert_eq!(f.imm, 4);    // offset 4
+        assert_eq!(f.imm, 4); // offset 4
     }
 
     #[test]
@@ -590,7 +586,7 @@ mod tests {
         let f = decode_compressed(0x0800);
         assert_eq!(f.quadrant, 0);
         assert_eq!(f.funct3, 0);
-        assert_eq!(f.rdp, 8);    // x8 = s0
+        assert_eq!(f.rdp, 8); // x8 = s0
         assert_eq!(f.imm, 16);
     }
 
@@ -600,7 +596,7 @@ mod tests {
         let f = decode_compressed(0x1ffc);
         assert_eq!(f.quadrant, 0);
         assert_eq!(f.funct3, 0);
-        assert_eq!(f.rdp, 15);   // x15 = a5
+        assert_eq!(f.rdp, 15); // x15 = a5
         assert_eq!(f.imm, 1020);
     }
 
@@ -609,9 +605,9 @@ mod tests {
         // c.lw x8, 0(x10) -> 0x4100
         let f = decode_compressed(0x4100);
         assert_eq!(f.quadrant, 0);
-        assert_eq!(f.funct3, 2);  // C.LW
-        assert_eq!(f.rdp, 8);     // x8
-        assert_eq!(f.rs1p, 10);   // x10 = a0
+        assert_eq!(f.funct3, 2); // C.LW
+        assert_eq!(f.rdp, 8); // x8
+        assert_eq!(f.rs1p, 10); // x10 = a0
         assert_eq!(f.imm, 0);
     }
 
@@ -629,7 +625,7 @@ mod tests {
         // c.ld x8, 0(x10) -> 0x6100
         let f = decode_compressed(0x6100);
         assert_eq!(f.quadrant, 0);
-        assert_eq!(f.funct3, 3);  // C.LD
+        assert_eq!(f.funct3, 3); // C.LD
         assert_eq!(f.imm, 0);
     }
 
@@ -647,8 +643,8 @@ mod tests {
         // c.sw x8, 0(x10) -> 0xc100
         let f = decode_compressed(0xc100);
         assert_eq!(f.quadrant, 0);
-        assert_eq!(f.funct3, 6);  // C.SW
-        assert_eq!(f.rdp, 8);     // rs2'
+        assert_eq!(f.funct3, 6); // C.SW
+        assert_eq!(f.rdp, 8); // rs2'
         assert_eq!(f.imm, 0);
     }
 
@@ -666,7 +662,7 @@ mod tests {
         // c.sd x8, 0(x10) -> 0xe100
         let f = decode_compressed(0xe100);
         assert_eq!(f.quadrant, 0);
-        assert_eq!(f.funct3, 7);  // C.SD
+        assert_eq!(f.funct3, 7); // C.SD
         assert_eq!(f.imm, 0);
     }
 
@@ -686,7 +682,7 @@ mod tests {
         // c.nop -> 0x0001
         let f = decode_compressed(0x0001);
         assert_eq!(f.quadrant, 1);
-        assert_eq!(f.funct3, 0);  // C.ADDI rd=0, imm=0
+        assert_eq!(f.funct3, 0); // C.ADDI rd=0, imm=0
         assert_eq!(f.rd, 0);
         assert_eq!(f.imm, 0);
     }
@@ -717,7 +713,7 @@ mod tests {
         // c.addiw x5, -2 -> 0x32f9
         let f = decode_compressed(0x32f9);
         assert_eq!(f.quadrant, 1);
-        assert_eq!(f.funct3, 1);  // C.ADDIW
+        assert_eq!(f.funct3, 1); // C.ADDIW
         assert_eq!(f.rd, 5);
         assert_eq!(f.imm, 0xFFFF_FFFF_FFFF_FFFEu64); // -2
     }
@@ -727,7 +723,7 @@ mod tests {
         // c.li x5, 31  -> 0x42fd
         let f = decode_compressed(0x42fd);
         assert_eq!(f.quadrant, 1);
-        assert_eq!(f.funct3, 2);  // C.LI
+        assert_eq!(f.funct3, 2); // C.LI
         assert_eq!(f.rd, 5);
         assert_eq!(f.imm, 31);
     }
@@ -768,7 +764,7 @@ mod tests {
         let f = decode_compressed(0x717d);
         assert_eq!(f.quadrant, 1);
         assert_eq!(f.funct3, 3);
-        assert_eq!(f.rd, 2);     // sp
+        assert_eq!(f.rd, 2); // sp
         assert_eq!(f.imm, 0xFFFF_FFFF_FFFF_FFF0u64); // -16
     }
 
@@ -787,11 +783,11 @@ mod tests {
         // c.srli x8, 3 -> 0x800d
         let f = decode_compressed(0x800d);
         assert_eq!(f.quadrant, 1);
-        assert_eq!(f.funct3, 4);  // MISC-ALU
-        assert_eq!(f.sf, 0);      // SRLI
-        assert_eq!(f.rs1p, 8);    // rd' = x8
-        assert_eq!(f.bit12, 0);   // shamt[5]=0
-        // shamt is bit12<<5 | bits[6:2]; imm=0 for funct3=4 (not decoded in imm_c1)
+        assert_eq!(f.funct3, 4); // MISC-ALU
+        assert_eq!(f.sf, 0); // SRLI
+        assert_eq!(f.rs1p, 8); // rd' = x8
+        assert_eq!(f.bit12, 0); // shamt[5]=0
+                                // shamt is bit12<<5 | bits[6:2]; imm=0 for funct3=4 (not decoded in imm_c1)
     }
 
     #[test]
@@ -800,7 +796,7 @@ mod tests {
         let f = decode_compressed(0x8491);
         assert_eq!(f.quadrant, 1);
         assert_eq!(f.funct3, 4);
-        assert_eq!(f.sf, 1);      // SRAI
+        assert_eq!(f.sf, 1); // SRAI
         assert_eq!(f.rs1p, 9);
     }
 
@@ -810,9 +806,9 @@ mod tests {
         let f = decode_compressed(0x997d);
         assert_eq!(f.quadrant, 1);
         assert_eq!(f.funct3, 4);
-        assert_eq!(f.sf, 2);      // ANDI
+        assert_eq!(f.sf, 2); // ANDI
         assert_eq!(f.rs1p, 10);
-        assert_eq!(f.bit12, 1);   // imm[5]=1 for -1
+        assert_eq!(f.bit12, 1); // imm[5]=1 for -1
     }
 
     #[test]
@@ -821,32 +817,32 @@ mod tests {
         let f = decode_compressed(0x8d91);
         assert_eq!(f.quadrant, 1);
         assert_eq!(f.funct3, 4);
-        assert_eq!(f.sf, 3);      // register ops
-        assert_eq!(f.bit12, 0);   // not RV64C
-        assert_eq!(f.bit65, 0);   // SUB
-        assert_eq!(f.rs1p, 11);   // rd' = x11
-        assert_eq!(f.rdp, 12);    // rs2' = x12
+        assert_eq!(f.sf, 3); // register ops
+        assert_eq!(f.bit12, 0); // not RV64C
+        assert_eq!(f.bit65, 0); // SUB
+        assert_eq!(f.rs1p, 11); // rd' = x11
+        assert_eq!(f.rdp, 12); // rs2' = x12
     }
 
     #[test]
     fn c1_xor() {
         // c.xor x11, x12 -> 0x8db1
         let f = decode_compressed(0x8db1);
-        assert_eq!(f.bit65, 1);   // XOR
+        assert_eq!(f.bit65, 1); // XOR
     }
 
     #[test]
     fn c1_or() {
         // c.or x11, x12 -> 0x8dd1
         let f = decode_compressed(0x8dd1);
-        assert_eq!(f.bit65, 2);   // OR
+        assert_eq!(f.bit65, 2); // OR
     }
 
     #[test]
     fn c1_and() {
         // c.and x11, x12 -> 0x8df1
         let f = decode_compressed(0x8df1);
-        assert_eq!(f.bit65, 3);   // AND
+        assert_eq!(f.bit65, 3); // AND
     }
 
     #[test]
@@ -854,8 +850,8 @@ mod tests {
         // c.subw x13, x14 -> 0x9e99
         let f = decode_compressed(0x9e99);
         assert_eq!(f.sf, 3);
-        assert_eq!(f.bit12, 1);   // RV64C
-        assert_eq!(f.bit65, 0);   // SUBW
+        assert_eq!(f.bit12, 1); // RV64C
+        assert_eq!(f.bit65, 0); // SUBW
         assert_eq!(f.rs1p, 13);
         assert_eq!(f.rdp, 14);
     }
@@ -866,7 +862,7 @@ mod tests {
         let f = decode_compressed(0x9eb9);
         assert_eq!(f.sf, 3);
         assert_eq!(f.bit12, 1);
-        assert_eq!(f.bit65, 1);   // ADDW
+        assert_eq!(f.bit65, 1); // ADDW
     }
 
     #[test]
@@ -874,8 +870,8 @@ mod tests {
         // c.j .+2 -> 0xa001 gives imm=0; real forward jump from objdump is 0xa009
         let f = decode_compressed(0xa009);
         assert_eq!(f.quadrant, 1);
-        assert_eq!(f.funct3, 5);  // C.J
-        assert_eq!(f.imm, 2);     // offset = 2
+        assert_eq!(f.funct3, 5); // C.J
+        assert_eq!(f.imm, 2); // offset = 2
     }
 
     #[test]
@@ -883,8 +879,8 @@ mod tests {
         // c.beqz x10, .+2 -> 0xc109
         let f = decode_compressed(0xc109);
         assert_eq!(f.quadrant, 1);
-        assert_eq!(f.funct3, 6);  // C.BEQZ
-        assert_eq!(f.rs1p, 10);   // x10 = a0
+        assert_eq!(f.funct3, 6); // C.BEQZ
+        assert_eq!(f.rs1p, 10); // x10 = a0
     }
 
     #[test]
@@ -892,7 +888,7 @@ mod tests {
         // c.bnez x10, .+2 -> 0xe109
         let f = decode_compressed(0xe109);
         assert_eq!(f.quadrant, 1);
-        assert_eq!(f.funct3, 7);  // C.BNEZ
+        assert_eq!(f.funct3, 7); // C.BNEZ
         assert_eq!(f.rs1p, 10);
     }
 
@@ -903,7 +899,7 @@ mod tests {
         // c.slli x10, 63 -> 0x157e
         let f = decode_compressed(0x157e);
         assert_eq!(f.quadrant, 2);
-        assert_eq!(f.funct3, 0);  // C.SLLI
+        assert_eq!(f.funct3, 0); // C.SLLI
         assert_eq!(f.rd, 10);
         assert_eq!(f.imm, 63);
     }
@@ -915,9 +911,9 @@ mod tests {
         // instead of 4, loading saved s2 (-560) instead of the correct value.
         let f = decode_compressed(0x4912);
         assert_eq!(f.quadrant, 2);
-        assert_eq!(f.funct3, 2);  // C.LWSP
-        assert_eq!(f.rd, 18);     // x18 = s2
-        assert_eq!(f.imm, 4);     // offset 4 (NOT 16!)
+        assert_eq!(f.funct3, 2); // C.LWSP
+        assert_eq!(f.rd, 18); // x18 = s2
+        assert_eq!(f.imm, 4); // offset 4 (NOT 16!)
     }
 
     #[test]
@@ -935,7 +931,7 @@ mod tests {
         // c.ldsp x5, 8(sp) -> 0x62a2
         let f = decode_compressed(0x62a2);
         assert_eq!(f.quadrant, 2);
-        assert_eq!(f.funct3, 3);  // C.LDSP
+        assert_eq!(f.funct3, 3); // C.LDSP
         assert_eq!(f.rd, 5);
         assert_eq!(f.imm, 8);
     }
@@ -958,7 +954,7 @@ mod tests {
         assert_eq!(f.funct3, 4);
         assert_eq!(f.rd, 5);
         assert_eq!(f.rs2, 10);
-        assert_eq!(f.bit12, 0);   // C.MV
+        assert_eq!(f.bit12, 0); // C.MV
     }
 
     #[test]
@@ -969,7 +965,7 @@ mod tests {
         assert_eq!(f.funct3, 4);
         assert_eq!(f.rd, 5);
         assert_eq!(f.rs2, 10);
-        assert_eq!(f.bit12, 1);   // C.ADD
+        assert_eq!(f.bit12, 1); // C.ADD
     }
 
     #[test]
@@ -987,9 +983,9 @@ mod tests {
         // c.swsp x5, 0(sp) -> 0xc016
         let f = decode_compressed(0xc016);
         assert_eq!(f.quadrant, 2);
-        assert_eq!(f.funct3, 6);  // C.SWSP
+        assert_eq!(f.funct3, 6); // C.SWSP
         assert_eq!(f.rs2, 5);
-        assert_eq!(f.imm2, 0);    // store offset in imm2
+        assert_eq!(f.imm2, 0); // store offset in imm2
     }
 
     #[test]
@@ -1006,7 +1002,7 @@ mod tests {
         // c.sdsp x5, 8(sp) -> 0xe416
         let f = decode_compressed(0xe416);
         assert_eq!(f.quadrant, 2);
-        assert_eq!(f.funct3, 7);  // C.SDSP
+        assert_eq!(f.funct3, 7); // C.SDSP
         assert_eq!(f.rs2, 5);
         assert_eq!(f.imm2, 8);
     }
@@ -1029,7 +1025,7 @@ mod tests {
         assert_eq!(f.opcode, 0x3B);
         assert_eq!(f.rd, 5);
         assert_eq!(f.func3, 0);
-        assert_eq!(f.func7, 0);  // ADDW func7=0
+        assert_eq!(f.func7, 0); // ADDW func7=0
     }
 
     #[test]
@@ -1039,7 +1035,7 @@ mod tests {
         assert_eq!(f.opcode, 0x3B);
         assert_eq!(f.rd, 6);
         assert_eq!(f.func3, 0);
-        assert_eq!(f.func7, 0x20);  // SUBW func7=0b0100000
+        assert_eq!(f.func7, 0x20); // SUBW func7=0b0100000
     }
 
     #[test]
@@ -1057,7 +1053,7 @@ mod tests {
         // slliw x6, x10, 3 -> 0x0035131b
         let f = decode_fields(0x0035131b);
         assert_eq!(f.opcode, 0x1B);
-        assert_eq!(f.func3, 1);  // SLLIW
+        assert_eq!(f.func3, 1); // SLLIW
         assert_eq!(f.imm12_se, 3);
     }
 
@@ -1066,7 +1062,7 @@ mod tests {
         // sraiw x8, x10, 4 -> 0x4045541b
         let f = decode_fields(0x4045541b);
         assert_eq!(f.opcode, 0x1B);
-        assert_eq!(f.func3, 5);  // SRAIW
+        assert_eq!(f.func3, 5); // SRAIW
     }
 
     #[test]
@@ -1074,8 +1070,8 @@ mod tests {
         // sd x9, -8(x10) -> 0xfe953c23
         let f = decode_fields(0xfe953c23);
         assert_eq!(f.opcode, 0x23);
-        assert_eq!(f.func3, 3);  // SD
-        // imm_s = -8 as sign-extended 12-bit
+        assert_eq!(f.func3, 3); // SD
+                                // imm_s = -8 as sign-extended 12-bit
         assert_eq!(f.imm_s, 0xFFFF_FFFF_FFFF_FFF8u64);
     }
 
@@ -1084,7 +1080,7 @@ mod tests {
         // ld x14, -8(x10) -> 0xff853703
         let f = decode_fields(0xff853703);
         assert_eq!(f.opcode, 0x03);
-        assert_eq!(f.func3, 3);  // LD
+        assert_eq!(f.func3, 3); // LD
         assert_eq!(f.imm12_se, 0xFFFF_FFFF_FFFF_FFF8u64); // -8
     }
 
@@ -1093,7 +1089,7 @@ mod tests {
         // fence.i -> 0x0000100f
         let f = decode_fields(0x0000100f);
         assert_eq!(f.opcode, 0x0F);
-        assert_eq!(f.func3, 1);  // FENCE.I
+        assert_eq!(f.func3, 1); // FENCE.I
     }
 
     #[test]
@@ -1101,17 +1097,17 @@ mod tests {
         // csrrw x5, mstatus, x10 -> 0x300512f3
         let f = decode_fields(0x300512f3);
         assert_eq!(f.opcode, 0x73);
-        assert_eq!(f.func3, 1);  // CSRRW
-        assert_eq!(f.imm12_se, 0x300);  // mstatus CSR address
+        assert_eq!(f.func3, 1); // CSRRW
+        assert_eq!(f.imm12_se, 0x300); // mstatus CSR address
     }
 
     #[test]
     fn csr_csrrsi() {
         // csrrsi x9, mstatus, 0x1f -> 0x300fe4f3
         let f = decode_fields(0x300fe4f3);
-        assert_eq!(f.func3, 6);  // CSRRSI
+        assert_eq!(f.func3, 6); // CSRRSI
         assert_eq!(f.rd, 9);
-        assert_eq!(f.rs1, 31);   // uimm
+        assert_eq!(f.rs1, 31); // uimm
     }
 
     #[test]
@@ -1119,10 +1115,10 @@ mod tests {
         // lr.w x5, (x10) -> 0x100522af
         let f = decode_fields(0x100522af);
         assert_eq!(f.opcode, 0x2F);
-        assert_eq!(f.func3, 2);  // .W
+        assert_eq!(f.func3, 2); // .W
         assert_eq!(f.rd, 5);
         assert_eq!(f.rs1, 10);
-        assert_eq!(f.func7 >> 2, 0b00010);  // LR funct5
+        assert_eq!(f.func7 >> 2, 0b00010); // LR funct5
     }
 
     #[test]
@@ -1131,14 +1127,14 @@ mod tests {
         let f = decode_fields(0x20b526af);
         assert_eq!(f.opcode, 0x2F);
         assert_eq!(f.func3, 2);
-        assert_eq!(f.func7 >> 2, 0b00100);  // AMOXOR funct5
+        assert_eq!(f.func7 >> 2, 0b00100); // AMOXOR funct5
     }
 
     #[test]
     fn amo_amomaxu_w() {
         // amomaxu.w x19, x11, (x10) -> 0xe0b529af
         let f = decode_fields(0xe0b529af);
-        assert_eq!(f.func7 >> 2, 0b11100);  // AMOMAXU funct5
+        assert_eq!(f.func7 >> 2, 0b11100); // AMOMAXU funct5
     }
 
     #[test]
@@ -1146,7 +1142,7 @@ mod tests {
         // amoadd.d x20, x11, (x10) -> 0x00b53a2f
         let f = decode_fields(0x00b53a2f);
         assert_eq!(f.opcode, 0x2F);
-        assert_eq!(f.func3, 3);  // .D
-        assert_eq!(f.func7 >> 2, 0b00000);  // AMOADD funct5
+        assert_eq!(f.func3, 3); // .D
+        assert_eq!(f.func7 >> 2, 0b00000); // AMOADD funct5
     }
 }

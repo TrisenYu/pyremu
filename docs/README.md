@@ -74,7 +74,7 @@ pyremu/
   _native/               # Rust 批量执行引擎 (libdecode.so)
 tests/                   # ~800 条测试
 examples/                # 编程式使用示例
-third-party/             # 第三方固件 & S-mode 运行时
+bsp/             # 第三方固件 & S-mode 运行时
 ```
 
 ## 测试
@@ -84,7 +84,7 @@ third-party/             # 第三方固件 & S-mode 运行时
 
 ## 第三方代码
 
-- `third-party/rust_smode_entry/` — Rust 编写的 S-mode TEE 管理器，以 PIE 位置无关方式编译链接，由 M-mode 加载到动态分配的物理内存中运行
+- `bsp/rust_smode_entry/` — Rust 编写的 S-mode TEE 管理器，以 PIE 位置无关方式编译链接，由 M-mode 加载到动态分配的物理内存中运行
 
 ## Rust Native 并发执行引擎
 

@@ -27,3 +27,43 @@ def mask64(val: int) -> int:
 def mask32(val: int) -> int:
     """将 *val* 截断为 32-bit 无符号整数 ``[0, 2^32)``."""
     return val & MASK32
+
+
+# ---------------------------------------------------------------
+#  Sign-extend helpers (moved from disassem.py to break circular import)
+# ---------------------------------------------------------------
+
+
+def sext(val: int, bits: int) -> int:
+    """Sign-extend *val* from *bits* width to a canonical 64-bit unsigned Python int.
+
+    Python's arbitrary-precision integers behave differently from finite-width
+    hardware in bitwise operations (|, &, ^, <<, >>) when values are negative.
+    Canonicalizing to [0, 2^64) ensures consistent behaviour regardless of
+    whether the value was built via sign-extend, zero-extend, or arithmetic.
+    """
+    sign_bit = 1 << (bits - 1)
+    result = (val & (sign_bit - 1)) - (val & sign_bit)
+    if bits <= 64:
+        result &= (1 << 64) - 1
+    return result
+
+
+def sext8(val: int) -> int:
+    """Sign-extend from 8 bits -> canonical 64-bit unsigned."""
+    return (val & 0x7F) - (val & 0x80) & 0xFFFF_FFFF_FFFF_FFFF
+
+
+def sext12(val: int) -> int:
+    """Sign-extend from 12 bits -> canonical 64-bit unsigned."""
+    return (val & 0x7FF) - (val & 0x800) & 0xFFFF_FFFF_FFFF_FFFF
+
+
+def sext16(val: int) -> int:
+    """Sign-extend from 16 bits -> canonical 64-bit unsigned."""
+    return (val & 0x7FFF) - (val & 0x8000) & 0xFFFF_FFFF_FFFF_FFFF
+
+
+def sext32(val: int) -> int:
+    """Sign-extend from 32 bits -> canonical 64-bit unsigned."""
+    return (val & 0x7FFF_FFFF) - (val & 0x8000_0000) & 0xFFFF_FFFF_FFFF_FFFF

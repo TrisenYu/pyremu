@@ -211,5 +211,3 @@ fn virtio_read(offset: u64, raw: *mut crate::state::FfiVirtIoCtx) -> Option<u64>
         _ => Some(0),
     }
 }
-
-

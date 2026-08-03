@@ -4,7 +4,9 @@
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 # Created at 2026/06/06 星期六 16:53:52
 # Last modified at 2026/06/06 星期六 17:07:36
-TLB_SIZE: int = 256
+from pyremu.configs_gen import TLB_ENTRIES
+
+TLB_SIZE: int = int(TLB_ENTRIES)
 
 
 class CacheEntry:

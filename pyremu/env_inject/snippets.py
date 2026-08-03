@@ -178,7 +178,7 @@ def imm64(rd: int, value: int) -> AsmSnippet:
         .dword value         # 内联数据 (64-bit)
 
     Args:
-        rd: 目标寄存器 (0–31).
+        rd: 目标寄存器 (0-31).
         value: 要加载的 64-bit 值.
     """
     return AsmSnippet(
@@ -221,7 +221,7 @@ def csr_write(csr_addr: int, rs: int) -> AsmSnippet:
 
     Args:
         csr_addr: CSR 地址 (12-bit).
-        rs: 源寄存器 (0–31).
+        rs: 源寄存器 (0-31).
     """
     return AsmSnippet(
         words=[((csr_addr & 0xFFF) << 20) | (rs << 15) | (0b001 << 12) | (_ZERO << 7) | _SYS],
