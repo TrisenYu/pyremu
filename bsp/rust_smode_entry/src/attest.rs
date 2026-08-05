@@ -5,7 +5,7 @@
 //! no_std / no-alloc / 整数运算 (兼容 riscv64imac 无 F/D)。
 //!
 //! 与 ref-emod `attest_emodule` 的差异: 使用 SHA-256 (真正 32 字节摘要),
-//! 不做 MD2 的 16→32 字节复制填充。
+//! 不做 MD2 的 16->32 字节复制填充。
 //!
 //! 后续可用密码学加速指令替换 SHA-256 / ECDSA 计算, 但本模块的
 //! `attest_payload` 接口保持不变。

@@ -1,4 +1,4 @@
-/* tee_enclave.h — Linux TEE enclave driver userspace interface
+/* tee_enclave.h - Linux TEE enclave driver userspace interface
  *
  * /dev/tee_enclave: ioctl-based enclave lifecycle management.
  * SBI ecall (ext_id=0x20221222) bridges to OpenSBI M-mode enclave extension.

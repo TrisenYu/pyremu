@@ -1,4 +1,4 @@
-/* probe_payload.c — 恶意探测飞地载荷 (运行在飞地 U-mode)
+/* probe_payload.c - 恶意探测飞地载荷 (运行在飞地 U-mode)
  *
  * 模拟攻击者获批的"可信"飞地应用, 实际执行 TLB 残留探测:
  *   1. 在与 victim 相同的 VA 分配一页
@@ -89,7 +89,7 @@ int main(int __unused argc, char __unused **argv) {
 		puts("[probe] Verdict: TLB leak CONFIRMED, sfence.vma BLOCKED it");
 		exit_code = 42; /* 泄漏确认码 */
 	} else if (correct_first) {
-		puts("[probe] Verdict: No leak — TLB properly isolated");
+		puts("[probe] Verdict: No leak - TLB properly isolated");
 		exit_code = 0;
 	} else {
 		puts("[probe] Verdict: Unexpected state");

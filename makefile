@@ -17,6 +17,30 @@ phony =
 # 全部变量定义集中在 configs.mk (路径/固件 flags/DISK/INITRD/ram 等)。
 include configs.mk
 
+ifeq ($(OS),Windows_NT)
+	uv_check := $(shell where uv 2>nul)
+	py_check  := $(shell dir .venv 2>nul)
+	activate  := .venv/Scripts/activate
+else
+	uv_check := $(shell command -v uv 2>/dev/null)
+	py_check  := $(shell ls .venv/pyvenv.cfg 2>/dev/null)
+	activate  := . $(or $(shell echo $$VIRTUAL_ENV),.venv/bin/activate)
+endif
+
+__uv-check:
+ifndef uv_check
+	$(error can not find uv, which could be installed by: curl -LsSf https://astral.sh/uv/install.sh | sh)
+endif
+phony += __uv-check
+
+__pyenv-check: __uv-check
+ifndef py_check
+	@uv venv && uv sync
+else
+	@uv sync
+endif
+phony += __pyenv-check
+
 
 # CARGO_FLAGS 变化时强制重建 native .so (需求: PYREMU_TRACE_SRET / PYREMU_DIAG_LOG
 # 设为非零/非空值时启用 --features diagnostic, 否则不启用).
@@ -94,7 +118,7 @@ $(zsbl_fsbl): $(fw_payload)
 
 # ---- 主入口: 启动模拟器 ----
 # 完整依赖链: Rust -> 固件编译 -> 拷贝 -> ZSBL -> 模拟器
-emu: $(zsbl_fsbl)
+emu: $(zsbl_fsbl) __pyenv-check
 	PYREMU_TRACE_TRAPS=1 PYREMU_TRACE_PMP=1 \
 	python -m pyremu.debugger --hart-logs=output/ $(pyargs)
 phony += emu
@@ -114,7 +138,7 @@ phony += build-fw-linux
 
 # fw_payload 模式 (Linux 内嵌 OpenSBI payload) — 备用; 主用 emu-linux (fw_jump)。
 # 嵌入的是vmlinux，会缺乏调试符号
-emu-linux-payload: $(zsbl_fsbl) $(fw_payload_linux)
+emu-linux-payload: $(zsbl_fsbl) $(fw_payload_linux) __pyenv-check
 	python -m pyremu.debugger \
 		--hart-logs=output/ --ram-base=0x80000000 --ram 512M --preload=$(zsbl_fsbl) \
 		--harts=$(hart_num) $(fw_payload_linux)
@@ -123,7 +147,7 @@ phony += emu-linux-payload
 
 # 主入口: fw_jump 模式启动 Linux。默认挂载 DISK 指向的 rootfs (存在时)。
 #   用法: make emu-linux hart_num=4 ram=2G [DISK=... | INITRD=...]
-emu-linux: $(zsbl_fsbl) $(fw_jump_elf) build-native $(if $(INITRD),$(INITRAMFS)) $(PLATFORM_CONFIG_GEN)
+emu-linux: $(zsbl_fsbl) $(fw_jump_elf) build-native $(if $(INITRD),$(INITRAMFS)) $(PLATFORM_CONFIG_GEN) __pyenv-check
 	python -m pyremu.debugger \
 		--hart-logs=output/ --ram-base=0x80000000 --ram $(ram) --preload=$(zsbl_fsbl) \
 		--kernel=$(LINUX_IMG) --sym=$(LINUX_VMLINUX) \
@@ -132,7 +156,7 @@ emu-linux: $(zsbl_fsbl) $(fw_jump_elf) build-native $(if $(INITRD),$(INITRAMFS))
 phony += emu-linux
 
 # 最小 init 验证内核能否走到执行 init 阶段
-emu-linux-sh: $(zsbl_fsbl) $(fw_jump_elf) build-native $(PLATFORM_CONFIG_GEN)
+emu-linux-sh: $(zsbl_fsbl) $(fw_jump_elf) build-native $(PLATFORM_CONFIG_GEN) __pyenv-check
 	PYTHON_GIL=0 python -m pyremu.debugger \
 		--hart-logs=output/ --ram-base=0x80000000 --ram $(ram) --preload=$(zsbl_fsbl) \
 		--kernel=$(LINUX_IMG) --sym=$(LINUX_VMLINUX) --fdt -1 \
@@ -155,11 +179,11 @@ phony += build-initramfs
 # ---- 测试 ----
 # 限制: 4 GiB 虚拟内存 (防止 batch 测试内存膨胀), --ignore 排除 ordering-dependent 失败.
 # 详见 memory/test-constraints.md 与 memory/ordering-dependent-native-batch-failures.md.
-test:
+test: __pyenv-check
 	ulimit -v 4194304 && PYTHON_GIL=0 pytest -x --ignore=tests/test_multihart_diff.py
 phony += test
 
-cov-test:
+cov-test: __pyenv-check
 	ulimit -v 4194304 && timeout=300 PYTHON_GIL=0 pytest -x \
 	--cov=. --cov-report=term --full-trace
 phony += cov-test

@@ -1,4 +1,4 @@
-/* flush_reload.c — Flush+Reload 缓存侧信道攻击演示 (Linux userspace)
+/* flush_reload.c - Flush+Reload 缓存侧信道攻击演示 (Linux userspace)
  *
  * 同进程内模拟 sender/receiver 两方通过 L2 缓存状态传递 64-bit secret.
  * flush 不依赖 CBO 指令, 使用同组地址填充逐出 (eviction-based):
@@ -93,10 +93,10 @@ static uint64_t calibrate(uint8_t *arr, size_t arr_sz) {
 
 	uint64_t hit_avg  = hit_sum / CALIBRATE_N;
 	uint64_t miss_avg = miss_sum / CALIBRATE_N;
-	printf("    hit  avg: %6llu cycles\n", (uint64_t)hit_avg);
-	printf("    miss avg: %6llu cycles\n", (uint64_t)miss_avg);
+	printf("    hit  avg: %6lu cycles\n", hit_avg);
+	printf("    miss avg: %6lu cycles\n", miss_avg);
 	printf(
-		"    diff:     %6llu cycles (%.1fx)\n",
+		"    diff:     %6lu cycles (%.1fx)\n",
 		(uint64_t)(miss_avg > hit_avg ? miss_avg - hit_avg : 0),
 		hit_avg ? (double)miss_avg / (double)hit_avg : 0.0);
 	return (hit_avg + miss_avg) / 2;
@@ -138,7 +138,7 @@ int main(void) {
 
 	puts("--- Calibration ---");
 	uint64_t threshold = calibrate(arr, arr_sz);
-	printf("threshold = %llu\n\n", (uint64_t)threshold);
+	printf("threshold = %lu\n\n", threshold);
 
 	puts("--- Covert Channel ---");
 	static const uint64_t secrets[] = {
@@ -161,7 +161,7 @@ int main(void) {
 			flush_addr(arr, arr_sz, &arr[i * SET_STRIDE]);
 		}
 
-		/* Sender: 按 secret 编码 — 访问对应行将其带入缓存 */
+		/* Sender: 按 secret 编码 - 访问对应行将其带入缓存 */
 		for (int i = 0; i < N_BITS; i++) {
 			if (secret & (1ULL << i)) {
 				__asm__ volatile("" ::"r"(*(volatile uint8_t *)&arr[i * SET_STRIDE]));
@@ -179,13 +179,11 @@ int main(void) {
 		total_bit_errs += bit_errs;
 
 		printf(
-			"  [%d] secret=0x%016llX recovered=0x%016llX"
+			"  [%d] secret=0x%016lX recovered=0x%016lX"
 			" bit_errs=%d %s\n",
 			s,
-			(uint64_t)secret,
-			(uint64_t)recovered,
-			bit_errs,
-			ok ? "OK" : "FAIL");
+			secret, recovered,
+			bit_errs, ok ? "OK" : "FAIL");
 	}
 
 	int total_bits = n_secrets * N_BITS;
@@ -194,21 +192,22 @@ int main(void) {
 		"Secrets recovered: %d/%d\n"
 		"Bit errors:        %d/%d (%.1f%%)\n",
 		ok_count,
-		n_secrets total_bit_errs,
+		n_secrets,
+		total_bit_errs,
 		total_bits,
 		100.0 * (double)total_bit_errs / (double)total_bits);
 
 	/* 如果 bit 错误率显著低于 50%, 说明信道有信号 */
 	double ber = (double)total_bit_errs / (double)total_bits;
 	if (ok_count == n_secrets) {
-		puts("Verdict: PASS — all secrets recovered perfectly");
+		puts("Verdict: PASS - all secrets recovered perfectly");
 	} else if (ber < 0.35) {
 		printf(
-			"Verdict: SIGNAL — BER=%.1f%% < 50%% (timing channel detected)\n",
+			"Verdict: SIGNAL - BER=%.1f%% < 50%% (timing channel detected)\n",
 			100.0 * ber);
 	} else {
 		printf(
-			"Verdict: NOISE — BER=%.1f%% (no observable timing channel)\n", 100.0 * ber);
+			"Verdict: NOISE - BER=%.1f%% (no observable timing channel)\n", 100.0 * ber);
 	}
 
 	free(arr);

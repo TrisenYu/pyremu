@@ -1,4 +1,4 @@
-/* tlb_leak_payload.c — TLB 残留条目跨页表泄漏演示 (musl 飞地 payload)
+/* tlb_leak_payload.c - TLB 残留条目跨页表泄漏演示 (musl 飞地 payload)
  *
  * 原理:
  *   当前 TLB 实现按 VPN 索引, 不作 mdid/asid 过滤, satp PPN 变化时若
@@ -7,10 +7,10 @@
  * 流程 (U-mode, 通过 Rust S-mode 运行时的 ecall mmap):
  *   1. mmap(VA_PROBE) → PPN_A, 写入 "SECRET-KEY-0123456789AB"
  *   2. 反复读 VA_PROBE 确保 TLB 填充 (VPN→PPN_A)
- *   3. munmap(VA_PROBE)                          — 清 PTE, 不刷 TLB
+ *   3. munmap(VA_PROBE)                          - 清 PTE, 不刷 TLB
  *   4. mmap(VA_PROBE) → PPN_B (不同物理页!)
- *   5. 读 VA_PROBE (无 sfence.vma)                — TLB hit? → PPN_A → "SECRET..."
- *   6. sfence.vma; 再读 VA_PROBE                  — TLB miss → PPN_B → 正确数据
+ *   5. 读 VA_PROBE (无 sfence.vma)                - TLB hit? → PPN_A → "SECRET..."
+ *   6. sfence.vma; 再读 VA_PROBE                  - TLB miss → PPN_B → 正确数据
  *   7. 输出结论
  *
  * 编译:
@@ -31,7 +31,7 @@
 #define PUBLIC_DATA  "PUBLIC-DATA-XXXXXXXXXXXX"
 #define VA_PROBE     ((volatile char *)0x20000000UL)
 
-/* RISC-V sfence.vma — 刷全部 TLB */
+/* RISC-V sfence.vma - 刷全部 TLB */
 static inline void tlb_flush_all(void) {
     __asm__ volatile("sfence.vma zero, zero" ::: "memory");
 }
@@ -40,7 +40,7 @@ int main(int argc __attribute__((unused)),
          char **argv __attribute__((unused))) {
     size_t page_sz = 4096;
 
-    /* ======== Phase 1: Victim — 填充 TLB with SECRET ======== */
+    /* ======== Phase 1: Victim - 填充 TLB with SECRET ======== */
     void *va = mmap((void *)VA_PROBE, page_sz,
                     PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
@@ -62,8 +62,8 @@ int main(int argc __attribute__((unused)),
     printf("[phase1] VA=%p wrote='%s' TLB filled (sum=0x%02x)\n",
            (void *)VA_PROBE, SECRET_DATA, sum & 0xFF);
 
-    /* ======== Phase 2: 换页 — munmap + mmap (同 VA, 不同 PPN) ======== */
-    /* munmap 清除 PTE, 但不刷新 TLB — 旧条目残留 */
+    /* ======== Phase 2: 换页 - munmap + mmap (同 VA, 不同 PPN) ======== */
+    /* munmap 清除 PTE, 但不刷新 TLB - 旧条目残留 */
     munmap(va, page_sz);
 
     va = mmap((void *)VA_PROBE, page_sz,
@@ -79,10 +79,10 @@ int main(int argc __attribute__((unused)),
     printf("[phase2] remapped VA=%p wrote='%s'\n",
            (void *)VA_PROBE, PUBLIC_DATA);
 
-    /* ======== Phase 3: 探测 — 无 flush 读 vs flush 后读 ======== */
+    /* ======== Phase 3: 探测 - 无 flush 读 vs flush 后读 ======== */
     char buf[64];
 
-    /* 读 1: 无 TLB flush — 若 TLB 残留, 读到旧 PPN (SECRET) */
+    /* 读 1: 无 TLB flush - 若 TLB 残留, 读到旧 PPN (SECRET) */
     memcpy(buf, (void *)VA_PROBE, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     int leak = (strncmp(buf, SECRET_DATA, strlen(SECRET_DATA)) == 0);
@@ -90,7 +90,7 @@ int main(int argc __attribute__((unused)),
 
     printf("[phase3] no-flush read: '%s'\n", buf);
 
-    /* 读 2: sfence.vma 后再读 — 必须走页表, 读到新 PPN (PUBLIC) */
+    /* 读 2: sfence.vma 后再读 - 必须走页表, 读到新 PPN (PUBLIC) */
     tlb_flush_all();
 
     char buf2[64];
@@ -112,8 +112,8 @@ int main(int argc __attribute__((unused)),
                  : correct2 ? "CORRECT (TLB flushed, page walk OK)"
                  : "UNKNOWN");
     printf("  Verdict: %s\n",
-           (leak && correct2) ? "TLB leak CONFIRMED — sfence.vma mitigates"
-           : (leak && leak2)  ? "TLB leak PERSISTS after sfence.vma — BUG"
+           (leak && correct2) ? "TLB leak CONFIRMED - sfence.vma mitigates"
+           : (leak && leak2)  ? "TLB leak PERSISTS after sfence.vma - BUG"
            : "No leak detected");
 
     munmap(va, page_sz);

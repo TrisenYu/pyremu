@@ -1,4 +1,4 @@
-//! ELF64 加载。紧跟 bsp/smode_entry/load_elf.c 的结构。
+//! ELF64 加载
 
 use crate::ecall_aux;
 use crate::constants::*;

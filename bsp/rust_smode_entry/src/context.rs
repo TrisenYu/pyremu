@@ -53,8 +53,8 @@ pub struct SharedBuf {
 /// 独立 wrapper 结构体以 `#[repr(align(4096))]` 强制对齐,
 /// **不依赖 BSS 布局** (BSS 中其他零初始化静态可能破坏
 /// `EnclaveContext` 内嵌字段的 4 KiB 对齐约束, 导致
-/// satp.PPN 指向错误物理页 → MMU 开启后全部取指页错误
-/// → trap loop → hart halt).
+/// satp.PPN 指向错误物理页 -> MMU 开启后全部取指页错误
+/// -> trap loop -> hart halt).
 #[repr(align(4096))]
 #[allow(dead_code)]
 pub struct PageTableRoot([Pte; 512]);

@@ -1,5 +1,5 @@
 annotated-types==0.8.0
-coverage==7.15.0
+coverage==7.15.3
 iniconfig==2.3.0
 lief==1.0.0
 loguru==0.7.3
@@ -20,7 +20,7 @@ pytest-cov==7.1.0
 pytest-timeout==2.4.0
 pyyaml==6.0.3
 rich==15.0.0
-ruff==0.15.20
+ruff==0.16.1
 typing-extensions==4.16.0
 typing-inspection==0.4.2
-wcwidth==0.8.1
+wcwidth==0.8.2

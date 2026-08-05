@@ -1,4 +1,4 @@
-/* hello_payload.c — picolibc 飞地 payload 测试
+/* hello_payload.c - picolibc 飞地 payload 测试
  *
  * 验证 syscalls.c 桥接 + picolibc libc 链接链:
  *   printf -> puts -> fputs -> write -> ecall write(64) -> Rust 运行时 -> UART

@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: GPL-2.0
 # tee_enclave_drv Kbuild Makefile
 #
-# 编译: make -C /path/to/linux M=$PWD modules
-# 需要 riscv64 交叉工具链 + 已编译的 Linux 内核树.
+# 外部模块编译: 工具链必须与编译内核树 (bsp/linux) 所用完全一致,
+# 否则 ABI 不匹配会导致 insmod 时符号解析失败或运行时崩溃.
 #
-# 使用:
-#   KDIR=$(pwd)/bsp/linux
-#   make ARCH=riscv CROSS_COMPILE=riscv64-unknown-linux-gnu- -C $(KDIR) M=$PWD modules
+# 当前内核树编译命令 (参考):
+#   make LLVM=1 HOSTCC=gcc ARCH=riscv \
+#     LLVM_PREFIX=/opt/custom-llvm/bin/ PATH="/opt/custom-llvm/bin:$$PATH" \
+#     CROSS_COMPILE=riscv64-unknown-linux-gnu- -j8
+#
+# 模块编译 (必须与上方一致):
+#   make -C ../linux M=$$PWD ARCH=riscv LLVM=1 \
+#     LLVM_PREFIX=/opt/custom-llvm/bin/ PATH="/opt/custom-llvm/bin:$$PATH" \
+#     CROSS_COMPILE=riscv64-unknown-linux-gnu- modules
 
 obj-m := tee_enclave_drv.o

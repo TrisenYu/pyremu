@@ -61,6 +61,8 @@ pub const ENCLAVE_REQ_SHUTDOWN: u64 = 1 << 0;
 // ---------------------------------------------------------------
 
 pub const SBI_LEGACY_PUTCHAR_EXT: u64 = 0x01;
+pub const SBI_DBCN_EXT: u64            = 0x4442434E;
+pub const SBI_DBCN_CONSOLE_WRITE: u64  = 0;
 pub const SBI_TIMER_EXT: u64 = 0x5449_4D45;
 pub const SBI_SET_TIMER_FUNC: u64 = 0x00;
 

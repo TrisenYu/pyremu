@@ -3,11 +3,11 @@
 #![no_std]
 #![no_main]
 
-mod ecall_aux;
+mod attest;
 mod constants;
 mod context;
-mod attest;
 mod csr;
+mod ecall_aux;
 mod elf;
 mod hang;
 mod memory;
@@ -65,7 +65,7 @@ pub unsafe extern "C" fn rust_main_before_mmu(
     // 无需再加 load_offset, 否则会 double-count base_pa.
     let end_pa = &raw const _end as u64;
 
-	context::init_context(man_pa_start, ENCLAVE_MODULE_LOAD_VA_INIT);
+    context::init_context(man_pa_start, ENCLAVE_MODULE_LOAD_VA_INIT);
 
     let pool_offset = end_pa - man_pa_start;
     let pool_size = memory::page_down(memory::chunk_2m_up(end_pa) - end_pa);
@@ -81,7 +81,11 @@ pub unsafe extern "C" fn rust_main_before_mmu(
     let va_offset = ENCLAVE_MAN_VA_START.wrapping_sub(man_pa_start);
 
     unsafe {
-        ret_boot_info.write(BootInfo { satp: satp_val, smode_sp, va_offset });
+        ret_boot_info.write(BootInfo {
+            satp: satp_val,
+            smode_sp,
+            va_offset,
+        });
     }
 }
 
@@ -117,7 +121,7 @@ pub unsafe extern "C" fn rust_main_after_mmu() {
     memory::map_user_argv(argv_pa, argc);
     let entry = elf::load_elf(payload_pa, payload_size);
 
-    // musl _start 要求 sp → argc 的栈布局 (argc/argv/envp/auxv)
+    // musl _start 要求 sp -> argc 的栈布局 (argc/argv/envp/auxv)
     let umode_sp = setup_musl_stack(umode_sp, argc);
 
     context::ctx_mut().umode_heap_top = UMODE_HEAP_START_ALIGNED - memory::umode_pool_avail();
@@ -139,7 +143,7 @@ pub unsafe extern "C" fn rust_main_after_mmu() {
 }
 
 // ---------------------------------------------------------------
-//  musl 栈布局: sp → argc | argv[] | NULL | envp[] | NULL | auxv[]
+//  musl 栈布局: sp -> argc | argv[] | NULL | envp[] | NULL | auxv[]
 // ---------------------------------------------------------------
 
 const AT_NULL: u64 = 0;
@@ -159,23 +163,23 @@ fn setup_musl_stack(sp_top: u64, _argc: u64) -> u64 {
 
     // auxv (先写入, 位于栈底)
     unsafe {
-        push_u64(&mut sp, 0);           // AT_NULL value
-        push_u64(&mut sp, AT_NULL);     // AT_NULL type
-        push_u64(&mut sp, 0);           // AT_GID = 0
-        push_u64(&mut sp, AT_GID);      // AT_GID type
-        push_u64(&mut sp, 0);           // AT_UID = 0
-        push_u64(&mut sp, AT_UID);      // AT_UID type
-        push_u64(&mut sp, 0x1000);      // AT_PAGESZ = 4096
-        push_u64(&mut sp, AT_PAGESZ);   // AT_PAGESZ type
+        push_u64(&mut sp, 0); // AT_NULL value
+        push_u64(&mut sp, AT_NULL); // AT_NULL type
+        push_u64(&mut sp, 0); // AT_GID = 0
+        push_u64(&mut sp, AT_GID); // AT_GID type
+        push_u64(&mut sp, 0); // AT_UID = 0
+        push_u64(&mut sp, AT_UID); // AT_UID type
+        push_u64(&mut sp, 0x1000); // AT_PAGESZ = 4096
+        push_u64(&mut sp, AT_PAGESZ); // AT_PAGESZ type
 
         // envp (空)
-        push_u64(&mut sp, 0);           // envp[0] = NULL
+        push_u64(&mut sp, 0); // envp[0] = NULL
 
         // argv (空, argc=0)
-        push_u64(&mut sp, 0);           // argv[0] = NULL
+        push_u64(&mut sp, 0); // argv[0] = NULL
 
         // argc
-        push_u64(&mut sp, 0);           // argc = 0
+        push_u64(&mut sp, 0); // argc = 0
     }
 
     sp
@@ -190,7 +194,8 @@ fn panic_handler(info: &PanicInfo) -> ! {
     if let Some(loc) = info.location() {
         println!(
             "[panic] {}:{} — {}\n",
-            loc.file(), loc.line(),
+            loc.file(),
+            loc.line(),
             info.message()
         );
     } else {

@@ -1,11 +1,11 @@
-/* tee_test.c — TEE enclave driver userspace test
+/* tee_test.c - TEE enclave driver userspace test
  *
  * Demonstrates /dev/tee_enclave ioctl interface:
- *   1. GET_MEM  — query available enclave memory pool
- *   2. GET_ID   — query current mdid (0 = host)
- *   3. CREATE   — spawn a new enclave (firmware-provided enclave manager)
- *   4. ENTER    — load & run a custom payload in the enclave
- *   5. SHUTDOWN — destroy enclave (or from inside the enclave)
+ *   1. GET_MEM  - query available enclave memory pool
+ *   2. GET_ID   - query current mdid (0 = host)
+ *   3. CREATE   - spawn a new enclave (firmware-provided enclave manager)
+ *   4. ENTER    - load & run a custom payload in the enclave
+ *   5. SHUTDOWN - destroy enclave (or from inside the enclave)
  *
  * SPDX-License-Identifier: GPL-2.0
  */
@@ -58,18 +58,19 @@ static int do_get_id(uint64_t *id) {
 	return 0;
 }
 
-static int do_create(void) {
+static int do_create(unsigned long long *enclave_id) {
 	/* CREATE transfers execution into the enclave on success.
      * The host thread becomes the enclave thread; it only returns
-     * here after the enclave calls SUSPEND (or on CREATE error). */
-	if (ioctl(fd, TEE_IOC_CREATE, 0) < 0) {
+     * here after the enclave calls SUSPEND (or on CREATE error).
+     * On success, *enclave_id receives the new enclave ID. */
+	if (ioctl(fd, TEE_IOC_CREATE, enclave_id) < 0) {
 		return -errno;
 	}
 	return 0;
 }
 
 static int do_enter(const struct tee_enter_args *args) {
-	/* Same caveat as CREATE — on success, transfers into enclave.
+	/* Same caveat as CREATE - on success, transfers into enclave.
      * Returns here after SUSPEND. */
 	if (ioctl(fd, TEE_IOC_ENTER, args) < 0) {
 		return -errno;
@@ -77,6 +78,7 @@ static int do_enter(const struct tee_enter_args *args) {
 	return 0;
 }
 
+__attribute__((unused))
 static int do_suspend(void) {
 	if (ioctl(fd, TEE_IOC_SUSPEND, 0) < 0) {
 		return -errno;
@@ -84,8 +86,8 @@ static int do_suspend(void) {
 	return 0;
 }
 
-static int do_shutdown(void) {
-	if (ioctl(fd, TEE_IOC_SHUTDOWN, 0) < 0) {
+static int do_shutdown(unsigned long long enclave_id) {
+	if (ioctl(fd, TEE_IOC_SHUTDOWN, &enclave_id) < 0) {
 		return -errno;
 	}
 	return 0;
@@ -137,7 +139,7 @@ int main(int argc, char **argv) {
 	if (rc == 0) {
 		printf("[test] GET_ID: current mdid=%llu (0=host)\n", (unsigned long long)mdid);
 	} else {
-		printf("[test] GET_ID: failed (%d) — SBI ext may not be loaded\n", rc);
+		printf("[test] GET_ID: failed (%d) - SBI ext may not be loaded\n", rc);
 	}
 
 	/* 3. Query available memory */
@@ -155,7 +157,7 @@ int main(int argc, char **argv) {
      * Skip if we can't find a payload to enter. */
 	if (argc < 2) {
 		printf("\n[test] Usage: %s <payload_path>\n", argv[0]);
-		puts("[test] Skipping CREATE/ENTER — no payload specified.");
+		puts("[test] Skipping CREATE/ENTER - no payload specified.");
 		puts("[test] Basic ioctl smoke test PASSED.");
 		close(fd);
 		return 0;
@@ -163,10 +165,11 @@ int main(int argc, char **argv) {
 
 	const char *payload_path = argv[1];
 	printf("\n[test] Creating enclave...\n");
-	rc = do_create();
+	unsigned long long enclave_id = 0;
+	rc = do_create(&enclave_id);
 	if (rc != 0) {
 		/* CREATE may fail if enclave manager is not in firmware */
-		printf("[test] CREATE: failed (%d) — skip ENTER test\n", rc);
+		printf("[test] CREATE: enclave_id=%llu (success)\n", (unsigned long long)enclave_id);
 		close(fd);
 		return 1;
 	}
@@ -177,7 +180,7 @@ int main(int argc, char **argv) {
 	unsigned char *payload = read_file(payload_path, &payload_size);
 	if (!payload) {
 		printf("[test] Cannot read payload '%s'\n", payload_path);
-		do_shutdown();
+		do_shutdown(enclave_id);
 		close(fd);
 		return 1;
 	}
@@ -203,7 +206,7 @@ int main(int argc, char **argv) {
 
 	/* 6. Shutdown */
 	printf("[test] Shutting down enclave...\n");
-	rc = do_shutdown();
+	rc = do_shutdown(enclave_id);
 	if (rc == 0) {
 		printf("[test] SHUTDOWN: enclave destroyed\n");
 	} else {

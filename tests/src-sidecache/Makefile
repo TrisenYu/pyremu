@@ -1,9 +1,9 @@
 # tests/src-sidecache/Makefile
-# 缓存侧信道攻击 PoC 套件 — 交叉编译为 RISC-V 静态 ELF
+# 缓存侧信道攻击 PoC 套件 - 交叉编译为 RISC-V 静态 ELF
 #
 # 两套编译链:
-#   Linux U-mode   (riscv64-linux-gnu-gcc)  — flush_reload
-#   Enclave musl   (clang + musl libc.a)    — hello_musl, victim_musl, probe_musl
+#   Linux U-mode   (riscv64-linux-gnu-gcc)  - flush_reload
+#   Enclave musl   (clang + musl libc.a)    - hello_musl, victim_musl, probe_musl
 #
 # 目标:
 #   make all                 全部编译
@@ -12,6 +12,10 @@
 #   make clean               清理
 
 phony =
+
+# 取消 GNU Make 内置的 %: %.c 隐式模式规则:
+# 防止在源码目录直接生成无 bin/ 前缀的二进制 (如 tee_concurrent).
+%: %.c
 
 # ---- 交叉编译器 (Linux glibc) ----
 CROSS_CC ?= $(shell command -v riscv64-linux-gnu-gcc 2>/dev/null || echo riscv64-unknown-linux-gnu-gcc)
@@ -37,13 +41,13 @@ MUSL_LDLIBS = $(MUSL_DIR)/lib/crt1.o \
 
 OUT_DIR    = bin
 PROGRAMS   = flush_reload tee_test tee_concurrent
-MUSL_PROGS = hello_musl victim_musl probe_musl tlb_leak_musl
+MUSL_PROGS = hello_payload victim_musl probe_musl tlb_leak_musl
 
 BINS      = $(addprefix $(OUT_DIR)/, $(PROGRAMS))
 MUSL_BINS = $(addprefix $(OUT_DIR)/, $(MUSL_PROGS))
 
-# ---- 默认目标 ----
-all: $(BINS) $(MUSL_BINS)
+# ---- 默认目标 (仅 Linux glibc 程序, musl payload 单独 make musl) ----
+all: $(BINS)
 phony += all
 
 musl: $(MUSL_BINS)
@@ -59,7 +63,7 @@ $(OUT_DIR)/%: %.c
 	$(CROSS_CC) $(CFLAGS) $< -o $@
 
 # ---- musl enclave payload 编译 ----
-$(OUT_DIR)/hello_musl: hello_payload.c
+$(OUT_DIR)/hello_payload: hello_payload.c
 	@mkdir -p $(@D)
 	$(MUSL_CC) $(MUSL_CFLAGS) -fuse-ld=lld $(MUSL_LDLIBS) $< -o $@
 

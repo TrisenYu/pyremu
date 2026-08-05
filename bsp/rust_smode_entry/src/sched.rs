@@ -32,7 +32,7 @@ pub fn tick_and_check_quota() {
     };
 
     if expired {
-        // 让出 CPU: M-mode 保存当前飞地上下文 → 切回 host.
+        // 让出 CPU: M-mode 保存当前飞地上下文 -> 切回 host.
         // host RESUME 后从此处继续执行.
         ecall_aux::enclave_call_suspend(0);
         // 新时间片开始
@@ -66,14 +66,14 @@ pub fn ticks_consumed() -> u64 {
 ///     Phase B 将替换为: S-mode 自行验证 host attestation quote.
 ///
 /// 在 timer interrupt 或 software interrupt 上下文中调用。
-/// SHUTDOWN 不返回 (通过 `enclave_call_exit` → M-mode 清理 → 切回 host).
+/// SHUTDOWN 不返回 (通过 `enclave_call_exit` -> M-mode 清理 -> 切回 host).
 pub fn check_pending_requests() {
     let flags = ecall_aux::enclave_call_query_requests();
 
     if flags & crate::constants::ENCLAVE_REQ_SHUTDOWN != 0 {
         // host 已通过 token 验证, 执行终止.
-        // `enclave_call_exit` 触发 SHUTDOWN ecall → M-mode 清理飞地
-        // → alter_hart_ctx_for_enclave 切回 host → 不返回.
+        // `enclave_call_exit` 触发 SHUTDOWN ecall -> M-mode 清理飞地
+        // -> alter_hart_ctx_for_enclave 切回 host -> 不返回.
         ecall_aux::enclave_call_exit(0);
     }
 }

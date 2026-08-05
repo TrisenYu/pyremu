@@ -29,6 +29,7 @@ help:
 	@echo "  make malice-conf     TLB side-channel probe across mdid domains"
 	@echo "  make malice-integ    Integrity probe (ID guessing, kernel VA injection)"
 	@echo "  make malice-all      Run all attacks"
+	@echo "  make concurrent      Concurrent enclave creation test"
 	@echo ""
 	@echo "  make install          Load driver (insmod)"
 	@echo "  make uninstall        Unload driver (rmmod)"

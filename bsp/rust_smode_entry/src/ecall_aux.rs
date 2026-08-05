@@ -155,6 +155,36 @@ pub fn sbi_putchar(c: u8) {
     }
 }
 
+/// Output a byte buffer via the SBI DBCN Console Write extension.
+/// The entire buffer is written atomically under M-mode's `console_out_lock`,
+/// preventing per-character interleaving with concurrent output from other harts.
+///
+/// Falls back to legacy `sbi_putchar` per byte if DBCN is not available.
+#[inline]
+pub fn sbi_console_write(buf: &[u8]) {
+    let pa = buf.as_ptr() as u64;
+    let len = buf.len() as u64;
+    let ret: u64;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") SBI_DBCN_EXT,
+            in("a6") SBI_DBCN_CONSOLE_WRITE,
+            in("a0") len,
+            in("a1") pa,
+            in("a2") 0_u64,
+            lateout("a0") ret,
+        );
+    }
+    // DBCN returns 0 on success, negative error code on failure.
+    // Fall back to character-by-character legacy putchar.
+    if ret != 0 {
+        for &byte in buf {
+            sbi_putchar(byte);
+        }
+    }
+}
+
 /// Schedule a timer interrupt at `stime_value` (absolute time in ticks).
 #[inline]
 pub fn sbi_set_timer(stime_value: u64) {

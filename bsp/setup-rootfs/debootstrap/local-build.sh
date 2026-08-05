@@ -20,6 +20,9 @@ GREEN='\033[32m'
 YELLOW='\033[33m'
 NC='\033[0m' # No Color
 
+TOY_SRC="$(cd "$(dirname "$0")/../../../tests/src-rv8" && pwd)"
+TOY_DEST="${ROOTFS_DIR}/eval/toy-progs"
+
 cleanup_mount() {
     mountpoint -q "${ROOTFS_DIR}/tmp" && umount -l "${ROOTFS_DIR}/tmp"
     mountpoint -q "${ROOTFS_DIR}/dev/pts" && umount -l "${ROOTFS_DIR}/dev/pts"
@@ -153,8 +156,6 @@ sed -i "s/^ZSH_THEME=\".*\"$/ZSH_THEME=\"gentoo\"/" /root/.zshrc || true
 EOF
 
 # toy benchmark programs -> /eval/toy-progs
-TOY_SRC="$(cd "$(dirname "$0")/../../../tests/src-rv8" && pwd)"
-TOY_DEST="${ROOTFS_DIR}/eval/toy-progs"
 mkdir -p "${TOY_DEST}"
 
 CROSS_CC=""
@@ -218,27 +219,13 @@ else
     echo ">> SKIP driver build: clang=${CLANG_CC} kdir=${KDIR}"
 fi
 
-# Build userspace test programs (static, with riscv64-linux-gnu-gcc)
+# Build via Makefile (single source of truth for program list),
+# then copy all resulting binaries + payloads at once.
 GCC_CROSS="riscv64-linux-gnu-gcc"
 if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
-    for prog in tee_test tee_malice; do
-        src="${TEE_TEST_SRC}/${prog}.c"
-        if [ -f "${src}" ]; then
-            ${GCC_CROSS} -static -O2 -Wall -I "${TEE_TEST_SRC}" \
-                "${src}" -o "${TEE_DEST}/${prog}" && \
-                echo "  ${prog}  OK"
-        fi
-    done
-    # Also copy the header for reference
+    make -C "${TEE_TEST_SRC}" -j"$(nproc)" CROSS_CC="${GCC_CROSS}" all
+    install -m755 "${TEE_TEST_SRC}"/bin/* "${TEE_DEST}/" 2>/dev/null || true
     cp -v "${TEE_TEST_SRC}/tee_enclave.h" "${TEE_DEST}/"
-    # Copy pre-built enclave payloads
-    for payload in hello_musl victim_musl probe_musl tlb_leak_musl; do
-        [ -f "${TEE_TEST_SRC}/bin/${payload}" ] && \
-            cp -v "${TEE_TEST_SRC}/bin/${payload}" "${TEE_DEST}/${payload}"
-    done
-    # symlink for eval.mk: hello_payload -> hello_musl
-    ln -sf hello_musl "${TEE_DEST}/hello_payload"
-    # Install the eval Makefile to /eval/
     EVAL_DEST="${ROOTFS_DIR}/eval"
     mkdir -p "${EVAL_DEST}"
     cp -v "${TEE_TEST_SRC}/eval.mk" "${EVAL_DEST}/Makefile"
