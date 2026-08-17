@@ -3,7 +3,7 @@
 
 MMIO 寄存器布局 (每个 hart 独立, stride=0x10):
   Offset 0x00: WDOG_CTRL    — 控制寄存器 (bit 0: enable, bit 1: reset on kick)
-  Offset 0x04: WDOG_TIMEOUT — 超时周期 (单位: 批次)
+  Offset 0x04: WDOG_TIMEOUT — 超时周期 (单位: 单轮加速执行)
   Offset 0x08: WDOG_COUNT   — 当前计数值 (只读)
   Offset 0x0C: WDOG_KICK    — 踢狗寄存器 (写任意值重置计数)
 
@@ -45,7 +45,7 @@ class HartWatchdog(Device):
         emu: Emulator,
         base: int = 0x1000_4000,
         num_harts: int = 2,
-        timeout: int = 500,  # 默认 500 批次超时
+        timeout: int = 500,  # 默认 500 单轮加速执行超时
     ) -> None:
         self.base_addr = base
         self._num_harts = num_harts
@@ -81,7 +81,7 @@ class HartWatchdog(Device):
         if reg == _WDOG_COUNT:
             return struct.pack("<I", self._count[hart])
         if reg == _WDOG_KICK:
-            return b"\x00" * size
+            pass
         return b"\x00" * size
 
     def write(self, offset: int, data: bytes) -> None:
@@ -102,7 +102,7 @@ class HartWatchdog(Device):
     # ---- Emulator integration ----
 
     def kick_all(self) -> None:
-        """所有 hart 重置计数器 — 模拟器每批次调用."""
+        """所有 hart 重置计数器 — 模拟器每单轮加速执行调用."""
         for i in range(self._num_harts):
             if self._ctrl[i] & _CTRL_ENABLE:
                 self._count[i] = self._timeout_val[i]
@@ -136,7 +136,7 @@ class HartWatchdog(Device):
 
         利用现有的 CLINT MSIP -> WFI 唤醒 -> M-mode trap -> sbi_ipi_process
         路径, 让空闲 hart 重新处理可能排队的 IPI 事件.
-        不访问固件特定地址 — 仅使用标准 CLINT 接口.
+        同时通知状态变化, 使中断缓存失效并触发 try_wfi_wakeup.
         """
         clint = self._emu.clint
         for h in self._emu.harts:
@@ -144,3 +144,5 @@ class HartWatchdog(Device):
                 hid = h.id
                 if hid < len(clint._msip):
                     clint._msip[hid] = 1
+        clint._notify_state_change()
+        self._emu._wake_event.set()

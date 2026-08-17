@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import pytest
 
+import pyremu.configs_gen
+import pyremu.emulator
 from pyremu.emulator import Emulator
 from pyremu.interrupt.plic import (
     PLIC_CONTEXT_BASE,
@@ -26,6 +28,13 @@ from pyremu.interrupt.plic import (
     PLIC_PRIORITY_STRIDE,
 )
 from pyremu.platform import PeripheralConfig, PlatformConfig
+
+
+@pytest.fixture(autouse=True)
+def _disable_aia_compile_override(monkeypatch):
+    """Disable PYREMU_AIA compile-time override."""
+    monkeypatch.setattr(pyremu.configs_gen, "PYREMU_AIA", False)
+
 
 _SRC = 1  # 中断源号 (对齐 virtio-blk)
 SEIP = 1 << 9
@@ -58,6 +67,7 @@ def test_native_sync_sets_seip_from_s_context():
     """源在 hart0 S-context(ctx1) 使能且挂起 -> 同步后 mip 含 SEIP."""
     emu = _make_emu(1)
     _plic_program(emu.plic, context=1, source=_SRC)  # ctx1 = hart0 S
+    assert emu.plic
     emu.plic.set_irq(_SRC, True)
 
     assert emu.harts[0].mip_val & SEIP == 0  # 同步前无
@@ -70,6 +80,7 @@ def test_native_sync_sets_meip_from_m_context():
     """源在 hart0 M-context(ctx0) 使能 -> 同步后 mip 含 MEIP."""
     emu = _make_emu(1)
     _plic_program(emu.plic, context=0, source=_SRC)  # ctx0 = hart0 M
+    assert emu.plic
     emu.plic.set_irq(_SRC, True)
 
     emu._native_sync_plic_mip()
@@ -81,6 +92,7 @@ def test_native_sync_clears_when_not_pending():
     """PLIC 撤除挂起后, 同步应清掉 mip 的 SEIP (不残留)."""
     emu = _make_emu(1)
     _plic_program(emu.plic, context=1, source=_SRC)
+    assert emu.plic
     emu.plic.set_irq(_SRC, True)
     emu._native_sync_plic_mip()
     assert emu.harts[0].mip_val & SEIP == SEIP
@@ -95,6 +107,7 @@ def test_native_sync_per_hart_isolated():
     emu = _make_emu(2)
     # hart1 的 S-context = 2*1+1 = 3
     _plic_program(emu.plic, context=3, source=_SRC)
+    assert emu.plic
     emu.plic.set_irq(_SRC, True)
 
     emu._native_sync_plic_mip()

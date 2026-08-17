@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Native acceleration layer — Rust cdylib via ctypes, with pure Python fallback.
+"""acceleration layer by pre-compiled dynamic library — Rust cdylib via ctypes, with pure Python fallback.
 
 Loads the pre-compiled Rust shared library.  If it is missing or the platform
 is unsupported, ``loguru`` emits a warning and the module degrades to pure
@@ -12,10 +12,10 @@ from __future__ import annotations
 import atexit
 import ctypes
 import os
+from pathlib import Path
 import shutil
 import sys
 import tempfile
-from pathlib import Path
 
 from loguru import logger
 
@@ -223,8 +223,10 @@ except OSError as exc:
 
 
 def native_available() -> bool:
-    """Return ``True`` if the native acceleration library is loaded."""
+    """Return ``True`` if the acceleration library is loaded."""
     return _lib is not None
+
+
 
 
 # ============================================================
@@ -864,6 +866,7 @@ class FfiClintCtx(ctypes.Structure):
         ("mtimecmp", ctypes.c_void_p),
         ("msip", ctypes.c_void_p),
         ("base", ctypes.c_uint64),
+        ("timebase_hz", ctypes.c_uint64),  # mtime 时钟源 Hz; 置0即禁用mtime的推进
     ]
 
 
@@ -873,6 +876,16 @@ class FfiDevCtx(ctypes.Structure):
         ("bases", ctypes.c_void_p),
         ("ends", ctypes.c_void_p),
         ("num", ctypes.c_uint8),
+    ]
+
+
+class FfiWatchdogCtx(ctypes.Structure):
+    """Host-side execution watchdog — matches Rust ``FfiWatchdogCtx``.
+
+    携带一次加速执行的时钟源超时时间 ``timeout_ns`` (纳秒, 0 = 禁用).
+    """
+    _fields_ = [
+        ("timeout_ns", ctypes.c_uint64),
     ]
 
 
@@ -931,7 +944,6 @@ class FfiHartCtx(ctypes.Structure):
     _fields_ = [
         ("states", ctypes.c_void_p),
         ("num_harts", ctypes.c_uint32),
-        ("max_instrs", ctypes.c_uint64),
         ("result", ctypes.c_void_p),
         ("stop_flag", ctypes.c_void_p),
         ("ext_irq", ctypes.c_void_p),
@@ -947,6 +959,7 @@ class FfiPeriphCtx(ctypes.Structure):
         ("dev", ctypes.c_void_p),
         ("uart", ctypes.c_void_p),
         ("virtio", ctypes.c_void_p),
+        ("watchdog", ctypes.c_void_p),
     ]
 
 
@@ -972,7 +985,7 @@ class FfiTlbCtx(ctypes.Structure):
 
 
 class PmpInfo:
-    """PMP configuration for a batch.
+    """PMP configuration.
 
     ``cfg`` and ``addr`` accept either Python bytes/list (copied to
     ctypes arrays) or pre-built ctypes arrays (used directly, enabling
@@ -1019,8 +1032,8 @@ class PmpInfo:
 
 
 class ClintInfo:
-    """CLINT state for a batch."""
-    __slots__ = ("mtime", "mtimecmp", "msip", "base")
+    """CLINT state"""
+    __slots__ = ("mtime", "mtimecmp", "msip", "base", "timebase_hz")
 
     def __init__(
         self,
@@ -1028,15 +1041,18 @@ class ClintInfo:
         mtimecmp=None,
         msip=None,
         base: int = 0,
+        timebase_hz: int = 10_000_000,
     ):
         self.mtime = mtime
-        self.mtimecmp = mtimecmp  # list or ctypes array
-        self.msip = msip          # list or ctypes array
+        self.mtimecmp = mtimecmp        # list or ctypes array
+        self.msip = msip                # list or ctypes array (level + edge counter)
         self.base = base
+        # mtime 时钟源频率
+        self.timebase_hz = timebase_hz
 
 
 class DevInfo:
-    """Device MMIO ranges for a batch."""
+    """Device MMIO ranges"""
     __slots__ = ("bases", "ends")
 
     def __init__(self, bases=None, ends=None):
@@ -1045,8 +1061,8 @@ class DevInfo:
 
 
 class UartInfo:
-    """UART context for a batch — lets Rust buffer sbi_printf output inline
-    and handle IE/IP/TXCTRL register reads without batch exits."""
+    """UART context — lets Rust buffer sbi_printf output inline
+    and handle IE/IP/TXCTRL register reads without exiting from speedup lib"""
     __slots__ = ("base", "tx_buf", "tx_wr", "ie", "txctrl", "rxctrl",
                  "rx_fifo_len", "tx_notify_fd", "no_stdout", "rx_notify")
 
@@ -1067,13 +1083,13 @@ class UartInfo:
 
 
 class VirtIOInfo:
-    """virtio-blk inline context for a batch — Rust handles all MMIO register
+    """virtio-blk inline context — Rust handles all MMIO register
     accesses inline; only QueueNotify exits to Python.
 
     Carries the full runtime state of the virtio-blk MMIO register file
-    across batches.  Without this, dynamic state written by the guest
+    across speedup process.  Without this, dynamic state written by the guest
     (queue descriptors, feature negotiation, InterruptStatus, etc.) is
-    silently reset to zero on every batch, and the guest sees a dead device.
+    silently reset to zero, and the guest sees a dead device.
     """
     __slots__ = (
         "base", "capacity", "queue_num_max",
@@ -1123,13 +1139,13 @@ def run_parallel(
     ram_base: int,
     shadow_base: int,
     shadow_size: int,
-    max_instrs: int,
     result,
     pmp: PmpInfo | None = None,
     clint: ClintInfo | None = None,
     dev: DevInfo | None = None,
     uart: UartInfo | None = None,
     virtio: VirtIOInfo | None = None,
+    watchdog_timeout_ns: int = 0,  # 时钟源超时时间 (纳秒); 0 = 禁用
     bp_addrs: list[int] | None = None,
     stop_flag=None,  # ctypes.c_uint8 or None — shared stop flag for Ctrl+Q
     ext_irq=None,  # FfiExtIrqCtx or None — external interrupt context
@@ -1140,7 +1156,9 @@ def run_parallel(
 
     Each non-halted hart runs in its own OS thread with a full
     fetch-decode-execute loop.  AMO instructions use real CPU atomics
-    (AtomicU32/AtomicU64).  All harts run until a stop condition is hit.
+    (AtomicU32/AtomicU64).  All harts run until a stop condition is hit
+    (stop_flag / all-idle WFI / halted / trap loop / breakpoint / MMIO).
+    No instruction quota — execution is continuous.
 
     *bp_addrs* is an optional list of PC addresses that trigger
     ``EXIT_BREAKPOINT`` when matched after instruction execution.
@@ -1194,6 +1212,7 @@ def run_parallel(
     clint_ffi.mtimecmp = ctypes.cast(_mtc_buf, ctypes.c_void_p).value
     clint_ffi.msip = ctypes.cast(_msip_buf, ctypes.c_void_p).value
     clint_ffi.base = clint.base if clint is not None else 0
+    clint_ffi.timebase_hz = clint.timebase_hz if clint is not None else 0
 
     # --- FfiDevCtx ---
     dev_ffi = FfiDevCtx()
@@ -1256,7 +1275,6 @@ def run_parallel(
     _hart_ctx = FfiHartCtx()
     _hart_ctx.states = ctypes.cast(states, ctypes.c_void_p).value or 0
     _hart_ctx.num_harts = num_harts
-    _hart_ctx.max_instrs = max_instrs
     _hart_ctx.result = ctypes.cast(ctypes.byref(result), ctypes.c_void_p).value or 0
     _hart_ctx.stop_flag = (
         ctypes.cast(ctypes.pointer(stop_flag), ctypes.c_void_p).value
@@ -1276,6 +1294,17 @@ def run_parallel(
     _periph_ctx.virtio = (
         ctypes.cast(_virtio_ffi_ptr, ctypes.c_void_p).value
         if _virtio_ffi_ptr else 0
+    )
+
+    # --- FfiWatchdogCtx --- 时钟源超时时间 (纳秒; 0 = 禁用, 不传指针)
+    _watchdog_ffi = FfiWatchdogCtx()
+    _watchdog_ffi_ptr = None
+    if watchdog_timeout_ns:
+        _watchdog_ffi.timeout_ns = int(watchdog_timeout_ns) & 0xFFFF_FFFF_FFFF_FFFF
+        _watchdog_ffi_ptr = ctypes.pointer(_watchdog_ffi)
+    _periph_ctx.watchdog = (
+        ctypes.cast(_watchdog_ffi_ptr, ctypes.c_void_p).value
+        if _watchdog_ffi_ptr else 0
     )
 
     _bp_ctx = FfiBpCtx()

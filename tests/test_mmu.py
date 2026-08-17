@@ -11,6 +11,8 @@ from pyremu.core.hart import HartWithRegs, RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend, translate_addr
 from pyremu.memory.bus import Bus
 from pyremu.memory.mmu import (
+    _sv39_vpn,
+    MemAccessMode,
     PAGE_SHIFT,
     PTE,
     PTE_A,
@@ -21,8 +23,6 @@ from pyremu.memory.mmu import (
     PTE_X,
     SATP_MODE_BARE,
     SATP_MODE_SV39,
-    MemAccessMode,
-    _sv39_vpn,
     translate_va,
 )
 

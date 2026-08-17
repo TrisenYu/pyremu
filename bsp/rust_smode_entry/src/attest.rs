@@ -30,32 +30,32 @@ use crate::constants::{ATTEST_PUB_KEY, LINEAR_MAP_OFFSET, SIG_LEN};
 ///
 /// 返回 `true` 表示验证通过。`size <= 64` 时无有效载荷, 返回 `false`。
 pub fn attest_payload(pa: u64, size: u64) -> bool {
-    let size = size as usize;
-    if size <= SIG_LEN {
-        return false;
-    }
+	let size = size as usize;
+	if size <= SIG_LEN {
+		return false;
+	}
 
-    // 经 linear-map 翻译读取载荷 (elf.rs 相同模式): PA + LINEAR_MAP_OFFSET。
-    let va = pa.wrapping_add(LINEAR_MAP_OFFSET);
-    let data = unsafe { core::slice::from_raw_parts(va as *const u8, size) };
+	// 经 linear-map 翻译读取载荷 (elf.rs 相同模式): PA + LINEAR_MAP_OFFSET。
+	let va = pa.wrapping_add(LINEAR_MAP_OFFSET);
+	let data = unsafe { core::slice::from_raw_parts(va as *const u8, size) };
 
-    // 拆分 bare 载荷与尾部签名。
-    let bare_len = size - SIG_LEN;
-    let (bare, sig_bytes) = data.split_at(bare_len);
+	// 拆分 bare 载荷与尾部签名。
+	let bare_len = size - SIG_LEN;
+	let (bare, sig_bytes) = data.split_at(bare_len);
 
-    // SHA-256 摘要 (32 字节)。
-    let digest = Sha256::digest(bare);
+	// SHA-256 摘要 (32 字节)。
+	let digest = Sha256::digest(bare);
 
-    // 解析压缩公钥 (33 字节 SEC1) 与签名 (64 字节 r‖s)。
-    let vk = match VerifyingKey::from_sec1_bytes(&ATTEST_PUB_KEY) {
-        Ok(k) => k,
-        Err(_) => return false,
-    };
-    let sig = match Signature::from_slice(sig_bytes) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+	// 解析压缩公钥 (33 字节 SEC1) 与签名 (64 字节 r‖s)。
+	let vk = match VerifyingKey::from_sec1_bytes(&ATTEST_PUB_KEY) {
+		Ok(k) => k,
+		Err(_) => return false,
+	};
+	let sig = match Signature::from_slice(sig_bytes) {
+		Ok(s) => s,
+		Err(_) => return false,
+	};
 
-    // 预哈希验证 (摘要已算好, 直接对 32 字节验证)。
-    vk.verify_prehash(digest.as_slice(), &sig).is_ok()
+	// 预哈希验证 (摘要已算好, 直接对 32 字节验证)。
+	vk.verify_prehash(digest.as_slice(), &sig).is_ok()
 }

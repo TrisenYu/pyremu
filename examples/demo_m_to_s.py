@@ -20,12 +20,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
+from pyremu.configs_aux import elf_dir, path_join
 from pyremu.utils.parse_bin import parse_firmware
 
 
 def main() -> None:
     emu = Emulator(PlatformConfig.qemu_virt())
-    fw = parse_firmware("tests/bins/elf/m_mode_to_s_mode.elf")
+    fw = parse_firmware(path_join(elf_dir(), "m_mode_to_s_mode.elf"))
     emu.load_firmware(fw)
 
     h = emu.harts[0]

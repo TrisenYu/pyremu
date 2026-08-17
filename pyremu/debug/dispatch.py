@@ -202,7 +202,7 @@ class DispatchMixin(SharedMixinAttrs):
                 f" @ 0x{self._emu.bus.ram_base:x}[/]  "
                 f"FDT: [dim]{f'0x{self._fdt_addr:x}' if self._fdt_addr else '—'}[/]",
                 "",
-                "Ctrl+C [dim]once[/]  -> pause emulation",
+                "Ctrl+Q [dim]once[/]  -> pause emulation",
                 "Type [bold]help/h/?[/] for commands",
             ]),
             title="RISC-V Interactive Debugger [bold green](rvdb)[/]",
@@ -275,7 +275,7 @@ class DispatchMixin(SharedMixinAttrs):
         sections: list[Table] = [
             self._section("执行控制", [
                 ("s/step [n]", "单步执行 n 条指令 (默认 1)"),
-                ("c/continue", "连续执行 (直到 Ctrl+C 暂停)"),
+                ("c/continue", "连续执行 (直到 Ctrl+Q 暂停)"),
                 ("r/run [n]", "执行 n 条指令 (默认 1)"),
                 ("undo/rollback", "回滚上一条指令"),
                 ("restart", "重置 hart/CLINT, 重新加载固件"),

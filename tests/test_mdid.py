@@ -3,17 +3,20 @@
 # SPDX-LICENSE-IDENTIFIER: GPL2.0
 
 """mdid CSR + mfence.did 指令测试 — TEE 飞地隔离与抗侧信道刷新."""
-
-
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import (
-    AccessFault, MemoryAccessFault, PageFault,
-    inject_memory_backend, mem_read, mem_write,
+    AccessFault,
+    inject_memory_backend,
+    mem_read,
+    mem_write,
+    MemoryAccessFault,
 )
-from pyremu.core.trap_def import TrapType, trap_cause_code
+from pyremu.core.trap_def import trap_cause_code, TrapType
 from pyremu.emulator import Emulator
 from pyremu.memory.bus import Bus
+from pyremu.memory.l2cache import L2CacheLine
+from pyremu.memory.pmp import Pmp, PmpAccessInfo
 from pyremu.memory.tlb import TLB, TLBLine
 from pyremu.platform import PlatformConfig
 
@@ -430,7 +433,6 @@ class TestMdidField:
         assert line.mdid == 0
 
     def test_l2_cache_line_has_mdid_default(self):
-        from pyremu.memory.l2cache import L2CacheLine
 
         line = L2CacheLine()
         assert hasattr(line, "mdid"), "L2CacheLine 应有 mdid 字段"
@@ -628,7 +630,6 @@ class TestPmpsplitPmpIsolation:
 
     def test_enclave_sees_only_assigned_entries(self):
         """mdid!=0 且 pmpsplit=4: PMP 条目 0-3 对飞地不可见, 4-7 正常检查."""
-        from pyremu.memory.pmp import Pmp, PmpAccessInfo
 
         pmp = Pmp({}, num_entries=8)
 
@@ -650,30 +651,40 @@ class TestPmpsplitPmpIsolation:
         )
 
         # Host 模式 (mdid=0): 两个条目都可见
-        info_host = PmpAccessInfo(pa=0x1000, size=4, mode_val=0, mstatus_val=0, pmpsplit=4, mdid=0)
+        info_host = PmpAccessInfo(
+            pa=0x1000, size=4, mode_val=0,
+            mstatus_val=0, pmpsplit=4, mdid=0
+        )
         assert pmp.check(info_host), "host 应能访问条目 0 的区域"
 
         # 飞地模式 (mdid=1, pmpsplit=4): 条目 0 不可见, 应 DENY
-        info_enc = PmpAccessInfo(pa=0x1000, size=4, mode_val=0, mstatus_val=0, pmpsplit=4, mdid=1)
+        info_enc = PmpAccessInfo(
+            pa=0x1000, size=4, mode_val=0,
+            mstatus_val=0, pmpsplit=4, mdid=1
+        )
         assert not pmp.check(info_enc), (
             "飞地不应能访问 host 的 PMP 条目 0 区域"
         )
 
         # 飞地应能访问条目 5 的区域
-        info_enc5 = PmpAccessInfo(pa=0x2000, size=4, mode_val=0, mstatus_val=0, pmpsplit=4, mdid=1)
+        info_enc5 = PmpAccessInfo(
+            pa=0x2000, size=4, mode_val=0,
+            mstatus_val=0, pmpsplit=4, mdid=1
+        )
         assert pmp.check(info_enc5), "飞地应能访问自己的 PMP 条目 5 区域"
 
     def test_enclave_no_entries_when_pmpsplit_exceeds(self):
         """pmpsplit >= num_entries -> 飞地无可用 PMP 条目, 全部拒绝."""
-        from pyremu.memory.pmp import Pmp, PmpAccessInfo
 
         pmp = Pmp({}, num_entries=8)
-        info = PmpAccessInfo(pa=0x1000, size=4, mode_val=0, mstatus_val=0, pmpsplit=8, mdid=1)
+        info = PmpAccessInfo(
+            pa=0x1000, size=4, mode_val=0,
+            mstatus_val=0, pmpsplit=8, mdid=1
+        )
         assert not pmp.check(info), "pmpsplit=8 >= num_entries=8 -> 飞地全拒"
 
     def test_pmpsplit_zero_legacy_all_visible(self):
         """pmpsplit=0 -> 飞地也能看到全部条目 (兼容模式)."""
-        from pyremu.memory.pmp import Pmp, PmpAccessInfo
 
         pmp = Pmp({}, num_entries=4)
 
@@ -692,7 +703,6 @@ class TestPmpsplitPmpIsolation:
 
     def test_host_always_sees_all_entries(self):
         """mdid=0 (host) 始终能看到全部 PMP 条目, 无视 pmpsplit."""
-        from pyremu.memory.pmp import Pmp, PmpAccessInfo
 
         pmp = Pmp({}, num_entries=8)
 
@@ -820,8 +830,6 @@ class TestPmpsplitMdidIntegration:
 
     def test_enclave_a_cannot_see_enclave_b_pmp_entries(self):
         """设置两个飞地各自的 PMP 区域后, 飞地 A 不能访问飞地 B 的物理内存."""
-        from pyremu.memory.pmp import Pmp, PmpAccessInfo
-
         pmp = Pmp({}, num_entries=16)
 
         class FakeCSR:
@@ -886,8 +894,8 @@ class TestPmpsplitMdidIntegration:
         # 验证各 hart 独立
         for hart_idx, mdid, pmpsplit in hart_configs:
             h = emu.harts[hart_idx]
-            assert h.mdid_val == mdid, f"Hart {i} mdid"
-            assert h.pmpsplit_val == pmpsplit, f"Hart {i} pmpsplit"
+            assert h.mdid_val == mdid, f"Hart {hart_idx} mdid"
+            assert h.pmpsplit_val == pmpsplit, f"Hart {hart_idx} pmpsplit"
 
     def test_pmpsplit_pmp_fault_on_enclave_access_host_region(self):
         """通过 hart 执行 store -> trap 验证 pmpsplit 阻止飞地访问 host 内存."""
@@ -917,12 +925,10 @@ class TestPmpsplitMdidIntegration:
         hart.mode = RiscvMode.S
 
         # 飞地写入自己的区域 (条目 4) -> OK
-        hart._consecutive_traps = 0
         mem_write(hart, 0x8000_2000, b"\xaa\xbb")
         assert hart.mcause_val == 0, f"飞地写自己的区域应成功: mcause={hart.mcause_val}"
 
         # 飞地写 host 区域 (条目 0, 对飞地不可见) -> StAccessFault
-        hart._consecutive_traps = 0
         try:
             mem_write(hart, 0x8000_1000, b"\xcc\xdd")
         except AccessFault:

@@ -102,65 +102,65 @@ pub(crate) use clear_csr;
 
 #[inline]
 pub fn read_sstatus() -> u64 {
-    read_csr!(sstatus)
+	read_csr!(sstatus)
 }
 #[inline]
 pub fn write_sstatus(v: u64) {
-    write_csr!(sstatus, v)
+	write_csr!(sstatus, v)
 }
 #[inline]
 pub fn read_sie() -> u64 {
-    read_csr!(sie)
+	read_csr!(sie)
 }
 #[inline]
 pub fn write_sie(v: u64) {
-    write_csr!(sie, v)
+	write_csr!(sie, v)
 }
 #[inline]
 pub fn read_sip() -> u64 {
-    read_csr!(sip)
+	read_csr!(sip)
 }
 #[inline]
 pub fn write_sip(v: u64) {
-    write_csr!(sip, v)
+	write_csr!(sip, v)
 }
 #[inline]
 pub fn read_satp() -> u64 {
-    read_csr!(satp)
+	read_csr!(satp)
 }
 #[inline]
 pub fn write_satp(v: u64) {
-    write_csr!(satp, v)
+	write_csr!(satp, v)
 }
 #[inline]
 pub fn read_sepc() -> u64 {
-    read_csr!(sepc)
+	read_csr!(sepc)
 }
 #[inline]
 pub fn write_sepc(v: u64) {
-    write_csr!(sepc, v)
+	write_csr!(sepc, v)
 }
 #[inline]
 pub fn read_stvec() -> u64 {
-    read_csr!(stvec)
+	read_csr!(stvec)
 }
 #[inline]
 pub fn write_stvec(v: u64) {
-    write_csr!(stvec, v)
+	write_csr!(stvec, v)
 }
 #[inline]
 pub fn read_scause() -> u64 {
-    read_csr!(scause)
+	read_csr!(scause)
 }
 #[inline]
 pub fn read_stval() -> u64 {
-    read_csr!(stval)
+	read_csr!(stval)
 }
 #[inline]
 pub fn read_sscratch() -> u64 {
-    read_csr!(sscratch)
+	read_csr!(sscratch)
 }
 #[inline]
 pub fn write_sscratch(v: u64) {
-    write_csr!(sscratch, v)
+	write_csr!(sscratch, v)
 }

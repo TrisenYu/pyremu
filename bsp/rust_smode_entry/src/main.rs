@@ -24,7 +24,7 @@ use core::panic::PanicInfo;
 use crate::constants::*;
 
 unsafe extern "C" {
-    static _end: u8;
+	static _end: u8;
 }
 
 core::arch::global_asm!(include_str!("entry.s"));
@@ -37,9 +37,9 @@ core::arch::global_asm!(include_str!("entry.s"));
 /// 寄存器约定一致（satp->a0, smode_sp->a1, va_offset->a2）。
 #[repr(C)]
 pub struct BootInfo {
-    pub satp: u64,
-    pub smode_sp: u64,
-    pub va_offset: u64,
+	pub satp: u64,
+	pub smode_sp: u64,
+	pub va_offset: u64,
 }
 
 /// 阶段一入口 — 由 entry.s 调用。
@@ -54,39 +54,39 @@ pub struct BootInfo {
 /// 隐式指针传递，破坏调用约定)。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_main_before_mmu(
-    ret_boot_info: *mut BootInfo,
-    enclave_id: u64,
-    man_pa_start: u64,
-    man_size: u64,
+	ret_boot_info: *mut BootInfo,
+	enclave_id: u64,
+	man_pa_start: u64,
+	man_size: u64,
 ) {
-    // uart::uart_init();
-    println!("[enclave] before MMU: id={enclave_id} pa=0x{man_pa_start:x} size=0x{man_size:x}\n");
-    // _end 符号已由 entry.s 中的 PIE 重定位调整至运行时地址 (base_pa + link_addr),
-    // 无需再加 load_offset, 否则会 double-count base_pa.
-    let end_pa = &raw const _end as u64;
+	// uart::uart_init();
+	println!("[enclave] before MMU: id={enclave_id} pa=0x{man_pa_start:x} size=0x{man_size:x}\n");
+	// _end 符号已由 entry.s 中的 PIE 重定位调整至运行时地址 (base_pa + link_addr),
+	// 无需再加 load_offset, 否则会 double-count base_pa.
+	let end_pa = &raw const _end as u64;
 
-    context::init_context(man_pa_start, ENCLAVE_MODULE_LOAD_VA_INIT);
+	context::init_context(man_pa_start, ENCLAVE_MODULE_LOAD_VA_INIT);
 
-    let pool_offset = end_pa - man_pa_start;
-    let pool_size = memory::page_down(memory::chunk_2m_up(end_pa) - end_pa);
-    memory::init_smode_pool(pool_offset, pool_size);
-    memory::map_smode_page_pool(pool_offset, pool_size);
-    memory::map_sections();
-    paging::setup_linear_map();
-    paging::identity_map_trampoline(man_pa_start);
+	let pool_offset = end_pa - man_pa_start;
+	let pool_size = memory::page_down(memory::chunk_2m_up(end_pa) - end_pa);
+	memory::init_smode_pool(pool_offset, pool_size);
+	memory::map_smode_page_pool(pool_offset, pool_size);
+	memory::map_sections();
+	paging::setup_linear_map();
+	paging::identity_map_trampoline(man_pa_start);
 
-    let root_pa = context::root_pa();
-    let satp_val = paging::init_satp(root_pa);
-    let smode_sp = unsafe { memory::alloc_smode_stack() };
-    let va_offset = ENCLAVE_MAN_VA_START.wrapping_sub(man_pa_start);
+	let root_pa = context::root_pa();
+	let satp_val = paging::init_satp(root_pa);
+	let smode_sp = unsafe { memory::alloc_smode_stack() };
+	let va_offset = ENCLAVE_MAN_VA_START.wrapping_sub(man_pa_start);
 
-    unsafe {
-        ret_boot_info.write(BootInfo {
-            satp: satp_val,
-            smode_sp,
-            va_offset,
-        });
-    }
+	unsafe {
+		ret_boot_info.write(BootInfo {
+			satp: satp_val,
+			smode_sp,
+			va_offset,
+		});
+	}
 }
 
 // ---------------------------------------------------------------
@@ -95,51 +95,51 @@ pub unsafe extern "C" fn rust_main_before_mmu(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_main_after_mmu() {
-    let (payload_pa, payload_size, argc) = ecall_aux::enclave_call_suspend(0);
+	let (payload_pa, payload_size, argc) = ecall_aux::enclave_call_suspend(0);
 
-    // 完整性证明: 执行载荷前先验证其尾部 ECDSA 签名。
-    // 载荷布局 [ bare | 64 字节签名 ]; 对 bare 做 SHA-256 后验签。
-    // ATTEST_ENABLE=false 时跳过 (签名流水线未就绪, 保持启动畅通)。
-    if ATTEST_ENABLE {
-        if !attest::attest_payload(payload_pa, payload_size) {
-            hang::hang_with_msg("[enclave] attestation failed — refusing to run payload");
-        }
-        println!("[enclave] attestation passed\n");
-    }
+	// 完整性证明: 执行载荷前先验证其尾部 ECDSA 签名。
+	// 载荷布局 [ bare | 64 字节签名 ]; 对 bare 做 SHA-256 后验签。
+	// ATTEST_ENABLE=false 时跳过 (签名流水线未就绪, 保持启动畅通)。
+	if ATTEST_ENABLE {
+		if !attest::attest_payload(payload_pa, payload_size) {
+			hang::hang_with_msg("[enclave] attestation failed — refusing to run payload");
+		}
+		println!("[enclave] attestation passed\n");
+	}
 
-    let argv_pa = payload_pa + memory::page_up(payload_size) + PAGE_SIZE;
-    let pool_start = memory::chunk_2m_down(argv_pa);
-    context::ctx_mut().umode_pool_pa_aligned = pool_start;
-    memory::init_umode_pool(
-        memory::page_up(argv_pa) - pool_start,
-        memory::page_down(
-            memory::chunk_2m_up(argv_pa + PAGE_SIZE) + CHUNK_2M_SIZE - (argv_pa + PAGE_SIZE),
-        ),
-    );
+	let argv_pa = payload_pa + memory::page_up(payload_size) + PAGE_SIZE;
+	let pool_start = memory::chunk_2m_down(argv_pa);
+	context::ctx_mut().umode_pool_pa_aligned = pool_start;
+	memory::init_umode_pool(
+		memory::page_up(argv_pa) - pool_start,
+		memory::page_down(
+			memory::chunk_2m_up(argv_pa + PAGE_SIZE) + CHUNK_2M_SIZE - (argv_pa + PAGE_SIZE),
+		),
+	);
 
-    let umode_sp = memory::alloc_map_umode_stack();
-    memory::map_user_argv(argv_pa, argc);
-    let entry = elf::load_elf(payload_pa, payload_size);
+	let umode_sp = memory::alloc_map_umode_stack();
+	memory::map_user_argv(argv_pa, argc);
+	let entry = elf::load_elf(payload_pa, payload_size);
 
-    // musl _start 要求 sp -> argc 的栈布局 (argc/argv/envp/auxv)
-    let umode_sp = setup_musl_stack(umode_sp, argc);
+	// musl _start 要求 sp -> argc 的栈布局 (argc/argv/envp/auxv)
+	let umode_sp = setup_musl_stack(umode_sp, argc);
 
-    context::ctx_mut().umode_heap_top = UMODE_HEAP_START_ALIGNED - memory::umode_pool_avail();
+	context::ctx_mut().umode_heap_top = UMODE_HEAP_START_ALIGNED - memory::umode_pool_avail();
 
-    let mut sstatus = csr::read_sstatus();
-    sstatus |= csr::SSTATUS_SUM;
-    sstatus &= !csr::SSTATUS_SPP;
+	let mut sstatus = csr::read_sstatus();
+	sstatus |= csr::SSTATUS_SUM;
+	sstatus &= !csr::SSTATUS_SPP;
 
-    csr::write_sstatus(sstatus);
-    csr::write_sepc(entry);
-    csr::write_sscratch(umode_sp);
-    csr::write_sie(csr::STI | csr::SSI);
+	csr::write_sstatus(sstatus);
+	csr::write_sepc(entry);
+	csr::write_sscratch(umode_sp);
+	csr::write_sie(csr::STI | csr::SSI);
 
-    let now: u64;
-    unsafe { core::arch::asm!("csrr {0}, time", out(reg) now) };
-    ecall_aux::sbi_set_timer(now + TIMER_INTERVAL);
+	let now: u64;
+	unsafe { core::arch::asm!("csrr {0}, time", out(reg) now) };
+	ecall_aux::sbi_set_timer(now + TIMER_INTERVAL);
 
-    println!("[enclave] entry=0x{entry:x} -> sret\n");
+	println!("[enclave] entry=0x{entry:x} -> sret\n");
 }
 
 // ---------------------------------------------------------------
@@ -154,35 +154,35 @@ const AT_GID: u64 = 13;
 /// 向 U-mode 栈写入 musl _start 期望的 argc/argv/envp/auxv 布局。
 /// 返回新的 sp (指向 argc)。
 fn setup_musl_stack(sp_top: u64, _argc: u64) -> u64 {
-    let mut sp = sp_top;
+	let mut sp = sp_top;
 
-    unsafe fn push_u64(sp: &mut u64, val: u64) {
-        *sp = sp.wrapping_sub(8);
-        unsafe { core::ptr::write_volatile(*sp as *mut u64, val) };
-    }
+	unsafe fn push_u64(sp: &mut u64, val: u64) {
+		*sp = sp.wrapping_sub(8);
+		unsafe { core::ptr::write_volatile(*sp as *mut u64, val) };
+	}
 
-    // auxv (先写入, 位于栈底)
-    unsafe {
-        push_u64(&mut sp, 0); // AT_NULL value
-        push_u64(&mut sp, AT_NULL); // AT_NULL type
-        push_u64(&mut sp, 0); // AT_GID = 0
-        push_u64(&mut sp, AT_GID); // AT_GID type
-        push_u64(&mut sp, 0); // AT_UID = 0
-        push_u64(&mut sp, AT_UID); // AT_UID type
-        push_u64(&mut sp, 0x1000); // AT_PAGESZ = 4096
-        push_u64(&mut sp, AT_PAGESZ); // AT_PAGESZ type
+	// auxv (先写入, 位于栈底)
+	unsafe {
+		push_u64(&mut sp, 0); // AT_NULL value
+		push_u64(&mut sp, AT_NULL); // AT_NULL type
+		push_u64(&mut sp, 0); // AT_GID = 0
+		push_u64(&mut sp, AT_GID); // AT_GID type
+		push_u64(&mut sp, 0); // AT_UID = 0
+		push_u64(&mut sp, AT_UID); // AT_UID type
+		push_u64(&mut sp, 0x1000); // AT_PAGESZ = 4096
+		push_u64(&mut sp, AT_PAGESZ); // AT_PAGESZ type
 
-        // envp (空)
-        push_u64(&mut sp, 0); // envp[0] = NULL
+		// envp (空)
+		push_u64(&mut sp, 0); // envp[0] = NULL
 
-        // argv (空, argc=0)
-        push_u64(&mut sp, 0); // argv[0] = NULL
+		// argv (空, argc=0)
+		push_u64(&mut sp, 0); // argv[0] = NULL
 
-        // argc
-        push_u64(&mut sp, 0); // argc = 0
-    }
+		// argc
+		push_u64(&mut sp, 0); // argc = 0
+	}
 
-    sp
+	sp
 }
 
 // ---------------------------------------------------------------
@@ -191,15 +191,15 @@ fn setup_musl_stack(sp_top: u64, _argc: u64) -> u64 {
 
 #[panic_handler]
 fn panic_handler(info: &PanicInfo) -> ! {
-    if let Some(loc) = info.location() {
-        println!(
-            "[panic] {}:{} — {}\n",
-            loc.file(),
-            loc.line(),
-            info.message()
-        );
-    } else {
-        println!("[panic] {}\n", info.message());
-    }
-    hang::hang()
+	if let Some(loc) = info.location() {
+		println!(
+			"[panic] {}:{} — {}\n",
+			loc.file(),
+			loc.line(),
+			info.message()
+		);
+	} else {
+		println!("[panic] {}\n", info.message());
+	}
+	hang::hang()
 }

@@ -103,6 +103,11 @@ class InterruptController(ABC):
         pass
 
     @abstractmethod
+    def get_mtimecmp(self, hart_id: int) -> int:
+        """返回指定 hart 的 mtimecmp 裸值."""
+        pass
+
+    @abstractmethod
     def get_next_timer_wakeup(self, hart_id: int) -> int:
         """返回 hart 的下一次定时器唤醒时间 (mtime 值); 0 = 无定时器.
 

@@ -17,7 +17,7 @@ CLINT 提供:
 寄存器布局 (SiFive 标准, 基址 0x0200_0000):
     MSIP_BASE     = 0x0000  (每个 hart 4 字节, bit 0 = software interrupt pending)
     MTIMECMP_BASE = 0x4000  (每个 hart 8 字节)
-    MTIME_BASE    = 0xBFF8  (8 字节, 全局共享)
+    time_base_val    = 0xBFF8  (8 字节, 全局共享)
 
 同时实现 InterruptController 和 Device 接口, 以便 Bus 和 Emulator 使用。
 """
@@ -26,6 +26,7 @@ from collections.abc import Callable
 
 from pyremu.interrupt.controller import INT_SOURCE_MIP_MASK, InterruptController, IntSource
 from pyremu.memory.bus import Device
+from pyremu.utils.mask import mask64
 
 # CLINT 标准基址 (SiFive)
 CLINT_BASE = 0x0200_0000
@@ -65,7 +66,7 @@ class CLINT(InterruptController, Device):
         # 每个 hart 的 MSIP (软件中断挂起): bit 0 有效
         self._msip = [0] * num_harts
 
-        # 每个 hart 的 MTIMECMP (定时器比较值): 64-bit
+        # 每个 hart 的 MTIMECMP (定时器比较值): 64-bit, 上电默认 0 (未配置)
         self._mtimecmp = [0] * num_harts
 
         # 全局 MTIME (单调计数器): 64-bit
@@ -146,15 +147,21 @@ class CLINT(InterruptController, Device):
         cmp = self._mtimecmp[hart_id]
         return cmp if cmp > 0 else 0
 
+    def get_mtimecmp(self, hart_id: int) -> int:
+        """返回指定 hart 的 mtimecmp 值 (裸值, 不做 >0 过滤)."""
+        if not (0 <= hart_id < self._num_harts):
+            return 0
+        return self._mtimecmp[hart_id]
+
     def set_mtimecmp(self, hart_id: int, val: int) -> None:
-        """设置指定 hart 的定时器比较值 (供 SSTC stimecmp CSR 写入同步)."""
+        """设置指定 hart 的定时器比较值."""
         if 0 <= hart_id < self._num_harts:
-            self._mtimecmp[hart_id] = val & 0xFFFF_FFFF_FFFF_FFFF
+            self._mtimecmp[hart_id] = mask64(val)
             self._notify_state_change()
 
     def tick(self, cycles: int = 1) -> None:
         """推进全局时钟."""
-        self._mtime = (self._mtime + cycles) & 0xFFFF_FFFF_FFFF_FFFF
+        self._mtime = mask64(self._mtime + cycles)
 
     # ----------------------------------------------------------
     #  Device 接口 (内存映射寄存器访问)
@@ -207,13 +214,13 @@ class CLINT(InterruptController, Device):
             local_off = offset - MTIMECMP_OFFSET
             hart_id = local_off // 8
             if 0 <= hart_id < self._num_harts:
-                self._mtimecmp[hart_id] = val & 0xFFFF_FFFF_FFFF_FFFF
+                self._mtimecmp[hart_id] = mask64(val)
                 self._notify_state_change()
             return
 
         # MTIME 寄存器
         if MTIME_OFFSET <= offset < MTIME_OFFSET + 8:
-            self._mtime = val & 0xFFFF_FFFF_FFFF_FFFF
+            self._mtime = mask64(val)
 
     # ----------------------------------------------------------
     #  属性

@@ -102,7 +102,7 @@
  *		which perform more than peephole optimization.  Please
  *		indicate the version of Dhrystone used when reporting the
  *		results to me.
- *		
+ *
  * RESULTS BEGIN HERE
  *
  *----------------DHRYSTONE VERSION 1.1 RESULTS BEGIN--------------------------
@@ -176,7 +176,7 @@
  * DEC PRO 380  11/73           Venix/PRO SVR2  cc               577     628
  * FHL QT+	68000-10Mhz	Os9/68000	version 1.3	 603	 649 FH
  * Apollo DN550	68010-?Mhz	AegisSR9/IX	cc 3.12		 666	 666
- * HP-110	8086-5.33Mhz	MSDOS 2.11	Aztec-C		 641	 676 
+ * HP-110	8086-5.33Mhz	MSDOS 2.11	Aztec-C		 641	 676
  * ATT PC6300	8086-8Mhz	MSDOS 2.11	b16cc 2.0	 632	 684
  * IBM PC/AT	80286-6Mhz	PCDOS 3.0	CI-C86 2.1	 666	 684
  * Tandy 6000	68000-8Mhz	Xenix 3.0	cc		 694	 694
@@ -284,7 +284,7 @@
  * VAX 11/785	-		UNIX 5.2	cc		2083	2083
  * VAX 11/785	-		VMS		VAX-11 C 2.0	2083	2083
  * VAX 11/785	-		UNIX SVR2	cc		2123	2083
- * VAX 11/785   -               ULTRIX-32 1.1   cc		2083    2091 
+ * VAX 11/785   -               ULTRIX-32 1.1   cc		2083    2091
  * VAX 11/785	-		UNIX 4.3bsd	cc		2135	2136
  * WICAT PB	68000-12.5Mhz	System V	WICAT C 4.1	1780	2233 S~
  * Pyramid 90x	-		OSx 2.3		cc		2272	2272
@@ -421,7 +421,7 @@ typedef struct Record RecordType;
 typedef RecordType *RecordPtr;
 typedef int boolean;
 
-#define TRUE 1
+#define TRUE  1
 #define FALSE 0
 
 void Proc0();

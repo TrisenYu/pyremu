@@ -9,24 +9,24 @@ import pytest
 
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
-from pyremu.emulator import Emulator
 from pyremu.core.mem_check_aux import (
-    MemoryAccessFault,
     check_instruction_fetch,
     inject_memory_backend,
     mem_read,
     mem_write,
+    MemoryAccessFault,
 )
 from pyremu.core.registers import _MmodeCSR
+from pyremu.emulator import Emulator
 from pyremu.memory.bus import Bus
 from pyremu.memory.pmp import (
+    decode_napot,
+    Pmp,
     PMP_A_NAPOT,
     PMP_R,
     PMP_W,
     PMP_X,
-    Pmp,
     PmpAccessInfo,
-    decode_napot,
 )
 
 # ============================================================
@@ -354,7 +354,6 @@ class TestPmpInHart:
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=False, w=True)
         hart.mode = RiscvMode.U
         hart._mem_write_phy(0x8000_1000, b"\xde\xad")
-        hart._consecutive_traps = 0
         try:
             mem_read(hart, 0x8000_1000, 4)
         except MemoryAccessFault:
@@ -527,7 +526,6 @@ class TestNativeBatchPmpFetch:
         # 切换到 S 模式
         hart.pc = 0x8020_1108
         hart.mode = RiscvMode.S
-        hart._consecutive_traps = 0
         hart.gprs[5] = 0
 
         emu.step()
@@ -551,7 +549,6 @@ class TestNativeBatchPmpFetch:
         # S 模式
         hart.pc = 0x8020_1108
         hart.mode = RiscvMode.S
-        hart._consecutive_traps = 0
         hart.gprs[5] = 0
 
         emu.step()
@@ -570,7 +567,6 @@ class TestNativeBatchPmpFetch:
 
         hart.pc = 0x8020_1108
         hart.mode = RiscvMode.S
-        hart._consecutive_traps = 0
         hart.gprs[5] = 0
 
         emu.step()
@@ -592,7 +588,6 @@ class TestNativeBatchPmpFetch:
 
         hart.pc = 0x8020_1108
         hart.mode = RiscvMode.M
-        hart._consecutive_traps = 0
         hart.gprs[5] = 0
 
         emu.step()

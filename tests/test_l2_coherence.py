@@ -28,7 +28,8 @@ def test_python_write_visible_to_native_read():
     # Verify via Python direct read (bypasses L2)
     direct = emu.bus._ram_read_direct(test_pa, 8)
     assert direct == test_val.to_bytes(8, byteorder="little"), (
-        f"Direct read after flush: expected {test_val:#018x}, got {int.from_bytes(direct, 'little'):#018x}"
+        f"Direct read after flush: expected {test_val:#018x},"+
+        f"got {int.from_bytes(direct, 'little'):#018x}"
     )
 
     # Verify via L2 read

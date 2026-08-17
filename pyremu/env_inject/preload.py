@@ -80,5 +80,8 @@ class Preloader:
         Returns:
             shellcode 入口地址.
         """
-        code = Path(path).read_bytes()
+        p = Path(path)
+        if not p.is_file():
+            raise FileNotFoundError(f"preload shellcode file not found: {p}")
+        code = p.read_bytes()
         return self.inject(code, addr)

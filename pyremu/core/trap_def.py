@@ -22,11 +22,17 @@ TrapType = Enum("TrapType", (
     "StAddrMisaligned",  # 6: 存储地址未对齐
     "StAccessFault",  # 7: 存储访问错误
     "EcallFromUmode",  # 8: U 模式 ecall
-    "EcallFromSmode",  # 9: S 模式 ecall
+    "EcallFromSmode",  # 9: S 模式 ecall  (also VS-mode)
+    "EcallFromHmode",  # 10: HS-mode ecall (reserved; normally M-mode handles via other means)
     "EcallFromMmode",  # 11: M 模式 ecall
     "InstrPageFault",  # 12: 指令页错误
     "LdPageFault",  # 13: 载入页错误
     "StPageFault",  # 15: 存储页错误
+    # H-extension guest-page faults (RISC-V privileged spec §8.6.2)
+    "InstrGuestPageFault",  # 20: 指令 guest-physical 页错误
+    "LdGuestPageFault",  # 21: 载入 guest-physical 页错误
+    "VirtualInstruction",  # 22: 虚拟指令 (HLVID emulation)
+    "StGuestPageFault",  # 23: 存储 guest-physical 页错误
     # === 中断 (Interrupt) — mcause bit 63 置 1 ===
     "SoftInterrupt",  # 软件中断 (通用)
     "UmodeSoftInterrupt",  # 0: U 模式软件中断
@@ -38,6 +44,12 @@ TrapType = Enum("TrapType", (
     "UmodeExternInterrupt",  # 8: U 模式外部中断
     "SmodeExternInterrupt",  # 9: S 模式外部中断
     "MmodeExternInterrupt",  # 11: M 模式外部中断
+    "HmodeSoftInterrupt",  # 2 (interrupt):  HS-mode 软件中断
+    "HmodeTimerInterrupt",  # 6 (interrupt):  HS-mode 定时器中断
+    "HmodeExternInterrupt",  # 10 (interrupt): HS-mode 外部中断
+    "VSmodeSoftInterrupt",  # 2 (interrupt):  VS-mode 软件中断 (same encoding as HS, context-dependent)
+    "VSmodeTimerInterrupt",  # 6 (interrupt):  VS-mode 定时器中断
+    "VSmodeExternInterrupt",  # 10 (interrupt): VS-mode 外部中断
 ))
 
 # ============================================================
@@ -59,21 +71,33 @@ _TRAP_CAUSE_CODE: dict[TrapType, int] = {
     TrapType.StAccessFault: 7,
     TrapType.EcallFromUmode: 8,
     TrapType.EcallFromSmode: 9,
+    TrapType.EcallFromHmode: 10,  # HS-mode ecall → 10 (reserved in spec; used here)
     TrapType.EcallFromMmode: 11,
     TrapType.InstrPageFault: 12,
     TrapType.LdPageFault: 13,
     TrapType.StPageFault: 15,
+    # H-extension guest-page faults
+    TrapType.InstrGuestPageFault: 20,
+    TrapType.LdGuestPageFault: 21,
+    TrapType.VirtualInstruction: 22,
+    TrapType.StGuestPageFault: 23,
     # 中断 (编号 | 中断标志位)
     TrapType.SoftInterrupt: 1 | (1 << 63),
     TrapType.UmodeSoftInterrupt: 0 | (1 << 63),
     TrapType.SmodeSoftInterrupt: 1 | (1 << 63),
     TrapType.MmodeSoftInterrupt: 3 | (1 << 63),
+    TrapType.HmodeSoftInterrupt: 2 | (1 << 63),
+    TrapType.VSmodeSoftInterrupt: 2 | (1 << 63),
     TrapType.UmodeTimerInterrupt: 4 | (1 << 63),
     TrapType.SmodeTimerInterrupt: 5 | (1 << 63),
     TrapType.MmodeTimerInterrupt: 7 | (1 << 63),
+    TrapType.HmodeTimerInterrupt: 6 | (1 << 63),
+    TrapType.VSmodeTimerInterrupt: 6 | (1 << 63),
     TrapType.UmodeExternInterrupt: 8 | (1 << 63),
     TrapType.SmodeExternInterrupt: 9 | (1 << 63),
     TrapType.MmodeExternInterrupt: 11 | (1 << 63),
+    TrapType.HmodeExternInterrupt: 10 | (1 << 63),
+    TrapType.VSmodeExternInterrupt: 10 | (1 << 63),
 }
 
 

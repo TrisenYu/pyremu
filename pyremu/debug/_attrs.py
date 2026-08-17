@@ -96,8 +96,6 @@ class SharedMixinAttrs:
 
     _MODE_COLORS: dict[str, str]
 
-    _show_diag: bool
-
     # UART stdin 转发 (终端 raw mode 管理)
     _stdin_forward: bool
     _stdin_fd: int

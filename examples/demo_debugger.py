@@ -6,11 +6,12 @@
     uv run python examples/demo_debugger.py
 """
 
-import sys
 from pathlib import Path
+import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from pyremu.configs_aux import elf_dir, path_join
 from pyremu.debugger import Debugger
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
@@ -18,7 +19,7 @@ from pyremu.utils.parse_bin import parse_firmware
 
 # 1. 创建模拟器并加载固件
 emu = Emulator(PlatformConfig.qemu_virt())
-fw = parse_firmware("tests/bins/elf/m_mode_to_s_mode.elf")
+fw = parse_firmware(path_join(elf_dir(), "m_mode_to_s_mode.elf"))
 emu.load_firmware(fw)
 
 # 2. 创建调试器 (默认 hart=0)

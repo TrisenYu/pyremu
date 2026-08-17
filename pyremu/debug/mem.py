@@ -18,11 +18,11 @@ from pyremu.core.mem_check_aux import translate_addr
 from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
 from pyremu.core.trap_def import trap_cause_name
 from pyremu.debug._attrs import SharedMixinAttrs
-from pyremu.debug.utils import MAX_INSTR_COUNT, check_rv64_addr, hex_addr
+from pyremu.debug.utils import check_rv64_addr, hex_addr, MAX_INSTR_COUNT
 from pyremu.memory.mmu import sv39_walk
 from pyremu.utils.disassem import disasm
-from pyremu.utils.wrapper import seize_val_err
 from pyremu.utils.mask import mask64
+from pyremu.utils.wrapper import seize_val_err
 
 # 反汇编着色常量
 _GPR_ALIASES = frozenset({

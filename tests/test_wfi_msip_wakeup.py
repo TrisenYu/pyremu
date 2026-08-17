@@ -1,5 +1,6 @@
 """WFI 被跨核 MSIP 唤醒的正确性测试 — 最小多核场景."""
 
+import os
 import struct
 
 import pytest
@@ -22,18 +23,8 @@ class TestWFIMsipWakeup:
 
     @pytest.fixture
     def emu_two_harts_native(self):
-        """启用 native batch 构造的双 hart Emulator (读取 native diag 计数器的用例需要)。
-
-        测试默认 PYREMU_NATIVE_BATCH=0; 此处构造时临时置 "1" 使 _native_states 就绪,
-        构造后由 conftest autouse 复位。"""
-        import os
         cfg = PlatformConfig(num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024)
-        prev = os.environ.get("PYREMU_NATIVE_BATCH")
-        os.environ["PYREMU_NATIVE_BATCH"] = "1"
-        try:
-            emu = Emulator(cfg, bootargs="")
-        finally:
-            os.environ["PYREMU_NATIVE_BATCH"] = prev if prev is not None else "0"
+        emu = Emulator(cfg, bootargs="")
         return emu
 
     @staticmethod
@@ -57,7 +48,7 @@ class TestWFIMsipWakeup:
         """
         emu = emu_two_harts
         self._setup_harts(emu)
-        h0, h1 = emu.harts[0], emu.harts[1]
+        _, h1 = emu.harts[0], emu.harts[1]
 
         # 在 H1 的 PC 位置写入 WFI 指令 + 自旋
         wfi_loop = struct.pack("<I", 0x10500073)  # wfi
@@ -88,12 +79,7 @@ class TestWFIMsipWakeup:
 
     def test_msip_wakes_wfi_hart_pure_python(self, emu_two_harts):
         """纯 Python 路径: MSIP 唤醒 WFI hart."""
-        import os
-        os.environ["PYREMU_NATIVE_BATCH"] = "0"
-        try:
-            self.test_msip_wakes_wfi_hart_native(emu_two_harts)
-        finally:
-            os.environ["PYREMU_NATIVE_BATCH"] = "0"
+        self.test_msip_wakes_wfi_hart_native(emu_two_harts)
 
     def test_no_msip_wfi_stays_waiting(self, emu_two_harts):
         """无 MSIP 时 WFI 保持等待."""
@@ -108,7 +94,8 @@ class TestWFIMsipWakeup:
         h1.pc = 0x80000100
         for _ in range(5):
             emu.step()
-        assert h1._waiting, f"H1 should still be in WFI (no MSIP sent), got waiting={h1._waiting}"
+        assert h1._waiting, \
+            f"H1 should still be in WFI (no MSIP sent), got waiting={h1._waiting}"
         assert h1.pc == 0x80000104, f"H1 PC should advance past WFI, got {h1.pc:#010x}"
 
     @pytest.mark.skip(
@@ -118,7 +105,6 @@ class TestWFIMsipWakeup:
         """验证 diag_clint_msip_set 计数器正确递增 (native batch 路径)."""
         emu = emu_two_harts_native
         self._setup_harts(emu)
-        h0, h1 = emu.harts[0], emu.harts[1]
         # 直接从 Python 写 CLINT MSIP[1]
         emu.bus.write(CLINT_BASE + 4, struct.pack("<I", 1))
         emu.step()

@@ -5,10 +5,12 @@
 """多 hart UART 行缓冲 + OpenSBI 彩票启动测试."""
 
 import functools
+from os import PathLike
 import re
 
 import pytest
 
+from pyremu.configs_aux import path_join, test_elf_dir
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import FirmwareImage, parse_firmware
@@ -30,11 +32,11 @@ def _strip_ansi(text: str) -> str:
 
 
 @functools.cache
-def _cached_firmware(path: str) -> FirmwareImage | None:
+def _cached_firmware(path: str | PathLike) -> FirmwareImage | None:
     return parse_firmware(path)
 
 
-_LOTTERY_ELF = "tests/bins/elf/lottery_boot.elf"
+_LOTTERY_ELF = path_join(test_elf_dir(), "lottery_boot.elf")
 # 固件在 1000 周期内即可完成彩票启动并输出全部关键行
 _LOTTERY_CYCLES = 1000
 
@@ -150,7 +152,6 @@ class TestUartLineBuffering:
 
     def test_per_hart_log_files(self, tmp_path):
         """日志文件按 hart 隔离 — 每个 hart 的日志文件含其完整输出."""
-        sink: list[str] = []
         emu = _make_emu(4)
         assert emu.uart is not None
         cap = _Capture()

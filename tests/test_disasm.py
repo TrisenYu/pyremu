@@ -161,7 +161,7 @@ class TestITypeALU:
 # ============================================================
 
 
-class TestRV64_32Bit:
+class TestRV64In32Bit:
     def test_addw(self):
         instr = _r_type(funct7=0, rs2=12, rs1=11, funct3=0, rd=10, opcode=OP32)
         assert disasm(instr, 0) == "addw         x10, x11, x12"
@@ -578,10 +578,10 @@ class TestCompressedLargeOffset:
         # 相同 raw 位但 funct3 改为 C.SDSP(111): bits[12:10]=101, bits[9:7]=000
         # 这会得到 offset = 0<<6 | 5<<3 = 40 — 巧合!
         # 用另一个能体现差异的 offset:
-        # C.SDSP 偏移 72: bits[12:10]=001, bits[9:7]=011 -> offset = 3<<6|1<<3 = 192+8=200... hmm
+        # C.SDSP 偏移 72: bits[12:10]=001, bits[9:7]=011 -> offset = 3<<6|1<<3 = 192+8=200...
         # Let me think of a better example.
         # C.SWSP offset 60: bits[12:9]=1111, bits[8:7]=00 -> offset = 0<<6|15<<2 = 60
-        # Same raw bits as C.SDSP: bits[12:10]=111, bits[9:7]=100 -> offset = 4<<6|7<<3 = 256+56 = 312
+        # Same raw bits as C.SDSP: bits[12:10]=111, bits[9:7]=100 -> offset = 312
         instr_swsp_60 = (0b110 << 13) | (15 << 9) | (5 << 2) | 0b10
         instr_sdsp_same = (0b111 << 13) | (7 << 10) | (4 << 7) | (5 << 2) | 0b10
         result_60 = disasm(instr_swsp_60, 0)

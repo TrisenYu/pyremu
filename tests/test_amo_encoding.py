@@ -13,7 +13,6 @@ from pyremu.core.hart import RiscvMode
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 
-
 # ============================================================
 #  编码: amoadd.w rd, rs2, (rs1)  — funct5=00000, func7 含 aq/rl
 # ============================================================

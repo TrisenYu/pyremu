@@ -25,6 +25,12 @@ from typing import TYPE_CHECKING
 from loguru import logger
 
 from pyremu.configs_aux import cfg_bool
+from pyremu.core.diag import (
+    log_ld_trap,
+    log_mret_to_u,
+    log_sret_to_u,
+    TRACE_SRET_TO_U,
+)
 from pyremu.core.hart import (
     MSTATUS_MIE,
     MSTATUS_MPIE,
@@ -35,7 +41,6 @@ from pyremu.core.hart import (
     MSTATUS_TW,
     RiscvMode,
 )
-from pyremu.core.diag import log_sret_to_u, log_mret_to_u, log_ld_trap, TRACE_SRET_TO_U
 from pyremu.core.trap_def import trap_cause_code, TrapType
 from pyremu.interrupt.controller import INT_SOURCE_MIP_MASK, IntSource
 from pyremu.utils.mask import mask64
@@ -86,6 +91,32 @@ _MODE_M = RiscvMode.M.value
 _MODE_S = RiscvMode.S.value
 _MODE_U = RiscvMode.U.value
 
+
+# ============================================================
+#  IMSIC eip trap-entry cleanup (legacy mode)
+# ============================================================
+
+
+def _imsic_clear_ipi_on_trap(hart: HartWithRegs, exc_code: int) -> None:
+    """Clear mip + IMSIC eip for software interrupt trap entry.
+
+    ``mip`` bit = ``1 << exc_code`` (MSIP=3→mip[3], SSIP=1→mip[1]).
+    IMSIC: MSIP→M-file IID=3, SSIP→S-file IID=1.
+    In AIA mode (eidelivery==1) eip is claimed via MTOPEI/STOPEI, not here.
+    """
+    hart.mip_val &= ~(1 << exc_code)
+    imsic = hart._imsic
+    if imsic is None:
+        return
+    if exc_code == 3:
+        file = imsic._files[hart.id][0]  # M-file
+    elif exc_code == 1:
+        file = imsic._files[hart.id][1]  # S-file
+    else:
+        return
+    if file.eidelivery == 0:
+        file.clear_pending(exc_code)
+
 # ============================================================
 #  Trap 处理
 # ============================================================
@@ -126,10 +157,6 @@ def deliver_trap(
     if was_wfi:
         hart._wfi_woken = True
 
-    # consecutive_traps is now tracked only at instruction boundaries
-    # (advance==0 && PC unchanged).  MRET/SRET resets it.
-    # Do NOT increment unconditionally here.
-
     # 获取 cause 编码 (中断标志已嵌入)
     code = trap_cause_code(cause)
     exc_code = code & 0x7FFF_FFFF_FFFF_FFFF  # 去掉 bit 63
@@ -149,15 +176,10 @@ def deliver_trap(
             f"exc_code={exc_code} mstatus={hart.mstatus_val:#018x}"
         )
         logger.debug(_ctx)
-    saved_pc = hart.pc
     if TRACE_SRET_TO_U:
         log_ld_trap(hart, code, tval)
     fn = _trap_deliver_smode if delegate else _trap_deliver_mmode
     fn(hart, code, exc_code, tval, is_interrupt)
-    # genuine trap-loop detection: PC didn't change -> same instruction
-    # keeps trapping
-    if hart.pc == saved_pc:
-        hart._consecutive_traps += 1
 
 
 # ---- S 模式 trap 投递 ----
@@ -210,16 +232,18 @@ def _trap_deliver_smode(
         # vectored: 所有异常跳转 BASE, 中断跳转 BASE + 4 * exc_code
         hart.pc = (tvec_base + 4 * exc_code)
 
-    # MSIP 中断投递到 S 模式: 同步清零 CLINT MSIP.
-    # 与 _trap_deliver_mmode 中的相同逻辑一致 — 当 MSIP 被 mideleg[3]=1
-    # 委派到 S 模式时, S-mode trap handler 可能无法通过 MMIO 清除 MSIP
-    # (需要访问仅 M-mode 可达的 CLINT 寄存器).  若不清零硬件源,
-    # sret 后 mip.MSIP 持续为 1 -> 死循环.
-    if is_interrupt and exc_code == 3:
+    # MSIP/SSIP 中断投递到 S 模式: 同步清零 CLINT MSIP + IMSIC eip.
+    # 在 AIA 模式下 IPI 通过 MEIP/SEIP (cause 11/9) 投递，eip 由 MTOPEI/
+    # STOPEI claim 清除，trap entry 不清理。
+    if not is_interrupt:
+        return
+    if exc_code == 3:  # MSIP (delegated to S)
         ctrl = hart._interrupt_ctrl
         if ctrl is not None:
             ctrl.clear_ipi(hart.id)
-        hart.mip_val &= ~(1 << 3)
+        _imsic_clear_ipi_on_trap(hart, exc_code)
+    elif exc_code == 1:  # SSIP
+        _imsic_clear_ipi_on_trap(hart, exc_code)
 
 
 # ---- M 模式 trap 投递 ----
@@ -277,26 +301,12 @@ def _trap_deliver_mmode(
     else:
         hart.pc = (tvec_base + 4 * exc_code)
 
-    # MSIP 中断: 同步清零 CLINT MSIP.
-    #
-    # RISC-V 规范: mip.MSIP 是只读位, 反映 CLINT 内存映射 MSIP 寄存器.
-    # 若 M 模式响应 MSIP 后不清零硬件源, mip.MSIP 将持续为 1,
-    # mret 后 check_pending_interrupts 立即再次命中 -> 死循环.
-    #
-    # 固件 handler 调用 sbi_ipi_process() -> mswi_ipi_clear() 尝试
-    # 写 0 到 CLINT MSIP, 但若该写入未达 CLINT (如 ACLINT MSWI 驱动
-    # 的基址与 CLINT 不一致), 则中断源永远不会被清除.
-    #
-    # 此处由模拟器保证: 当 MSIP 被 M 模式响应时, 硬件直接清零 CLINT 源.
-    # 这与某些 RISC-V 实现中 MSIP 为边沿触发自清零的行为一致.
+    # MSIP 中断: 同步清零 CLINT MSIP + IMSIC eip (legacy mode).
     if is_interrupt and exc_code == 3:  # MSIP (mcause code 3)
         ctrl = hart._interrupt_ctrl
         if ctrl is not None:
             ctrl.clear_ipi(hart.id)
-        # 同步清零 mip CSR (与 Rust ``state.mip &= !(1 << 3)`` 一致).
-        # 硬件源已清除, 但 check_pending_interrupts 中的 _update_hw_mip
-        # 在 deliver_trap 之前已执行, mip.MSIP 可能仍为 1.
-        hart.mip_val &= ~(1 << 3)
+        _imsic_clear_ipi_on_trap(hart, exc_code)
 
 
 # ============================================================
@@ -488,7 +498,7 @@ def try_wfi_wakeup(
 
     特殊处理 CLINT MSIP: 真实硬件上 CLINT 将 MSIP 位断言为独立物理中断线,
     WFI 由此唤醒不依赖 mie.MSIE (只要求 CLINT MSIP 寄存器非零).
-    mie.MSIE 仅控制该中断是否被 *投递*.  这与 Rust native batch
+    mie.MSIE 仅控制该中断是否被 *投递*.  这与加速所用的动态链接库中定义的函数
     ``try_wfi_wakeup`` 的行为一致 — 多核 TLB shootdown 场景中若
     mie.MSIE 因固件代码路径被意外清零, 跳过该条件可避免发送核在
     ``tlb_sync`` 中永远自旋的死锁.
@@ -517,19 +527,19 @@ def try_wfi_wakeup(
         mip_bits |= INT_SOURCE_MIP_MASK[IntSource.STI]
         has_pending = True
 
-    # PLIC 外部中断 (MEIP/SEIP) — CLINT.check_interrupt 不含 PLIC 源位,
-    # 但 _update_hw_mip 的 _HW_MIP_MASK 覆盖 MEIP/SEIP (bits 11/9),
-    # 若此处不补齐则 _update_hw_mip 会清除 _native_sync_plic_mip() 刚置位的
-    # SEIP/MEIP ->WFI 永远无法被 UART/virtio 等外设中断唤醒。
-    # 修正: 与 check_pending_interrupts (line 578-584) 相同的 PLIC 合并逻辑.
-    plic_mip = 0
-    if hart._plic is not None:
-        plic_mip = hart._plic.get_pending_mip(hart.id)
-    mip_bits = mip_bits | plic_mip
+    # AIA IMSIC 或 PLIC 外部中断 (MEIP/SEIP).
+    # Always query IMSIC when present — get_pending_mip's raw-eip
+    # fallback correctly reports IPIs even when eidelivery=0.
+    ext_mip = 0
+    if hart._imsic is not None:
+        ext_mip = hart._imsic.get_pending_mip(hart.id)
+    if ext_mip == 0 and hart._plic is not None:
+        ext_mip = hart._plic.get_pending_mip(hart.id)
+    mip_bits = mip_bits | ext_mip
 
     _update_hw_mip(hart, mip_bits)
 
-    if not has_pending and not msip_raw and plic_mip == 0:
+    if not has_pending and not msip_raw and ext_mip == 0:
         return False
 
     # WFI 唤醒: 检查 mip & mie (源级).  特殊处理 MSIP: 即使 mie.MSIE=0,
@@ -548,9 +558,7 @@ def try_wfi_wakeup(
     return True
 
 
-def check_pending_interrupts(
-    hart: HartWithRegs,
-) -> bool:
+def check_pending_interrupts(hart: HartWithRegs) -> bool:
     """在指令边界检查是否有待处理且使能的中断.
 
     若有, 则通过 _take_trap 注入中断并返回 True;
@@ -591,13 +599,25 @@ def check_pending_interrupts(
         mip_bits |= INT_SOURCE_MIP_MASK[IntSource.STI]
         has_pending = True
 
-    # 3. PLIC: 外部中断 (MEIP/SEIP)
-    plic_mip = 0
-    if hart._plic is not None:
-        plic_mip = hart._plic.get_pending_mip(hart.id)
+    # 3. 外部中断: IMSIC (AIA) 或 PLIC (legacy) — MEIP/SEIP
+    #    IMSIC 通过 eidelivery 控制当前谁在驱动外部中断线:
+    #    eidelivery=1 → MSI 模式, IMSIC eip/eie 驱动 MEIP/SEIP.
+    #    eidelivery=0 → legacy 模式, ext_irq drain 驱动 MEIP/SEIP.
+    #
+    #    Always query IMSIC when present — get_pending_mip's raw-eip
+    #    fallback correctly reports IPIs (IID=1,3) even when eidelivery=0.
+    #    Without this, cross-hart IPIs sent before the kernel sets
+    #    eidelivery=1 are invisible → SMP boot stalls until the ~1 s
+    #    cpu_up timeout expires.  PLIC is still consulted as a fallback
+    #    when IMSIC reports nothing.
+    ext_mip = 0
+    if hart._imsic is not None:
+        ext_mip = hart._imsic.get_pending_mip(hart.id)
+    if ext_mip == 0 and hart._plic is not None:
+        ext_mip = hart._plic.get_pending_mip(hart.id)
 
     # 合并全部硬件中断源
-    mip_bits = mip_bits | plic_mip
+    mip_bits = mip_bits | ext_mip
 
     # 更新 mip CSR: 用当前硬件状态替换硬件源位, 保留软件写入位.
     # 必须在 early return 之前执行 — 即使无 pending 中断, 也要清除已撤除的
@@ -605,7 +625,7 @@ def check_pending_interrupts(
     # 导致下次 mip & mie 仍命中 -> MSIP 风暴.
     _update_hw_mip(hart, mip_bits)
 
-    if not has_pending and plic_mip == 0:
+    if not has_pending and ext_mip == 0:
         # 无中断挂起 -> 更新缓存供后续快速路径使用
         hart._int_cache_version = hart._int_state_version
         hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)
@@ -655,17 +675,13 @@ def deliver_trap_nested_enabled(
 ) -> None:
     """deliver_trap 的嵌套中断变体.
 
-    与 deliver_trap 基本相同, 但对中断 trap 不递增 _consecutive_traps,
-    因为嵌套中断是预期中的正常行为, 不应触发连续 trap 保护机制.
+    与 deliver_trap 相同, 但用于嵌套中断投递场景 (中断 handler 内再次触发中断).
     """
     hart.clear_reservation()
     was_wfi = hart._waiting
     hart._waiting = False
     if was_wfi:
         hart._wfi_woken = True
-
-    # consecutive_traps is tracked at instruction boundaries;
-    # no unconditional increment here.
 
     code = trap_cause_code(cause)
     exc_code = code & 0x7FFF_FFFF_FFFF_FFFF
@@ -701,11 +717,41 @@ def check_pending_interrupts_nested_enabled(
             return False
 
     # ---- 全量中断检查 ----
+    # 1. CLINT: 定时器 + 软件中断
     has_pending, mip_bits, _ = ctrl.check_interrupt(hart.id)
 
+    # 2. STIP via stimecmp (Sstc 扩展)
+    #    S 模式直接写 stimecmp CSR 设置定时器, 无需 SBI ecall 往返.
+    #    硬件: mtime >= stimecmp > 0 ⇒ STIP 置位; 否则 STIP 清零.
+    stimecmp_val = hart._csr_read_raw("stimecmp")
+    if stimecmp_val > 0 and hart._interrupt_ctrl.get_mtime() >= stimecmp_val:
+        mip_bits |= INT_SOURCE_MIP_MASK[IntSource.STI]
+        has_pending = True
+
+    # 3. 外部中断: IMSIC (AIA) 或 PLIC (legacy) — MEIP/SEIP
+    #    IMSIC 通过 eidelivery 控制当前谁在驱动外部中断线:
+    #    eidelivery=1 → MSI 模式, IMSIC eip/eie 驱动 MEIP/SEIP.
+    #    eidelivery=0 → legacy 模式, ext_irq drain 驱动 MEIP/SEIP.
+    #
+    #    Always query IMSIC when present — get_pending_mip's raw-eip
+    #    fallback correctly reports IPIs (IID=1,3) even when eidelivery=0.
+    #    Without this, cross-hart IPIs sent before the kernel sets
+    #    eidelivery=1 are invisible → SMP boot stalls until the ~1 s
+    #    cpu_up timeout expires.  PLIC is still consulted as a fallback
+    #    when IMSIC reports nothing.
+    ext_mip = 0
+    if hart._imsic is not None:
+        ext_mip = hart._imsic.get_pending_mip(hart.id)
+    if ext_mip == 0 and hart._plic is not None:
+        ext_mip = hart._plic.get_pending_mip(hart.id)
+
+    # 合并全部硬件中断源
+    mip_bits = mip_bits | ext_mip
+
+    # 更新 mip CSR: 用当前硬件状态替换硬件源位, 保留软件写入位.
     _update_hw_mip(hart, mip_bits)
 
-    if not has_pending:
+    if not has_pending and ext_mip == 0:
         # 无中断挂起 -> 更新缓存
         hart._int_cache_version = hart._int_state_version
         hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)

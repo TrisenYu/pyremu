@@ -15,8 +15,10 @@ Usage::
     lo = mask32(value)         # 等价于 value & 0xFFFF_FFFF
 """
 
-MASK64: int = 0xFFFF_FFFF_FFFF_FFFF
-MASK32: int = 0xFFFF_FFFF
+MASK08: int = 0xFF
+MASK16: int = (MASK08 << 8) | MASK08
+MASK32: int = (MASK16 << 16) | MASK16
+MASK64: int = (MASK32 << 32) | MASK32
 
 
 def mask64(val: int) -> int:
@@ -28,6 +30,12 @@ def mask32(val: int) -> int:
     """将 *val* 截断为 32-bit 无符号整数 ``[0, 2^32)``."""
     return val & MASK32
 
+def mask16(val: int) -> int:
+    """将 *val* 截断为 16-bit 无符号整数 ``[0, 2^16)``."""
+    return val & MASK16
+
+def mask08(val: int) -> int:
+    return val & MASK08
 
 # ---------------------------------------------------------------
 #  Sign-extend helpers (moved from disassem.py to break circular import)
@@ -45,25 +53,25 @@ def sext(val: int, bits: int) -> int:
     sign_bit = 1 << (bits - 1)
     result = (val & (sign_bit - 1)) - (val & sign_bit)
     if bits <= 64:
-        result &= (1 << 64) - 1
+        result = mask64(result)
     return result
 
 
 def sext8(val: int) -> int:
     """Sign-extend from 8 bits -> canonical 64-bit unsigned."""
-    return (val & 0x7F) - (val & 0x80) & 0xFFFF_FFFF_FFFF_FFFF
+    return mask64((val & 0x7F) - (val & 0x80))
 
 
 def sext12(val: int) -> int:
     """Sign-extend from 12 bits -> canonical 64-bit unsigned."""
-    return (val & 0x7FF) - (val & 0x800) & 0xFFFF_FFFF_FFFF_FFFF
+    return mask64((val & 0x7FF) - (val & 0x800))
 
 
 def sext16(val: int) -> int:
     """Sign-extend from 16 bits -> canonical 64-bit unsigned."""
-    return (val & 0x7FFF) - (val & 0x8000) & 0xFFFF_FFFF_FFFF_FFFF
+    return mask64((val & 0x7FFF) - (val & 0x8000))
 
 
 def sext32(val: int) -> int:
     """Sign-extend from 32 bits -> canonical 64-bit unsigned."""
-    return (val & 0x7FFF_FFFF) - (val & 0x8000_0000) & 0xFFFF_FFFF_FFFF_FFFF
+    return mask64((val & 0x7FFF_FFFF) - (val & 0x8000_0000))

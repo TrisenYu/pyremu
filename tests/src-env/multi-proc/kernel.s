@@ -513,9 +513,9 @@ sched_no_wrap:
     li   t0, MAX_PROCS
     blt  t5, t0, sched_scan    // 未扫满一轮, 继续
 
-    // 无 READY 进程 -> idle
-    // (s_mode_idle 在文件末尾定义)
-    j    s_mode_idle_label
+    // 无 READY 进程 -> 停机
+    // (stop_machine 在文件末尾定义)
+    j    stop_machine
 
 sched_found:
     // current_pid ← t2
@@ -1004,9 +1004,16 @@ stack_top_m:
     .skip 4096
 stack_top_s:
 
-// ---- idle loop (back to .text) ----
+// ---- 停机序列 (back to .text) ----
+// 全部进程完成后执行: semihosting SYS_EXIT (QEMU 裸机测试同款约定),
+// 一个 hart 执行即停止整个引擎 (状态保留), run() 返回 / 调试器接管.
 .section .text
-s_mode_idle:
-s_mode_idle_label:
+stop_machine:
+    li   a0, 0x18
+    slli x0, x0, 0x1f
+    ebreak
+    srai x0, x0, 7
+    // 兜底: 纯 Python 路径无 semihosting, WFI 自旋
+stop_machine_idle:
     wfi
-    j    s_mode_idle_label
+    j    stop_machine_idle

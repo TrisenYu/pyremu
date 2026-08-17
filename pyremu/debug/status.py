@@ -14,10 +14,10 @@ from pyremu.core.trap_def import trap_cause_name
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.utils import (
     EXC_NAMES,
-    IRQ_NAMES,
     fmt_instr_count,
     hex_addr,
     ip_bits,
+    IRQ_NAMES,
 )
 
 
@@ -208,9 +208,6 @@ class StatusMixin(SharedMixinAttrs):
         tbl.add_column("Mode", style="yellow", width=5)
         tbl.add_column("State", width=8)
         tbl.add_column("Instr", justify="right")
-        if getattr(self, '_show_diag', False):
-            tbl.add_column("MSIP ↑/↓/wfi W0/W1r/s cds wak:M/T/O trap:D/S msk nt:wf/mode clint", justify="right")
-
         for h in harts:
             mark = "*" if h.id == active_hart else " "
             if h._halted:
@@ -223,17 +220,6 @@ class StatusMixin(SharedMixinAttrs):
             # execute, so their count stays unchanged while running
             # harts advance.
             instr_fmt = fmt_instr_count(h._total_instrs)
-            if getattr(self, '_show_diag', False):
-                mode_names = {0: "U", 1: "S", 2: "H", 3: "M", 8: "D"}
-                d = h.diag
-                nt_mode_str = mode_names.get(d.nt_mode, "?")
-                pen = d.nt_pending
-                msip_fmt = f"{d.msip_set}/{d.msip_clr}/{d.mtc_wr} " + \
-                f"{d.msip_wr0}/{d.wr1_remote}/{d.wr1_self} " + \
-                f"{d.cd_start} {d.wfi_wake_msip}/{d.wfi_wake_mtip}/{d.wfi_wake_other} " + \
-                f"{d.trap_msip_total}/{d.trap_msip_delegated} {d.msip_masked} " + \
-                f"{d.msip_no_trap}:{d.wfi_no_trap}/{nt_mode_str} "+ \
-                f"clint={d.nt_clint_raw:#x} pen={pen:#x}"
             tbl.add_row(
                 mark, str(h.id), hex_addr(h.pc),
                 h.mode.name, state, instr_fmt,
@@ -260,29 +246,7 @@ class StatusMixin(SharedMixinAttrs):
         tbl.add_row("mtvec", hex_addr(h.mtvec_val))
         tbl.add_row("satp", hex_addr(h.satp_val))
         tbl.add_row(
-            "连续 trap",
-            f"{h._consecutive_traps}/{self._emu._TRAP_LOOP_THRESHOLD} (阈值)",
-        )
-        tbl.add_row(
             "reservation",
             f"valid={h.reservation_valid}, addr=0x{h.reservation_addr:x}",
         )
-        if getattr(self, '_show_diag', False):
-            d = h.diag
-            tbl.add_row(
-                "MSIP edges",
-                f"set={d.msip_set}  clr={d.msip_clr}"
-                f"  wr0={d.msip_wr0}  wr1={d.msip_wr1}"
-                f"  trap_total={d.trap_msip_total}"
-                f"  delegated={d.trap_msip_delegated}",
-            )
-            mode_names = {0: "U", 1: "S", 2: "H", 3: "M", 8: "D"}
-            nt_mode_str = mode_names.get(d.nt_mode, "?")
-            tbl.add_row(
-                "MSIP no-trap snap",
-                f"mip=0x{d.nt_mip:016x}  mie=0x{d.nt_mie:016x}"
-                f"  mode={nt_mode_str}  clint_raw=0x{d.nt_clint_raw:02x}"
-                f"  pending=0x{d.nt_pending:016x}"
-                f"  msie_clr_pc=0x{d.msie_cleared_at:016x}",
-            )
         self._console.print(tbl)

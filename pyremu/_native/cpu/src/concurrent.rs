@@ -1,15 +1,11 @@
 //! Thread-per-hart concurrent execution engine.
 //!
-//! Replaces the sequential round-robin batch model with true OS-thread parallelism:
-//! one ``std::thread`` per non-halted hart, shared RAM via raw pointer (x86 TSO),
-//! CLINT state via ``Atomic*``, and AMO atomics via ``AtomicU32``/``AtomicU64``.
-//!
-//! ``run_parallel`` is the FFI entry point, mirroring ``run_batch``'s signature
-//! so the Python side can switch transparently.
+//! ``run_parallel`` is the FFI entry point so the Python side can switch transparently.
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
-
+use std::sync::{
+    atomic::AtomicBool, atomic::AtomicU32, atomic::AtomicU64, atomic::AtomicU8, atomic::Ordering,
+    Arc, Mutex,
+};
 
 // ============================================================
 //  Items extracted to sibling modules in cpu/src/
@@ -26,12 +22,9 @@ use crate::hart_sched::*;
 use crate::diag;
 
 use crate::state::{
-    exit_reason,
-	BatchResult, HartState, MemCtx,
-	FfiClintCtx, FfiDevCtx, FfiPmpCtx,
-	FfiUartCtx, FfiVirtIoCtx,
+    exit_reason, FfiClintCtx, FfiDevCtx, FfiPmpCtx, FfiUartCtx, FfiVirtIoCtx, FfiWatchdogCtx,
+    HartState, InstrToBeExec, MemCtx,
 };
-
 
 // ============================================================
 //  Send/Sync wrappers for FFI raw pointers
@@ -81,7 +74,6 @@ pub(crate) struct SharedDevCtx {
 unsafe impl Send for SharedDevCtx {}
 unsafe impl Sync for SharedDevCtx {}
 
-
 // ============================================================
 //  Concurrent CLINT context — Atomic wrappers around shared state
 // ============================================================
@@ -100,12 +92,16 @@ unsafe impl Sync for SharedDevCtx {}
 /// level-triggered detector would miss.
 pub struct ConcurrentClintCtx {
     pub base: u64,
-    /// Shared mtime counter — each hart increments atomically per instruction.
+    /// Shared mtime counter — advanced by clock source
+    /// (``advance_clock_source``), NOT per instruction.
     pub mtime: *const AtomicU64,
     /// Per-hart mtimecmp registers — indexed by hart_id.
     pub mtimecmp: *const AtomicU64,
     /// Per-hart MSIP level bytes — indexed by hart_id.
     pub msip: *const AtomicU8,
+    /// mtime 时钟源频率 (Hz) — 0 表示禁用 clock source
+    /// (Rust 单元测试传入 0 保持确定性).
+    pub timebase_hz: u64,
     pub num_harts: u32,
     /// Per-hart atomic MSIP pending slots (Release write from sender,
     /// Acquire swap from receiver).  Set after ``ModuleState`` creation.
@@ -115,6 +111,17 @@ pub struct ConcurrentClintCtx {
     /// Populated by ``run_harts`` after thread spawn; ``Cell`` enables
     /// late initialisation via ``&self`` (same pattern as ``msip_pending``).
     pub hart_threads: Cell<*const std::thread::Thread>,
+    /// Per-hart ``HartState`` array (FFI 共享的 hart 状态指针).
+    ///
+    /// 双重用途:
+    /// 1. 跨 hart 读取 ``stimecmp`` (SSTC) — ``wfi_check_all_idle`` 据此在全部
+    ///    hart WFI 空闲时快进 mtime 到下一截止时间, legacy 与 AIA 两种模式都需要
+    ///    (内核 clockevent 在 legacy 下同样走 SSTC).
+    /// 2. AIA 模式下 ``try_handle_imsic_concurrent`` 跨 hart 置/清目标 hart 的
+    ///    IMSIC eip 位 (seteipnum/clreipnum MMIO).
+    ///
+    /// 由 ``run_parallel`` 在 FFI 解包后无条件写入.
+    pub hart_states: Cell<*const HartState>,
 }
 
 // Safety: Python holds the backing ctypes arrays alive for the FFI call.
@@ -136,9 +143,11 @@ impl ConcurrentClintCtx {
             mtime: raw.mtime as *const AtomicU64,
             mtimecmp: raw.mtimecmp as *const AtomicU64,
             msip: raw.msip as *const AtomicU8,
+            timebase_hz: raw.timebase_hz,
             num_harts,
             msip_pending: Cell::new(std::ptr::null()),
             hart_threads: Cell::new(std::ptr::null()),
+            hart_states: Cell::new(std::ptr::null()),
         }
     }
 }
@@ -219,10 +228,25 @@ pub struct ModuleState {
     /// on ``HartState.mip`` between the sender's direct write and the receiver's
     /// ``sync_mtip``/``sync_msip`` calls.
     pub msip_pending: Box<[AtomicU64]>,
+    /// 本轮加速执行的时钟源基准 Instant (加速执行起点).
+    pub st_time_val: std::time::Instant,
+    /// 起始时的 mtime 值 (marshal 后的新鲜值).
+    /// 指令计数推进的基准: target = time_base_val + instr_delta * timebase_hz / 1e9.
+    pub time_base_val: u64,
+    /// 每 hart 起始指令计数引用 (与 ``time_base_val`` 同一基准).
+    /// ``advance_clock_source`` 用 ``state.total_instrs - instr_ref_num[hid]`` 计算
+    /// 本轮加速执行已执行的指令增量, 再换算为 mtime tick.
+    pub instr_ref_num: Box<[u64]>,
 }
 
 impl ModuleState {
-    pub fn new(num_harts: u32, active_hart_num: u32, init_tlb_gen: u64) -> Self {
+    pub fn new(
+        num_harts: u32,
+        active_hart_num: u32,
+        init_tlb_gen: u64,
+        time_base_val: u64,
+        instr_ref_num: Vec<u64>,
+    ) -> Self {
         let mut v = Vec::with_capacity(num_harts as usize);
         let mut gv = Vec::with_capacity(num_harts as usize);
         let mut rv = Vec::with_capacity(num_harts as usize);
@@ -243,6 +267,9 @@ impl ModuleState {
             tlb_gen_per_hart: gv.into_boxed_slice(),
             lr_reserved: rv.into_boxed_slice(),
             msip_pending: mv.into_boxed_slice(),
+            st_time_val: std::time::Instant::now(),
+            time_base_val,
+            instr_ref_num: instr_ref_num.into_boxed_slice(),
         }
     }
 
@@ -273,20 +300,20 @@ impl ModuleState {
 ///
 /// PLIC and device state lives on the Python side.  When a device raises
 /// (or lowers) an interrupt, Python updates this struct.  Rust checks
-/// ``pending`` periodically inside the hart loop; when set it exits the
-/// batch so Python can call ``_native_sync_plic_mip()`` to update each
+/// ``pending`` periodically inside the hart loop; when set it exits,
+/// Python can call ``_native_sync_plic_mip()`` to update each
 /// hart's ``mip`` with the latest PLIC-driven MEIP/SEIP bits.
 #[repr(C)]
 pub struct FfiExtIrqCtx {
     /// Non-zero: at least one external interrupt source is asserted and
-    /// the PLIC state may have changed.  Rust exits the batch on next check.
+    /// the PLIC state may have changed.  Rust exits on next check.
     pub pending: u8,
     /// Bitmap of pending interrupt sources.  Bit *i* corresponds to PLIC
     /// interrupt source *i* (1 = UART, 2 = VirtIO, …).  Updated atomically
     /// by Python; currently informational, may drive inline delivery later.
     pub sources: u32,
     /// Highest priority among currently-pending sources, or 0 if none.
-    /// Rust may skip the batch exit when priority ≤ the current hart's
+    /// Rust may skip and exit when priority <= the current hart's
     /// PLIC threshold (not yet implemented — always exits when pending≠0).
     pub max_priority: u8,
     pub _pad: [u8; 2],
@@ -296,8 +323,7 @@ pub struct FfiExtIrqCtx {
 pub struct FfiHartCtx {
     pub states: *mut HartState,
     pub num_harts: u32,
-    pub max_instrs: u64,
-    pub result: *mut BatchResult,
+    pub instr_group: *mut InstrToBeExec,
     pub stop_flag: *const u8,
     pub ext_irq: *mut FfiExtIrqCtx,
 }
@@ -311,6 +337,7 @@ pub struct FfiPeriphCtx {
     pub dev: *const FfiDevCtx,
     pub uart: *const FfiUartCtx,
     pub virtio: *const FfiVirtIoCtx,
+    pub watchdog: *const FfiWatchdogCtx,
 }
 
 /// Breakpoint configuration passed across the FFI boundary.
@@ -321,7 +348,7 @@ pub struct FfiBpCtx {
 }
 
 /// TLB generation counter passed across the FFI boundary (mutable —
-/// Rust writes back the post-batch values so they persist across calls).
+/// Rust writes back the values so they persist across calls).
 #[repr(C)]
 pub struct FfiTlbCtx {
     pub gen: *mut u64,
@@ -348,16 +375,16 @@ static EMPTY_UART: FfiUartCtx = FfiUartCtx {
 };
 
 #[inline]
-unsafe fn init_result(result: *mut BatchResult) {
-    (*result).total_instrs = 0;
-    (*result).exit_reason = exit_reason::NORMAL;
-    (*result).exit_hart_id = 0;
-    (*result).exit_pc = 0;
-    (*result).exit_instr = 0;
-    (*result).trap_cause = 0;
-    (*result).trap_tval = 0;
-    (*result).trap_is_interrupt = 0;
-    (*result).trap_delegated = 0;
+unsafe fn init_instr_group(instr_group: *mut InstrToBeExec) {
+    (*instr_group).total_instrs = 0;
+    (*instr_group).exit_reason = exit_reason::NORMAL;
+    (*instr_group).exit_hart_id = 0;
+    (*instr_group).exit_pc = 0;
+    (*instr_group).exit_instr = 0;
+    (*instr_group).trap_cause = 0;
+    (*instr_group).trap_tval = 0;
+    (*instr_group).trap_is_interrupt = 0;
+    (*instr_group).trap_delegated = 0;
 }
 
 #[inline]
@@ -383,6 +410,76 @@ unsafe fn build_bps(bp: *const FfiBpCtx) -> &'static [u64] {
     std::slice::from_raw_parts(bp.addrs, bp.count as usize)
 }
 
+/// 软件看门狗轮询周期 (µs) — 周期性向中断控制器发置位请求信号 (unpark 全部
+/// WFI hart) 的间隔, 兼作看门狗自身阻塞的周期.
+/// 与 Python 侧 ``WFI_WATCHDOG_MS`` (5 ms) 对齐.
+const WATCHDOG_POLL_US: u64 = 5_000;
+
+/// 唤醒所有已注册 hart 线程 — WFI hart 现以 ``park()`` 无限阻塞,
+/// 必须由看门狗/完成信号显式 ``unpark`` (解耦通知) 才能醒来.
+fn unpark_all_harts(clint: &ConcurrentClintCtx) {
+    let ptr = clint.hart_threads.get();
+    if ptr.is_null() {
+        return;
+    }
+    // Safety: ``hart_threads`` 由 ``run_harts`` 在线程全部 spawn 后写入,
+    // 并在 join 前保持有效; 本函数仅在 ``run_harts`` 生命周期内被调用.
+    let slice = unsafe { std::slice::from_raw_parts(ptr, clint.num_harts as usize) };
+    for t in slice {
+        t.unpark();
+    }
+}
+
+/// 软件看门狗线程 — 单轮加速执行内的唯一轮询者.
+///
+/// WFI hart 仅以 ``park()`` 阻塞等待 (由 MSIP 发送方或本看门狗 ``unpark``
+/// 唤醒), 不自行 ``park_timeout`` 轮询. 看门狗按固定周期
+/// (``WATCHDOG_POLL_US``, 时钟源) 周期性 ``unpark_all_harts`` 唤醒全部
+/// WFI hart: 被唤醒的 hart 重新执行 ``wfi_sync_and_check`` -> ``sync_mtip``/
+/// ``sync_msip``/``sync_imsic``, 由中断控制器判定定时器/软件/外部中断是否
+/// 挂起 (置位对应 mip 位), 挂起则退出 WFI 投递中断, 否则重新阻塞等待.
+///
+/// 定时器 (mtime) 的推进与截止判定都不归看门狗管: mtime 由活动 hart 在指令
+/// 边界按指令计数推进 (``advance_clock_source``), 全部 WFI 空闲时由
+/// ``wfi_check_all_idle`` 快进到下一截止时间.
+fn watchdog_loop(
+    module: &ModuleState,
+    clint: &ConcurrentClintCtx,
+    stop_flag: *const u8,
+    uart_rx_notify: *const u8,
+    timeout_ns: u64,
+) {
+    loop {
+        // 1. 时钟源超时 (终止条件): 越过 timeout_ns 时以 TIMEOUT 停止.
+        if timeout_ns != 0 && module.st_time_val.elapsed().as_nanos() as u64 >= timeout_ns {
+            module.request_stop(StopInfo {
+                reason: exit_reason::TIMEOUT,
+                ..StopInfo::empty()
+            });
+            unpark_all_harts(clint);
+            return;
+        }
+
+        // 2. 停止 / RX 检查: 有信号则唤醒全部 WFI hart 让其自行退出.
+        let internal_stop = module.stop_flag.load(Ordering::Acquire);
+        let external_stop = !stop_flag.is_null() && unsafe { *stop_flag != 0 };
+        let rx_ready = !uart_rx_notify.is_null() && unsafe { *uart_rx_notify != 0 };
+        if internal_stop || external_stop || rx_ready {
+            unpark_all_harts(clint);
+        }
+        if internal_stop || external_stop {
+            return;
+        }
+
+        // 3. 周期性向中断控制器发置位请求信号: unpark 全部 WFI hart, 让它们重新
+        //    执行 wfi_sync_and_check 判定定时器/软件/外部中断是否挂起并投递. mtime
+        //    由活动 hart 按指令计数推进, 看门狗无法预知 mtime 何时越过截止 (取决
+        //    于指令执行速率), 只能以固定周期唤醒.
+        unpark_all_harts(clint);
+        std::thread::park_timeout(std::time::Duration::from_micros(WATCHDOG_POLL_US));
+    }
+}
+
 /// Spawn one OS thread per hart, run ``hart_worker``, join all.
 unsafe fn run_harts(
     states: *mut HartState,
@@ -396,19 +493,30 @@ unsafe fn run_harts(
     uart_ffi: *const FfiUartCtx,
     module: &Arc<ModuleState>,
     breakpoints: &'static [u64],
-    max_instrs: u64,
+    timeout_ns: u64,
 ) {
-    let max_per_hart = if max_instrs == 0 {
-        u64::MAX
-    } else {
-        (max_instrs / num_harts as u64).max(1)
-    };
-
     let uart_ref: &'static FfiUartCtx = if uart_ffi.is_null() {
         &EMPTY_UART
     } else {
         std::mem::transmute(&*uart_ffi)
     };
+
+    // 软件看门狗: 先 spawn 以便把其 Thread 句柄 move 进每个 hart 闭包.
+    // 看门狗是单轮加速执行内唯一轮询者, 周期性向中断控制器发置位请求信号唤醒 WFI hart.
+    let clint_ptr: &'static ConcurrentClintCtx = std::mem::transmute(cc_clint);
+    let wd_module = Arc::clone(module);
+    let wd_stop_ptr = stop_flag as usize;
+    let wd_rx_ptr = uart_ref.rx_notify as usize;
+    let wd_handle = std::thread::spawn(move || {
+        watchdog_loop(
+            &wd_module,
+            clint_ptr,
+            wd_stop_ptr as *const u8,
+            wd_rx_ptr as *const u8,
+            timeout_ns,
+        );
+    });
+    let watchdog_thread = wd_handle.thread().clone();
 
     let mut handles = Vec::with_capacity(num_harts as usize);
     let mut thread_refs: Vec<std::thread::Thread> = Vec::with_capacity(num_harts as usize);
@@ -427,27 +535,36 @@ unsafe fn run_harts(
         let dev_send = shared_dev;
         let bp_send: &'static [u64] = std::mem::transmute(breakpoints);
         let state_addr = states.add(hid as usize) as usize;
-        let clint_ptr: &'static ConcurrentClintCtx = std::mem::transmute(cc_clint);
         let uart_ptr = uart_ref;
-        let mph = max_per_hart;
         let stop_ptr = stop_flag as usize;
         let ext_irq_ptr = ext_irq as usize;
+        let wd_thread = watchdog_thread.clone();
 
         let handle = std::thread::spawn(move || {
             let state = &mut *(state_addr as *mut HartState);
             hart_worker(
-                state, hid as u8, mem_send, pmp_send, dev_send,
-                clint_ptr, uart_ptr, &mref, bp_send, mph,
+                state,
+                hid as u8,
+                mem_send,
+                pmp_send,
+                dev_send,
+                clint_ptr,
+                uart_ptr,
+                &mref,
+                bp_send,
                 stop_ptr as *const u8,
                 ext_irq_ptr as *mut FfiExtIrqCtx,
             );
+            // 完成信号: 唤醒其余 WFI hart 与看门狗, 让单轮加速执行尽快收敛退出.
+            unpark_all_harts(clint_ptr);
+            wd_thread.unpark();
         });
         thread_refs.push(handle.thread().clone());
         handles.push(handle);
     }
 
-    // Store thread handles for MSIP unpark: sender calls unpark() on
-    // the receiver's thread to wake it from park_timeout in wfi_spin.
+    // Store thread handles for MSIP/unpark: 发送方 (MSIP) 与看门狗调用
+    // unpark() 唤醒接收方 hart 线程, 使其从 wfi_spin 的 park() 醒来.
     let thread_slice: Box<[std::thread::Thread]> = thread_refs.into_boxed_slice();
     cc_clint.hart_threads.set(thread_slice.as_ptr());
     std::mem::forget(thread_slice); // pointer valid until run_harts returns
@@ -455,29 +572,30 @@ unsafe fn run_harts(
     for h in handles {
         let _ = h.join();
     }
+    let _ = wd_handle.join();
 }
 
 #[inline]
-unsafe fn collect_stop(module: &ModuleState, result: *mut BatchResult) {
+unsafe fn collect_stop(module: &ModuleState, instr_group: *mut InstrToBeExec) {
     if let Ok(guard) = module.stop_info.lock() {
-        (*result).exit_reason = guard.reason;
-        (*result).exit_hart_id = guard.hart_id;
-        (*result).exit_pc = guard.pc;
-        (*result).exit_instr = guard.instr;
-        (*result).trap_cause = guard.trap_cause;
-        (*result).trap_tval = guard.trap_tval;
-        (*result).trap_is_interrupt = guard.trap_is_interrupt;
-        (*result).trap_delegated = guard.trap_delegated;
+        (*instr_group).exit_reason = guard.reason;
+        (*instr_group).exit_hart_id = guard.hart_id;
+        (*instr_group).exit_pc = guard.pc;
+        (*instr_group).exit_instr = guard.instr;
+        (*instr_group).trap_cause = guard.trap_cause;
+        (*instr_group).trap_tval = guard.trap_tval;
+        (*instr_group).trap_is_interrupt = guard.trap_is_interrupt;
+        (*instr_group).trap_delegated = guard.trap_delegated;
     }
 }
 
 #[inline]
-unsafe fn sum_instrs(states: *mut HartState, num_harts: u32, result: *mut BatchResult) {
+unsafe fn sum_instrs(states: *mut HartState, num_harts: u32, instr_group: *mut InstrToBeExec) {
     let mut total: u64 = 0;
     for hid in 0..num_harts {
         total = total.wrapping_add((*states.add(hid as usize)).total_instrs);
     }
-    (*result).total_instrs = total;
+    (*instr_group).total_instrs = total;
 }
 
 #[inline]
@@ -501,6 +619,39 @@ unsafe fn writeback_mtime(clint_raw: &FfiClintCtx, cc_clint: &ConcurrentClintCtx
     *clint_raw.mtime = (*cc_clint.mtime).load(Ordering::SeqCst);
 }
 
+/// 纳秒/秒 — Duration 换算为时钟 tick 的定义性常数.
+const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// 按指令计数推进 mtime.
+///
+/// mtime 以每 hart 本轮已执行的指令增量 ``state.total_instrs - instr_ref_num[hid]``
+/// 为源, 换算 ``ticks = instr_delta * timebase_hz / 1e9``. guest 时钟随已执行指令
+/// 数推进, 与时钟源无关.
+///
+/// 一轮加速执行中 mtime 不再冻结: 内核 rdtime 忙等 (udelay/自旋) 能在 acceleration
+/// 内观察到时间推进并退出, 延迟不再被量化为整批 (SMP bringup 超时根因).
+///
+/// ``fetch_max`` 保证单调: 多 hart 并发推进取最大值, 且不会被
+/// ``wfi_check_all_idle`` 的快进值回退.
+pub(crate) fn advance_clock_source(
+    module: &ModuleState,
+    clint: &ConcurrentClintCtx,
+    state: &HartState,
+) {
+    if clint.timebase_hz == 0 {
+        return;
+    }
+    let hid = state.mhartid as usize;
+    if hid >= module.instr_ref_num.len() {
+        return;
+    }
+    let instr_delta = state.total_instrs.wrapping_sub(module.instr_ref_num[hid]);
+    // instr_delta * timebase_hz: 峰值 ~4M * 10MHz = 4e13, 远小于 u64 上限, 无需 u128.
+    let ticks = instr_delta.saturating_mul(clint.timebase_hz) / NS_PER_SEC;
+    let target = module.time_base_val.wrapping_add(ticks);
+    unsafe { &*clint.mtime }.fetch_max(target, Ordering::Relaxed);
+}
+
 // ============================================================
 //  FFI entry point
 // ============================================================
@@ -519,9 +670,9 @@ pub unsafe extern "C" fn run_parallel(
     let states = hart.states;
     let num_harts = hart.num_harts;
 
-    // 2. Zero-initialise result + build contexts
+    // 2. Zero-initialise instr_group + build contexts
     let (mem, pmp_raw, clint_raw, dev_raw, cc_clint, active) = unsafe {
-        init_result(hart.result);
+        init_instr_group(hart.instr_group);
         (
             &*ffi.mem,
             &*ffi.pmp,
@@ -531,15 +682,47 @@ pub unsafe extern "C" fn run_parallel(
             count_active(states, num_harts),
         )
     };
+    // stimecmp (SSTC) 是内核 clockevent 在 legacy 与 AIA 两种模式下的共同定时器源.
+    // ``wfi_check_all_idle`` 通过本指针读取 stimecmp, 判断全部 WFI hart 空闲时
+    // 该把 mtime 快进到哪个截止. 无条件设置本指针
+    cc_clint.hart_states.set(states as *const HartState);
 
-    // 3. Module state (TLB gen persists across batches)
-    let tlb_gen_ptr = if tlb.is_null() { std::ptr::null_mut() } else { unsafe { (*tlb).gen } };
-    let tlb_gen_per_hart_ptr = if tlb.is_null() { std::ptr::null_mut() } else { unsafe { (*tlb).gen_per_hart } };
-    let init_gen = if tlb_gen_ptr.is_null() { 0 } else { unsafe { *tlb_gen_ptr } };
-    let module = Arc::new(ModuleState::new(num_harts, active, init_gen));
-    // Wire the msip_pending atomic channel into the CLINT context so
-    // senders can atomically signal the target hart's WFI loop.
+    // 3. Module state (TLB gen persists between different speedup stage)
+    let tlb_gen_ptr = if tlb.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*tlb).gen }
+    };
+    let tlb_gen_per_hart_ptr = if tlb.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*tlb).gen_per_hart }
+    };
+    let init_gen = if tlb_gen_ptr.is_null() {
+        0
+    } else {
+        unsafe { *tlb_gen_ptr }
+    };
+    // time_base_val = marshal 时的 mtime 值, advance_clock_source 以此为基准继续推进.
+    // instr_ref_num = 每个 hart 在 marshal 时的 total_instrs (指令计数推进基准).
+    let instr_ref_num: Vec<u64> = (0..num_harts as usize)
+        .map(|hid| unsafe { (*states.add(hid)).total_instrs })
+        .collect();
+    let module = Arc::new(ModuleState::new(
+        num_harts,
+        active,
+        init_gen,
+        unsafe { *clint_raw.mtime },
+        instr_ref_num,
+    ));
     cc_clint.msip_pending.set(module.msip_pending.as_ptr());
+
+    // 时钟源超时时间 (ns, 0 = 禁用) — 由 FfiWatchdogCtx 注入.
+    let timeout_ns = if ffi.watchdog.is_null() {
+        0
+    } else {
+        unsafe { (*ffi.watchdog).timeout_ns }
+    };
 
     // 4. Build shared contexts
     let virtio_raw: *mut FfiVirtIoCtx = if ffi.virtio.is_null() {
@@ -548,34 +731,53 @@ pub unsafe extern "C" fn run_parallel(
         ffi.virtio as *mut FfiVirtIoCtx
     };
     let shared_mem = SharedMemCtx {
-        ram: mem.ram, ram_size: mem.ram_size, ram_base: mem.ram_base,
-        shadow_base: mem.shadow_base, shadow_size: mem.shadow_size,
+        ram: mem.ram,
+        ram_size: mem.ram_size,
+        ram_base: mem.ram_base,
+        shadow_base: mem.shadow_base,
+        shadow_size: mem.shadow_size,
         lr_reserved: module.lr_reserved.as_ptr() as *mut AtomicU64,
     };
-    let shared_pmp = SharedPmpCtx { cfg: pmp_raw.cfg, addr: pmp_raw.addr, num: pmp_raw.num };
+    let shared_pmp = SharedPmpCtx {
+        cfg: pmp_raw.cfg,
+        addr: pmp_raw.addr,
+        num: pmp_raw.num,
+    };
     let shared_dev = SharedDevCtx {
-        bases: dev_raw.bases, ends: dev_raw.ends, num: dev_raw.num,
-        virtio_base: if virtio_raw.is_null() { 0 } else { unsafe { (*virtio_raw).base } },
+        bases: dev_raw.bases,
+        ends: dev_raw.ends,
+        num: dev_raw.num,
+        virtio_base: if virtio_raw.is_null() {
+            0
+        } else {
+            unsafe { (*virtio_raw).base }
+        },
         virtio_raw,
     };
 
-
     unsafe {
-		// 5. Spawn & join hart threads
+        // 5. Spawn & join hart threads
         run_harts(
-            states, num_harts, hart.stop_flag, hart.ext_irq,
-            shared_mem, shared_pmp, shared_dev,
-            &cc_clint, ffi.uart, &module,
-            build_bps(bp), hart.max_instrs,
+            states,
+            num_harts,
+            hart.stop_flag,
+            hart.ext_irq,
+            shared_mem,
+            shared_pmp,
+            shared_dev,
+            &cc_clint,
+            ffi.uart,
+            &module,
+            build_bps(bp),
+            timeout_ns,
         );
-		// 6. Collect results — single unsafe block for all write-backs
-	    collect_stop(&module, hart.result);
-        sum_instrs(states, num_harts, hart.result);
+        // 6. Collect results — single unsafe block for all write-backs
+        collect_stop(&module, hart.instr_group);
+        sum_instrs(states, num_harts, hart.instr_group);
         writeback_tlb(tlb_gen_ptr, tlb_gen_per_hart_ptr, &module, num_harts);
         writeback_mtime(clint_raw, &cc_clint);
     }
 }
-
 
 // ============================================================
 //  Tests
@@ -586,7 +788,7 @@ mod tests {
     use super::*;
     // Items extracted from this file into sibling modules — bring them
     // back in scope so tests can reference them directly.
-    use crate::state::riscv_mode;
+    use crate::state::{riscv_mode, PYREMU_AIA};
     use std::mem;
 
     fn make_state(pc: u64, hart_id: u64) -> HartState {
@@ -602,14 +804,14 @@ mod tests {
     unsafe fn call_run_parallel(
         states: *mut HartState,
         num_harts: u32,
-        max_instrs: u64,
-        result: *mut BatchResult,
+        instr_group: *mut InstrToBeExec,
         mem: *const MemCtx,
         pmp: *const FfiPmpCtx,
         clint: *const FfiClintCtx,
         dev: *const FfiDevCtx,
         uart: *const FfiUartCtx,
         virtio: *const FfiVirtIoCtx,
+        watchdog: *const FfiWatchdogCtx,
         bp_addrs: *const u64,
         bp_count: u32,
         stop_flag: *const u8,
@@ -618,16 +820,28 @@ mod tests {
         tlb_gen_per_hart: *mut u64,
     ) {
         let hart = FfiHartCtx {
-            states, num_harts, max_instrs, result, stop_flag, ext_irq,
+            states,
+            num_harts,
+            instr_group,
+            stop_flag,
+            ext_irq,
         };
         let periph = FfiPeriphCtx {
-            mem, pmp, clint, dev, uart, virtio,
+            mem,
+            pmp,
+            clint,
+            dev,
+            uart,
+            virtio,
+            watchdog,
         };
         let bp = FfiBpCtx {
-            addrs: bp_addrs, count: bp_count,
+            addrs: bp_addrs,
+            count: bp_count,
         };
         let mut tlb = FfiTlbCtx {
-            gen: tlb_gen, gen_per_hart: tlb_gen_per_hart,
+            gen: tlb_gen,
+            gen_per_hart: tlb_gen_per_hart,
         };
         run_parallel(&hart, &periph, &bp, &mut tlb);
     }
@@ -648,8 +862,7 @@ mod tests {
         ram_base: u64,
         shadow_base: u64,
         shadow_size: u64,
-        max_instrs: u64,
-        result: *mut BatchResult,
+        instr_group: *mut InstrToBeExec,
     ) {
         let mem = MemCtx {
             ram,
@@ -686,23 +899,25 @@ mod tests {
             mtimecmp: mtimecmp_vec.as_mut_ptr(),
             msip: msip_vec.as_mut_ptr(),
             base: 0,
+            timebase_hz: 0, // 单元测试禁用 clock-source 推进, 保持确定性
         };
         call_run_parallel(
             states,
             num,
-            max_instrs,
-            result,
+            instr_group,
             &mem as *const MemCtx,
             &pmp as *const FfiPmpCtx,
             &clint as *const FfiClintCtx,
             &dev as *const FfiDevCtx,
-            std::ptr::null(), // uart
-            std::ptr::null(), // virtio
-            std::ptr::null(), // bp_addrs
-            0,                // bp_count
-            std::ptr::null(), // stop_flag
+            std::ptr::null(),     // uart
+            std::ptr::null(),     // virtio
+            std::ptr::null(),     // watchdog
+            std::ptr::null(),     // bp_addrs
+            0,                    // bp_count
+            std::ptr::null(),     // stop_flag
             std::ptr::null_mut(), // ext_irq
-            std::ptr::null_mut(), std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         );
     }
 
@@ -717,8 +932,8 @@ mod tests {
         let mut state = make_state(0, 0);
         state.mode = riscv_mode::M; // WFI is NOP in M-mode when mip=0->enters waiting
         state.mie = 0;
-        state.mip = 0;
-        let mut result: BatchResult = unsafe { mem::zeroed() };
+        state.mip.store(0, Ordering::Release);
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
         unsafe {
             run_parallel_defaults(
                 &mut state as *mut HartState,
@@ -728,18 +943,105 @@ mod tests {
                 0,
                 0,
                 0,
-                100,
-                &mut result as *mut BatchResult,
+                &mut instr_group as *mut InstrToBeExec,
             );
         }
         assert_eq!(state.gprs[5], 15, "addi instructions should execute");
-        assert_eq!(result.exit_reason, exit_reason::WFI_WAIT);
+        assert_eq!(instr_group.exit_reason, exit_reason::WFI_WAIT);
+    }
+
+    /// Regression: WFI 阻塞时 stimecmp (SSTC) 截止必须在 legacy (非 AIA) 模式下
+    /// 被识别并快进 mtime. 修复前 ``run_parallel`` 仅在 ``PYREMU_AIA`` 下设置
+    /// ``hart_states``, legacy 模式下该指针恒为 null, ``wfi_check_all_idle`` 扫描不到
+    /// stimecmp → mtime 不推进 → 用 usleep_range() (SSTC) 睡眠的 hart 永不唤醒,
+    /// 辅助核上线握手 (cpuhp_ap_sync_alive) 死锁.
+    #[test]
+    fn wfi_fastforwards_mtime_to_stimecmp_in_legacy_mode() {
+        // 本测试明确覆盖 legacy 模式 (PYREMU_AIA=false) 下的 stimecmp 唤醒路径 —
+        // 修复前 ``run_parallel`` 以 PYREMU_AIA 门控 hart_states, legacy 模式下指针恒为
+        // null 导致 stimecmp 不可见. AIA 构建下该路径走 IMSIC 分支, 跳过本测试.
+        if PYREMU_AIA {
+            return;
+        }
+
+        let mut ram = vec![0u8; 256];
+        write_u32_le(&mut ram, 0, 0x1050_0073); // WFI
+
+        let mut state = make_state(0, 0);
+        state.mode = riscv_mode::M; // WFI 在 M 模式且 mip=0 时进入等待
+        state.mie = 0;
+        state.mip.store(0, Ordering::Release);
+        state.stimecmp = 5000; // 未来 SSTC 截止时间
+
+        let mem = MemCtx {
+            ram: ram.as_mut_ptr(),
+            ram_size: ram.len() as u64,
+            ram_base: 0,
+            shadow_base: 0,
+            shadow_size: 0,
+        };
+        let dev_bases: [u64; 0] = [];
+        let dev_ends: [u64; 0] = [];
+        let dev = FfiDevCtx {
+            bases: dev_bases.as_ptr(),
+            ends: dev_ends.as_ptr(),
+            num: 0,
+        };
+        // 单个 TOR 条目覆盖全地址空间 (R/W/X), 避免 pmp_ok 因 num==0 拒绝访问.
+        let mut pmp_cfg: [u8; 1] = [0x0F];
+        let mut pmp_addr: [u64; 1] = [u64::MAX];
+        let pmp = FfiPmpCtx {
+            cfg: pmp_cfg.as_mut_ptr(),
+            addr: pmp_addr.as_mut_ptr(),
+            num: 1,
+            pmpsplit: 0,
+        };
+
+        // mtimecmp 置 u64::MAX (无截止), stimecmp=5000 (唯一截止).
+        // mtime 由测试持有以便断言其被快进到 stimecmp.
+        let nh = 1usize;
+        let mut mtimecmp_vec: Vec<u64> = vec![u64::MAX; nh];
+        let mut msip_vec: Vec<u8> = vec![0u8; nh];
+        let mut mtime_val: u64 = 0;
+        let clint = FfiClintCtx {
+            mtime: &mut mtime_val as *mut u64,
+            mtimecmp: mtimecmp_vec.as_mut_ptr(),
+            msip: msip_vec.as_mut_ptr(),
+            base: 0,
+            timebase_hz: 0, // 禁用 clock-source 推进, mtime 仅由快进决定
+        };
+
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
+        unsafe {
+            call_run_parallel(
+                &mut state as *mut HartState,
+                1,
+                &mut instr_group as *mut InstrToBeExec,
+                &mem as *const MemCtx,
+                &pmp as *const FfiPmpCtx,
+                &clint as *const FfiClintCtx,
+                &dev as *const FfiDevCtx,
+                std::ptr::null(),     // uart
+                std::ptr::null(),     // virtio
+                std::ptr::null(),     // watchdog
+                std::ptr::null(),     // bp_addrs
+                0,                    // bp_count
+                std::ptr::null(),     // stop_flag
+                std::ptr::null_mut(), // ext_irq
+                std::ptr::null_mut(), // tlb_gen
+                std::ptr::null_mut(), // tlb_gen_per_hart
+            );
+        }
+        assert_eq!(
+            mtime_val, 5000,
+            "WFI 应快进 mtime 到 stimecmp 截止 (legacy 模式) — hart_states 必须在非 AIA 下也设置"
+        );
     }
 
     /// Test that ECALL delivers trap inline: mode -> M, PC -> mtvec,
     /// mepc = ECALL address.  The M-mode handler at mtvec advances
     /// mepc by 4 (to skip ECALL) and MRETs back to S-mode, where
-    /// WFI terminates the batch cleanly.
+    /// WFI terminates cleanly.
     #[test]
     fn parallel_ecall_inline_trap() {
         let mut ram = vec![0u8; 256];
@@ -766,9 +1068,9 @@ mod tests {
         state.mtvec = mtvec_addr;
         state.mstatus = (1 << 11) | (1 << 7); // MPP=S, MPIE=1
         state.mie = 0;
-        state.mip = 0;
+        state.mip.store(0, Ordering::Release);
 
-        let mut result: BatchResult = unsafe { mem::zeroed() };
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
         unsafe {
             run_parallel_defaults(
                 &mut state as *mut HartState,
@@ -778,15 +1080,14 @@ mod tests {
                 0,
                 0,
                 0,
-                100,
-                &mut result as *mut BatchResult,
+                &mut instr_group as *mut InstrToBeExec,
             );
         }
         // addi x5,0,1 executed before ECALL
         assert_eq!(state.gprs[5], 1);
         // ECALL trap delivered inline -> M-mode handler -> MRET -> S-mode -> WFI
         assert_eq!(
-            result.exit_reason,
+            instr_group.exit_reason,
             exit_reason::WFI_WAIT,
             "inline ECALL+M-mode handler+MRET+WFI->WFI_WAIT exit"
         );
@@ -807,14 +1108,14 @@ mod tests {
         let mut s0 = make_state(0, 0);
         s0.mode = riscv_mode::M; // WFI needs M-mode to avoid TW trap
         s0.mie = 0;
-        s0.mip = 0;
+        s0.mip.store(0, Ordering::Release);
         let mut s1 = make_state(128, 1);
         s1.mode = riscv_mode::M;
         s1.mie = 0;
-        s1.mip = 0;
+        s1.mip.store(0, Ordering::Release);
         let mut states = [s0, s1];
 
-        let mut result: BatchResult = unsafe { mem::zeroed() };
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
         unsafe {
             run_parallel_defaults(
                 states.as_mut_ptr(),
@@ -824,19 +1125,18 @@ mod tests {
                 0,
                 0,
                 0,
-                100,
-                &mut result as *mut BatchResult,
+                &mut instr_group as *mut InstrToBeExec,
             );
         }
         // Both harts finished their adds before entering WFI.
-        // Since all harts end up in WFI, the batch exits with WFI_WAIT.
+        // Since all harts end up in WFI, the exits with WFI_WAIT.
         assert_eq!(states[0].gprs[5], 13, "hart 0: x5 should be 13");
         assert_eq!(states[1].gprs[6], 27, "hart 1: x6 should be 27");
         assert_eq!(
-            result.exit_reason,
+            instr_group.exit_reason,
             exit_reason::WFI_WAIT,
             "both harts WFI -> should exit with WFI_WAIT, got {}",
-            result.exit_reason
+            instr_group.exit_reason
         );
     }
 
@@ -852,10 +1152,10 @@ mod tests {
         let mut state = make_state(0, 0);
         state.mode = riscv_mode::M;
         state.mie = 0;
-        state.mip = 0;
+        state.mip.store(0, Ordering::Release);
         state.gprs[7] = shared_addr; // addr
         state.gprs[6] = 3; // addend
-        let mut result: BatchResult = unsafe { mem::zeroed() };
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
         unsafe {
             run_parallel_defaults(
                 &mut state as *mut HartState,
@@ -865,8 +1165,7 @@ mod tests {
                 0,
                 0,
                 0,
-                100,
-                &mut result as *mut BatchResult,
+                &mut instr_group as *mut InstrToBeExec,
             );
         }
         let final_val = ram[shared_addr as usize] as u32
@@ -878,7 +1177,7 @@ mod tests {
             "single hart AMOADD: 42+3=45, got {}",
             final_val
         );
-        assert_eq!(result.exit_reason, exit_reason::WFI_WAIT);
+        assert_eq!(instr_group.exit_reason, exit_reason::WFI_WAIT);
     }
 
     #[test]
@@ -904,19 +1203,19 @@ mod tests {
         let mut s0 = make_state(0, 0);
         s0.mode = riscv_mode::M; // WFI needs M-mode
         s0.mie = 0;
-        s0.mip = 0;
+        s0.mip.store(0, Ordering::Release);
         s0.gprs[7] = shared_addr; // rs1 — address
         s0.gprs[6] = 3; // rs2 — value to add
 
         let mut s1 = make_state(128, 1);
         s1.mode = riscv_mode::M;
         s1.mie = 0;
-        s1.mip = 0;
+        s1.mip.store(0, Ordering::Release);
         s1.gprs[7] = shared_addr;
         s1.gprs[6] = 5;
 
         let mut states = [s0, s1];
-        let mut result: BatchResult = unsafe { mem::zeroed() };
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
         unsafe {
             run_parallel_defaults(
                 states.as_mut_ptr(),
@@ -926,8 +1225,7 @@ mod tests {
                 0,
                 0,
                 0,
-                100,
-                &mut result as *mut BatchResult,
+                &mut instr_group as *mut InstrToBeExec,
             );
         }
 
@@ -947,16 +1245,19 @@ mod tests {
     fn parallel_stop_on_mmio_store() {
         let mut ram = vec![0u8; 4096];
         let dev_addr: u64 = 0x1000_0000; // UART MMIO
-                                         // Hart 0: store x5 -> dev_addr (MMIO exit); Hart 1: addi x0,x0,0 loop
-                                         // sb x5, 0(x6)  where x6 = dev_addr, x5 = 0x41 ('A')
-        write_u32_le(&mut ram, 0, 0x0051_3023); // sd x5, 0(x2) — no, let me use a simple store
-                                                // Actually: sd x5, 0(x6) = 0x0053_3023 (stores x5 to [x6+0])
-        write_u32_le(&mut ram, 0, 0x0053_3023); // sd x5, 0(x6)
-                                                // Hart 1: NOP loop at offset 128 — enough iterations to stay alive
-        // until hart 0's MMIO store triggers the batch exit.
-        for i in 0..500 {
-            write_u32_le(&mut ram, (128 + i * 4) as usize, 0x0000_0013); // addi x0, x0, 0
-        }
+
+        // Hart 0: store x5 -> [x6] where x6 = dev_addr (MMIO store -> exit).
+        // sd x5, 0(x6) = 0x00533023 (rs2=x5, rs1=x6, imm=0).
+        write_u32_le(&mut ram, 0, 0x0053_3023);
+
+        // Hart 1: infinite two-instruction loop at offset 128 that advances PC
+        // every iteration (addi then jal back), so it stays alive forever and
+        // never triggers a stop condition (no MMIO / WFI / trap-loop).  The old
+        // finite NOP sequence ran off into 0x0000 (illegal compressed instr) and
+        // raised a racy TRAP exit that could beat hart 0's MMIO exit, making
+        // this test flaky under load.
+        write_u32_le(&mut ram, 128, 0x0010_8093); // addi x1, x1, 1
+        write_u32_le(&mut ram, 132, 0xffdf_f06f); // jal  x0, -4  -> back to 128
 
         let mut s0 = make_state(0, 0);
         s0.mode = riscv_mode::M; // Bare-mode VA=PA
@@ -1001,35 +1302,37 @@ mod tests {
             mtimecmp: mtimecmp_vec.as_mut_ptr(),
             msip: msip_vec.as_mut_ptr(),
             base: 0,
+            timebase_hz: 0, // 单元测试禁用 clock-source 推进, 保持确定性
         };
-        let mut result: BatchResult = unsafe { mem::zeroed() };
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
         unsafe {
             call_run_parallel(
                 states.as_mut_ptr(),
                 2,
-                100,
-                &mut result as *mut BatchResult,
+                &mut instr_group as *mut InstrToBeExec,
                 &mem as *const MemCtx,
                 &pmp as *const FfiPmpCtx,
                 &clint as *const FfiClintCtx,
                 &dev as *const FfiDevCtx,
-                std::ptr::null(), // uart
-                std::ptr::null(), // virtio
-                std::ptr::null(), // bp_addrs
-                0,                // bp_count
-                std::ptr::null(), // stop_flag
-            std::ptr::null_mut(), // ext_irq
-                std::ptr::null_mut(), std::ptr::null_mut(),
+                std::ptr::null(),     // uart
+                std::ptr::null(),     // virtio
+                std::ptr::null(),     // watchdog
+                std::ptr::null(),     // bp_addrs
+                0,                    // bp_count
+                std::ptr::null(),     // stop_flag
+                std::ptr::null_mut(), // ext_irq
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
             );
         }
 
-        // Store to device MMIO should trigger batch exit with MMIO reason.
+        // Store to device MMIO should trigger an exit with MMIO reason.
         assert_eq!(
-            result.exit_reason,
+            instr_group.exit_reason,
             exit_reason::MMIO,
-            "store to MMIO device should cause batch exit with MMIO reason"
+            "store to MMIO device should cause an exit with MMIO reason"
         );
-        assert_eq!(result.exit_hart_id, 0, "exit hart should be 0");
+        assert_eq!(instr_group.exit_hart_id, 0, "exit hart should be 0");
     }
 
     #[test]
@@ -1042,14 +1345,14 @@ mod tests {
         let mut s0 = make_state(0, 0);
         s0.mode = riscv_mode::M;
         s0.mie = 0;
-        s0.mip = 0;
+        s0.mip.store(0, Ordering::Release);
         let mut s1 = make_state(128, 1);
         s1.mode = riscv_mode::M;
         s1.mie = 0;
-        s1.mip = 0;
+        s1.mip.store(0, Ordering::Release);
         let mut states = [s0, s1];
 
-        let mut result: BatchResult = unsafe { mem::zeroed() };
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
         unsafe {
             run_parallel_defaults(
                 states.as_mut_ptr(),
@@ -1059,17 +1362,16 @@ mod tests {
                 0,
                 0,
                 0,
-                100,
-                &mut result as *mut BatchResult,
+                &mut instr_group as *mut InstrToBeExec,
             );
         }
 
-        // Both harts should be in WFI, and batch should exit with WFI_WAIT
+        // Both harts should be in WFI, and acceleration should exit with WFI_WAIT
         assert_eq!(
-            result.exit_reason,
+            instr_group.exit_reason,
             exit_reason::WFI_WAIT,
             "All WFI should cause WFI_WAIT exit, got {}",
-            result.exit_reason
+            instr_group.exit_reason
         );
         assert_eq!(states[0].waiting, 1);
         assert_eq!(states[1].waiting, 1);
@@ -1077,15 +1379,14 @@ mod tests {
 
     /// Helper: run_parallel with a custom CLINT base address.
     #[allow(unused)]
-	unsafe fn run_parallel_with_clint(
+    unsafe fn run_parallel_with_clint(
         states: *mut HartState,
         num: u32,
         ram: *mut u8,
         ram_sz: u64,
         ram_base: u64,
         clint_base: u64,
-        max_instrs: u64,
-        result: *mut BatchResult,
+        instr_group: *mut InstrToBeExec,
     ) {
         let mem = MemCtx {
             ram,
@@ -1121,23 +1422,25 @@ mod tests {
             mtimecmp: mtimecmp_vec.as_mut_ptr(),
             msip: msip_vec.as_mut_ptr(),
             base: clint_base,
+            timebase_hz: 0, // 单元测试禁用 clock-source 推进, 保持确定性
         };
         call_run_parallel(
             states,
             num,
-            max_instrs,
-            result,
+            instr_group,
             &mem as *const MemCtx,
             &pmp as *const FfiPmpCtx,
             &clint as *const FfiClintCtx,
             &dev as *const FfiDevCtx,
-            std::ptr::null(), // uart
-            std::ptr::null(), // virtio
-            std::ptr::null(), // bp_addrs
-            0,                // bp_count
-            std::ptr::null(), // stop_flag
+            std::ptr::null(),     // uart
+            std::ptr::null(),     // virtio
+            std::ptr::null(),     // watchdog
+            std::ptr::null(),     // bp_addrs
+            0,                    // bp_count
+            std::ptr::null(),     // stop_flag
             std::ptr::null_mut(), // ext_irq
-            std::ptr::null_mut(), std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         );
     }
 
@@ -1147,15 +1450,20 @@ mod tests {
         let mut ram = vec![0u8; 1024];
         let clint_base: u64 = 0x2000000;
 
-        // Single hart in M-mode writes to CLINT MSIP for hart 0 (self).
-        // 0x00: addi t0, x0, 0x42        ->t0 = 0x42 (control: prove PROLOGUE runs)
-        // 0x04: sw   t0, 0x1000(x0)     ->store to RAM (control: prove STORE works)
+        // Single hart in M-mode writes to CLINT MSIP for hart 0 (self),
+        // then enters WFI.  With MSIE enabled and MIE=1, the pending MSIP
+        // triggers a trap to mtvec (0x200) which does MRET, resuming at the
+        // instruction after WFI (a second WFI) for a clean all-idle exit.
+        // 0x00: addi t0, x0, 0x42        ->t0 = 0x42 (control)
+        // 0x04: sw   t0, 0x1000(x0)     ->store to RAM (control)
         // 0x08: lui  t0, 0x20000        ->t0 = 0x20000000
-        // 0x0C: addi t0, t0, 0          ->t0 = 0x20000000 (CLINT MSIP for hart 0)
+        // 0x0C: addi t0, t0, 0          ->t0 = 0x20000000 (CLINT MSIP hart 0)
         // 0x10: addi t1, x0, 1          ->t1 = 1
         // 0x14: sw   t1, 0(t0)          ->write MSIP=1 for hart 0
-        // 0x18: addi t2, x0, 0x42       ->t2 = 0x42 (proves CLINT write succeeded)
-        // 0x1C: wfi                      ->exit
+        // 0x18: addi t2, x0, 0x42       ->t2 = 0x42 (proves CLINT write OK)
+        // 0x1C: wfi                      ->enter WFI, MSIP pending → trap
+        // 0x20: wfi                      ->reached after MSI handler mrets;
+        //                                    MSIP cleared → all-idle 退出
         write_u32_le(&mut ram, 0x00, 0x04200293); // addi t0, x0, 0x42
         write_u32_le(&mut ram, 0x04, 0x00502023); // sw t0, 0(x0) — RAM store to PA 0
         write_u32_le(&mut ram, 0x08, 0x020002B7); // lui t0, 0x2000 ->t0 = 0x2000000
@@ -1164,19 +1472,27 @@ mod tests {
         write_u32_le(&mut ram, 0x14, 0x0062A023); // sw t1, 0(t0)
         write_u32_le(&mut ram, 0x18, 0x04200393); // addi t2, x0, 0x42
         write_u32_le(&mut ram, 0x1C, 0x10500073); // wfi
+        write_u32_le(&mut ram, 0x20, 0x10500073); // wfi
 
         let mut state = HartState {
             pc: 0,
             mode: riscv_mode::M,
-            mstatus: 0,
+            mstatus: (3 << 11) | (1 << 7) | (1 << 3), // MPP=M, MPIE=1, MIE=1
             ..unsafe { std::mem::zeroed() }
         };
-        state.mie = 0;
-        state.mip = 0;
-        state.mtvec = 0x200; // in case of trap, MRET at 0x200
-        write_u32_le(&mut ram, 0x200, 0x30200073); // mret
+        state.mie = 1 << 3;  // MSIE — allow MSI to be taken
+        state.mip.store(0, Ordering::Release);
+        // M-mode trap handler at 0x200: clear CLINT MSIP for hart 0
+        // to prevent re-triggering the level-triggered interrupt, then MRET.
+        // 0x200: lui  t1, 0x20000    ->t1 = 0x20000000 (CLINT base)
+        // 0x204: sw   x0, 0(t1)      ->CLINT[hart0].msip = 0
+        // 0x208: mret
+        state.mtvec = 0x200;
+        write_u32_le(&mut ram, 0x200, 0x02000337); // lui t1, 0x20000
+        write_u32_le(&mut ram, 0x204, 0x00032023); // sw x0, 0(t1)
+        write_u32_le(&mut ram, 0x208, 0x30200073); // mret
 
-        let mut result: BatchResult = unsafe { mem::zeroed() };
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
 
         unsafe {
             run_parallel_with_clint(
@@ -1186,27 +1502,34 @@ mod tests {
                 ram.len() as u64,
                 0,
                 clint_base,
-                50,
-                &mut result as *mut BatchResult,
+                &mut instr_group as *mut InstrToBeExec,
             );
         }
 
         // RAM store at 0x04 should have written 0x42 to PA=0
         assert_eq!(ram[0], 0x42, "RAM store should have set RAM[0]=0x42");
-        assert_eq!(state.gprs[5], 0x2000000, "t0 should = 0x2000000; got {:#x}", state.gprs[5]);
-        assert_eq!(state.gprs[7], 0x42,
-            "CLINT MSIP write should succeed; t2={:#x}", state.gprs[7]);
+        assert_eq!(
+            state.gprs[5], 0x2000000,
+            "t0 should = 0x2000000; got {:#x}",
+            state.gprs[5]
+        );
+        assert_eq!(
+            state.gprs[7], 0x42,
+            "CLINT MSIP write should succeed; t2={:#x}",
+            state.gprs[7]
+        );
         assert_eq!(state.halted, 0, "hart should not be halted");
     }
 
     /// Cross-hart MSI delivery test.
     ///
-    /// Hart 0 sends an MSI to Hart 1 via CLINT MMIO write, then spins.
+    /// Hart 0 sends an MSI to Hart 1 via CLINT MMIO write, then enters WFI.
     /// Hart 1 starts in WFI, should wake on MSI, trap to M-mode handler
     /// (which does MRET), and execute the marker instruction after WFI.
-    /// After the batch, Hart 1's t0 MUST be 0x42 — proving the MSI was
+    /// Hart 1's t0 MUST be 0x42 — proving the MSI was
     /// delivered, the trap handler ran, and execution resumed at the
-    /// instruction following WFI.
+    /// instruction following WFI.  Both harts then idle → WFI_WAIT exit
+    /// (no instruction quota).
     #[test]
     fn cross_hart_msip_wakes_target() {
         let mut ram = vec![0u8; 4096];
@@ -1221,8 +1544,10 @@ mod tests {
         // 0x10: addi t0, t0, 4         ->t0 = 0x20000004 (CLINT MSIP for hart 1)
         // 0x14: addi t1, x0, 1         ->t1 = 1
         // 0x18: sw   t1, 0(t0)         ->write MSIP=1 for hart 1
-        // 0x1C: addi x0, x0, 0          ->NOP (avoid jal-self consecutive_traps)
-        // 0x20: jal  x0, -12           ->jump back to 0x1C (spin loop)
+        // 0x1C: addi x0, x0, 0          ->NOP
+        // 0x20: wfi                    ->hart 0 进入 WFI; 两个 hart 全部空闲后
+        //                                 all-idle 检测退出acceleration(无指令配额,
+        //                                 靠自然停止条件终止执行)
         write_u32_le(&mut ram, 0x00, 0x20000293); // addi t0, x0, 512
         write_u32_le(&mut ram, 0x04, 0xFFF28293); // addi t0, t0, -1
         write_u32_le(&mut ram, 0x08, 0xFE029EE3); // bnez t0, -8  -> PC=0x04
@@ -1231,7 +1556,7 @@ mod tests {
         write_u32_le(&mut ram, 0x14, 0x00100313); // addi t1, x0, 1
         write_u32_le(&mut ram, 0x18, 0x0062A023); // sw t1, 0(t0)
         write_u32_le(&mut ram, 0x1C, 0x00000013); // addi x0, x0, 0 (NOP)
-        write_u32_le(&mut ram, 0x20, 0xFFDFF06F); // jal x0, -12 -> PC=0x1C
+        write_u32_le(&mut ram, 0x20, 0x10500073); // wfi
 
         // --- Hart 1 instructions (PC=0x100) ---
         // 0x100: wfi                    ->enter WFI
@@ -1267,19 +1592,19 @@ mod tests {
         let mut s0 = make_state(0, 0);
         s0.mode = riscv_mode::M;
         s0.mie = 0;
-        s0.mip = 0;
+        s0.mip.store(0, Ordering::Release);
         s0.mtvec = 0x200; // valid MRET handler at 0x200 (shared with Hart 1)
 
         // --- Hart 1 state ---
         let mut s1 = make_state(0x100, 1);
         s1.mode = riscv_mode::M;
-        s1.mie = 0;                       // no interrupts enabled initially
-        s1.mip = 0;                       // no interrupts pending
-        s1.mtvec = 0x300;                 // M-mode handler at 0x300 (clears MSIP then MRET)
+        s1.mie = 0; // no interrupts enabled initially
+        s1.mip.store(0, Ordering::Release); // no interrupts pending
+        s1.mtvec = 0x300; // M-mode handler at 0x300 (clears MSIP then MRET)
         s1.mstatus = (3 << 11) | (1 << 7) | (1 << 3); // MPP=M, MPIE=1, MIE=1
 
         let mut states = [s0, s1];
-        let mut result: BatchResult = unsafe { mem::zeroed() };
+        let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
 
         unsafe {
             run_parallel_with_clint(
@@ -1289,26 +1614,27 @@ mod tests {
                 ram.len() as u64,
                 0, // ram_base
                 clint_base,
-                100_000, // max_instrs — enough for delay + spin + MSI delivery
-                &mut result as *mut BatchResult,
+                &mut instr_group as *mut InstrToBeExec,
             );
         }
 
         // MSI MUST have been detected by Hart 1's sync_msip.
-        assert!(states[1].diag.msip_last_seen > 0,
-            "Hart 1 should have detected MSIP via sync_msip");
+        assert!(
+            states[1].diag.msip_last_seen > 0,
+            "Hart 1 should have detected MSIP via sync_msip"
+        );
 
         // mcause MUST indicate MSI was delivered (bit 63=1=interrupt, code=3=MSI).
         let is_interrupt = (states[1].mcause >> 63) != 0;
         let cause_code = states[1].mcause & 0x7FFF_FFFF_FFFF_FFFF;
-        assert!(is_interrupt && cause_code == 3,
-            "Hart 1 mcause should show MSI interrupt; got mcause={:#x}", states[1].mcause);
+        assert!(
+            is_interrupt && cause_code == 3,
+            "Hart 1 mcause should show MSI interrupt; got mcause={:#x}",
+            states[1].mcause
+        );
 
-        // Hart 1 must NOT have halted or consecutive traps (no trap loop).
+        // Hart 1 must NOT have halted (no trap loop).
         assert_eq!(states[1].halted, 0, "Hart 1 should not be halted");
-        assert_eq!(states[1].consecutive_traps, 0,
-            "Hart 1 consecutive_traps should be 0; got {}",
-            states[1].consecutive_traps);
 
         // The marker value: if MSI arrived AFTER WFI, PC advances past WFI
         // before the trap, mepc points to the addi, and t0=0x42 after MRET.
@@ -1336,10 +1662,12 @@ mod tests {
         // 0x00: addi s2, a5, -1   -> s2 = -2 (a5 = -1)
         // 0x04: bltz s2, +0x10    -> branch to 0x18 (if s2 < 0)
         // 0x08: addi s1, x0, 0xBAD ->s1 = 0xBAD (only reached if bltz fails)
-        // 0x0C: ebreak             -> exit batch
+        // 0x0C: ebreak             -> trap to mtvec
         // ...
         // 0x18: addi s2, x0, 42   -> s2 = 42 (landing pad)
-        // 0x1C: ebreak             -> exit batch
+        // 0x1C: ebreak             -> trap to mtvec
+        // 0x40: wfi (mtvec)        -> trap 处理入口; 无指令配额后
+        //                             由 WFI 空闲退出终止 acceleration
 
         write_u32_le(&mut ram, 0, 0xFFF78913); // addi s2, a5, -1
         write_u32_le(&mut ram, 4, 0x00094A63); // bltz s2, +0x14 -> PC=0x18
@@ -1347,6 +1675,7 @@ mod tests {
         write_u32_le(&mut ram, 12, 0x00100073); // ebreak
         write_u32_le(&mut ram, 24, 0x02A00913); // addi s2, x0, 42 (landing pad)
         write_u32_le(&mut ram, 28, 0x00100073); // ebreak
+        write_u32_le(&mut ram, 0x40, 0x10500073); // wfi
 
         let mut state = HartState {
             pc: 0,
@@ -1355,33 +1684,132 @@ mod tests {
             mstatus: 0,
             ..unsafe { std::mem::zeroed() }
         };
+        state.mtvec = 0x40; // ebreak -> WFI -> all-idle 退出
         state.gprs[15] = 0xFFFF_FFFF_FFFF_FFFFu64; // a5 = -1
 
-        let mut result: BatchResult = unsafe { std::mem::zeroed() };
-        let mem = MemCtx { ram: ram.as_mut_ptr(), ram_size: ram.len() as u64,
-            ram_base: 0, shadow_base: 0, shadow_size: 0 };
-        let dev = FfiDevCtx { bases: [].as_ptr(), ends: [].as_ptr(), num: 0 };
-        let pmp = FfiPmpCtx { cfg: [].as_mut_ptr(), addr: [].as_mut_ptr(),
-            num: 0, pmpsplit: 0 };
+        let mut instr_group: InstrToBeExec = unsafe { std::mem::zeroed() };
+        let mem = MemCtx {
+            ram: ram.as_mut_ptr(),
+            ram_size: ram.len() as u64,
+            ram_base: 0,
+            shadow_base: 0,
+            shadow_size: 0,
+        };
+        let dev = FfiDevCtx {
+            bases: [].as_ptr(),
+            ends: [].as_ptr(),
+            num: 0,
+        };
+        let pmp = FfiPmpCtx {
+            cfg: [].as_mut_ptr(),
+            addr: [].as_mut_ptr(),
+            num: 0,
+            pmpsplit: 0,
+        };
         let mut mtimecmp = [u64::MAX; 1];
         let mut msip = [0u8; 1];
         let mut mtime: u64 = 0;
-        let clint = FfiClintCtx { mtime: &mut mtime, mtimecmp: mtimecmp.as_mut_ptr(),
-            msip: msip.as_mut_ptr(), base: 0 };
+        let clint = FfiClintCtx {
+            mtime: &mut mtime,
+            mtimecmp: mtimecmp.as_mut_ptr(),
+            msip: msip.as_mut_ptr(),
+            base: 0,
+            timebase_hz: 0, // 单元测试禁用clock-source 推进, 保持确定性
+        };
 
         unsafe {
-            call_run_parallel(&mut state, 1, 10, &mut result, &mem, &pmp, &clint, &dev,
-                std::ptr::null(), std::ptr::null(), std::ptr::null(), 0,
-                std::ptr::null(), std::ptr::null_mut(),
-                std::ptr::null_mut(), std::ptr::null_mut());
+            call_run_parallel(
+                &mut state,
+                1,
+                &mut instr_group,
+                &mem,
+                &pmp,
+                &clint,
+                &dev,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
         }
 
         // BLTZ should have branched ->s2 = 42
-        assert_eq!(state.gprs[18], 42,
-            "BLTZ s2,-2 MUST branch: expected s2=42, got {}", state.gprs[18]);
+        assert_eq!(
+            state.gprs[18], 42,
+            "BLTZ s2,-2 MUST branch: expected s2=42, got {}",
+            state.gprs[18]
+        );
         // s1 should NOT be 0xBAD (proves we didn't fall through)
-        assert_ne!(state.gprs[9], 0xBAD,
-            "BLTZ should have branched; s1=0xBAD means fallthrough occurred");
+        assert_ne!(
+            state.gprs[9], 0xBAD,
+            "BLTZ should have branched; s1=0xBAD means fallthrough occurred"
+        );
     }
 
+    #[test]
+    fn pmp_concurrent_csrw_two_harts() {
+        let mut ram = vec![0u8; 4096];
+        // csrw pmpaddr1, x5  ->  (0x3B1 << 20) | (5 << 15) | (1 << 12) | 0x73 = 0x3B129073
+        // WFI
+        write_u32_le(&mut ram, 0, 0x3B129073);
+        write_u32_le(&mut ram, 4, 0x10500073);
+
+        let mut s0 = make_state(0, 0);
+        s0.gprs[5] = 0xA000;
+        s0.mie = 0; s0.mip.store(0, Ordering::Release);
+
+        let mut s1 = make_state(0, 1);
+        s1.gprs[5] = 0xB000;
+        s1.mie = 0; s1.mip.store(0, Ordering::Release);
+
+        let mut states = [s0, s1];
+
+        // PMP with 16 entries, permissive
+        let mut pmp_cfg: [u8; 128] = [0u8; 128];
+        let mut pmp_addr: [u64; 128] = [u64::MAX; 128];
+        // Set address mode to NAPOT for all 16 entries per hart
+        for h in 0..2 {
+            for e in 0..16 {
+                pmp_cfg[h * 64 + e] = 0x0F; // R|W|X|NAPOT
+            }
+        }
+        let pmp = FfiPmpCtx {
+            cfg: pmp_cfg.as_mut_ptr(),
+            addr: pmp_addr.as_mut_ptr(),
+            num: 64, // per-hart entries (flat buf has 128 / 2 harts)
+            pmpsplit: 0,
+        };
+
+        let mut instr_group: InstrToBeExec = unsafe { std::mem::zeroed() };
+        unsafe {
+            call_run_parallel(
+                states.as_mut_ptr(), 2, &mut instr_group,
+                &MemCtx { ram: ram.as_mut_ptr(), ram_size: 4096, ram_base: 0, shadow_base: 0, shadow_size: 0 },
+                &pmp,
+                &FfiClintCtx { mtime: &mut 0u64, mtimecmp: &mut [u64::MAX, u64::MAX][0], msip: &mut [0u8, 0u8][0], base: 0, timebase_hz: 0 },
+                &FfiDevCtx { bases: [].as_ptr(), ends: [].as_ptr(), num: 0 },
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(), 0,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+        }
+        println!("exit_reason={} exit_hart={} total={}", instr_group.exit_reason, instr_group.exit_hart_id, instr_group.total_instrs);
+        println!("hart0: pc={:#x} gpr5={:#x}", states[0].pc, states[0].gprs[5]);
+        println!("hart1: pc={:#x} gpr5={:#x}", states[1].pc, states[1].gprs[5]);
+        // Check PMP writes
+        assert_eq!(pmp_addr[1], 0xA000, "hart0 pmpaddr1");
+        assert_eq!(pmp_addr[65], 0xB000, "hart1 pmpaddr1 in flat buf");
+        // WFI exit expected
+        assert_eq!(instr_group.exit_reason, exit_reason::WFI_WAIT);
+    }
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 # 仅供参考
+# 启用aia的方式
 qemu-system-riscv64 \
-  -machine virt \
+  -machine virt,aia=aplic-imsic \
   -m 2G -smp 1 \
   -kernel bsp/linux/arch/riscv/boot/Image \
   -drive file=bsp/setup-rootfs/debootstrap/riscv-sd.ext4,format=raw,if=none,id=drv0 \

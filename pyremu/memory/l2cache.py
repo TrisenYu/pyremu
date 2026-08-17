@@ -404,7 +404,7 @@ class L2Cache(CacheBase):
     def flush_all(self) -> int:
         """将全部脏行 (MODIFIED) 回写到 RAM, 保持有效 (降级为 EXCLUSIVE).
 
-        用于 native batch 执行前: 确保 Rust 从 bytearray 读取时
+        调用动态链接库加速执行前: 确保 Rust 从 bytearray 读取时
         能看到 Python 侧通过 L2 写入的全部数据。
 
         Returns:
@@ -425,10 +425,10 @@ class L2Cache(CacheBase):
     def invalidate_all(self) -> int:
         """使全部缓存行失效 (不写回).
 
-        用于 native batch 执行后: Rust 已直接修改 bytearray,
+        调用动态链接库加速执行后: Rust 已直接修改 bytearray,
         L2 中的旧缓存行 (包括脏行) 全部过时, 必须无条件丢弃。
-        脏行数据已在 pre-batch flush_all() 中回写, 此处再写回会
-        覆盖 Rust batch 对同一 PA 的修改 -> 页表/栈数据污染。
+        脏行数据已回写, 此处再写回会覆盖动态链接库在一轮加速过程中对同一物理地址的修改，
+        避免页表/栈数据污染。
 
         Returns:
             失效的缓存行数.

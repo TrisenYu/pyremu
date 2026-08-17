@@ -44,26 +44,18 @@ Guest 可通过该设备读写磁盘镜像 (raw 格式).
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import os
 import struct
 import sys
-import os
-from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from pyremu.configs_aux import cfg_bool
+from pyremu.core.diag import diag
 from pyremu.memory.bus import Device
+from pyremu.utils.mask import mask16, mask32
 
 if TYPE_CHECKING:
-    from pyremu.interrupt.plic import PLIC
-
-# 诊断日志开关 (PYREMU_DIAG_VERBOSE=1): 打印每个 virtqueue 请求与 IRQ 拉高/拉低,
-# 用于排查块设备 I/O 完成中断是否正确投递到 hart。
-_DIAG = cfg_bool("PYREMU_DIAG_VERBOSE")
-
-
-def _diag(msg: str) -> None:
-    if _DIAG:
-        print(f"[virtio] {msg}", file=sys.stderr, flush=True)
+    from typing import Any as _Any
 
 # ============================================================
 #  MMIO 寄存器偏移
@@ -202,7 +194,7 @@ class VirtIOBlock(Device):
         mem_read: Callable[[int, int], bytes],
         mem_write: Callable[[int, bytes], None],
         queue_size_max: int = 256,
-        plic: PLIC | None = None,
+        plic: _Any = None,
         irq: int = 0,
         read_only: bool = False,
     ) -> None:
@@ -215,7 +207,6 @@ class VirtIOBlock(Device):
         if not os.path.exists(image_path):
             with open(image_path, "wb") as f:
                 f.truncate(0)
-        self._read_only = read_only
         if read_only:
             self._fd = os.open(image_path, os.O_RDONLY)
         else:
@@ -223,7 +214,8 @@ class VirtIOBlock(Device):
                 self._fd = os.open(image_path, os.O_RDWR)
             except PermissionError:
                 self._fd = os.open(image_path, os.O_RDONLY)
-                self._read_only = True
+                read_only = True
+        self._read_only = read_only
         self._disk_size = os.lseek(self._fd, 0, os.SEEK_END)
 
         # PLIC 集成: 完成中断经 plic.set_irq(irq, True) 投递 (irq=0 时不接 PLIC)。
@@ -284,7 +276,7 @@ class VirtIOBlock(Device):
 
         if offset == VIRTIO_MMIO_DEVICE_FEATURES:
             sel = self._device_features_sel
-            return (_DEVICE_FEATURES >> (sel * 32)) & 0xFFFF_FFFF
+            return mask32(_DEVICE_FEATURES >> (sel * 32))
 
         if offset == VIRTIO_MMIO_QUEUE_NUM_MAX:
             return self._queue_num_max
@@ -314,7 +306,7 @@ class VirtIOBlock(Device):
 
         elif offset == VIRTIO_MMIO_DRIVER_FEATURES:
             sel = self._driver_features_sel
-            mask_low = (val & 0xFFFF_FFFF) << (sel * 32)
+            mask_low = mask32(val) << (sel << 5)
             self._driver_features = (self._driver_features & ~(0xFFFF_FFFF << (sel * 32))) | mask_low
 
         elif offset == VIRTIO_MMIO_DRIVER_FEATURES_SEL:
@@ -347,22 +339,22 @@ class VirtIOBlock(Device):
                 self._status = val
 
         elif offset == VIRTIO_MMIO_QUEUE_DESC_LOW:
-            self._queue_desc = (self._queue_desc & 0xFFFF_FFFF_0000_0000) | (val & 0xFFFF_FFFF)
+            self._queue_desc = (self._queue_desc & 0xFFFF_FFFF_0000_0000) | mask32(val)
 
         elif offset == VIRTIO_MMIO_QUEUE_DESC_HIGH:
-            self._queue_desc = (self._queue_desc & 0xFFFF_FFFF) | ((val & 0xFFFF_FFFF) << 32)
+            self._queue_desc = mask32(self._queue_desc) | (mask32(val) << 32)
 
         elif offset == VIRTIO_MMIO_QUEUE_DRIVER_LOW:
-            self._queue_driver = (self._queue_driver & 0xFFFF_FFFF_0000_0000) | (val & 0xFFFF_FFFF)
+            self._queue_driver = (self._queue_driver & 0xFFFF_FFFF_0000_0000) | mask32(val)
 
         elif offset == VIRTIO_MMIO_QUEUE_DRIVER_HIGH:
-            self._queue_driver = (self._queue_driver & 0xFFFF_FFFF) | ((val & 0xFFFF_FFFF) << 32)
+            self._queue_driver = mask32(self._queue_driver) | (mask32(val) << 32)
 
         elif offset == VIRTIO_MMIO_QUEUE_DEVICE_LOW:
-            self._queue_device = (self._queue_device & 0xFFFF_FFFF_0000_0000) | (val & 0xFFFF_FFFF)
+            self._queue_device = (self._queue_device & 0xFFFF_FFFF_0000_0000) | mask32(val)
 
         elif offset == VIRTIO_MMIO_QUEUE_DEVICE_HIGH:
-            self._queue_device = (self._queue_device & 0xFFFF_FFFF) | ((val & 0xFFFF_FFFF) << 32)
+            self._queue_device = mask32(self._queue_device) | (mask32(val) << 32)
 
     # ---- virtio-blk 配置空间 ----
 
@@ -371,10 +363,10 @@ class VirtIOBlock(Device):
         local = offset - 0x100
         if local == VIRTIO_BLK_CFG_CAPACITY:
             # 低 32-bit 容量 (扇区数)
-            return (self._disk_size // SECTOR_SIZE) & 0xFFFF_FFFF
+            return mask32(self._disk_size // SECTOR_SIZE)
         if local == VIRTIO_BLK_CFG_CAPACITY + 4:
             # 高 32-bit 容量
-            return ((self._disk_size // SECTOR_SIZE) >> 32) & 0xFFFF_FFFF
+            return mask32((self._disk_size // SECTOR_SIZE) >> 32)
         return 0
 
     # ---- virtqueue 处理 ----
@@ -426,8 +418,11 @@ class VirtIOBlock(Device):
             # 置中断状态位 (bit 0: used buffer notification) 并向 PLIC 拉高中断线
             self._interrupt_status |= 1
             self._raise_irq()
-            _diag(f"processed {processed} req(s), used_idx={self._last_avail_idx}, "
-                  f"int_status={self._interrupt_status:#x} -> raise_irq")
+            diag(
+                "virtio",
+                f"processed {processed} req(s), used_idx={self._last_avail_idx}, "
+                f"int_status={self._interrupt_status:#x} -> raise_irq"
+            )
 
         return self._last_avail_idx != avail_idx  # 仍有未处理? 调用方需再次调用
 
@@ -440,7 +435,7 @@ class VirtIOBlock(Device):
         """中断已被 Guest ACK 且无残留状态位时, 向 PLIC 拉低中断源。"""
         if self._interrupt_status == 0 and self._plic is not None and self._irq:
             self._plic.set_irq(self._irq, False)
-            _diag("lower_irq (acked, int_status=0)")
+            diag("virtio", "lower_irq (acked, int_status=0)")
 
     def _process_descriptor_chain(self, head: int) -> bool:
         """处理一个描述符链: header -> data -> status."""
@@ -468,10 +463,10 @@ class VirtIOBlock(Device):
 
         # 执行 I/O
         if req_type == VIRTIO_BLK_T_IN:
-            _diag(f"REQ read  sector={sector} len={desc_len}")
+            diag("virtio", f"REQ read  sector={sector} len={desc_len}")
             ok = self._do_read(sector, desc_addr, desc_len)
         elif req_type == VIRTIO_BLK_T_OUT:
-            _diag(f"REQ write sector={sector} len={desc_len}")
+            diag("virtio", f"REQ write sector={sector} len={desc_len}")
             ok = self._do_write(sector, desc_addr, desc_len)
         elif req_type == VIRTIO_BLK_T_FLUSH:
             # FLUSH: 把文件内容刷到磁盘
@@ -566,7 +561,7 @@ class VirtIOBlock(Device):
         return int.from_bytes(raw, "little")
 
     def _write_u16(self, pa: int, val: int) -> None:
-        self._mem_write(pa, struct.pack("<H", val & 0xFFFF))
+        self._mem_write(pa, struct.pack("<H", mask16(val)))
 
     def _reset(self) -> None:
         """设备重置."""

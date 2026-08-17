@@ -36,14 +36,14 @@ RISC-V Platform-Level Interrupt Controller (PLIC).
 
 from __future__ import annotations
 
-import os
 import sys
 
+from pyremu.configs_gen import PYREMU_DIAG_VERBOSE
 from pyremu.memory.bus import Device
 
 # 诊断日志开关 (PYREMU_DIAG_VERBOSE=1): 打印 set_irq / claim / complete,
 # 用于确认外设完成中断是否被正确投递并被 hart claim/complete。
-_DIAG = os.environ.get("PYREMU_DIAG_VERBOSE") == "1"
+_DIAG = PYREMU_DIAG_VERBOSE == 1
 
 
 def _diag(msg: str) -> None:

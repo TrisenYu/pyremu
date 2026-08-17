@@ -8,17 +8,13 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import select
 import signal
 import sys
 import termios
 import threading
-
-from pyremu.configs_aux import cfg_bool
-import tty
-from pathlib import Path
-
-from typing import TYPE_CHECKING, Any
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pyremu.core.decoder import Hart
@@ -48,6 +44,7 @@ from pyremu.debug.utils import (
 )
 from pyremu.emulator import Emulator
 from pyremu.utils.parse_bin import FirmwareImage
+
 
 class DebuggerBase(SharedMixinAttrs):
     """调试器核心基类 — 初始化所有共享状态, 提供输出和信号处理.
@@ -88,7 +85,7 @@ class DebuggerBase(SharedMixinAttrs):
         # Pending stdin bytes — UART RX FIFO is only 8 bytes, so excess
         # bytes from os.read() are buffered here and fed on subsequent
         # _feed_uart_stdin calls.  Without this, fast typing / paste in
-        # native batch mode silently drops bytes beyond the 8th.
+        # rust lib will silently drop bytes beyond the 8th.
         self._stdin_pending: bytes = b""
 
         # Stdin daemon thread — 独立于处理器执行循环, 持续将 stdin 转发到
@@ -99,9 +96,6 @@ class DebuggerBase(SharedMixinAttrs):
         self._stdin_daemon_running: bool = False
         self._stdin_daemon_thread: threading.Thread | None = None
 
-        # Diagnostic counters visible only when PYREMU_DIAG_VERBOSE=1
-        self._show_diag: bool = cfg_bool("PYREMU_DIAG_VERBOSE")
-
         # UART stdin 转发 — 终端 raw 模式管理
         self._stdin_forward: bool = True
         self._stdin_fd: int = sys.stdin.fileno()
@@ -110,7 +104,6 @@ class DebuggerBase(SharedMixinAttrs):
         self._snapshot: HartSnapshot | None = None
         self._mem_changes: list[MemoryChange] = []
         self._instr_count: int = 0
-        self._consecutive_stalls: int = 0
         self._fdt_addr: int | None = None
 
         # Rich console
@@ -188,7 +181,7 @@ class DebuggerBase(SharedMixinAttrs):
         self._paused = True
         self._console.print("\n暂停请求 — 当前指令完成后回到 REPL")
         try:
-            self._emu.request_native_stop()
+            self._emu.notify_processor()
         except Exception:
             pass
 
@@ -199,12 +192,12 @@ class DebuggerBase(SharedMixinAttrs):
         if self._emu._termio is not None:
             self._emu._termio.stop()
         self._restore_term()
-        self._emu._idle_poll_cb = None
+        self._emu._stdin_forward_callback = None
 
     def _enter_run_mode(self) -> None:
         """切换到运行模式: Ctrl+Q 暂停, cbreak stdin (ISIG 关, Ctrl+C 透传).
 
-        ── TX: QEMU fd_chr_write 模型, 与批次零耦合 ──
+        ── TX: QEMU fd_chr_write 模型, 与单轮加速执行零耦合 ──
         固件写 TXDATA -> Rust inline handler -> libc::write(1, &byte, 1).
         每字节即时输出, _console_echo=False 抑制 Python 双重输出.
 
@@ -223,7 +216,7 @@ class DebuggerBase(SharedMixinAttrs):
         if self._emu.uart is not None:
             self._emu.uart.clear_rx()
 
-        self._emu._idle_poll_cb = self._idle_poll
+        self._emu._stdin_forward_callback = self._idle_poll
 
         # 完整 raw 模式 (对照 termio/src/lib.rs raw 设置):
         # - 关 ECHO/ICANON/IEXTEN/ISIG: 所有字符原样透传
@@ -343,7 +336,7 @@ class DebuggerBase(SharedMixinAttrs):
             self._stdin_daemon_thread = None
 
     # ----------------------------------------------------------
-    #  UART stdin 转发 (主线程 select+os.read, 每批次边界执行)
+    #  UART stdin 转发 (主线程 select+os.read, 每单轮加速执行边界执行)
     # ----------------------------------------------------------
 
     def _feed_uart_stdin(self) -> bool:
@@ -359,9 +352,8 @@ class DebuggerBase(SharedMixinAttrs):
             had_input = self._emu._termio.drain_rx()
             if had_input:
                 self._emu._wake_event.set()
-            # _rx_notify 由 Rust termio 线程置 1; daemon 搬运数据后不清零
-            # (留给 Rust batch engine 做快速退出信号). 此处 ring buffer 排空后
-            # 清零, 但需防 TOCTOU: 清零与判空之间 Rust 可能写入新数据.
+            # _rx_notify 由 Rust termio 线程置 1; daemon 搬运数据后不清零.
+            # 此处 ring buffer 排空后清零, 但需防 TOCTOU: 清零与判空之间 Rust 可能写入新数据.
             termio = self._emu._termio
             if termio._rx_wr.value == termio._rx_rd.value:
                 termio._rx_notify.value = 0
@@ -447,7 +439,7 @@ class DebuggerBase(SharedMixinAttrs):
 
         Returns:
             True 仅当有 stdin 数据被 preload (中断 WFI 睡眠, 立即同步
-            PLIC 并重启 batch)。恒返回 True 会使 WFI 轮询循环每次立即
+            PLIC 并重新使用动态链接库加速)。恒返回 True 会使 WFI 轮询循环每次立即
             退出 ->热自旋 100% CPU。
         """
         had_input = False
@@ -538,8 +530,8 @@ class DebuggerBase(SharedMixinAttrs):
         self._running = False
         while True:
             try:
-                prompt = (f"[bold red]rvdb:{self._hart_id}[/]"
-                          f" ([cyan]{self.hart.mode.name}[/]) > ")
+                prompt = f"[bold red]rvdb:{self._hart_id}[/]" + \
+                         f" ([cyan]{self.hart.mode.name}[/]) > "
                 user_input = self._session.prompt(prompt).strip()
             except (KeyboardInterrupt, EOFError):
                 self._console.print("\n[dim]goodbye[/]")

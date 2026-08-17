@@ -204,7 +204,7 @@ ls -la "${TOY_DEST}"
 echo ">> Building TEE enclave driver & test programs ..."
 TEE_DRV_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_enclave_drv" && pwd)"
 TEE_TEST_SRC="$(cd "$(dirname "$0")/../../../tests/src-sidecache" && pwd)"
-TEE_DEST="${ROOTFS_DIR}/eval/tee-test"
+TEE_DEST="${ROOTFS_DIR}/eval/cache-probe-exploit"
 mkdir -p "${TEE_DEST}"
 
 # Build kernel module (requires linux tree at ../../linux)
@@ -214,7 +214,7 @@ if [ -x "${CLANG_CC}" ] && [ -d "${KDIR}" ]; then
     make -C "${KDIR}" M="${TEE_DRV_SRC}" ARCH=riscv \
         CC="${CLANG_CC}" LD="${CLANG_CC/clang/ld.lld}" \
         STRIP="${CLANG_CC/clang/llvm-strip}" modules 2>&1 | tail -3
-    cp -v "${TEE_DRV_SRC}/tee_enclave_drv.ko" "${TEE_DEST}/"
+    cp -v "${TEE_DRV_SRC}/tee_enclave_drv.ko" "${ROOTFS_DIR}/eval/"
 else
     echo ">> SKIP driver build: clang=${CLANG_CC} kdir=${KDIR}"
 fi
@@ -226,15 +226,64 @@ if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
     make -C "${TEE_TEST_SRC}" -j"$(nproc)" CROSS_CC="${GCC_CROSS}" all
     install -m755 "${TEE_TEST_SRC}"/bin/* "${TEE_DEST}/" 2>/dev/null || true
     cp -v "${TEE_TEST_SRC}/tee_enclave.h" "${TEE_DEST}/"
-    EVAL_DEST="${ROOTFS_DIR}/eval"
-    mkdir -p "${EVAL_DEST}"
-    cp -v "${TEE_TEST_SRC}/eval.mk" "${EVAL_DEST}/Makefile"
+    cp -v "${TEE_TEST_SRC}/eval.mk" "${TEE_DEST}/Makefile"
 else
     echo ">> SKIP test programs: ${GCC_CROSS} not found"
 fi
 
 echo ">> TEE components:"
 ls -la "${TEE_DEST}"
+
+# TEE enclave stress test programs
+STRESS_SRC="$(cd "$(dirname "$0")/../../../tests/src-stress" && pwd)"
+STRESS_PREBUILT="$(cd "$(dirname "$0")/../../../build/src-stress" && pwd)"
+STRESS_DEST="${ROOTFS_DIR}/eval/stress-test"
+mkdir -p "${STRESS_DEST}"
+
+if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
+    make -C "${STRESS_SRC}" -j"$(nproc)" CROSS_CC="${GCC_CROSS}" all
+    install -m755 "${STRESS_SRC}"/bin/* "${STRESS_DEST}/" 2>/dev/null || true
+    cp -v "${STRESS_SRC}/tee_enclave.h" "${STRESS_DEST}/"
+    cp -v "${STRESS_SRC}/eval.mk" "${STRESS_DEST}/Makefile"
+elif ls "${STRESS_PREBUILT}/tee_stress" >/dev/null 2>&1; then
+    echo ">> No cross-compiler, installing prebuilt stress test binaries ..."
+    install -m755 "${STRESS_PREBUILT}/tee_stress" "${STRESS_DEST}/"
+    install -m755 "${STRESS_PREBUILT}/stress_payload" "${STRESS_DEST}/"
+    cp -v "${STRESS_SRC}/tee_enclave.h" "${STRESS_DEST}/"
+    cp -v "${STRESS_SRC}/eval.mk" "${STRESS_DEST}/Makefile"
+else
+    echo ">> SKIP stress tests: ${GCC_CROSS} not found, no prebuilt binaries"
+fi
+
+echo ">> Stress test components:"
+ls -la "${STRESS_DEST}"
+
+# Top-level /eval/Makefile — delegates to subdirectories
+cat > "${ROOTFS_DIR}/eval/Makefile" <<'EVALMK'
+# /eval/Makefile — TEE test suite entry point
+#
+#   make help                  Show this help
+#   make probe                 Side-channel probe & exploit tests
+#   make stress                Batch enclave lifecycle stress tests
+
+.PHONY: help probe stress
+
+help:
+	@echo "=== /eval TEE Test Suite ==="
+	@echo "  make probe    cache-probe-exploit (side-channel + DoS + integrity)"
+	@echo "  make stress   stress-test (batch enclave lifecycle 2/20/200/2000/20000)"
+	@echo ""
+	@echo "  cd cache-probe-exploit && make help   for attack details"
+	@echo "  cd stress-test && make help           for stress test details"
+
+probe:
+	$(MAKE) -C cache-probe-exploit probe
+
+stress:
+	$(MAKE) -C stress-test stress
+EVALMK
+
+echo ">> /eval/Makefile created"
 
 # cleanup host binary and devices
 rm -f "${ROOTFS_DIR}/usr/bin/qemu-riscv64-static"

@@ -7,7 +7,7 @@
 
 import pytest
 
-from pyremu.memory.tlb import TLB, decode_tlb_perm
+from pyremu.memory.tlb import decode_tlb_perm, TLB
 
 
 class TestTLBBasic:

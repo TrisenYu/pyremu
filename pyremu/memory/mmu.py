@@ -21,6 +21,8 @@ from pyremu._native import (
     sv39_decompose_va as _native_sv39_decompose_va,
 )
 
+from pyremu.utils.mask import mask64
+
 # ============================================================
 #  地址翻译模式 (satp.MODE)
 # ============================================================
@@ -89,7 +91,7 @@ class PTE:
     __slots__ = ("raw",)
 
     def __init__(self, raw: int = 0) -> None:
-        self.raw = raw & 0xFFFF_FFFF_FFFF_FFFF
+        self.raw = mask64(raw)
 
     @classmethod
     def from_int(cls, val: int) -> "PTE":
@@ -310,7 +312,7 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
     vpn = _sv39_vpn(va)  # (vpn2, vpn1, vpn0)
 
     # 一级页表: 基址 = root_ppn << PAGE_SHIFT, 索引 vpn[2]
-    table_addr = (root_ppn << PAGE_SHIFT) & 0xFFFF_FFFF_FFFF_FFFF
+    table_addr = mask64(root_ppn << PAGE_SHIFT)
     raw = _read_pte(table_addr + vpn[0] * 8, mem_read_phy)
 
     if _NATIVE_MMU:
@@ -324,7 +326,7 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
 
     # 二级页表
     l1_ppn = l1.ppn if _NATIVE_MMU else pte.ppn
-    table_addr = (l1_ppn << PAGE_SHIFT) & 0xFFFF_FFFF_FFFF_FFFF
+    table_addr = mask64(l1_ppn << PAGE_SHIFT)
     raw = _read_pte(table_addr + vpn[1] * 8, mem_read_phy)
 
     if _NATIVE_MMU:
@@ -348,7 +350,7 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
 
     # 三级页表 (4 KiB 普通页)
     l2_ppn = l2.ppn if _NATIVE_MMU else pte.ppn
-    table_addr = (l2_ppn << PAGE_SHIFT) & 0xFFFF_FFFF_FFFF_FFFF
+    table_addr = mask64(l2_ppn << PAGE_SHIFT)
     raw = _read_pte(table_addr + vpn[2] * 8, mem_read_phy)
 
     if _NATIVE_MMU:
@@ -391,7 +393,7 @@ def translate_va(va: int, satp_val: int, mem_read_phy: Callable[[int, int], byte
 
     if mode == SATP_MODE_BARE:
         # 无地址翻译: VA 即 PA; 全权限 (物理地址无页级保护)
-        return True, va & 0xFFFF_FFFF_FFFF_FFFF, 0xF
+        return True, mask64(va), 0xF
 
     if mode == SATP_MODE_SV39:
         root_ppn = satp_val & ((1 << 44) - 1)
@@ -401,7 +403,7 @@ def translate_va(va: int, satp_val: int, mem_read_phy: Callable[[int, int], byte
         # 物理地址 = PPN << 12 | offset (VA[11:0])
         offset = va & (PAGE_SIZE - 1)
         pa = (ppn << PAGE_SHIFT) | offset
-        return True, pa & 0xFFFF_FFFF_FFFF_FFFF, perm
+        return True, mask64(pa), perm
 
     # Sv48 等其他模式暂未实现
     return False, 0, 0

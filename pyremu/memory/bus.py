@@ -23,24 +23,22 @@ PMA (Physical Memory Attributes):
 必须排除于所有缓存机制之外 — 不走 TLB 缓存, 不走 L2 缓存, 直通设备。
 """
 
-import ctypes
-import os
 from abc import ABC, abstractmethod
+import ctypes
 
 from pyremu._native import (
-    bus_read_ram as _native_read_ram,
-    bus_write_ram as _native_write_ram,
+    bus_read_ram,
+    bus_write_ram,
     native_available,
 )
+from pyremu.configs_gen import PYREMU_NO_L2
 
 # Module-level cache for native pointers to bytearray buffers.
 # Stored here (not on Bus instances) so that deepcopy() never
 # touches ctypes from_buffer() objects, which segfault the GC.
 _ram_native_ptrs: dict[int, int] = {}  # id(bytearray) -> raw pointer
 
-# Inlined from pyremu.core.diag to break circular import:
-#   bus -> core.diag -> core.__init__ -> ... -> clint -> bus
-NO_L2 = os.environ.get("PYREMU_NO_L2") == "1"
+NO_L2 = PYREMU_NO_L2 == 1
 
 
 class Device(ABC):
@@ -260,7 +258,7 @@ class Bus:
         # Rust native fast path: only for regular access sizes (1/2/4/8).
         # L2 cache line fills (64 B) would overflow the 8-byte read-out buffer.
         if self._use_native and self._ram_native_ptr and size in (1, 2, 4, 8) and \
-        _native_read_ram(
+        bus_read_ram(
             self._ram_buf_type.from_buffer(self._ram),
             self._ram_size, self._ram_base,
             self._shadow_base if self._shadow_base is not None else 0,
@@ -284,7 +282,7 @@ class Bus:
         # Rust native fast path: only for regular access sizes (1/2/4/8).
         # L2 cache line fills produce larger writes via the Python path.
         if self._use_native and self._ram_native_ptr and data_len in (1, 2, 4, 8) and \
-        _native_write_ram(
+        bus_write_ram(
             self._ram_buf_type.from_buffer(self._ram),
             self._ram_size, self._ram_base,
             0 if self._shadow_base is None else self._shadow_base,
@@ -311,7 +309,7 @@ class Bus:
     def flush_l2(self) -> int:
         """将 L2 缓存中全部脏行回写到 RAM (bytearray).
 
-        native batch 执行前必须调用, 确保 Rust 从 bytearray 读取时
+        调用动态链接库加速前必须调用, 确保 Rust 从 bytearray 读取时
         能看到 Python 侧通过 bus.write() 写入的全部数据.
 
         Returns:
@@ -324,7 +322,7 @@ class Bus:
     def invalidate_l2(self) -> int:
         """使 L2 缓存全部行失效 (脏行先回写).
 
-        native batch 执行后调用, 确保 Python 侧后续通过 L2 读取时
+        调用动态链接库加速执行后调用, 确保 Python 侧后续通过 L2 读取时
         不会命中 Rust 直接修改 bytearray 前的过时缓存行.
 
         Returns:
@@ -354,13 +352,13 @@ class Bus:
 
     # 最大 CPU store 大小 (RISC-V: sd = 8 bytes).
     # 超过此阈值的写入必定是 DMA/批量传输, 应绕过 L2 直写 bytearray,
-    # 避免缓存行逐出覆盖 Rust batch 的直接写入.
+    # 避免缓存行逐出覆盖加速用动态链接库的直接写入.
     _MAX_CPU_STORE = 8
 
     def _ram_bypass_l2(self, addr: int, data_len: int) -> bool:
         """RAM 地址是否应绕过 L2 缓存, 直写 bytearray.
 
-        Rust batch 直接修改 bytearray, 不经过 L2。若 Python 侧 L2 缓存行
+        调用动态链接库加速时，直接修改 bytearray, 不经过 L2。若 Python 侧 L2 缓存行
         覆盖同一 PA 的字节 (写命中合并旧数据 -> flush 回写), 会污染 Rust
         的修改, 表现为页表 PTE 或栈数据被覆写为旧值。
 

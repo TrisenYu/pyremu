@@ -13,12 +13,12 @@ use crate::ecall_aux;
 /// 发送一个字节。通过 legacy SBI putchar 阻塞输出。
 #[inline]
 pub fn uart_putc(c: u8) {
-    ecall_aux::sbi_putchar(c);
+	ecall_aux::sbi_putchar(c);
 }
 
 /// 非阻塞接收一个字节。SBI legacy 不支持非阻塞 RX。
 /// 待 M-mode 提供对应的 ecall 接口后再实现。
 #[allow(unused)]
 pub fn uart_getc() -> Option<u8> {
-    todo!("SBI ecall based UART RX is not yet implemented")
+	todo!("SBI ecall based UART RX is not yet implemented")
 }

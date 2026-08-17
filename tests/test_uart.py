@@ -20,6 +20,7 @@ import pytest
 
 from pyremu._native import native_available
 from pyremu.emulator import Emulator
+from pyremu.interrupt.plic import PLIC
 from pyremu.peripheral.uart import IP_RXWM, IP_TXWM, UART
 from pyremu.platform import PeripheralConfig, PlatformConfig
 
@@ -325,7 +326,6 @@ class TestTxWatermarkInterrupt:
 
     def test_ie_txwm_raises_plic_line(self):
         """IE.txwm 使能且水位满足 ->PLIC 中断线拉高 (旧行为: 从不拉高)."""
-        from pyremu.interrupt.plic import PLIC
 
         plic = PLIC(base_addr=0x0C00_0000, num_sources=4, num_contexts=2)
         uart = UART(base=0x1000_0000, plic=plic, irq=1)
@@ -351,3 +351,69 @@ class TestTxWatermarkInterrupt:
         uart.preload(b"x")
         ip = self._read_ip(uart)
         assert ip & IP_TXWM and ip & IP_RXWM
+
+
+class TestRxWatermarkInterrupt:
+    """RX 触发阈值 rxcnt 位于 rxctrl bits[18:16] (SiFive spec, 与 txcnt 同偏移).
+
+    回归背景: 旧实现误从 bits[2:0] 取 rxcnt — Linux sifive 驱动 probe 写
+    rxctrl = RXEN|(0<<16) = 0x1, 旧代码读到 rxcnt=1 (rxen 位), 单字节输入
+    (FIFO 占用 1, 不满足 1>1) 永不触发 RX 中断。交互终端中逐字符输入产生
+    单字节滞留: 尾字节 (如命令后的 \\n) 永远不被客机读取, 表现为输入冻结
+    (zsh 下 UP ARROW 召回命令后回车无响应)。对照 QEMU sifive_uart:
+    SIFIVE_UART_GET_RXCNT(rxctrl) = ((rxctrl) >> 16) & 0x7。
+    """
+
+    REG_RXCTRL = 0x0C
+    REG_IE = 0x10
+    REG_IP = 0x14
+    RXEN = 0x1
+
+    def _read_ip(self, uart: UART) -> int:
+        return int.from_bytes(uart.read(self.REG_IP, 4), "little")
+
+    def test_rxwm_single_byte_after_driver_probe_write(self):
+        """驱动 probe 写 rxctrl=RXEN (rxcnt=0) 后, 单字节即置位 IP.rxwm.
+
+        旧行为: rxcnt 误读 bits[2:0]=1 (rxen 位), 单字节不置位 ->本测试失败。
+        """
+        uart = _make_uart([])
+        uart.write(self.REG_RXCTRL, self.RXEN.to_bytes(4, "little"))
+        uart.preload(b"x")
+        assert self._read_ip(uart) & IP_RXWM
+
+    def test_rxwm_single_byte_raises_plic_line(self):
+        """rxctrl=RXEN + IE.rxwm 使能时, 单字节 preload 必须拉高 PLIC 线.
+
+        锁定冻结场景: 尾字节滞留 FIFO 且 PLIC 不挂起 ->客机永不读取。
+        """
+        plic = PLIC(base_addr=0x0C00_0000, num_sources=4, num_contexts=2)
+        uart = UART(base=0x1000_0000, plic=plic, irq=1)
+        uart.write(self.REG_RXCTRL, self.RXEN.to_bytes(4, "little"))
+        uart.write(self.REG_IE, (0x2).to_bytes(4, "little"))  # IE.rxwm
+        uart.preload(b"\n")
+        assert plic._pending[1], "单字节到达且阈值满足时 PLIC 线必须拉高"
+
+    def test_rxwm_respects_rxcnt_threshold(self):
+        """rxcnt=1 (bits[18:16]) 时: 1 字节不触发, 第 2 字节触发."""
+        uart = _make_uart([])
+        uart.write(self.REG_RXCTRL, (self.RXEN | (1 << 16)).to_bytes(4, "little"))
+        uart.preload(b"a")
+        assert not (self._read_ip(uart) & IP_RXWM)
+        uart.preload(b"b")
+        assert self._read_ip(uart) & IP_RXWM
+
+    def test_rxctrl_write_reevaluates_plic_line(self):
+        """降低 rxcnt 使既有 FIFO 内容满足触发条件 ->写 RXCTRL 立即拉高 PLIC.
+
+        旧实现 RXCTRL 写路径不调用 _update_plic_irq ->中断线状态滞后。
+        """
+        plic = PLIC(base_addr=0x0C00_0000, num_sources=4, num_contexts=2)
+        uart = UART(base=0x1000_0000, plic=plic, irq=1)
+        uart.write(self.REG_RXCTRL, (self.RXEN | (1 << 16)).to_bytes(4, "little"))
+        uart.write(self.REG_IE, (0x2).to_bytes(4, "little"))
+        uart.preload(b"a")  # 占用 1, rxcnt=1 ->不满足
+        assert not plic._pending[1]
+        # 驱动重写 rxcnt=0 ->既有字节立即满足触发条件
+        uart.write(self.REG_RXCTRL, self.RXEN.to_bytes(4, "little"))
+        assert plic._pending[1], "rxcnt 降低后既有 FIFO 数据必须立即触发中断"

@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Pyremu is a RISC-V emulator written in Python (CPython 3.14). It models a multi-hart in-order CPU core targeting the RV64 IMA_C ISA with Zicsr, privilege levels (U/S/H/M/D), Sv39 MMU with TLB, L2 cache with MESI protocol, CLINT timer/IPI controller, basic peripherals (UART/SPI/I2C/GPIO), an FDT generator, and an interactive debugger (rvdb). The project is in active mid-stage development.
 
-**Implemented**: RV64 I (base integer), M (mul/div), A (atomics — LR/SC/AMO), C (compressed), Zicsr (CSR read/write), FENCE/FENCE.I, ECALL/EBREAK/MRET/SRET, WFI (true pipeline stop with interrupt wake-up, TW trap), SFENCE.VMA, Sv39 address translation (4 KiB pages + 2 MiB superpages), trap delegation (medeleg/mideleg) to S-mode, PMP (NAPOT/NA4/TOR, M-mode bypass, MPRV), configurable PMA (ram_base + device MMIO routing), a full RV64 disassembler (I/M/A/C/Zicsr/privileged), an interactive debugger with rich TUI + prompt_toolkit REPL (disasm, stack backtrace, multi-step, command repeat, snapshot/rollback), a platform configuration system (dataclass-based presets + JSON/TOML/YAML deserialization).  **TEE 扩展**: `mdid` CSR (0x5C0, 内存域 ID), `pmpsplit` CSR (0x5C1, PMP 虚拟化预留), `mfence.did` 指令 (0x5A000073, 按域刷 TLB/L2 缓存), 缓存行自动 mdid 标记 (TLB 插入 + L2 分配/命中的 `current_mdid` 同步).
+**Implemented**: RV64 I (base integer), M (mul/div), A (atomics — LR/SC/AMO), C (compressed), Zicsr (CSR read/write), FENCE/FENCE.I, ECALL/EBREAK/MRET/SRET, WFI (true pipeline stop with interrupt wake-up, TW trap), SFENCE.VMA, Sv39 address translation (4 KiB pages + 2 MiB superpages), trap delegation (medeleg/mideleg) to S-mode, PMP (NAPOT/NA4/TOR, M-mode bypass, MPRV), configurable PMA (ram_base + device MMIO routing), a full RV64 disassembler (I/M/A/C/Zicsr/privileged), an interactive debugger with rich TUI + prompt_toolkit REPL (disasm, stack backtrace, multi-step, command repeat, snapshot/rollback), a platform configuration system (dataclass-based presets + JSON/TOML/YAML deserialization).  
 
-**Not yet implemented**: floating-point (F/D/Zfh), RVV 1.0 Vector extension (opcode 0x57, ~200 条指令: vsetivli/vsetvl/vector load/store/arithmetic/permute), AIA/IMSIC (stub), peripheral interrupt generation.
+**Not yet implemented**: RVV 1.0 Vector extension (opcode 0x57, ~200 条指令: vsetivli/vsetvl/vector load/store/arithmetic/permute), peripheral interrupt generation.
 
 ## Commands
 
@@ -32,6 +32,7 @@ uv run pytest --cov=. --cov-report=term
 
 # Launch interactive debugger (rvdb)
 python -m pyremu.debugger tests/bins/elf/nonsense.o
+ulimit -v 4194304 && PYTHONPATH=/path/to/pyremu timeout 120 uv run /tmp/diag.py
 ```
 
 ## Architecture
@@ -40,7 +41,7 @@ python -m pyremu.debugger tests/bins/elf/nonsense.o
 
 ```
 pyremu/
-  emulator.py               # 多核执行循环 (round-robin, trap 循环检测)
+  emulator.py               # 多核执行循环 (round-robin, 停止条件: 断点/停机/全 halted/超时)
   debugger.py                # 交互式调试器 rvdb (prompt_toolkit + rich)
   platform.py                # PlatformConfig — 平台配置 (dataclass 预设 + JSON/TOML/YAML)
 
@@ -70,7 +71,7 @@ pyremu/
   interrupt/                # 中断子系统
     controller.py           # InterruptController ABC, IntSource
     clint.py                # CLINT (mtime/mtimecmp 定时器 + MSIP IPI)
-    aia.py                  # AIA/IMSIC (桩)
+    aia.py                  # AIA/IMSIC
 
   env_inject/               # 运行时注入
     preload.py              # Preloader — 将 shellcode 注入 RAM
@@ -137,7 +138,7 @@ HartWithRegs (core/hart.py)
     gprs[32], fprs[32], csrs (name->CSR), itlb/dtlb,
     pc, mode, _bus: Bus, _interrupt_ctrl: InterruptController,
     _mem_read_phy, _mem_write_phy,
-    reservation (LR/SC), _halted, _consecutive_traps, _waiting
+    reservation (LR/SC), _halted, _waiting
     mstatus/mtvec/mepc/mcause/… 快捷 property
 └── Hart (core/decoder.py)  ← 仅继承 HartWithRegs
         exec_instr() -> 返回 2/4 (PC 需推进) 或 0 (PC 已被修改)
@@ -219,7 +220,9 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 
 `handle_wfi(hart)`: 若 `mstatus.TW=1` 且非 M 模式 -> IllInstr; 若已有待处理中断 -> 立即返回 (NOP); 否则 hart 进入 `_waiting` 状态.
 
-连续 trap 检测: `deliver_trap` 递增 `_consecutive_traps`; 指令正常执行时清零. 超过阈值 (3) 则 hart 进入 `_halted` 状态并转储全部寄存器.
+> 连续执行 (run/continue) 无指令配额与连续 trap 兜底 (与 QEMU 一致): 死循环 /
+> 非法指令 trap loop 不会自动暂停 hart, 由停止条件 (断点命中 / semihosting 停机 /
+> 全部 hart halted / 时钟源超时) 或外部设备暂停事件 (Ctrl+Q) 终止执行.
 
 **trap.py** 提供: `TrapType` 枚举 (14 异常 + 10 中断), `trap_cause_code(trap) -> int`, `trap_is_interrupt(trap) -> bool`, `trap_cause_name(mcause_val) -> str` (mcause 值 -> 可读名称).
 
@@ -336,7 +339,6 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 | test_clint.py | 12 | mtime 递增, mtimecmp 定时器中断, MSIP 软件中断 |
 | test_cache_base.py | 10 | CacheBase/CacheLineBase 抽象接口 |
 | test_l2cache.py | 10 | L2Cache MESI 状态转换, 读写分配, 回写 |
-| test_mdid.py | 28 | mdid/mfence.did TEE 扩展: CSR 读写, TLB/L2 按域刷新 |
 | test_debugger.py | 220 | 调试器 REPL 命令分发, 反汇编, 断点 (addr/instr/opcode), PC 校验, 栈回溯, 符号表, info/status |
 
 ## Important design notes
@@ -487,8 +489,8 @@ csrw medeleg, t0
 验证修复后的正确行为并锁定回归底线.
 
 测试用例要求:
-- 能复现修复前的错误行为 (修复前的代码跑该测试必失败)
-- 覆盖 bug 的精确触发条件 (不要用碰巧不会触发 bug 的宽松参数)
+- 能复现修复前的错误行为
+- 覆盖 bug 的精确触发条件
 - 如涉及位掩码/偏移量, 选择能使修前/修后产生不同结果的具体值
 
 反例 — 已有的 `test_megapage_ppn_mask_regression` 使用 `PPN=0xABCD0` (bit 9=0),
@@ -686,4 +688,4 @@ if data is None: ...
 3. **`li` 伪指令**: 加载大于 32 位的常量时 `li` 展开为多指令序列,
    调试时建议用 `llvm-objdump -d --mattr=+m` 确认实际编码.
 
-TEE 飞地扩展细节见 [[tee-enclave-extension]] (本地记忆文件).
+TEE 飞地扩展细节见 [[tee-enclave-extension]] (本地介绍文件).

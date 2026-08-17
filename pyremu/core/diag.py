@@ -15,7 +15,7 @@ Usage:
 
 from __future__ import annotations
 
-import os
+import sys
 from typing import TYPE_CHECKING
 
 from pyremu.configs_aux import cfg_bool, cfg_str
@@ -28,11 +28,11 @@ if TYPE_CHECKING:
 # ============================================================
 
 class HartDiag:
-    """Per-hart diagnostic counters populated by Rust batch engine.
+    """Per-hart diagnostic counters populated by speedup execution engine.
 
     Mirrors the Rust ``HartDiag`` struct field-for-field; names use
     the Python convention (drop ``clint_`` / ``_snapshot`` suffix).
-    Initialised to zero; updated by ``unmarshal_hart`` after each batch.
+    Initialised to zero; updated by ``unmarshal_hart`` after each speedup.
     """
 
     __slots__ = (
@@ -99,13 +99,109 @@ class HartDiag:
         self.msip_last_seen = d.msip_last_seen         # type: ignore[attr-defined]
 
 
+# ============================================================
+#  AiaDiag — AIA 中断诊断计数器 (Python 路径)
+# ============================================================
+
+
+class AiaDiag:
+    """AIA 中断诊断计数器, 暴露 stopi/mtopi 返回值分布与中断投递统计.
+
+    用于诊断 AIA 模式 (IMSIC+APLIC) 下的中断风暴、未处理中断等性能问题.
+    与 Rust 侧 ``atomic::AtomicU64`` 计数器 (STOPI_SEI_CT 等) 语义一致.
+
+    Usage:
+        from pyremu.core.diag import aia_diag
+        aia_diag.record_stopi(val)
+        print(aia_diag.snapshot())
+    """
+
+    __slots__ = (
+        "_stopi_sei", "_stopi_ssi", "_stopi_sti", "_stopi_zero",
+        "_mtopi_mei", "_mtopi_msi", "_mtopi_mti", "_mtopi_zero",
+        "_delivered",
+    )
+
+    def __init__(self) -> None:
+        # stopi (S-mode top interrupt, CSR 0xDB0) 返回值分布
+        self._stopi_sei: int = 0   # IID=9  (IMSIC external via SEIP)
+        self._stopi_ssi: int = 0   # IID=1  (legacy SSIP)
+        self._stopi_sti: int = 0   # IID=5  (timer via STIP)
+        self._stopi_zero: int = 0  # 0 (no interrupt)
+
+        # mtopi (M-mode top interrupt, CSR 0xFB0) 返回值分布
+        self._mtopi_mei: int = 0   # IID=11 (IMSIC external via MEIP)
+        self._mtopi_msi: int = 0   # IID=3  (legacy MSIP)
+        self._mtopi_mti: int = 0   # IID=7  (timer via MTIP)
+        self._mtopi_zero: int = 0  # 0
+
+        # 中断投递统计 (按 cause code 名称)
+        self._delivered: dict[str, int] = {
+            "MEI": 0, "MSI": 0, "MTI": 0,
+            "SEI": 0, "SSI": 0, "STI": 0,
+        }
+
+    def record_stopi(self, val: int) -> None:
+        iid = (val >> 16) & 0x7FF
+        if val == 0:
+            self._stopi_zero += 1
+        elif iid == 9:
+            self._stopi_sei += 1
+        elif iid == 1:
+            self._stopi_ssi += 1
+        elif iid == 5:
+            self._stopi_sti += 1
+
+    def record_mtopi(self, val: int) -> None:
+        iid = (val >> 16) & 0x7FF
+        if val == 0:
+            self._mtopi_zero += 1
+        elif iid == 11:
+            self._mtopi_mei += 1
+        elif iid == 3:
+            self._mtopi_msi += 1
+        elif iid == 7:
+            self._mtopi_mti += 1
+
+    def record_delivery(self, cause_name: str) -> None:
+        if cause_name in self._delivered:
+            self._delivered[cause_name] += 1
+
+    def snapshot(self) -> dict:
+        """返回当前计数器的快照 (不重置)."""
+        return {
+            "stopi": {
+                "SEI(IID=9)": self._stopi_sei,
+                "SSI(IID=1)": self._stopi_ssi,
+                "STI(IID=5)": self._stopi_sti,
+                "ZERO": self._stopi_zero,
+            },
+            "mtopi": {
+                "MEI(IID=11)": self._mtopi_mei,
+                "MSI(IID=3)": self._mtopi_msi,
+                "MTI(IID=7)": self._mtopi_mti,
+                "ZERO": self._mtopi_zero,
+            },
+            "delivered": dict(self._delivered),
+        }
+
+    def reset(self) -> None:
+        self.__init__()
+
 TRACE_SRET_TO_U = cfg_bool("PYREMU_TRACE_SRET")
 _DIAG_FILE = cfg_str("PYREMU_DIAG_LOG")
-_SRET_DIAG_FILE = os.environ.get("PYREMU_SRET_LOG", _DIAG_FILE)
+_SRET_DIAG_FILE = cfg_str("PYREMU_SRET_LOG") or _DIAG_FILE
+_VERBOSE = cfg_bool("PYREMU_DIAG_VERBOSE")
+
+
+def diag(tag: str, msg: str) -> None:
+    """向 stderr 输出带 ``[tag]`` 前缀的诊断信息，由 ``PYREMU_DIAG_VERBOSE`` 控制."""
+    if _VERBOSE:
+        print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
 
 # 排查开关: 设置 PYREMU_NO_L2=1 后 Bus.read/write 对 RAM 地址完全绕过 L2 缓存.
-# Rust batch 直接写 bytearray, L2 写命中合并旧数据后 flush 回写会污染 bytearray.
-NO_L2 = os.environ.get("PYREMU_NO_L2") == "1"
+# 动态链接库内直接写 bytearray, L2 写命中合并旧数据后 flush 回写会污染 bytearray.
+NO_L2 = cfg_bool("PYREMU_NO_L2")
 
 # 诊断开关: PYREMU_DIAG_LOG 已设置时启用 PAGE_POISON (0xFE) 写追踪.
 DIAG_POISON = bool(_DIAG_FILE)

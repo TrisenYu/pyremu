@@ -19,6 +19,7 @@ from functools import partial
 
 from pydantic import BaseModel
 
+from pyremu.configs_gen import PYREMU_AIA, PYREMU_H_EXT
 from pyremu.utils.regname import init_csr_map, init_gpr_map
 
 # ============================================================
@@ -308,7 +309,7 @@ _csr_bank: dict[int, CSR] = {
     0x602: _HmodeCSR(name="hedeleg"),
     0x603: _HmodeCSR(name="hideleg"),
     0x604: _HmodeCSR(name="hie"),
-    0x605: _HmodeCSR(name="htimedelta"),
+    0x605: _HmodeCSR(name="htvec"),
     0x606: _HmodeCSR(name="hcounteren", xlen=32),
     0x607: _HmodeCSR(name="hgeie"),
     0x608: _HmodeCSR(name="hvien"),
@@ -316,7 +317,7 @@ _csr_bank: dict[int, CSR] = {
     0x60A: _HmodeCSR(name="henvcfg"),
     0x612: _HmodeCSR(name="hedelegh", xlen=32),
     0x613: _HmodeCSR(name="hidelegh", xlen=32),
-    0x615: _HmodeCSR(name="htimedeltah", xlen=32),
+    0x615: _HmodeCSR(name="htimedelta"),
     0x618: _HmodeCSR(name="hvienh", xlen=32),
     0x61A: _HmodeCSR(name="henvcfgh", xlen=32),
     0x643: _HmodeCSR(name="htval"),
@@ -363,6 +364,7 @@ _csr_bank: dict[int, CSR] = {
     0xC81: _UmodeCSR(name="timeh").strip_w(),
     0xC82: _UmodeCSR(name="instreth").strip_w(),
     0xDA0: _SmodeCSR(name="scountovf").strip_w(),
+    0xDB0: _SmodeCSR(name="stopi").strip_w(),
     0xE12: _HmodeCSR(name="hgeip").strip_w(),
     0xEB0: _HmodeCSR(name="vstopi").strip_w(),
     # 机器信息 (只读)
@@ -371,8 +373,29 @@ _csr_bank: dict[int, CSR] = {
     0xF13: _MmodeCSR(name="mimpid").strip_w(),
     0xF14: _MmodeCSR(name="mhartid").strip_w(),
     0xF15: _MmodeCSR(name="mconfigptr").strip_w(),
-    0xFB0: _MmodeCSR(name="mtopi").strip_w().not_implemented(),
+    0xFB0: _MmodeCSR(name="mtopi").strip_w(),
 }
+
+
+# AIA=1 时 AIA CSR 可访问; AIA=0 时全部返回 IllInstr (门控).
+# miselect / mireg / siselect / sireg / mtopei / stopei / mtopi / stopi
+# 必须在 AIA 禁用时统一不可达, 防止内核/固件误判 IMSIC 存在.
+if not PYREMU_AIA:
+    for _aia_addr in (
+        0x150, 0x151,  # siselect, sireg
+        0x15C,         # stopei
+        0x350, 0x351,  # miselect, mireg
+        0x35C,         # mtopei
+        0xDB0,         # stopi
+        0xFB0,         # mtopi
+    ):
+        _csr_bank[_aia_addr].not_implemented()
+
+# H-extension: PYREMU_H_EXT=0 时全部 H-mode CSR 不可访问.
+if not PYREMU_H_EXT:
+    for _addr, _csr in _csr_bank.items():
+        if _csr.access in (CsrAccess.h_ro, CsrAccess.h_rw):
+            _csr.not_implemented()
 
 
 def register_gpr():

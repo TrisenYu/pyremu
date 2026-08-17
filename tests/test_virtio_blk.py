@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Generator
 import os
+from pathlib import Path
 import struct
 import tempfile
-from collections.abc import Generator
-from pathlib import Path
 
 import pytest
 
@@ -63,9 +63,9 @@ from pyremu.peripheral.virtio_blk import (
     VIRTIO_STATUS_DRIVER,
     VIRTIO_STATUS_DRIVER_OK,
     VIRTIO_STATUS_FEATURES_OK,
+    VirtIOBlock,
     VRING_DESC_F_NEXT,
     VRING_DESC_F_WRITE,
-    VirtIOBlock,
 )
 
 # ============================================================

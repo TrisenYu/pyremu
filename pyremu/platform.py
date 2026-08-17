@@ -37,6 +37,15 @@ import yaml
 
 from pyremu import configs_gen
 
+from enum import Enum
+
+
+class InterruptMode(Enum):
+    """中断子系统模式."""
+    LEGACY = "legacy"  # CLINT (MSIP+MTIP) + PLIC (MEIP+SEIP)
+    AIA = "aia"        # CLINT (MTIP only) + IMSIC (MSIP+MEIP+SEIP) + APLIC (wired→MSI)
+
+
 COMPILE_OPTS: str = "rv64imacfd_sstc_zicsr_zifencei"
 
 @dataclass
@@ -51,6 +60,9 @@ class PeripheralConfig:
     plic_base: int = 0x0C00_0000  # PLIC 基址 (SiFive standard)
     virtio_blk_base: int = 0  # 0 = 禁用
     watchdog_base: int = 0x1000_4000
+    imsic_m_base: int = 0  # IMSIC M-file MMIO 基址 (0=禁用, AIA 标准 0x2400_0000)
+    imsic_s_base: int = 0  # IMSIC S-file MMIO 基址 (0=禁用, AIA 标准 0x2800_0000)
+    aplic_base: int = 0  # APLIC 基址 (0=禁用, AIA 标准 0x0C00_0000)
 
 
 @dataclass
@@ -77,6 +89,7 @@ class PlatformConfig:
     isa: str = COMPILE_OPTS
     timebase_freq: int = 10_000_000  # 10 MHz
     pmp_entries: int = 64  # PMP 条目数 (0=禁用, 8/16/64 常见)
+    interrupt_mode: InterruptMode = InterruptMode.LEGACY
     disk_image: str | None = None  # virtio-blk 磁盘镜像路径, None=不挂载
 
     # DTB /reserved-memory no-map 区域列表 (base, size).
@@ -88,6 +101,20 @@ class PlatformConfig:
     )
 
     periph: PeripheralConfig = field(default_factory=PeripheralConfig)
+
+    def __post_init__(self) -> None:
+        """编译期 AIA 开关: PYREMU_AIA=1 时强制启用 IMSIC+APLIC.
+
+        基址从 configs_gen (由 emu-configs.mk 生成) 读取. 仅在 legacy 模式下
+        覆盖, 显式指定 AIA 的预设 (qemu_virt_aia) 不受影响. 任何构造路径
+        (预设工厂 / from_dict / 直接实例化) 均经由此处统一解析, 故 Emulator
+        无需再对 interrupt_mode 做二次判断.
+        """
+        if configs_gen.PYREMU_AIA and self.interrupt_mode == InterruptMode.LEGACY:
+            self.interrupt_mode = InterruptMode.AIA
+            self.periph.imsic_m_base = configs_gen.IMSIC_M_BASE
+            self.periph.imsic_s_base = configs_gen.IMSIC_S_BASE
+            self.periph.aplic_base = configs_gen.APLIC_BASE
 
     @classmethod
     def from_dict(
@@ -107,6 +134,9 @@ class PlatformConfig:
 
         plat_fields = set(cls.__dataclass_fields__) - {"periph"}
         plat_kw: dict[str, Any] = {k: v for k, v in d.items() if k in plat_fields}
+        # 枚举转换: interrupt_mode 从 string 反序列化
+        if "interrupt_mode" in plat_kw and isinstance(plat_kw["interrupt_mode"], str):
+            plat_kw["interrupt_mode"] = InterruptMode(plat_kw["interrupt_mode"])
         return cls(periph=periph, **plat_kw)
 
     @classmethod
@@ -189,3 +219,18 @@ class PlatformConfig:
                 clint_base=0x0200_0000,
             ),
         )
+
+    @classmethod
+    def qemu_virt_aia(cls) -> PlatformConfig:
+        """QEMU virt AIA 平台 — 使用 IMSIC+APLIC 替代 PLIC.
+
+        IMSIC 基址 0x2400_0000, 每 hart stride 0x1000.
+        APLIC 基址 0x0C00_0000 (复用 PLIC 地址空间).
+        定时器仍由 CLINT mtimecmp 提供.
+        """
+        cfg = cls.qemu_virt()
+        cfg.interrupt_mode = InterruptMode.AIA
+        cfg.periph.imsic_m_base = 0x2400_0000
+        cfg.periph.imsic_s_base = 0x2800_0000
+        cfg.periph.aplic_base = 0x0C00_0000
+        return cfg

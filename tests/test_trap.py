@@ -4,9 +4,11 @@
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """Trap 处理测试: cause code 映射、ECALL/EBREAK/MRET/SRET 流程."""
+import struct
 
 import pytest
 
+from pyremu.configs_aux import path_join, test_elf_dir
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import (
     MSTATUS_MIE,
@@ -18,10 +20,15 @@ from pyremu.core.hart import (
     RiscvMode,
 )
 from pyremu.core.mem_check_aux import (
-    AccessFault, AlignmentFault, MemoryAccessFault, PageFault,
-    inject_memory_backend, mem_read, mem_write,
+    AccessFault,
+    AlignmentFault,
+    inject_memory_backend,
+    mem_read,
+    mem_write,
+    MemoryAccessFault,
+    PageFault,
 )
-from pyremu.core.trap_def import TrapType, trap_cause_code, trap_is_interrupt
+from pyremu.core.trap_def import trap_cause_code, trap_is_interrupt, TrapType
 from pyremu.core.trap_handler import (
     check_pending_interrupts,
     deliver_trap,
@@ -35,8 +42,8 @@ from pyremu.emulator import Emulator
 from pyremu.interrupt.clint import CLINT
 from pyremu.memory.bus import Bus
 from pyremu.platform import PeripheralConfig, PlatformConfig
-from pyremu.utils.parse_bin import parse_firmware
 from pyremu.utils.disassem import Opc
+from pyremu.utils.parse_bin import parse_firmware
 
 # ============================================================
 #  trap_cause_code / trap_is_interrupt
@@ -1398,7 +1405,6 @@ class TestPageFault:
         assert mem_read(hart, 0x0, 4) == b"\x01\x02\x03\x04"
         assert mem_read(hart, 0x0, 4) == b"\x01\x02\x03\x04"
 
-        hart._consecutive_traps = 0
         try:
             mem_read(hart, 0x1000, 4)
         except PageFault:
@@ -1579,7 +1585,6 @@ class TestTimerInterrupt:
         hart.mie = True
         hart.mode = RiscvMode.M
         hart.pc = 0x2000
-        hart._consecutive_traps = 0
         self._set_mtimecmp(clint, 0, 200)
         clint.tick(150)  # mtime = 250 >= 200
 
@@ -1881,21 +1886,22 @@ class TestWfi:
         # 将 WFI 指令写入 RAM
         emu.bus.write(0x80000000, self.WFI_INSTR.to_bytes(4, "little"))
 
-        # 设置定时器: mtimecmp = 50, 当前 mtime = 0
-        self._set_mtimecmp(clint, 0, 50)
-
         # step 1: 执行 WFI -> 进入等待
         emu.step()
         assert hart._waiting, "step 1: 应进入 WFI 等待"
         assert hart.pc == 0x80000004, "PC 应指向 WFI 后一条指令"
 
-        # step 2: 仍等待, mtime 从 0->1, 不到 50
+        # 设置定时器: mtimecmp = 当前 mtime + 10000 (~1ms 安全余量)
+        now = clint.get_mtime()
+        self._set_mtimecmp(clint, 0, now + 10000)
+
+        # step 2: 仍等待, mtime 未到 deadline
         emu.step()
         assert hart._waiting, "step 2: 仍应等待"
         assert hart.pc == 0x80000004, "PC 不应变化"
 
         # 推进 mtime 越过 mtimecmp
-        clint.tick(100)  # mtime 变成 ~102, 大于 50
+        clint.tick(20000)
 
         # step 3: 中断唤醒
         emu.step()
@@ -2074,7 +2080,6 @@ class TestWfi:
         hart0.csrs["mip"].val &= ~(1 << 3)
         hart0._waiting = False
         # _wfi_woken 保持 True (MRET 已不再清除此标记)
-        hart0._consecutive_traps = 0
         hart0.mode = RiscvMode.M
         hart0.mstatus_val |= MSTATUS_MIE
         hart0.pc = 0x80000000
@@ -2139,7 +2144,6 @@ class TestWfi:
         # 清除 MSIP 以免 check_pending_interrupts 在 MRET 之后立即再次触发 trap.
         emu.clint.clear_ipi(0)
         h.csrs["mip"].val &= ~(1 << 3)
-        h._consecutive_traps = 0
         emu.step()
         assert h.pc == wfi_pc_after, (
             f"MRET 后 PC 应回到 WFI+4, 实际 {h.pc:#x}"
@@ -2153,7 +2157,6 @@ class TestWfi:
         h.pc = 0x80000000  # 模拟分支回到 WFI
         emu.clint.clear_ipi(0)
         h.csrs["mip"].val &= ~(1 << 3)
-        h._consecutive_traps = 0
         emu.step()  # WFI NOP 路径
         assert h._waiting is False, (
             "_wfi_woken=True -> WFI 应视为 NOP, 不应进入等待"
@@ -2244,17 +2247,6 @@ class TestStackOverflowMmode:
             f"addr=0x{addr:x} size={size} {'write' if is_write else 'read'}: "
             f"expected cause={expected_cause}, actual={hart.mcause_val}"
         )
-
-    def test_consecutive_stack_overflows_count(self, hart):
-        """Repeated stack overflows increment consecutive_traps when PC loops."""
-        for i in range(5):
-            try:
-                mem_write(hart, self.RAM_BASE - 8, b"\x00" * 4)
-            except MemoryAccessFault:
-                pass
-            assert hart._consecutive_traps == i + 1, (
-                f"trap #{i+1}: consecutive_traps should be {i+1}"
-            )
 
 
 class TestStackOverflowSmode:
@@ -2429,26 +2421,6 @@ class TestStackOverflowSmode:
         assert data == b"\xAB\xCD\xEF\x01"
         assert hart.mcause_val == 0
 
-    def test_consecutive_guard_page_traps_count(self, hart, ram_ctx):
-        """Repeated guard page hits increment consecutive_traps when PC loops."""
-        ram, _read_fn, _write_fn = ram_ctx
-        self._prep_smode(hart, ram)
-
-        # StPageFault is not delegated ->trap goes to M-mode mtvec.
-        # Set PC = mtvec so the trap entry IS the trapping PC — each
-        # mem_write triggers a new trap at the same address ->counter
-        # increments.
-        hart.pc = hart.mtvec_val
-        for i in range(5):
-            hart.mode = RiscvMode.S
-            try:
-                mem_write(hart, self.GUARD_VA, b"\x00" * 4)
-            except MemoryAccessFault:
-                pass
-            assert hart._consecutive_traps == i + 1, (
-                f"guard page trap #{i+1}: consecutive_traps should be {i+1}"
-            )
-
 
 class TestStackOverflowUmode:
     """U-mode stack overflow: Sv39 guard page -> StPageFault delegated to S-mode.
@@ -2459,7 +2431,7 @@ class TestStackOverflowUmode:
       U: well-behaved (bounded input fib) or pathological (stack_bomb)
     """
 
-    ELF_PATH = "tests/bins/elf/u_mode_run_fib.elf"
+    ELF_PATH = path_join(test_elf_dir(), "u_mode_run_fib.elf")
 
     @pytest.fixture
     def emu_and_fw(self):
@@ -2768,8 +2740,6 @@ class TestSstatusMstatusLinkage:
 
     def test_spp_set_after_smode_trap(self, hart):
         """S 模式触发 ebreak -> sstatus.SPP 应 = 1 (来自 S 模式)."""
-        from pyremu.core.trap_handler import deliver_trap
-
         hart.mode = RiscvMode.S
         hart.csrs["medeleg"].val = 1 << 3  # 委派 breakpoint
         hart.csrs["stvec"].val = 0x80004000
@@ -2789,7 +2759,11 @@ class TestSstatusMstatusLinkage:
 
 
 class TestStimecmpClintSync:
-    """验证 stimecmp/stimecmph CSR 写入同步到 CLINT mtimecmp."""
+    """验证 stimecmp 与 CLINT mtimecmp 互相独立 (匹配 QEMU / 真实硬件).
+
+    QEMU 验证: time_helper.c 中 riscv_timer_write_timecmp() 仅管理 STIP;
+    riscv_aclint.c 中 riscv_aclint_mtimer_write_timecmp() 仅管理 MTIP.
+    两者是完全独立的比较器。"""
 
     @pytest.fixture
     def clint(self) -> CLINT:
@@ -2803,26 +2777,45 @@ class TestStimecmpClintSync:
         h.interrupt_ctrl = clint
         return h
 
-    def test_stimecmp_write_syncs_to_mtimecmp(self, hart, clint):
-        """写 stimecmp CSR -> CLINT mtimecmp 同步更新."""
+    def test_stimecmp_independent_of_mtimecmp(self, hart, clint):
+        """写 stimecmp CSR 不影响 CLINT mtimecmp (独立比较器)."""
+        # Set mtimecmp directly (simulating OpenSBI)
+        clint.set_mtimecmp(0, 0xFFFF_FFFF_FFFF_FFFF)
+        # Write stimecmp — must NOT overwrite mtimecmp
         hart.write_csr(0x14D, 0x12345_6789_ABCD)
-        assert clint._mtimecmp[0] == 0x12345_6789_ABCD, (
-            "stimecmp 写入后 CLINT mtimecmp 应同步"
+        assert clint._mtimecmp[0] == 0xFFFF_FFFF_FFFF_FFFF, (
+            "stimecmp 写入后 CLINT mtimecmp 应保持不变 (独立比较器)"
+        )
+        assert hart.csrs["stimecmp"].val == 0x12345_6789_ABCD, (
+            "stimecmp CSR 应正确存储写入值"
         )
 
-    def test_stimecmp_zero_does_not_trigger_timer(self, hart, clint):
-        """stimecmp=0 时 mtimecmp=0, 不触发定时器中断 (条件 mtimecmp>0)."""
-        hart.write_csr(0x14D, 0)
-        assert clint._mtimecmp[0] == 0
-        has, mip, src = clint.check_interrupt(0)
-        assert not (mip & (1 << 7)), "stimecmp=0 不应触发 MTIP"
+    def test_mtimecmp_independent_of_stimecmp(self, hart, clint):
+        """写 CLINT mtimecmp (MMIO) 不影响 stimecmp CSR."""
+        hart.write_csr(0x14D, 0xAAAA_BBBB_CCCC_DDDD)
+        clint.set_mtimecmp(0, 0xDEAD_BEEF)
+        assert hart.csrs["stimecmp"].val == 0xAAAA_BBBB_CCCC_DDDD, (
+            "CLINT mtimecmp 写入后 stimecmp 应保持不变 (独立比较器)"
+        )
 
-    def test_stimecmp_future_value_triggers_after_tick(self, hart, clint):
-        """stimecmp=100, tick(200) -> MTIP 置位."""
+    def test_stimecmp_zero_does_not_affect_mtimecmp(self, hart, clint):
+        """stimecmp=0 不影响已设置的 mtimecmp."""
+        clint.set_mtimecmp(0, 0x100)
+        hart.write_csr(0x14D, 0)
+        assert clint._mtimecmp[0] == 0x100, (
+            "stimecmp=0 写入后 mtimecmp 应保持不变"
+        )
+
+    def test_clint_check_interrupt_uses_mtimecmp_not_stimecmp(self, hart, clint):
+        """CLINT.check_interrupt 的 MTIP 仅取决于 mtimecmp, 不取决于 stimecmp."""
+        # Set stimecmp far in the "past" — MTIP should NOT fire
         hart.write_csr(0x14D, 100)
+        clint.set_mtimecmp(0, 0xFFFFFFFF_FFFFFFFF)  # far future
         clint.tick(200)
-        has, mip, src = clint.check_interrupt(0)
-        assert mip & (1 << 7), "mtime(200) >= stimecmp(100) 应触发 MTIP"
+        has, mip, _src = clint.check_interrupt(0)
+        assert not (mip & (1 << 7)), (
+            "MTIP 仅取决于 CLINT mtimecmp; stimecmp 到期不应触发 MTIP"
+        )
 
     def test_stimecmph_write_merges_to_stimecmp(self, hart):
         """stimecmph (0x15D) 写入高 32 位合并到 stimecmp (RV64)."""
@@ -2904,9 +2897,8 @@ class TestWfiWakeupByStimecmp:
         hart.csrs["mip"].val = 0
 
         woken = try_wfi_wakeup(hart)
-        assert not woken, (
-            f"stimecmp=500 > mtime=100, 不应唤醒"
-        )
+        assert not woken, \
+            "stimecmp=500 > mtime=100, 不应唤醒"
         assert hart._waiting, "应保持 waiting 状态"
 
     def test_wfi_wakeup_stimecmp_zero_no_wake(self, hart, clint):
@@ -3023,13 +3015,9 @@ class TestWfiWakeupByStimecmp:
         模拟 Linux 多核 idle: S-mode hart 设置 stimecmp 后执行 WFI.
         修复前 try_wfi_wakeup 不检查 stimecmp, step() 返回 0 后死循环.
 
-        使用 PYREMU_NATIVE_BATCH=0 测试纯 Python 路径中的 try_wfi_wakeup.
-        Rust 侧 sync_mtip 已正确实现, 测试聚焦 Python 侧修复.
-
         注意: 使用 M-mode 运行测试 (避免 S-mode PMP 默认拒绝).
         定时器测试关注 mip&mie 的 STIP/STIE 交互, 与特权级无关.
         """
-        monkeypatch.setenv("PYREMU_NATIVE_BATCH", "0")
         emu = Emulator(
             PlatformConfig(
                 num_harts=1,
@@ -3128,7 +3116,7 @@ class TestMsipClearingOnTrapDelivery:
         taken = check_pending_interrupts(h)
         assert taken, "MSIP 应被投递"
         assert h.mode == RiscvMode.M, "应切换到 M 模式"
-        assert h.mcause_val == 0x8000_0000_0000_0003, f"mcause 应为 MSI, 实际={h.mcause_val:#x}"
+        assert h.mcause_val == 0x8000_0000_0000_0003, "mcause 应为 MSI, 实际={h.mcause_val:#x}"
 
         # 关键断言: CLINT _msip 已被清零
         assert clint._msip[0] == 0, (
@@ -3273,33 +3261,32 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
     # 从 TestPageFault 继承的测试直接调用 mem_read/mem_write,
     # 现因抛出 MemoryAccessFault 而失败。暂时跳过, 待逐个改写为
     # 经 exec_instr 或显式捕获 MemoryAccessFault 的版本。
-    import pytest as _pytest
 
-    @_pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
+    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
     def test_ld_page_fault_root_pte_invalid(self):
         pass
 
-    @_pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
+    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
     def test_ld_page_fault_l2_pte_invalid(self):
         pass
 
-    @_pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
+    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
     def test_ld_page_fault_l3_pte_invalid(self):
         pass
 
-    @_pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
+    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
     def test_ld_page_fault_unsupported_mode(self):
         pass
 
-    @_pytest.mark.skip(reason="直接调用 mem_write 依赖旧返回值行为, 需改写")
+    @pytest.mark.skip(reason="直接调用 mem_write 依赖旧返回值行为, 需改写")
     def test_st_page_fault_invalid_pte(self):
         pass
 
-    @_pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
+    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
     def test_page_fault_before_pma(self):
         pass
 
-    @_pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
+    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
     def test_tlb_caches_and_page_fault_on_miss(self):
         pass
 
@@ -3307,7 +3294,6 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         self, hart, ram: bytearray, valid_va: int, valid_pa: int,
     ):
         """建立单页 Sv39 映射 (仅 valid_va ->valid_pa 可访问)."""
-        from pyremu.core.hart import RiscvMode
         vpn0 = (valid_va >> 12) & 0x1FF
         root_ppn = self.L1_BASE >> self.PAGE_SHIFT
         self._write_pte(ram, self.L1_BASE, 0, self._make_pte(
@@ -3338,7 +3324,6 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         fault_va = 0x2000
         self._setup_sv39_for(hart, ram, valid_va, valid_pa)
 
-        import struct
         saved_val = 0xDEADBEEF
         hart.gprs[13] = saved_val  # a3
 
@@ -3373,7 +3358,6 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         fault_va = 0x2000
         self._setup_sv39_for(hart, ram, valid_va, valid_pa)
 
-        import struct
         lo12 = fault_va & 0xFFF
         addi_instr = 0x000E0E13 | ((lo12 & 0xFFF) << 20)
         sd_instr = 0x005E3023  # sd x5, 0(x28)
@@ -3402,7 +3386,6 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         fault_va = 0x2000
         self._setup_sv39_for(hart, ram, valid_va, valid_pa)
 
-        import struct
         saved_val = 0xA5A5A5A5
         hart.gprs[10] = saved_val  # a0
 
@@ -3436,7 +3419,6 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         fault_va = 0x2000
         self._setup_sv39_for(hart, ram, valid_va, valid_pa)
 
-        import struct
         lo12 = fault_va & 0xFFF
         addi_instr = 0x000E0E13 | ((lo12 & 0xFFF) << 20)
         c_sd = 0xE184  # C.SD rs2'=x8(s0), rs1'=x28(t3), uimm=0
@@ -3465,7 +3447,6 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         fault_va = 0x2000
         self._setup_sv39_for(hart, ram, valid_va, valid_pa)
 
-        import struct
         saved_val = 0xCAFECAFE
         hart.gprs[10] = saved_val  # a0
 

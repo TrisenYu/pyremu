@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Terminal I/O 后台线程 — QEMU chardev-stdio 模型 (Rust libtermio.so 实现).
 
-独立于 CPU 模拟批次循环, 以 Rust 后台线程持续转发 stdin->RX 环形缓冲和
+独立于 CPU 模拟单轮加速执行循环, 以 Rust 后台线程持续转发 stdin->RX 环形缓冲和
 TX 环形缓冲->stdout。对照 QEMU ``vendor/qemu-10.2.0/chardev/char-stdio.c``:
 
 - **单一 owner**: 线程运行期间, Rust 线程是唯一的控制台写者 (对照
@@ -20,8 +20,8 @@ cbreak 由 Debugger 负责)。
 Usage:
     term = TerminalIO(uart, wake_event, stdin_fd, stdout_fd)
     native = term.start()  # True: Rust 线程接管终端; False: Python 回退
-    term.drain_rx()        # RX 环形缓冲 ->UART RX buffer (每批次前调用)
-    term.drain_tx_logs()   # TX 环形缓冲 ->UART 行缓冲/日志 (每批次后调用)
+    term.drain_rx()        # RX 环形缓冲 ->UART RX buffer (每单轮加速执行前调用)
+    term.drain_tx_logs()   # TX 环形缓冲 ->UART 行缓冲/日志 (每单轮加速执行后调用)
     term.stop()            # 停止线程 + 恢复终端 + 排空残留
 """
 
@@ -118,7 +118,7 @@ class TerminalIO:
         fcntl.fcntl(self._rx_notify_w, fcntl.F_SETFL, fl_rx | os.O_NONBLOCK)
         self._tx_drain_thread: threading.Thread | None = None
 
-        # TX 归档 daemon — 异步将 ring buffer 写入 hart 日志, 与批次循环解耦
+        # TX 归档 daemon — 异步将 ring buffer 写入 hart 日志, 与单轮加速执行循环解耦
         self._tx_archive_running = False
         self._tx_archive_thread: threading.Thread | None = None
 
@@ -264,8 +264,8 @@ class TerminalIO:
             drained += 1
             had_input = True
         self._rx_rd.value = rd  # 发布消费进度 (Rust 容量控制依据)
-        # _rx_notify 不在此处清零 — RX daemon 抢先 drain 后 Rust batch
-        # engine 仍需看到通知以触发快速批次退出 (hart_sched.rs:1362).
+        # _rx_notify 不在此处清零 — RX daemon 抢先 drain 后
+        # 调用加速执行所用的动态链接库仍需看到通知，以触发快速退出
         # 清零由 idle poll 路径在确认 ring buffer 为空后负责.
         if had_input and self._ext_irq is not None:
             self._ext_irq.pending = 1  # 通知 CPU 引擎内联投递 SEIP/MEIP
@@ -342,7 +342,7 @@ class TerminalIO:
 
     # ----------------------------------------------------------
     #  TX 归档 daemon 线程 — 异步将 ring buffer 写入 hart 日志文件,
-    # 不依赖批次边界, 与指令执行循环完全解耦.
+    # 不依赖单轮加速执行边界, 与指令执行循环完全解耦.
     # ----------------------------------------------------------
 
     def start_tx_archive_thread(self) -> None:
@@ -365,7 +365,7 @@ class TerminalIO:
 
     def _tx_archive_loop(self) -> None:
         """TX 归档 daemon 入口: select 等待 Rust notify -> 归档 hart 日志.
-        与批次循环完全异步, 仅在 Rust 写入 ring buffer 后触发."""
+        与单轮加速执行循环完全异步, 仅在 Rust 写入 ring buffer 后触发."""
         notify_r = self._tx_notify_r
         while self._tx_archive_running:
             try:

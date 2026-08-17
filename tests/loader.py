@@ -22,15 +22,16 @@ PCB 布局 (每进程 40 字节, 与 kernel.s 中 PCB_*_OFF 常量一致):
     from pyremu.platform import PlatformConfig
     from pyremu.utils.parse_bin import parse_firmware
     from pyremu.loader import MultiProgramLoader
+    from pyremu.configs_aux import test_elf_dir
 
     emu = Emulator(PlatformConfig.qemu_virt())
-    kernel = parse_firmware("tests/bins/elf/kernel.elf")
+    kernel = parse_firmware(test_elf_dir("kernel.elf"))
     emu.load_firmware(kernel)
 
     loader = MultiProgramLoader(emu, kernel)
     loader.add_process("u_fib_entry")
     loader.add_process("u_nqueen_entry")
-    loader.run(cycles=50000)
+    loader.run()
 """
 
 from __future__ import annotations
@@ -131,23 +132,17 @@ class MultiProgramLoader:
 
     def run(
         self,
-        cycles: int = 50000,
         uart_input: bytes | None = None,
     ) -> str:
-        """运行模拟 *cycles* 个周期, 返回 UART 输出.
+        """运行模拟直至内核停机 (semihosting SYS_EXIT / 全部 hart halted),
+        返回 UART 输出.
 
         若提供 *uart_input*, 预加载到 UART RX buffer.
-        分批调用 Emulator.run() 以便在 hart halted 时提前退出.
         """
         if uart_input:
             self._uart.preload(uart_input)
 
-        BATCH = 10000
-        remaining = cycles
-        while remaining > 0 and not self._hart._halted:
-            chunk = min(BATCH, remaining)
-            self._emu.run(chunk, timeout=0)
-            remaining -= chunk
+        self._emu.run(timeout=0)
 
         return self._uart.tx_data().decode("latin-1", errors="replace")
 

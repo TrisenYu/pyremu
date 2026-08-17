@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """通用 Hart 停滞检测与恢复 — 模拟器内置看门狗.
 
-无需固件适配, 利用 emulator 自身的批次轮转作为"时钟".
+无需固件适配, 利用 emulator 自身的单轮加速执行轮转作为"时钟".
 当某个 hart 在 M-mode 中停滞 (PC 不再推进) 且另一个 hart 在 WFI 空闲时,
 自动重新触发 MSIP 给空闲 hart, 打破可能的跨核死锁.
 
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 class HartStallWatchdog:
-    """批次级 hart 停滞检测器 — 在 ``Emulator._step_native`` 中每批次调用."""
+    """单轮加速执行级 hart 停滞检测器 — 在 ``Emulator._speedup_for_cmd_step`` 中每单轮加速执行调用."""
 
     def __init__(self, emu: Emulator, *, threshold: int = 5) -> None:
         self._emu = emu
@@ -28,7 +28,7 @@ class HartStallWatchdog:
         self._track: dict[int, tuple[int, int]] = {}
 
     def check(self) -> bool:
-        """每批次返回后调用; 若执行了恢复操作则返回 True."""
+        """每单轮加速执行返回后调用; 若执行了恢复操作则返回 True."""
         emu = self._emu
         harts = emu.harts
         clint = emu.clint

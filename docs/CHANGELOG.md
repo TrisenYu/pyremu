@@ -1,3 +1,46 @@
+## 2026-08-14 — 移除连续 trap 兜底 + 时钟源超时改为绝对 deadline
+
+### 移除连续 trap 检测 (对齐 QEMU)
+
+**背景**: 旧实现以 `_consecutive_traps` 计数器 + `TRAP_LOOP_THRESHOLD=3` 启发式在
+连续 trap 时 `halt` hart (转储寄存器). QEMU 无此逻辑 — 死循环 / 非法指令 trap loop
+在真实硬件上就是无限执行, 由调试器/超时接管, 不应由 emulator 自行暂停.
+
+**修复**: 完全删除该逻辑 (Rust + Python + 配置 + 测试):
+- Rust: `HartState.consecutive_traps` 字段 (以 `_pad` 5→6 保持 repr(C) 布局字节不变),
+  `TRAP_LOOP_THRESHOLD`, `track_consecutive_traps` → 重命名为纯 PC 推进 `advance_pc`
+- Python: `hart._consecutive_traps`, `emulator._TRAP_LOOP_THRESHOLD`,
+  `trap_handler.deliver_trap` 递增, `debug/exec.py`/`debug/status.py` 显示行
+- 配置: `emu-configs.mk` `TRAP_LOOP_THRESHOLD`, `configs_gen.py` 重生成
+
+**影响**: 死循环固件不再被自动 halt, 连续执行 (run/continue) 依赖停止条件终止:
+断点命中 / semihosting 停机 / 全部 hart halted / 时钟源超时 / Ctrl+Q 设备暂停.
+
+### 时钟源超时: 相对 tick → 绝对 deadline
+
+**现象**: `run(timeout=...)` 对 trap loop 永不触发 — `FfiWatchdogCtx.timeout_ticks`
+为相对 tick 数, 看门狗以 `time_base_val + timeout_ticks` 判定; 而 trap loop 令单轮
+加速执行极速退出, `time_base_val` 每轮重置, 相对 tick 永远无法越过 deadline.
+
+**修复**: 改为绝对 deadline (`run()` 起点 mtime + `timeout_sec * timebase_hz`),
+Rust 看门狗以 `cur >= timeout_deadline` 判定:
+- `FfiWatchdogCtx.timeout_ticks` → `timeout_deadline` (Rust/Python/FFI 三侧同步)
+- `emulator.run()` 纯 Python 路径补上等价超时判定 (原先无看门狗线程、无超时检查)
+
+### 纯 Python `run()` 补齐断点与超时判定
+
+native 引擎在 Rust 内联比对断点 / 看门狗线程判超时; 纯 Python 路径 (`_speedup_hart_states
+is None`) 原先既不查断点也不查超时, `continue` 在无 termio 场景下会永久挂死.
+新增 `_check_bp_hit_py()` 与绝对 deadline 检查, 使两条路径停止语义一致.
+
+### 回归测试
+
+- `tests/test_legacy_debugger.py::test_continue_dispatches`: 改为 `ram_base=0` 使
+  0x1000 落在 RAM 内 + 在 0x1004 设断点, `continue` 执行完 NOP 命中断点即刻暂停.
+- 删除依赖连续 trap halt 的测试: `test_consecutive_traps_halt_hart`,
+  `test_consecutive_stack_overflows_count`, `test_consecutive_guard_page_traps_count`,
+  `test_consecutive_traps_halt`, `test_consecutive_trap_halt_and_status`.
+
 ## 2026-07-30 — 事件驱动执行引擎 + PMP MPRV 修复 + Ctrl+Q 调试器暂停
 
 ### PMP MPRV — `clear` 崩溃根因修复 (最关键)

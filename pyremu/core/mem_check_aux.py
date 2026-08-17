@@ -18,9 +18,9 @@ from pyremu.core.hart import MSTATUS_MXR, MSTATUS_SUM, RiscvMode
 from pyremu.core.registers import check_csr_access, CsrAccessError
 from pyremu.core.trap_def import TrapType
 from pyremu.core.trap_handler import deliver_trap
-from pyremu.memory.mmu import PTE_R, PTE_U, PTE_X, PAGE_SIZE, SATP_MODE_BARE, translate_va
+from pyremu.memory.mmu import PAGE_SIZE, PTE_R, PTE_U, PTE_X, SATP_MODE_BARE, translate_va
 from pyremu.memory.pmp import PmpAccessInfo
-from pyremu.utils.mask import mask64
+from pyremu.utils.mask import mask16, mask64
 
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
@@ -47,6 +47,7 @@ class PageFault(MemoryAccessFault):
 
 class AccessFault(MemoryAccessFault):
     """PMP 或 PMA 拒绝访问 (LdAccessFault / StAccessFault)."""
+
 
 # ============================================================
 #  PMP CSR 地址范围验证
@@ -206,7 +207,7 @@ def translate_addr(
     # TLB 查找 (ASID-tagged: Bare 模式 asid=0 匹配全部)
     vpn = va >> 12
     tlb: TLB = hart.dtlb
-    _asid = (hart.satp_val >> 44) & 0xFFFF if hart.mmu_mode != SATP_MODE_BARE else 0
+    _asid = mask16(hart.satp_val >> 44) if hart.mmu_mode != SATP_MODE_BARE else 0
     hit, ppn, perm = tlb.lookup(vpn, asid=_asid)
     if hit:
         # _check_pte_perm 需等 TLB 存储真实 PTE 权限 (非硬编码 0xF) 后启用
@@ -238,8 +239,7 @@ def translate_addr(
     # 将翻译结果插入 TLB 缓存 (标记当前 hart 的 mdid, 供 mfence.did 按域刷新)
     new_vpn = va >> 12
     new_ppn = pa >> 12
-    tlb.insert(new_vpn, new_ppn, perm=0xF, level=0,
-               mdid=hart.mdid_val, asid=_asid)
+    tlb.insert(new_vpn, new_ppn, perm=0xF, level=0, mdid=hart.mdid_val, asid=_asid)
 
     return True, pa
 
@@ -276,8 +276,7 @@ def mem_read(
     # 跨页边界检查: M/D 模式与 Bare 模式下 VA==PA, 无需拆分.
     # 仅 S/U 模式且 MMU 使能时 VA->PA 映射可能不连续.
     _mmu_active = (
-        hart.mode not in (RiscvMode.M, RiscvMode.D)
-        and hart.mmu_mode != SATP_MODE_BARE
+        hart.mode not in (RiscvMode.M, RiscvMode.D) and hart.mmu_mode != SATP_MODE_BARE
     )
     page_end = (addr & ~0xFFF) + 0x1000
     if _mmu_active and size > 1 and addr + size > page_end:
@@ -290,16 +289,24 @@ def mem_read(
             raise PageFault
         ok2, pa2 = translate_addr(hart, addr + first_size, is_write=False, is_execute=False)
         if not ok2:
-            deliver_trap(hart, TrapType.LdPageFault, tval=addr + first_size, is_interrupt=False)
+            deliver_trap(
+                hart, TrapType.LdPageFault, tval=addr + first_size, is_interrupt=False
+            )
             raise PageFault
         # 跨页 PMP: 逐页检查
         pmp: Pmp = hart._pmp
-        for (check_pa, check_size) in ((pa1, first_size), (pa2, second_size)):
-            if not pmp.check(PmpAccessInfo(
-                pa=check_pa, size=check_size, mode_val=hart.mode.value,
-                mstatus_val=hart.mstatus_val, is_write=False,
-                pmpsplit=hart.pmpsplit_val, mdid=hart.mdid_val,
-            )):
+        for check_pa, check_size in ((pa1, first_size), (pa2, second_size)):
+            if not pmp.check(
+                PmpAccessInfo(
+                    pa=check_pa,
+                    size=check_size,
+                    mode_val=hart.mode.value,
+                    mstatus_val=hart.mstatus_val,
+                    is_write=False,
+                    pmpsplit=hart.pmpsplit_val,
+                    mdid=hart.mdid_val,
+                )
+            ):
                 deliver_trap(hart, TrapType.LdAccessFault, tval=addr, is_interrupt=False)
                 raise AccessFault
         return hart._mem_read_phy(pa1, first_size) + hart._mem_read_phy(pa2, second_size)
@@ -312,10 +319,17 @@ def mem_read(
 
     # PMP 检查 — 物理内存保护 (对 M 模式且 MPRV=0 自动放行)
     pmp: Pmp = hart._pmp
-    if not pmp.check(PmpAccessInfo(
-        pa=pa, size=size, mode_val=hart.mode.value, mstatus_val=hart.mstatus_val,
-        is_write=False, pmpsplit=hart.pmpsplit_val, mdid=hart.mdid_val,
-    )):
+    if not pmp.check(
+        PmpAccessInfo(
+            pa=pa,
+            size=size,
+            mode_val=hart.mode.value,
+            mstatus_val=hart.mstatus_val,
+            is_write=False,
+            pmpsplit=hart.pmpsplit_val,
+            mdid=hart.mdid_val,
+        )
+    ):
         deliver_trap(hart, TrapType.LdAccessFault, tval=addr, is_interrupt=False)
         raise AccessFault
 
@@ -356,8 +370,7 @@ def mem_write(
 
     # 跨页边界检查: M/D 模式与 Bare 模式下无需拆分.
     _mmu_active = (
-        hart.mode not in (RiscvMode.M, RiscvMode.D)
-        and hart.mmu_mode != SATP_MODE_BARE
+        hart.mode not in (RiscvMode.M, RiscvMode.D) and hart.mmu_mode != SATP_MODE_BARE
     )
     page_end = (addr & ~0xFFF) + 0x1000
     if _mmu_active and size > 1 and addr + size > page_end:
@@ -369,15 +382,23 @@ def mem_write(
             raise PageFault
         ok2, pa2 = translate_addr(hart, addr + first_size, is_write=True, is_execute=False)
         if not ok2:
-            deliver_trap(hart, TrapType.StPageFault, tval=addr + first_size, is_interrupt=False)
+            deliver_trap(
+                hart, TrapType.StPageFault, tval=addr + first_size, is_interrupt=False
+            )
             raise PageFault
         pmp: Pmp = hart._pmp
-        for (check_pa, check_size) in ((pa1, first_size), (pa2, second_size)):
-            if not pmp.check(PmpAccessInfo(
-                pa=check_pa, size=check_size, mode_val=hart.mode.value,
-                mstatus_val=hart.mstatus_val, is_write=True,
-                pmpsplit=hart.pmpsplit_val, mdid=hart.mdid_val,
-            )):
+        for check_pa, check_size in ((pa1, first_size), (pa2, second_size)):
+            if not pmp.check(
+                PmpAccessInfo(
+                    pa=check_pa,
+                    size=check_size,
+                    mode_val=hart.mode.value,
+                    mstatus_val=hart.mstatus_val,
+                    is_write=True,
+                    pmpsplit=hart.pmpsplit_val,
+                    mdid=hart.mdid_val,
+                )
+            ):
                 deliver_trap(hart, TrapType.StAccessFault, tval=addr, is_interrupt=False)
                 raise AccessFault
         hart.clear_reservation()
@@ -393,10 +414,17 @@ def mem_write(
 
     # PMP 检查
     pmp: Pmp = hart._pmp
-    if not pmp.check(PmpAccessInfo(
-        pa=pa, size=size, mode_val=hart.mode.value, mstatus_val=hart.mstatus_val,
-        is_write=True, pmpsplit=hart.pmpsplit_val, mdid=hart.mdid_val,
-    )):
+    if not pmp.check(
+        PmpAccessInfo(
+            pa=pa,
+            size=size,
+            mode_val=hart.mode.value,
+            mstatus_val=hart.mstatus_val,
+            is_write=True,
+            pmpsplit=hart.pmpsplit_val,
+            mdid=hart.mdid_val,
+        )
+    ):
         deliver_trap(hart, TrapType.StAccessFault, tval=addr, is_interrupt=False)
         raise AccessFault
 
@@ -434,7 +462,7 @@ def _translate_instruction_addr(
         (ok, pa, perm) — perm 供调用方做 SUM 权限检查.
     """
     vpn = va >> 12
-    _asid = (hart.satp_val >> 44) & 0xFFFF if hart.mmu_mode != SATP_MODE_BARE else 0
+    _asid = mask16(hart.satp_val >> 44) if hart.mmu_mode != SATP_MODE_BARE else 0
     hit, ppn, perm = tlb.lookup(vpn, asid=_asid)
     if hit:
         offset = va & (PAGE_SIZE - 1)
@@ -458,8 +486,7 @@ def _translate_instruction_addr(
     # 跳过 MMIO 地址的缓存 (与 dtlb 策略一致)
     bus: Bus | None = hart._bus
     if bus is None or not bus.is_device_addr(pa):
-        tlb.insert(new_vpn, new_ppn, perm=perm, level=0,
-                   mdid=hart.mdid_val, asid=_asid)
+        tlb.insert(new_vpn, new_ppn, perm=perm, level=0, mdid=hart.mdid_val, asid=_asid)
     return True, pa, perm
 
 
@@ -504,21 +531,24 @@ def check_instruction_fetch(
     # 清除 MPRV 位确保 M 模式取指绕过 PMP (无需关心 MPP).
     pmp: Pmp = hart._pmp
     _fetch_mstatus = hart.mstatus_val & ~(1 << 17)  # MPRV=0 for instruction fetch
-    if not pmp.check(PmpAccessInfo(
-        pa=pa, size=4, mode_val=hart.mode.value, mstatus_val=_fetch_mstatus,
-        is_execute=True, pmpsplit=hart.pmpsplit_val, mdid=hart.mdid_val,
-    )):
-        deliver_trap(
-            hart, TrapType.InstrAccessFault, tval=va, is_interrupt=False
+    if not pmp.check(
+        PmpAccessInfo(
+            pa=pa,
+            size=4,
+            mode_val=hart.mode.value,
+            mstatus_val=_fetch_mstatus,
+            is_execute=True,
+            pmpsplit=hart.pmpsplit_val,
+            mdid=hart.mdid_val,
         )
+    ):
+        deliver_trap(hart, TrapType.InstrAccessFault, tval=va, is_interrupt=False)
         return False, 0
 
     # PMA 检查
     bus: Bus | None = hart._bus
     if bus is not None and not bus.is_valid_addr(pa):
-        deliver_trap(
-            hart, TrapType.InstrAccessFault, tval=va, is_interrupt=False
-        )
+        deliver_trap(hart, TrapType.InstrAccessFault, tval=va, is_interrupt=False)
         return False, 0
 
     return True, pa

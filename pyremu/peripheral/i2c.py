@@ -20,6 +20,7 @@ CTRL.STOP 结束传输. 简化为即时完成模型 (总线不实际仿真时序
 """
 
 from pyremu.memory.bus import Device
+from pyremu.utils.mask import mask08, mask16
 
 
 class I2C(Device):
@@ -63,7 +64,7 @@ class I2C(Device):
 
     def set_slave_data(self, reg: int, val: int) -> None:
         """设置从设备寄存器的模拟值."""
-        self._slave_data[reg] = val & 0xFF
+        self._slave_data[reg] = mask08(val)
 
     # ---- Device 接口 ----
 
@@ -100,7 +101,7 @@ class I2C(Device):
             # 读取从设备数据 (模拟)
             self._busy = False
             if self._addr & 0x100:  # rw=1: read
-                reg = self._addr & 0xFF
+                reg = mask08(self._addr)
                 return self._slave_data.get(reg, 0)
             return self._data
         if offset == self.REG_ADDR:
@@ -122,14 +123,14 @@ class I2C(Device):
                 self._busy = False
             return
         if offset == self.REG_DATA:
-            self._data = val & 0xFF
+            self._data = mask08(val)
             self._busy = False  # 瞬时完成
             return
         if offset == self.REG_ADDR:
             self._addr = val
             # 检查地址是否有对应的从设备数据
-            self._nack = (val & 0xFF) not in self._slave_data
+            self._nack = mask08(val) not in self._slave_data
             return
         if offset == self.REG_PRESCALE:
-            self._prescale = val & 0xFFFF
+            self._prescale = mask16(val)
             return

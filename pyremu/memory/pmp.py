@@ -22,11 +22,11 @@ from typing import Any
 
 from loguru import logger
 
-from pyremu.configs_aux import cfg_bool
 from pyremu._native import (
     native_available,
     pmp_check as _native_pmp_check,
 )
+from pyremu.configs_aux import cfg_bool
 from pyremu.utils.mask import mask64
 
 # PMP 配置位 (每 8-bit 条目中的位偏移)
@@ -179,7 +179,7 @@ class Pmp:
         self._cache_dirty = False
 
     def _sync_from_flat(self) -> None:
-        """将 Rust batch 修改后的 flat 数组同步回 CSR entries (flat -> entries).
+        """将调用动态链接库加速修改后的 flat 数组同步回 CSR entries (flat -> entries).
 
         逐字节写回 pmpcfg 寄存器: 先读 CSR 当前值, 替换目标字节,
         写回, 确保同一寄存器内其他条目不受影响.

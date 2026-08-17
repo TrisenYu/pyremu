@@ -16,10 +16,7 @@ TLB 缓存最近使用的虚拟页号 (VPN) -> 物理页号 (PPN) 映射,
 
 from dataclasses import dataclass
 
-from pyremu.memory.cache_base import (
-    CacheBase, CacheLineBase,
-    ReplacementPolicy
-)
+from pyremu.memory.cache_base import CacheBase, CacheLineBase, ReplacementPolicy
 
 
 @dataclass
@@ -93,7 +90,7 @@ class TLB(CacheBase):
         entry = self._find_by_tag(vpn)
         if entry is not None:
             e: TLBLine = entry  # type: ignore
-            if asid != 0 and e.asid != 0 and e.asid != asid:
+            if asid != 0 and e.asid not in (0, asid):
                 return False, 0, 0
             return True, e.ppn, e.perm
         return False, 0, 0

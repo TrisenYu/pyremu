@@ -34,12 +34,9 @@ from pyremu._native import (
 )
 from pyremu.core.hart import HartWithRegs
 from pyremu.core.mem_check_aux import (
-    AccessFault,
-    AlignmentFault,
-    MemoryAccessFault,
-    PageFault,
     mem_read,
     mem_write,
+    MemoryAccessFault,
     validate_csr,
 )
 from pyremu.core.registers import CsrAccessError
@@ -52,19 +49,26 @@ from pyremu.core.trap_handler import (
     trap_mret,
     trap_sret,
 )
-
+from pyremu.utils.disassem import (
+    AMOF5_MAP,
+    AmoFunct5,
+    AMOW_MAP,
+    AmoWidth,
+    brFn3,
+    BRFN3_MAP,
+    ldFn3,
+    LDFN3_MAP,
+    stFn3,
+    STFN3_MAP,
+)
 from pyremu.utils.mask import (
+    mask16,
     mask32,
     mask64,
     sext,
     sext8,
     sext16,
     sext32,
-)
-from pyremu.utils.disassem import (
-    brFn3, ldFn3, stFn3,
-    AmoFunct5, AmoWidth,
-    BRFN3_MAP, LDFN3_MAP, STFN3_MAP, AMOF5_MAP, AMOW_MAP,
 )
 
 _sint64 = ctypes.c_int64
@@ -409,7 +413,7 @@ class Hart(HartWithRegs):
                     _sint64(sext32(v1)).value,
                     _sint64(sext32(v2)).value,
                 )
-                result = sext32(result & 0xFFFF_FFFF)
+                result = sext32(mask32(result))
             else:
                 raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=100")
         elif part1 == 0b101:
@@ -418,10 +422,10 @@ class Hart(HartWithRegs):
                 result = sext32(result)
             elif part2 == 1:
                 result = _trunc_div(v1, v2)
-                result = sext32(result & 0xFFFF_FFFF)
+                result = sext32(mask32(result))
             elif part2 == 0x20:
                 result = _sint64(sext32(v1) >> (v2 & 0x1F)).value
-                result = sext32(result & 0xFFFF_FFFF)
+                result = sext32(mask32(result))
             else:
                 raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=101")
         elif part1 == 0b110:
@@ -433,7 +437,7 @@ class Hart(HartWithRegs):
                     _sint64(sext32(v1)).value,
                     _sint64(sext32(v2)).value,
                 )
-                result = sext32(result & 0xFFFF_FFFF)
+                result = sext32(mask32(result))
             else:
                 raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=110")
         elif part2 == 0:
@@ -441,7 +445,7 @@ class Hart(HartWithRegs):
             result = sext32(result)
         elif part2 == 1:
             result = _trunc_rem(v1, v2)
-            result = sext32(result & 0xFFFF_FFFF)
+            result = sext32(mask32(result))
         else:
             raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=111")
         if f.rd != 0:
@@ -476,13 +480,13 @@ class Hart(HartWithRegs):
         elif part1 == 0b001:
             if part7 != 0:
                 raise ValueError(f"invalid funct7={part7:#x} for SLLIW")
-            result = mask32(((v1 & 0xFFFF_FFFF) << shamt))
+            result = mask32((mask32(v1) << shamt))
             result = sext32(result)
         elif part1 == 0b101:
             if part7 == 0:
-                result = mask32(((v1 & 0xFFFF_FFFF) >> shamt))
+                result = mask32((mask32(v1) >> shamt))
             elif part7 == 0x20:
-                result = mask32(_sint64(sext32(v1 & 0xFFFF_FFFF) >> shamt).value)
+                result = mask32(_sint64(sext32(mask32(v1)) >> shamt).value)
             else:
                 raise ValueError(f"invalid funct7={part7:#x} for SRLIW/SRAIW")
             result = sext32(result)
@@ -1412,7 +1416,7 @@ class Hart(HartWithRegs):
         # 16-bit 压缩指令 — 非法编码触发 IllInstr 陷态
         if f.is_compressed:
             try:
-                return self.handle_compressed(instr & 0xFFFF)
+                return self.handle_compressed(mask16(instr))
             except MemoryAccessFault:
                 return 0
             except (ValueError, NotImplementedError, CsrAccessError):

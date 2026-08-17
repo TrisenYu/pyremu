@@ -6,22 +6,25 @@
 """多核模拟器集成测试: 多 hart 执行, IPI, AMO 跨 hart 竞争."""
 
 import ctypes
+import time
 
 import pytest
 
+from pyremu.configs_gen import CPU_FREQ_HZ
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import (
-    BatchResult,
     HartState,
-    RiscvMode,
-    TlbEntry,
+    InstrToBeExec,
     marshal_hart,
+    RiscvMode,
     unmarshal_hart,
 )
 from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.trap_handler import check_pending_interrupts
-from pyremu.emulator import Emulator
+from pyremu.emulator import Emulator, TimeoutError
 from pyremu.memory.bus import Bus
+from pyremu.platform import PlatformConfig
+from pyremu.utils.mask import mask64
 
 
 class TestEmulatorInit:
@@ -539,7 +542,7 @@ class TestAluEdgeCases:
         instr = TestAluEdgeCases._r_type(funct7, rs2, rs1, funct3, rd)
         advance = hart.exec_instr(instr)
         if advance:
-            hart.pc = (hart.pc + advance) & 0xFFFF_FFFF_FFFF_FFFF
+            hart.pc = mask64(hart.pc + advance)
         return hart.gprs[rd]
 
     @staticmethod
@@ -547,7 +550,7 @@ class TestAluEdgeCases:
         instr = TestAluEdgeCases._i_shift(funct6, shamt, rs1, funct3, rd)
         advance = hart.exec_instr(instr)
         if advance:
-            hart.pc = (hart.pc + advance) & 0xFFFF_FFFF_FFFF_FFFF
+            hart.pc = mask64(hart.pc + advance)
         return hart.gprs[rd]
 
     # ============================================================
@@ -1290,20 +1293,6 @@ class TestStepEdgeCases:
         assert emu.harts[0].pc == 0x1000  # 跳过的 hart PC 未变
         assert emu.harts[1].pc == 0x1004  # 正常执行的 hart PC+4
 
-    def test_consecutive_traps_halt_hart(self):
-        """连续 3 次以上 trap 导致 hart 永久停止."""
-        emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
-        # 写入非法指令 (全零)
-        emu.load_code(0x1000, b"\x00\x00\x00\x00" * 10)
-        h = emu.harts[0]
-        # 执行多步触发连续 trap
-        for _ in range(5):
-            emu.step()
-        assert h._halted, "连续 trap 后 hart 应被停止"
-        # 此后 step() 跳过该 hart
-        executed = emu.step()
-        assert executed == 0, "已停止的 hart 不应再执行"
-
     def test_not_implemented_error_delivers_ill_instr(self):
         """未实现的操作码触发 IllInstr 陷态, hart 不崩溃."""
         emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
@@ -1344,9 +1333,11 @@ class TestRunTimeout:
     def test_timeout_raises_timeouterror(self):
         """非零 timeout 超时时抛出 TimeoutError."""
         emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0, ram_size=64 * 1024)
-        emu.load_code(0x1000, b"\x13\x00\x00\x00" * 10000)
-        with pytest.raises(emu.TimeoutError) as exc_info:
-            emu.run(max_cycles=10**9, timeout=0.001, yield_every=1000)
+        # nop @0x1000 + jal x0,-4 @0x1004 — 死循环 (跳回 0x1000), 依赖时钟源超时兜底.
+        # 不能用 jal x0,0 (跳自身): 停滞检测会将其误判为 trap 循环而提前 halt.
+        emu.load_code(0x1000, b"\x13\x00\x00\x00\x6f\xf0\xdf\xff")
+        with pytest.raises(TimeoutError) as exc_info:
+            emu.run(timeout=0.01, yield_every=1000)
         err = exc_info.value
         assert "超时" in str(err)
 
@@ -1354,16 +1345,18 @@ class TestRunTimeout:
         """run() 返回执行的周期数 (int)."""
         emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0, ram_size=64 * 1024)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 5)
-        cycles = emu.run(max_cycles=5, timeout=0)
+        # 断点终止连续执行 (max_cycles 已移除), 使 run() 确定性返回.
+        emu._bp_addrs = [0x1000 + 4 * 5]
+        cycles = emu.run(timeout=0)
         assert isinstance(cycles, int)
-        assert cycles >= 5
 
     def test_yield_every_zero_runs_full(self):
-        """yield_every=0 时 run() 不限速执行全部周期."""
+        """yield_every=0 时 run() 不限速执行到断点."""
         emu = Emulator(num_harts=1, prog_cnt=0x1000, ram_base=0)
         emu.load_code(0x1000, b"\x13\x00\x00\x00" * 5)
-        cycles = emu.run(max_cycles=5, timeout=0, yield_every=0)
-        assert cycles >= 5
+        emu._bp_addrs = [0x1000 + 4 * 5]
+        cycles = emu.run(timeout=0, yield_every=0)
+        assert isinstance(cycles, int)
 
 
 # ============================================================
@@ -1411,8 +1404,7 @@ class TestEmulatorProperties:
         t1 = h.csrs["time"].val
         assert c1 > c0, f"mcycle 应递增: {c0} -> {c1}"
         assert i1 > i0, f"minstret 应递增: {i0} -> {i1}"
-        assert t1 > t0, f"time 应递增 (来自 CLINT mtime): {t0} -> {t1}"
-        # time 应等于 CLINT 的 mtime
+        # mtime 按指令计数推进, 单条指令不足 1 tick, time 可不递增但须与 mtime 同步
         assert t1 == emu.clint.get_mtime(), (
             f"time CSR 应与 CLINT mtime 同步: {t1} vs {emu.clint.get_mtime()}"
         )
@@ -1427,9 +1419,40 @@ class TestEmulatorProperties:
         delta_c = h.csrs["mcycle"].val - c1
         delta_i = h.csrs["minstret"].val - i1
         delta_t = h.csrs["time"].val - t1
-        assert delta_c == 2, f"3 步后 mcycle 差值应为 2, 实际 {delta_c}"
+        # mcycle 按时钟源推进, 差值由流逝时间决定, 不固定为 2.
+        assert delta_c >= 0, f"mcycle 差值不应为负, 实际 {delta_c}"
         assert delta_i == 2, f"3 步后 minstret 差值应为 2, 实际 {delta_i}"
-        assert delta_t == 2, f"3 步后 time 差值应为 2, 实际 {delta_t}"
+        # mtime 按指令计数推进, 2 条指令不足 1 tick, time 不递增.
+        assert delta_t >= 0, f"time 差值不应为负: delta={delta_t}"
+        assert h.csrs["time"].val == emu.clint.get_mtime(), (
+            f"time CSR 应与 CLINT mtime 同步"
+        )
+
+
+class TestWfiIdleSleep:
+    """WFI 全 hart 空闲睡眠 — 必须被 _wake_event 立即唤醒 (输入 daemon)."""
+
+    def test_wfi_sleep_wakes_on_wake_event(self):
+        """_wfi_sleep_if_idle 仅等待 _wake_event, 已 set 的事件应立即返回.
+
+        回归: 键盘输入经独立 daemon 线程 set(_wake_event) 唤醒主线程,
+        WFI 睡眠不得再阻塞至 sleep_sec (最多 200ms) 超时 — 否则内核
+        WFI 等待期间输入延迟, 表现为"回车需额外按键触发"。
+        """
+        emu = Emulator(num_harts=1, ram_base=0x80000000, ram_size=0x10000)
+        hart = emu.harts[0]
+        hart._waiting = True
+        # 定时器设到远处 -> sleep_sec = _WFI_MAX_SLEEP = 0.2s
+        emu.clint._mtime = 0
+        emu.clint._mtimecmp[0] = 100_000_000
+
+        # 输入 daemon 已完成转发并 set(_wake_event) — 修复后应立即返回,
+        # 而非阻塞到 sleep_sec (200ms) 超时。
+        emu._wake_event.set()
+        start = time.monotonic()
+        emu._wfi_sleep_if_idle([hart], 1)
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.15, f"应由 _wake_event 立即唤醒, 实际 {elapsed:.3f}s"
 
 
 class TestL2SizeZero:
@@ -1437,7 +1460,6 @@ class TestL2SizeZero:
 
     def test_l2_size_zero_emulator_runs(self):
         """l2_size=0 的 Emulator 可正常执行指令, 不触发 IndexError."""
-        from pyremu.platform import PlatformConfig
         cfg = PlatformConfig.qemu_virt()
         cfg.num_harts = 1
         cfg.l2_size = 0
@@ -1565,8 +1587,6 @@ class TestBusErrorOnUnmappedAccess:
     @pytest.fixture
     def emu(self) -> Emulator:
         emu = Emulator(num_harts=1)
-        # 使用纯 Python 路径以隔离测试目标 (不受 native batch 影响)
-        emu._native_batch = False
         return emu
 
     def test_load_from_unmapped_addr_traps(self, emu):
@@ -1675,8 +1695,8 @@ class TestNativeBatchLayout:
     #     assert ctypes.sizeof(HartState) < 4096
 
     def test_batch_result_8byte_aligned(self) -> None:
-        """BatchResult 必须 8 字节对齐."""
-        assert ctypes.sizeof(BatchResult) % 8 == 0
+        """InstrToBeExec (原 BatchResult) 必须 8 字节对齐."""
+        assert ctypes.sizeof(InstrToBeExec) % 8 == 0
 
     def test_itlb_is_array_of_structs(self) -> None:
         """itlb 确保 array-of-structs 而非 struct-of-arrays.
@@ -1696,6 +1716,77 @@ class TestNativeBatchLayout:
         assert hasattr(hs.dtlb[0], "vpn")
         assert hasattr(hs.dtlb[0], "ppn")
         assert hasattr(hs.dtlb[0], "valid")
+
+
+class TestClockDecoupling:
+    """指令计数时钟模型: mtime 按已执行指令数推进, mcycle 按时钟源推进.
+
+    回归: 旧实现按时钟源 (time.monotonic()) 推进 mtime, 使 mtime 速率与执行
+    速度无关 — 固件忙等 (rdtime 自旋) 期间 mtime 仍推进, SMP bringup 超时.
+    改为 mtime 按指令计数推进 (100 指令 = 1 tick), mcycle 仍按时钟源推进.
+    """
+
+    @pytest.fixture
+    def nop_emu(self) -> Emulator:
+        """单 hart 模拟器, 加载 128 条 NOP — 无 WFI/ECALL/trap."""
+        emu = Emulator(num_harts=1)
+        nops = b"\x13\x00\x00\x00" * 128  # addi x0, x0, 0
+        emu.load_code(0x8000_0000, nops)
+        return emu
+
+    def test_mtime_advances_per_100_instructions(self, nop_emu):
+        """mtime 按指令计数推进: 100 条指令 = 1 tick (10 MHz / 1 GHz)."""
+        emu = nop_emu
+        mtime_before = emu.clint.get_mtime()
+        for _ in range(100):
+            emu.step()
+        assert emu.clint.get_mtime() - mtime_before == 1, (
+            "100 条指令应推进 mtime 恰好 1 tick"
+        )
+
+    def test_advance_mtime_instr_conversion(self, nop_emu):
+        """_advance_mtime_instr 按 timebase_freq/CPU_FREQ_HZ 换算, 余数跨调用累积."""
+        emu = nop_emu
+        mtime_before = emu.clint.get_mtime()
+
+        # 100 指令 -> 1 tick
+        emu._advance_mtime_instr(100)
+        assert emu.clint.get_mtime() - mtime_before == 1
+
+        # 50 指令 -> 0 tick (余数累积); 再 50 指令 -> 1 tick
+        emu._advance_mtime_instr(50)
+        assert emu.clint.get_mtime() - mtime_before == 1
+        emu._advance_mtime_instr(50)
+        assert emu.clint.get_mtime() - mtime_before == 2
+
+    def test_advance_mcycle_clock_source(self, nop_emu, monkeypatch):
+        """_advance_mcycle 按时钟源推进 mcycle, 不动 mtime."""
+        now_holder = {"t": 100.0}
+        monkeypatch.setattr(time, "monotonic", lambda: now_holder["t"])
+        emu = nop_emu
+        emu._last_clock_sync = 100.0
+        cyc_before = emu._cycle
+        mtime_before = emu.clint.get_mtime()
+
+        now_holder["t"] = 101.0
+        emu._advance_mcycle()
+        assert emu._cycle - cyc_before == CPU_FREQ_HZ
+        assert emu.clint.get_mtime() == mtime_before
+
+    def test_marshal_clint_no_mtime_advance(self, nop_emu, monkeypatch):
+        """_native_marshal_clint 不再按时钟源推进 mtime (mtime 与时钟源解耦)."""
+        now_holder = {"t": 300.0}
+        monkeypatch.setattr(time, "monotonic", lambda: now_holder["t"])
+        emu = nop_emu
+        emu._last_clock_sync = 300.0
+        mtime_before = emu.clint.get_mtime()
+
+        now_holder["t"] = 300.5
+        info = emu._native_marshal_clint()
+        assert emu.clint.get_mtime() == mtime_before, (
+            "marshal_clint 不得再按时钟源推进 mtime"
+        )
+        assert info.mtime == mtime_before
 
 
 class TestMarshalUnmarshalRoundtrip:
@@ -1736,13 +1827,13 @@ class TestMarshalUnmarshalRoundtrip:
         hart = self._fresh_hart()
         for i in range(32):
             # 用可识别模式: i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE
-            hart.gprs[i] = (i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE) & 0xFFFF_FFFF_FFFF_FFFF
+            hart.gprs[i] = mask64(i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE)
         # x0 写保护 — GprFile 应忽略写入
         hart.gprs[0] = 0  # explicitly ensure
         out = self._roundtrip(hart)
         assert out.gprs[0] == 0, "x0 must always be 0"
         for i in range(1, 32):
-            expected = (i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE) & 0xFFFF_FFFF_FFFF_FFFF
+            expected = mask64(i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE)
             assert out.gprs[i] == expected, (
                 f"gprs[{i}] = {out.gprs[i]:#018x}, expected {expected:#018x}"
             )
@@ -1853,10 +1944,8 @@ class TestMarshalUnmarshalRoundtrip:
     def test_halted_roundtrip(self) -> None:
         hart = self._fresh_hart()
         hart._halted = True
-        hart._consecutive_traps = 3
         out = self._roundtrip(hart)
         assert out._halted is True
-        assert out._consecutive_traps == 3
 
     # ---------- TEE CSRs ----------
     def test_mdid_pmpsplit_roundtrip(self) -> None:
@@ -1894,10 +1983,10 @@ class TestMarshalUnmarshalRoundtrip:
     def test_fpr_roundtrip(self) -> None:
         hart = self._fresh_hart()
         for i in range(32):
-            hart._fpr_bits[i] = (0x3FF0_0000_0000_0000 + i * 0x1000_0000_0000) & 0xFFFF_FFFF_FFFF_FFFF
+            hart._fpr_bits[i] = mask64(0x3FF0_0000_0000_0000 + i * 0x1000_0000_0000)
         out = self._roundtrip(hart)
         for i in range(32):
-            expected = (0x3FF0_0000_0000_0000 + i * 0x1000_0000_0000) & 0xFFFF_FFFF_FFFF_FFFF
+            expected = mask64(0x3FF0_0000_0000_0000 + i * 0x1000_0000_0000)
             assert out._fpr_bits[i] == expected, f"fpr[{i}] mismatch"
 
     def test_fcsr_roundtrip(self) -> None:

@@ -12,28 +12,31 @@ use crate::ecall_aux;
 const BUF_SIZE: usize = 512;
 
 pub struct FmtBuf {
-    buf: [u8; BUF_SIZE],
-    pos: usize,
+	buf: [u8; BUF_SIZE],
+	pos: usize,
 }
 
 impl FmtBuf {
-    pub fn new() -> Self {
-        Self { buf: [0u8; BUF_SIZE], pos: 0 }
-    }
+	pub fn new() -> Self {
+		Self {
+			buf: [0u8; BUF_SIZE],
+			pos: 0,
+		}
+	}
 
-    pub fn as_written(&self) -> &[u8] {
-        &self.buf[..self.pos]
-    }
+	pub fn as_written(&self) -> &[u8] {
+		&self.buf[..self.pos]
+	}
 }
 
 impl Write for FmtBuf {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let bytes = s.as_bytes();
-        let n = bytes.len().min(self.buf.len() - self.pos);
-        self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
-        self.pos += n;
-        Ok(())
-    }
+	fn write_str(&mut self, s: &str) -> fmt::Result {
+		let bytes = s.as_bytes();
+		let n = bytes.len().min(self.buf.len() - self.pos);
+		self.buf[self.pos..self.pos + n].copy_from_slice(&bytes[..n]);
+		self.pos += n;
+		Ok(())
+	}
 }
 
 /// 格式化输出到控制台。整条消息通过一次 SBI ecall 发出。
@@ -69,23 +72,23 @@ macro_rules! print {
 /// 输出以 `\0` 结尾的字符串（逐字符，调试用）。
 #[allow(unused)]
 pub fn puts(s: &str) {
-    for &byte in s.as_bytes() {
-        if byte == 0 {
-            break;
-        }
-        ecall_aux::sbi_putchar(byte);
-    }
+	for &byte in s.as_bytes() {
+		if byte == 0 {
+			break;
+		}
+		ecall_aux::sbi_putchar(byte);
+	}
 }
 
 /// 将 u64 按十六进制输出（逐字符，调试用）。
 #[allow(unused)]
 pub fn putx(val: u64) {
-    for shift in (0..16).rev() {
-        let nibble = ((val >> (shift * 4)) & 0xF) as u8;
-        ecall_aux::sbi_putchar(if nibble < 10 {
-            b'0' + nibble
-        } else {
-            b'a' + nibble - 10
-        });
-    }
+	for shift in (0..16).rev() {
+		let nibble = ((val >> (shift * 4)) & 0xF) as u8;
+		ecall_aux::sbi_putchar(if nibble < 10 {
+			b'0' + nibble
+		} else {
+			b'a' + nibble - 10
+		});
+	}
 }

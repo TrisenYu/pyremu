@@ -2,17 +2,15 @@
 # -*- coding: utf-8 -*-
 """短时间片抢占测试 — 验证抢占下进程交替执行与正确性."""
 
-from pathlib import Path
-
 import pytest
 
+from pyremu.configs_aux import test_elf_dir
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import parse_firmware
 from tests.loader import MultiProgramLoader
 
-BIN_DIR = Path(__file__).resolve().parent / "bins" / "elf"
-KERNEL_ELF = BIN_DIR / "kernel.elf"
+KERNEL_ELF = test_elf_dir("kernel.elf")
 
 
 def _make_emu(*procs: str):
@@ -34,14 +32,14 @@ class TestPreemptInterleave:
 
     def test_interleaved(self):
         _, loader = _make_emu("u_prog_a_entry", "u_prog_b_entry")
-        out = loader.run(cycles=50_000)
+        out = loader.run()
         seq = "".join(c for c in out if c in "AB")
         transitions = sum(1 for i in range(len(seq) - 1) if seq[i] != seq[i + 1])
         assert transitions > 1, f"未交错, transitions={transitions}"
 
     def test_both_produce_output(self):
         _, loader = _make_emu("u_prog_a_entry", "u_prog_b_entry")
-        out = loader.run(cycles=200_000)
+        out = loader.run()
         assert out.count("A") >= 50, f"A count too low: {out.count('A')}"
         assert out.count("B") >= 50, f"B count too low: {out.count('B')}"
 
@@ -53,20 +51,20 @@ class TestPreemptCorrectness:
     def test_fib_alone(self, n, expected):
         """fib 单独运行 (无其他进程抢占)."""
         _, loader = _make_emu("u_fib_entry")
-        out = loader.run(cycles=300_000, uart_input=f"{n}\n".encode())
+        out = loader.run(uart_input=f"{n}\n".encode())
         assert f"fib({n})={expected}" in out
 
     def test_nqueen_alone(self):
         """nqueen 单独运行."""
         _, loader = _make_emu("u_nqueen_entry")
-        out = loader.run(cycles=500_000)
+        out = loader.run()
         for n, v in [(1, 1), (2, 0), (3, 0), (4, 2)]:
             assert f"nq({n})={v}" in out, f"nq({n})={v} 未找到"
 
     def test_fib_nqueen_together(self):
         """fib + nqueen 同时运行 — 基本正确性."""
         _, loader = _make_emu("u_nqueen_entry", "u_fib_entry")
-        out = loader.run(cycles=500_000, uart_input=b"7\n")
+        out = loader.run(uart_input=b"7\n")
         assert "fib(7)=13" in out
         # nqueen 输出可能因交错而难以精确匹配, 但 exit 应出现
         assert "exit: code=0" in out

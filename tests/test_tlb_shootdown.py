@@ -8,8 +8,9 @@
 这是 SMP boot 死锁 (ticket spinlock in sbi_fifo.qlock) 的简化版复现.
 """
 
-import struct
 import os
+import struct
+
 import pytest
 
 from pyremu.core.hart import RiscvMode
@@ -182,92 +183,76 @@ class TestTlbSyncCounter:
           3. emu.step() ->H0 醒来 ->陷阱 ->mret ->执行 amoadd ->递减共享变量
           4. H1 读共享变量 ->应为 0 (被 H0 递减后)
 
-        NOTE: native 路径暂跳过 — Rust 批量引擎未实现 MSIP 投递后自动清零
-        CLINT._msip (Python 路径在 _trap_deliver_mmode 中处理, 见
-        trap_handler.py:285-300)。批量模式中 MSIP 在同一批次内重复触发,
-        导致 amoadd 被多次执行 ->计数器被错误递减。
-        待 Rust 引擎同步 MSIP 自清零行为后重新启用。
         """
-        if use_native:
-            pytest.skip("Rust 引擎暂未实现 MSIP 投递后自清零")
-        if not use_native:
-            os.environ["PYREMU_NATIVE_BATCH"] = "0"
-        else:
-            os.environ.pop("PYREMU_NATIVE_BATCH", None)
+        cfg = PlatformConfig(
+            num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024
+        )
+        emu = Emulator(cfg, bootargs="")
+        h0, h1 = emu.harts
+        self._setup_two_mmode_harts(emu)
 
-        try:
-            cfg = PlatformConfig(
-                num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024
-            )
-            emu = Emulator(cfg, bootargs="")
-            h0, h1 = emu.harts
-            self._setup_two_mmode_harts(emu)
+        # tlb_sync 原始值 = 1 (模拟 H1 的 tlb_update 递增后)
+        emu.bus.write(self.SHARED_ADDR, struct.pack("<I", 1))
 
-            # tlb_sync 原始值 = 1 (模拟 H1 的 tlb_update 递增后)
-            emu.bus.write(self.SHARED_ADDR, struct.pack("<I", 1))
+        # H0 代码: wfi ->amoadd -1 ->wfi
+        instr_dec = _encode_amoadd_w(rd=5, rs1=10, rs2=11)
+        emu.bus.write(self.H0_BASE, struct.pack("<I", _encode_wfi()))     # +0
+        emu.bus.write(self.H0_BASE + 4, struct.pack("<I", instr_dec))     # +4
+        emu.bus.write(self.H0_BASE + 8, struct.pack("<I", _encode_wfi())) # +8
 
-            # H0 代码: wfi ->amoadd -1 ->wfi
-            instr_dec = _encode_amoadd_w(rd=5, rs1=10, rs2=11)
-            emu.bus.write(self.H0_BASE, struct.pack("<I", _encode_wfi()))     # +0
-            emu.bus.write(self.H0_BASE + 4, struct.pack("<I", instr_dec))     # +4
-            emu.bus.write(self.H0_BASE + 8, struct.pack("<I", _encode_wfi())) # +8
+        # H1 代码: nop ->wfi
+        emu.bus.write(self.H1_BASE, struct.pack("<I", _encode_nop()))
+        emu.bus.write(self.H1_BASE + 4, struct.pack("<I", _encode_wfi()))
 
-            # H1 代码: nop ->wfi
-            emu.bus.write(self.H1_BASE, struct.pack("<I", _encode_nop()))
-            emu.bus.write(self.H1_BASE + 4, struct.pack("<I", _encode_wfi()))
+        # 预设 H0 寄存器
+        h0.gprs[10] = self.SHARED_ADDR   # rs1 = addr
+        h0.gprs[11] = 0xFFFF_FFFF         # rs2 = -1
 
-            # 预设 H0 寄存器
-            h0.gprs[10] = self.SHARED_ADDR   # rs1 = addr
-            h0.gprs[11] = 0xFFFF_FFFF         # rs2 = -1
+        h0.pc = self.H0_BASE
+        h1.pc = self.H1_BASE
 
-            h0.pc = self.H0_BASE
-            h1.pc = self.H1_BASE
+        # --- 阶段 1: 让 H0 进入 WFI ---
+        for _ in range(5):
+            emu.step()
 
-            # --- 阶段 1: 让 H0 进入 WFI ---
-            for _ in range(5):
-                emu.step()
+        assert h0._waiting, "H0 应在 WFI (阶段 1)"
 
-            assert h0._waiting, f"H0 应在 WFI (阶段 1)"
+        # --- 阶段 2: H1 发送 MSIP[0] (模拟 sbi_ipi_send_many) ---
+        emu.bus.write(CLINT_BASE, struct.pack("<I", 1))
+        # 并发模型: H0 的 WFI 被 MSIP 唤醒 ->陷阱到 mtvec →
+        # mret ->回到 amoadd (+4) ->执行 amoadd ->下一个 wfi (+8)
+        # MSIP 此时必须清除, 否则第二个 wfi 会立即再次唤醒
+        for _ in range(10):
+            emu.step()
+            # 当 MSIP 还被挂起而 H0 又回到 WFI 时, 发动机检测到
+            # 中断并再投递, 但 trap handler 是 mret, 故 amoadd
+            # 已执行过的情形下 H0 回到 +8 处的 WFI 即可稳定等待.
+            if h0._waiting and (h0.gprs[5] & 0xFFFF_FFFF) == 1:
+                # amoadd 已执行 (返回旧值 1), 清除 MSIP 让 H0 可稳定 WFI
+                emu.clint._msip[0] = 0
 
-            # --- 阶段 2: H1 发送 MSIP[0] (模拟 sbi_ipi_send_many) ---
-            emu.bus.write(CLINT_BASE, struct.pack("<I", 1))
-            # 并发模型: H0 的 WFI 被 MSIP 唤醒 ->陷阱到 mtvec →
-            # mret ->回到 amoadd (+4) ->执行 amoadd ->下一个 wfi (+8)
-            # MSIP 此时必须清除, 否则第二个 wfi 会立即再次唤醒
-            for _ in range(10):
-                emu.step()
-                # 当 MSIP 还被挂起而 H0 又回到 WFI 时, 发动机检测到
-                # 中断并再投递, 但 trap handler 是 mret, 故 amoadd
-                # 已执行过的情形下 H0 回到 +8 处的 WFI 即可稳定等待.
-                if h0._waiting and (h0.gprs[5] & 0xFFFF_FFFF) == 1:
-                    # amoadd 已执行 (返回旧值 1), 清除 MSIP 让 H0 可稳定 WFI
-                    emu.clint._msip[0] = 0
+        # --- 阶段 3: 验证 H0 执行了 amoadd -1 ---
+        after = struct.unpack("<I", emu.bus.read(self.SHARED_ADDR, 4))[0]
+        h0_rd = h0.gprs[5] & 0xFFFF_FFFF
 
-            # --- 阶段 3: 验证 H0 执行了 amoadd -1 ---
-            after = struct.unpack("<I", emu.bus.read(self.SHARED_ADDR, 4))[0]
-            h0_rd = h0.gprs[5] & 0xFFFF_FFFF
+        assert after == 0, (
+            f"[native={use_native}] 递减后应为 0, 实际 {after}"
+        )
+        assert h0_rd == 1, (
+            f"[native={use_native}] amoadd 应返回旧值 1, 实际 {h0_rd}"
+        )
 
-            assert after == 0, (
-                f"[native={use_native}] 递减后应为 0, 实际 {after}"
-            )
-            assert h0_rd == 1, (
-                f"[native={use_native}] amoadd 应返回旧值 1, 实际 {h0_rd}"
-            )
+        # --- 阶段 4: H1 读取应看到 0 (模拟 tlb_sync 自旋退出) ---
+        lw_instr = _encode_lw(rd=6, rs1=10)
+        emu.bus.write(self.H1_BASE + 4, struct.pack("<I", lw_instr))
+        h1.pc = self.H1_BASE + 4
+        h1.gprs[10] = self.SHARED_ADDR
+        h1.exec_instr(lw_instr)
+        h1_sees = h1.gprs[6] & 0xFFFF_FFFF
 
-            # --- 阶段 4: H1 读取应看到 0 (模拟 tlb_sync 自旋退出) ---
-            lw_instr = _encode_lw(rd=6, rs1=10)
-            emu.bus.write(self.H1_BASE + 4, struct.pack("<I", lw_instr))
-            h1.pc = self.H1_BASE + 4
-            h1.gprs[10] = self.SHARED_ADDR
-            h1.exec_instr(lw_instr)
-            h1_sees = h1.gprs[6] & 0xFFFF_FFFF
-
-            assert h1_sees == 0, (
-                f"[native={use_native}] H1 应看到 tlb_sync=0, 实际 {h1_sees}"
-            )
-        finally:
-            if not use_native:
-                del os.environ["PYREMU_NATIVE_BATCH"]
+        assert h1_sees == 0, (
+            f"[native={use_native}] H1 应看到 tlb_sync=0, 实际 {h1_sees}"
+        )
 
     # ================================================================
     #  Test 4: 多次 MSIP 唤醒 + AMO 的序列正确性

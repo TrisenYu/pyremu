@@ -61,8 +61,8 @@ pub const ENCLAVE_REQ_SHUTDOWN: u64 = 1 << 0;
 // ---------------------------------------------------------------
 
 pub const SBI_LEGACY_PUTCHAR_EXT: u64 = 0x01;
-pub const SBI_DBCN_EXT: u64            = 0x4442434E;
-pub const SBI_DBCN_CONSOLE_WRITE: u64  = 0;
+pub const SBI_DBCN_EXT: u64 = 0x4442434E;
+pub const SBI_DBCN_CONSOLE_WRITE: u64 = 0;
 pub const SBI_TIMER_EXT: u64 = 0x5449_4D45;
 pub const SBI_SET_TIMER_FUNC: u64 = 0x00;
 
@@ -130,35 +130,35 @@ pub const SHA256_DIGEST: usize = 32;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+	use super::*;
 
-    #[test]
-    fn test_pte_v_flag_is_lsb() {
-        assert_eq!(PTE_V, 1);
-    }
+	#[test]
+	fn test_pte_v_flag_is_lsb() {
+		assert_eq!(PTE_V, 1);
+	}
 
-    #[test]
-    fn test_pte_flags_are_distinct() {
-        let flags = [PTE_V, PTE_R, PTE_W, PTE_X, PTE_U, PTE_G, PTE_A, PTE_D];
-        for i in 0..flags.len() {
-            for j in (i + 1)..flags.len() {
-                assert_ne!(
-                    flags[i], flags[j],
-                    "PTE flags at position {i} and {j} overlap"
-                );
-            }
-        }
-    }
+	#[test]
+	fn test_pte_flags_are_distinct() {
+		let flags = [PTE_V, PTE_R, PTE_W, PTE_X, PTE_U, PTE_G, PTE_A, PTE_D];
+		for i in 0..flags.len() {
+			for j in (i + 1)..flags.len() {
+				assert_ne!(
+					flags[i], flags[j],
+					"PTE flags at position {i} and {j} overlap"
+				);
+			}
+		}
+	}
 
-    #[test]
-    fn test_chunk_2m_is_sv39_mega_page() {
-        // CHUNK_2M_SIZE 必须等于一个 Sv39 mega page
-        assert_eq!(CHUNK_2M_SIZE, 1 << (PAGE_SHIFT + SV39_VPN_LEN as u64));
-    }
+	#[test]
+	fn test_chunk_2m_is_sv39_mega_page() {
+		// CHUNK_2M_SIZE 必须等于一个 Sv39 mega page
+		assert_eq!(CHUNK_2M_SIZE, 1 << (PAGE_SHIFT + SV39_VPN_LEN as u64));
+	}
 
-    #[test]
-    fn test_page_constants_consistent() {
-        assert_eq!(PAGE_SIZE, 1 << PAGE_SHIFT);
-        assert_eq!(CHUNK_2M_SIZE, 1 << CHUNK_2M_SHIFT);
-    }
+	#[test]
+	fn test_page_constants_consistent() {
+		assert_eq!(PAGE_SIZE, 1 << PAGE_SHIFT);
+		assert_eq!(CHUNK_2M_SIZE, 1 << CHUNK_2M_SHIFT);
+	}
 }

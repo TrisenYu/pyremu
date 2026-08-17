@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pyremu.debugger import Debugger
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
+from pyremu.configs_aux import elf_dir, path_join
 from pyremu.utils.parse_bin import parse_firmware
 
 
@@ -126,13 +127,13 @@ def demo_pathological(emu: Emulator, fw) -> None:
 def main() -> None:
     # ---- Well-behaved demo ----
     emu = Emulator(PlatformConfig.qemu_virt())
-    fw = parse_firmware("tests/bins/elf/u_mode_run_fib.elf")
+    fw = parse_firmware(path_join(elf_dir(), "u_mode_run_fib.elf"))
     emu.load_firmware(fw)
     demo_well_behaved(emu, fw)
 
     # ---- Pathological demo (fresh emulator) ----
     emu2 = Emulator(PlatformConfig.qemu_virt())
-    fw2 = parse_firmware("tests/bins/elf/u_mode_run_fib.elf")
+    fw2 = parse_firmware(path_join(elf_dir(), "u_mode_run_fib.elf"))
     emu2.load_firmware(fw2)
     demo_pathological(emu2, fw2)
 

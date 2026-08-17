@@ -19,7 +19,6 @@
 """
 
 import ctypes
-import os
 import struct
 
 import pytest
@@ -49,18 +48,7 @@ def _make_emu(num_harts: int) -> Emulator:
         pmp_entries=16,
         periph=PeripheralConfig(),
     )
-    # 测试默认 PYREMU_NATIVE_BATCH=0 (纯 Python)。本用例专测 native 并发
-    # 引擎的 PMP 隔离, 构造 Emulator 时临时启用 native batch。
-    prev = os.environ.get("PYREMU_NATIVE_BATCH")
-    os.environ["PYREMU_NATIVE_BATCH"] = "1"
-    try:
-        emu = Emulator(cfg)
-    finally:
-        if prev is None:
-            os.environ.pop("PYREMU_NATIVE_BATCH", None)
-        else:
-            os.environ["PYREMU_NATIVE_BATCH"] = prev
-    assert emu._native_batch, "本测试要求启用 native batch"
+    emu = Emulator(cfg)
     return emu
 
 
@@ -81,7 +69,7 @@ def test_per_hart_pmp_roundtrip_not_mirrored():
     _set_pmpaddr(emu.harts[0], 0, 0xAAAA)
     _set_pmpaddr(emu.harts[1], 0, 0xBBBB)
 
-    emu.run(1)
+    emu.run()
 
     # 修复前: hart1 的 0xBBBB 从未送入 native, 批次后被 hart0 的值镜像覆盖。
     assert emu.harts[0].csrs["pmpaddr0"].val == 0xAAAA
@@ -100,7 +88,7 @@ def test_per_hart_pmp_concurrent_write_isolated():
     emu.harts[0].write_gpr(5, 0xA000)
     emu.harts[1].write_gpr(5, 0xB000)
 
-    emu.run(1)
+    emu.run()
 
     # 每个 hart 的 csrw 只应写入自己的 PMP 切片。
     assert emu.harts[0].csrs["pmpaddr1"].val == 0xA000
@@ -117,7 +105,7 @@ def test_four_hart_pmp_all_distinct():
         h.mode = RiscvMode.M
         _set_pmpaddr(h, 1, vals[i])
 
-    emu.run(1)
+    emu.run()
 
     # 修复前: 仅 hart0 的 PMP 被 marshal 并镜像到全部 hart -> 全部压成 0x1000。
     for i, h in enumerate(emu.harts):

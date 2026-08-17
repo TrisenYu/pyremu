@@ -13,7 +13,7 @@ RISC-V RV64 反汇编器.
 """
 from enum import Enum
 
-from pyremu.utils.mask import mask64, sext, sext8, sext12, sext16, sext32
+from pyremu.utils.mask import mask64, sext, sext12
 from pyremu.utils.regname import check_csr, gpr_name
 
 _UNKNOWN = "<unknown opcode>"
@@ -362,7 +362,7 @@ def _dis_itype(instr: int) -> str:
             return _UNKNOWN
         shamt = (instr >> 20) & 0x3F
         return f"slli         {_rd(instr)}, {_rs1(instr)}, {shamt}"
-    if f3 == 0b101:  # SRLI / SRAI
+    elif f3 == 0b101:  # SRLI / SRAI
         shamt = (instr >> 20) & 0x3F
         f6 = parse_func6(instr)
         if f6 == 0x00:  # SRLI (funct6=0b000000)
@@ -683,7 +683,7 @@ def _dis_compressed(
         return f"c.?    0x{c16:04x}"
 
     # --- Quadrant 1: CI / CJ / CB ---
-    if quad == 0b01:
+    elif quad == 0b01:
         rd_name = gpr_name((c16 >> 7) & 0x1F)
         rs1_p = _c_x8(c16 >> 7)
         imm6 = ((c16 >> 12) & 1) << 5 | ((c16 >> 2) & 0x1F)
@@ -793,7 +793,7 @@ def _dis_compressed(
         return f"c.?    0x{c16:04x}"
 
     # --- Quadrant 2: CR / CSS ---
-    if quad == 0b10:
+    elif quad == 0b10:
         rd_name_q2 = gpr_name((c16 >> 7) & 0x1F)
         rs2_name = gpr_name((c16 >> 2) & 0x1F)
         rd_q2 = (c16 >> 7) & 0x1F
@@ -859,8 +859,6 @@ def _dis_compressed(
             # offset = {inst[9:7], inst[12:10], 000}  (8-byte aligned)
             uimm = ((c16 >> 7) & 0b111) << 6 | ((c16 >> 10) & 0b111) << 3
             return f"c.sdsp       {rs2_name}, {uimm}(sp)"
-
-        return f"c.?    0x{c16:04x}"
 
     return f"c.?    0x{c16:04x}"
 

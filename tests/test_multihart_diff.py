@@ -6,18 +6,17 @@
 """
 
 import os
-import pytest
 
-os.environ["PYREMU_NATIVE_BATCH"] = "0"
+import pytest
 
 from pyremu.core.hart import HartWithRegs, MSTATUS_MIE, RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend
+from pyremu.core.trap_def import TrapType
 from pyremu.core.trap_handler import (
     check_pending_interrupts,
     deliver_trap,
     try_wfi_wakeup,
 )
-from pyremu.core.trap_def import TrapType
 from pyremu.emulator import Emulator
 from pyremu.interrupt.clint import CLINT
 from pyremu.memory.bus import Bus
@@ -96,7 +95,7 @@ class TestSatpIsolation:
         assert h0._mmu_mode == 8 and h1._mmu_mode == 0
 
         h0.satp_val = 0  # 改回 Bare
-        assert h1._mmu_mode == 0, f"H1 _mmu_mode 被 H0 修改污染了"
+        assert h1._mmu_mode == 0, "H1 _mmu_mode 被 H0 修改污染了"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -203,7 +202,7 @@ class TestTrapStateIsolation:
         assert h1.pc == h1_init_pc, f"H1 PC={h1.pc:#x} ≠ {h1_init_pc:#x}"
         assert h1.mode == RiscvMode.S, f"H1 mode={h1.mode}"
         assert h1.satp_val == 0, f"H1 satp={h1.satp_val:#x}"
-        assert h1.mstatus_val == h1_init_mstatus, f"H1 mstatus changed"
+        assert h1.mstatus_val == h1_init_mstatus, "H1 mstatus changed"
 
     def test_trap_delivery_isolated_native(self):
         """Rust batch 中 H0 有中断时 H1 (WFI 等待) 状态不漂移."""
@@ -775,17 +774,7 @@ class TestMsipClearBothPaths:
             num_harts=1, ram_base=0x80000000,
             ram_size=1024 * 1024,  # 1 MiB
         )
-        saved = os.environ.get("PYREMU_NATIVE_BATCH")
-        os.environ["PYREMU_NATIVE_BATCH"] = "1" if use_native else "0"
-        try:
-            emu = Emulator(cfg)
-        finally:
-            if saved is not None:
-                os.environ["PYREMU_NATIVE_BATCH"] = saved
-            else:
-                del os.environ["PYREMU_NATIVE_BATCH"]
-        if use_native and not emu._native_batch:
-            pytest.skip("native batch not initialised")
+        emu = Emulator(cfg)
         return emu
 
     # CLINT base address for MSIP clear in the handler.
@@ -868,17 +857,7 @@ class TestWfiWakeupMsipBypass:
             num_harts=num_harts, ram_base=0x80000000,
             ram_size=1024 * 1024,
         )
-        saved = os.environ.get("PYREMU_NATIVE_BATCH")
-        os.environ["PYREMU_NATIVE_BATCH"] = "1" if use_native else "0"
-        try:
-            emu = Emulator(cfg)
-        finally:
-            if saved is not None:
-                os.environ["PYREMU_NATIVE_BATCH"] = saved
-            else:
-                del os.environ["PYREMU_NATIVE_BATCH"]
-        if use_native and not emu._native_batch:
-            pytest.skip("native batch not initialised")
+        emu = Emulator(cfg)
         return emu
 
     @staticmethod

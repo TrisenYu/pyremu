@@ -101,7 +101,7 @@ class UART(Device):
         # 写 UART MMIO 地址时自动标记, 仅用于 hart 日志文件分流归档.
         self._current_writer: int | None = None
 
-        # Terminal I/O 反向引用 — 由 Emulator._init_native_batch 注入,
+        # Terminal I/O 反向引用 — 由 Emulator._init_for_speedup_lib 注入,
         # 用于调试器/模拟器直连路径管理终端所有权。
         self.termio: object | None = None
 
@@ -181,16 +181,16 @@ class UART(Device):
 
         - **txwm**: TX FIFO 占用 < txctrl.txcnt (bits[18:16])。本模型 TX 即时
           排空 (FIFO 恒空, 占用=0), 故 txcnt>0 时条件恒成立。
-        - **rxwm**: RX FIFO 占用 > rxctrl.rxcnt (bits[2:0])。
+        - **rxwm**: RX FIFO 占用 > rxctrl.rxcnt (bits[18:16], 与 txcnt 同偏移)。
           默认 rxcnt=0, 故 FIFO 非空时置位。
 
-        TXDATA 写入可能由 Rust 批量引擎 inline 处理 (绕过 _write_reg),
+        TXDATA 写入可能由加速执行动态链接库于内部处理 (绕过 _write_reg),
         故 IP 不能依赖写入路径锁存, 必须在读取时按状态计算。
         """
         ip = 0
         if ((self._txctrl >> 16) & 0x7) > 0:
             ip |= IP_TXWM
-        rxcnt = self._rxctrl & 0x7
+        rxcnt = (self._rxctrl >> 16) & 0x7
         with self._rx_lock:
             if len(self._rx_fifo) > rxcnt:
                 ip |= IP_RXWM
@@ -315,6 +315,9 @@ class UART(Device):
             return
         if offset == REG_RXCTRL:
             self._rxctrl = val
+            # rxcnt (bits[18:16]) 是 IP.rxwm 的比较阈值, 其变化可直接改变
+            # 中断触发条件 — 与 TXCTRL 路径同理, 写后必须同步 PLIC 中断线.
+            self._update_plic_irq()
             return
         if offset == REG_IE:
             self._ie = val & 3

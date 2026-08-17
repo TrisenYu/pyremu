@@ -17,10 +17,10 @@
     其他: 视为 raw binary
 """
 
-import struct
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
+import struct
 
 import lief
 
@@ -377,7 +377,7 @@ def _parse_raw(
 
 @seize_err_if_any()
 def parse_firmware(
-    path: str,
+    path: str | PathLike,
     base_addr: int = 0,
 ) -> "FirmwareImage | None":
     """跨平台固件解析入口 — 自动识别格式并提取机器码。

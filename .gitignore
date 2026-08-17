@@ -16,9 +16,14 @@ wheels/
 .ruff_cache
 .coverage
 .claude
+.codex
+
 vendor/*
+!vendor/riscv-tests
+
 bsp/*
 !bsp/rust_smode_entry/
+!bsp/kei-boot/
 !bsp/setup-rootfs/
 !bsp/.linux-config
 !bsp/tee_enclave_drv
@@ -36,8 +41,9 @@ bsp/setup-rootfs/busybox-1.38.0/
 *.pyd
 pyremu/_native/target/
 
-# Generated config (make PLATFORM_CONFIG_GEN)
+# Generated config
 pyremu/configs_gen.py
+pyremu/_native/cpu/src/config_gen.rs
 
 # Hart serial log output
 output/

@@ -13,13 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
+from pyremu.configs_aux import elf_dir, path_join
 from pyremu.utils.parse_bin import parse_firmware
 
 # 1. 创建模拟器实例 — 默认 qemu_virt 平台
 emu = Emulator(PlatformConfig.qemu_virt())
 
 # 2. 解析并加载 ELF 固件
-fw = parse_firmware("tests/bins/elf/m_mode_to_s_mode.elf")
+fw = parse_firmware(path_join(elf_dir(), "m_mode_to_s_mode.elf"))
 emu.load_firmware(fw)
 
 # 3. 执行指定周期数

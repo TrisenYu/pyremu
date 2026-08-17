@@ -12,8 +12,8 @@
 import pytest
 
 from pyremu.core.decoder import Hart
-from pyremu.utils.disassem import Opc, sext
 from pyremu.core.mem_check_aux import inject_memory_backend
+from pyremu.utils.disassem import Opc, sext
 
 # ============================================================
 #  32-bit 标准指令编码辅助

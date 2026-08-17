@@ -23,13 +23,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
+from pyremu.configs_aux import elf_dir, path_join
 from pyremu.utils.parse_bin import parse_firmware
 from tests.loader import MultiProgramLoader
 
 
 def main() -> None:
     emu = Emulator(PlatformConfig.qemu_virt())
-    kernel = parse_firmware("tests/bins/elf/kernel.elf")
+    kernel = parse_firmware(path_join(elf_dir(), "kernel.elf"))
     emu.load_firmware(kernel)
 
     loader = MultiProgramLoader(emu, kernel)

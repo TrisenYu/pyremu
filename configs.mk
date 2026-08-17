@@ -5,8 +5,8 @@
 # 可覆盖项 (?=): hart_num / ram / rdinit / DISK / INITRD / ROOTFS_DIR。
 
 # ---- 公共基础路径 (供下方各定义复用, 避免重复前缀) ----
-bsp_dir = bsp
-bins_dir    = tests/bins
+bsp_dir     = bsp
+bins_dir    = build
 elf_dir     = $(bins_dir)/elf
 firm_dir    = $(bins_dir)/firm-bin
 linux_dir   = $(bsp_dir)/linux
@@ -21,22 +21,24 @@ CARGO_FLAGS    ?=
 ifneq ($(or $(PYREMU_DIAG_LOG),$(PYREMU_TRACE_SRET)),)
   CARGO_FLAGS += --features diagnostic
 endif
-NATIVE_SRC     = $(shell find $(NATIVE_DIR)/cpu $(NATIVE_DIR)/termio -type f -name '*.rs') \
-                 $(NATIVE_DIR)/Cargo.toml $(NATIVE_DIR)/cpu/Cargo.toml $(NATIVE_DIR)/termio/Cargo.toml
+NATIVE_SRC = $(shell find $(NATIVE_DIR)/cpu $(NATIVE_DIR)/termio -type f -name '*.rs') \
+             $(NATIVE_DIR)/Cargo.toml $(NATIVE_DIR)/cpu/Cargo.toml $(NATIVE_DIR)/termio/Cargo.toml
 
-# ---- 保留内存区域 ----
-# 供特定固件代码实现使用, 需与 custom-opensbi Kconfig (POOL_BASE/POOL_SIZE) 保持同步.
-# DTB /reserved-memory no-map 节点据此生成, 确保 Linux 内核线性映射排除该区域,
-# 避免内核分配器与固件在同一物理区间内产生访问冲突.
-RESERVED_MEM_BASE ?= 0x83000000
-RESERVED_MEM_SIZE  ?= 0x10000000  # 256 MiB
+# ---- 模拟器硬件特性 (隔离到 emu-configs.mk) ----
+include emu-configs.mk
 
 # ---- 路径配置 ----
-hart_num       = 2
-zsbl_fsbl      = $(firm_dir)/zsbl_fsbl_stub_cold_asm.bin
+hart_num = 2
+kei-sav = $(firm_dir)/kei.sav.bin
+
 fw_payload     = $(elf_dir)/custom_opensbi_fw_payload.elf
 fw_jump        = $(elf_dir)/custom_opensbi_fw_jump.elf
 fw_dynamic     = $(elf_dir)/custom_opensbi_fw_dynamic.elf
+
+# TEE enclave stress test
+STRESS_SRC_DIR = tests/src-stress
+STRESS_BIN_DIR = build/src-stress
+STRESS_PROGS   = $(STRESS_BIN_DIR)/tee_stress $(STRESS_BIN_DIR)/stress_payload
 
 # custom-opensbi
 # Rust S-mode 可信管理程序 (嵌入到固件 .coffer_enclave_man 段)
@@ -47,7 +49,7 @@ RUST_SMODE_BIN = $(RUST_SMODE_DIR)/rust_smode_entry.bin
 
 # 调试器参数
 pyargs = --ram-base=0x80000000 \
-	--preload=$(zsbl_fsbl) \
+	--preload=$(kei_sav) \
 	--hart=$(hart_num) \
 	$(fw_payload)
 
@@ -109,21 +111,6 @@ ram        ?= 2G
 rdinit     ?= /bin/bash
 
 
-# ---- 模拟器编译期配置 (Python / Rust 共享) ----
-# 通过 makefile 生成 pyremu/configs_gen.py, 替代各处硬编码与 os.environ.get.
-TLB_ENTRIES        ?= 256    # TLB 条目数
-NATIVE_MAX_INSTRS  ?= 100000 # 单次 native batch 最大指令数
-TRAP_LOOP_THRESHOLD ?= 3     # 连续 trap 超此次数 -> hart halt
-
-# 诊断开关 (可通过环境变量在运行时覆盖)
-PYREMU_NATIVE_BATCH    ?= 1   # 默认启用 native batch; 0 = 纯 Python
-PYREMU_DIAG_LOG        ?= /tmp/sret_py.log
-PYREMU_DIAG_VERBOSE    ?= 0   # 1 = 打印 virqueue 请求等详细诊断
-PYREMU_TRACE_SRET      ?= 0   # 1 = 追踪 SRET 到 U-mode
-PYREMU_TRACE_TRAPS     ?= 0   # 1 = 追踪全部 trap 投递
-PYREMU_TRACE_PMP       ?= 0   # 1 = 追踪 PMP 匹配
-
-
 # ---- Kernel bootargs ----
 # dyndbg: dynamic debug 控制 (内核 pr_debug/dev_dbg), 可覆盖.
 #   +p 启用全部, func NAME +p 按函数, file PATH +p 按文件, 留空关闭.
@@ -149,3 +136,5 @@ disk_args       = $(if $(wildcard $(DISK)),--disk=$(DISK))
 opt-cc      = /opt/custom-llvm/bin/clang
 opt-src-dir = $(PWD)/tests/src/
 opt-bin-dir = $(PWD)/$(bins_dir)/
+
+export

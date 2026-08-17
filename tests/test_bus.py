@@ -8,6 +8,10 @@
 import pytest
 
 from pyremu.memory.bus import Bus, Device
+from pyremu.peripheral.gpio import GPIO
+from pyremu.peripheral.i2c import I2C
+from pyremu.peripheral.spi import SPI
+from pyremu.peripheral.uart import UART
 
 
 class _DummyDevice(Device):
@@ -190,8 +194,6 @@ class TestDeviceNarrowRead:
 
     def test_byte_read_from_high_bit_reg(self):
         """UART RXFIFO_EMPTY (bit31=1) 在 lb (size=1) 读取时仅返回低字节."""
-        from pyremu.peripheral.uart import UART
-
         u = UART(base=0x1000_0000)
         # RXDATA (offset=4) 在 RX 空时返回 RXFIFO_EMPTY = 1<<31
         val4 = u.read(4, 4)  # 4 字节读 — 应成功
@@ -203,36 +205,28 @@ class TestDeviceNarrowRead:
         assert val1 == b"\x00"
 
     def test_halfword_read_from_high_bit_reg(self):
-        """2 字节读也应截断高位."""
-        from pyremu.peripheral.uart import UART
-
+        """2 字节读应截断高位."""
         u = UART(base=0x1000_0000)
         val2 = u.read(4, 2)  # 2 字节读
         assert len(val2) == 2
         assert val2 == b"\x00\x00"  # bit31 在字节 3, 被截去
 
     def test_spi_byte_read_truncates(self):
-        """SPI 设备窄读也正确截断."""
-        from pyremu.peripheral.spi import SPI
-
+        """SPI 设备也正确截断."""
         s = SPI(base=0x1000_1000)
         val1 = s.read(0, 1)  # CTRL 寄存器, 初始为 0
         assert len(val1) == 1
         assert val1 == b"\x00"
 
     def test_i2c_byte_read_truncates(self):
-        """I2C 设备窄读也正确截断."""
-        from pyremu.peripheral.i2c import I2C
-
+        """I2C 设备也正确截断."""
         i2c = I2C(base=0x1000_2000)
         val1 = i2c.read(0, 1)
         assert len(val1) == 1
         assert val1 == b"\x00"
 
     def test_gpio_byte_read_truncates(self):
-        """GPIO 设备窄读也正确截断."""
-        from pyremu.peripheral.gpio import GPIO
-
+        """GPIO 设备也正确截断."""
         g = GPIO(base=0x1000_3000)
         val1 = g.read(0, 1)
         assert len(val1) == 1

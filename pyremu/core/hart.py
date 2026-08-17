@@ -30,10 +30,11 @@ from pyremu.core.registers import (
 from pyremu.memory.cache import TLB_SIZE
 from pyremu.memory.pmp import Pmp
 from pyremu.memory.tlb import TLB
-from pyremu.utils.mask import mask64, mask32
+from pyremu.utils.mask import mask16, mask32, mask64
 
 if TYPE_CHECKING:
     from pyremu.interrupt.controller import InterruptController
+    from pyremu.interrupt.imsic import IMSIC
     from pyremu.interrupt.plic import PLIC
     from pyremu.memory.bus import Bus
 
@@ -88,7 +89,9 @@ class RiscvMode(Enum):
 
 
 # u8 privilege value -> RiscvMode (for unmarshalling from FFI / wire formats).
-_MODE_FROM_U8: dict[int, RiscvMode] = {0: RiscvMode.U, 1: RiscvMode.S, 3: RiscvMode.M}
+_MODE_FROM_U8: dict[int, RiscvMode] = {
+    0: RiscvMode.U, 1: RiscvMode.S, 2: RiscvMode.H, 3: RiscvMode.M,
+}
 
 
 def mode_from_u8(raw: int) -> RiscvMode:
@@ -142,8 +145,8 @@ MSTATUS_SD = 1 << 63  # 状态脏位 (FS 或 XS 为脏时置 1)
 
 # SPP / MPP 编码 -> RiscvMode 的映射
 _SPP_TO_MODE = {0: RiscvMode.U, 1: RiscvMode.S}
-_MPP_TO_MODE = {0: RiscvMode.U, 1: RiscvMode.S, 3: RiscvMode.M}
-_MODE_TO_MPP = {RiscvMode.U: 0, RiscvMode.S: 1, RiscvMode.M: 3}
+_MPP_TO_MODE = {0: RiscvMode.U, 1: RiscvMode.S, 2: RiscvMode.H, 3: RiscvMode.M}
+_MODE_TO_MPP = {RiscvMode.U: 0, RiscvMode.S: 1, RiscvMode.H: 2, RiscvMode.M: 3}
 _MODE_TO_SPP = {RiscvMode.U: 0, RiscvMode.S: 1}
 
 
@@ -214,6 +217,13 @@ class HartWithRegs:
         # PLIC 引用 — 外部中断 (MEIP/SEIP), 与 CLINT 互补
         self._plic: PLIC | None = None
 
+        # AIA IMSIC 引用 — 外部 + 软件中断 via MSI (替代 PLIC)
+        self._imsic: IMSIC | None = None
+        self._imsic_select_m: int = 0  # miselect (0x350) 缓存
+        self._imsic_select_s: int = 0  # siselect (0x150) 缓存
+        self._imsic_pre_m_eip: list[int] | None = None  # _marshal_imsic 快照
+        self._imsic_pre_s_eip: list[int] | None = None  # _marshal_imsic 快照
+
         # LR/SC 预留 (A-extension 原子指令)
         # 执行 LR 时记录预留地址; 任何 hart 向该地址写入时清除预留;
         # SC 仅在预留有效时成功, 否则失败; trap 发生时也清除预留
@@ -227,7 +237,6 @@ class HartWithRegs:
 
         # 异常/陷态追踪
         self._halted: bool = False  # 进入不可恢复陷态后置位
-        self._consecutive_traps: int = 0  # 连续 trap 计数 (正常执行时清零)
 
         # mdid 缓存 — 避免每周期通过 pydantic dict 读取 (热路径, ~1M 次/基准测试)
         self._mdid_val: int = 0
@@ -245,7 +254,7 @@ class HartWithRegs:
         self._wfi_woken: bool = False
 
         # 每 hart 指令计数 — 该 hart 实际执行的指令数.
-        # 跨 batch 累加; native batch 中由 Rust 通过 state.total_instrs 更新,
+        # 允许跨动态链接库调用时累加; 加速用动态链接库内通过 state.total_instrs 更新,
         # 纯 Python 路径中由 sync_counters 递增.
         self._total_instrs: int = 0
 
@@ -289,6 +298,35 @@ class HartWithRegs:
         # sip 是 mip 的受限视图 — 只有 mideleg 委派的位在 S 模式可见
         if csr_name == "sip":
             return self._csr_read_raw("mip") & self._csr_read_raw("mideleg")
+        # AIA IMSIC CSRs — indirect register access via miselect/mireg
+        if self._imsic is None:
+            return self._csr_read_raw(csr_name)
+        if csr_name == "miselect":
+            return self._imsic_select_m
+        if csr_name == "siselect":
+            return self._imsic_select_s
+        if csr_name == "mireg":
+            return self._imsic.csr_read(self.id, 'M', self._imsic_select_m)
+        if csr_name == "sireg":
+            return self._imsic.csr_read(self.id, 'S', self._imsic_select_s)
+        if csr_name == "mtopi":
+            return self._read_mtopi()
+        if csr_name == "stopi":
+            return self._read_stopi()
+        if csr_name == "mtopei":
+            val = self._imsic.read_topei(self.id, 'M')
+            # Clear MSIP for IID=3 (mirrors Rust MTOPEI read handler).
+            if val != 0 and mask16(val >> 16) == 3:
+                self.mip_val &= ~(1 << 3)
+            return val
+        if csr_name == "stopei":
+            val = self._imsic.read_topei(self.id, 'S')
+            if val != 0 and mask16(val >> 16) == 1:
+                self.mip_val &= ~(1 << 1)
+            return val
+        if csr_name in ("mireg2", "mireg3", "mireg4", "mireg5", "mireg6",
+                        "sireg2", "sireg3", "sireg4", "sireg5", "sireg6"):
+            return 0
         return self._csr_read_raw(csr_name)
 
     # CSR names whose writes affect interrupt state and must invalidate the
@@ -326,26 +364,28 @@ class HartWithRegs:
             self._csr_write_raw(csr_name, val)
             self._pmp.invalidate_cache()
             # 同步 PMP 到其他 hart — OpenSBI 冷启动 hart 可能不是 hart 0,
-            # 而 _step_native 始终使用 active[0]._pmp 构建传给 Rust 的扁平数组
+            # 而 _speedup_for_cmd_step 始终使用 active[0]._pmp 构建传给 Rust 的扁平数组
             for h in (self._all_harts or ()):
                 if h is not self:
                     h._csr_write_raw(csr_name, val)
                     h._pmp.invalidate_cache()
             return
         elif csr_name == "stimecmp":
-            # SSTC: S-mode 直接写 stimecmp -> 同步到 CLINT mtimecmp
-            # 用于 timer 比较 (mtime >= stimecmp 时触发 STIP)
+            # SSTC: S-mode stimecmp — INDEPENDENT of CLINT mtimecmp.
+            # Immediately re-evaluate STIP (matching QEMU's
+            # riscv_timer_write_timecmp).  This is critical for the
+            # kernel's stopi loop in riscv_intc_aia_irq() — without
+            # immediate update, stopi reads stale mip_val.STIP and
+            # never returns 0.
             self._csr_write_raw(csr_name, val)
-            if self._interrupt_ctrl is not None:
-                self._interrupt_ctrl.set_mtimecmp(self.id, val)
+            self._eval_stip(val)
         elif csr_name == "stimecmph":
             # RV32 only: stimecmp 高 32 位 (RV64 上 stimecmp 已是 64-bit)
             cur = mask32(self._csr_read_raw("stimecmp"))
             merged = cur | (mask32(val) << 32)
             self._csr_write_raw("stimecmp", merged)
             self._csr_write_raw(csr_name, mask32(val))
-            if self._interrupt_ctrl is not None:
-                self._interrupt_ctrl.set_mtimecmp(self.id, merged)
+            self._eval_stip(merged)
         elif csr_name == "sstatus":
             # sstatus 是 mstatus 的受限视图: 写入 sstatus 时更新 mstatus 对应位
             mstatus = self._csr_read_raw("mstatus")
@@ -365,6 +405,52 @@ class HartWithRegs:
             old_mip = self._csr_read_raw("mip")
             new_mip = (old_mip & ~mideleg) | (val & mideleg)
             self._csr_write_raw("mip", new_mip)
+        elif self._imsic is not None and csr_name == "miselect":
+            self._imsic_select_m = mask32(val)
+            self._csr_write_raw(csr_name, self._imsic_select_m)
+        elif self._imsic is not None and csr_name == "siselect":
+            self._imsic_select_s = mask32(val)
+            self._csr_write_raw(csr_name, self._imsic_select_s)
+        elif self._imsic is not None and csr_name == "mireg":
+            self._imsic.csr_write(self.id, 'M', self._imsic_select_m, val)
+        elif self._imsic is not None and csr_name == "sireg":
+            self._imsic.csr_write(self.id, 'S', self._imsic_select_s, val)
+        elif self._imsic is not None and csr_name in ("stopei", "mtopei"):
+            # Writing to stopei/mtopei claims the specified IID per AIA spec.
+            iid = (val >> 16) & 0x7FF
+            if iid == 0:
+                return
+            priv = 'S' if csr_name == "stopei" else 'M'
+            self._imsic.clear_ip_number(self.id, priv, iid)
+            # Clear MSIP/SSIP for IPI IIDs (same rationale as _read_mtopi).
+            if csr_name == "mtopei": #  and iid == 3
+                self.mip_val &= ~(1 << iid)
+            elif csr_name == "stopei": # and iid == 1
+                self.mip_val &= ~(1 << iid)
+        elif self._imsic is not None and csr_name in ("stopi", "mtopi"):
+            # Writing to stopi/mtopi claims the specified IID per AIA spec.
+            iid = (val >> 16) & 0x7FF
+            if csr_name == "mtopi":
+                mip_clr = self._imsic.claim_mtopi_iid(self.id, iid)
+                self.mip_val &= ~mip_clr
+                if iid != 7 or self._interrupt_ctrl is None:  # IRQ_M_TIMER: bump mtimecmp
+                    return
+                now = self._interrupt_ctrl.get_mtime()
+                mtc = self._interrupt_ctrl.get_mtimecmp(self.id)
+                if 0 < mtc <= now:
+                    self._interrupt_ctrl.set_mtimecmp(self.id, now + 4)
+            elif csr_name == "stopi":
+                mip_clr = self._imsic.claim_stopi_iid(self.id, iid)
+                self.mip_val &= ~mip_clr
+                if iid != 5:  # IRQ_S_TIMER: bump stimecmp
+                    return
+                stc, now = 0, 0
+                if "stimecmp" in self.csrs:
+                    stc = self._csr_read_raw("stimecmp")
+                if self._interrupt_ctrl is not None:
+                    now = self._interrupt_ctrl.get_mtime()
+                if 0 < stc <= now:
+                    self._csr_write_raw("stimecmp", now + 4)
         else:
             self._csr_write_raw(csr_name, val)
 
@@ -551,7 +637,7 @@ class HartWithRegs:
         """写入 satp 时同步更新缓存的 MMU 模式.
 
         ASID 字段 (bits[59:44]) 按 WARL 硬连线为 0: 本实现的 TLB (Python 与
-        Rust 批量引擎两侧) 查找均不带 ASID 标签。若允许 ASID 读回非零,
+        加速执行用动态链接库两侧) 查找均不带 ASID 标签。若允许 ASID 读回非零,
         Linux 探测到 ASID 支持后会启用 ASID 分配器, 上下文切换时仅改写
         satp.ASID 而不执行 sfence.vma — 前一地址空间的 TLB 表项残留命中,
         用户进程读到脏数据随机 SIGSEGV (ld.so 崩溃)。读回 0 则内核走
@@ -622,6 +708,15 @@ class HartWithRegs:
     def plic(self, p):
         self._plic = p
 
+    @property
+    def imsic(self):
+        """AIA IMSIC 中断控制器 (MSI 外部 + 软件中断)."""
+        return self._imsic
+
+    @imsic.setter
+    def imsic(self, im):
+        self._imsic = im
+
     def notify_int_state_change(self) -> None:
         """通知中断状态可能已改变 (CSR 写入 / CLINT 更新 / 特权级切换).
 
@@ -638,6 +733,108 @@ class HartWithRegs:
     @all_harts.setter
     def all_harts(self, harts):
         self._all_harts = harts
+
+    # ----------------------------------------------------------
+    #  mtopi / stopi — AIA Top Interrupt CSR read
+    # ----------------------------------------------------------
+    #
+    #  Timer bits (MTIP / STIP) are computed from LIVE mtime /
+    #  mtimecmp / stimecmp, NOT from the cached mip_val.  In the Python
+    #  execution path there is no per-instruction sync_mtip equivalent
+    #  (unlike the speedup execution engine).  If we read stale mip_val, the
+    #  kernel's ``while (csr_read(CSR_TOPI))`` loop in
+    #  riscv_intc_aia_irq() never exits — the kernel writes a new
+    #  stimecmp, but mip_val.STIP still reads 1 from the previous tick.
+    #
+    #  SSIP / MSIP use mip_val because they are either edge-driven
+    #  (auto-cleared at trap entry) or level-driven via CLINT MSIP,
+    #  which check_pending_interrupts keeps fresh via _update_hw_mip.
+
+    def _eval_stip(self, stimecmp_val: int) -> None:
+        """Immediately re-evaluate mip.STIP after stimecmp write.
+
+        Matches QEMU's riscv_timer_write_timecmp: on every CSR write to
+        stimecmp, STIP is recomputed immediately (not at the next
+        instruction boundary like sync_mtip does in the speedup execution engine).
+        This is critical for the kernel's stopi loop to exit.
+        """
+        if self._interrupt_ctrl is not None:
+            now = self._interrupt_ctrl.get_mtime()
+            if stimecmp_val > 0 and now >= stimecmp_val:
+                self.mip_val |= 1 << 5
+            else:
+                self.mip_val &= ~(1 << 5)
+
+    @staticmethod
+    def _timer_pending(mtime: int, cmp: int) -> bool:
+        """True if *mtime* has reached the non-zero comparator *cmp*."""
+        return cmp > 0 and mtime >= cmp
+
+    def _read_mtopi(self) -> int:
+        """Machine Top Interrupt (0xFB0).  Priority: MEI(11) > MSI(3) > MTI(7).
+
+        Per AIA spec, mtopi returns the MAJOR identity.  ALL IMSIC M-file
+        interrupts — external (IID >= 6) and the IPI (minor identity 1) — are
+        delivered via MEIP and reported as IID=11 (MEI); the actual minor
+        identity is read from MTOPEI.
+        """
+        if self._imsic is not None:
+            topei = self._imsic.peek_topei(self.id, 'M')
+            if topei != 0:
+                # All IMSIC M-file interrupts (IPI + external) → MEI=11.
+                # The IPI minor identity (1) is NOT a major identity — the
+                # IMSIC delivers it via MEIP, and the minor identity is
+                # revealed only via MTOPEI.
+                prio = topei & 0xFF
+                return (11 << 16) | prio
+        if (self.mip_val & self.mie_val) & (1 << 3):
+            val = (3 << 16) | 1
+            # Clear MSIP — mirrors Rust compute_mtopi.
+            # Prevents re-delivery after the M-mode handler has claimed the IPI
+            # via MTOPEI.  The handler must call sbi_ipi_raw_clear(0) to
+            # clear the CLINT level bit for the next IPI.
+            self.mip_val &= ~(1 << 3)
+            return val
+        if self._interrupt_ctrl is not None and (self.mie_val & (1 << 7)):
+            now = self._interrupt_ctrl.get_mtime()
+            mtc = self._interrupt_ctrl.get_mtimecmp(self.id)
+            if self._timer_pending(now, mtc):
+                val = (7 << 16) | 1
+                return val
+        return 0
+
+    def _read_stopi(self) -> int:
+        """Supervisor Top Interrupt (0xDB0).  Priority: SEI(9) > SSI(1) > STI(5).
+
+        Per AIA spec, stopi returns the MAJOR identity.  ALL IMSIC S-file
+        interrupts — external (IID >= 6) and the IPI (minor identity 1) — are
+        delivered via SEIP and reported as IID=9 (SEI); the actual minor
+        identity is read from STOPEI.
+        """
+        if self._imsic is not None:
+            topei = self._imsic.peek_topei(self.id, 'S')
+            if topei != 0:
+                # All IMSIC S-file interrupts (IPI + external) → SEI=9.
+                # The IPI minor identity (1) is NOT a major identity — the
+                # IMSIC delivers it via SEIP, and the minor identity is
+                # revealed only via STOPEI.
+                prio = topei & 0xFF
+                return (9 << 16) | prio
+        if (self.mip_val & self.mie_val) & (1 << 1):
+            val = (1 << 16) | 1
+            # Clear SSIP — mirrors Rust compute_stopi.
+            # In AIA mode SSIP normally comes through IMSIC S-file (eip[1] →
+            # STOPEI claim), but when falling through to this legacy path the
+            # bit must be cleared to prevent re-delivery.
+            self.mip_val &= ~(1 << 1)
+            return val
+        if self._interrupt_ctrl is not None and (self.mie_val & (1 << 5)):
+            now = self._interrupt_ctrl.get_mtime()
+            stc = self._csr_read_raw("stimecmp") if "stimecmp" in self.csrs else 0
+            if self._timer_pending(now, stc):
+                val = (5 << 16) | 1
+                return val
+        return 0
 
     # ----------------------------------------------------------
     #  mdid — 内存域 ID (TEE 飞地/服务标识, M 模式管理器维护)
@@ -775,8 +972,21 @@ class HartDiagC(ctypes.Structure):
     ]
 
 
+class ImsicFileC(ctypes.Structure):
+    """Single IMSIC interrupt file — must match Rust ``ImsicFile`` exactly."""
+    _fields_ = [
+        ("eip", ctypes.c_uint32 * 64),
+        ("eie", ctypes.c_uint32 * 64),
+        ("eidelivery", ctypes.c_uint8),
+        ("eithreshold", ctypes.c_uint8),
+        ("select", ctypes.c_uint32),
+        ("present", ctypes.c_uint8),
+        ("eip_ext_any", ctypes.c_uint8),
+    ]
+
+
 class HartState(ctypes.Structure):
-    """Per-hart state marshaled to/from the Rust batch execution loop.
+    """Per-hart state marshaled to/from the acceleration execution loop.
 
     Field order and types must exactly match ``state::HartState`` in Rust.
     """
@@ -811,10 +1021,9 @@ class HartState(ctypes.Structure):
         ("waiting", ctypes.c_uint8),
         ("wfi_woken", ctypes.c_uint8),
         ("halted", ctypes.c_uint8),
-        ("consecutive_traps", ctypes.c_uint8),
         ("mdid", ctypes.c_uint8),
         ("pmpsplit", ctypes.c_uint8),
-        ("_pad", ctypes.c_uint8 * 5),
+        ("_pad", ctypes.c_uint8 * 6),
         # ---- Phase B: TLB entries (array-of-structs, 32 × 2) ----
         ("itlb", TlbEntry * TLB_SIZE),
         ("dtlb", TlbEntry * TLB_SIZE),
@@ -836,11 +1045,14 @@ class HartState(ctypes.Structure):
         ("fprs", ctypes.c_uint64 * 32),
         ("fcsr", ctypes.c_uint32),
         ("_fpad", ctypes.c_uint8 * 4),
+        # ---- Phase H: AIA IMSIC register files ----
+        ("imsic_m", ImsicFileC),
+        ("imsic_s", ImsicFileC),
     ]
 
 
-class BatchResult(ctypes.Structure):
-    """Result returned by ``run_batch`` describing why the batch stopped."""
+class InstrToBeExec(ctypes.Structure):
+    """contain result describing why the current acceleration stopped."""
 
     _fields_ = [
         ("total_instrs", ctypes.c_uint64),
@@ -865,6 +1077,7 @@ EXIT_EBREAK = 4
 EXIT_WFI_WAIT = 5
 EXIT_ERROR = 6
 EXIT_BREAKPOINT = 7
+EXIT_TIMEOUT = 8
 
 
 # ============================================================
@@ -903,14 +1116,13 @@ def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
     state.waiting = 1 if hart._waiting else 0
     state.wfi_woken = 1 if hart._wfi_woken else 0
     state.halted = 1 if hart._halted else 0
-    state.consecutive_traps = hart._consecutive_traps
 
     state.mdid = hart.mdid_val
     state.pmpsplit = hart.pmpsplit_val
 
     # ---- Phase B: TLB entries ----
-    # Skip TLB marshalling for now — Rust handles TLB internally during batch.
-    # Python TLB stays as ground truth; before each batch, Rust TLB is cold
+    # Skip TLB marshalling for now — Rust handles TLB internally during acceleration.
+    # Python TLB stays as ground truth; before each acceleration, Rust TLB is cold
     # but refills from page walks.
 
     # ---- Phase C: Extra CSRs ----
@@ -925,13 +1137,16 @@ def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
     state.total_instrs = hart._total_instrs
 
     # ---- Phase F2: MSIP edge counter — must survive round-trips so
-    # Rust sync_msip doesn't re-detect stale edges at batch start ----
+    # Rust sync_msip doesn't re-detect stale edges at acceleration start ----
     state.diag.msip_last_seen = hart.diag.msip_last_seen
 
     # ---- Phase G: F/D floating point ----
     for i in range(32):
         state.fprs[i] = hart._fpr_bits[i]
     state.fcsr = hart.csrs["fcsr"].val & 0xFF
+
+    # ---- Phase H: AIA IMSIC state ----
+    _marshal_imsic(hart, state)  # TEMP: isolate PMP regression
 
 
 def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
@@ -965,12 +1180,11 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
     hart._waiting = state.waiting != 0
     hart._wfi_woken = state.wfi_woken != 0
     hart._halted = state.halted != 0
-    hart._consecutive_traps = state.consecutive_traps
 
     hart._mdid_val = state.mdid
     hart._pmpsplit_val = state.pmpsplit
 
-    # ---- Phase B: TLB — Rust TLB is cold after batch, don't write back ----
+    # ---- Phase B: TLB — Rust TLB is cold after acceleration, don't write back ----
     # Python TLB is ground truth.
 
     # ---- Phase C: Extra CSRs ----
@@ -994,3 +1208,89 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
     hart.csrs["fcsr"].val = state.fcsr & 0xFF
     hart.csrs["frm"].val = (state.fcsr >> 5) & 0x7
     hart.csrs["fflags"].val = state.fcsr & 0x1F
+
+    # ---- Phase H: AIA IMSIC state ----
+    _unmarshal_imsic(hart, state)  # TEMP: isolate PMP regression
+
+
+def _marshal_imsic(hart: HartWithRegs, state: HartState) -> None:
+    """Copy Python IMSIC state into the Rust ``HartState`` ctypes struct."""
+    imsic = hart._imsic
+    if imsic is None or hart.id >= imsic.num_harts:
+        # IMSIC not wired for this hart — clear present so Rust's
+        # step_interrupts MEIP/SEIP cleanup is a no-op.  Without this,
+        # ImsicFile::empty() defaults present=1 and the cleanup runs on
+        # every instruction, defeating ext_irq drain and causing spurious
+        # interrupt loops when daemon-injected eip bits exist.
+        state.imsic_m.present = 0
+        state.imsic_s.present = 0
+        return
+    mf, sf = imsic._files[hart.id]
+    # Save eip snapshot so _unmarshal_imsic can detect daemon-added
+    # bits (injected by the RX daemon thread in the middle of acceleration)
+    # and preserve them across the marshal→unmarshal cycle.
+    # Without this, _unmarshal_imsic's Rust→Python copy overwrites daemon-injected eip bits.
+    hart._imsic_pre_m_eip = list(mf.eip)
+    hart._imsic_pre_s_eip = list(sf.eip)
+    # Marshal eip/eie + compute eip_ext_any for Rust fast-path.
+    # Mask IPI identities (1=S-IPI, 3=M-IPI) from word 0 — only
+    # external interrupts (>=6) count for eip_ext_any.
+    _ext_m, _ext_s = 0, 0
+    _mask0 = ~((1 << 1) | (1 << 3))  # exclude IID_S_IPI=1, IID_M_IPI=3
+    for j in range(64):
+        state.imsic_m.eip[j] = mf.eip[j]
+        state.imsic_m.eie[j] = mf.eie[j]
+        state.imsic_s.eip[j] = sf.eip[j]
+        state.imsic_s.eie[j] = sf.eie[j]
+        if j == 0:
+            if mf.eip[0] & _mask0: _ext_m = 1
+            if sf.eip[0] & _mask0: _ext_s = 1
+        else:
+            if mf.eip[j]: _ext_m = 1
+            if sf.eip[j]: _ext_s = 1
+    state.imsic_m.eidelivery = mf.eidelivery
+    state.imsic_m.eithreshold = mf.eithreshold
+    state.imsic_m.select = hart._imsic_select_m
+    state.imsic_m.present = 1  # IMSIC is wired
+    state.imsic_m.eip_ext_any = _ext_m
+    state.imsic_s.eidelivery = sf.eidelivery
+    state.imsic_s.eithreshold = sf.eithreshold
+    state.imsic_s.select = hart._imsic_select_s
+    state.imsic_s.present = 1  # IMSIC is wired
+    state.imsic_s.eip_ext_any = _ext_s
+
+
+def _unmarshal_imsic(hart: HartWithRegs, state: HartState) -> None:
+    """Copy Rust ``HartState`` IMSIC fields back into Python IMSIC object.
+
+    Preserves eip bits that were injected by the daemon thread (e.g. UART
+    RX → APLIC → IMSIC) during the speedup execution — these are not known to
+    Rust and would be lost if we simply replaced Python eip with Rust eip.
+    """
+    imsic = hart._imsic
+    if imsic is None or hart.id >= imsic.num_harts:
+        hart._imsic_select_m = state.imsic_m.select
+        hart._imsic_select_s = state.imsic_s.select
+        return
+    mf, sf = imsic._files[hart.id]
+    # Compute daemon-added bits: bits set in Python between marshal and now
+    # that were NOT in the snapshot.  These must survive the
+    # Rust→Python copy.
+    pre_m = getattr(hart, '_imsic_pre_m_eip', None)
+    pre_s = getattr(hart, '_imsic_pre_s_eip', None)
+    for j in range(64):
+        daemon_m = mf.eip[j] & ~pre_m[j] if pre_m else 0
+        daemon_s = sf.eip[j] & ~pre_s[j] if pre_s else 0
+        mf.eip[j] = state.imsic_m.eip[j] | daemon_m
+        mf.eie[j] = state.imsic_m.eie[j]
+        sf.eip[j] = state.imsic_s.eip[j] | daemon_s
+        sf.eie[j] = state.imsic_s.eie[j]
+    mf.eidelivery = state.imsic_m.eidelivery
+    mf.eithreshold = state.imsic_m.eithreshold
+    sf.eidelivery = state.imsic_s.eidelivery
+    sf.eithreshold = state.imsic_s.eithreshold
+    hart._imsic_select_m = state.imsic_m.select
+    hart._imsic_select_s = state.imsic_s.select
+    # Update _any_ext cache — daemon may have set external interrupt bits.
+    mf._update_any_ext()
+    sf._update_any_ext()
