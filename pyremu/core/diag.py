@@ -113,7 +113,6 @@ class AiaDiag:
     Usage:
         from pyremu.core.diag import aia_diag
         aia_diag.record_stopi(val)
-        print(aia_diag.snapshot())
     """
 
     __slots__ = (

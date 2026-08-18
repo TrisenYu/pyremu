@@ -67,7 +67,6 @@ from pyremu.core.mem_check_aux import (
 )
 from pyremu.core.trap_def import TrapType
 from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap, try_wfi_wakeup
-from pyremu.core.watchdog import HartStallWatchdog
 from pyremu.interrupt.aplic import APLIC
 from pyremu.interrupt.clint import CLINT
 from pyremu.interrupt.imsic import IMSIC
@@ -261,9 +260,6 @@ class Emulator:
 
         self._setup_interrupt_controllers(config)
         self._setup_peripherals(config)
-
-        # PC-stall watchdog — 检测 M-mode hart 停滞 + S-mode WFI
-        self._stall_watchdog = HartStallWatchdog(self, threshold=3)
 
         # 创建 harts, 注入后端
         self.harts: list[Hart] = []
@@ -1121,14 +1117,6 @@ class Emulator:
         else:
             self.watchdog.tick()
 
-
-        # PC-stall 检测: M-mode hart 停滞 + S-mode WFI 时触发 MSIP 重注入,
-        # 打破 tlb_sync 死锁 (发端 M-mode 自旋等 sync=0, 收端 S-mode WFI 已清
-        # CLINT MSIP 无法再唤醒, 且自旋不重发 MSIP)。
-        if not self._stall_watchdog.check():
-            return all_exec_cnt
-
-        # 看门狗已设置 CLINT MSIP; 重新唤醒 WFI hart
         for hart in self.harts:
             if not hart._waiting or hart._halted:
                 continue

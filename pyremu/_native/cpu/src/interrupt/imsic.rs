@@ -14,7 +14,6 @@
 //! The Python-side ``trap_handler.py`` manages the IMSIC eip life-cycle.
 
 use crate::concurrent::ConcurrentClintCtx;
-use crate::diag;
 use crate::state::{HartState, ImsicFile, PYREMU_AIA};
 use core::sync::atomic::Ordering;
 
@@ -210,17 +209,7 @@ pub(crate) fn imsic_handle_seteipnum(
 ) -> bool {
 	imsic_eip_set(hart_states, target_hart, file_tag, eip_num);
 	if !hart_threads.is_null() && target_hart < num_harts as usize {
-		diag::log_line(&format!(
-			"IMSIC_UNPARK target={} threads_nonnull",
-			target_hart,
-		));
 		unsafe { &*hart_threads.add(target_hart) }.unpark();
-	} else {
-		diag::log_line(&format!(
-			"IMSIC_UNPARK_SKIP target={} threads_null={}",
-			target_hart,
-			hart_threads.is_null(),
-		));
 	}
 	true
 }
@@ -259,7 +248,7 @@ pub(crate) fn imsic_handle_clreipnum(
 pub(crate) fn try_handle_imsic_concurrent(
 	pa: u64,
 	val: u64,
-	state: &HartState,
+	_state: &HartState,
 	clint: &ConcurrentClintCtx,
 ) -> bool {
 	if !PYREMU_AIA {
@@ -273,7 +262,7 @@ pub(crate) fn try_handle_imsic_concurrent(
 	let eip_num = val as u32;
 
 	if addr.reg_off == 0x0000 {
-		let handled = imsic_handle_seteipnum(
+		return imsic_handle_seteipnum(
 			clint.hart_states.get(),
 			clint.hart_threads.get(),
 			clint.num_harts,
@@ -281,15 +270,6 @@ pub(crate) fn try_handle_imsic_concurrent(
 			file_tag,
 			eip_num,
 		);
-		diag::log_line(&format!(
-			"IMSIC_WR h{}->h{} file={:#x} eip={} {}",
-			state.mhartid,
-			addr.hart,
-			file_tag,
-			eip_num,
-			if handled { "INLINE" } else { "FALLBACK" },
-		));
-		return handled;
 	}
 	if addr.reg_off == 0x0008 {
 		imsic_handle_clreipnum(clint.hart_states.get(), addr.hart, file_tag, eip_num);
@@ -313,26 +293,7 @@ pub(crate) fn try_handle_imsic_read_concurrent(pa: u64, num_harts: u32) -> Optio
 	if !PYREMU_AIA {
 		return None;
 	}
-	match decode_imsic_addr(pa, num_harts as u64) {
-		Some(addr) => {
-			// Rate-limited: log first 4 reads per hart per file
-			// to confirm kernel's IMSIC driver is probing the device.
-			// Use a static counter to avoid flooding diag.log.
-			static RD_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-			let n = RD_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-			if n < 8 {
-				diag::log_line(&format!(
-					"IMSIC_RD pa=0x{:x} hart={} file={} off=0x{:x}",
-					pa,
-					addr.hart,
-					if addr.is_sfile { 'S' } else { 'M' },
-					addr.reg_off,
-				));
-			}
-			Some(0)
-		}
-		None => None,
-	}
+	decode_imsic_addr(pa, num_harts as u64).map(|_| 0)
 }
 
 // ============================================================
@@ -516,9 +477,6 @@ pub(crate) fn imsic_reg_write(file: &mut ImsicFile, select: u32, val: u64) -> u8
 	match select {
 		_SEL_EIDELIVERY => {
 			let new = (val & 1) as u8;
-			if file.eidelivery != new {
-				diag::log_line(&format!("IMSIC_EIDELIVERY {} -> {}", file.eidelivery, new,));
-			}
 			file.eidelivery = new;
 			0
 		}
@@ -675,20 +633,6 @@ pub(crate) fn imsic_topei_claim_iid(file: &mut ImsicFile, iid: u32) {
 			!= 0
 	};
 	if word < _EIP_WORDS && is_pending {
-		#[cfg(feature = "diagnostic")]
-		if iid == IID_S_IPI || iid == IID_M_IPI {
-			use std::sync::atomic::{AtomicU32, Ordering as AO};
-			static N: AtomicU32 = AtomicU32::new(0);
-			if N.fetch_add(1, AO::Relaxed) < 40 {
-				crate::diag::log_line(&format!(
-					"CLAIM_IPI iid={} word={} bit={} eip_before={:#x}",
-					iid,
-					word,
-					bit,
-					file.eip[word].load(AO::Acquire),
-				));
-			}
-		}
 		file.eip[word].fetch_and(!(1 << bit), Ordering::Release);
 		imsic_update_eip_ext_any(file);
 	}

@@ -41,7 +41,7 @@ _IRQ_TYPE_LEVEL_HIGH = 0x4
 # 为什么需要: 无此属性时, 内核启动到用户态早期会阻塞在 wait_for_random_bytes()
 # 直到 CRNG 完成初始化。真实硬件靠中断/设备抖动积累熵, 但在确定性模拟器中抖动
 # 极弱, try_to_generate_entropy() 需海量迭代 —— 实测虚拟时间从 ~16s 空转到 ~1401s
-# 才 "crng init done", 表现为启动疑似死锁 (全核 WFI, 靠 mtime 快进空耗)。
+# 才 "crng init done"
 #
 # 修复原理: drivers/of/fdt.c 的 early_init_dt_scan_chosen 读取 /chosen/rng-seed,
 # 调用 add_bootloader_randomness(); 配合 random.trust_bootloader=on 内核参数,

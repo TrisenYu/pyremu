@@ -315,23 +315,7 @@ pub fn csr_read(ctx: &mut CsrContext, addr: u16) -> (u64, u8) {
             // legacy SSIP/STIP which are dispatched through stopi
             // (0xDB0).
             let (raw, _) = imsic_topei_peek(&ctx.state.imsic_s);
-            #[cfg(feature = "diagnostic")]
-            {
-                // 限速 stopei 观测: 记录 **每一次** stopei 读取 (raw==0 或 !=0),
-                // 以区分 "stopei 从未被读" 与 "stopei 被读但返回 0 (eip 已被
-                // 其它机制清掉)" 两种断裂模式. 最多 60 次.
-                static N: AtomicU32 = AtomicU32::new(0);
-                if N.fetch_add(1, Ordering::Relaxed) < 60 {
-                    crate::diag::log_line(&format!(
-                        "STOPEI h{} raw={:#x} iid={} s_eip0={:#x} mode={}",
-                        ctx.state.mhartid,
-                        raw,
-                        (raw >> 16) as u32,
-                        ctx.state.imsic_s.eip[0].load(Ordering::Acquire),
-                        ctx.state.mode,
-                    ));
-                }
-            }
+
             if raw != 0 {
                 let iid = (raw >> 16) as u32;
                 imsic_topei_claim_iid(&mut ctx.state.imsic_s, iid);

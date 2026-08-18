@@ -95,7 +95,7 @@ unsafe impl Send for SigActionCell {}
 static OLD_SIGCONT: Mutex<Option<SigActionCell>> = Mutex::new(None);
 
 extern "C" fn sigcont_handler(_sig: libc::c_int) {
-	// 仅调用 tcsetattr (POSIX async-signal-safe); QEMU term_stdio_handler 同款。
+	// 仅调用 tcsetattr (POSIX async-signal-safe);
 	if !TERM_ACTIVE.load(Ordering::Acquire) {
 		return;
 	}

@@ -22,15 +22,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from loguru import logger
-
-from pyremu.configs_aux import cfg_bool
-from pyremu.core.diag import (
-    log_ld_trap,
-    log_mret_to_u,
-    log_sret_to_u,
-    TRACE_SRET_TO_U,
-)
 from pyremu.core.hart import (
     MSTATUS_MIE,
     MSTATUS_MPIE,
@@ -47,8 +38,6 @@ from pyremu.utils.mask import mask64
 
 if TYPE_CHECKING:
     from pyremu.core.hart import HartWithRegs
-
-_TRACE_TRAPS = cfg_bool("PYREMU_TRACE_TRAPS")
 
 # 中断优先级列表 (按优先级从高到低排列).
 # 预计算为模块级常量, 避免 check_pending_interrupts
@@ -74,6 +63,11 @@ _HW_MIP_MASK: int = (
     | INT_SOURCE_MIP_MASK[IntSource.SEI]  # bit 9 — PLIC
 )
 
+# RiscvMode 枚举值预计算, 避免每条指令访问 .value property
+_MODE_M = RiscvMode.M.value
+_MODE_S = RiscvMode.S.value
+_MODE_U = RiscvMode.U.value
+
 
 def _update_hw_mip(hart: HartWithRegs, hw_mip_bits: int) -> None:
     """用当前硬件状态替换 mip CSR 中的硬件源位.
@@ -85,11 +79,6 @@ def _update_hw_mip(hart: HartWithRegs, hw_mip_bits: int) -> None:
     current = hart._csr_read_raw("mip")
     hart._csr_write_raw("mip", (current & ~_HW_MIP_MASK) | hw_mip_bits)
 
-
-# RiscvMode 枚举值预计算, 避免每条指令访问 .value property
-_MODE_M = RiscvMode.M.value
-_MODE_S = RiscvMode.S.value
-_MODE_U = RiscvMode.U.value
 
 
 # ============================================================
@@ -168,16 +157,6 @@ def deliver_trap(
         choice = hart.csrs["mideleg"].val if is_interrupt else hart.csrs["medeleg"].val
         delegate = bool(choice & (1 << exc_code))
 
-    if _TRACE_TRAPS:
-        _target = "S" if delegate else "M"
-        _ctx = (
-            f"[trap:{hart.id}] {hart.mode.name}->{_target}: {cause.name} "
-            f"tval={tval:#018x} pc={hart.pc:#018x} "
-            f"exc_code={exc_code} mstatus={hart.mstatus_val:#018x}"
-        )
-        logger.debug(_ctx)
-    if TRACE_SRET_TO_U:
-        log_ld_trap(hart, code, tval)
     fn = _trap_deliver_smode if delegate else _trap_deliver_mmode
     fn(hart, code, exc_code, tval, is_interrupt)
 
@@ -361,17 +340,13 @@ def trap_mret(
         mstatus &= ~MSTATUS_MIE
     mstatus |= MSTATUS_MPIE
 
-    # MPP ← U (最低特权)
+    # MPP设置为U模式
     mstatus &= ~MSTATUS_MPP
     hart.mstatus_val = mstatus
 
-    # PC ← mepc
     hart.pc = mask64(hart.mepc_val)
 
-    if TRACE_SRET_TO_U and hart.mode == RiscvMode.U:
-        log_mret_to_u(hart)
-
-    # 注意: 不在此处清除 _wfi_woken.
+    # 不在此处清除 _wfi_woken.
     # _wfi_woken 由 deliver_trap 在从 WFI 唤醒时置位, 意在让紧随其后的
     # handle_wfi 将 WFI 视为 NOP 并推进 PC, 从而允许 while (...) wfi()
     # 轮询循环在 trap handler 返回后重新检查状态条件.
@@ -408,10 +383,6 @@ def trap_sret(
 
     # PC ← sepc
     hart.pc = mask64(hart.sepc_val)
-
-    # 诊断: 记录 sret->U 的完整寄存器状态 (PC 已更新后再记录)
-    if TRACE_SRET_TO_U and hart.mode == RiscvMode.U:
-        log_sret_to_u(hart)
 
     # 不在此处清除 _wfi_woken (同 trap_mret 的注释说明).
 

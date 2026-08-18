@@ -41,6 +41,8 @@ pub fn log_line(_line: &str) {
 
 /// Track the reason for exiting the WFI spin loop.
 #[inline(always)]
+#[allow(unused)]
+#[allow(dead_code)]
 pub fn wfi_wake_reason(_diag: &mut HartDiag, _pending: u64, _msip_edge: bool) {
 	#[cfg(feature = "diagnostic")]
 	{

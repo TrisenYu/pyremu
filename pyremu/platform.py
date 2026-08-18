@@ -27,17 +27,16 @@ Usage:
 
 from __future__ import annotations
 
-import json
-import tomllib
 from dataclasses import dataclass, field
+from enum import Enum
+import json
 from pathlib import Path
+import tomllib
 from typing import Any
 
 import yaml
 
 from pyremu import configs_gen
-
-from enum import Enum
 
 
 class InterruptMode(Enum):
@@ -97,7 +96,9 @@ class PlatformConfig:
     # Kconfig POOL_BASE/POOL_SIZE 保持同步. 单边修改会导致内核在保留区内分配
     # 页面, 与固件访问产生冲突.
     reserved_memory_ranges: list[tuple[int, int]] = field(
-        default_factory=lambda: [(configs_gen.RESERVED_MEM_BASE, configs_gen.RESERVED_MEM_SIZE)]
+        default_factory=lambda: [
+            (configs_gen.RESERVED_MEM_BASE, configs_gen.RESERVED_MEM_SIZE)
+        ]
     )
 
     periph: PeripheralConfig = field(default_factory=PeripheralConfig)

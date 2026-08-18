@@ -1,17 +1,16 @@
 // use std::time::Instant;
 use crate::concurrent::{ConcurrentClintCtx, FfiExtIrqCtx, ModuleState, StopInfo};
-use crate::diag;
 use crate::interrupt::{clint::sync_msip, clint::sync_mtip, sync_imsic};
 use crate::state::{exit_reason, riscv_mode, HartState};
 use std::sync::atomic::Ordering;
 
 /// Check whether any interrupt is pending (including MSIP via level-triggered
 /// CLINT).  Returns ``(woke, msip_pending)``.
-#[inline]
 /// Check all interrupt sources and sync into ``mip`` before potential park.
 /// QEMU equivalent: ``qemu_mutex_lock & qemu_cond_wait`` — the I/O thread
 /// updates interrupt state and signals the vCPU thread.  Here the Python
 /// daemon writes ``ext_irq.pending`` and we synchronise it into ``mip``.
+#[inline]
 pub(crate) fn wfi_sync_and_check(
 	state: &mut HartState,
 	clint: &ConcurrentClintCtx,
@@ -57,27 +56,7 @@ pub(crate) fn wfi_sync_and_check(
 
 	let rx_ready = !uart_rx_notify.is_null() && unsafe { *uart_rx_notify != 0 };
 	let msip_pending = (state.mip.load(Ordering::Acquire) & (1 << 3)) != 0;
-	// Diagnostic: dump wake-decision inputs whenever SEIP (bit 9) or MEIP
-	// (bit 11) is pending — the IMSIC IPI wake path.  Reveals mode / mie /
-	// mideleg / S-file eip at the moment the parked hart re-checks wake.
-	if (state.mip.load(Ordering::Acquire) & ((1 << 9) | (1 << 11))) != 0 {
-		diag::log_line(&format!(
-			"WFI_CHECK h{} mode={} mip={:#x} mie={:#x} mideleg={:#x} mstatus={:#x} \
-			 s_present={} s_eid={} s_eip0={:#x} m_present={} m_eid={} m_eip0={:#x}",
-			state.mhartid,
-			state.mode,
-			state.mip.load(Ordering::Acquire),
-			state.mie,
-			state.mideleg,
-			state.mstatus,
-			state.imsic_s.present,
-			state.imsic_s.eidelivery,
-			state.imsic_s.eip[0].load(Ordering::Acquire),
-			state.imsic_m.present,
-			state.imsic_m.eidelivery,
-			state.imsic_m.eip[0].load(Ordering::Acquire),
-		));
-	}
+
 	// In M-mode, exclude delegated (S-level) interrupts from the wake
 	// check.  Delegated interrupts (SEI, SSI, STI) are invisible to
 	// mtopi and cannot be handled by the M-mode trap handler, so waking
@@ -168,11 +147,6 @@ pub(crate) fn wfi_check_all_idle(
 	if (state.mip.load(Ordering::Acquire) & (1 << 3)) != 0 {
 		state.waiting = 0;
 		state.wfi_woken = 1;
-		diag::wfi_wake_reason(
-			&mut state.diag,
-			state.mip.load(Ordering::Acquire) & state.mie,
-			true,
-		);
 		return Some(true); // wake — trap will be delivered on re-entry
 	}
 	module.request_stop(StopInfo {
@@ -279,6 +253,10 @@ mod tests {
 		// edge counter 非零. 修复后只看电平位 -> 正常退出 Some(false);
 		// 修复前 byte != 0 -> 误判 any_hart_msip -> 返回 None (活锁).
 		let result = wfi_check_all_idle(&mut state, 0, &clint, &module, false);
-		assert_eq!(result, Some(false), "edge counter 非零但电平位=0 时 WFI 应正常退出");
+		assert_eq!(
+			result,
+			Some(false),
+			"edge counter 非零但电平位=0 时 WFI 应正常退出"
+		);
 	}
 }

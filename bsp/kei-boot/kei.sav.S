@@ -1,4 +1,3 @@
-.section .text, "ax", @progbits
 /*
 	kei.sav: RISC-V Zero/First Stage Boot Loader (ZSBL/FSBL)
 
@@ -27,6 +26,11 @@
 	以及所有test失效时应当执行的相关操作
 	失败时启用相应的自检LED
 */
+.section .text, "ax", @progbits
+
+/**
+ * 固件入口
+*/
 .globl _start
 _start:
 	/* 设置mtvec为_AL1S_HANG */
@@ -47,13 +51,16 @@ _AL1S_BSS_CLEAR:
 	addi	t0, t0, 8
 	bltu	t0, t1, _AL1S_BSS_CLEAR
 _AL1S_BSS_DONE:
-
 	/* 跳转到下一阶段的程序 */
 	csrrs	a0, mhartid, x0      // 读取当前 hart ID 到 a0
 	lla		a1, _start + 0x10000 // 设置 默认放置于 _start + 64 KiB 的FDT 地址
 	li		t0, RAM_BASE         // 固件的 _start 会设置于 RAM_BASE。此处略去加载环节
 	jr		t0                   // Alice, startup!
 
+
+/**
+ * 简易hang
+*/
 _AL1S_HANG:
 	wfi
 	j       _AL1S_HANG

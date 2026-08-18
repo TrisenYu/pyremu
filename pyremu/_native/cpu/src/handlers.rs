@@ -1675,7 +1675,7 @@ const SH_SYS_WRITEC: u64 = 0x03;
 const SH_SYS_WRITE: u64 = 0x05;
 const SH_SYS_ISTTY: u64 = 0x09;
 /// SYS_EXIT — 停机序列操作码 (ARM semihosting 约定, QEMU 裸机测试
-/// 固件同款退出方式; 0x20026 的 RISC-V QEMU 变体此处不支持).
+/// 类似的固件退出方式).
 pub(crate) const SH_SYS_EXIT: u64 = 0x18;
 
 /// Read a u64 from RAM at physical address *pa* (Bare-Mode, VA = PA).

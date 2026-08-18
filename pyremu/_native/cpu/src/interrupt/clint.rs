@@ -1,5 +1,4 @@
 use crate::concurrent::{ConcurrentClintCtx, ModuleState};
-use crate::diag;
 use crate::state::HartState;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -163,10 +162,6 @@ pub(crate) fn clint_write_msip_concurrent(clint: &ConcurrentClintCtx, target: us
 	if target >= clint.num_harts as usize {
 		return;
 	}
-	// Log only non-zero writes (IPI send, not clear).
-	if val & 1 != 0 {
-		diag::log_line(&format!("CLINT_MSIP target=h{} set=1", target));
-	}
 	let p = unsafe { &*clint.msip.add(target) };
 	if val & 1 != 0 {
 		// Write-1: set the CLINT level bit AND atomically signal the
@@ -318,7 +313,6 @@ pub(crate) fn clint_write_msip(clint: &ClintCtx, target: usize, current: usize, 
 	}
 	ts.mip.fetch_or(1 << 3, Ordering::AcqRel);
 	ts.diag.clint_msip_set = ts.diag.clint_msip_set.wrapping_add(1);
-	diag::log_line(&format!("CLINT_MSIP h{}->h{} set=1", current, target,));
 	if target != current {
 		clint.yield_for_ipi.set(true);
 		clint.ipi_sender_hart.set(current as u8);

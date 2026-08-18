@@ -36,19 +36,11 @@ RISC-V Platform-Level Interrupt Controller (PLIC).
 
 from __future__ import annotations
 
-import sys
-
-from pyremu.configs_gen import PYREMU_DIAG_VERBOSE
 from pyremu.memory.bus import Device
 
 # 诊断日志开关 (PYREMU_DIAG_VERBOSE=1): 打印 set_irq / claim / complete,
 # 用于确认外设完成中断是否被正确投递并被 hart claim/complete。
-_DIAG = PYREMU_DIAG_VERBOSE == 1
 
-
-def _diag(msg: str) -> None:
-    if _DIAG:
-        print(f"[plic] {msg}", file=sys.stderr, flush=True)
 
 # PLIC 常量 — 地址空间分区
 PLIC_PRIORITY_BASE = 0x000000
@@ -266,20 +258,18 @@ class PLIC(Device):
         if src > 0:
             self._pending[src] = False
             self._claimed[context] = src
-        _diag(f"claim ctx={context} -> src={src}")
         return src
 
     def _do_complete(self, context: int, src: int) -> None:
         """Complete: 标记中断处理完成, 允许再次触发.
 
-        电平语义: 若设备电平仍为高 (claim 后设备未拉低 set_irq),
-        complete 时重新置位 pending, 使中断再次投递 (QEMU sifive_plic 同款).
+        若设备电平仍为高 (claim 后设备未拉低 set_irq),
+        complete 时重新置位 pending, 使中断再次投递
         """
         if 0 < src <= self._num_sources and self._claimed[context] == src:
             self._claimed[context] = 0
             if self._level[src]:
                 self._pending[src] = True
-            _diag(f"complete ctx={context} src={src} relevel={self._level[src]}")
 
     # ---- 位数组辅助 ----
 

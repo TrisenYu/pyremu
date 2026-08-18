@@ -728,8 +728,8 @@ pub(crate) fn handle_system_concurrent(
 		0 => return priv_ecall_concurrent(state, instr, clint, module),
 		1 => {
 			// EBREAK — semihosting 或普通 breakpoint.
-			// SYS_EXIT: 停机序列 (QEMU semihosting exit 同款约定) — 一个
-			// hart 执行即可停止整个引擎, 状态保留在 live 数组中, 由上层
+			// SYS_EXIT: 停机序列 — 一个 hart 执行即可停止整个引擎,
+			// 状态保留在 live 数组中, 由上层
 			// 消费 (调试器接管 / run() 返回). 裸 ebreak 保持 NOP.
 			if state.gprs[10] == crate::handlers::SH_SYS_EXIT
 				&& crate::handlers::semihosting_match(_ctx, state.pc)

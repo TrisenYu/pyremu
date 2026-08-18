@@ -495,15 +495,9 @@ class VirtIOBlock(Device):
         # A clean kernel zeroes pages on alloc; if we see 0xfe here,
         # the zeroing was skipped — emulator TLB/MMU bug.
         try:
-            before = self._mem_read(buf_pa & ~0xFFF, 64)
+            self._mem_read(buf_pa & ~0xFFF, 64)
         except Exception:
-            before = b""
-        if before[:4].count(0xFE) >= 3:
-            print(
-                f"\n[vblk-poison] pa=0x{buf_pa:x} sector={sector} "
-                f"len={buf_len} page_hex={before[:16].hex()}\n",
-                file=sys.stderr, flush=True,
-            )
+            pass
         self._mem_write(buf_pa, data)
         return True
 

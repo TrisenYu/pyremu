@@ -4,7 +4,6 @@
 //! Python ``deliver_trap`` in ``trap_handler.py``.
 
 use crate::concurrent::{ConcurrentClintCtx, ModuleState};
-use crate::diag;
 use crate::hart_sched::read_gpr;
 use crate::interrupt::imsic_clear_ipi_on_trap;
 use crate::state::{riscv_mode, HartState};
@@ -98,21 +97,6 @@ pub fn deliver_trap(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	} else {
 		false
 	};
-
-	diag::log_line(&format!(
-		"TRAP h{} code={:#x} irq={} mode={} pc={:#x} mideleg={:#x} medeleg={:#x} mstatus={:#x} mip={:#x} mie={:#x} delegate={}",
-		state.mhartid,
-		code,
-		is_interrupt,
-		state.mode,
-		state.pc,
-		state.mideleg,
-		state.medeleg,
-		state.mstatus,
-		state.mip.load(Ordering::Acquire),
-		state.mie,
-		delegate,
-	));
 
 	if delegate {
 		deliver_trap_smode(state, code, tval)
@@ -341,15 +325,6 @@ pub(crate) fn priv_ecall_concurrent(
 		state.gprs[10] = 0;
 		return 4;
 	}
-
-	// Log non-TIME ecalls (sparse, won't flood): SBI_IPI, HSM, etc.
-	diag::log_line(&format!(
-		"ECALL h{} a7=0x{:x} a6=0x{:x} a0=0x{:x}",
-		state.mhartid,
-		a7,
-		a6,
-		read_gpr(state, 10),
-	));
 
 	// NOTE: there is intentionally NO fast path for SBI_IPI (a7=0x735049).
 	// Writing only CLINT MSIP is insufficient — the firmware's

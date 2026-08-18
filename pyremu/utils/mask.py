@@ -25,7 +25,6 @@ def mask64(val: int) -> int:
     """将 *val* 截断为 64-bit 无符号整数 ``[0, 2^64)``."""
     return val & MASK64
 
-
 def mask32(val: int) -> int:
     """将 *val* 截断为 32-bit 无符号整数 ``[0, 2^32)``."""
     return val & MASK32

@@ -14,14 +14,18 @@ from pyremu.core.hart import (
     MSTATUS_MIE,
     MSTATUS_MPIE,
     MSTATUS_MPP,
+    MSTATUS_MXR,
     MSTATUS_SIE,
+    MSTATUS_SPIE,
     MSTATUS_SPP,
+    MSTATUS_SUM,
     MSTATUS_TW,
     RiscvMode,
 )
 from pyremu.core.mem_check_aux import (
     AccessFault,
     AlignmentFault,
+    check_instruction_fetch,
     inject_memory_backend,
     mem_read,
     mem_write,
@@ -1412,6 +1416,147 @@ class TestPageFault:
         assert hart.mcause_val == 13, (
             f"TLB miss 后无效 PTE 应触发 LdPageFault, 实际={hart.mcause_val}"
         )
+
+
+# ============================================================
+#  PTE 权限位检查 — R/W/X/U/SUM/MXR
+# ============================================================
+
+
+class TestPtePermissionEnforcement(TestPageFault):
+    """PTE 权限位检查回归 — mem_read/mem_write/check_instruction_fetch.
+
+    回归: ``translate_addr`` 曾将 dtlb 条目 perm 硬编码为 0xF 且从不调用
+    ``_check_pte_perm``, 导致 X=0 页可读、W=0 页可写、S 模式无 SUM 可读 U 页、
+    S 模式可取指 U 页等越权访问静默通过。本类锁定修复后的正确拒绝/放行行为。
+    """
+
+    def _map_leaf(
+        self,
+        ram: bytearray,
+        va: int = 0,
+        *,
+        r: bool = False,
+        w: bool = False,
+        x: bool = False,
+        u: bool = False,
+    ):
+        """构建三级 Sv39 映射 va -> DATA_PA, 叶 PTE 权限按参数."""
+        vpn0 = (va >> 12) & 0x1FF
+        vpn1 = (va >> 21) & 0x1FF
+        vpn2 = (va >> 30) & 0x1FF
+        target_ppn = self.DATA_PA >> self.PAGE_SHIFT
+        self._write_pte(
+            ram,
+            self.L1_BASE,
+            vpn2,
+            self._make_pte(v=True, ppn=self.L2_BASE >> self.PAGE_SHIFT),
+        )
+        self._write_pte(
+            ram,
+            self.L2_BASE,
+            vpn1,
+            self._make_pte(v=True, ppn=self.L3_BASE >> self.PAGE_SHIFT),
+        )
+        self._write_pte(
+            ram,
+            self.L3_BASE,
+            vpn0,
+            self._make_pte(v=True, r=r, w=w, x=x, u=u, ppn=target_ppn),
+        )
+
+    # ---- 读权限 ----
+
+    def test_mem_read_execute_only_page_faults(self, hart, ram_ctx):
+        """X=1/R=0 且 MXR=0: S 模式读 -> LdPageFault (13)."""
+        ram, _read_fn, _write_fn = ram_ctx
+        self._map_leaf(ram, x=True)
+        self._enable_sv39(hart)
+        with pytest.raises(PageFault):
+            mem_read(hart, 0x0, 4)
+        assert hart.mcause_val == 13, f"应为 LdPageFault(13), 实际={hart.mcause_val}"
+
+    def test_mem_read_execute_only_with_mxr_allowed(self, hart, ram_ctx):
+        """X=1/R=0 且 MXR=1: S 模式读应成功."""
+        ram, _read_fn, _write_fn = ram_ctx
+        self._map_leaf(ram, x=True)
+        self._enable_sv39(hart)
+        ram[self.DATA_PA : self.DATA_PA + 4] = b"\xde\xad\xbe\xef"
+        hart.mstatus_val |= MSTATUS_MXR
+        assert mem_read(hart, 0x0, 4) == b"\xde\xad\xbe\xef"
+        assert hart.mcause_val == 0, f"不应 trap, mcause={hart.mcause_val}"
+
+    # ---- 写权限 ----
+
+    def test_mem_write_readonly_page_faults(self, hart, ram_ctx):
+        """R=1/W=0 (R-X 代码页): S 模式写 -> StPageFault (15)."""
+        ram, _read_fn, _write_fn = ram_ctx
+        self._map_leaf(ram, r=True, x=True)
+        self._enable_sv39(hart)
+        with pytest.raises(PageFault):
+            mem_write(hart, 0x0, b"\x01\x02\x03\x04")
+        assert hart.mcause_val == 15, f"应为 StPageFault(15), 实际={hart.mcause_val}"
+
+    def test_mem_write_rw_page_succeeds(self, hart, ram_ctx):
+        """R=1/W=1: S 模式写应成功 (正向对照)."""
+        ram, _read_fn, _write_fn = ram_ctx
+        self._map_leaf(ram, r=True, w=True)
+        self._enable_sv39(hart)
+        mem_write(hart, 0x0, b"\x01\x02\x03\x04")
+        assert hart.mcause_val == 0, f"不应 trap, mcause={hart.mcause_val}"
+        assert bytes(ram[self.DATA_PA : self.DATA_PA + 4]) == b"\x01\x02\x03\x04"
+
+    # ---- SUM (S 模式访问 U 页) ----
+
+    def test_smode_read_user_page_without_sum_faults(self, hart, ram_ctx):
+        """U=1 且 SUM=0: S 模式读 -> LdPageFault (13)."""
+        ram, _read_fn, _write_fn = ram_ctx
+        self._map_leaf(ram, r=True, u=True)
+        self._enable_sv39(hart)
+        with pytest.raises(PageFault):
+            mem_read(hart, 0x0, 4)
+        assert hart.mcause_val == 13, f"应为 LdPageFault(13), 实际={hart.mcause_val}"
+
+    def test_smode_read_user_page_with_sum_allowed(self, hart, ram_ctx):
+        """U=1 且 SUM=1: S 模式读应成功."""
+        ram, _read_fn, _write_fn = ram_ctx
+        self._map_leaf(ram, r=True, u=True)
+        self._enable_sv39(hart)
+        ram[self.DATA_PA : self.DATA_PA + 4] = b"\xaa\xbb\xcc\xdd"
+        hart.mstatus_val |= MSTATUS_SUM
+        assert mem_read(hart, 0x0, 4) == b"\xaa\xbb\xcc\xdd"
+        assert hart.mcause_val == 0, f"不应 trap, mcause={hart.mcause_val}"
+
+    # ---- 取指权限 ----
+
+    def test_fetch_non_executable_page_faults(self, hart, ram_ctx):
+        """X=0: S 模式取指 -> InstrPageFault (12)."""
+        ram, _read_fn, _write_fn = ram_ctx
+        self._map_leaf(ram, r=True, w=True)
+        self._enable_sv39(hart)
+        ok, _pa = check_instruction_fetch(hart, 0x0)
+        assert not ok
+        assert hart.mcause_val == 12, f"应为 InstrPageFault(12), 实际={hart.mcause_val}"
+
+    def test_smode_fetch_user_page_faults(self, hart, ram_ctx):
+        """U=1/X=1: S 模式取指 -> InstrPageFault (12), 即使 SUM=1 也不放行."""
+        ram, _read_fn, _write_fn = ram_ctx
+        self._map_leaf(ram, x=True, u=True)
+        self._enable_sv39(hart)
+        hart.mstatus_val |= MSTATUS_SUM  # SUM 仅影响数据访问, 不影响取指
+        ok, _pa = check_instruction_fetch(hart, 0x0)
+        assert not ok
+        assert hart.mcause_val == 12, f"应为 InstrPageFault(12), 实际={hart.mcause_val}"
+
+    def test_fetch_executable_page_succeeds(self, hart, ram_ctx):
+        """X=1/U=0: S 模式取指应成功 (正向对照)."""
+        ram, _read_fn, _write_fn = ram_ctx
+        self._map_leaf(ram, x=True)
+        self._enable_sv39(hart)
+        ok, pa = check_instruction_fetch(hart, 0x0)
+        assert ok
+        assert pa == self.DATA_PA
+        assert hart.mcause_val == 0, f"不应 trap, mcause={hart.mcause_val}"
 
 
 # ============================================================

@@ -155,27 +155,6 @@ pub(crate) fn compute_stopi(state: &mut HartState, mtime: u64) -> (u64, u8) {
 	//    the SEIP line, and read_stopi returns the mip bit number (9=SEI).
 	//    The minor identity is revealed only via STOPEI.
 	let (raw, _) = imsic_topei_peek(&state.imsic_s);
-	#[cfg(feature = "diagnostic")]
-	{
-		// 限速 stopi 观测: 仅在返回非零 (应触发 IMSIC 分派) 或 SEIP 挂起但
-		// 返回 0 (丢失信号) 时记录, 每条最多 40 次. 用于定位 AIA 启动挂死中
-		// stopi→stopei 链路的断裂点, 不产生海量日志.
-		static N: AtomicU32 = AtomicU32::new(0);
-		let seip = (state.mip.load(Ordering::Acquire) & (1 << 9)) != 0;
-		if (raw != 0 || seip) && N.fetch_add(1, Ordering::Relaxed) < 40 {
-			diag::log_line(&format!(
-				"STOPI h{} ret={:#x} raw={:#x} mip={:#x} mie={:#x} mode={} s_eid={} s_eip0={:#x}",
-				state.mhartid,
-				if raw != 0 { (9u64 << 16) | (raw & 0xFF) } else { 0 },
-				raw,
-				state.mip.load(Ordering::Acquire),
-				state.mie,
-				state.mode,
-				state.imsic_s.eidelivery,
-				state.imsic_s.eip[0].load(Ordering::Acquire),
-			));
-		}
-	}
 	if raw != 0 {
 		// External interrupt (IPI minor 1 included): return IID=9 (SEI).
 		let prio = raw & 0xFF;
