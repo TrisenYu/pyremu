@@ -1,0 +1,29 @@
+# TEE 可信应用载荷 (fn_apps)
+#
+# 计算密集域, 作为 TEE 飞地 payload 运行 (Rust, cargo 构建):
+#   orbit  轨道动力学 (N-body 多体 + RK4 vs 辛积分能量漂移对比)
+#   chem      量子化学 (Hartree-Fock SCF, H2 STO-3G 基态)
+#   graphene  凝聚态 (石墨烯紧束缚能带, Dirac 锥)
+#   ising     统计物理 (2D Ising 模型 Monte Carlo, Onsager 临界温度)
+#   fem       数值计算 (二维 Poisson 有限元, 二阶收敛)
+#   dsp    数字信号处理 (FFT 谱分析 + FIR 低通滤波 + OFDM 基带收发 + DTMF 音频检测)
+#
+#   knots  拓扑扭结 (Jones 多项式, libhomfly C 实现) — 非 Rust,
+#          独立 Makefile 构建 (见 knots/Makefile), 不在本 workspace 内.
+#
+# 目标: riscv64gc-unknown-linux-musl (lp64d 硬浮点 ABI, 静态链接).
+# 交叉链接配置见 .cargo/config.toml; 链接工具链见 ../bsp/musl-gc-sysroot.
+[workspace]
+members = ["orbit", "chem", "graphene", "ising", "fem", "dsp"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+# 飞地内无 unwind 目标, panic 直接停机; LTO + 单 codegen-unit 减小静态体积
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+codegen-units = 1

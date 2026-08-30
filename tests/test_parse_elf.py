@@ -10,7 +10,7 @@ import tempfile
 
 import pytest
 
-from pyremu.configs_aux import test_elf_dir
+from pyremu.configs_aux import examed_elf_dir
 from pyremu.utils.file_ops import (
     get_abs_filename_arr_from_dir,
     is_file,
@@ -128,7 +128,7 @@ class TestParseElf:
     @pytest.fixture
     def elf_paths(self) -> list[str]:
         """获取测试用 ELF 文件列表 (仅真正的 ELF 文件)."""
-        elf_dir = test_elf_dir()
+        elf_dir = examed_elf_dir()
         paths = get_abs_filename_arr_from_dir(elf_dir)
         assert paths is not None and len(paths) > 0, "bins/elf/ 下未找到文件"
         # 仅保留魔数为 ELF 的文件 (排除 .S 源码和 .txt 等)

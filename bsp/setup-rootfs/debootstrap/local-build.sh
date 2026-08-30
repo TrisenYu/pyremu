@@ -221,9 +221,12 @@ fi
 
 # Build via Makefile (single source of truth for program list),
 # then copy all resulting binaries + payloads at once.
+# 需要同时构建 musl 飞地载荷 (hello_payload / victim_cache / attacker_cache):
+# cross_enclave_cache 探测与 benign/concurrent 生命周期均依赖它们, 只跑 all
+# 会导致 /eval 下缺失载荷, probe 无法执行.
 GCC_CROSS="riscv64-linux-gnu-gcc"
 if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
-    make -C "${TEE_TEST_SRC}" -j"$(nproc)" CROSS_CC="${GCC_CROSS}" all
+    make -C "${TEE_TEST_SRC}" -j"$(nproc)" CROSS_CC="${GCC_CROSS}" all musl
     install -m755 "${TEE_TEST_SRC}"/bin/* "${TEE_DEST}/" 2>/dev/null || true
     cp -v "${TEE_TEST_SRC}/tee_enclave.h" "${TEE_DEST}/"
     cp -v "${TEE_TEST_SRC}/eval.mk" "${TEE_DEST}/Makefile"
@@ -236,7 +239,6 @@ ls -la "${TEE_DEST}"
 
 # TEE enclave stress test programs
 STRESS_SRC="$(cd "$(dirname "$0")/../../../tests/src-stress" && pwd)"
-STRESS_PREBUILT="$(cd "$(dirname "$0")/../../../build/src-stress" && pwd)"
 STRESS_DEST="${ROOTFS_DIR}/eval/stress-test"
 mkdir -p "${STRESS_DEST}"
 
@@ -245,14 +247,8 @@ if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
     install -m755 "${STRESS_SRC}"/bin/* "${STRESS_DEST}/" 2>/dev/null || true
     cp -v "${STRESS_SRC}/tee_enclave.h" "${STRESS_DEST}/"
     cp -v "${STRESS_SRC}/eval.mk" "${STRESS_DEST}/Makefile"
-elif ls "${STRESS_PREBUILT}/tee_stress" >/dev/null 2>&1; then
-    echo ">> No cross-compiler, installing prebuilt stress test binaries ..."
-    install -m755 "${STRESS_PREBUILT}/tee_stress" "${STRESS_DEST}/"
-    install -m755 "${STRESS_PREBUILT}/stress_payload" "${STRESS_DEST}/"
-    cp -v "${STRESS_SRC}/tee_enclave.h" "${STRESS_DEST}/"
-    cp -v "${STRESS_SRC}/eval.mk" "${STRESS_DEST}/Makefile"
 else
-    echo ">> SKIP stress tests: ${GCC_CROSS} not found, no prebuilt binaries"
+    echo ">> SKIP stress tests: ${GCC_CROSS} not found"
 fi
 
 echo ">> Stress test components:"
@@ -270,10 +266,10 @@ cat > "${ROOTFS_DIR}/eval/Makefile" <<'EVALMK'
 
 help:
 	@echo "=== /eval TEE Test Suite ==="
-	@echo "  make probe    cache-probe-exploit (side-channel + DoS + integrity)"
+	@echo "  make probe    cache-probe-exploit (全部缓存侧信道: Flush+Reload + 生命周期 + 并发 + TLB/integrity)"
 	@echo "  make stress   stress-test (batch enclave lifecycle 2/20/200/2000/20000)"
 	@echo ""
-	@echo "  cd cache-probe-exploit && make help   for attack details"
+	@echo "  cd cache-probe-exploit && make help   for attack details (含阻塞式 DoS: malice-avail)"
 	@echo "  cd stress-test && make help           for stress test details"
 
 probe:

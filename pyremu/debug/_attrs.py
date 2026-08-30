@@ -58,7 +58,6 @@ class SharedMixinAttrs:
 
     _running: bool
     _sigint_count: int
-    _paused: bool
     _terminated: bool
 
     _snapshot: HartSnapshot | None

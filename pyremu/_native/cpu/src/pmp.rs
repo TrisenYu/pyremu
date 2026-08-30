@@ -164,7 +164,7 @@ pub extern "C" fn pmp_check(
 	mode_val: u8,
 	mstatus_val: u64,
 	pmpsplit: u8,
-	mdid: u8,
+	mdid: u64,
 ) -> u8 {
 	// ---- Determine effective privilege mode ----
 	let mut eff_mode = mode_val;
@@ -284,7 +284,7 @@ mod tests {
 		mode_val: u8,
 		mstatus_val: u64,
 		pmpsplit: u8,
-		mdid: u8,
+		mdid: u64,
 	) -> u8 {
 		pmp_check(
 			cfg.as_ptr(),
@@ -377,6 +377,30 @@ mod tests {
 		];
 		// PA=0x82FF_FFF0 inside entry 3's TOR range [0x00C0_0000, 0x8300_0000)
 		assert_eq!(check(&cfg, &addr, 4, 0x82FF_FFF0u64, 0, 0, 1, 0, 2, 1), 1);
+	}
+
+	/// 飞地 ID ≥ 256 时 PMP 隔离必须保持 — 修复前 mdid 参数是 u8, csrw mdid, 256
+	/// 截断为 0 (别名回 host), enclave_mode (mdid != 0) 判定失效 → 飞地可访问
+	/// host 侧条目 [0, pmpsplit), 权限提升.
+	#[test]
+	fn test_enclave_split_high_mdid() {
+		let cfg = [
+			PMP_A_TOR | PMP_R | PMP_W,
+			PMP_A_TOR | PMP_R | PMP_W,
+			PMP_A_TOR | PMP_R | PMP_W,
+			PMP_A_TOR | PMP_R | PMP_W,
+		];
+		let addr = [
+			0x0010_0000u64,
+			0x0020_0000u64,
+			0x0030_0000u64,
+			0x8300_0000u64 >> 2,
+		];
+		// mdid=256 (u8 别名 0 = host): 访问 host 条目 0 的 TOR 范围 [0, 0x0010_0000)
+		// 必须 DENY. 修复前 enclave_mode=false → 条目 0 匹配 → 错误 ALLOW.
+		assert_eq!(check(&cfg, &addr, 4, 0x0008_0000u64, 0, 0, 1, 0, 2, 256), 0);
+		// mdid=300 (u8 别名 44, 仍 != 0): 访问自身条目 3 范围应 ALLOW.
+		assert_eq!(check(&cfg, &addr, 4, 0x82FF_FFF0u64, 0, 0, 1, 0, 2, 300), 1);
 	}
 
 	#[test]

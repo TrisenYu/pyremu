@@ -4,11 +4,13 @@ use crate::constants::*;
 use crate::csr;
 use crate::ecall_aux;
 use crate::hang;
-use crate::paging;
-use crate::println;
 use crate::sched;
 use crate::syscall;
 
+#[cfg(feature = "diagnostic")]
+use crate::paging;
+#[cfg(feature = "diagnostic")]
+use crate::println;
 // ---------------------------------------------------------------
 //  GPR 寄存器别名（对应 smode_entry/trap_handler.h 中 CTX_INDEX_*）
 // ---------------------------------------------------------------
@@ -230,6 +232,7 @@ pub unsafe extern "C" fn trap_dispatch(gprs: &mut TrapGprs, sepc: u64, scause: u
 	}
 
 	// 页错误：额外输出 VA -> PA 诊断信息
+	#[cfg(feature = "diagnostic")]
 	if scause == 0xc || scause == 0xd || scause == 0xf {
 		if let Some(pa) = paging::get_pa(stval) {
 			println!("page_fault: va=0x{stval:x} pa=0x{pa:x}\n");
@@ -282,7 +285,7 @@ fn interrupt_dispatch(cause: u64) {
 			}
 			csr::clear_csr!(sip, csr::STI);
 
-			// 时间片记账与配额检查 (见 sched.rs).
+			// 时间片检查 (见 sched.rs).
 			sched::tick_and_check_quota();
 			// 同时检查是否有 host 发来的待处理请求.
 			sched::check_pending_requests();

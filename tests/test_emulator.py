@@ -6,10 +6,12 @@
 """多核模拟器集成测试: 多 hart 执行, IPI, AMO 跨 hart 竞争."""
 
 import ctypes
+import threading
 import time
 
 import pytest
 
+from pyremu.configs_aux import force_config
 from pyremu.configs_gen import CPU_FREQ_HZ
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import (
@@ -17,14 +19,28 @@ from pyremu.core.hart import (
     InstrToBeExec,
     marshal_hart,
     RiscvMode,
+    TlbEntry,
     unmarshal_hart,
 )
 from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.trap_handler import check_pending_interrupts
-from pyremu.emulator import Emulator, TimeoutError
+from pyremu.emulator import Emulator, RunStopReason, TimeoutError
 from pyremu.memory.bus import Bus
+from pyremu.peripheral.termio import TerminalIO
+from pyremu.peripheral.uart import UART, UART_IRQ
 from pyremu.platform import PlatformConfig
 from pyremu.utils.mask import mask64
+
+
+@pytest.fixture
+def legacy_plic():
+    """强制 legacy PLIC 模式 (PYREMU_AIA=0), 供测试 PLIC 内联/直写契约的用例.
+
+    编译期开关 PYREMU_AIA=1 时 Emulator 默认走 AIA (IMSIC+APLIC), 不再创建
+    PLIC; 本 fixture 局部覆盖回 legacy, 用例结束自动恢复, 不污染后续测试.
+    """
+    with force_config("PYREMU_AIA", 0):
+        yield
 
 
 class TestEmulatorInit:
@@ -1397,7 +1413,7 @@ class TestEmulatorProperties:
         # 初始值取决于复位, 允许从 0 开始
         c0 = h.csrs["mcycle"].val
         i0 = h.csrs["minstret"].val
-        t0 = h.csrs["time"].val
+        # t0 = h.csrs["time"].val
         emu.step()
         c1 = h.csrs["mcycle"].val
         i1 = h.csrs["minstret"].val
@@ -1430,14 +1446,18 @@ class TestEmulatorProperties:
 
 
 class TestWfiIdleSleep:
-    """WFI 全 hart 空闲睡眠 — 必须被 _wake_event 立即唤醒 (输入 daemon)."""
+    """WFI 全 hart 空闲睡眠 — 事件驱动唤醒, 但陈旧事件不得引起忙转."""
 
-    def test_wfi_sleep_wakes_on_wake_event(self):
-        """_wfi_sleep_if_idle 仅等待 _wake_event, 已 set 的事件应立即返回.
+    def test_wfi_sleep_stale_event_does_not_spin(self):
+        """回归: 已置位的 _wake_event 电平残留不得阻止睡眠 (忙转).
 
-        回归: 键盘输入经独立 daemon 线程 set(_wake_event) 唤醒主线程,
-        WFI 睡眠不得再阻塞至 sleep_sec (最多 200ms) 超时 — 否则内核
-        WFI 等待期间输入延迟, 表现为"回车需额外按键触发"。
+        修复前 drain_rx 无条件 set(_wake_event), 首次外设活动 (UART RX /
+        ext_irq / 看门狗 MSIP) 后事件永久置位, 且 _wfi_sleep_if_idle 等待前
+        不 clear — wait(timeout) 每次立即返回, 全 hart WFI 空闲退化为 ~100%
+        CPU 忙转, 宿主被拖满, 键盘输入看似"无响应"。
+
+        修复后等待前先 clear() 事件; 陈旧事件仅表示先前循环已处理过的工作,
+        本轮回合应正常睡眠, 不得因残留置位空转。
         """
         emu = Emulator(num_harts=1, ram_base=0x80000000, ram_size=0x10000)
         hart = emu.harts[0]
@@ -1446,13 +1466,142 @@ class TestWfiIdleSleep:
         emu.clint._mtime = 0
         emu.clint._mtimecmp[0] = 100_000_000
 
-        # 输入 daemon 已完成转发并 set(_wake_event) — 修复后应立即返回,
-        # 而非阻塞到 sleep_sec (200ms) 超时。
+        # 模拟 boot 期间外设活动遗留的电平: 事件已 set
         emu._wake_event.set()
         start = time.monotonic()
         emu._wfi_sleep_if_idle([hart], 1)
         elapsed = time.monotonic() - start
-        assert elapsed < 0.15, f"应由 _wake_event 立即唤醒, 实际 {elapsed:.3f}s"
+        assert elapsed >= 0.15, f"陈旧事件不得阻止睡眠 (忙转), 实际 {elapsed:.3f}s"
+
+    def test_wfi_sleep_wakes_on_event_during_wait(self):
+        """睡眠期间到达的新事件应立即唤醒 (输入延迟低).
+
+        事件驱动的正确语义: clear-then-wait 后, daemon 在睡眠中途 set 事件
+        唤醒主线程, 使键盘输入能被下一轮 batch 及时转发 — 输入延迟上界为
+        事件到达时刻, 而非 sleep_sec (200ms) 超时。
+        """
+        emu = Emulator(num_harts=1, ram_base=0x80000000, ram_size=0x10000)
+        hart = emu.harts[0]
+        hart._waiting = True
+        emu.clint._mtime = 0
+        emu.clint._mtimecmp[0] = 100_000_000
+
+        def _late_set():
+            time.sleep(0.05)
+            emu._wake_event.set()
+
+        th = threading.Thread(target=_late_set, daemon=True)
+        th.start()
+        start = time.monotonic()
+        emu._wfi_sleep_if_idle([hart], 1)
+        elapsed = time.monotonic() - start
+        th.join()
+        assert elapsed < 0.15, f"睡眠中到达的事件应即时唤醒, 实际 {elapsed:.3f}s"
+
+    def test_drain_rx_only_wakes_on_input(self):
+        """回归: 空 drain (无输入) 不得 set _wake_event.
+
+        修复前 drain_rx 无条件 set(_wake_event), RX daemon 每 0.5s 周期
+        drain 一次, 事件被无限重新置位 -> _wfi_sleep_if_idle 的 wait 永不
+        阻塞 (忙转)。修复后仅在有实际输入搬运到 UART FIFO 时才唤醒。
+        """
+        uart = UART()
+        ev = threading.Event()
+        termio = TerminalIO(uart, ev)
+
+        # 空 ring: drain_rx 返回 False, 不 set 事件
+        termio._rx_wr.value = 0
+        termio._rx_rd.value = 0
+        ev.clear()
+        ok = termio.drain_rx()
+        assert ok is False
+        assert not ev.is_set(), "空 drain 不得 set _wake_event"
+
+        # ring 中有字节: drain_rx 返回 True, set 事件
+        termio._rx_buf[0] = ord("a")
+        termio._rx_wr.value = 1
+        termio._rx_rd.value = 0
+        ev.clear()
+        ok = termio.drain_rx()
+        assert ok is True
+        assert ev.is_set(), "有输入时应 set _wake_event"
+
+    @pytest.mark.usefixtures("legacy_plic")
+    def test_drain_rx_write_through_plic(self):
+        """回归: RX 排空必须经 raise_device_irq write-through 持久 PLIC 数组.
+
+        修复前 drain_rx 仅置 _ext_irq.pending, 不写 FFI 持久数组 (源挂起)。
+        batch 运行期间 Rust 内联 plic_recompute_mip 用 batch 起始的旧数组
+        (源挂起=0) 覆盖 SEIP -> UART 中断永远投递不出去, 客机在 nohz 空闲
+        路径自旋冻结 (make emu-linux-sh 间歇性卡死)。修复后 drain 经
+        on_irq (= raise_device_irq) -> plic.set_irq 内联写穿 _ffi_pending/
+        _ffi_level, 使 batch 内 Rust 仲裁立即看到 UART 源挂起。
+        """
+        emu = Emulator(num_harts=1)
+        uart = emu.uart
+        assert uart is not None and uart._irq == UART_IRQ
+        # 模拟客机已使能 RX 水位中断 (IE bit1 = rxwm)
+        uart._ie = 1 << 1
+        ev = threading.Event()
+        termio = TerminalIO(
+            uart,
+            ev,
+            ext_irq=emu._native_ext_irq,
+            on_irq=emu.raise_device_irq,
+        )
+        emu._native_marshal_plic()  # 分配持久数组 (真实启动路径先于首个 batch)
+
+        # Rust termio 线程写入 stdin -> ring buffer, daemon drain
+        termio._rx_buf[0] = ord("H")
+        termio._rx_wr.value = 1
+        termio._rx_rd.value = 0
+        assert termio.drain_rx() is True
+        # write-through: FFI 持久数组 (PLIC 持有) 与 ext_irq 通知位同步置位
+        assert emu.plic._ffi_pending[UART_IRQ] == 1
+        assert emu.plic._ffi_level[UART_IRQ] == 1
+        assert emu._native_ext_irq.pending == 1
+        assert emu.plic._pending[UART_IRQ] is True
+        assert ev.is_set()
+
+        # 反向: 客机关闭 RX 中断 (IE=0) 后 drain 不得强制拉高挂起位 —
+        # 电平语义, raise_device_irq 收到真实电平 False -> 持久数组清零.
+        uart._ie = 0
+        uart.clear_rx()
+        emu._native_unmarshal_plic(emu._native_marshal_plic())
+        termio._rx_buf[1] = ord("B")
+        termio._rx_wr.value = 2
+        termio._rx_rd.value = 1
+        emu._native_ext_irq.pending = 0
+        assert termio.drain_rx() is True
+        assert emu.plic._ffi_pending[UART_IRQ] == 0, "IE 关闭时不得虚假挂起"
+        assert emu.plic._pending[UART_IRQ] is False
+
+    @pytest.mark.usefixtures("legacy_plic")
+    def test_uart_read_empty_deasserts_ffi_level(self):
+        """回归: guest 读空 RX FIFO 必须写穿 FFI level=0, 防 Rust complete 重挂起风暴.
+
+        修复前 UART._update_plic_irq 仅更新 Python PLIC 对象, 不写 FFI 持久数组。
+        batch 运行期间 guest 读空 FIFO 后, Rust 内联 plic_do_complete 读到陈旧
+        level=1 -> 重挂起 pending -> SEIP 再次置位 -> spurious 中断无限循环
+        (batch 永不结束, 等价冻结)。修复后 set_irq 内联写穿 _ffi_pending/
+        _ffi_level, complete 读到 level=0 不再重挂。
+        """
+        emu = Emulator(num_harts=1)
+        uart = emu.uart
+        assert uart is not None and uart._irq == UART_IRQ
+        uart._ie = 1 << 1  # RX 水位中断使能 (IE bit1 = rxwm)
+        # 数据入队 -> set_irq 写穿: FFI 数组与 Python 对象同步置位
+        uart.preload(b"AB")
+        assert emu.plic._ffi_pending[UART_IRQ] == 1
+        assert emu.plic._ffi_level[UART_IRQ] == 1
+        # 模拟 guest ISR 逐个读走 FIFO (RXDATA 偏移 0x04); 读空后电平写穿为 0
+        uart.read(0x04, 1)
+        assert emu.plic._ffi_pending[UART_IRQ] == 1, "还有数据时不得 deassert"
+        uart.read(0x04, 1)
+        assert emu.plic._ffi_pending[UART_IRQ] == 0, "读空后不得残留挂起"
+        assert emu.plic._ffi_level[UART_IRQ] == 0, "读空后陈旧电平不得残留"
+        assert emu.plic._level[UART_IRQ] is False
+        assert emu.plic._pending[UART_IRQ] is False
 
 
 class TestL2SizeZero:
@@ -1680,19 +1829,27 @@ class TestNativeBatchLayout:
     会造成内存布局不匹配 → SIGBUS (Bus error).
     这些用例在每次构建后锁死布局合约.
     """
-    # def test_tlb_entry_size_24(self) -> None:
-    #     """TlbEntry 必须恰好 24 字节."""
-    #     assert ctypes.sizeof(TlbEntry) == 24, (
-    #         f"TlbEntry 应为 24 字节, 实际 {ctypes.sizeof(TlbEntry)}B"
-    #     )
+    def test_tlb_entry_size_40(self) -> None:
+        """TlbEntry 必须恰好 40 字节.
+
+        mdid 从 u8 加宽为 u64 后 TlbEntry 由 32B 涨到 40B (mdid 对齐到偏移 24).
+        与 Rust ``state::TlbEntry`` 逐字节一致, 否则 Rust 在错误偏移读字段 → SIGBUS.
+        """
+        assert ctypes.sizeof(TlbEntry) == 40, (
+            f"TlbEntry 应为 40 字节, 实际 {ctypes.sizeof(TlbEntry)}B"
+        )
 
     def test_hart_state_8byte_aligned(self) -> None:
         """HartState 必须 8 字节对齐."""
         assert ctypes.sizeof(HartState) % 8 == 0
 
-    # def test_hart_state_under_4k(self) -> None:
-    #     """HartState 不应膨胀超过 4096 字节."""
-    #     assert ctypes.sizeof(HartState) < 4096
+    def test_hart_state_reasonable_size(self) -> None:
+        """HartState 不应异常膨胀 (与 Rust 侧 ``hart_state_size_reasonable`` 对齐).
+
+        256 TLB 条目 × 40B × 2 (itlb+dtlb) ≈ 20 KB, 实际 ~22 KB < 64 KB.
+        若某次 FFI 改动让布局爆炸 (如把整块 RAM 塞进 HartState), 此测试会拦住.
+        """
+        assert ctypes.sizeof(HartState) < 65536
 
     def test_batch_result_8byte_aligned(self) -> None:
         """InstrToBeExec (原 BatchResult) 必须 8 字节对齐."""
@@ -1718,6 +1875,86 @@ class TestNativeBatchLayout:
         assert hasattr(hs.dtlb[0], "valid")
 
 
+@pytest.mark.usefixtures("legacy_plic")
+class TestPlicNativeInline:
+    """PLIC 内联 (Rust batch) 的 Python 侧 marshal/unmarshal 契约.
+
+    回归: kernel 直映射包含 PLIC MMIO (enable 写约 767/s), 旧实现每次访问都
+    退出 Rust batch 回落到 Python MMIO, 使 EXT4 recovery 阶段吞吐跌至 ~0.6M/s.
+    修复为 Rust 内联处理 PLIC MMIO (claim/complete/enable/threshold/priority),
+    状态经持久 ctypes 数组在 batch 边界 marshal/unmarshal 往返, 设备线程
+    ``raise_device_irq`` 直接 write-through pending/level, 保证 batch 内新设备
+    中断对 Rust 内联仲裁可见.
+    """
+
+    def test_marshal_plic_fields(self):
+        """marshal 产出正确的 base/num_sources/num_contexts 与位打包 enable."""
+        emu = Emulator(num_harts=2)
+        plic = emu.plic
+        assert plic is not None
+        plic._priority[10] = 5
+        plic._enable[0][10] = True      # word 0, bit 10
+        plic._enable[0][33] = True      # word 1, bit 1 (source 33)
+        plic._enable[1][7] = True       # context 1, word 0, bit 7
+        info = emu._native_marshal_plic()
+        assert info is not None
+        assert info.base == plic.base_addr
+        assert info.num_sources == plic._num_sources
+        assert info.num_contexts == plic._num_contexts
+        # enable 数组: context * num_words + word
+        nw = (plic._num_sources + 31) // 32
+        assert len(info.enable) == plic._num_contexts * nw
+        assert info.priority[10] == 5
+        assert info.enable[0 * nw + 0] & (1 << 10) != 0, "source 10 应落 word 0 bit 10"
+        assert info.enable[0 * nw + 1] & (1 << 1) != 0, "source 33 应落 word 1 bit 1"
+        assert info.enable[1 * nw + 0] & (1 << 7) != 0, "context 1 source 7"
+
+    def test_unmarshal_plic_roundtrip(self):
+        """marshal → (模拟 Rust 内联改 state) → unmarshal 往返保真."""
+        emu = Emulator(num_harts=2)
+        plic = emu.plic
+        plic._priority[10] = 5
+        plic._enable[0][10] = True
+        plic._enable[1][7] = True
+        plic._threshold[1] = 3
+        plic._claimed[0] = 10
+        # pending/level 由 set_irq 写穿 FFI 数组 (直接改 Python 列表不会同步)
+        plic.set_irq(10, True)
+        info = emu._native_marshal_plic()
+        # 模拟 Rust 内联: claim 清 pending, 记录 claimed; complete 后电平仍高重挂.
+        info.pending[10] = 0
+        info.claimed[0] = 10
+        info.pending[10] = 1
+        info.threshold[0] = 7
+        emu._native_unmarshal_plic(info)
+        assert plic._priority[10] == 5
+        assert plic._pending[10] is True
+        assert plic._level[10] is True
+        assert plic._enable[0][10] is True
+        assert plic._enable[1][7] is True
+        assert plic._threshold[1] == 3
+        assert plic._threshold[0] == 7
+        assert plic._claimed[0] == 10
+
+    def test_raise_device_irq_write_through(self):
+        """设备线程 raise_device_irq write-through 到 FFI 持久数组 (batch 内对 Rust 可见)."""
+        emu = Emulator(num_harts=2)
+        emu._native_marshal_plic()  # 首次分配持久数组
+        emu.raise_device_irq(25, True)
+        assert emu.plic._ffi_pending[25] == 1
+        assert emu.plic._ffi_level[25] == 1
+        emu.raise_device_irq(25, False)
+        assert emu.plic._ffi_pending[25] == 0
+        assert emu.plic._ffi_level[25] == 0
+
+    def test_marshal_plic_none_when_no_plic(self):
+        """无 PLIC 时 marshal 返回 None (native 侧回落 MMIO)."""
+        emu = Emulator(num_harts=1)
+        emu.plic = None
+        assert emu._native_marshal_plic() is None
+        assert emu._native_unmarshal_plic(None) is None
+
+
 class TestClockDecoupling:
     """指令计数时钟模型: mtime 按已执行指令数推进, mcycle 按时钟源推进.
 
@@ -1728,35 +1965,35 @@ class TestClockDecoupling:
 
     @pytest.fixture
     def nop_emu(self) -> Emulator:
-        """单 hart 模拟器, 加载 128 条 NOP — 无 WFI/ECALL/trap."""
+        """单 hart 模拟器, 加载 4096 条 NOP — 无 WFI/ECALL/trap."""
         emu = Emulator(num_harts=1)
-        nops = b"\x13\x00\x00\x00" * 128  # addi x0, x0, 0
+        nops = b"\x13\x00\x00\x00" * 4096  # addi x0, x0, 0
         emu.load_code(0x8000_0000, nops)
         return emu
 
     def test_mtime_advances_per_100_instructions(self, nop_emu):
-        """mtime 按指令计数推进: 100 条指令 = 1 tick (10 MHz / 1 GHz)."""
+        """mtime 按指令计数推进: 100 条指令 = 20 tick (10 MHz × NS_PER_INSTR=20ns)."""
         emu = nop_emu
         mtime_before = emu.clint.get_mtime()
         for _ in range(100):
             emu.step()
-        assert emu.clint.get_mtime() - mtime_before == 1, (
-            "100 条指令应推进 mtime 恰好 1 tick"
+        assert emu.clint.get_mtime() - mtime_before == 20, (
+            "100 条指令应推进 mtime 恰好 20 tick (5 指令/tick)"
         )
 
     def test_advance_mtime_instr_conversion(self, nop_emu):
-        """_advance_mtime_instr 按 timebase_freq/CPU_FREQ_HZ 换算, 余数跨调用累积."""
+        """_advance_mtime_instr 按 timebase_freq*NS_PER_INSTR 换算, 余数跨调用累积."""
         emu = nop_emu
         mtime_before = emu.clint.get_mtime()
 
-        # 100 指令 -> 1 tick
-        emu._advance_mtime_instr(100)
+        # 5 指令 -> 恰好 1 tick (10 MHz × 20ns/instr)
+        emu._advance_mtime_instr(5)
         assert emu.clint.get_mtime() - mtime_before == 1
 
-        # 50 指令 -> 0 tick (余数累积); 再 50 指令 -> 1 tick
-        emu._advance_mtime_instr(50)
+        # 4 指令 -> 0 tick (余数累积 0.8); 再 1 指令 -> 满 1 tick
+        emu._advance_mtime_instr(4)
         assert emu.clint.get_mtime() - mtime_before == 1
-        emu._advance_mtime_instr(50)
+        emu._advance_mtime_instr(1)
         assert emu.clint.get_mtime() - mtime_before == 2
 
     def test_advance_mcycle_clock_source(self, nop_emu, monkeypatch):
@@ -1787,6 +2024,59 @@ class TestClockDecoupling:
             "marshal_clint 不得再按时钟源推进 mtime"
         )
         assert info.mtime == mtime_before
+
+    def test_native_batch_mtime_pure_instruction_count(self, nop_emu):
+        """native batch (run_parallel) 下 mtime 纯按指令计数推进, 与流逝时间解耦.
+
+        回归: 工作树曾把 Rust ``advance_clock_source`` 改为实时/混合模型,
+        legacy 模式 PLIC 相位后 HZ=250 的 4ms tick 指令预算不足 (~8-12K 条),
+        低于 kernel post-PLIC timer handler 路径 → mret 后立即再 trap 的活锁,
+        kernel_init 被饿死, 串口停在 plic 设备树节点输出. 修复为纯指令源
+        (20ns/instr) 后, native 路径 mtime 推进率必须与 Python 路径一致:
+        5 条指令 = 1 tick, 流逝时间完全不参与.
+        """
+        emu = nop_emu
+        assert emu._speedup_hart_states is not None, "回归测试必须走 native batch"
+        # 断点设在第 2000 条 NOP 之后, run() 经 native batch 返回
+        emu._bp_addrs = [0x8000_0000 + 2000 * 4]
+        emu.run(timeout=15)
+        assert emu._run_stop_reason == RunStopReason.BREAKPOINT, (
+            f"应命中断点, 实际 reason={emu._run_stop_reason}"
+        )
+        assert emu._total_instrs == 2000, (
+            f"应恰好执行 2000 条 NOP, 实际 {emu._total_instrs}"
+        )
+        mtime = emu.clint.get_mtime()
+        # 5 条指令 = 1 tick (10 MHz × 20ns/instr / 1e9). 边界滞后 ≤1 条
+        # (advance_clock_source 在每条指令执行前的循环顶推进), 故期望落在
+        # [total//5 - 1, total//5]. 实时/混合模型在此刻会推进
+        # elapsed*timebase ≈ 10^3~10^4+ tick, 远越上界 → 复现修复前行为.
+        lo = emu._total_instrs // 5 - 1
+        hi = emu._total_instrs // 5
+        assert lo <= mtime <= hi, (
+            f"native batch 2000 条指令 mtime 应为 [{lo}, {hi}] tick (纯指令源), "
+            f"实际 {mtime}"
+        )
+        emu.close()
+
+    def test_native_mtime_no_wallclock_leak_on_idle(self, nop_emu):
+        """无指令执行时, mtime 不随流逝时间推进 (无实时泄漏).
+
+        回归: 实时/混合模型在空闲批次 instr_delta=0 时仍按真实流逝推进 mtime,
+        与 Python 侧 ``_wfi_sleep_if_idle`` 的 clint.tick 实时补偿叠加成
+        ~2× real 双倍计数, 重新制造 tick 风暴压力. 修复后空闲期 mtime 静止,
+        由 WFI 补偿独占实时源.
+        """
+        emu = nop_emu
+        emu._bp_addrs = [0x8000_0000 + 2000 * 4]
+        emu.run(timeout=15)
+        assert emu._run_stop_reason == RunStopReason.BREAKPOINT
+        mtime_before = emu.clint.get_mtime()
+        time.sleep(0.3)  # 无指令执行, 流逝 300ms
+        assert emu.clint.get_mtime() == mtime_before, (
+            "空闲期 mtime 不得随流逝时间推进 (实时泄漏)"
+        )
+        emu.close()
 
 
 class TestMarshalUnmarshalRoundtrip:
@@ -1956,6 +2246,26 @@ class TestMarshalUnmarshalRoundtrip:
         assert out.mdid_val == 5
         assert out.pmpsplit_val == 2
 
+    def test_mdid_above_255_roundtrip(self) -> None:
+        """
+        mdid 超过 255 时 marshal 往返必须保持完整 64-bit 值.
+
+        回归: HartState.mdid / TlbEntry.mdid 曾声明为 c_uint8 (Rust 侧 u8),
+        与 csr.rs ``val as u8`` 截断共同构成 batch-4 (2000 并发, id ≥ 256)
+        挂死根因 — 300→44, 256→0 (别名回 host, SUSPEND handler 误判而挂死).
+        c_uint8 字段赋值 300 会直接抛 ValueError, 本用例在旧布局下无法通过.
+        """
+        hart = self._fresh_hart()
+        hart._mdid_val = 300
+        out = self._roundtrip(hart)
+        assert out.mdid_val == 300
+
+        # 256 ≡ 0 (mod 256) 是最危险别名 (→ host), 必须保留原值
+        hart2 = self._fresh_hart()
+        hart2._mdid_val = 256
+        out2 = self._roundtrip(hart2)
+        assert out2.mdid_val == 256
+
     # ---------- Extra CSRs ----------
     def test_extra_csrs_roundtrip(self) -> None:
         hart = self._fresh_hart()
@@ -2117,3 +2427,144 @@ class TestBranchEdgeCases:
             assert hart.pc == 0x3AD0, f"s2={s2_val} s4={s4_val}: should loop to 0x3ad0"
         else:
             assert hart.pc == 0x3B0A, f"s2={s2_val} s4={s4_val}: should exit to 0x3b0a"
+
+
+class TestNativeXonlyFetch:
+    """native 引擎对 X-only 页 (R=0, W=0, X=1) 的取指回归.
+
+    回归 (Batch-20 trap loop 根因): Rust ``walk_l0`` / ``walk_l1_leaf`` 对
+    取指也强制 PTE_R, 使 runtime 映射在 0xffffffe000001000 的 X-only text
+    (trap_vector) 取指被误判 InstrPageFault. 修复后取指仅要求 PTE_X.
+
+    本测试通过 emulator 的 native run_parallel 引擎端到端复现: STIP 投递到
+    stvec=trap_vector (X-only 高 VA 页), 若取指失败则陷入 M 模式 trap loop,
+    永远命不中断点; 修复后 trap_vector 首条指令被取指+执行, 断点命中.
+    """
+
+    # 与 runtime identity_map_trampoline / map_sections 生成值逐位一致:
+    #   L1[0x57] = 0x22b800cf  R|W|X 2 MiB superleaf  -> PA 0x8ae00000
+    #   L0[1]    = 0x22b804c9  X-only 4 KiB leaf       -> PA 0x8ae01000
+    MAN_PA = 0x8AE0_0000
+    TRAP_VEC_VA = 0xFFFF_FFE0_0000_1000
+    ROOT_PA = 0x8AE0_A000
+    L1_LOW_PA = 0x8AE0_B000
+    L1_HIGH_PA = 0x8AE0_C000
+    L0_HIGH_PA = 0x8AE0_D000
+    TEXT_PA = 0x8AE0_1000
+
+    @staticmethod
+    def _pte_ptr(target_pa: int) -> int:
+        """指针 PTE (V=1, R=W=X=0), 指向 *target_pa*."""
+        return 1 | ((target_pa >> 12) << 10)
+
+    def _build_page_tables(
+        self,
+        emu: Emulator,
+    ) -> None:
+        """写入 Sv39 页表: 低 VA identity 超页 + 高 VA X-only trap_vector 映射."""
+        ram = emu.bus
+
+        def wr64(pa: int, val: int) -> None:
+            ram.write_ram_direct(pa, val.to_bytes(8, "little"))
+
+        # root[vpn2=2] -> L1_LOW (低 VA identity 区域)
+        wr64(self.ROOT_PA + 2 * 8, self._pte_ptr(self.L1_LOW_PA))
+        # root[vpn2=0x180] -> L1_HIGH (高 VA trap_vector 区域)
+        wr64(self.ROOT_PA + 0x180 * 8, self._pte_ptr(self.L1_HIGH_PA))
+        # L1_LOW[vpn1=0x57] = R|W|X 2 MiB superleaf -> PA 0x8ae00000
+        wr64(self.L1_LOW_PA + 0x57 * 8, 0x22B8_00CF)
+        # L1_HIGH[vpn1=0] -> L0_HIGH
+        wr64(self.L1_HIGH_PA + 0 * 8, self._pte_ptr(self.L0_HIGH_PA))
+        # L0_HIGH[vpn0=1] = X-only leaf (R=0 W=0 X=1, A|D 预置) -> PA 0x8ae01000
+        wr64(self.L0_HIGH_PA + 1 * 8, 0x22B8_04C9)
+
+    def _make_emu(
+        self,
+    ) -> tuple[Emulator, object]:
+        """构建单 hart 模拟器: 页表 + 代码 + S 模式飞地入口态 (STIP 立即 pending)."""
+        # MAN_PA=0x8ae00000 偏移 0xae00000 (182 MiB) > 默认 128 MiB RAM —
+        # 必须扩 RAM 才能覆盖 enclave 池与页表 (对齐 make stress 场景).
+        emu = Emulator(num_harts=1, ram_size=0x1000_0000)
+        h = emu.harts[0]
+        self._build_page_tables(emu)
+        # trap_vector: lui x1, 0x5AA (5AA005B7) 然后 NOP 填充
+        trap_code = (0x5AA0_05B7).to_bytes(4, "little") + b"\x13\x00\x00\x00" * 255
+        emu.load_code(self.TEXT_PA, trap_code)
+        # 低 VA 预中断点 NOP 填充
+        emu.load_code(self.MAN_PA, b"\x13\x00\x00\x00" * 64)
+
+        # ---- hart 状态 (镜像 OpenSBI 飞地入口 + 全权限 PMP) ----
+        h.mode = RiscvMode.S
+        h.satp_val = (8 << 60) | (self.ROOT_PA >> 12)
+        h.csrs["stvec"].val = self.TRAP_VEC_VA
+        h.csrs["mideleg"].val = 0x222  # SSI|STI|SEI 委派 S
+        h.csrs["mie"].val |= 1 << 5  # STIE
+        h.mstatus_val |= 1 << 1  # SIE
+        h.csrs["pmpaddr0"].val = (1 << 64) - 1
+        h.csrs["pmpcfg0"].val = 0xF
+        h._pmp.invalidate_cache()
+        # SSTC: stimecmp=1, mtime 置为 1 -> STIP 立即 pending (native 引擎用
+        # stimecmp/mtime 重新评估 STIP, 手工 mip 位会被 sync 覆盖)
+        h.csrs["stimecmp"].val = 1
+        emu.clint._mtime = 1
+        # M-mode trap handler 指向低 VA (identity 映射), 便于失败时观察 trap loop
+        h.csrs["mtvec"].val = self.MAN_PA
+        h.pc = self.MAN_PA
+        return emu, h
+
+    def test_xonly_fetch_via_stip_trap_vector(
+        self,
+    ) -> None:
+        """X-only 高 VA trap_vector 在 native 引擎下取指成功并执行.
+
+        修复前 walk_l0 对取指强制 PTE_R -> InstrPageFault -> M 模式 trap loop,
+        永不抵达断点; 修复后 trap_vector 首条指令执行, pc 推进到 +4 命中断点.
+        """
+        emu, h = self._make_emu()
+        emu._bp_addrs = [self.TRAP_VEC_VA + 4]
+
+        emu.run(timeout=15)
+
+        assert emu._run_stop_reason == RunStopReason.BREAKPOINT, (
+            f"应在 trap_vector+4 命中断点, 实际 reason={emu._run_stop_reason} "
+            f"pc=0x{h.pc:x} mode={h.mode} mcause=0x{h.csrs['mcause'].val:x}"
+        )
+        assert h.pc == self.TRAP_VEC_VA + 4, (
+            f"trap_vector 首条指令应被取指+执行 (X-only 页取指成功)"
+        )
+        assert h.mode == RiscvMode.S, (
+            f"不应陷入 M 模式 trap loop, 实际 mode={h.mode}"
+        )
+        assert h.csrs["mcause"].val == 0, (
+            f"不应投递任何异常, 实际 mcause=0x{h.csrs['mcause'].val:x}"
+        )
+
+    def test_xonly_page_data_read_still_faults(
+        self,
+    ) -> None:
+        """X-only 页数据读仍被拒绝 (取指放宽不影响 R 位要求)."""
+        emu, h = self._make_emu()
+        # 让 S 模式从 X-only 页读取: 若实现错误地把取指放宽波及数据读,
+        # 这里将不再触发 LoadPageFault.
+        h.pc = self.TRAP_VEC_VA
+        h.gprs[4] = self.TRAP_VEC_VA  # ld x1, 0(x4) 的源地址指向 X-only 页
+        # 在 trap_vector 放一条加载指令: ld x1, 0(x4) = 0x00023083
+        emu.load_code(
+            self.TEXT_PA,
+            (0x0002_3083).to_bytes(4, "little") + b"\x13\x00\x00\x00" * 255,
+        )
+        # 关闭 STIP 干扰 (stimecmp 设远未来), 专注数据访问
+        h.csrs["stimecmp"].val = 1 << 40
+        emu.clint._mtime = 0
+        # LoadPageFault (bit 13) 委派 S — 否则同步异常投递到 M 模式写
+        # mcause/mtval, scause 不更新 (与 runtime 显式委派页错误的配置一致)
+        h.csrs["medeleg"].val |= 1 << 13
+
+        emu.step()
+
+        # S 模式同步异常投递到 stvec, cause 存于 scause (非 mcause)
+        assert h.csrs["scause"].val == 13, (  # LoadPageFault
+            f"X-only 页数据读应触发 LoadPageFault, 实际 scause=0x"
+            f"{h.csrs['scause'].val:x}"
+        )
+        assert h.csrs["stval"].val == self.TRAP_VEC_VA

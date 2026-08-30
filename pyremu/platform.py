@@ -59,6 +59,7 @@ class PeripheralConfig:
     plic_base: int = 0x0C00_0000  # PLIC 基址 (SiFive standard)
     virtio_blk_base: int = 0  # 0 = 禁用
     watchdog_base: int = 0x1000_4000
+    crng_base: int = 0x1000_6000  # 模拟随机数生成器 (0 = 禁用)
     imsic_m_base: int = 0  # IMSIC M-file MMIO 基址 (0=禁用, AIA 标准 0x2400_0000)
     imsic_s_base: int = 0  # IMSIC S-file MMIO 基址 (0=禁用, AIA 标准 0x2800_0000)
     aplic_base: int = 0  # APLIC 基址 (0=禁用, AIA 标准 0x0C00_0000)
@@ -218,6 +219,7 @@ class PlatformConfig:
                 i2c_base=0,
                 gpio_base=0,
                 clint_base=0x0200_0000,
+                crng_base=0,
             ),
         )
 

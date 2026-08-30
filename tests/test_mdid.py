@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 # SPDX-LICENSE-IDENTIFIER: GPL2.0
 
-"""mdid CSR + mfence.did 指令测试 — TEE 飞地隔离与抗侧信道刷新."""
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import (
@@ -133,7 +132,6 @@ class TestMfenceDid:
     # -- TLB flush 隔离性 --
 
     def test_flushes_only_matching_mdid(self):
-        """mfence.did 仅刷新 mdid 匹配的 TLB 条目, 不匹配的保留."""
         emu = _make_emu()
         h = emu.harts[0]
 
@@ -158,7 +156,6 @@ class TestMfenceDid:
         assert hit2, "mdid=2 不应被刷掉"
 
     def test_flushes_itlb_and_dtlb_both(self):
-        """mfence.did 同时刷新 itlb 和 dtlb."""
         emu = _make_emu()
         h = emu.harts[0]
 
@@ -833,8 +830,8 @@ class TestPmpsplitMdidIntegration:
         pmp = Pmp({}, num_entries=16)
 
         class FakeCSR:
-            val: int
-            def __init__(self, v): self.val = v
+            def __init__(self, v):
+                self.val = v
 
         # Host 区域: PMP 条目 0-5
         # 飞地区域: PMP 条目 6-15 (pmpsplit=6)

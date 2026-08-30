@@ -17,6 +17,12 @@ OUTPUT     := rust_smode_entry.bin
 
 include config.mk
 
+# 诊断输出: DIAGNOSTIC 非 0 时向 cargo 传递 --features diagnostic.
+CARGO_FLAGS ?=
+ifneq ($(filter-out 0 false,$(DIAGNOSTIC)),)
+CARGO_FLAGS += --features diagnostic
+endif
+
 phony = all
 
 all: build
@@ -51,11 +57,11 @@ phony += gen-config
 
 
 check: gen-config link.ld
-	cargo check --target $(TARGET)
+	cargo check --target $(TARGET) $(CARGO_FLAGS)
 phony += check
 
 build: check
-	cargo build --release --target $(TARGET)
+	cargo build --release --target $(TARGET) $(CARGO_FLAGS)
 	$(OBJCOPY) -O binary $(BUILD_DIR)/rust_smode_entry $(OUTPUT)
 	@echo "[$(OUTPUT) built successfully]"
 phony += build

@@ -1,0 +1,10 @@
+# 数值计算载荷 (有限元)
+#
+# 二维 Poisson 方程 P1 三角形有限元, 验证二阶收敛。无外部依赖
+# (刚度阵组装 + 高斯消元)。
+#
+# 自检: 网格加密一倍 L2 误差降为 1/4 (ratio ≈ 4)。
+[package]
+name = "fem"
+version.workspace = true
+edition.workspace = true

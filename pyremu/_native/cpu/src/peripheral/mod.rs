@@ -1,8 +1,10 @@
 //! Device MMIO helpers and inline handlers.
 
+pub mod plic;
 pub mod uart;
 pub mod virtio;
 
+use crate::state::FfiPlicCtx;
 use crate::state::FfiVirtIoCtx;
 
 /// Device MMIO address ranges (base + end per device).
@@ -15,6 +17,10 @@ pub struct DevCtx {
 	/// Mutable pointer to the FFI virtio-blk state that Rust updates inline.
 	/// Valid for the duration of one ``run_parallel`` call.
 	pub virtio_raw: *mut FfiVirtIoCtx,
+	/// Mutable pointer to the FFI PLIC state that Rust updates inline
+	/// (claim/complete/priority/enable/threshold).  Null = no PLIC present.
+	/// Valid for the duration of one ``run_parallel`` call.
+	pub plic: *mut FfiPlicCtx,
 }
 
 impl DevCtx {

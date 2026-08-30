@@ -106,13 +106,19 @@ fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::state::FfiVirtIoC
 			(*raw).interrupt_status |= write_data as u32;
 			Some(0)
 		},
-		// InterruptACK (0x064) — clear bits; flag PLIC lowering if all zero
-		0x064 => unsafe {
-			let old = (*raw).interrupt_status;
-			(*raw).interrupt_status = old & !(write_data as u32);
-			if (*raw).interrupt_status == 0 && old != 0 {
-				(*raw).irq_maybe_lower = 1;
+		// InterruptACK (0x064) — 清空中断位.
+		// 若 ACK 后 ISR 归零 (old 非零且被全清), 必须同步拉低 PLIC IRQ 电平,
+		// 否则 guest 紧随其后的 PLIC complete 内联执行时看到陈旧高电平 ->
+		// 重挂 pending -> 虚假中断 (kernel "irq N: nobody cared"). 故返回 None
+		// 强制 MMIO 退出, 由 Python _mmio_write 在 complete 之前调用
+		// _lower_irq_if_idle 拉低电平.  仅清除部分中断位时无需拉低电平, 内联处理.
+		0x064 => {
+			let old = unsafe { (*raw).interrupt_status };
+			let new = old & !(write_data as u32);
+			if new == 0 && old != 0 {
+				return None;
 			}
+			unsafe { (*raw).interrupt_status = new };
 			Some(0)
 		},
 		// Status (0x070) — writing 0 resets the device
@@ -212,5 +218,58 @@ fn virtio_read(offset: u64, raw: *mut crate::state::FfiVirtIoCtx) -> Option<u64>
 			}
 		}
 		_ => Some(0),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::try_handle_virtio;
+	use crate::peripheral::DevCtx;
+	use crate::state::FfiVirtIoCtx;
+
+	fn make_dev(ctx: &mut FfiVirtIoCtx) -> DevCtx {
+		DevCtx {
+			bases: std::ptr::null(),
+			ends: std::ptr::null(),
+			num: 0,
+			virtio_base: 0x1000_8000,
+			virtio_raw: ctx as *mut FfiVirtIoCtx,
+			plic: std::ptr::null_mut(),
+		}
+	}
+
+	/// Regression: ACK 清空全部中断位时必须强制 MMIO 退出 (返回 None), 否则
+	/// PLIC complete 内联执行时看到陈旧高电平 -> 重挂 pending -> 虚假中断
+	/// (kernel "irq N: nobody cared").  修复前此处返回 Some(0) 并仅置
+	/// irq_maybe_lower, 电平拉低被推迟到加速执行边界, complete 已先执行.
+	#[test]
+	fn ack_clearing_all_bits_forces_mmio_exit() {
+		let mut ctx: FfiVirtIoCtx = unsafe { std::mem::zeroed() };
+		ctx.interrupt_status = 1;
+		let dev = make_dev(&mut ctx);
+		let r = try_handle_virtio(0x1000_8000 + 0x064, true, 1, 4, &dev);
+		assert_eq!(r, None, "ACK 清空全部中断位应强制 MMIO 退出以同步拉低电平");
+	}
+
+	/// ACK 仅清除部分中断位 (ISR 仍非零) 时内联处理, 不退出, 电平无需拉低.
+	#[test]
+	fn ack_clearing_partial_bits_stays_inline() {
+		let mut ctx: FfiVirtIoCtx = unsafe { std::mem::zeroed() };
+		ctx.interrupt_status = 0b11;
+		let dev = make_dev(&mut ctx);
+		let r = try_handle_virtio(0x1000_8000 + 0x064, true, 1, 4, &dev);
+		assert_eq!(r, Some(0), "部分清除应内联处理");
+		assert_eq!(ctx.interrupt_status, 0b10, "应仅清除 ACK 指定位");
+	}
+
+	/// ACK 写 0 (未清除任何位) 内联处理, ISR 不变.
+	#[test]
+	fn ack_zero_stays_inline() {
+		let mut ctx: FfiVirtIoCtx = unsafe { std::mem::zeroed() };
+		ctx.interrupt_status = 1;
+		let dev = make_dev(&mut ctx);
+		let r = try_handle_virtio(0x1000_8000 + 0x064, true, 0, 4, &dev);
+		assert_eq!(r, Some(0));
+		assert_eq!(ctx.interrupt_status, 1);
 	}
 }

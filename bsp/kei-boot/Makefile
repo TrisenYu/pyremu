@@ -17,7 +17,7 @@ COLD_BOOT_DONE_VADDR := $(shell $(READELF) -s $(FW_ELF) 2>/dev/null | \
 ifneq ($(COLD_BOOT_DONE_VADDR),)
 COLD_BOOT_DONE_ADDR := $(shell python3 -c \
 	"print(hex($(RAM_BASE) + 0x$(COLD_BOOT_DONE_VADDR)))")
-else
+else # 没办法算就只能硬编码
 COLD_BOOT_DONE_ADDR := 0x800842F8
 endif
 
@@ -26,7 +26,7 @@ COLD_BOOT_LOTTERY_VADDR := $(shell $(READELF) -s $(FW_ELF) 2>/dev/null | \
 ifneq ($(COLD_BOOT_LOTTERY_VADDR),)
 COLD_BOOT_LOTTERY_ADDR := $(shell python3 -c \
 	"print(hex($(RAM_BASE) + 0x$(COLD_BOOT_LOTTERY_VADDR)))")
-else
+else # 没办法算就只能硬编码
 COLD_BOOT_LOTTERY_ADDR := 0x800842F0
 endif
 
@@ -43,7 +43,7 @@ kei-sav:
 	$(OBJCOPY) -O binary kei.sav.elf $(firmbin_dir)/kei.sav_asm.bin
 	$(CLANG) $(ZSBL_FLAGS) $(ZSBL_DEFS) -DCOLD_BOOT kei.sav.S -T kei.sav.lds -o kei.sav_cold.elf
 	$(OBJCOPY) -O binary kei.sav_cold.elf $(firmbin_dir)/kei.sav.bin
-	@echo "kei.sav 已根据固件符号表更新"
+	@echo "kei.sav 已按固件符号表更新"
 
 clean:
 	-rm -f kei.sav.elf kei.sav_cold.elf

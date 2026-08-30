@@ -21,6 +21,7 @@ use crate::memory;
 pub struct Pte(pub u64);
 
 impl Pte {
+	#[cfg(feature = "diagnostic")]
 	pub const fn empty() -> Self {
 		Self(0)
 	}
@@ -154,12 +155,14 @@ pub fn unmap_page(vaddr: u64, level: u8) {
 //  VA -> PA 翻译
 // ---------------------------------------------------------------
 
+#[cfg(feature = "diagnostic")]
 struct WalkResult {
 	level: i8,
 	pte: Pte,
 }
 
 /// 三层 Sv39 页表遍历。未命中时 level = -1。
+#[cfg(feature = "diagnostic")]
 fn walk_page_table(va: u64) -> WalkResult {
 	let idxs: [usize; 3] = [
 		((va & 0x7F_C000_0000) >> 30) as usize,
@@ -198,6 +201,7 @@ fn walk_page_table(va: u64) -> WalkResult {
 }
 
 /// VA -> PA。未映射返回 None。
+#[cfg(feature = "diagnostic")]
 pub fn get_pa(va: u64) -> Option<u64> {
 	let r = walk_page_table(va);
 	if r.level < 0 {

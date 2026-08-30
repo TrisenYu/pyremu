@@ -16,10 +16,16 @@
   数据竞争 + 瞬时执行权限丢失 -> 内核取指访问故障 (cause=1)。
 
 这些用例在修复前必失败 (两 hart 的 PMP 被压成同一值), 修复后通过。
+
+run() 无指令配额, 对纯 WFI 无停机固件按设计持续阻塞 (等待 stdin/定时器/看门狗
+唤醒), 永不返回。固件需以 ARM semihosting SYS_EXIT 序列 (a0=0x18; slli/ebreak/
+srai) 使 run() 经 EXIT_EBREAK 返回; 仅"批次内并发写"用例保留 WFI 作全 hart
+屏障, 经设备暂停事件 (notify_processor) 终止 — 见 ``_run_wfi_firmware``。
 """
 
 import ctypes
 import struct
+import threading
 
 import pytest
 
@@ -33,10 +39,31 @@ pytestmark = pytest.mark.skipif(
 )
 
 RAM_BASE = 0x8000_0000
-# WFI: hart 执行后进入等待, 让并发引擎在所有 hart 停下后干净退出批次。
+# ARM semihosting SYS_EXIT 停机序列: slli x0,x0,0x1f; ebreak; srai x0,x0,7,
+# 且 a0 = SH_SYS_EXIT (0x18)。native 引擎仅对带 marker 的 SYS_EXIT 序列经
+# exit_reason::EBREAK 停机; 裸 ebreak 保持 NOP。
+SEMIHOSTING_EXIT = struct.pack("<III", 0x01F0_1013, 0x0010_0073, 0x4070_5013)
+SH_SYS_EXIT = 0x18
+# WFI: 批次内并发写测试的"全部 hart 执行完毕"屏障 — WFI_WAIT 仅在所有 hart
+# 均进入等待时才退出批次, 保证每个 hart 的 csrw 均已写入各自 PMP 切片.
 WFI = 0x1050_0073
 # csrw pmpaddr1, x5  ->  csrrw x0, 0x3B1, x5
 CSRW_PMPADDR1_X5 = (0x3B1 << 20) | (5 << 15) | (1 << 12) | 0x73
+
+
+def _run_wfi_firmware(emu: Emulator) -> None:
+    """运行 WFI 固件批次, 经设备暂停事件使 run() 返回.
+
+    run() 对全部 hart WFI 等待的情形按设计持续阻塞. 测试只需观测单批次执行
+    后的 PMP 状态: 批次完成 (全部 hart 的 csrw 落地 + 进入 WFI) 后, 由外部
+    设备暂停请求 (notify_processor — 打断连续执行的唯一通道) 终止 run().
+    """
+    timer = threading.Timer(0.05, emu.notify_processor)
+    timer.start()
+    try:
+        emu.run()
+    finally:
+        timer.cancel()
 
 
 def _make_emu(num_harts: int) -> Emulator:
@@ -60,11 +87,13 @@ def _set_pmpaddr(hart, idx: int, val: int) -> None:
 def test_per_hart_pmp_roundtrip_not_mirrored():
     """各 hart 的 PMP 经 native 批次后保持独立, 不被镜像成同一值."""
     emu = _make_emu(2)
-    # 两个 hart 执行同一段自旋代码 (不触碰 PMP), 仅验证 PMP 往返隔离。
-    emu.load_code(RAM_BASE, struct.pack("<I", WFI))
+    # 两个 hart 执行同一段停机序列 (不触碰 PMP), 仅验证 PMP 往返隔离。
+    # 以 semihosting SYS_EXIT 序列收尾使 run() 经 EXIT_EBREAK 返回。
+    emu.load_code(RAM_BASE, SEMIHOSTING_EXIT)
     for h in emu.harts:
         h.pc = RAM_BASE
         h.mode = RiscvMode.M
+        h.write_gpr(10, SH_SYS_EXIT)
 
     _set_pmpaddr(emu.harts[0], 0, 0xAAAA)
     _set_pmpaddr(emu.harts[1], 0, 0xBBBB)
@@ -79,7 +108,11 @@ def test_per_hart_pmp_roundtrip_not_mirrored():
 def test_per_hart_pmp_concurrent_write_isolated():
     """一个 hart 在批次内写 pmpaddr, 只落到自己的切片, 不污染其它 hart."""
     emu = _make_emu(2)
-    # 程序: csrw pmpaddr1, x5; 然后自旋。
+    # 程序: csrw pmpaddr1, x5; 然后 WFI 作全 hart 屏障。
+    # 不用 SYS_EXIT 停机: 首个 hart 的 SYS_EXIT 会立即停止整个批次,
+    # 抢跑其它 hart 尚未执行的 csrw (已知竞态). WFI 则要求所有 hart 都
+    # 进入等待才退出批次, 保证每个 hart 的 csrw 均已落地 — 经设备暂停
+    # 事件 (_run_wfi_firmware) 终止 run()。
     prog = struct.pack("<II", CSRW_PMPADDR1_X5, WFI)
     emu.load_code(RAM_BASE, prog)
     for h in emu.harts:
@@ -88,7 +121,7 @@ def test_per_hart_pmp_concurrent_write_isolated():
     emu.harts[0].write_gpr(5, 0xA000)
     emu.harts[1].write_gpr(5, 0xB000)
 
-    emu.run()
+    _run_wfi_firmware(emu)
 
     # 每个 hart 的 csrw 只应写入自己的 PMP 切片。
     assert emu.harts[0].csrs["pmpaddr1"].val == 0xA000
@@ -98,11 +131,12 @@ def test_per_hart_pmp_concurrent_write_isolated():
 def test_four_hart_pmp_all_distinct():
     """4 hart 各持不同 PMP, 经 native 批次后互不干扰 (复现 SMP 竞争场景)."""
     emu = _make_emu(4)
-    emu.load_code(RAM_BASE, struct.pack("<I", WFI))
+    emu.load_code(RAM_BASE, SEMIHOSTING_EXIT)
     vals = [0x1000, 0x2000, 0x3000, 0x4000]
     for i, h in enumerate(emu.harts):
         h.pc = RAM_BASE
         h.mode = RiscvMode.M
+        h.write_gpr(10, SH_SYS_EXIT)
         _set_pmpaddr(h, 1, vals[i])
 
     emu.run()

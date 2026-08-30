@@ -28,13 +28,13 @@
 
 /* ---- 全局共享 (只读) ---- */
 
-static const char    *g_payload_path = NULL;
-static uint8_t       *g_payload      = NULL;
-static size_t         g_payload_size = 0;
-static atomic_int     g_passed;
-static atomic_int     g_failed;
-static atomic_int     g_mem_exhausted;
-static atomic_bool    g_stop;
+static const char *g_payload_path = NULL;
+static uint8_t *g_payload		  = NULL;
+static size_t g_payload_size	  = 0;
+static atomic_int g_passed;
+static atomic_int g_failed;
+static atomic_int g_mem_exhausted;
+static atomic_bool g_stop;
 
 /* ---- helpers ---- */
 
@@ -45,15 +45,25 @@ static void die(const char *msg) {
 
 static uint8_t *read_file(const char *path, size_t *size) {
 	FILE *fp = fopen(path, "rb");
-	if (!fp) return NULL;
+	if (!fp) {
+		return NULL;
+	}
 	fseek(fp, 0, SEEK_END);
 	long sz = ftell(fp);
 	fseek(fp, 0, SEEK_SET);
-	if (sz <= 0) { fclose(fp); return NULL; }
+	if (sz <= 0) {
+		fclose(fp);
+		return NULL;
+	}
 	uint8_t *buf = malloc((size_t)sz);
-	if (!buf) { fclose(fp); return NULL; }
+	if (!buf) {
+		fclose(fp);
+		return NULL;
+	}
 	if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
-		free(buf); fclose(fp); return NULL;
+		free(buf);
+		fclose(fp);
+		return NULL;
 	}
 	fclose(fp);
 	*size = (size_t)sz;
@@ -65,7 +75,9 @@ static uint8_t *read_file(const char *path, size_t *size) {
 static void *worker(void *arg) {
 	(void)arg;
 
-	if (atomic_load(&g_stop)) return NULL;
+	if (atomic_load(&g_stop)) {
+		return NULL;
+	}
 
 	int fd = open(TEE_DEVICE_PATH, O_RDWR);
 	if (fd < 0) {
@@ -73,8 +85,9 @@ static void *worker(void *arg) {
 		return NULL;
 	}
 
+	// 请求创建可信应用
 	uint64_t enclave_id = 0;
-	int rc = ioctl(fd, TEE_IOC_CREATE, &enclave_id);
+	int rc				= ioctl(fd, TEE_IOC_CREATE, &enclave_id);
 	if (rc < 0) {
 		if (errno == ENOMEM) {
 			atomic_fetch_add(&g_mem_exhausted, 1);
@@ -87,15 +100,17 @@ static void *worker(void *arg) {
 	}
 
 	struct tee_enter_args args = {
-		.enclave_id   = enclave_id,
+		.enclave_id	  = enclave_id,
 		.payload_ptr  = (uint64_t)g_payload,
 		.payload_size = g_payload_size,
-		.argc         = 0,
-		.argv_ptr     = 0,
+		.argc		  = 0,
+		.argv_ptr	  = 0,
 	};
+
+	// 请求进入可信应用
 	rc = ioctl(fd, TEE_IOC_ENTER, &args);
 
-	/* SHUTDOWN — 即使 ENTER 失败也尝试 */
+	/* 请求停用当前可信应用 — 即使 ENTER 失败也尝试 */
 	ioctl(fd, TEE_IOC_SHUTDOWN, &enclave_id);
 
 	if (rc < 0) {
@@ -117,19 +132,33 @@ static void run_batch(int count) {
 	atomic_store(&g_stop, false);
 
 	pthread_t *threads = calloc((size_t)count, sizeof(pthread_t));
-	if (!threads) die("calloc threads");
+	if (!threads) {
+		die("calloc threads");
+	}
 
 	for (int i = 0; i < count; i++) {
-		int rc = pthread_create(&threads[i], NULL, worker, NULL);
+		int rc = pthread_create(
+			&threads[i],
+			NULL,
+			worker, // 流程： create -> enter -> shutdown
+			NULL);
 		if (rc != 0) {
-			fprintf(stderr, "  [%d] pthread_create failed at %d/%d (errno=%d)\n",
-			        count, i + 1, count, rc);
+			fprintf(
+				stderr,
+				"  [%d] pthread_create failed at %d/%d (errno=%d)\n",
+				count,
+				i + 1,
+				count,
+				rc);
 			/* 继续等待已创建的线程 */
 		}
 	}
 
 	for (int i = 0; i < count; i++) {
-		if (threads[i]) pthread_join(threads[i], NULL);
+		if (!threads[i]) {
+			continue;
+		}
+		pthread_join(threads[i], NULL);
 	}
 	free(threads);
 
@@ -138,7 +167,9 @@ static void run_batch(int count) {
 	int m = atomic_load(&g_mem_exhausted);
 
 	printf("  result: passed=%d failed=%d", p, f);
-	if (m) printf(" mem_exhausted=%d", m);
+	if (m) {
+		printf(" mem_exhausted=%d", m);
+	}
 	puts("\n");
 }
 
@@ -151,23 +182,29 @@ int main(int argc, char **argv) {
 	}
 	g_payload_path = argv[1];
 
-	const int batches[]    = {2, 20, 200, 2000, 20000};
-	const int num_batches  = sizeof(batches) / sizeof(batches[0]);
+	const int batches[]	  = {2, 20, 200, 2000, 20000};
+	const int num_batches = sizeof(batches) / sizeof(batches[0]);
 
 	/* 查询初始内存 (单次 open) */
 	int info_fd = open(TEE_DEVICE_PATH, O_RDWR);
-	if (info_fd < 0) die("open " TEE_DEVICE_PATH);
+	if (info_fd < 0) {
+		die("open " TEE_DEVICE_PATH);
+	}
 	struct tee_mem_info mem;
 	if (ioctl(info_fd, TEE_IOC_GET_MEM, &mem) == 0) {
 		puts("=== TEE Enclave Concurrent Stress Test ===\n");
-		printf("[info] initial memory: free=%lu max_contiguous=%lu (2MiB units)\n\n",
-		       mem.free_total, mem.max_contiguous);
+		printf(
+			"[info] initial memory: free=%lu max_contiguous=%lu (2MiB units)\n\n",
+			mem.free_total,
+			mem.max_contiguous);
 	}
 	close(info_fd);
 
 	/* 加载 payload (只读, 线程共享) */
 	g_payload = read_file(g_payload_path, &g_payload_size);
-	if (!g_payload) die("read payload");
+	if (!g_payload) {
+		die("read payload");
+	}
 	printf("[info] payload '%s' loaded (%zu bytes)\n\n", g_payload_path, g_payload_size);
 
 	int total_passed = 0, total_failed = 0;

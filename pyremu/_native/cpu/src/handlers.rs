@@ -19,6 +19,7 @@ use crate::trap::{deliver_illegal_instruction, deliver_trap, exc_code, mcause_va
 pub use crate::interrupt::clint::ClintCtx;
 pub(crate) use crate::interrupt::clint::{clint_write_msip, try_handle_clint};
 pub use crate::peripheral::{is_device_addr, virtio::try_handle_virtio, DevCtx};
+use crate::peripheral::plic::try_handle_plic_concurrent;
 pub use crate::pmp::{pmp_ok, PmpCtx};
 
 // Re-export from csr.rs
@@ -317,6 +318,22 @@ pub fn handle_load(
 		return 4;
 	}
 
+	// PLIC inline (serial 回落路径, 与 load_mem_compressed 同源).
+	if let Some(data) = try_handle_plic_concurrent(tr.pa, false, 0, size, state, dev.plic) {
+		let result_val = if signed {
+			match size {
+				1 => sext(data, 8),
+				2 => sext(data, 16),
+				4 => sext(data, 32),
+				_ => data,
+			}
+		} else {
+			data
+		};
+		write_gpr(state, f.rd, result_val);
+		return 4;
+	}
+
 	// MMIO check (non-CLINT, non-virtio devices)
 	if is_device_addr(tr.pa, dev) {
 		instr_group.exit_reason = exit_reason::MMIO;
@@ -415,6 +432,11 @@ pub fn handle_store(
 	// virtio-blk inline check — handle all MMIO registers except QueueNotify
 	// to avoid the expensive exits during device probe.
 	if let Some(_) = try_handle_virtio(tr.pa, true, val, size, dev) {
+		return 4;
+	}
+
+	// PLIC inline (serial 回落路径, 与 store_mem_compressed 同源).
+	if let Some(_) = try_handle_plic_concurrent(tr.pa, true, val, size, state, dev.plic) {
 		return 4;
 	}
 
@@ -698,13 +720,13 @@ fn dispatch_privileged(
 				3 => riscv_mode::M,
 				_ => riscv_mode::M,
 			};
-			// MIE ← MPIE, MPIE ← 1
+			// MIE <- MPIE, MPIE <- 1
 			state.mstatus &= !(1 << 3); // clear MIE
 			if mpie != 0 {
 				state.mstatus |= 1 << 3;
 			} // MIE = MPIE
 			state.mstatus |= 1 << 7; // MPIE = 1
-			state.mstatus &= !(0b11 << 11); // MPP ← U (0)
+			state.mstatus &= !(0b11 << 11); // MPP <- U (0)
 			state.pc = state.mepc;
 			state.waiting = 0;
 			0
@@ -722,13 +744,13 @@ fn dispatch_privileged(
 			} else {
 				riscv_mode::S
 			};
-			// SIE ← SPIE, SPIE ← 1
+			// SIE <- SPIE, SPIE <- 1
 			state.mstatus &= !(1 << 1); // clear SIE
 			if spie != 0 {
 				state.mstatus |= 1 << 1;
 			} // SIE = SPIE
 			state.mstatus |= 1 << 5; // SPIE = 1
-			state.mstatus &= !(1 << 8); // SPP ← U (0)
+			state.mstatus &= !(1 << 8); // SPP <- U (0)
 			state.pc = state.sepc;
 			state.waiting = 0;
 			0
@@ -1577,6 +1599,11 @@ fn load_mem_compressed(
 		return data;
 	}
 
+	// PLIC inline (压缩指令直映射访问) — 与 handle_load_concurrent 同源.
+	if let Some(data) = try_handle_plic_concurrent(tr.pa, false, 0, size, state, dev.plic) {
+		return data;
+	}
+
 	if is_device_addr(tr.pa, dev) {
 		instr_group.exit_reason = exit_reason::MMIO;
 		instr_group.exit_instr = instr_word;
@@ -1631,6 +1658,11 @@ fn store_mem_compressed(
 	}
 
 	if let Some(_) = try_handle_virtio(tr.pa, true, val, size, dev) {
+		return 0;
+	}
+
+	// PLIC inline (压缩指令直映射访问) — 与 handle_store_concurrent 同源.
+	if let Some(_) = try_handle_plic_concurrent(tr.pa, true, val, size, state, dev.plic) {
 		return 0;
 	}
 
@@ -1888,6 +1920,7 @@ mod tests {
 			msip: msip.as_mut_ptr(),
 			states: states.as_mut_ptr(),
 			num_harts: 2,
+			timebase_hz: 0, // 单元测试: 无 clock-source 推进, mtime 冻结
 			yield_for_ipi: Cell::new(false),
 			ipi_sender_hart: Cell::new(0),
 			ipi_sender_rounds: Cell::new(0),
@@ -1958,6 +1991,7 @@ mod tests {
 			msip: msip.as_mut_ptr(),
 			states: states.as_mut_ptr(),
 			num_harts: 2,
+			timebase_hz: 0, // 单元测试: 无 clock-source 推进, mtime 冻结
 			yield_for_ipi: Cell::new(false),
 			ipi_sender_hart: Cell::new(0),
 			ipi_sender_rounds: Cell::new(0),

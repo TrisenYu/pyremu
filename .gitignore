@@ -1,17 +1,26 @@
 # Python-generated files
-__pycache__/
 *.py[oc]
-build/
-dist/
 wheels/
 *.egg-info
-.DS_Store
-.vscode
 *.prof
-.node_modules
+# Native extension build artifacts (platform-specific, not committed)
+*.so
+*.dll
+*.dylib
+*.pyd
+**/bin/
+**/build/
+**/dist/
+**/target/
+**/*node_modules
+**/__pycache__/
+# serial log output
+**/output/
 
 # Virtual environments
+.DS_Store
 .venv
+.vscode
 .pytest_cache
 .ruff_cache
 .coverage
@@ -20,31 +29,24 @@ wheels/
 
 vendor/*
 !vendor/riscv-tests
+!vendor/keystone
+!vendor/musl
 
 bsp/*
 !bsp/rust_smode_entry/
+!bsp/rust_payloads/
 !bsp/kei-boot/
 !bsp/setup-rootfs/
-!bsp/.linux-config
-!bsp/tee_enclave_drv
-
 # Large build artifacts (bsp)
 bsp/setup-rootfs/debootstrap/riscv-sd.ext4
 bsp/setup-rootfs/debootstrap/debian-riscv-initrd.cpio.gz
 bsp/setup-rootfs/debootstrap/tmp-rootfs/
 bsp/setup-rootfs/busybox-1.38.0/
+!bsp/.linux-config
+!bsp/tee_enclave_drv
 
-# Native extension build artifacts (platform-specific, not committed)
-*.so
-*.dll
-*.dylib
-*.pyd
-pyremu/_native/target/
+to-read/*
 
 # Generated config
 pyremu/configs_gen.py
 pyremu/_native/cpu/src/config_gen.rs
-
-# Hart serial log output
-output/
-

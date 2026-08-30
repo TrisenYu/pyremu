@@ -1,5 +1,5 @@
 [run]
-source = my_package
+source = pyremu
 omit = */tests/*
 
 [report]

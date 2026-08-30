@@ -34,6 +34,8 @@ Linux 内核通过 ``local->msi_pa = base + hart * 0x1000`` 计算 MSI 目标地
 
 from __future__ import annotations
 
+import threading
+
 from pyremu.memory.bus import Device
 from pyremu.utils.mask import mask32
 
@@ -353,10 +355,23 @@ class IMSIC(Device):
         self._files: list[tuple[_ImsicFile, _ImsicFile]] = [
             (_ImsicFile(), _ImsicFile()) for _ in range(num_harts)
         ]
-        # 总 MMIO 覆盖范围: 连续 M+S, 每 hart stride 0x1000.
-        # QEMU 兼容单一 reg 条目: <base, 2*num_harts*0x1000>.
-        self.size = 2 * num_harts * _PAGE_STRIDE
+        # 总 MMIO 覆盖范围: M 区 + S 区, 每 hart stride 0x1000.
+        # M 区和 S 区大小均对齐到 2^ceil(log2(num_harts)) * 0x1000
+        # 以满足 OpenSBI imsic_data_check 的 power-of-2 对齐要求.
+        if num_harts > 1:
+            _hib = (num_harts - 1).bit_length()
+        else:
+            _hib = 0
+        self._padded_file_count = 1 << _hib  # ≥ num_harts 的 2 的幂
+        self._padded_region = self._padded_file_count * _PAGE_STRIDE
+        self.size = 2 * self._padded_region  # M 区 + S 区
         self.base_addr = m_base_addr  # 保留旧接口兼容
+
+        # 并发安全: RX daemon 经 set_ip_number 写 eip, 主线程经 get_pending_mip/
+        # csr_read/csr_write/claim/read_topei 读/写 eip — 共享状态访问需互斥.
+        # 锁顺序 APLIC -> IMSIC (APLIC.set_irq -> _deliver_from_source ->
+        # set_ip_number), 不得反向.
+        self._lock = threading.Lock()
 
     # ----------------------------------------------------------
     #  内部辅助
@@ -365,23 +380,28 @@ class IMSIC(Device):
     def _resolve(self, offset: int) -> tuple[int, _ImsicFile, int] | None:
         """根据 MMIO 偏移解析 (hart_id, file, offset_within_file).
 
-        QEMU-compatible contiguous layout:
-          - M-files: offset [0,          num_harts * 0x1000)
-          - S-files: offset [N*0x1000, 2*num_harts * 0x1000)
+        QEMU-compatible contiguous layout (padded to power-of-2):
+          - M-files: offset [0,              padded_region)
+          - S-files: offset [padded_region,  2*padded_region)
+        padded_region = 2^ceil(log2(num_harts)) * 0x1000.
         每范围内 stride = 0x1000 (IMSIC_MMIO_PAGE_SZ).
-        Returns None 若不在有效范围内.
+        仅 hart_id < num_harts 有效; 补齐区域返回 None.
         """
-        m_size = self.num_harts * _PAGE_STRIDE
+        region = self._padded_region
 
-        if 0 <= offset < m_size:
+        if 0 <= offset < region:
             # M-file 范围
             hart_id = offset // _PAGE_STRIDE
+            if hart_id >= self.num_harts:
+                return None  # padding slot
             off = offset % _PAGE_STRIDE
             return (hart_id, self._files[hart_id][0], off)
-        if m_size <= offset < 2 * m_size:
+        if region <= offset < 2 * region:
             # S-file 范围
-            rel = offset - m_size
+            rel = offset - region
             hart_id = rel // _PAGE_STRIDE
+            if hart_id >= self.num_harts:
+                return None  # padding slot
             off = rel % _PAGE_STRIDE
             return (hart_id, self._files[hart_id][1], off)
         return None
@@ -428,17 +448,18 @@ class IMSIC(Device):
 
         *offset* 是相对于 device.base_addr 的偏移 (Bus 约定).
         """
-        resolved = self._resolve(offset)
-        if resolved is None:
-            return
-        _hart_id, file, file_off = resolved
-        val = int.from_bytes(data, "little", signed=False)
-        val32 = mask32(val)
+        with self._lock:
+            resolved = self._resolve(offset)
+            if resolved is None:
+                return
+            _hart_id, file, file_off = resolved
+            val = int.from_bytes(data, "little", signed=False)
+            val32 = mask32(val)
 
-        if file_off == _EIPNUM_SET_OFF:
-            file.set_pending(val32)
-        elif file_off == _EIPNUM_CLR_OFF:
-            file.clear_pending(val32)
+            if file_off == _EIPNUM_SET_OFF:
+                file.set_pending(val32)
+            elif file_off == _EIPNUM_CLR_OFF:
+                file.clear_pending(val32)
 
     # ----------------------------------------------------------
     #  外部中断查询 (供 check_pending_interrupts 使用)
@@ -456,19 +477,20 @@ class IMSIC(Device):
         (IID>=6) require eidelivery=1 — when eidelivery=0 they are managed
         by the legacy PLIC path or Rust ext_irq drain.
         """
-        if not (0 <= hart_id < self.num_harts):
-            return 0
-        mip = 0
+        with self._lock:
+            if not (0 <= hart_id < self.num_harts):
+                return 0
+            mip = 0
 
-        m_val = self.peek_topei(hart_id, 'M')
-        if m_val != 0:
-            mip |= 1 << 11  # MEIP
+            # 直接读内层 _ImsicFile.peek_topei (不加锁), 避免与 self.peek_topei
+            # 的锁产生 re-entrant 死锁.
+            mf, sf = self._files[hart_id]
+            if mf.peek_topei() != 0:
+                mip |= 1 << 11  # MEIP
+            if sf.peek_topei() != 0:
+                mip |= 1 << 9   # SEIP
 
-        s_val = self.peek_topei(hart_id, 'S')
-        if s_val != 0:
-            mip |= 1 << 9   # SEIP
-
-        return mip
+            return mip
 
     def is_delivery_active(self, hart_id: int) -> bool:
         """Return True if IMSIC delivery is enabled for this hart.
@@ -476,10 +498,12 @@ class IMSIC(Device):
         When eidelivery=0 for both M and S files, external interrupts are
         managed by the legacy PLIC path and IMSIC should not gate MEIP/SEIP.
         """
-        mf = self._file_for(hart_id, 'M')
-        sf = self._file_for(hart_id, 'S')
-        return (mf is not None and mf.eidelivery != 0) or \
-               (sf is not None and sf.eidelivery != 0)
+        with self._lock:
+            mf = self._file_for(hart_id, 'M')
+            sf = self._file_for(hart_id, 'S')
+            return (mf is not None and mf.eidelivery != 0) or (
+                sf is not None and sf.eidelivery != 0
+            )
 
     # ----------------------------------------------------------
     #  MSI 注入 (供 Phase 2 APLIC 使用)
@@ -492,9 +516,10 @@ class IMSIC(Device):
         get_pending_mip() 将 eip 映射到 mip 位，check_pending_interrupts
         检测并投递 MEI/SEI trap。M-mode handler 通过 MTOPEI 读取 IID。
         """
-        file = self._file_for(hart_id, priv)
-        if file is not None:
-            file.set_pending(eip_num)
+        with self._lock:
+            file = self._file_for(hart_id, priv)
+            if file is not None:
+                file.set_pending(eip_num)
 
     def clear_ip_number(self, hart_id: int, priv: str, eip_num: int) -> None:
         """清除指定 hart 的指定 privilege IMSIC file 的 pending 位.
@@ -503,9 +528,24 @@ class IMSIC(Device):
         中断时调用, 将 IMSIC eip 同步清除 (guest 已通过 stopei claim,
         但设备端仍需通知 IMSIC 中断已不存在).
         """
-        file = self._file_for(hart_id, priv)
-        if file is not None:
-            file.clear_pending(eip_num)
+        with self._lock:
+            file = self._file_for(hart_id, priv)
+            if file is not None:
+                file.clear_pending(eip_num)
+
+    def clear_ipi_on_trap(self, hart_id: int, exc_code: int) -> None:
+        """清除软件中断 trap 入口对应的 IMSIC eip 位 (legacy 路径).
+
+        exc_code: 3 (MSIP→M-file IID=3) 或 1 (SSIP→S-file IID=1).
+        仅当 eidelivery==0 时清除 — eidelivery==1 的 AIA 路径经 MTOPEI/STOPEI
+        claim, 不走此处 (与 trap_handler._imsic_clear_ipi_on_trap 原语义一致).
+        """
+        if exc_code not in (1, 3) or not (0 <= hart_id < self.num_harts):
+            return
+        with self._lock:
+            file = self._files[hart_id][0 if exc_code == 3 else 1]
+            if file.eidelivery == 0:
+                file.clear_pending(exc_code)
 
     # ----------------------------------------------------------
     #  mtopi / stopi IID claim — 完整覆盖全部 6 个主要 IID
@@ -521,19 +561,20 @@ class IMSIC(Device):
           IID=11 (MEIP): 清 IMSIC M-file 最高 eip + mip.MEIP
           其他外部 IID:  清 IMSIC M-file 指定 eip + mip.MEIP
         """
-        if iid == 0:
-            return 0
-        mf = self._file_for(hart_id, 'M')
-        if iid == 7 or mf is None:
+        with self._lock:
+            if iid == 0:
+                return 0
+            mf = self._file_for(hart_id, 'M')
+            if iid == 7 or mf is None:
+                return 1 << iid
+            if iid == 11:
+                # MEI major identity: claim TOP M-file eip (kernel read MTOPEI
+                # first for minor IID).  clear_pending(11) would target eip[11]
+                # which is NOT the correct pending bit.
+                mf.read_topei()
+                return 1 << 11
+            mf.clear_pending(iid)
             return 1 << iid
-        if iid == 11:
-            # MEI major identity: claim TOP M-file eip (kernel read MTOPEI
-            # first for minor IID).  clear_pending(11) would target eip[11]
-            # which is NOT the correct pending bit.
-            mf.read_topei()
-            return 1 << 11
-        mf.clear_pending(iid)
-        return 1 << iid
 
     def claim_stopi_iid(self, hart_id: int, iid: int) -> int:
         """S-mode stopi claim: 认领 IID 并返回需清除的 mip 位掩码.
@@ -545,19 +586,20 @@ class IMSIC(Device):
           IID=9 (SEIP):  清 IMSIC S-file 最高 eip (major→top claim)
           其他外部 IID:  清 IMSIC S-file 指定 eip + mip.SEIP
         """
-        if iid == 0:
-            return 0
-        sf = self._file_for(hart_id, 'S')
-        if iid == 5 or sf is None:
+        with self._lock:
+            if iid == 0:
+                return 0
+            sf = self._file_for(hart_id, 'S')
+            if iid == 5 or sf is None:
+                return 1 << iid
+            if iid == 9:
+                # SEI major identity: claim TOP S-file eip (kernel read STOPEI
+                # first for minor IID).  clear_pending(9) would target eip[9]
+                # which is NOT the correct pending bit.
+                sf.read_topei()
+                return 1 << 9
+            sf.clear_pending(iid)
             return 1 << iid
-        if iid == 9:
-            # SEI major identity: claim TOP S-file eip (kernel read STOPEI
-            # first for minor IID).  clear_pending(9) would target eip[9]
-            # which is NOT the correct pending bit.
-            sf.read_topei()
-            return 1 << 9
-        sf.clear_pending(iid)
-        return 1 << iid
 
     # ----------------------------------------------------------
     #  CSR 接口 (供 hart.py write_csr / read_csr 调用)
@@ -565,16 +607,18 @@ class IMSIC(Device):
 
     def csr_read(self, hart_id: int, priv: str, select: int) -> int:
         """根据 miselect/siselect 读 IMSIC 寄存器."""
-        file = self._file_for(hart_id, priv)
-        if file is None:
-            return 0
-        return file.csr_read(select)
+        with self._lock:
+            file = self._file_for(hart_id, priv)
+            if file is None:
+                return 0
+            return file.csr_read(select)
 
     def csr_write(self, hart_id: int, priv: str, select: int, val: int) -> None:
         """根据 miselect/siselect 写 IMSIC 寄存器."""
-        file = self._file_for(hart_id, priv)
-        if file is not None:
-            file.csr_write(select, val)
+        with self._lock:
+            file = self._file_for(hart_id, priv)
+            if file is not None:
+                file.csr_write(select, val)
 
     # ----------------------------------------------------------
     #  topei (mtopei / stopei) 读
@@ -582,14 +626,16 @@ class IMSIC(Device):
 
     def peek_topei(self, hart_id: int, priv: str) -> int:
         """返回 (IID << 16) | priority, 不修改 pending 位 (mtopi 用)."""
-        file = self._file_for(hart_id, priv)
-        if file is None:
-            return 0
-        return file.peek_topei()
+        with self._lock:
+            file = self._file_for(hart_id, priv)
+            if file is None:
+                return 0
+            return file.peek_topei()
 
     def read_topei(self, hart_id: int, priv: str) -> int:
         """返回 (IID << 16) | priority, 同时 claim (清 pending)."""
-        file = self._file_for(hart_id, priv)
-        if file is None:
-            return 0
-        return file.read_topei()
+        with self._lock:
+            file = self._file_for(hart_id, priv)
+            if file is None:
+                return 0
+            return file.read_topei()

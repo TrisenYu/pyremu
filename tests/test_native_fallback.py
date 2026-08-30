@@ -13,7 +13,14 @@ from pyremu._native import native_available
 from pyremu.core.decoder import Hart
 from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.utils.disassem import Opc
-from tests.test_compressed_diff import _b_type, _c1, _i_type, _j_type, _make_ram, _u_type
+from tests.test_calc.test_compressed_diff import (
+    _b_type,
+    _c1,
+    _i_type,
+    _j_type,
+    _make_ram,
+    _u_type,
+)
 
 
 @pytest.fixture

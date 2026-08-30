@@ -5,7 +5,7 @@
 // I/O 通过 ECALL (a7=2 putc, a7=3 puts, a7=1 exit).
 // 导出: u_nqueen_entry
 
-.section .text
+.section .uprog.text, "ax", @progbits
 .globl u_nqueen_entry
 
 // ============================================================
@@ -186,14 +186,14 @@ putdec:
 // ============================================================
 //  数据
 // ============================================================
-.section .data
+.section .uprog.data, "aw", @progbits
 .align 2
 nq_n:
     .word 0
 nq_solutions:
     .word 0
 
-.section .rodata
+.section .uprog.rodata, "a", @progbits
 .align 2
 str_nq:
     .asciz "nq("

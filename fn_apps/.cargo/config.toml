@@ -1,0 +1,33 @@
+# ================================================================
+#  riscv64gc-unknown-linux-musl 交叉链接配置
+#
+#  RISC-V 载荷采用硬浮点 ABI (lp64d): Rust prebuilt std 为 lp64d,
+#  因此链接所用的 musl libc 也必须以 gc/lp64d 重建 (bsp/musl-gc-sysroot),
+#  不能使用 bsp/musl-1.2.6 的 rv64imac/lp64 (软浮点) 产物.
+#
+#  链接链:
+#    clang (riscv64-linux-musl 目标) -> lld
+#      -B  bsp/musl-gc-sysroot/lib   找 crt1.o/crti.o/crtn.o/crtbeginT.o/crtend.o
+#      -L  bsp/musl-gc-sysroot/lib   libc.a (musl gc/lp64d) + libgcc.a + libgcc_s.a
+#      -static                         全静态
+#
+#  libgcc:  -lgcc 解析 libgcc.a (基础算术); rustc 对 musl 目标自动追加 -lgcc_s
+#  解析 libgcc_s.a (unwind _Unwind_* 符号). 两者均已由 bsp/build-musl-sysroot.sh
+#  放入 bsp/musl-gc-sysroot/lib, 无需再引用宿主 GCC 目录.
+# ================================================================
+
+[build]
+target = "riscv64gc-unknown-linux-musl"
+
+[target.riscv64gc-unknown-linux-musl]
+linker = "/opt/custom-llvm/bin/clang"
+rustflags = [
+    "-C", "link-arg=--target=riscv64-linux-musl",
+    "-C", "link-arg=-march=rv64gc",
+    "-C", "link-arg=-mabi=lp64d",
+    "-C", "link-arg=-fuse-ld=lld",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-B../bsp/musl-gc-sysroot/lib",
+    "-C", "link-arg=-L../bsp/musl-gc-sysroot/lib",
+    "-C", "link-arg=-lgcc",
+]

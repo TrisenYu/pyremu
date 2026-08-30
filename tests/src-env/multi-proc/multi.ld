@@ -40,4 +40,29 @@ SECTIONS {
     }
 
     _end = .;
+
+    /*
+     * U 模式用户程序专用区域 — 独立页 (0x80020000).
+     *
+     * 内核在 setup_sv39 中将其 identity 映射为 U=1 页 (内核页 U=0),
+     * 这样 S 模式内核取指与 U 模式进程执行互不冲突 (Sv39 U-bit 规则:
+     * S 模式永不从 U=1 页取指, 见 RISC-V §4.3.2). 若 U 程序与内核文本
+     * 混在同一页, 页粒度的 U 位无法同时服务 S 与 U 两种模式.
+     *
+     * __UPROG_START__ / __UPROG_END__ 由内核 setup_sv39 引用, 决定映射范围.
+     */
+    . = 0x80020000;
+    __UPROG_START__ = .;
+
+    .uprog : ALIGN(8) {
+        *(.uprog.text .uprog.text.*)
+        *(.uprog.rodata .uprog.rodata.*)
+        *(.uprog.data .uprog.data.*)
+    }
+
+    .uprog.bss : ALIGN(8) {
+        *(.uprog.bss .uprog.bss.*)
+    }
+
+    __UPROG_END__ = .;
 }

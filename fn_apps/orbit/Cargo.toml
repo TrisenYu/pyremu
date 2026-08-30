@@ -1,0 +1,14 @@
+# 轨道动力学载荷 — N-body 多体 + RK4 vs 辛积分对比
+# 算法来源: 开源 utsuroi crate (RK4 + Dormand-Prince + Störmer-Verlet + Yoshida)
+[package]
+name = "orbit_payload"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "orbit_payload"
+path = "src/main.rs"
+
+[dependencies]
+utsuroi = "0.1"
+nalgebra = "0.34"

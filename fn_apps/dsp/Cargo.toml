@@ -1,0 +1,14 @@
+# 数字信号处理载荷
+#
+# FFT 谱分析 + FIR 低通滤波 + OFDM 基带收发。FFT 内核使用开源 rustfft crate
+# (混合基数, 纯 Rust), 复数类型复用其再导出的 num-complex。
+#
+# 自检: Parseval 能量守恒; 单一正弦频谱峰; IFFT(FFT(x)) 往返一致;
+#       FIR 通带/阻带增益; OFDM 无噪信道误比特率 = 0。
+[package]
+name = "dsp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustfft = "6"

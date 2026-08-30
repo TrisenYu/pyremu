@@ -12,6 +12,11 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 
+[features]
+# 编译时启用诊断输出 (如[map_sec]/[map_pool]/[page_fault]/[syscall]).
+# 通过 make DIAGNOSTIC=1 或 cargo --features diagnostic 开启.
+diagnostic = []
+
 [dependencies]
 elf = { version = "0.8.0", default-features = false }
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }

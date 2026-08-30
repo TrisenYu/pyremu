@@ -13,7 +13,7 @@
 //
 // 导出: u_fib_entry — 内核调度器通过 sepc 跳转至此.
 
-.section .text
+.section .uprog.text, "ax", @progbits
 .globl u_fib_entry
 
 .equ LINE_MAX, 20
@@ -34,6 +34,9 @@ u_fib_entry:
     la   a0, input_buf
     li   a1, LINE_MAX
     call readline
+    // readline 返回 a0 = 行长度; 0 = 输入流耗尽 (EOF), 正常退出
+    // (配合 loader 的 run(timeout=0): 进程必须终止, 内核才能 stop_machine 停机)
+    beqz a0, fib_eof
 
     // 解析
     la   a0, input_buf
@@ -69,6 +72,15 @@ fib_exit:
     li   a7, 1                 // exit
     ecall
     j    fib_exit
+
+// ============================================================
+//  fib_eof — 输入流耗尽: 正常结束进程 (exit 0)
+// ============================================================
+fib_eof:
+    li   a0, 0
+    li   a7, 1                 // exit
+    ecall
+    j    fib_eof
 
 
 // ============================================================
@@ -123,7 +135,9 @@ readline:
     // uart_getc via ECALL
     li   a7, 4
     ecall
-    // a0 = char
+    // a0 = char (0 = 无数据, 输入流已耗尽)
+    // 视为 EOF: 结束本行 (s1 未前移, 返回长度为 0), 由主循环 exit(0)
+    beqz a0, readline_done
 
     li   t0, '\n'
     beq  a0, t0, readline_done
@@ -238,11 +252,11 @@ putdec_out:
 // ============================================================
 //  数据
 // ============================================================
-.section .rodata
+.section .uprog.rodata, "a", @progbits
 .align 2
 str_prompt:
     .asciz "fib> "
 
-.section .bss
+.section .uprog.bss, "aw", @nobits
 input_buf:
     .skip LINE_MAX

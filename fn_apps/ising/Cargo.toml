@@ -1,0 +1,10 @@
+# 统计物理载荷
+#
+# 2D 方格子 Ising 模型 Metropolis Monte Carlo, 验证 Onsager 精确临界温度。
+# 无外部依赖 (自带 xorshift64 随机数)。
+#
+# 自检: 低温有序 (m→1) / 高温无序 (m→0); 比热峰 T ≈ 2.269。
+[package]
+name = "ising"
+version.workspace = true
+edition.workspace = true

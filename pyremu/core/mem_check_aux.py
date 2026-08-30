@@ -243,9 +243,7 @@ def translate_addr(
         return False, 0
 
     ok, pa, perm = translate_va(va, hart.satp_val, hart._mem_read_phy)
-    if not ok:
-        return False, 0
-    if not _check_pte_perm(
+    if not ok or not _check_pte_perm(
         eff_mode, perm, hart.mstatus_val, is_write=is_write, is_execute=is_execute
     ):
         return False, 0
@@ -258,9 +256,12 @@ def translate_addr(
 
     # 将翻译结果插入 TLB 缓存 (存真实 PTE 权限, 命中路径方可复用 _check_pte_perm;
     # 标记当前 hart 的 mdid, 供 mfence.did 按域刷新)
-    new_vpn = va >> 12
-    new_ppn = pa >> 12
-    tlb.insert(new_vpn, new_ppn, perm=perm, level=0, mdid=hart.mdid_val, asid=_asid)
+    tlb.insert(
+        va >> 12, pa >> 12,
+        perm=perm, level=0,
+        mdid=hart.mdid_val,
+        asid=_asid
+    )
 
     return True, pa
 

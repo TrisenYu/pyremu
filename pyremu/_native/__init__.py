@@ -107,7 +107,7 @@ try:
         ctypes.c_uint8,  # mode_val
         ctypes.c_uint64,  # mstatus_val
         ctypes.c_uint8,  # pmpsplit
-        ctypes.c_uint8,  # mdid
+        ctypes.c_uint64,  # mdid
     ]
     _lib.pmp_check.restype = ctypes.c_uint8
 
@@ -879,6 +879,26 @@ class FfiDevCtx(ctypes.Structure):
     ]
 
 
+class FfiPlicCtx(ctypes.Structure):
+    """PLIC state — matches Rust ``FfiPlicCtx``.
+
+    指针字段指向 Emulator 持有的持久 ctypes 数组, Rust 在加速执行内联读写
+    (claim/complete/priority/enable/threshold), 设备线程 ``raise_device_irq``
+    直接 write-through pending/level, 保证 batch 内新设备中断对 Rust 可见.
+    """
+    _fields_ = [
+        ("base", ctypes.c_uint64),
+        ("num_sources", ctypes.c_uint32),
+        ("num_contexts", ctypes.c_uint32),
+        ("priority", ctypes.c_void_p),
+        ("pending", ctypes.c_void_p),
+        ("level", ctypes.c_void_p),
+        ("enable", ctypes.c_void_p),
+        ("threshold", ctypes.c_void_p),
+        ("claimed", ctypes.c_void_p),
+    ]
+
+
 class FfiWatchdogCtx(ctypes.Structure):
     """Host-side execution watchdog — matches Rust ``FfiWatchdogCtx``.
 
@@ -960,6 +980,7 @@ class FfiPeriphCtx(ctypes.Structure):
         ("uart", ctypes.c_void_p),
         ("virtio", ctypes.c_void_p),
         ("watchdog", ctypes.c_void_p),
+        ("plic", ctypes.c_void_p),
     ]
 
 
@@ -1060,6 +1081,42 @@ class DevInfo:
         self.ends = ends    # ctypes array of uint64
 
 
+class PlicInfo:
+    """PLIC inline context — 持久 ctypes 数组, Rust 在加速执行内联读写.
+
+    与 ClintInfo 每轮 marshal 重新分配不同: PLIC 状态必须跨 batch 持久, 因为
+    设备线程 ``raise_device_irq`` 需 write-through 到同一批数组, 使 batch 内
+    新到达的设备中断对 Rust inline 仲裁可见. Emulator 持有这些数组, marshal
+    仅复制 Python PLIC 状态入数组, unmarshal 反向复制.
+    """
+    __slots__ = (
+        "base", "num_sources", "num_contexts",
+        "priority", "pending", "level", "enable", "threshold", "claimed",
+    )
+
+    def __init__(
+        self,
+        base: int = 0,
+        num_sources: int = 0,
+        num_contexts: int = 0,
+        priority=None,
+        pending=None,
+        level=None,
+        enable=None,
+        threshold=None,
+        claimed=None,
+    ):
+        self.base = base
+        self.num_sources = num_sources
+        self.num_contexts = num_contexts
+        self.priority = priority      # ctypes array of uint8 (num_sources+1)
+        self.pending = pending        # ctypes array of uint8 (num_sources+1)
+        self.level = level            # ctypes array of uint8 (num_sources+1)
+        self.enable = enable          # ctypes array of uint32 (num_contexts * num_words)
+        self.threshold = threshold    # ctypes array of uint8 (num_contexts)
+        self.claimed = claimed        # ctypes array of uint32 (num_contexts)
+
+
 class UartInfo:
     """UART context — lets Rust buffer sbi_printf output inline
     and handle IE/IP/TXCTRL register reads without exiting from speedup lib"""
@@ -1145,6 +1202,7 @@ def run_parallel(
     dev: DevInfo | None = None,
     uart: UartInfo | None = None,
     virtio: VirtIOInfo | None = None,
+    plic: PlicInfo | None = None,
     watchdog_timeout_ns: int = 0,  # 时钟源超时时间 (纳秒); 0 = 禁用
     bp_addrs: list[int] | None = None,
     stop_flag=None,  # ctypes.c_uint8 or None — shared stop flag for Ctrl+Q
@@ -1264,6 +1322,21 @@ def run_parallel(
         _virtio_ffi.interrupt_status = virtio.interrupt_status
         _virtio_ffi_ptr = ctypes.pointer(_virtio_ffi)
 
+    # --- FfiPlicCtx --- 持久数组指针直传 (Rust inline 读写, 设备线程 write-through)
+    _plic_ffi = FfiPlicCtx()
+    _plic_ffi_ptr = None
+    if plic is not None and plic.base != 0:
+        _plic_ffi.base = plic.base
+        _plic_ffi.num_sources = plic.num_sources
+        _plic_ffi.num_contexts = plic.num_contexts
+        _plic_ffi.priority = ctypes.cast(plic.priority, ctypes.c_void_p).value
+        _plic_ffi.pending = ctypes.cast(plic.pending, ctypes.c_void_p).value
+        _plic_ffi.level = ctypes.cast(plic.level, ctypes.c_void_p).value
+        _plic_ffi.enable = ctypes.cast(plic.enable, ctypes.c_void_p).value
+        _plic_ffi.threshold = ctypes.cast(plic.threshold, ctypes.c_void_p).value
+        _plic_ffi.claimed = ctypes.cast(plic.claimed, ctypes.c_void_p).value
+        _plic_ffi_ptr = ctypes.pointer(_plic_ffi)
+
     # Breakpoint addresses — build a ctypes array if any provided
     _bp_arr = None
     if bp_addrs:
@@ -1305,6 +1378,10 @@ def run_parallel(
     _periph_ctx.watchdog = (
         ctypes.cast(_watchdog_ffi_ptr, ctypes.c_void_p).value
         if _watchdog_ffi_ptr else 0
+    )
+    _periph_ctx.plic = (
+        ctypes.cast(_plic_ffi_ptr, ctypes.c_void_p).value
+        if _plic_ffi_ptr else 0
     )
 
     _bp_ctx = FfiBpCtx()
@@ -1374,6 +1451,7 @@ class TermIoHandle(ctypes.Structure):
         ("pause_flag", ctypes.c_void_p),   # *mut AtomicU8 — pause (debugger break)
         ("rx_notify", ctypes.c_void_p),    # *mut AtomicU8 — new RX data notification
         ("rx_notify_fd", ctypes.c_int32),  # fd: Rust termio 写 1B 唤醒 RX daemon
+        ("rx_drain_fd", ctypes.c_int32),   # fd: Python 消费 ring 后写 1B 唤醒 termio 续传
     ]
 
 
@@ -1393,6 +1471,9 @@ try:
 
     _termio_lib.terminal_io_attach.argtypes = [ctypes.POINTER(TermIoHandle)]
     _termio_lib.terminal_io_attach.restype = ctypes.c_int32
+
+    _termio_lib.terminal_io_set_emu_stop_flag.argtypes = [ctypes.c_void_p]
+    _termio_lib.terminal_io_set_emu_stop_flag.restype = None
 
 except OSError as exc:
     logger.warning(
@@ -1439,4 +1520,15 @@ def termio_is_running() -> bool:
     if _termio_lib is not None:
         return _termio_lib.terminal_io_is_running() != 0
     return False
+
+
+def termio_set_emu_stop_flag(ptr: int) -> None:
+    """把 CPU 引擎停止标志地址注入 termio 线程, 供 Ctrl+Q 直连置位.
+
+    *ptr* 为 ``ctypes.addressof(emu._native_stop_flag)``. termio 线程检测到
+    Ctrl+Q 时直接写该标志, 绕过 SIGINT -> Python handler 往返 (主线程阻塞在
+    run_parallel 时信号处理器不执行, 直连路径保证 Rust 引擎仍能即时停止).
+    """
+    if _termio_lib is not None:
+        _termio_lib.terminal_io_set_emu_stop_flag(ptr)
 

@@ -8,7 +8,7 @@ import struct
 
 import pytest
 
-from pyremu.configs_aux import path_join, test_elf_dir
+from pyremu.configs_aux import path_join, examed_elf_dir
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import parse_firmware
@@ -20,7 +20,7 @@ def multi_hart_emu():
     cfg = PlatformConfig.qemu_virt()
     cfg.num_harts = 2
     emu = Emulator(cfg)
-    kernel = parse_firmware(path_join(test_elf_dir(), "kernel.elf"))
+    kernel = parse_firmware(path_join(examed_elf_dir(), "kernel.elf"))
     assert kernel is not None, "kernel.elf 解析失败"
     emu.load_firmware(kernel)
     return emu

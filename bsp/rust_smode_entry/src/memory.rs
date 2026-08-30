@@ -160,8 +160,11 @@ unsafe fn map_one_section(sec_start: u64, sec_end: u64, va_offset: u64, flags: u
 	// VA = PA + va_offset (sec_start 是 PIE 重定位后的运行时 PA)
 	let va = sec_start.wrapping_add(va_offset);
 	// DEBUG: trace first page
-	let vpn2 = (va >> 30) & 0x1FF;
-	crate::println!("[map_sec] pa=0x{sec_start:x} va=0x{va:x} vpn2=0x{vpn2:x} flags=0x{flags:x}\n");
+	#[cfg(feature = "diagnostic")]
+	{
+		let vpn2 = (va >> 30) & 0x1FF;
+		crate::println!("[map_sec] pa=0x{sec_start:x} va=0x{va:x} vpn2=0x{vpn2:x} flags=0x{flags:x}\n");
+	}
 	for i in 0..(page_up(size) >> PAGE_SHIFT) {
 		paging::map_page(
 			va + i * PAGE_SIZE,
@@ -179,6 +182,7 @@ pub fn map_smode_page_pool(pool_ofs: u64, pool_size: u64) {
 	let va_ofs = ENCLAVE_MAN_VA_START.wrapping_sub(ctx.manager_pa_start);
 
 	// DEBUG: trace first page mapping
+	#[cfg(feature = "diagnostic")]
 	if pool_size > 0 {
 		let first_pa = start_pa;
 		let first_va = first_pa.wrapping_add(va_ofs);

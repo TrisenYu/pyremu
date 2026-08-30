@@ -9,8 +9,8 @@
 Pyremu 是一个用 Python (CPython 3.14) 编写的 **RISC-V 指令集模拟器与交互式调试器**，
 面向固件调试、TEE 开发、操作系统调试等场景。
 
-模拟多 hart，支持 RV64 **IMAC** 指令扩展 (F/D/Zfh 暂未实现)、五级特权级 (U/S/H/M/D)、
-Sv39 虚拟内存、L2 缓存 MESI 一致性协议、PLIC 平台级中断控制器、CLINT 时钟/核间中断。
+模拟多 hart，支持 RV64 **IMAC** 指令扩展、三级特权级 (U/S/M)、
+Sv39 虚拟内存、L2 缓存 MESI 一致性协议、CLINT、PLIC、APLIC、IMSIC等基本中断设备。
 
 ## 快速上手
 
@@ -34,11 +34,11 @@ python examples/demo_emulator.py
 
 | 模块 | 内容 |
 |------|------|
-| **指令集** | RV64 IMAC + Zicsr + C, M 扩展 (mul/div/rem) 和 A 扩展 (LR/SC/AMO), F/D/Zfh 暂未实现 |
-| **特权级** | U/S/H/M/D 五级, ECALL/EBREAK/MRET/SRET (含 medeleg/mideleg 委派), WFI (TW 检查, 中断唤醒) |
+| **指令集** | RV64 IMAC + Zicsr + C, M 扩展 (mul/div/rem) 和 A 扩展 (LR/SC/AMO) |
+| **特权级** | U/S/M, ECALL/EBREAK/MRET/SRET (含 medeleg/mideleg 委派), WFI (TW 检查, 中断唤醒) |
 | **虚拟内存** | Sv39 页表遍历 (4 KiB 页 + 2 MiB 超级页), TLB (全相联 FIFO/LRU) |
-| **内存保护** | PMP (NAPOT/NA4/TOR, L 位锁定, 最多 64 条, MPRV 感知), PMA 可配置 |
-| **缓存** | 共享 L2 缓存, MESI 一致性协议, 按 hart 的 mdid 域标记 |
+| **内存保护** | PMP (NAPOT/NA4/TOR, 最多 64 条, MPRV 感知), PMA 可配置 |
+| **缓存** | 共享 L2 缓存, MESI 一致性协议 |
 | **中断** | CLINT (mtime 定时器 + MSIP IPI), PLIC (平台级中断控制器, 电平语义, M/S 双 context) |
 | **外设** | UART (SiFive 16550 子集), virtio-blk, SPI, I2C, GPIO, Hart Watchdog |
 | **平台** | FDT 设备树生成, PlatformConfig 预设 (qemu_virt / sifive_u54) |
@@ -66,12 +66,12 @@ pyremu/
   platform.py            # PlatformConfig 平台描述
   core/                  # Hart, 解码器, trap 处理, 寄存器模型
   memory/                # MMU, TLB, L2 缓存, PMP, 总线
-  peripheral/            # UART, virtio-blk, SPI, I2C, GPIO, watchdog, TermIO
+  peripheral/            # UART, virtio-blk, SPI, I2C, GPIO, watchdog等
   interrupt/             # CLINT, PLIC, 中断控制器抽象, AIA
-  debug/                 # rvdb 交互式调试器 (prompt_toolkit + rich)
+  debug/                 # rvdbg 简易交互式调试器
   utils/                 # 反汇编器, FDT 生成, ELF 解析
   env_inject/            # 预加载 shellcode 注入
-  _native/               # Rust 批量执行引擎 (libdecode.so)
+  _native/               # Rust 加速执行引擎
 tests/                   # ~800 条测试
 examples/                # 编程式使用示例
 bsp/             # 第三方固件 & S-mode 运行时
@@ -84,7 +84,7 @@ bsp/             # 第三方固件 & S-mode 运行时
 
 ## 第三方代码
 
-- `bsp/rust_smode_entry/` — Rust 编写的 S-mode TEE 管理器，以 PIE 位置无关方式编译链接，由 M-mode 加载到动态分配的物理内存中运行
+- `bsp/rust_smode_entry/` — Rust 编写的 S-mode TEE 管理器，由 M-mode 加载到动态分配的物理内存中运行
 
 ## Rust Native 并发执行引擎
 
@@ -115,9 +115,8 @@ CLINT 中断与 `tlb_gen` 计数器 (SFENCE.VMA 广播)。
 ### 构建
 
 ```bash
-make build-native     # Release 构建 + 复制到 pyremu/_native/libdecode.so
+make build-native # Release 构建 + 复制到 pyremu/_native/libdecode.so
 ```
-
 也可以手动构建:
 
 ```bash
@@ -130,19 +129,7 @@ cargo test --manifest-path pyremu/_native/Cargo.toml   # Rust 侧单元测试
 构建依赖: Rust 工具链 (edition 2021), 无需 `maturin`/`setuptools-rust`——输出为标准
 cdylib，通过 CPython 内置 `ctypes` 加载。
 
-### 纯 Python 回退
-
-`.so` 缺失或不兼容时，模拟器自动回退到纯 Python 执行路径。可通过环境变量显式禁用:
-
-```bash
-PYREMU_NATIVE_BATCH=0 python -m pyremu.debugger tests/bins/elf/...
-```
-
-也可以通过 `Emulator` 构造参数控制:
-
-```python
-emu = Emulator(cfg, native_batch=False)
-```
+当 `.so` 缺失或不兼容时，模拟器将回退到纯 Python 执行路径。但执行用时较长，且目前缺乏维护。
 
 ### 已支持的指令
 
@@ -171,23 +158,11 @@ cargo test --manifest-path pyremu/_native/Cargo.toml   # sizeof/align
 uv run pytest tests/test_emulator.py::TestNativeBatchLayout   # Python 侧
 ```
 
-## 调试器快捷键
+## 快捷键
 
 | 按键 | 功能 |
 |------|------|
-| **Ctrl+Q** | 运行中暂停，回到 REPL |
-| **Ctrl+C** | 透传 raw 0x03 给客机 |
-
-## 注意事项
-
-### 跨页取指与数据访问
-
-RISC-V 指令取指固定 4 字节，当 PC 处于页末（offset ≥ 0xFFE）时，取指跨越两个 VA 页。
-Sv39 页表下这两个 VA 页可能映射到**非连续**物理页，模拟器对每个 VA 页独立做 MMU 翻译后
-拼接结果。非对齐数据 load/store 跨越页边界时同理。
-
-此机制对正确运行 ld-linux 等动态链接器至关重要——动态链接器常在页边界附近执行代码，
-链接后的 .plt/.got 等段跨越 VA 页时，物理页不连续会导致取指拼接错误。
+| **Ctrl+Q** | 运行中暂停，回到调试器 |
 
 ### 开发命令
 

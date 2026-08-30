@@ -79,7 +79,6 @@ class DebuggerBase(SharedMixinAttrs):
 
         self._running: bool = False
         self._sigint_count: int = 0
-        self._paused: bool = False
         self._terminated: bool = False
 
         # Pending stdin bytes — UART RX FIFO is only 8 bytes, so excess
@@ -178,7 +177,6 @@ class DebuggerBase(SharedMixinAttrs):
         raise KeyboardInterrupt
 
     def _sigint_run(self, _signum: int, _frame) -> None:
-        self._paused = True
         self._console.print("\n暂停请求 — 当前指令完成后回到 REPL")
         try:
             self._emu.notify_processor()
@@ -205,9 +203,9 @@ class DebuggerBase(SharedMixinAttrs):
         stdin daemon 独立于处理器执行循环持续读取, 与 WFI 零耦合.
         处理器仅看到 PLIC 外部中断信号 -> try_wfi_wakeup() 自然唤醒.
         """
-        # 终端 ISIG 已关闭, 键盘 Ctrl+C (0x03) 作为普通字节透传给客机,
-        # 不经信号路径. 此处的 SIGINT handler 只响应 Rust termio 线程的
-        # Ctrl+Q -> kill(SIGINT), 实现与 Python daemon Ctrl+Q 同等的即时停止.
+        # 终端 ISIG 关闭后键盘 Ctrl+C (0x03) 作为普通字节透传给客机, 不经信号
+        # 路径; Ctrl+Q 停止由 termio 的 notify_emu_stop 直连置位 stop_flag, 同样
+        # 不经信号. 此 SIGINT handler 仅覆盖 stdin 未转发的场景 (终端仍生成 SIGINT).
         signal.signal(signal.SIGINT, self._sigint_run)
 
         if not self._stdin_forward:
@@ -246,6 +244,10 @@ class DebuggerBase(SharedMixinAttrs):
             attrs[6][termios.VTIME] = 0
             termios.tcsetattr(self._stdin_fd, termios.TCSANOW, attrs)
 
+        # 启动 native termio 线程接管 stdin (事件驱动, 零轮询). 启动失败
+        # (libtermio.so 缺失 / stdin 非 TTY) 时回退到 Python select daemon.
+        if self._emu._termio is not None:
+            self._emu._termio.start()
         # TermIO daemon 已接管 stdin (native 模式), Python daemon 不需要再读.
         if self._emu._termio is None or not self._emu._termio.native_active:
             self._start_stdin_daemon()
@@ -349,16 +351,8 @@ class DebuggerBase(SharedMixinAttrs):
         # (daemon 读走后 select 返回空即 no-op)
 
         if self._emu._termio is not None and self._emu._termio.native_active:
-            had_input = self._emu._termio.drain_rx()
-            if had_input:
-                self._emu._wake_event.set()
-            # _rx_notify 由 Rust termio 线程置 1; daemon 搬运数据后不清零.
-            # 此处 ring buffer 排空后清零, 但需防 TOCTOU: 清零与判空之间 Rust 可能写入新数据.
-            termio = self._emu._termio
-            if termio._rx_wr.value == termio._rx_rd.value:
-                termio._rx_notify.value = 0
-                if termio._rx_wr.value != termio._rx_rd.value:
-                    termio._rx_notify.value = 1  # 恢复: 新数据恰在清空间隙到达
+            # 排空 RX ring -> UART FIFO, 内部处理 _rx_notify 的 TOCTOU 清零.
+            had_input = self._emu._termio.drain_rx_feed_uart()
             self._flush_uart_if_present()
             return had_input
 
@@ -553,3 +547,6 @@ class DebuggerBase(SharedMixinAttrs):
                 self._console.print("\n[dim]REPL 中断[/]")
             except Exception:
                 self._console.print_exception()
+        # REPL 退出: 释放 Emulator 全部 I/O 资源 (termio 管道 fd + UART 日志).
+        # _enter_repl_mode 已 stop termio; close() 幂等, 额外关闭日志文件.
+        self._emu.close()

@@ -14,7 +14,8 @@ use crate::handlers::{
 use crate::interrupt::{
 	check_and_deliver_interrupt_concurrent,
 	clint::{sync_msip, sync_mtip, try_handle_clint_concurrent},
-	imsic_topei_peek, try_handle_imsic_concurrent, try_handle_imsic_read_concurrent,
+	imsic_topei_peek, sync_ext_irq_mip, try_handle_imsic_concurrent,
+	try_handle_imsic_read_concurrent,
 	wfi::wfi_spin,
 	IID_M_IPI, IID_S_IPI,
 };
@@ -22,8 +23,14 @@ use crate::op_dispatcher::{
 	handle_alu, handle_auipc, handle_br, handle_fence, handle_fp_fma, handle_fp_op, handle_jal,
 	handle_jalr, handle_lui, handle_op32, handle_op_imm, handle_op_imm32,
 };
-use crate::peripheral::{is_device_addr, uart::try_handle_uart_concurrent};
-use crate::state::{exit_reason, riscv_mode, FfiUartCtx, HartState, InstrToBeExec, MemCtx};
+use crate::peripheral::{
+	is_device_addr,
+	plic::{plic_sync_mip_if_legacy, try_handle_plic_concurrent},
+	uart::try_handle_uart_concurrent,
+};
+use crate::state::{
+	exit_reason, riscv_mode, FfiPlicCtx, FfiUartCtx, HartState, InstrToBeExec, MemCtx,
+};
 use crate::translate::{tlb_flush_all, tlb_mark_all_dirty, translate_va, TranslateFault, WalkCtx};
 use crate::trap::{
 	deliver_illegal_instruction, deliver_trap, exc_code, mcause_val, priv_ecall_concurrent,
@@ -382,6 +389,24 @@ pub(crate) fn handle_load_concurrent(
 		return 4;
 	}
 
+	// PLIC inline — kernel 直映射访问 PLIC (priority/pending/enable/threshold/claim)
+	// 是 EXT4 recovery 阶段 batch 频繁退出的根因, 必须内联处理.
+	// claim 清 pending 后内部立即重算 mip.MEIP/SEIP, 避免延后到 step_interrupts.
+	if let Some(data) = try_handle_plic_concurrent(tr.pa, false, 0, size, state, dev.plic) {
+		let result_val = if signed {
+			match size {
+				1 => sext(data, 8),
+				2 => sext(data, 16),
+				4 => sext(data, 32),
+				_ => data,
+			}
+		} else {
+			data
+		};
+		write_gpr(state, f.rd, result_val);
+		return 4;
+	}
+
 	// MMIO
 	if is_device_addr(tr.pa, dev) {
 		module.request_stop(StopInfo {
@@ -508,6 +533,12 @@ pub(crate) fn handle_store_concurrent(
 
 	// IMSIC inline: route IPI identities through CLINT MSIP fast path
 	if try_handle_imsic_concurrent(tr.pa, val, state, clint) {
+		return 4;
+	}
+
+	// PLIC inline — priority/enable/threshold/complete 写内联处理; 写后立即
+	// 重算 mip.MEIP/SEIP, 覆盖 "先挂起后使能" 的延迟投递与 claim 后电平重挂场景.
+	if try_handle_plic_concurrent(tr.pa, true, val, size, state, dev.plic).is_some() {
 		return 4;
 	}
 
@@ -822,6 +853,7 @@ pub(crate) fn exec_compressed_concurrent(
 		msip: clint.msip as *mut u8,
 		states: std::ptr::null_mut(),
 		num_harts: clint.num_harts,
+		timebase_hz: clint.timebase_hz,
 		yield_for_ipi: Cell::new(false),
 		ipi_sender_hart: Cell::new(0),
 		ipi_sender_rounds: Cell::new(0),
@@ -997,6 +1029,7 @@ fn make_contexts(
 		num: dev.num,
 		virtio_base: dev.virtio_base,
 		virtio_raw: dev.virtio_raw,
+		plic: dev.plic,
 	};
 	let walk = WalkCtx {
 		ram: mem_val.ram,
@@ -1074,11 +1107,11 @@ fn handle_wfi_state(
 /// should ``continue`` the main loop).
 fn step_interrupts(
 	state: &mut HartState,
-	hart_id: u8,
+	_hart_id: u8,
 	clint: &ConcurrentClintCtx,
 	just_woke_from_wfi: bool,
+	plic: *mut FfiPlicCtx,
 ) -> bool {
-	let _ = hart_id; // used only in #[cfg(feature = "diagnostic")] block
 	sync_mtip(state, clint);
 	// When just woke from WFI, wfi_sync_and_check already called sync_msip
 	// and auto-cleared the CLINT level bit.  Calling sync_msip again here
@@ -1185,16 +1218,39 @@ fn step_interrupts(
 			}
 		}
 	}
-	// Force-enable MEIE/SEIE when IMSIC genuinely has MEIP/SEIP pending
-	// (stale bits already cleaned up above).  OpenSBI's AIA path may not
-	// explicitly set mie.MEIE, relying on the IMSIC irqchip path
-	// (csr_swap MTOPEI) for dispatch.
-	if (state.mip.load(Ordering::Acquire) & (1 << 11)) != 0 && (state.mie & (1 << 11)) == 0 {
+	// Force-enable MEIE/SEIE ONLY when IMSIC owns the external interrupt
+	// path (AIA mode).  OpenSBI's AIA path may not explicitly set
+	// mie.MEIE for IMSIC IPIs (IID=1/3 route through MEIP/SEIP), relying
+	// on the IMSIC irqchip path (csr_swap MTOPEI) for dispatch.
+	//
+	// In legacy PLIC mode (imsic not present) this force-enable is FATAL:
+	// OpenSBI's PLIC irqchip driver has NO process_hwirqs (only the AIA
+	// IMSIC driver does), so sbi_irqchip_init never sets mie.MEIE and
+	// sbi_irqchip_process() always returns SBI_ENODEV.  If we force-enable
+	// MEIE behind the guest's back, a transient MEIP (e.g. ext_irq.pending
+	// latched while UART RX data sat undrained) fires an M-mode external
+	// trap into an unprocessable irqchip → sbi_trap_error → sbi_hart_hang
+	// → the whole SMP boot freezes (observed: mcause=0x800000000000000b on
+	// every hart right after the `riscv-plic: plic@c000000:` DT node).
+	if state.imsic_m.present != 0
+		&& (state.mip.load(Ordering::Acquire) & (1 << 11)) != 0
+		&& (state.mie & (1 << 11)) == 0
+	{
 		state.mie |= 1 << 11;
 	}
-	if (state.mip.load(Ordering::Acquire) & (1 << 9)) != 0 && (state.mie & (1 << 9)) == 0 {
+	if state.imsic_s.present != 0
+		&& (state.mip.load(Ordering::Acquire) & (1 << 9)) != 0
+		&& (state.mie & (1 << 9)) == 0
+	{
 		state.mie |= 1 << 9;
 	}
+	// Legacy PLIC 模式 (IMSIC 缺席) 的 MEIP/SEIP 对账: ext_irq 机制在 batch 内
+	// 置位 MEIP/SEIP 后, 这里按 PLIC 真实仲裁结果 (pending + enable + prio>threshold)
+	// 核对 — 覆盖 "device raise 早于 guest enable" 的虚假置位, 以及内联 claim 已清
+	// pending 的场景 (claim/complete/enable 写路径已即时重算, 此处为兜底).  门控
+	// ``mip ext bits != 0`` 保证零位时零开销; AIA 模式 (imsic present) 由上面的
+	// IMSIC 清理块独占, 此处不介入.
+	plic_sync_mip_if_legacy(state, plic);
 	if check_and_deliver_interrupt_concurrent(state, clint) {
 		return true;
 	}
@@ -1318,53 +1374,24 @@ pub(crate) fn hart_worker(
 		if !stop_flag.is_null() && unsafe { *stop_flag != 0 } {
 			return;
 		}
-		// mtime 按指令计数推进 (见 advance_clock_source) — 执行循环持续运行,
-		// 仅由外部信号 (Ctrl+Q -> stop_flag) 暂停.
+		// mtime 按每 hart 指令增量推进 (见 advance_clock_source, NS_PER_INSTR) —
+		// 执行循环持续运行, 仅由外部信号 (Ctrl+Q -> stop_flag) 暂停.
 		advance_clock_source(module, clint, state);
 		// External interrupt (UART, VirtIO, …): daemon set pending after
 		// injecting data into UART RX FIFO.  Raise SEIP/MEIP inline so the
 		// guest's trap handler processes the interrupt within this acceleration.
-		if !ext_irq.is_null() && unsafe { (*ext_irq).pending != 0 } {
-			// Level-triggered: Python sets pending=1 when ring buffer or
-			// UART FIFO has data, clears to 0 only when both are empty.
-			// We do NOT clear pending here — Python manages the lifecycle.
-			//
-			// Only set MEIP/SEIP for lines NOT owned by IMSIC.  When
-			// eidelivery=1, the IMSIC file drives its own mip bit —
-			// _native_sync_plic_mip sets it at the acceleration boundary from
-			// the marshalled eip, and cross-hart imsic_eip_set sets it
-			// directly on the target hart's mip.  Unconditionally
-			// setting both bits on every instruction forces the
-			// step_interrupts cleanup to call imsic_topei_peek twice
-			// per instruction, creating a fetch_or / topei_peek /
-			// fetch_and ping-pong that causes ~22× instruction
-			// throughput regression in AIA mode.
-			//
-			// When marshal ran before the daemon set the IMSIC eip,
-			// the interrupt is invisible for the current acceleration
-			// regardless: the unconditional set was being cleared by
-			// step_interrupts before check_and_deliver could act on
-			// it.  The next acceleration boundary's _native_sync_plic_mip
-			// re-syncs the correct bits from the new eip state
-			// regardless of which approach we use here.
-			let mfile_owns = state.imsic_m.present != 0 && state.imsic_m.eidelivery != 0;
-			let sfile_owns = state.imsic_s.present != 0 && state.imsic_s.eidelivery != 0;
-			if !sfile_owns {
-				state.mip.fetch_or(1 << 9, Ordering::AcqRel);
-			}
-			if !mfile_owns {
-				state.mip.fetch_or(1 << 11, Ordering::AcqRel);
-			}
-		}
+		// 仅对未被 IMSIC 占用的线路置位 (eidelivery=1 时 IMSIC 独占, 见
+		// sync_ext_irq_mip 注释); 无条件置位会造成 AIA 模式 ~22× 指令吞吐回归.
+		sync_ext_irq_mip(state, ext_irq);
 		// TermIO RX notification: stdin bytes arrived in ring buffer.
 		// Force immediate exit -> Python drain_rx() moves data
 		// from ring buffer into UART FIFO -> _native_sync_plic_mip
 		// raises SEIP -> guest reads data on next acceleration without
 		// waiting for PLIC round-trip or acceleration completion.
-		if !uart.rx_notify.is_null() && unsafe { *uart.rx_notify != 0 } {
-			module.stop_flag.store(true, Ordering::Release);
-			return;
-		}
+		// if !uart.rx_notify.is_null() && unsafe { *uart.rx_notify != 0 } {
+		// 	module.stop_flag.store(true, Ordering::Release);
+		//	return;
+		// }
 		if state.halted != 0 {
 			// Halted harts exit the worker.  Spinning here would deadlock
 			// the engine because the other harts may be waiting for this
@@ -1384,7 +1411,7 @@ pub(crate) fn hart_worker(
 		}
 
 		// ---- Interrupts ----
-		if step_interrupts(state, hart_id, clint, just_woke_from_wfi) {
+		if step_interrupts(state, hart_id, clint, just_woke_from_wfi, dev.plic) {
 			continue;
 		}
 
@@ -1451,11 +1478,11 @@ pub(crate) fn hart_worker(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::concurrent::{ConcurrentClintCtx, ModuleState, StopInfo};
+	use crate::concurrent::{ConcurrentClintCtx, ModuleState, StopInfo, NS_PER_INSTR};
 	use crate::handlers::{DevCtx, PmpCtx};
 	use crate::state::{riscv_mode, FfiUartCtx, HartState, TlbEntry};
 	use crate::translate::WalkCtx;
-	use std::sync::atomic::AtomicU64;
+	use std::sync::atomic::{AtomicU64, AtomicU8};
 
 	/// Build a permissive PMP context: single TOR entry covering all of
 	/// memory with R/W/X.  Needed because pmp_ok per RISC-V spec §3.7.1
@@ -1681,6 +1708,7 @@ mod tests {
 			num: 0,
 			virtio_base: 0,
 			virtio_raw: std::ptr::null_mut(),
+				plic: std::ptr::null_mut(),
 		};
 		// Build minimal inline CLINT/UART contexts for the load handler.
 		let _mtime = std::sync::atomic::AtomicU64::new(0);
@@ -1790,6 +1818,7 @@ mod tests {
 			num: 0,
 			virtio_base: 0,
 			virtio_raw: std::ptr::null_mut(),
+				plic: std::ptr::null_mut(),
 		};
 		let _mtime = std::sync::atomic::AtomicU64::new(0);
 		let _mtimecmp = std::sync::atomic::AtomicU64::new(0);
@@ -2008,5 +2037,206 @@ mod tests {
 		let adv = crate::csr::handle_csr(&mut csr_ctx, 12, 0, 0xC00, 2, 0xc000_2673, &mut result);
 		assert_eq!(adv, 4, "rdcycle 必须一轮加速中完成");
 		assert_eq!(result.exit_reason, 0, "rdcycle 不得设置退出原因");
+	}
+
+	/// 构造最小 CLINT 上下文 (timer/IPI 全关, 供中断边界测试使用).
+	fn clint_ctx_empty() -> ConcurrentClintCtx {
+		let _mtime = Box::new(std::sync::atomic::AtomicU64::new(0));
+		let _mtimecmp = Box::new(std::sync::atomic::AtomicU64::new(0));
+		let _msip = Box::new(std::sync::atomic::AtomicU8::new(0));
+		let clint = ConcurrentClintCtx {
+			base: 0,
+			mtime: &*_mtime,
+			mtimecmp: &*_mtimecmp,
+			msip: &*_msip,
+			num_harts: 1,
+			msip_pending: Cell::new(std::ptr::null()),
+			hart_threads: Cell::new(std::ptr::null()),
+			hart_states: Cell::new(std::ptr::null()),
+			timebase_hz: 0, // 单元测试禁用 clock-source 推进
+		};
+		// 泄漏 Box 使指针在整个测试生命周期有效 (与 interrupt/mod.rs 的
+		// clint_with_msip 做法一致).
+		std::mem::forget(_mtime);
+		std::mem::forget(_mtimecmp);
+		std::mem::forget(_msip);
+		clint
+	}
+
+	/// 回归 (make emu-linux-sh 测速相位 + tick 活锁 + legacy PLIC 相位 tick 风暴):
+	/// mtime 曾按单调时钟流逝推进 — 低速模拟 (~0.3 MIPS) 下内核 HZ=250 的定时器
+	/// tick (4ms = 40000 ticks) 每真实 4ms 仅隔 ~1100 条指令, tick 处理路径一超长
+	/// 即陷入 mret 后立即再 trap 的活锁, 客机在测速/ALSA 相位随机停滞 (guest
+	/// 4.5s~18.9s 不等), 且引擎卡在 native batch 无法响应 Ctrl+Q.
+	/// 修复: 纯指令计数 (20ns/instr, 无实时分量) — tick 预算 2e5 条, 永不风暴.
+	/// 曾尝试 min(实时流逝, 指令计数) 混合模型: 200ns/instr 预算 2e4 条仍实测停滞
+	/// (legacy PLIC 相位后 sched_tick + update_vsyscall + timekeeping + tracing
+	/// 路径过长, kernel_init 被饿死, 见 /tmp/pyremu_repro/stall_dbg_stack.log),
+	/// 且空闲批次实时分量与 Python 侧 clint.tick 补偿叠加成 ~2× real 双倍计数.
+	/// 本测试断言 mtime 推进纯粹按指令: 1600 条指令 * 20ns/instr * 10MHz = 320 ticks,
+	/// 与流逝时间 (10/100ms) 完全无关 (无实时泄漏).
+	#[test]
+	fn advance_clock_source_pure_instruction_advance_independent_of_elapsed() {
+		let timebase_hz = 10_000_000u64; // 10 MHz: 1 tick = 100ns
+		let base_mtime = 1_000_000u64;
+		let mtime_atomic = AtomicU64::new(base_mtime);
+		let mtimecmp_atomic = AtomicU64::new(0);
+		let msip_atomic = AtomicU8::new(0);
+		let clint = ConcurrentClintCtx {
+			base: 0,
+			mtime: &mtime_atomic as *const AtomicU64,
+			mtimecmp: &mtimecmp_atomic as *const AtomicU64,
+			msip: &msip_atomic as *const AtomicU8,
+			num_harts: 1,
+			msip_pending: std::cell::Cell::new(std::ptr::null()),
+			hart_threads: std::cell::Cell::new(std::ptr::null()),
+			hart_states: std::cell::Cell::new(std::ptr::null()),
+			timebase_hz,
+		};
+
+		// 本轮已执行 1600 条指令 (instr_ref_num=1000 -> total_instrs=2600).
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mhartid = 0;
+		state.total_instrs = 2600;
+		let mut module = ModuleState::new(1, 1, 0, base_mtime, vec![1000u64].into_boxed_slice());
+
+		// 两种流逝下推进量必须一致: 1600 条 * 20ns/instr * 10MHz = 320 ticks.
+		for elapsed_ms in [10u64, 100u64] {
+			module.st_time_val = std::time::Instant::now()
+				.checked_sub(std::time::Duration::from_millis(elapsed_ms))
+				.expect("Instant 减法不应下溢");
+			mtime_atomic.store(base_mtime, Ordering::Relaxed);
+			advance_clock_source(&module, &clint, &state);
+			let delta = mtime_atomic.load(Ordering::Relaxed) - base_mtime;
+			assert_eq!(
+				delta, 320,
+				"mtime 必须纯按指令增量推进 (1600 条 -> 320 ticks @20ns/instr), \
+				 与流逝 ({elapsed_ms}ms) 无关; 实际 {delta}"
+			);
+		}
+	}
+
+	/// 回归 (混合模型空闲批次双倍计数):
+	/// 曾引入 min(实时流逝, 指令计数): 空闲批次 instr_delta=0 时 min 取 0 不推进,
+	/// 但 Python ``_wfi_sleep_if_idle`` 同时按真实流逝 clint.tick 补偿 mtime — 若
+	/// 批次侧对实时分量取非 0 值 (或引入任何非指令源), 两者叠加令 mtime 以
+	/// ~2× real 流逝 (实测 1.65×), 重新制造风暴压力. 本测试断言 0 指令、100ms
+	/// 流逝下 mtime 推进必须为 0 (时钟源仅指令, 空闲期由 Python 侧独占补偿).
+	#[test]
+	fn advance_clock_source_zero_instr_does_not_advance() {
+		let timebase_hz = 10_000_000u64;
+		let base_mtime = 1_000_000u64;
+		let mtime_atomic = AtomicU64::new(base_mtime);
+		let mtimecmp_atomic = AtomicU64::new(0);
+		let msip_atomic = AtomicU8::new(0);
+		let clint = ConcurrentClintCtx {
+			base: 0,
+			mtime: &mtime_atomic as *const AtomicU64,
+			mtimecmp: &mtimecmp_atomic as *const AtomicU64,
+			msip: &msip_atomic as *const AtomicU8,
+			num_harts: 1,
+			msip_pending: std::cell::Cell::new(std::ptr::null()),
+			hart_threads: std::cell::Cell::new(std::ptr::null()),
+			hart_states: std::cell::Cell::new(std::ptr::null()),
+			timebase_hz,
+		};
+
+		// 本轮 0 条指令 (total_instrs == instr_ref_num == 1000).
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mhartid = 0;
+		state.total_instrs = 1000;
+		let mut module = ModuleState::new(1, 1, 0, base_mtime, vec![1000u64].into_boxed_slice());
+
+		module.st_time_val = std::time::Instant::now()
+			.checked_sub(std::time::Duration::from_millis(100))
+			.expect("Instant 减法不应下溢");
+		mtime_atomic.store(base_mtime, Ordering::Relaxed);
+		advance_clock_source(&module, &clint, &state);
+		let delta = mtime_atomic.load(Ordering::Relaxed) - base_mtime;
+		assert_eq!(
+			delta, 0,
+			"0 指令的空闲批次不得推进 mtime (时钟源仅指令, WFI 补偿在 Python 侧); \
+			 实际 {delta}"
+		);
+	}
+
+	/// 回归 (make emu-linux-sh legacy 模式 PLIC 相位后 tick 风暴):
+	/// 停滞根因是 HZ=250 的 4ms tick 预算不足 — mret 后立即再 trap 的活锁,
+	/// kernel_init 被饿死. legacy PLIC 相位后内核 (tracing 配置) 的 sched_tick +
+	/// update_vsyscall + timekeeping trap 路径实测 5~5e4 条指令 (stall_dbg_stack.log:
+	/// 三 hart 全在 update_vsyscall / cpu_do_idle / tmigr_requires_handle_remote).
+	/// 纯指令计数的 tick 预算 = 1e9 / (NS_PER_INSTR × HZ) (与 timebase 无关):
+	///   NS_PER_INSTR=20  => 2e5 条/tick (本值: handler 实测 ≤5e4, 4× 余量);
+	///   NS_PER_INSTR=40  => 1e5 条/tick (2× 余量, 上界);
+	///   NS_PER_INSTR=80  => 5e4 条/tick (恰好贴 handler 上限, 无余量);
+	///   NS_PER_INSTR=200 => 2e4 条/tick (实测仍停滞);
+	///   NS_PER_INSTR=500 => 8e3 条/tick (实测仍停滞).
+	#[test]
+	fn advance_clock_source_instruction_floor_meets_hz250_tick_budget() {
+		const HZ: u64 = 250;
+		let budget = 1_000_000_000u64 / (NS_PER_INSTR * HZ);
+		assert!(
+			budget >= 100_000,
+			"HZ=250 tick 指令预算不足: {budget} 条/tick < 100000 \
+			 (handler 实测上限 ~5e4, 需 ≥2× 余量; NS_PER_INSTR 过大)"
+		);
+	}
+
+	#[test]
+	fn legacy_plic_meip_does_not_force_enable_meie() {
+		// 回归 (make emu-linux-sh PLIC 相位启动停滞):
+		// 传统 PLIC 模式下 (imsic 不存在), OpenSBI 的 PLIC irqchip 驱动没有
+		// process_hwirqs (只有 AIA IMSIC 驱动有), 故 sbi_irqchip_init 不会置
+		// mie.MEIE, 且 sbi_irqchip_process() 恒返回 SBI_ENODEV。 若此处对瞬时
+		// MEIP 强制使能 MEIE, M 级外部陷阱会落入 OpenSBI 无法处理的 irqchip,
+		// sbi_trap_error -> sbi_hart_hang 冻结整个 SMP 启动 —— 实测在
+		// `riscv-plic: plic@c000000:` 设备树节点输出后所有 hart 均以
+		// mcause=0x800000000000000b (MEIP) 停滞 (见 /tmp/plic_stall_fh.log)。
+		let clint = clint_ctx_empty();
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mhartid = 0;
+		state.mode = riscv_mode::S;
+		state.mstatus = 1 << 3; // MIE = 1 — M 级中断可抢占 S 模式
+		state.mie = 0; // 客机未使能任何中断 (含 MEIE)
+		state.mip.store(1 << 11, Ordering::Release); // 瞬时 MEIP
+
+		step_interrupts(&mut state, 0, &clint, false, std::ptr::null_mut());
+
+		assert_eq!(
+			state.mie & (1 << 11),
+			0,
+			"PLIC 模式下不得强制使能 MEIE — 否则 MEIP 陷阱落入 OpenSBI 无法处理的 irqchip (SBI_ENODEV) -> sbi_hart_hang"
+		);
+		assert_eq!(
+			state.mip.load(Ordering::Acquire) & (1 << 11),
+			1 << 11,
+			"MEIP 保持 pending (由 Python 侧 batch 边界 _native_sync_plic_mip 同步清除)"
+		);
+	}
+
+	#[test]
+	fn aia_imsic_meip_still_force_enables_meie() {
+		// 正控制: AIA 模式下 (imsic present) 强制使能必须保留 —— OpenSBI 的
+		// IMSIC IPI 路径 (IID=1/3 经 MEIP) 可能不显式设置 mie.MEIE, 去掉后
+		// WFI 中的 hart 永远不会因 IPI 唤醒 -> SMP 启动停滞。
+		let clint = clint_ctx_empty();
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mhartid = 0;
+		state.mode = riscv_mode::S;
+		state.mstatus = 1 << 3; // MIE = 1
+		state.mie = 0;
+		state.mip.store(1 << 11, Ordering::Release); // MEIP (IMSIC IPI)
+		state.imsic_m.present = 1;
+		// 使 IMSIC M-file 持有 IPI 位, 让 stale-bit 清理保留 MEIP
+		// (否则 eidelivery=0 且无 IPI 时会清除 MEIP, 后续断言失去意义).
+		state.imsic_m.eip[0].store(1 << crate::interrupt::imsic::IID_M_IPI, Ordering::Release);
+
+		step_interrupts(&mut state, 0, &clint, false, std::ptr::null_mut());
+
+		assert_eq!(
+			state.mie & (1 << 11),
+			1 << 11,
+			"AIA 模式 (IMSIC present) 下仍须强制使能 MEIE"
+		);
 	}
 }

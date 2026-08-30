@@ -1,3 +1,271 @@
+## 2026-08-29 — WFI 停驻批次终结竞态修复: wfi_spin 自醒安全网 (park_timeout)
+
+### 现象
+
+`make emu-linux-sh` (legacy PLIC, 3 harts, `init=/bin/zsh`) 在
+"Run /bin/zsh as init process" 之后仍间歇性停滞 (MSIP 电平保留修复后 2/6 次),
+180 秒以上无新输出, 且停滞进程无法被 Ctrl+Q 终止。GDB 挂附显示停滞进程仅剩
+5 个线程: main (阻塞在 `run_parallel` 的 join)、1 个 hart 线程 (阻塞在 glibc
+`syscall` futex)、termio 轮询线程与 2 个 Python 轮询线程; 软件看门狗与另外
+2 个 hart 线程均已退出。看门狗只在 stop/超时时退出 (1800s 超时排除), 故
+`stop_flag` 必然已置位。
+
+### 根因
+
+`wfi_spin` 停驻的 hart 用无限 `std::thread::park()` 阻塞, 唤醒完全依赖外部
+unpark: 看门狗每 5ms 周期 `unpark_all_harts`、其他 hart 退出时的完成信号
+(`run_harts` 的 exit-closure)、MSIP 发送方。当某 hart 在最后一次 unpark 之后
+park、且看门狗已按 stop 退出时, 该 hart 会带着已置位的 `stop_flag` 永久睡眠:
+无人再 unpark, `run_harts` 的 join 永不返回, batch 永不收敛, Ctrl+Q 也因
+main 卡死在 FFI 调用内而无法生效。全 crate 枚举确认 `wfi.rs` 的 `park()` 是
+唯一无限阻塞点: 所有 `Mutex::lock` 均以 `if let Ok` 不阻塞, 唯一 `.unwrap()`
+的 `SH_LAST_TAGGED_HART` 仅在 semihosting 路径 (Linux 启动不使用)。
+
+### 修复
+
+`wfi_spin` 的无限 `park()` 改为与看门狗轮询周期对齐的自醒阻塞
+`park_timeout(WATCHDOG_POLL_US)` (5ms)。外部 unpark (MSIP 发送方/看门狗) 仍
+提供零延迟唤醒; 即使全部外部唤醒源消失, 停驻 hart 也会自行醒来重新检查
+`stop_flag` 与中断挂起 (mtip/msip/imsic/ext_irq/uart_rx), 有界时间内必定
+收敛退出。自醒周期与看门狗现有 5ms 周期唤醒等价, 正常路径零额外开销, 仅在
+看门狗消失后兜底 — 将批次终结正确性从"4 线程 unpark 时序无竞态"变为
+"每 hart 独立自愈"。
+
+- `pyremu/_native/cpu/src/interrupt/wfi.rs` — `park()` 改为
+  `park_timeout(WATCHDOG_POLL_US)`; 更新设计注释 (自醒安全网)
+- `pyremu/_native/cpu/src/concurrent.rs` — `WATCHDOG_POLL_US` 改为
+  `pub(crate)` (供 `wfi_spin` 复用); 更新看门狗/轮询周期注释
+
+### 回归测试
+
+- `wfi_spin_exits_on_stop_without_any_unpark` — 构造
+  `active_hart_num > wfi_count` 使 hart 落入真实 park 路径, 停驻后仅置位
+  `stop_flag` 不做任何 unpark, 断言有界时间内返回 false (修复前无限 park
+  会超时挂起, 精确复现停滞时"最后 unpark 已消费"的场景)。
+
+### 验证
+
+- `cargo test` 383+14 全部通过; 新增回归测试通过
+- 修复前停滞率 2/6 (~33%), 修复后 `make emu-linux-sh` 连续 10 次全部干净
+  引导到 zsh 提示符 (0 停滞)
+- 提示符后连续 3 条命令均获得唯一输出标记且提示符重现, 客机持续响应
+
+---
+
+## 2026-08-29 — 跨核 MSIP 丢失修复: batch 边界电平保留
+
+### 现象
+
+`make emu-linux-sh` (legacy PLIC, 3 harts, `init=/bin/zsh`) 在
+"Run /bin/zsh as init process" 之后间歇性启动停滞 (2/6 次), 180 秒以上无任何
+新输出。停滞点正是 `kernel_execve` 前后 — 该路径在全部 3 个 hart 上反复执行
+TLB shootdown (smp_call_function IPI + tlb_sync 自旋等待确认)。
+
+### 根因
+
+`_speedup_for_cmd_step` 在 batch 结束后有一段"MSIP 电平同步"循环:
+
+```python
+_pre_speedup_msip = [self.clint._msip[hid] & 1 for hid in range(len(self.harts))]
+# ... batch ...
+if (mip_val & (1 << 3)) == 0 and clint._msip[hid] and _pre_speedup_msip[hid]:
+    clint._msip[hid] = 0
+```
+
+该循环按 **batch 前的旧电平** 反向清除 Python `CLINT._msip`。当 batch 前
+MSIP 已挂起 (旧 IPI), 执行期间旧 IPI 的 handler 写 0 清电平、随后另一 hart
+写入新 IPI (电平重新置 1), 而目标 hart 的 `sync_msip` 尚未消费该电平
+(`mip.MSIP == 0`), 循环会把电平 1 误判为"旧 MSIP 已投递"而清零。新 IPI 的
+edge channel (`msip_pending`) 是 per-batch 的, 随 batch 结束释放, 于是该
+跨核 IPI 被永久丢弃 — 发送方永远自旋在 OpenSBI `tlb_sync` -> TLB-shootdown
+死锁, 表现为启动停滞。
+
+### 修复
+
+移除该循环。`_native_unmarshal_clint` 已经把 msip 数组的电平位回写为
+`clint._msip[hid] = raw & 1`; Rust 侧 `clint_write_msip_concurrent` 写 0 时
+同步 `fetch_and(0xFE)` 清零电平位, 故 unmarshal 读到的电平即为 batch 结束时的
+真实状态: 电平 1 代表一个真实挂起、尚未确认的 IPI, 必须保留到下一轮 batch
+由 `sync_msip` 投递。
+
+- `pyremu/emulator.py` — 删除 `_pre_speedup_msip` 捕获与 MSIP 电平同步循环,
+  以 unmarshal 的电平回写为准。
+
+### 回归测试
+
+- `test_msip_reset_during_batch_survives_unmarshal` — 旧 IPI 清除后新 IPI
+  电平重新置 1、目标 hart 尚未 sync (`mip.MSIP == 0`) 的 batch 边界场景,
+  断言 `clint._msip` 保留为 1 (修复前被清零)。
+
+---
+
+## 2026-08-28 — UART RX 输入冻结修复: PLIC set_irq 内联 write-through FFI 持久数组
+
+### 现象
+
+`make emu-linux-sh` (legacy PLIC, 3 harts, `init=/bin/zsh`) 间歇性冻结:
+客机回显一行后停在半条命令处, Ctrl+Q 无响应。诊断显示冻结时全部 hart 在
+nohz 空闲路径自旋, `mip=0xa00` (SEIP|MEIP 挂起) 但 trap 永不投递, batch
+永不结束。echo#0 正常、echo#1 冻结 — 同一输出在 batch 空闲 (parked) 与
+batch 活跃 (某 hart 做 nohz housekeeping) 时表现不同。
+
+### 根因
+
+RX daemon 的 `_drain_rx_locked` 置 `_ext_irq.pending=1` 通知引擎, 却绕过
+`raise_device_irq`, 不更新 PLIC 持久数组 (源挂起仍为 batch 起始 marshal 的
+0)。batch 运行期间 Rust 内联 `sync_ext_irq_mip` 依锁存置 SEIP, 随后
+`plic_recompute_mip` 用陈旧数组 (源挂起=0) 立即覆盖 SEIP — UART 中断永远
+投递不出去, 挂起的锁存使 WFI 表现为 NOP (`mip & mie != 0`), 客机在 nohz
+空闲自旋冻结。
+
+### 修复
+
+将 PLIC 中断源挂起/电平的 write-through 收敛到 PLIC 对象自身:
+
+- `pyremu/interrupt/plic.py` — PLIC 持有 FFI 持久数组 `_ffi_pending`/
+  `_ffi_level` (ctypes, 暴露给 Rust batch 内联仲裁); `set_irq` 每次改线时
+  内联写穿, 取代原先散落在 `raise_device_irq` 的显式数组写入。
+- `pyremu/peripheral/termio.py` — RX 排空路径经 `on_irq` (= `raise_device_irq`)
+  -> `plic.set_irq` 同步 PLIC, 而非仅置 `_ext_irq.pending`; `raise_device_irq`
+  仅保留 ext_irq 通知位 + 唤醒。
+- `pyremu/emulator.py` — `_native_marshal_plic` 使用 PLIC 的 `_ffi_pending`/
+  `_ffi_level`; priority/enable/threshold/claimed 仍由 marshal 维护。
+
+同时闭合读空 deassert 路径: guest 读空 RX FIFO 时 `_update_plic_irq` ->
+`set_irq(False)` 写穿 `_ffi_level`, Rust `plic_do_complete` 不再从陈旧高电平
+重挂起 — 否则 claim/complete 形成无限 spurious 中断风暴 (等价冻结)。
+
+### 回归测试
+
+- `test_drain_rx_write_through_plic` — drain 后 `_ffi_pending`/`_ffi_level`
+  置位, ext_irq 通知; IE 关闭时不得虚假挂起
+- `test_uart_read_empty_deasserts_ffi_level` — 读空 FIFO 后 `_ffi_level=0`,
+  防止 complete 重挂起风暴
+- `test_raise_device_irq_write_through` / `test_unmarshal_plic_roundtrip`
+  — 更新为经 PLIC FFI 数组断言
+
+## 2026-08-25 — native 引擎 X-only 页取指修复: walk_l0/walk_l1_leaf 对取指强制 PTE_R
+
+### 现象
+
+`make stress` (AIA 使能) 运行到 Batch 20 后 hart 陷入 trap loop, 表现为
+"看起来像重启 Linux": hart 反复在 M 模式 `_trap_handler` 与 S 模式
+`0xffffffe000001000` (trap_vector) 之间跳转, 永不恢复。诊断显示
+`mcause=0xc` (InstrPageFault), `mtval=0xffffffe000001000`。
+
+### 根因
+
+runtime 将 trap_vector 映射在高 VA 0xffffffe000001000 的 **X-only 页**
+(L0[1] = 0x22b804c9: R=0, W=0, X=1, A|D 预置), 与 Linux 等 OS 常见的
+"text 段可执行但不可读" 布局一致。RISC-V 规范允许对 X-only 页取指
+(X 检查单独生效, 不要求 R)。但 native 引擎 `translate.rs` 的
+`walk_l0` / `walk_l1_leaf` 对取指 (is_execute=true) 也强制 PTE_R,
+导致 X-only trap_vector 取指被误判 InstrPageFault, hart 陷入 M 模式
+trap loop — Batch-20 挂死根因。
+
+### 修复
+
+`pyremu/_native/cpu/src/translate.rs` — `walk_l0` / `walk_l1_leaf` 新增
+`is_execute` 参数, need_perm 计算改为:
+
+```rust
+let need_perm = if is_write { PTE_R | PTE_W } else if is_execute { 0 } else { PTE_R };
+```
+
+取指不要求 R 位; X 检查由 `translate_va` 的 `check_pte_perm` 后置完成
+(is_execute 时返回 pte_x), 因此 X-only 数据读/写仍被正确拒绝。
+
+### 回归测试
+
+- Rust 单元测试 `sv39_walk_allows_fetch_of_xonly_leaf`: 对 X-only 4 KiB 页
+  取指返回正确 PA, 数据读/写均返回 None
+- `tests/test_emulator.py::TestNativeXonlyFetch` (端到端, native run 引擎):
+  - `test_xonly_fetch_via_stip_trap_vector`: STIP 投递到 stvec=trap_vector
+    (X-only 页), 取指成功并执行, 断点命中, 不陷入 M 模式 — 修复前必然超时
+  - `test_xonly_page_data_read_still_faults`: 同页数据读仍触发 LoadPageFault
+    (scause=13, stval=trap_vector) — 确认取指放宽未波及 R 位要求
+
+## 2026-08-25 — Zbb andn/orn/xnor 误实现修复: funct7=0x20 分支回落基础 ALU 语义
+
+### 现象
+
+Zbb 扩展指令 `andn`/`orn`/`xnor` (funct7=0x20) 执行结果错误:
+
+- `andn` (funct3=0b111) 被实现为 `rs1 & rs2` (AND), 规范应为 `rs1 & ~rs2`
+- `orn` (funct3=0b110) 被实现为 `rs1 | rs2` (OR), 规范应为 `rs1 | ~rs2`
+- `xnor` (funct3=0b100) 被实现为 `rs1 ^ rs2` (XOR), 规范应为 `~(rs1 ^ rs2)`
+
+`test_zbb.py::TestZbbRtype` 中对应三个测试项使用了与错误实现"恰好一致"的
+期望值 (如 andn 期望 `0xFF00... & 0xF0F0...` 的纯 AND 结果), 因此测试一直通过,
+掩盖了规范背离。真实固件 (Linux Zbb 代码路径) 会计算出错误结果。
+
+### 根因
+
+`Hart._handle_op_alu` 对 funct7=0x20 的指令未识别为 Zbb 重定义语义, 直接回落
+基础 ALU 分支 (funct3=0b111→and, 0b110→or, 0b100→xor)。RISC-V 规范中 funct7=0x20
+与基础 ALU 的 funct7=0x00 共用 opcode/funct3 编码, 但语义不同: Zbb 将
+funct3=0b111/0b110/0b100 重新定义为 andn/orn/xnor (操作数取反后运算)。
+
+### 修复
+
+`pyremu/core/decoder.py` — 新增 `_zbb_alu()` 辅助函数, 对 funct7 ∈ {0x05, 0x20, 0x30}
+的 R-type 指令 (Zbb 全集) 统一分发:
+
+- funct7=0x20: `andn`=mask64(v1 & ~v2), `orn`=mask64(v1 | ~v2), `xnor`=mask64(~(v1 ^ v2))
+- funct7=0x05: `min`/`max` (有符号), `minu`/`maxu` (无符号)
+- funct7=0x30: `rol`/`ror` (64-bit 旋转, 移位量取 rs2 低 6 位)
+
+`_handle_op_alu` 中 funct3=0b100/0b110/0b111 的分支改为: funct7=0x00 时保留基础
+XOR/OR/AND 语义, funct7=0x20 时调用 `_zbb_alu`。所有结果经 `mask64` 归一化到
+`[0, 2^64)`, 遵循 GPR 64-bit 规范化约定。
+
+### 回归测试 (`tests/test_zbb.py::TestZbbRtype::test_zbb_rtype`)
+
+- 修正 andn/orn/xnor 三个测试项的期望值为规范值:
+  - andn `0xFF00FF00FF00FF00 & ~0xF0F0... = 0x0F000F000F000F00`
+  - orn `0xFF00FF00FF00FF00 | ~0xF0F0... = 0xFF0FFF0FFF0FFF0F`
+  - xnor `~(0xFF00FF00FF00FF00 ^ 0xF0F0...) = 0xF00FF00FF00FF00F`
+- 修正后的期望值在修复前实现下必然失败, 在修复后实现下通过 —
+  构成对 andn/orn/xnor 语义的回归锁定。
+
+## 2026-08-23 — WFI 空闲忙转修复: `_wake_event` 电平残留导致全 hart 空闲 100% CPU
+
+### 现象
+
+真实 Linux 客机 (rootfs 启动到 zsh) 全 hart WFI 空闲时, 模拟器进程仍占用
+~67% 聚合 CPU (3 harts)。宿主被拖满后, 键盘输入看似"无响应" — 与用户报告
+"启动到 zsh 后无法响应任何输入" 的现象吻合。
+
+### 根因
+
+`_wake_event` 是电平信号, 但消费方与置位方不对称:
+
+1. **置位方过多**: `termio.drain_rx()` 在**每次** drain 时无条件 `set()` (含空
+   drain); RX daemon 每 0.5s 周期 drain 一次, 事件被无限重新置位。UART RX 输入、
+   `ext_irq` 置位、看门狗 MSIP 注入也都 `set()`。
+2. **消费方只在一个窄路径 `clear()`**: `_native_finalize` 仅在中断真正唤醒
+   hart (`_recheck > 0`) 时 `clear()`; 常规 WFI_WAIT 退出路径不 clear。
+
+首次外设活动后事件永久置位 → `_wfi_sleep_if_idle` 的 `wait(timeout)` 每次立即
+返回 → "全 hart WFI 睡眠" 退化为 batch 忙转循环, CPU 100%。
+
+### 修复
+
+1. **`_wfi_sleep_if_idle` 等待前先 `clear()`** — 陈旧事件只表示先前循环已处理
+   过的工作, 不得阻止本轮睡眠。clear-then-wait 的微小竞态 (clear 与 wait 之间
+   到达的事件) 至多让本轮回合多睡一个 timeout, 数据不丢失: RX daemon 持续 drain,
+   下轮 batch 必然处理 ring 中数据, 输入延迟上界 = sleep_sec (≤ 200ms)。
+2. **`termio.drain_rx()` 仅在有实际输入搬运到 UART FIFO 时 `set()`** — 空 drain
+   不再重新置位事件, 消除 daemon 每 0.5s 周期对事件的无谓重置。
+
+### 回归测试 (`tests/test_emulator.py::TestWfiIdleSleep`)
+
+- `test_wfi_sleep_stale_event_does_not_spin`: 已置位的事件残留不得阻止睡眠
+  (修复前 wait 立即返回 → 断言失败, 复现忙转)
+- `test_wfi_sleep_wakes_on_event_during_wait`: 睡眠中途到达的新事件应立即唤醒
+  (保留事件驱动低输入延迟特性)
+- `test_drain_rx_only_wakes_on_input`: 空 drain 不得 set 事件; 有输入时 set
+
 ## 2026-08-14 — 移除连续 trap 兜底 + 时钟源超时改为绝对 deadline
 
 ### 移除连续 trap 检测 (对齐 QEMU)

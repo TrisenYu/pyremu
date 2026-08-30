@@ -55,7 +55,6 @@ class ExecutionMixin(SharedMixinAttrs):
     _mem_changes: list[MemoryChange]
     _watch_ranges: list[tuple[int, int]]
     _watch_hit: tuple[int, int, int, bytes] | None
-    _paused: bool
     _running: bool
     _terminated: bool
     _sigint_count: int
@@ -171,7 +170,6 @@ class ExecutionMixin(SharedMixinAttrs):
                 if not (max(a, ws) < min(a + sz, we)):
                     continue
                 self._watch_hit = (h.pc, a, sz, change.old)
-                self._paused = True
                 self._console.print(
                     f"  [red] (@) 写监控命中[/] pc={hex_addr(h.pc)}"
                     f"  写入 {hex_addr(a)} ({sz}B)"
@@ -212,7 +210,7 @@ class ExecutionMixin(SharedMixinAttrs):
 
         停止事件与接管:
         - Ctrl+Q 设备暂停事件 — 引擎逐指令检查、即时退出, 状态保留
-          在 live 数组中; stop_flag 由本函数消费 -> _paused.
+          在 live 数组中; stop_flag 由本函数消费后回到 REPL.
         - 固件停机序列 (semihosting SYS_EXIT) -> 调试器接管.
         - addr 断点命中 (Rust 内联比对, EXIT_BREAKPOINT) -> 报告.
         - 全部 hart halted.
@@ -222,7 +220,6 @@ class ExecutionMixin(SharedMixinAttrs):
             timeout: 时钟源超时秒数, 默认 3600 (1 小时). 设为 0 禁用.
         """
         self._running = True
-        self._paused = False
         self._terminated = False
         self._bp_hit_this_run.clear()
         self._enter_run_mode()
@@ -246,7 +243,6 @@ class ExecutionMixin(SharedMixinAttrs):
         except TimeoutError:
             self._warn(f"运行超时 ({timeout:.0f}s), 强制停止")
             self._show_trap_context(self.hart)
-            self._paused = True
         finally:
             # 引擎可能在无退出事件时长时间运行; 一轮结束刷新 UART 输出.
             self._flush_uart_if_present()
@@ -255,18 +251,14 @@ class ExecutionMixin(SharedMixinAttrs):
         if self._emu._native_stop_flag.value != 0:
             # Ctrl+Q 事件 — 全部 hart 已暂停, 消费标志后回到 REPL.
             self._emu._native_stop_flag.value = 0
-            self._paused = True
         if reason == RunStopReason.BREAKPOINT:
             self._check_multi_hart_bp(include_addr=True)
-            self._paused = True
         elif reason == RunStopReason.EBREAK:
             self._console.print(
                 "[dim]固件执行停机序列 (semihosting SYS_EXIT) — 全部 hart 停止[/]"
             )
-            self._paused = True
         elif all(h._halted for h in self._emu.harts):
             self._warn("所有 Hart 已暂停")
-            self._paused = True
 
         self._running = False
         self._enter_repl_mode()
@@ -287,7 +279,6 @@ class ExecutionMixin(SharedMixinAttrs):
         if count <= 0:
             self._err("步数须 > 0")
             return
-        self._paused = False
         self._hart_paused.clear()
 
         for _ in range(count):
@@ -337,7 +328,6 @@ class ExecutionMixin(SharedMixinAttrs):
 
     def cmd_run(self, n: int = 1) -> None:
         self._console.print(f"[dim]执行 {n} 条指令...[/]")
-        self._paused = False
         self._hart_paused.clear()
         for _ in range(n):
             self._emu.step()
@@ -423,7 +413,6 @@ class ExecutionMixin(SharedMixinAttrs):
         self._stack_frames = []
         self._current_frame_idx = 0
         self._last_command = None
-        self._paused = False
         self._hart_paused.clear()
         self._bp_hit_this_run.clear()
         self._prev_instr_csr_addr = -1

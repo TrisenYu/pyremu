@@ -97,14 +97,9 @@ def _imsic_clear_ipi_on_trap(hart: HartWithRegs, exc_code: int) -> None:
     imsic = hart._imsic
     if imsic is None:
         return
-    if exc_code == 3:
-        file = imsic._files[hart.id][0]  # M-file
-    elif exc_code == 1:
-        file = imsic._files[hart.id][1]  # S-file
-    else:
-        return
-    if file.eidelivery == 0:
-        file.clear_pending(exc_code)
+    # 经 IMSIC 公共入口 (持锁) 清除 eip, 与 RX daemon 的 set_ip_number RMW
+    # 互斥, 避免 eip[word] 的丢失更新.
+    imsic.clear_ipi_on_trap(hart.id, exc_code)
 
 # ============================================================
 #  Trap 处理
@@ -182,9 +177,9 @@ def _trap_deliver_smode(
     hart.stval_val = tval
 
     # 更新 mstatus:
-    #   SPIE ← SIE (保存进入 trap 前的中断使能)
-    #   SIE  ← 0   (进入 trap 后关全局中断)
-    #   SPP  ← 当前特权级
+    #   SPIE <- SIE (保存进入 trap 前的中断使能)
+    #   SIE  <- 0   (进入 trap 后关全局中断)
+    #   SPP  <- 当前特权级
     mstatus = hart.mstatus_val
     if mstatus & MSTATUS_SIE:
         mstatus |= MSTATUS_SPIE
@@ -192,7 +187,7 @@ def _trap_deliver_smode(
         mstatus &= ~MSTATUS_SPIE
     mstatus &= ~MSTATUS_SIE
 
-    # SPP ← 当前 mode (U=0, S=1)
+    # SPP <- 当前 mode (U=0, S=1)
     _spp_map = {RiscvMode.U: 0, RiscvMode.S: 1}
     spp_code = _spp_map.get(hart.mode, 0)
     mstatus = (mstatus & ~MSTATUS_SPP) | (spp_code << 8)
@@ -246,9 +241,9 @@ def _trap_deliver_mmode(
     hart.mtval_val = tval
 
     # 更新 mstatus:
-    #   MPIE ← MIE
-    #   MIE  ← 0
-    #   MPP  ← 当前特权级
+    #   MPIE <- MIE
+    #   MIE  <- 0
+    #   MPP  <- 当前特权级
     mstatus = hart.mstatus_val
     if mstatus & MSTATUS_MIE:
         mstatus |= MSTATUS_MPIE
@@ -256,7 +251,7 @@ def _trap_deliver_mmode(
         mstatus &= ~MSTATUS_MPIE
     mstatus &= ~MSTATUS_MIE
 
-    # MPP ← 当前 mode
+    # MPP <- 当前 mode
     _mpp_map = {RiscvMode.U: 0, RiscvMode.S: 1, RiscvMode.M: 3}
     mpp_code = _mpp_map.get(hart.mode, 0)
     mstatus = (mstatus & ~MSTATUS_MPP) | (mpp_code << 11)
@@ -308,10 +303,46 @@ def trap_ecall(
     deliver_trap(hart, cause, tval=hart.pc, is_interrupt=False)
 
 
+# ---- RISC-V semihosting 停机序列 (QEMU 裸机测试约定) ----
+# 固件停机序列: ``li a0, 0x18; slli x0,x0,0x1f; ebreak; srai x0,x0,7``.
+# marker 指令编码与 Rust 引擎 handlers.rs 的 SEMIHOSTING_PRE/POST 保持一致.
+_SEMIHOSTING_SYS_EXIT: int = 0x18
+_SEMIHOSTING_PRE: int = 0x01F01013  # slli x0, x0, 0x1f
+_SEMIHOSTING_POST: int = 0x40705013  # srai x0, x0, 7
+
+
+def _is_semihosting_sys_exit(
+    hart: HartWithRegs,
+) -> bool:
+    """检测 ebreak 处是否为 semihosting SYS_EXIT 停机序列.
+
+    ebreak 前后各 4 字节必须是指定 marker (slli/srai x0), 且 a0 == 0x18.
+    identity (VA=PA) 映射下 pc 即物理地址, 直接经 Bus 读取固件字节.
+    """
+    if hart.gprs[10] != _SEMIHOSTING_SYS_EXIT:
+        return False
+    bus = hart._bus
+    if bus is None:
+        return False
+    data = bus.try_read(hart.pc - 4, 12)
+    if data is None or len(data) < 12:
+        return False
+    return (
+        int.from_bytes(data[0:4], "little") == _SEMIHOSTING_PRE
+        and int.from_bytes(data[8:12], "little") == _SEMIHOSTING_POST
+    )
+
+
 def trap_ebreak(
     hart: HartWithRegs,
 ) -> None:
     """EBREAK: 断点异常."""
+    # semihosting SYS_EXIT (停机序列) — 不投递断点 trap, 置停机标记供 run()
+    # 返回. native 引擎 (try_semihosting) 在此情形同样直接停机而非投递 trap;
+    # 纯 Python 路径若无此检测, 固件停机序列会退化为 WFI 自旋, run() 永不返回.
+    if _is_semihosting_sys_exit(hart):
+        hart._semihosting_sys_exit = True
+        return
     deliver_trap(hart, TrapType.Breakpoint, tval=hart.pc, is_interrupt=False)
 
 
@@ -328,12 +359,12 @@ def trap_mret(
         return
     mstatus = hart.mstatus_val
 
-    # 恢复特权级: mode ← MPP
+    # 恢复特权级: mode <- MPP
     mpp = (mstatus & MSTATUS_MPP) >> 11
     _mpp_to_mode = {0: RiscvMode.U, 1: RiscvMode.S, 3: RiscvMode.M}
     hart.mode = _mpp_to_mode.get(mpp, RiscvMode.U)
 
-    # 恢复中断使能: MIE ← MPIE, 然后 MPIE ← 1
+    # 恢复中断使能: MIE <- MPIE, 然后 MPIE <- 1
     if mstatus & MSTATUS_MPIE:
         mstatus |= MSTATUS_MIE
     else:
@@ -366,22 +397,22 @@ def trap_sret(
         return
     mstatus = hart.mstatus_val
 
-    # 恢复特权级: mode ← SPP
+    # 恢复特权级: mode <- SPP
     spp = (mstatus & MSTATUS_SPP) >> 8
     hart.mode = RiscvMode.U if spp == 0 else RiscvMode.S
 
-    # 恢复中断使能: SIE ← SPIE, 然后 SPIE ← 1
+    # 恢复中断使能: SIE <- SPIE, 然后 SPIE <- 1
     if mstatus & MSTATUS_SPIE:
         mstatus |= MSTATUS_SIE
     else:
         mstatus &= ~MSTATUS_SIE
     mstatus |= MSTATUS_SPIE
 
-    # SPP ← U
+    # SPP <- U
     mstatus &= ~MSTATUS_SPP
     hart.mstatus_val = mstatus
 
-    # PC ← sepc
+    # PC <- sepc
     hart.pc = mask64(hart.sepc_val)
 
     # 不在此处清除 _wfi_woken (同 trap_mret 的注释说明).

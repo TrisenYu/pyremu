@@ -6,6 +6,7 @@
 """
 
 import os
+from unittest import mock
 
 import pytest
 
@@ -168,6 +169,37 @@ class TestCrossHartMsip:
         set_msip(emu.clint, 1, 1)
         emu.step()
         assert emu.clint._msip[1] == 1, f"MSIP[1]={emu.clint._msip[1]}"
+
+    def test_msip_reset_during_batch_survives_unmarshal(self):
+        """batch 期间新 IPI 的电平必须保留到下一轮, 不得被旧电平反向清除.
+
+        回归: 旧实现用 batch 前的 MSIP 电平 (旧 IPI 已挂起) 反向清除
+        CLINT._msip。若 batch 执行期间旧 IPI 的 handler 写 0 清电平、随后
+        另一 hart 写入新 IPI (电平重新置 1), 而目标 hart 的 sync_msip 尚未
+        消费该电平 (mip.MSIP == 0), 则该新 IPI 被误清零 -> 发送方永远自旋
+        在 OpenSBI tlb_sync 等待确认 -> TLB-shootdown 死锁。
+        """
+        cfg = PlatformConfig(num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024)
+        emu = Emulator(cfg, bootargs="")
+
+        # 旧 IPI: batch 前 CLINT MSIP[1] 已挂起 (旧代码 _pre_speedup_msip[1] == 1)
+        emu.clint._msip[1] = 1
+
+        def _stub_batch(*_args, **_kwargs):
+            # 模拟 Rust 加速执行结果:
+            # 1) 目标 hart 1 的 handler 写 0 清除旧 MSIP
+            # 2) 随后另一 hart 写入新 IPI -> msip 数组电平位重新置 1
+            # 3) 目标 hart 的 sync_msip 尚未消费该电平 -> mip.MSIP 保持 0
+            emu._clint_msip_arr[1] = 1
+            emu._speedup_hart_states[1].mip &= ~(1 << 3)
+            return None
+
+        with mock.patch("pyremu.emulator.run_parallel", side_effect=_stub_batch):
+            emu._speedup_for_cmd_step(emu.harts)
+
+        assert (
+            emu.clint._msip[1] == 1
+        ), "batch 期间新到达的 MSIP 电平必须保留到下一轮 batch 投递"
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -344,8 +344,19 @@ fn walk_l1_leaf(
 	vpn0: u64,
 	offset: u64,
 	is_write: bool,
+	is_execute: bool,
 ) -> Option<TranslateResult> {
-	let need_perm = if is_write { PTE_R | PTE_W } else { PTE_R };
+	// 取指不要求 R 位 — RISC-V 允许 X-only 页 (R=0, W=0, X=1) 被取指,
+	// X 检查由 translate_va 的 check_pte_perm 后置完成. 修复前此处对取指
+	// 也强制 PTE_R, 导致 runtime 的 X-only text (trap_vector 高 VA 映射)
+	// 取指被误判 InstrPageFault (Batch-20 trap loop 根因).
+	let need_perm = if is_write {
+		PTE_R | PTE_W
+	} else if is_execute {
+		0
+	} else {
+		PTE_R
+	};
 	if perm as u64 & need_perm != need_perm {
 		return None;
 	}
@@ -398,6 +409,7 @@ fn walk_l0(
 	vpn0: u64,
 	offset: u64,
 	is_write: bool,
+	is_execute: bool,
 ) -> Option<TranslateResult> {
 	let addr = (l1_ppn << 12).wrapping_add(vpn0 * 8);
 	let raw = read_pte(ctx, addr);
@@ -405,7 +417,14 @@ fn walk_l0(
 	if pte.v == 0 || pte.is_leaf == 0 {
 		return None;
 	}
-	let need_perm = if is_write { PTE_R | PTE_W } else { PTE_R };
+	// 与 walk_l1_leaf 相同: 取指不要求 R 位 (X-only 页可执行).
+	let need_perm = if is_write {
+		PTE_R | PTE_W
+	} else if is_execute {
+		0
+	} else {
+		PTE_R
+	};
 	if pte.perm as u64 & need_perm != need_perm {
 		return None;
 	}
@@ -475,7 +494,13 @@ fn is_trace_vpn(vpn: u64) -> bool {
 ///
 /// Returns ``Some(TranslateResult)`` on success (4 KiB or 2 MiB leaf),
 /// or ``None`` if the walk encounters an invalid/non-resident PTE.
-pub fn sv39_walk(ctx: &WalkCtx, satp: u64, va: u64, is_write: bool) -> Option<TranslateResult> {
+pub fn sv39_walk(
+	ctx: &WalkCtx,
+	satp: u64,
+	va: u64,
+	is_write: bool,
+	is_execute: bool,
+) -> Option<TranslateResult> {
 	let mode = satp >> 60;
 	if mode != SATP_MODE_SV39 {
 		return None;
@@ -502,11 +527,12 @@ pub fn sv39_walk(ctx: &WalkCtx, satp: u64, va: u64, is_write: bool) -> Option<Tr
 			vpn.vpn0,
 			vpn.offset,
 			is_write,
+			is_execute,
 		)?;
 		return Some(r);
 	}
 
-	let r = walk_l0(ctx, l1_pte.ppn, vpn.vpn0, vpn.offset, is_write)?;
+	let r = walk_l0(ctx, l1_pte.ppn, vpn.vpn0, vpn.offset, is_write, is_execute)?;
 	Some(r)
 }
 
@@ -605,7 +631,7 @@ pub fn tlb_insert(
 	ppn: u64,
 	perm: u8,
 	level: u8,
-	mdid: u8,
+	mdid: u64,
 	asid: u16,
 ) {
 	let idx = match prefer_idx {
@@ -703,8 +729,11 @@ fn check_pte_perm(perm: u8, eff_mode: u8, mstatus: u64, is_write: bool, is_execu
 			return false;
 		}
 	} else if eff_mode == riscv_mode::S {
-		// SUM=1 allows S-mode to access user (U=1) pages
-		if pte_u && (mstatus & (1 << 18)) == 0 {
+		// SUM=1 允许 S 模式数据访问 U=1 页; 但取指永不许可
+		// (RISC-V §4.3.2 基础规则 — S 模式不能从 U 页取指, 与 SUM 无关).
+		// 早期实现遗漏 is_execute 分支, 使 SUM 放行了 S 模式对 U 页的取指,
+		// 与 Python mem_check_aux._check_pte_perm 分歧.
+		if pte_u && (is_execute || (mstatus & (1 << 18)) == 0) {
 			return false;
 		}
 	}
@@ -905,7 +934,7 @@ pub fn translate_va(
 	};
 
 	// ---- Page-table walk ----
-	let result = sv39_walk(ctx, state.satp, va, is_write)
+	let result = sv39_walk(ctx, state.satp, va, is_write, is_execute)
 		.ok_or_else(|| TranslateFault::PageFault(fault_code(is_execute, is_write)))?;
 
 	if !check_pte_perm(result.perm, eff_mode, state.mstatus, is_write, is_execute) {
@@ -1144,7 +1173,7 @@ mod tests {
 			num_harts: 1,
 		};
 
-		let result = sv39_walk(&ctx, satp, 0x1000, false);
+		let result = sv39_walk(&ctx, satp, 0x1000, false, false);
 		assert!(result.is_some());
 		let l0_off = 0x2000usize + (sv39_decompose_va(0x1000).vpn0 * 8) as usize;
 		let l0_val = u64::from_le_bytes(ram[l0_off..l0_off + 8].try_into().unwrap());
@@ -1168,7 +1197,7 @@ mod tests {
 			num_harts: 1,
 		};
 
-		let result = sv39_walk(&ctx, satp, 0x2000, true);
+		let result = sv39_walk(&ctx, satp, 0x2000, true, false);
 		assert!(result.is_some());
 		let l0_off = 0x2000usize + (sv39_decompose_va(0x2000).vpn0 * 8) as usize;
 		let l0_val = u64::from_le_bytes(ram[l0_off..l0_off + 8].try_into().unwrap());
@@ -1196,7 +1225,7 @@ mod tests {
 			num_harts: 1,
 		};
 
-		let _result = sv39_walk(&ctx, satp, 0x3000, false);
+		let _result = sv39_walk(&ctx, satp, 0x3000, false, false);
 		let l2_off = (sv39_decompose_va(0x3000).vpn2 * 8) as usize;
 		let l2_val = u64::from_le_bytes(ram[l2_off..l2_off + 8].try_into().unwrap());
 		assert_ne!(l2_val & PTE_A, 0, "A bit should be set on L2 PTE");
@@ -1204,6 +1233,52 @@ mod tests {
 		let l1_off = 0x1000usize + (sv39_decompose_va(0x3000).vpn1 * 8) as usize;
 		let l1_val = u64::from_le_bytes(ram[l1_off..l1_off + 8].try_into().unwrap());
 		assert_ne!(l1_val & PTE_A, 0, "A bit should be set on L1 PTE");
+	}
+
+	#[test]
+	fn sv39_walk_allows_fetch_of_xonly_leaf() {
+		// 回归: X-only 页 (R=0, W=0, X=1) 必须允许取指.
+		// 修复前 walk_l0 对取指也强制 PTE_R, 使 runtime 的 X-only text
+		// (trap_vector 高 VA 映射) 取指被误判 InstrPageFault → Batch-20 trap loop.
+		let mut ram = vec![0u8; 0x3000];
+		let va = 0xffff_ffe0_0000_1000u64; // 与 enclave trap_vector 同型的高 VA
+		let pa = 0x8ae0_1000u64;
+		let satp = setup_4k_page_table(&mut ram, va, pa, PTE_X);
+		let ctx = WalkCtx {
+			ram: ram.as_mut_ptr(),
+			ram_size: ram.len() as u64,
+			ram_base: 0,
+			shadow_base: 0,
+			shadow_size: 0,
+			tlb_gen: std::ptr::null(),
+			itlb_hand: Cell::new(0),
+			dtlb_hand: Cell::new(0),
+			lr_reserved: std::ptr::null_mut(),
+			num_harts: 1,
+		};
+
+		// 取指 (is_execute=true): 必须成功, 且翻译到正确的 PA.
+		let fetch = sv39_walk(&ctx, satp, va, false, true);
+		assert!(
+			fetch.is_some(),
+			"X-only leaf 取指必须成功 (修复前返回 None)"
+		);
+		assert_eq!(
+			fetch.unwrap().pa,
+			pa,
+			"X-only leaf 取指应翻译到正确物理地址"
+		);
+
+		// 数据读 (is_execute=false, is_write=false): R=0 页不可读, 仍应失败.
+		let load = sv39_walk(&ctx, satp, va, false, false);
+		assert!(
+			load.is_none(),
+			"X-only leaf 数据读仍应被拒绝 (需要 PTE_R)"
+		);
+
+		// 写 (is_write=true): R&W 均缺, 仍应失败.
+		let store = sv39_walk(&ctx, satp, va, true, false);
+		assert!(store.is_none(), "X-only leaf 写仍应被拒绝 (需要 PTE_R|PTE_W)");
 	}
 
 	#[test]
@@ -1330,6 +1405,53 @@ mod tests {
 			pa,
 			Some(0x8000_2000),
 			"D-mode fetch must bypass Sv39 (VA==PA)"
+		);
+	}
+
+	/// Regression: S 模式取指永不从 U 页执行, 即使 SUM=1 也不能放行
+	/// (RISC-V §4.3.2 基础规则 — SUM 只放宽数据访问, 取指不受 SUM 影响).
+	/// 早期实现遗漏 is_execute 分支, 使 SUM 错误放行了 S 模式对 U 页的取指,
+	/// 与 Python mem_check_aux._check_pte_perm 分歧: 内核 sret 到 U 页时
+	/// native 模式取指被错误允许/拒绝不一致, 产生难以定位的执行路径分叉.
+	#[test]
+	fn s_mode_fetch_of_user_page_faults_even_with_sum() {
+		// U=1 可执行页: SUM=1 时 S 模式取指 U 页必须 fault.
+		let perm = (PTE_U | PTE_X) as u8;
+		assert!(
+			!check_pte_perm(perm, riscv_mode::S, 1 << 18, false, true),
+			"S 模式取指 U 页必须 fault, 与 SUM=1 无关"
+		);
+		// SUM=0 时同样 fault.
+		assert!(
+			!check_pte_perm(perm, riscv_mode::S, 0, false, true),
+			"S 模式取指 U 页在 SUM=0 时必须 fault"
+		);
+		// 对照: 同一 U|X 页在 U 模式取指合法 (不会走到 U-check 拒绝).
+		assert!(
+			check_pte_perm(perm, riscv_mode::U, 0, false, true),
+			"U 模式从 U|X 页取指应合法"
+		);
+	}
+
+	/// Regression: SUM=1 只放宽 S 模式对 U 页的*数据*访问 — 读取 (或写入) 放行,
+	/// 取指仍拒绝. 与 Python mem_check_aux._check_pte_perm 保持一致.
+	#[test]
+	fn sum_allows_data_access_but_not_fetch() {
+		// U=1 可读页: SUM=1 只放行 S 模式*数据*访问, 取指仍拒绝.
+		let perm = (PTE_U | PTE_R) as u8;
+		assert!(
+			check_pte_perm(perm, riscv_mode::S, 1 << 18, false, false),
+			"S 模式数据读 U 页在 SUM=1 时应放行"
+		);
+		// SUM=0: S 模式数据读 U 页拒绝.
+		assert!(
+			!check_pte_perm(perm, riscv_mode::S, 0, false, false),
+			"S 模式数据读 U 页在 SUM=0 时应拒绝"
+		);
+		// 取指 (即使读到可读页) 仍拒绝 — 取指只看 X 位.
+		assert!(
+			!check_pte_perm(perm, riscv_mode::S, 1 << 18, false, true),
+			"S 模式从仅可读 U 页取指必须 fault (无 X 位)"
 		);
 	}
 }

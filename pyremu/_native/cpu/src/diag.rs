@@ -4,9 +4,13 @@
 //! When the feature is disabled, each function compiles to a no-op — the
 //! call sites stay clean (no ``#[cfg]`` at every caller) and the compiler
 //! eliminates the dead stores.
+#[cfg(feature = "diagnostic")]
+use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "diagnostic")]
+use std::io::Write;
 
-use crate::state::HartDiag;
-
+use crate::state::{HartDiag, HartState};
+use crate::translate::WalkCtx;
 // ============================================================
 //  Shared: log file helper
 // ============================================================
@@ -24,7 +28,6 @@ fn diag_log_path() -> String {
 pub fn log_line(_line: &str) {
 	#[cfg(feature = "diagnostic")]
 	{
-		use std::io::Write;
 		if let Ok(mut f) = std::fs::OpenOptions::new()
 			.create(true)
 			.append(true)
@@ -35,6 +38,8 @@ pub fn log_line(_line: &str) {
 	}
 }
 
+/// 长 batch 诊断: 采样各 hart 的 PC/mode/waiting/halted/mip 快照.
+///
 // ============================================================
 //  WFI spin-loop diagnostics
 // ============================================================
@@ -90,7 +95,7 @@ pub fn msie_cleared_at(_diag: &mut HartDiag, _pc: u64) {
 #[inline(always)]
 #[allow(unused)]
 #[allow(dead_code)]
-pub fn ld_linux_trap(_state: &crate::state::HartState, _code: u64, _tval: u64) {
+pub fn ld_linux_trap(_state: &HartState, _code: u64, _tval: u64) {
 	#[cfg(feature = "diagnostic")]
 	{
 		let pc = _state.pc;
@@ -128,10 +133,9 @@ pub fn ld_linux_trap(_state: &crate::state::HartState, _code: u64, _tval: u64) {
 #[inline(always)]
 #[allow(unused)]
 #[allow(dead_code)]
-pub fn sret_to_umode(_state: &crate::state::HartState, _ctx: &crate::translate::WalkCtx) {
+pub fn sret_to_umode(_state: &HartState, _ctx: &WalkCtx) {
 	#[cfg(feature = "diagnostic")]
 	{
-		use std::sync::atomic::{AtomicU32, Ordering};
 		static REMAINING: AtomicU32 = AtomicU32::new(u32::MAX);
 		let v = REMAINING.load(Ordering::Relaxed);
 		let remaining = if v == u32::MAX {
@@ -177,16 +181,19 @@ pub fn sret_to_umode(_state: &crate::state::HartState, _ctx: &crate::translate::
 
 /// Read 64 u64 words from the user stack at sp, translating through Sv39 if enabled.
 #[cfg(feature = "diagnostic")]
+#[inline(always)]
+#[allow(unused)]
+#[allow(dead_code)]
 fn read_user_stack_from_sp(
-	_state: &crate::state::HartState,
-	_ctx: &crate::translate::WalkCtx,
+	_state: &HartState,
+	_ctx: &WalkCtx,
 ) -> [u64; 64] {
 	let mut out = [0u64; 64];
 	let sp = _state.gprs[2];
 	for i in 0..64u64 {
 		let va = sp.wrapping_add(i * 8);
 		let pa = if _state.mmu_mode == 8 {
-			match crate::translate::sv39_walk(_ctx, _state.satp, va, false) {
+			match crate::translate::sv39_walk(_ctx, _state.satp, va, false, false) {
 				Some(t) => t.pa,
 				None => continue,
 			}

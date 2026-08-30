@@ -110,8 +110,6 @@ class BreakpointMixin(SharedMixinAttrs):
         )
         if self._bp_mode == "async":
             self._hart_paused.add(hart.id)
-        else:
-            self._paused = True
 
     # ----------------------------------------------------------
     #  地址匹配

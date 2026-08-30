@@ -1,0 +1,10 @@
+# 量子化学载荷 (化学生物域)
+#
+# Hartree-Fock 自洽场: H2 分子 STO-3G 最小基组基态能量。无外部依赖的纯数值内核
+# (高斯积分 + SCF 迭代), 仅用 f64 数学。
+#
+# 自检: H 原子基态 -0.4666 Ha; H2 分子 HF 总能量 -1.1167 Ha (键长 R=1.4 Bohr)。
+[package]
+name = "chem"
+version.workspace = true
+edition.workspace = true

@@ -16,6 +16,7 @@
 - GPIO  : 双向通用 I/O 控制器
 """
 
+from pyremu.peripheral.crng import CRNG
 from pyremu.peripheral.gpio import GPIO
 from pyremu.peripheral.i2c import I2C
 from pyremu.peripheral.spi import SPI
@@ -23,4 +24,4 @@ from pyremu.peripheral.termio import TerminalIO
 from pyremu.peripheral.uart import UART
 from pyremu.peripheral.virtio_blk import VirtIOBlock
 
-__all__ = ["TerminalIO", "UART", "SPI", "I2C", "GPIO", "VirtIOBlock"]
+__all__ = ["TerminalIO", "UART", "SPI", "I2C", "GPIO", "VirtIOBlock", "CRNG"]

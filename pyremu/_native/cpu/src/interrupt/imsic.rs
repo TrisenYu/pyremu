@@ -137,20 +137,24 @@ pub(crate) struct ImsicAddr {
 ///   ============ ============================= ===================
 ///   Range        Offset                         Per-hart stride
 ///   ============ ============================= ===================
-///   M-file       [0,          num_harts*0x1000) 0x1000
-///   S-file       [N*0x1000,  2*num_harts*0x1000) 0x1000
+///   M-file       [0,          padded*0x1000)    0x1000
+///   S-file       [padded*0x1000, 2*padded*0x1000) 0x1000
 ///   ============ ============================= ===================
 ///
-/// Single ``reg`` entry ``<IMSIC_M_BASE, 2*num_harts*0x1000>`` passes
-/// OpenSBI's ``imsic_data_check`` without modification (single entry →
-/// ``addr == base_addr`` trivially).  ``imsic_ipi_send`` works because
-/// ``reloff = hart_index * 0x1000`` always lands inside the M-file half.
+/// ``padded`` is ``num_harts`` rounded up to a power of two.  This MUST
+/// match the DTB (``padded_count = 1 << hart_index_bits``) and the Python
+/// IMSIC (``_padded_file_count = 1 << (num_harts - 1).bit_length()``) —
+/// OpenSBI's ``imsic_data_check`` rejects any ``reg`` size not aligned to
+/// ``2^hart_index_bits * PAGE_SIZE``, so both halves are padded.  Using the
+/// raw ``num_harts`` here shifts the S-file base one hart short for
+/// non-power-of-2 hart counts (e.g. 3), silently mis-routing S-file IPIs /
+/// device MSIs to the wrong hart.
 ///
 /// Each page contains ``seteipnum`` at +0x0 and ``clreipnum`` at +0x8.
 pub(crate) fn decode_imsic_addr(pa: u64, num_harts: u64) -> Option<ImsicAddr> {
 	let base = crate::state::IMSIC_M_BASE;
 	let page_stride: u64 = 0x1000; // IMSIC_MMIO_PAGE_SZ
-	let m_range = num_harts * page_stride;
+	let m_range = num_harts.next_power_of_two() * page_stride;
 
 	if pa < base {
 		return None;
@@ -159,8 +163,12 @@ pub(crate) fn decode_imsic_addr(pa: u64, num_harts: u64) -> Option<ImsicAddr> {
 	let off = pa - base;
 	if off < m_range {
 		// M-file half
+		let hart = (off / page_stride) as usize;
+		if hart >= num_harts as usize {
+			return None; // padding slot — no backing file
+		}
 		return Some(ImsicAddr {
-			hart: (off / page_stride) as usize,
+			hart,
 			is_sfile: false,
 			reg_off: off % page_stride,
 		});
@@ -168,13 +176,17 @@ pub(crate) fn decode_imsic_addr(pa: u64, num_harts: u64) -> Option<ImsicAddr> {
 	if off < 2 * m_range {
 		// S-file half
 		let s_off = off - m_range;
+		let hart = (s_off / page_stride) as usize;
+		if hart >= num_harts as usize {
+			return None; // padding slot — no backing file
+		}
 		return Some(ImsicAddr {
-			hart: (s_off / page_stride) as usize,
+			hart,
 			is_sfile: true,
 			reg_off: s_off % page_stride,
 		});
 	}
-	return None;
+	None
 }
 
 // ============================================================
@@ -1765,5 +1777,53 @@ mod tests {
 			1 << 9,
 			"SEIP stays pending when SIE=0"
 		);
+	}
+
+	// ---- decode_imsic_addr: power-of-2 padding ----
+
+	#[test]
+	fn decode_imsic_addr_pads_non_power_of_two_harts() {
+		// 3 harts → padded count = 4.  M-files occupy [0, 0x4000),
+		// S-files occupy [0x4000, 0x8000) — matching DTB/Python.
+		let base = crate::state::IMSIC_M_BASE;
+
+		// M-files for hart 0..2 must decode to the correct hart.
+		for hart in 0..3 {
+			let a = decode_imsic_addr(base + (hart * 0x1000), 3).unwrap();
+			assert_eq!(a.hart, hart as usize);
+			assert!(!a.is_sfile, "offset {hart:#x} is an M-file");
+			assert_eq!(a.reg_off, 0);
+		}
+
+		// S-file base = base + padded*0x1000 = base + 0x4000.
+		// Regression: the old `m_range = num_harts * 0x1000 = 0x3000`
+		// decoded base+0x4000 as hart 1's S-file (off=0x1000 past the
+		// S-file half), mis-routing hart 0's S-file IPI to hart 1.
+		let s0 = decode_imsic_addr(base + 0x4000, 3).unwrap();
+		assert!(s0.is_sfile, "base+0x4000 is the S-file half");
+		assert_eq!(s0.hart, 0, "S-file base maps to hart 0, not hart 1");
+
+		// Hart 2's S-file sits at base + 0x4000 + 2*0x1000 = 0x6000.
+		let s2 = decode_imsic_addr(base + 0x6000, 3).unwrap();
+		assert!(s2.is_sfile);
+		assert_eq!(s2.hart, 2);
+
+		// Padding slot (hart 3) has no backing file — decode must reject it.
+		assert!(decode_imsic_addr(base + 0x7000, 3).is_none());
+	}
+
+	#[test]
+	fn decode_imsic_addr_power_of_two_harts_unchanged() {
+		// 4 harts → padded count = 4 (identical to raw count).
+		let base = crate::state::IMSIC_M_BASE;
+		for hart in 0..4 {
+			let a = decode_imsic_addr(base + (hart * 0x1000), 4).unwrap();
+			assert_eq!(a.hart, hart as usize);
+			assert!(!a.is_sfile);
+		}
+		// S-file base = base + 4*0x1000.
+		let s0 = decode_imsic_addr(base + 0x4000, 4).unwrap();
+		assert!(s0.is_sfile);
+		assert_eq!(s0.hart, 0);
 	}
 }

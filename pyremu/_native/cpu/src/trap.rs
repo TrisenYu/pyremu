@@ -130,7 +130,7 @@ pub fn deliver_trap_smode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	// Save tval
 	state.stval = tval;
 
-	// mstatus: SPIE ← SIE, SIE ← 0, SPP ← current mode
+	// mstatus: SPIE <- SIE, SIE <- 0, SPP <- current mode
 	let sie_present = (state.mstatus & MSTATUS_SIE) != 0;
 	let spp_bits = mode_to_spp(state.mode) << 8;
 	if sie_present {
@@ -251,7 +251,7 @@ pub fn deliver_trap_mmode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	// Save tval
 	state.mtval = tval;
 
-	// mstatus: MPIE ← MIE, MIE ← 0, MPP ← current mode
+	// mstatus: MPIE <- MIE, MIE <- 0, MPP <- current mode
 	let mie_present = (state.mstatus & MSTATUS_MIE) != 0;
 	let mpp_bits = mode_to_mpp(state.mode) << 11;
 	if mie_present {

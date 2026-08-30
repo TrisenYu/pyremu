@@ -155,6 +155,140 @@ def _trunc_rem(a: int, b: int) -> int:
     return a - _trunc_div(a, b) * b
 
 
+# ============================================================
+#  Zbb (Basic bit-manipulation) 辅助函数
+# ============================================================
+
+def _zbb_imm(funct3: int, v: int, shamt: int) -> int:
+    """Zbb OP-IMM 分发 (funct7=0x30, funct3=001 或 101).
+
+    funct3=001 时, shamt 编码子指令 (imm[4:0]):
+      0=clz, 1=ctz, 2=cpop, 4=sext.b, 5=sext.h
+    funct3=101 时, shamt 为 rori 的旋转量.
+    """
+    if funct3 == 0b001:
+        if shamt == 0:  # clz
+            return 64 - mask64(v).bit_length() if v else 64
+        if shamt == 1:  # ctz
+            return (v & -v).bit_length() - 1 if v else 64
+        if shamt == 2:  # cpop
+            return bin(mask64(v)).count('1')
+        if shamt == 4:  # sext.b
+            byte = v & 0xFF
+            return byte | (0xFFFF_FFFF_FFFF_FF00 if byte & 0x80 else 0)
+        if shamt == 5:  # sext.h
+            hw = v & 0xFFFF
+            return hw | (0xFFFF_FFFF_FFFF_0000 if hw & 0x8000 else 0)
+    elif funct3 == 0b101:
+        # rori: rotate right immediate (64-bit)
+        s = shamt & 0x3F
+        v64 = mask64(v)
+        return mask64((v64 >> s) | (v64 << (64 - s))) if s else v64
+    raise ValueError(f"invalid Zbb funct3={funct3:#b} shamt={shamt}")
+
+
+def _zbb_imm32(funct3: int, v: int, shamt: int) -> int:
+    """Zbb OP-IMM-32 分发 (funct7=0x30).
+
+    funct3=001: shamt 编码子指令 — 0=clzw, 1=ctzw, 2=cpopw
+    funct3=101: roriw (32-bit rotate right immediate, 结果 sign-extend)
+    """
+    v32 = mask32(v)
+    if funct3 == 0b001:
+        if shamt == 0:  # clzw
+            r = 32 - v32.bit_length() if v32 else 32
+            return r
+        if shamt == 1:  # ctzw
+            r = (v32 & -v32).bit_length() - 1 if v32 else 32
+            return r
+        if shamt == 2:  # cpopw
+            return bin(v32).count('1')
+    elif funct3 == 0b101:
+        # roriw: rotate right 32-bit by immediate
+        s = shamt & 0x1F
+        r = mask32((v32 >> s) | (v32 << (32 - s))) if s else v32
+        return sext32(r)
+    raise ValueError(f"invalid Zbb imm32 funct3={funct3:#b} shamt={shamt}")
+
+
+def _zbb_orc_b(v: int) -> int:
+    """orc.b: 对每个字节, 若任一 bit 为 1 则该字节全 1, 否则全 0."""
+    result = 0
+    for i in range(8):
+        byte = (v >> (i * 8)) & 0xFF
+        if byte:
+            result |= 0xFF << (i * 8)
+    return result
+
+
+def _zbb_rev8(v: int) -> int:
+    """rev8.d (RV64): 字节序反转."""
+    result = 0
+    for i in range(8):
+        result |= ((mask64(v) >> (i * 8)) & 0xFF) << ((7 - i) * 8)
+    return result
+
+
+def _zbb_alu(
+    funct3: int,
+    funct7: int,
+    v1: int,
+    v2: int,
+) -> int:
+    """Zbb R-type 分发 (funct7 ∈ {0x05, 0x20, 0x30})."""
+    if funct7 == 0x20:
+        if funct3 == 0b111:  # andn: rs1 & ~rs2
+            return mask64(v1 & ~v2)
+        if funct3 == 0b110:  # orn: rs1 | ~rs2
+            return mask64(v1 | ~v2)
+        if funct3 == 0b100:  # xnor: ~(rs1 ^ rs2)
+            return mask64(~(v1 ^ v2))
+    elif funct7 == 0x05:
+        s1 = _sint64(v1).value
+        s2 = _sint64(v2).value
+        if funct3 == 0b100:  # min
+            return mask64(min(s1, s2))
+        if funct3 == 0b110:  # max
+            return mask64(max(s1, s2))
+        if funct3 == 0b101:  # minu
+            return min(mask64(v1), mask64(v2))
+        if funct3 == 0b111:  # maxu
+            return max(mask64(v1), mask64(v2))
+    elif funct7 == 0x30:
+        s = _uint64(v2).value & 0x3F
+        v1m = mask64(v1)
+        if funct3 == 0b001:  # rol
+            return mask64((v1m << s) | (v1m >> (64 - s))) if s else v1m
+        if funct3 == 0b101:  # ror
+            return mask64((v1m >> s) | (v1m << (64 - s))) if s else v1m
+    raise ValueError(
+        f"invalid Zbb funct3={funct3:#b} funct7={funct7:#x}"
+    )
+
+
+def _zbb_alu32(
+    funct3: int,
+    funct7: int,
+    v1: int,
+    v2: int,
+) -> int:
+    """Zbb OP-32 R-type 分发 (funct7=0x30): rolw, rorw.
+
+    结果 sign-extend 到 64-bit.
+    """
+    s = _uint64(v2).value & 0x1F
+    v32 = mask32(v1)
+    if funct3 == 0b001:  # rolw
+        r = mask32((v32 << s) | (v32 >> (32 - s))) if s else v32
+        return sext32(r)
+    if funct3 == 0b101:  # rorw
+        r = mask32((v32 >> s) | (v32 << (32 - s))) if s else v32
+        return sext32(r)
+    raise ValueError(
+        f"invalid Zbb op32 funct3={funct3:#b} funct7={funct7:#x}"
+    )
+
+
 def _flush_tlbs(origin, vpn: int | None, all_harts: list | None) -> None:
     """SFENCE.VMA helper: broadcast TLB flush across all harts.
 
@@ -218,12 +352,18 @@ class Hart(HartWithRegs):
 
         if native_available():
             r = _native_alu_op(f.func3, f.func7, v1, v2)
-            if r.trap:
-                raise ValueError(
-                    f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
-                )
-            self.gprs[f.rd] = r.value
-            return 4
+            if not r.trap:
+                self.gprs[f.rd] = r.value
+                return 4
+            # Zbb (funct7 in {0x05, 0x20, 0x30}): fallback to Python
+            if f.func7 in (0x05, 0x20, 0x30):
+                result = _zbb_alu(f.func3, f.func7, v1, v2)
+                if f.rd != 0:
+                    self.gprs[f.rd] = result
+                return 4
+            raise ValueError(
+                f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
+            )
 
         # -- 纯 Python fallback (.so 缺失或调试时使用) --
         part1, part2 = f.func3, f.func7
@@ -243,6 +383,8 @@ class Hart(HartWithRegs):
                 s1 = _sint64(v1).value
                 s2 = _sint64(v2).value
                 result = mask64(_sint64((s1 * s2) >> 64).value)
+            elif part2 == 0x30:
+                result = _zbb_alu(part1, part2, v1, v2)  # Zbb: rol
             else:
                 raise ValueError(f"invalid funct7={part2:#x} for funct3=001")
         elif part1 == 0b010:
@@ -265,10 +407,12 @@ class Hart(HartWithRegs):
                 raise ValueError(f"invalid funct7={part2:#x} for funct3=011")
         elif part1 == 0b100:
             if part2 not in {0, 1}:
-                raise ValueError(f"invalid funct7={part2:#x} for funct3=100")
-            result = v1 ^ v2
-            if part2 == 1:
-                result = mask64(_trunc_div(_sint64(v1).value, _sint64(v2).value))
+                # Zbb: xnor (0x20), min (0x05)
+                result = _zbb_alu(part1, part2, v1, v2)
+            else:
+                result = v1 ^ v2
+                if part2 == 1:
+                    result = mask64(_trunc_div(_sint64(v1).value, _sint64(v2).value))
         elif part1 == 0b101:
             if part2 == 0:
                 result = mask64((_uint64(v1).value >> (v2 & 0x3F)))
@@ -276,20 +420,26 @@ class Hart(HartWithRegs):
                 result = mask64(_trunc_div(_uint64(v1).value, _uint64(v2).value))
             elif part2 == 0x20:
                 result = mask64(_sint64(_sint64(v1).value >> (v2 & 0x3F)).value)
+            elif part2 == 0x30:
+                result = _zbb_alu(part1, part2, v1, v2)  # Zbb: ror
             else:
                 raise ValueError(f"invalid funct7={part2:#x} for funct3=101")
         elif part1 == 0b110:
             if part2 not in {0, 1}:
-                raise ValueError(f"invalid funct7={part2:#x} for funct3=110")
-            result = v1 | v2
-            if part2 == 1:
-                result = mask64(_trunc_rem(_sint64(v1).value, _sint64(v2).value))
+                # Zbb: orn (0x20), max (0x05)
+                result = _zbb_alu(part1, part2, v1, v2)
+            else:
+                result = v1 | v2
+                if part2 == 1:
+                    result = mask64(_trunc_rem(_sint64(v1).value, _sint64(v2).value))
         else:  # part1 == 0b111
             if part2 not in {0, 1}:
-                raise ValueError(f"invalid funct7={part2:#x} for funct3=111")
-            result = v1 & v2
-            if part2 == 1:
-                result = mask64(_trunc_rem(_uint64(v1).value, _uint64(v2).value))
+                # Zbb: andn (0x20), maxu (0x05)
+                result = _zbb_alu(part1, part2, v1, v2)
+            else:
+                result = v1 & v2
+                if part2 == 1:
+                    result = mask64(_trunc_rem(_uint64(v1).value, _uint64(v2).value))
         if f.rd != 0:
             self.gprs[f.rd] = result
         return 4
@@ -304,11 +454,17 @@ class Hart(HartWithRegs):
 
         if native_available():
             r = _native_op_imm(f.func3, f.func7, v1, f.imm12_se)
-            if r.trap:
+            if not r.trap:
+                self.gprs[f.rd] = r.value
+                return 4
+            # Zbb (funct7=0x30): native 未实现, fallback 到 Python
+            if f.func7 != 0x30:
                 raise ValueError(
                     f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
                 )
-            self.gprs[f.rd] = r.value
+            result = _zbb_imm(f.func3, v1, f.imm12_se & 0x3F)
+            if f.rd != 0:
+                self.gprs[f.rd] = result
             return 4
 
         # -- 纯 Python fallback --
@@ -320,9 +476,13 @@ class Hart(HartWithRegs):
         if part1 == 0b000:
             result = mask64((v1 + imm))
         elif part1 == 0b001:
-            if part6 != 0:
+            if part6 == 0:
+                result = mask64((v1 << shamt))
+            elif part6 == 0x18:
+                # Zbb: clz/ctz/cpop/sext.b/sext.h (shamt=imm[4:0] 选子指令)
+                result = _zbb_imm(part1, v1, shamt)
+            else:
                 raise ValueError(f"invalid funct6={part6:#x} for SLLI")
-            result = mask64((v1 << shamt))
         elif part1 == 0b010:
             result = 1 if _sint64(v1).value < imm else 0
         elif part1 == 0b011:
@@ -334,6 +494,15 @@ class Hart(HartWithRegs):
                 result = mask64((_uint64(v1).value >> shamt))
             elif part6 == 0x10:
                 result = mask64(_sint64(_sint64(v1).value >> shamt).value)
+            elif part6 == 0x18:
+                # Zbb: rori (rotate right immediate, funct7=0x30)
+                result = _zbb_imm(0b101, v1, shamt)
+            elif part6 == 0x0A:
+                # Zbb: orc.b (funct7=0x14, funct12=0x287)
+                result = _zbb_orc_b(v1)
+            elif part6 == 0x1A:
+                # Zbb: rev8.d (funct7=0x35, funct12=0x6B8, RV64)
+                result = _zbb_rev8(v1)
             else:
                 raise ValueError(f"invalid funct6={part6:#x} for SRLI/SRAI")
         elif part1 == 0b110:
@@ -354,12 +523,18 @@ class Hart(HartWithRegs):
 
         if native_available():
             r = _native_op32(f.func3, f.func7, v1, v2)
-            if r.trap:
-                raise ValueError(
-                    f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
-                )
-            self.gprs[f.rd] = r.value
-            return 4
+            if not r.trap:
+                self.gprs[f.rd] = r.value
+                return 4
+            # Zbb (funct7=0x30, funct3 ∈ {001, 101}): fallback
+            if f.func7 == 0x30 and f.func3 in (0b001, 0b101):
+                result = _zbb_alu32(f.func3, f.func7, v1, v2)
+                if f.rd != 0:
+                    self.gprs[f.rd] = result
+                return 4
+            raise ValueError(
+                f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
+            )
 
         # -- 纯 Python fallback --
         part1, part2 = f.func3, f.func7
@@ -384,6 +559,8 @@ class Hart(HartWithRegs):
                 s1 = _sint64(sext32(v1)).value
                 s2 = _sint64(sext32(v2)).value
                 result = mask64(_sint64((s1 * s2) >> 32).value)
+            elif part2 == 0x30:
+                result = _zbb_alu32(part1, part2, v1, v2)  # Zbb: rolw
             else:
                 raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=001")
         elif part1 == 0b010:
@@ -426,6 +603,8 @@ class Hart(HartWithRegs):
             elif part2 == 0x20:
                 result = _sint64(sext32(v1) >> (v2 & 0x1F)).value
                 result = sext32(mask32(result))
+            elif part2 == 0x30:
+                result = _zbb_alu32(part1, part2, v1, v2)  # Zbb: rorw
             else:
                 raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=101")
         elif part1 == 0b110:
@@ -463,9 +642,15 @@ class Hart(HartWithRegs):
         if native_available():
             r = _native_op_imm32(f.func3, f.func7, v1, f.imm12_se)
             if r.trap:
-                raise ValueError(
-                    f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
-                )
+                # Zbb (funct7=0x30): fallback to Python
+                if f.func7 != 0x30:
+                    raise ValueError(
+                        f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
+                    )
+                result = _zbb_imm32(f.func3, v1, f.imm12_se & 0x1F)
+                if f.rd != 0:
+                    self.gprs[f.rd] = result
+                return 4
             self.gprs[f.rd] = r.value
             return 4
 
@@ -478,18 +663,26 @@ class Hart(HartWithRegs):
             result = mask32((v1 + imm))
             result = sext32(result)
         elif part1 == 0b001:
-            if part7 != 0:
+            if part7 == 0:
+                result = mask32((mask32(v1) << shamt))
+                result = sext32(result)
+            elif part7 == 0x30:
+                # Zbb: clzw/ctzw/cpopw
+                result = _zbb_imm32(part1, v1, shamt)
+            else:
                 raise ValueError(f"invalid funct7={part7:#x} for SLLIW")
-            result = mask32((mask32(v1) << shamt))
-            result = sext32(result)
         elif part1 == 0b101:
             if part7 == 0:
                 result = mask32((mask32(v1) >> shamt))
+                result = sext32(result)
             elif part7 == 0x20:
                 result = mask32(_sint64(sext32(mask32(v1)) >> shamt).value)
+                result = sext32(result)
+            elif part7 == 0x30:
+                # Zbb: roriw
+                result = _zbb_imm32(part1, v1, shamt)
             else:
                 raise ValueError(f"invalid funct7={part7:#x} for SRLIW/SRAIW")
-            result = sext32(result)
         else:
             raise ValueError(f"invalid funct3={part1:#x} for opImm32")
         if f.rd != 0:
@@ -800,9 +993,9 @@ class Hart(HartWithRegs):
                 if self.pc != saved_pc:
                     return 0
                 if rd != 0:
-                    self.gprs[rd] = 0  # 成功 -> rd ← 0
+                    self.gprs[rd] = 0  # 成功 -> rd <- 0
             elif rd != 0:
-                self.gprs[rd] = 1  # 失败 -> rd ← 非零
+                self.gprs[rd] = 1  # 失败 -> rd <- 非零
             self.clear_reservation()
             return 4
         # else: AMOxxx - 原子读-改-写

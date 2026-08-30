@@ -196,6 +196,15 @@ class UART(Device):
                 ip |= IP_RXWM
         return ip
 
+    def irq_asserted(self) -> bool:
+        """返回当前 UART 中断线电平 (IP & IE != 0).
+
+        供外部 (termio RX 排空路径) 在注入数据后查询真实电平, 用于
+        按电平语义同步 PLIC 挂起位 — 而非无条件拉高, 避免 IE 关闭时
+        产生虚假挂起。
+        """
+        return bool(self._ip_value() & self._ie)
+
     def _update_plic_irq(self) -> None:
         """根据 IP 水位状态与 IE 使能同步 PLIC 中断线 (电平语义).
 
@@ -205,7 +214,7 @@ class UART(Device):
         """
         if self._plic is None or self._irq <= 0:
             return
-        self._plic.set_irq(self._irq, bool(self._ip_value() & self._ie))
+        self._plic.set_irq(self._irq, self.irq_asserted())
 
     # ---- 公开方法 ----
     def preload(self, data: bytes) -> int:
@@ -244,6 +253,17 @@ class UART(Device):
     def tx_clear(self) -> None:
         """清空 TX buffer."""
         self._tx_buf.clear()
+
+    def record_tx_byte(self, byte: int) -> None:
+        """记录 TX 字节到行缓冲 (native Rust 直写 stdout 路径的归档回填).
+
+        与 ``_write_reg`` 的 TXDATA 路径不同, 此方法仅追加到 ``_tx_buf``,
+        不触发 ``_tx_callback`` / ``os.write`` — native 模式下 Rust 引擎已
+        即时输出到 stdout, 再输出即双重写控制台. 供 termio 在排空 TX ring
+        buffer 时同步回填, 使 ``tx_data()`` 在 native 与纯 Python 两条路径
+        下返回一致的完整输出.
+        """
+        self._tx_buf.append(byte)
 
     # ---- Device 接口 ----
 

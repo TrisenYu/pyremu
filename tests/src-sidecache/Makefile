@@ -1,15 +1,14 @@
 # tests/src-sidecache/Makefile
-# 缓存侧信道攻击 PoC 套件 - 交叉编译为 RISC-V 静态 ELF
+# 跨飞地缓存侧信道测试 - Flush+Reload 探测
 #
 # 两套编译链:
-#   Linux U-mode   (riscv64-linux-gnu-gcc)  - flush_reload
-#   Enclave musl   (clang + musl libc.a)    - hello_musl, victim_musl, probe_musl
+#   Linux glibc  (riscv64-linux-gnu-gcc)  - cross_enclave_cache, tee_test, ...
+#   Enclave musl (clang + musl libc.a)    - victim_cache, victim_kalman, attacker_cache
 #
 # 目标:
-#   make all                 全部编译
-#   make flush_reload        仅编译 Flush+Reload 用户态演示
-#   make musl                仅编译 musl 飞地 payload
-#   make clean               清理
+#   make all              编译 host 程序 (glibc)
+#   make musl             编译飞地载荷 (musl)
+#   make clean            清理
 
 phony =
 
@@ -25,13 +24,18 @@ CFLAGS  = -static -O2 -Wall
 MUSL_DIR   = $(abspath ../../bsp/musl-1.2.6)
 MUSL_CC    = /opt/custom-llvm/bin/clang
 MUSL_TARGET = riscv64-linux-musl
-MUSL_ARCH   = rv64imac
-LIBGCC      = /usr/lib/gcc/riscv64-unknown-elf/14.2.0/rv64imac/lp64/libgcc.a
+# 必须硬浮点 lp64d: musl sysroot 以 rv64imafdc/lp64d 构建, 软浮点 lp64 会
+# 与 crt1.o 的硬浮点 ABI 冲突 (cannot link different floating-point ABI)。
+MUSL_ARCH   = rv64gc
+MUSL_ABI    = lp64d
+LIBGCC      = /usr/lib/gcc/riscv64-unknown-elf/14.2.0/rv64iafd/lp64d/libgcc.a
 
-MUSL_CFLAGS = --target=$(MUSL_TARGET) -march=$(MUSL_ARCH) \
+MUSL_CFLAGS = --target=$(MUSL_TARGET) -march=$(MUSL_ARCH) -mabi=$(MUSL_ABI) \
               -static -nostdlib -nostdinc -O2 -Wall \
-              -isystem $(MUSL_DIR)/include \
-              -isystem $(MUSL_DIR)/obj/include
+              -isystem $(MUSL_DIR)/arch/riscv64 \
+              -isystem $(MUSL_DIR)/arch/generic \
+              -isystem $(MUSL_DIR)/obj/include \
+              -isystem $(MUSL_DIR)/include
 
 MUSL_LDLIBS = $(MUSL_DIR)/lib/crt1.o \
               $(MUSL_DIR)/lib/crti.o \
@@ -40,13 +44,14 @@ MUSL_LDLIBS = $(MUSL_DIR)/lib/crt1.o \
               $(LIBGCC)
 
 OUT_DIR    = bin
-PROGRAMS   = flush_reload tee_test tee_concurrent
-MUSL_PROGS = hello_payload victim_musl probe_musl tlb_leak_musl
+PROGRAMS   = cross_enclave_cache tee_test tee_concurrent tee_malice
+MUSL_PROGS = hello_payload victim_musl probe_musl tlb_leak_musl \
+             victim_cache victim_kalman attacker_cache
 
 BINS      = $(addprefix $(OUT_DIR)/, $(PROGRAMS))
 MUSL_BINS = $(addprefix $(OUT_DIR)/, $(MUSL_PROGS))
 
-# ---- 默认目标 (仅 Linux glibc 程序, musl payload 单独 make musl) ----
+# ---- 默认目标 (Linux glibc 程序) ----
 all: $(BINS)
 phony += all
 
@@ -54,11 +59,7 @@ musl: $(MUSL_BINS)
 phony += musl
 
 # ---- Linux glibc 编译 ----
-$(OUT_DIR)/flush_reload: flush_reload.c
-	@mkdir -p $(@D)
-	$(CROSS_CC) $(CFLAGS) $< -o $@
-
-$(OUT_DIR)/%: %.c
+$(OUT_DIR)/%: %.c tee_enclave.h
 	@mkdir -p $(@D)
 	$(CROSS_CC) $(CFLAGS) $< -o $@
 
@@ -71,6 +72,18 @@ $(OUT_DIR)/%_musl: %_payload.c
 	@mkdir -p $(@D)
 	$(MUSL_CC) $(MUSL_CFLAGS) -fuse-ld=lld $(MUSL_LDLIBS) $< -o $@
 
+$(OUT_DIR)/victim_cache: victim_cache_payload.c
+	@mkdir -p $(@D)
+	$(MUSL_CC) $(MUSL_CFLAGS) -fuse-ld=lld $(MUSL_LDLIBS) $< -o $@
+
+$(OUT_DIR)/victim_kalman: victim_kalman_payload.c
+	@mkdir -p $(@D)
+	$(MUSL_CC) $(MUSL_CFLAGS) -fuse-ld=lld $(MUSL_LDLIBS) $< -o $@
+
+$(OUT_DIR)/attacker_cache: attacker_cache_payload.c
+	@mkdir -p $(@D)
+	$(MUSL_CC) $(MUSL_CFLAGS) -fuse-ld=lld $(MUSL_LDLIBS) $< -o $@
+
 # ---- 清理 ----
 clean:
 	rm -rf $(OUT_DIR)
@@ -79,11 +92,11 @@ phony += clean
 # ---- 帮助 ----
 help:
 	@echo "tests/src-sidecache"
-	@echo "  make          build all"
-	@echo "  make musl     build musl enclave payloads"
+	@echo "  make          build host programs (glibc)"
+	@echo "  make musl     build enclave payloads (musl)"
 	@echo "  make clean    remove bin/"
-	@echo "  Linux: $(PROGRAMS)"
-	@echo "  Musl:  $(MUSL_PROGS)"
+	@echo "  Host:    $(PROGRAMS)"
+	@echo "  Enclave: $(MUSL_PROGS)"
 phony += help
 
 .PHONY: $(phony)

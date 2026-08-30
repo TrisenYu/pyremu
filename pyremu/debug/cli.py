@@ -264,7 +264,7 @@ def _setup_entry_symbol(
         sys.exit(1)
     for h in emu.harts:
         h.write_gpr(10, target_entry)
-    logger.info(f"a0 ← {entry_symbol} = 0x{target_entry:x}")
+    logger.info(f"a0 <- {entry_symbol} = 0x{target_entry:x}")
     return target_entry
 
 

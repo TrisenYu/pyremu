@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from pyremu.interrupt.aplic import APLIC
     from pyremu.interrupt.imsic import IMSIC
     from pyremu.interrupt.plic import PLIC
-    from pyremu.peripheral import GPIO, I2C, SPI, UART, VirtIOBlock
+    from pyremu.peripheral import CRNG, GPIO, I2C, SPI, UART, VirtIOBlock
     from pyremu.peripheral.watchdog import HartWatchdog
 
 # APLIC 有线中断触发类型 (interrupts 第二 cell). 与 QEMU virt.c 对齐:
@@ -36,18 +36,6 @@ if TYPE_CHECKING:
 # 写 0 会让内核 aplic_irq_set_type 配成 SM_INACTIVE, 完成中断永不投递.
 _IRQ_TYPE_LEVEL_HIGH = 0x4
 
-# /chosen/rng-seed — 引导期熵种子 (供内核初始化 CRNG).
-#
-# 为什么需要: 无此属性时, 内核启动到用户态早期会阻塞在 wait_for_random_bytes()
-# 直到 CRNG 完成初始化。真实硬件靠中断/设备抖动积累熵, 但在确定性模拟器中抖动
-# 极弱, try_to_generate_entropy() 需海量迭代 —— 实测虚拟时间从 ~16s 空转到 ~1401s
-# 才 "crng init done"
-#
-# 修复原理: drivers/of/fdt.c 的 early_init_dt_scan_chosen 读取 /chosen/rng-seed,
-# 调用 add_bootloader_randomness(); 配合 random.trust_bootloader=on 内核参数,
-# credit_init_bits(len*8) 直接完成 CRNG 初始化。
-# 种子 ≥32 字节 (256 bit) 即可; 使用宿主 os.urandom(64) 提供 512 bit 真随机熵
-# (QEMU / U-Boot 等真实引导器均以同样方式注入熵)。
 
 
 @dataclass
@@ -142,8 +130,19 @@ def _dtb_chosen(
         sw.property_string("stdout-path", f"/soc/serial@{p.uart_base:x}")
     if bootargs:
         sw.property_string("bootargs", bootargs)
+
     # 引导期熵种子 —— 使内核在启动即完成 CRNG 初始化, 避免用户态早期阻塞在
     # getrandom()/wait_for_random_bytes() (详见文件顶部注释)。
+    # /chosen/rng-seed — 引导期熵种子 (供内核初始化 CRNG).
+    #
+    # 为什么需要: 无此属性时, 内核启动到用户态早期会阻塞在 wait_for_random_bytes()
+    # 直到 CRNG 完成初始化。真实硬件靠中断/设备抖动积累熵，但目前没有实现这一随机数生成器设备
+    #
+    # 修复原理: drivers/of/fdt.c 的 early_init_dt_scan_chosen 读取 /chosen/rng-seed,
+    # 调用 add_bootloader_randomness(); 配合 random.trust_bootloader=on 内核参数,
+    # credit_init_bits(len*8) 直接完成 CRNG 初始化。
+    # 种子 >= 32 字节 (256 bit) 即可;
+    # 使用宿主 os.urandom(64) 提供 512 bit 真随机熵
     sw.property("rng-seed", os.urandom(64))
     if initrd is not None:
         # initramfs (cpio[.gz]) 已加载到 [initrd.start, initrd.end)。
@@ -151,7 +150,7 @@ def _dtb_chosen(
         # of_read_number 按属性长度自动识别 4/8 字节。
         sw.property("linux,initrd-start", struct.pack(">Q", initrd.start))
         sw.property("linux,initrd-end", struct.pack(">Q", initrd.end))
-    sw.end_node()  # chosen
+    sw.end_node()
 
 
 def _dtb_aliases(
@@ -276,7 +275,11 @@ def _dtb_plic(
     plic_phandle: int | None,
     cpu_phandles: list[int],
 ) -> None:
-    """plic@ — 每 hart context 一条 <&cpu_intc 11> (MEIP)."""
+    """plic@ — 每 hart 双 context (M+S): <&cpu_intc 11>, <&cpu_intc 9>.
+
+    context 序号: 0=hart0 M, 1=hart0 S, 2=hart1 M, 3=hart1 S, ...
+    OpenSBI 初始化 M-context, Linux 认领 S-context.
+    """
     if plic is None:
         return
     plic_base = cfg.periph.plic_base
@@ -485,6 +488,21 @@ def _dtb_watchdog(
     sw.end_node()  # watchdog
 
 
+def _dtb_crng(
+    sw: libfdt.FdtSw,
+    cfg: PlatformConfig,
+    crng: CRNG | None,
+) -> None:
+    """crng@ — 模拟随机数生成器 (运行期熵源, DTB 可见)."""
+    if crng is None:
+        return
+    base = cfg.periph.crng_base
+    sw.begin_node(f"crng@{base:x}")
+    sw.property_string("compatible", "pyremu,crng")
+    sw.property("reg", _encode_reg_4mib(base, 0x1000))
+    sw.end_node()  # crng
+
+
 # ============================================================
 #  DTB 构建入口
 # ============================================================
@@ -499,6 +517,7 @@ def build_dtb(
     gpio: GPIO | None = None,
     virtio_blk: VirtIOBlock | None = None,
     watchdog: HartWatchdog | None = None,
+    crng: CRNG | None = None,
     plic: PLIC | None = None,
     imsic: IMSIC | None = None,
     aplic: APLIC | None = None,
@@ -515,6 +534,7 @@ def build_dtb(
         i2c_gen: I2C 外设实例.
         gpio: GPIO 外设实例.
         virtio_blk: virtio-blk 外设实例.
+        crng: 模拟随机数生成器实例 (None 则跳过 crng 节点).
         plic: PLIC 中断控制器实例 (legacy 模式).
         imsic: IMSIC 中断控制器实例 (AIA 模式).
         aplic: APLIC 有线→MSI 桥实例 (AIA 模式).
@@ -561,10 +581,9 @@ def build_dtb(
             aplic_phandle = next_phandle
             next_phandle += 1
             ext_irq_handle_prop = aplic_phandle
-    else:
-        if plic is not None:
-            ext_irq_handle_prop = next_phandle
-            next_phandle += 1
+    elif plic is not None:
+        ext_irq_handle_prop = next_phandle
+        next_phandle += 1
 
     sw.begin_node("soc")
     sw.property_u32("#address-cells", 2)
@@ -577,14 +596,25 @@ def build_dtb(
     _dtb_clint(sw, cfg, cpu_phandles)
     if is_aia:
         m_base = cfg.periph.imsic_m_base
-        m_size = cfg.num_harts * page_stride
+        # OpenSBI imsic_data_check 要求 reg size 对齐到
+        # 2^hart_index_bits * PAGE_SIZE.  hart_index_bits =
+        # ceil(log2(num_harts)), 即 (num_harts-1).bit_length().
+        # 非 2 的幂 hart 数 (如 3, 5, 6, 7) 若不补齐,
+        # OpenSBI imsic_cold_irqchip_init 失败 → 无 irqchip →
+        # sbi_irqchip_process 返回 SBI_ENODEV (-1000).
+        if cfg.num_harts > 1:
+            hart_index_bits = (cfg.num_harts - 1).bit_length()
+        else:
+            hart_index_bits = 0
+        padded_count = 1 << hart_index_bits  # ≥ num_harts 的 2 的幂
+        m_size = padded_count * page_stride
         # M 节点: M-files 范围, MEIP(11) 专用.
         _dtb_imsic_file(sw, cfg, imsic, imsic_m_phandle, cpu_phandles,
                         cpu_intc_irq=_IMSIC_IRQ_M, base_addr=m_base, size=m_size)
-        # S 节点: S-files 范围 (M-base + N*0x1000), SEIP(9) 专用.
+        # S 节点: S-files 范围 (M-base + padded_count*0x1000), SEIP(9) 专用.
         _dtb_imsic_file(sw, cfg, imsic, imsic_s_phandle, cpu_phandles,
                         cpu_intc_irq=_IMSIC_IRQ_S,
-                        base_addr=m_base + cfg.num_harts * page_stride,
+                        base_addr=m_base + padded_count * page_stride,
                         size=m_size)
         _dtb_aplic(sw, cfg, aplic, aplic_phandle, imsic_s_phandle)
     else:
@@ -592,6 +622,7 @@ def build_dtb(
     _dtb_uart(sw, cfg, uart, ext_irq_handle_prop, next_phandle)
     _dtb_simple_devices(sw, cfg, spi, i2c_gen, gpio, virtio_blk)
     _dtb_watchdog(sw, cfg)
+    _dtb_crng(sw, cfg, crng)
 
     sw.end_node()  # soc
     sw.end_node()  # root

@@ -11,10 +11,6 @@
 use softfloat_pure::softfloat::{float32_t, float64_t};
 use softfloat_pure::{Float, RoundingMode, TininessMode};
 
-#[cfg(feature = "diagnostic")]
-#[allow(unused)]
-use crate::diag;
-
 use crate::concurrent::{ModuleState, StopInfo};
 use crate::handlers::{pmp_ok, try_handle_virtio, DevCtx, PmpCtx, EXIT_SENTINEL};
 use crate::hart_sched::{

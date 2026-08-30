@@ -47,6 +47,8 @@ vendor/qemu-10.2.0/hw/intc/riscv_aplic.c):
 
 from __future__ import annotations
 
+import threading
+
 from pyremu.interrupt.imsic import IMSIC
 from pyremu.memory.bus import Device
 from pyremu.utils.mask import mask32
@@ -129,6 +131,11 @@ class APLIC(Device):
 
         self._domaincfg: int = _DOMAINCFG_IE  # IE=1 (默认使能)
 
+        # 并发安全: 外设线程经 set_irq 写 state, 主线程经 read/write 读/写
+        # sourcecfg/target/state — 共享状态访问需互斥. 锁顺序 APLIC -> IMSIC
+        # (set_irq -> _deliver_from_source -> imsic.set_ip_number), 不得反向.
+        self._lock = threading.Lock()
+
     # ================================================================
     #  外设编程接口
     # ================================================================
@@ -142,51 +149,62 @@ class APLIC(Device):
         - level=True  → 输入电平拉高 (设备断言中断线)
         - level=False → 输入电平拉低 (设备撤除中断线)
         """
-        if not (0 < source_num <= self.num_sources):
-            return
+        with self._lock:
+            if not (0 < source_num <= self.num_sources):
+                return
 
-        sm = self._sourcecfg[source_num] & _SM_MASK
-        if sm == _SM_INACTIVE:
-            return
+            sm = self._sourcecfg[source_num] & _SM_MASK
+            if sm == _SM_INACTIVE:
+                return
 
-        old_state = self._state[source_num]
-        old_input = (old_state & _STATE_INPUT) != 0
+            old_state = self._state[source_num]
+            old_input = (old_state & _STATE_INPUT) != 0
 
-        # 更新输入电平
-        if level:
-            self._state[source_num] |= _STATE_INPUT
-        else:
-            self._state[source_num] &= ~_STATE_INPUT
+            # 更新输入电平
+            if level:
+                self._state[source_num] |= _STATE_INPUT
+            else:
+                self._state[source_num] &= ~_STATE_INPUT
 
-        # 依据触发类型决定是否置 pending
-        update = False
-        if sm == _SM_LEVEL_HIGH and level and not (old_state & _STATE_PENDING):
-            self._state[source_num] |= _STATE_PENDING
-            update = True
-        elif sm == _SM_LEVEL_LOW and not level and not (old_state & _STATE_PENDING):
-            self._state[source_num] |= _STATE_PENDING
-            update = True
-        elif sm == _SM_EDGE_RISE and level and not old_input and not (old_state & _STATE_PENDING):
-            self._state[source_num] |= _STATE_PENDING
-            update = True
-        elif sm == _SM_EDGE_FALL and not level and old_input and not (old_state & _STATE_PENDING):
-            self._state[source_num] |= _STATE_PENDING
-            update = True
+            # 依据触发类型决定是否置 pending
+            update = False
+            if sm == _SM_LEVEL_HIGH and level and not (old_state & _STATE_PENDING):
+                self._state[source_num] |= _STATE_PENDING
+                update = True
+            elif sm == _SM_LEVEL_LOW and not level and not (old_state & _STATE_PENDING):
+                self._state[source_num] |= _STATE_PENDING
+                update = True
+            elif (
+                sm == _SM_EDGE_RISE
+                and level and not old_input
+                and not (old_state & _STATE_PENDING)
+            ):
+                self._state[source_num] |= _STATE_PENDING
+                update = True
+            elif (
+                sm == _SM_EDGE_FALL
+                and not level and old_input
+                and not (old_state & _STATE_PENDING)
+            ):
+                self._state[source_num] |= _STATE_PENDING
+                update = True
 
-        if update:
-            self._deliver_from_source(source_num)
+            if update:
+                self._deliver_from_source(source_num)
 
     # ================================================================
     #  Device 接口 (MMIO)
     # ================================================================
 
     def read(self, offset: int, size: int) -> bytes:
-        val = self._mmio_read(offset)
-        return val.to_bytes(size, "little", signed=False)
+        with self._lock:
+            val = self._mmio_read(offset)
+            return val.to_bytes(size, "little", signed=False)
 
     def write(self, offset: int, data: bytes) -> None:
-        val = int.from_bytes(data, "little", signed=False)
-        self._mmio_write(offset, mask32(val))
+        with self._lock:
+            val = int.from_bytes(data, "little", signed=False)
+            self._mmio_write(offset, mask32(val))
 
     # ================================================================
     #  MMIO 内部方法

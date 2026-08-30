@@ -260,22 +260,21 @@ class TestComplete:
         assert claim2 == 5
 
     def test_complete_wrong_source_ignored(self, plic):
-        """写回不匹配的 source id 无效."""
+        """写回不匹配的 source id 无效 — complete 不生效, claimed 不变."""
         _write_u32(plic, _priority_offset(5), 3)
         _write_u32(plic, _enable_offset(0, 0), 1 << 5)
         plic.set_irq(5, True)
         _read_u32(plic, _context_claim_offset(0))  # claim source 5
 
-        # 尝试 complete source 3 (不匹配)
+        # 尝试 complete source 3 (不匹配) — 应无效
         _write_u32(plic, _context_claim_offset(0), 3)
+        # claimed[0] 仍为 5, _do_complete 不生效
 
-        # 再次触发 source 5 应该可行 (complete 未生效, claimed 仍为 5)
+        # 再次触发 source 5 — PLIC spec: pending 是 per-source (非 per-context),
+        # re-pend 后任何 context (含原 claimer) 均可再次 claim.
         plic.set_irq(5, True)
         claim2 = _read_u32(plic, _context_claim_offset(0))
-        # claimed[0] 仍是 5, 第二次 claim 会返回谁?
-        # 实际上 _claimed 还是 5, 新的 pending 不会被 claim
-        # 直到 complete 原 source
-        assert claim2 == 0  # 新 pending 被跳过, 因为 old claim 没完成
+        assert claim2 == 5  # re-pend 允许 re-claim, 即使前次未 complete
 
 
 # ============================================================

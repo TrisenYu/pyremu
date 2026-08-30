@@ -1311,9 +1311,8 @@ class TestCmdBreakpoint:
         dbg = _make_dbg()
         dbg.hart.pc = 0x1000  # 此处有 NOP (来自 _make_dbg)
         dbg.cmd_bp_set("0x1000")
-        # 断点命中应阻止执行, 且设置 _paused
+        # 断点命中应阻止执行 (PC 不推进)
         dbg.step_one()
-        assert dbg._paused
         # PC 不应推进 (断点在指令执行前命中)
         assert dbg.hart.pc == 0x1000
 
@@ -1322,7 +1321,6 @@ class TestCmdBreakpoint:
         dbg.hart.pc = 0x1000
         dbg.cmd_bp_set("0x80000000")  # 不匹配
         dbg.step_one()
-        assert not dbg._paused
         # PC 应已推进
         assert dbg.hart.pc != 0x1000
 
@@ -1352,7 +1350,7 @@ class TestCmdBreakpoint:
         dbg._emu.bus.write(0x1000, b"\x73\x00\x00\x00")
         dbg.hart.pc = 0x1000
         dbg.step_one()
-        assert dbg._paused, "ECALL 断点应命中"
+        assert dbg.hart.pc == 0x1000, "ECALL 断点应命中 (PC 不推进)"
 
     def test_instr_bp_miss_on_addi(self):
         """非 ECALL 指令不应命中 instr 断点."""
@@ -1361,7 +1359,7 @@ class TestCmdBreakpoint:
         # 0x1000 已有 NOP (addi x0, x0, 0 = 0x00000013)
         dbg.hart.pc = 0x1000
         dbg.step_one()
-        assert not dbg._paused, "NOP 不应命中 ECALL 断点"
+        assert dbg.hart.pc != 0x1000, "NOP 不应命中 ECALL 断点 (PC 推进)"
 
     # -- opcode 断点 --
 
@@ -1381,7 +1379,7 @@ class TestCmdBreakpoint:
         dbg._emu.bus.write(0x1000, instr.to_bytes(4, "little"))
         dbg.hart.pc = 0x1000
         dbg.step_one()
-        assert dbg._paused, "opcode 0x73 断点应命中"
+        assert dbg.hart.pc == 0x1000, "opcode 0x73 断点应命中 (PC 不推进)"
 
     # -- 列表 / 删除 / 清除 --
 
@@ -1465,11 +1463,9 @@ class TestCmdBreakpoint:
 
     def test_bp_runtime_state_cleared_on_restart(self):
         dbg = _make_dbg()
-        dbg._paused = True
         dbg._hart_paused.add(0)
         dbg._bp_hit_this_run.add(("addr", 0x1000))
         dbg.cmd_restart()
-        assert not dbg._paused
         assert len(dbg._hart_paused) == 0
         assert len(dbg._bp_hit_this_run) == 0
 
@@ -1480,13 +1476,10 @@ class TestCmdBreakpoint:
         dbg.hart.pc = 0x1000
         # 第一次命中
         assert dbg._check_breakpoints(dbg.hart, 0x1000, 0x00000013)
-        assert dbg._paused
         assert ("addr", 0x1000) in dbg._bp_hit_this_run
         # 同一 continue 内再次检查 -> 应跳过
-        dbg._paused = False
         hit_again = dbg._check_breakpoints(dbg.hart, 0x1000, 0x00000013)
         assert not hit_again, "同一 continue 内不应重复命中"
-        assert not dbg._paused
 
     def test_bp_c_second_call_skips_same_addr(self):
         """第二遍 c 应跳过已命中地址, 执行指令推进 PC."""
@@ -1497,7 +1490,6 @@ class TestCmdBreakpoint:
         assert dbg._check_breakpoints(dbg.hart, 0x1000, 0x00000013)
         assert ("addr", 0x1000) in dbg._bp_hit_this_run
         # 模拟 c 后回到 REPL, 再 c 一次: 同一地址应被跳过
-        dbg._paused = False
         hit = dbg._check_breakpoints(dbg.hart, 0x1000, 0x00000013)
         assert not hit, "第二次 c 应跳过同一地址的断点"
         # 推进 PC 后命中记录应失效 (不同地址不受影响)
@@ -1539,7 +1531,6 @@ class TestCmdBreakpoint:
         dbg._emu.bus.write(0x1000, csr_instr.to_bytes(4, "little"))
         hit = dbg._check_breakpoints(dbg.hart, 0x1000, csr_instr)
         assert hit
-        assert dbg._paused
 
     def test_cond_bp_miss_on_mismatch(self):
         """条件不匹配时 cond 断点不应命中."""
@@ -1551,7 +1542,6 @@ class TestCmdBreakpoint:
         dbg._emu.bus.write(0x1000, csr_instr.to_bytes(4, "little"))
         hit = dbg._check_breakpoints(dbg.hart, 0x1000, csr_instr)
         assert not hit
-        assert not dbg._paused
 
     def test_addr_bp_with_cond_match(self):
         """地址断点+条件: 地址和条件都匹配才命中."""
@@ -1607,7 +1597,7 @@ class TestCmdBreakpoint:
         assert hit
 
     def test_cond_bp_respects_bp_mode_async(self):
-        """async 模式: 条件断点命中时设置 _hart_paused 而非 _paused."""
+        """async 模式: 条件断点命中时设置 _hart_paused."""
         dbg = _make_dbg(num_harts=2)
         dbg._bp_mode = "async"
         dbg._dispatch(["bp", "if", "csr", "mtvec", "==", "0"])
@@ -1618,7 +1608,6 @@ class TestCmdBreakpoint:
         hit = dbg._check_breakpoints(dbg.hart, 0x1000, csr_instr)
         assert hit
         assert dbg.hart.id in dbg._hart_paused
-        assert not dbg._paused  # async 模式不设 _paused
 
     def test_cond_bp_invalid_syntax(self):
         """bp if 缺参数时警告, 不崩溃."""

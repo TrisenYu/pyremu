@@ -9,7 +9,7 @@ include!("config_gen.rs");
 //  TLB entry
 // ============================================================
 
-/// A single TLB entry — 32 bytes, 8-byte aligned.
+/// A single TLB entry — 40 bytes, 8-byte aligned.
 /// Layout is FFI-locked; must match Python ``TlbEntry`` ctypes definition.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -19,7 +19,10 @@ pub struct TlbEntry {
 	pub perm: u8,
 	pub level: u8,
 	pub valid: u8,
-	pub mdid: u8,
+	/// Memory domain ID — full 64-bit.  Must NOT be narrowed to u8:
+	/// enclave IDs ≥ 256 would alias to 0 (= host) and break both
+	/// `mfence.did` domain isolation and PMP enclave-mode checks.
+	pub mdid: u64,
 	pub tlb_epoch: u32,
 	pub dirty: u8,
 	pub accessed: u8,
@@ -150,9 +153,11 @@ pub struct HartState {
 	pub waiting: u8,
 	pub wfi_woken: u8,
 	pub halted: u8,
-	pub mdid: u8,
+	/// Memory domain ID — full 64-bit (see ``TlbEntry.mdid`` for why not u8).
+	/// u64 对齐后由偏移 6 移到偏移 8, 整个字节块从 16B 涨到 24B.
+	pub mdid: u64,
 	pub pmpsplit: u8,
-	pub _pad: [u8; 6],
+	pub _pad: [u8; 7],
 
 	// ---- Phase B: TLB entries ----
 	pub itlb: [TlbEntry; TLB_ENTRIES],
@@ -191,6 +196,22 @@ pub struct HartState {
 	// ---- Phase H: AIA IMSIC register files (M + S per hart) ----
 	pub imsic_m: ImsicFile,
 	pub imsic_s: ImsicFile,
+
+	// ---- Phase I: per-hart one-shot timer deadlines (QEMU ACLINT 模型) ----
+	//
+	// QEMU 在 timecmp/stimecmp 写入时判定过去/未来: 过去立即置位, 未来清位并
+	// 设定一个一次性 deadline (``riscv_aclint_mtimer_write_timecmp``), 定时器到期
+	// 才再次置位; 电平保持到前向重设 deadline。本字段把"一次性定时器"翻译到当前 hart
+	// 的指令计数空间: 写入 future 值时, deadline = 写入时刻的 total_instrs +
+	// ceil(剩余 tick / (timebase × NS_PER_INSTR / 1e9)) (见 timer_deadline_own)。
+	// ``sync_mtip`` 对 ACTIVE hart 仅在 total_instrs >= deadline 时置位
+	// (永不清除 — 清除仅发生在 timecmp/stimecmp 写入: 未来值→清位, 0→禁用),
+	// 从而与其他活跃 hart 的共享 mtime 膨胀解耦。这是与"每指令持续比较
+	// cur_mtime >= cmp"模型的关键差异: 共享 mtime 由所有活跃 hart 以 fetch_max
+	// 推进, 快 hart 会过早触发慢 hart 刚重设 deadline 的定时器 → mret 后立即再 trap
+	// 的活锁。0 = 未设定 deadline (写入即到期/禁用时置 0)。
+	pub stip_deadline: u64,
+	pub mtip_deadline: u64,
 }
 
 // ============================================================
@@ -324,6 +345,37 @@ pub struct FfiDevCtx {
 	pub bases: *const u64,
 	pub ends: *const u64,
 	pub num: u8,
+}
+
+/// PLIC state (crosses FFI boundary).  Pointers are mutable so Rust can
+/// update priority / pending / level / enable / threshold / claimed inline
+/// (claim/complete 语义), 避免 kernel 直映射访问 PLIC 时的 batch 退出.
+///
+/// Python 持有底层 ctypes 数组, 并在每次加速执行边界 marshal/unmarshal;
+/// 设备侧 ``raise_device_irq`` 也会直接写入本数组 (write-through), 保证 batch
+/// 内新到达的设备中断对 Rust 可见.
+#[repr(C)]
+pub struct FfiPlicCtx {
+	/// PLIC MMIO base address (0 = no PLIC device present).
+	pub base: u64,
+	/// Number of interrupt sources (source 0 reserved, sources 1..=num_sources).
+	pub num_sources: u32,
+	/// Number of contexts (2 per hart typically: M + S).
+	pub num_contexts: u32,
+	/// Per-source priority (u8, bits [2:0] valid).  Index 0..=num_sources.
+	pub priority: *mut u8,
+	/// Per-source pending flag (0/1).  Shared with Python device set_irq.
+	pub pending: *mut u8,
+	/// Per-source level flag (0/1) — gateway 语义: complete 时电平仍高则重挂 pending.
+	pub level: *mut u8,
+	/// Per-context enable 位图: enable[ctx * num_words + word], 每 u32 一个 word,
+	/// bit i = source (word*32 + i); source 0 保留恒为 0 (与 Python plic.py 一致).
+	/// num_words = (num_sources + 31) / 32.
+	pub enable: *mut u32,
+	/// Per-context threshold (u8, bits [2:0] valid).
+	pub threshold: *mut u8,
+	/// Per-context claimed source (0 = none).
+	pub claimed: *mut u32,
 }
 
 /// Host-side execution watchdog (crosses FFI boundary).
@@ -475,7 +527,8 @@ mod tests {
 
 	#[test]
 	fn tlb_entry_size() {
-		assert_eq!(size_of::<TlbEntry>(), 32);
+		// mdid 加宽 u8→u64 后 TlbEntry 由 32B 涨到 40B (mdid 对齐到偏移 24).
+		assert_eq!(size_of::<TlbEntry>(), 40);
 		assert_eq!(align_of::<TlbEntry>(), 8);
 	}
 
@@ -526,7 +579,7 @@ mod tests {
 			halted: 0,
 			mdid: 0,
 			pmpsplit: 0,
-			_pad: [0; 6],
+			_pad: [0; 7],
 			itlb: [TlbEntry::empty(); TLB_ENTRIES],
 			dtlb: [TlbEntry::empty(); TLB_ENTRIES],
 			mscratch: 0,
@@ -543,6 +596,8 @@ mod tests {
 			_fpad: [0; 4],
 			imsic_m: ImsicFile::empty(),
 			imsic_s: ImsicFile::empty(),
+			stip_deadline: 0,
+			mtip_deadline: 0,
 		};
 		// Enable IMSIC state tracking when AIA is active so that
 		// sync_imsic() and imsic_topei_peek() see eip/eie state.

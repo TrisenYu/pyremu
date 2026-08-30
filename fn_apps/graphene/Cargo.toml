@@ -1,0 +1,9 @@
+# 凝聚态电子结构载荷
+#
+# 石墨烯紧束缚能带: 蜂窝晶格最近邻跳跃, Dirac 锥与费米速度。无外部依赖。
+#
+# 自检: K 点 E=0 (无带隙); 费米速度 vF=3ta/2; Γ 点 E=3t, M 点 E=t。
+[package]
+name = "graphene"
+version.workspace = true
+edition.workspace = true

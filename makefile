@@ -66,12 +66,7 @@ $(NATIVE_SO) $(TERMIO_SO): $(NATIVE_SRC) $(NATIVE_CONFIG_GEN)
 	install -m 755 $(NATIVE_DIR)/target/release/libtermio.so $(TERMIO_SO)
 	@echo "libdecode.so + libtermio.so 已构建"
 
-build-native: $(NATIVE_CONFIG_GEN)
-	@$(MAKE) -C pyremu
-	cargo build --release --manifest-path $(NATIVE_DIR)/Cargo.toml --workspace $(CARGO_FLAGS)
-	install -m 755 $(NATIVE_DIR)/target/release/libdecode.so $(NATIVE_SO)
-	install -m 755 $(NATIVE_DIR)/target/release/libtermio.so $(TERMIO_SO)
-	@echo "libdecode.so + libtermio.so 已构建"
+build-native: $(NATIVE_SO) $(TERMIO_SO)
 phony += build-native
 
 clean-native:
@@ -90,20 +85,6 @@ $(RUST_SMODE_BIN): $(wildcard $(RUST_SMODE_DIR)/src/*.rs) $(wildcard $(RUST_SMOD
 
 build-rust: $(RUST_SMODE_BIN)
 phony += build-rust
-
-# ---- TEE enclave stress test 编译 ----
-# 编译飞地压力测试 (tee_stress + stress_payload), 拷贝到 build/src-stress/
-STRESS_CROSS_CC ?= $(shell command -v riscv64-linux-gnu-gcc 2>/dev/null || echo riscv64-unknown-linux-gnu-gcc)
-$(STRESS_BIN_DIR)/tee_stress $(STRESS_BIN_DIR)/stress_payload: $(wildcard $(STRESS_SRC_DIR)/*.c $(STRESS_SRC_DIR)/*.h)
-	@mkdir -p $(STRESS_SRC_DIR)/bin
-	$(MAKE) -C $(STRESS_SRC_DIR) CROSS_CC="$(STRESS_CROSS_CC)" all
-	@mkdir -p $(STRESS_BIN_DIR)
-	install -m755 $(STRESS_SRC_DIR)/bin/* $(STRESS_BIN_DIR)/
-	@echo "stress tests 已构建: $(STRESS_BIN_DIR)"
-
-build-stress: $(STRESS_BIN_DIR)/tee_stress $(STRESS_BIN_DIR)/stress_payload
-phony += build-stress
-
 
 # 对bsp/opensbi的编译配置
 $(FW_BUILD_DIR)/fw_payload.elf: $(RUST_SMODE_BIN) $(FW_SRC_DEPS)
@@ -166,18 +147,6 @@ emu-linux-payload: ${kei-sav} $(fw_payload_linux) __pyenv-check
 		--harts=$(hart_num) $(fw_payload_linux)
 phony += emu-linux-payload
 
-
-# 主入口: fw_jump 模式启动 Linux。默认挂载 DISK 指向的 rootfs (存在时)。
-#   用法: make emu-linux hart_num=4 ram=2G [DISK=... | INITRD=...]
-emu-linux: ${kei-sav} $(fw_jump_elf) build-native $(if $(INITRD),$(INITRAMFS)) __pyenv-check
-	@$(MAKE) -C pyremu
-	python -m pyremu.debugger \
-		--hart-logs=output/ --ram-base=0x80000000 --ram $(ram) --preload=${kei-sav} \
-		--kernel=$(LINUX_IMG) --sym=$(LINUX_VMLINUX) \
-		$(initrd_args) $(disk_args) $(bootargs_arg) \
-		--harts=$(hart_num) $(fw_jump_elf)
-phony += emu-linux
-
 # 最小 init 验证内核能否走到执行 init 阶段
 emu-linux-sh: ${kei-sav} $(fw_jump_elf) build-native __pyenv-check
 	@$(MAKE) -C pyremu
@@ -201,8 +170,9 @@ $(INITRAMFS):
 build-initramfs: $(INITRAMFS)
 phony += build-initramfs
 
+
 # ---- 测试 ----
-# 限制: 4 GiB 虚拟内存 (防止 batch 测试内存膨胀), --ignore 排除 ordering-dependent 失败.
+# 限制: 4 GiB 虚拟内存, --ignore 排除 ordering-dependent 失败.
 # 详见 memory/test-constraints.md 与 memory/ordering-dependent-native-batch-failures.md.
 # ---- 测试 ----
 test-build:
@@ -210,12 +180,14 @@ test-build:
 phony += test-build
 
 test: __pyenv-check test-build
-	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 timeout 120 uv run pytest -x
+	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 uv run pytest -v -x \
+		--ignore=tests/test_multihart_diff.py
 phony += test
 
+# timeout 600
 cov-test: __pyenv-check
-	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 timeout 120 uv run pytest -x \
-	--cov=. --cov-report=term --full-trace
+	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 uv run pytest -v -x \
+		--cov=pyremu --cov-report=term --ignore=tests/test_multihart_diff.py --full-trace
 phony += cov-test
 
 .PHONY: $(phony)

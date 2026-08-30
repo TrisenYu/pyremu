@@ -22,10 +22,13 @@ CFLAGS     = -static -O2 -Wall
 MUSL_DIR    = $(abspath ../../bsp/musl-1.2.6)
 MUSL_CC     = /opt/custom-llvm/bin/clang
 MUSL_TARGET = riscv64-linux-musl
-MUSL_ARCH   = rv64imac
-LIBGCC      = /usr/lib/gcc/riscv64-unknown-elf/14.2.0/rv64imac/lp64/libgcc.a
+# 必须硬浮点 lp64d: musl sysroot 以 rv64imafdc/lp64d 构建, 软浮点 lp64 会
+# 与 crt1.o 的硬浮点 ABI 冲突 (cannot link different floating-point ABI)。
+MUSL_ARCH   = rv64gc
+MUSL_ABI    = lp64d
+LIBGCC      = /usr/lib/gcc/riscv64-unknown-elf/14.2.0/rv64iafd/lp64d/libgcc.a
 
-MUSL_CFLAGS = --target=$(MUSL_TARGET) -march=$(MUSL_ARCH) \
+MUSL_CFLAGS = --target=$(MUSL_TARGET) -march=$(MUSL_ARCH) -mabi=$(MUSL_ABI) \
               -static -nostdlib -nostdinc -O2 -Wall \
               -isystem $(MUSL_DIR)/arch/riscv64 \
               -isystem $(MUSL_DIR)/arch/generic \
@@ -39,7 +42,7 @@ MUSL_LDLIBS = $(MUSL_DIR)/lib/crt1.o \
               $(LIBGCC)
 
 OUT_DIR    = bin
-PROGRAMS   = tee_stress
+PROGRAMS   = tee_stress tee_max_online
 PAYLOADS   = stress_payload
 
 BINS       = $(addprefix $(OUT_DIR)/, $(PROGRAMS))

@@ -8,7 +8,7 @@ import struct
 
 import pytest
 
-from pyremu.configs_aux import path_join, test_elf_dir
+from pyremu.configs_aux import examed_elf_dir, path_join
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import (
     MSTATUS_MIE,
@@ -16,7 +16,6 @@ from pyremu.core.hart import (
     MSTATUS_MPP,
     MSTATUS_MXR,
     MSTATUS_SIE,
-    MSTATUS_SPIE,
     MSTATUS_SPP,
     MSTATUS_SUM,
     MSTATUS_TW,
@@ -2576,7 +2575,7 @@ class TestStackOverflowUmode:
       U: well-behaved (bounded input fib) or pathological (stack_bomb)
     """
 
-    ELF_PATH = path_join(test_elf_dir(), "u_mode_run_fib.elf")
+    ELF_PATH = path_join(examed_elf_dir(), "u_mode_run_fib.elf")
 
     @pytest.fixture
     def emu_and_fw(self):

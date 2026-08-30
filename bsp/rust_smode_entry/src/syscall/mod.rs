@@ -17,6 +17,7 @@ mod types;
 
 use crate::ecall_aux;
 use crate::memory;
+#[cfg(feature = "diagnostic")]
 use crate::println;
 use crate::trap::TrapGprs;
 
@@ -176,6 +177,7 @@ pub fn syscall_handler(gprs: &TrapGprs) -> u64 {
 
         // ---- 未知 ----
         _ => {
+            #[cfg(feature = "diagnostic")]
             println!("syscall: unknown {}\n", num);
             ENOSYS
         }

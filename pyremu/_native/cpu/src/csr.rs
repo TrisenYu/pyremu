@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 
 use crate::concurrent::ConcurrentClintCtx;
 use crate::handlers::PmpCtx;
+use crate::interrupt::clint::write_stimecmp;
 use crate::interrupt::{
 	compute_mtopi, compute_stopi, imsic_reg_read, imsic_reg_write, imsic_topei_claim_iid,
 	imsic_topei_peek, sync_imsic_one, IID_M_IPI, IID_S_IPI,
@@ -267,7 +268,9 @@ pub fn csr_read(ctx: &mut CsrContext, addr: u16) -> (u64, u8) {
 
         // TEE CSRs (mdid=0x5C0, pmpsplit=0x5C1) — memory domain ID
         // and PMP virtualization split register.
-        0x5C0 => (ctx.state.mdid as u64, CSR_OK),
+        // mdid 是完整 64-bit: 收窄到 u8 会使 ≥256 的飞地 ID 别名回 0 (host),
+        // 既绕过 PMP 隔离 (mdid!=0 判定失效), 又让 SUSPEND handler 误判 host.
+        0x5C0 => (ctx.state.mdid, CSR_OK),
         0x5C1 => (ctx.state.pmpsplit as u64, CSR_OK),
 
         // ---- AIA IMSIC CSRs (gated behind PYREMU_AIA) ----
@@ -473,10 +476,17 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
         0xC00 | 0xC02 | 0xC80 | 0xC82 => CSR_OK,
 
         // Sstc stimecmp (0x14D) — S-mode timer compare value.
+        // QEMU 一次性定时器语义 (riscv_aclint_mtimer_write_timecmp):
+        // 过去值立即置位 STIP, 未来值清位并设定本 hart 指令计数空间的
+        // deadline (sync_mtip 活跃分支据此判定, 与共享 mtime 跨 hart 膨胀解耦).
         // Writing stimecmp also syncs to the CLINT mtimecmp array via the
         // pointer stored in clint context; this happens in Python's
         // ``_csr_write_raw("stimecmp", …)`` path during unmarshal.
-        STIMECMP => { ctx.state.stimecmp = val; CSR_OK }
+        STIMECMP => {
+            ctx.state.stimecmp = val;
+            write_stimecmp(ctx.state, ctx.mtime(), val, ctx.clint.timebase_hz);
+            CSR_OK
+        }
 
         // Floating-point CSRs — writing sets FS to Dirty + SD.
         FFLAGS => {
@@ -499,7 +509,8 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
         }
 
         // TEE CSRs (mdid / pmpsplit)
-        0x5C0 => { ctx.state.mdid = val as u8; CSR_OK }
+        // mdid 完整 64-bit 保存 — 见读路径注释, 收窄到 u8 是 batch-4 挂死根因.
+        0x5C0 => { ctx.state.mdid = val; CSR_OK }
         0x5C1 => { ctx.state.pmpsplit = val as u8; CSR_OK }
 
         // Debug/trace trigger CSRs (0x7A0-0x7AF) — not implemented.
@@ -614,8 +625,13 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
                 // IRQ_S_TIMER (STIP): clear mip bit + bump
                 // stimecmp so the interrupt does not re-fire.
                 ctx.state.mip.fetch_and(!(1 << 5), Ordering::AcqRel);
-                if ctx.state.stimecmp <= ctx.mtime() {
-                    ctx.state.stimecmp = ctx.mtime() + 4;
+                let now = ctx.mtime();
+                if ctx.state.stimecmp <= now {
+                    ctx.state.stimecmp = now + 4;
+                    // bump 后 stimecmp 为未来值: 按 QEMU 语义设定一次性 deadline.
+                    // 不设定则 sync_mtip 活跃分支退化为共享 mtime 比较, 会被其他
+                    // 活跃 hart 的进度膨胀提前置位 → mret 后立即再 trap 的活锁.
+                    write_stimecmp(ctx.state, now, ctx.state.stimecmp, ctx.clint.timebase_hz);
                 }
             } else if iid == 9 {
                 // IID=9 (SEI) — major identity for supervisor external.
@@ -810,19 +826,12 @@ pub fn handle_csr(
 		return EXIT_SENTINEL;
 	}
 
-	// stimecmp: immediately re-evaluate STIP (matching QEMU's
-	// riscv_timer_write_timecmp).  sync_mtip runs at the next
-	// instruction boundary, but the kernel reads stopi BEFORE
-	// that boundary inside riscv_intc_aia_irq().  Without this,
-	// stopi sees a stale STIP and never returns 0.
-	if csr_addr == STIMECMP {
-		let st_pending = ctx.state.stimecmp > 0 && ctx.mtime() >= ctx.state.stimecmp;
-		if st_pending {
-			ctx.state.mip.fetch_or(1 << 5, Ordering::AcqRel);
-		} else {
-			ctx.state.mip.fetch_and(!(1 << 5), Ordering::AcqRel);
-		}
-	}
+	// STIMECMP 写路径的 mip.STIP 立即更新已由 csr_write 内的 write_stimecmp
+	// 完成 (0→清, 过去→置位, 未来→清+设定 deadline), 与 QEMU 语义逐行一致;
+	// 此处不再重复基于共享 mtime 的重新比较 — 那会与 deadline 模型矛盾
+	// (跨 batch 边界的共享 mtime 膨胀会把刚设定的未来定时器重新推成"已到期").
+	// sync_mtip 仍在下一指令边界运行, 但 stopi 在此之前读到的 mip.STIP
+	// 已是最新值 (write_stimecmp 在写指令内同步置/清位)。
 
 	// stopi / mtopi claim is now handled entirely within csr_write
 	// (see the 0xDB0 / 0xFB0 match arms), which has access to mtime
@@ -1085,7 +1094,8 @@ mod tests {
 	#[test]
 	fn write_mip_preserves_stip_and_seip() {
 		let mut s = test_state();
-		s.mip.store((1 << 5) | (1 << 9) | (1 << 1), Ordering::Release);
+		s.mip
+			.store((1 << 5) | (1 << 9) | (1 << 1), Ordering::Release);
 		{
 			let clint = test_clint(0);
 			let mut ctx = test_csr_ctx(&mut s, &clint);
@@ -1093,9 +1103,21 @@ mod tests {
 			assert_eq!(st, CSR_OK);
 		}
 		let mip = s.mip.load(Ordering::Acquire);
-		assert_eq!(mip & (1 << 5), 1 << 5, "STIP is read-only, must be preserved");
-		assert_eq!(mip & (1 << 9), 1 << 9, "SEIP is read-only, must be preserved");
-		assert_eq!(mip & (1 << 1), 0, "SSIP is software-writable, must be cleared");
+		assert_eq!(
+			mip & (1 << 5),
+			1 << 5,
+			"STIP is read-only, must be preserved"
+		);
+		assert_eq!(
+			mip & (1 << 9),
+			1 << 9,
+			"SEIP is read-only, must be preserved"
+		);
+		assert_eq!(
+			mip & (1 << 1),
+			0,
+			"SSIP is software-writable, must be cleared"
+		);
 	}
 
 	#[test]
@@ -1385,7 +1407,11 @@ mod tests {
 		// csrr stopi → (9 << 16) | prio (SEI major identity).
 		let (val, st) = csr_read(&mut ctx, 0xDB0);
 		assert_eq!(st, CSR_OK);
-		assert_eq!((val >> 16) & 0x7FF, 9, "stopi must report SEI major identity");
+		assert_eq!(
+			(val >> 16) & 0x7FF,
+			9,
+			"stopi must report SEI major identity"
+		);
 
 		// 回写同一值 (read-modify-write) — 必须 no-op, eip 保持 pending.
 		let wst = csr_write(&mut ctx, 0xDB0, val);
@@ -1415,7 +1441,11 @@ mod tests {
 
 		let (val, st) = csr_read(&mut ctx, 0xFB0);
 		assert_eq!(st, CSR_OK);
-		assert_eq!((val >> 16) & 0x7FF, 11, "mtopi must report MEI major identity");
+		assert_eq!(
+			(val >> 16) & 0x7FF,
+			11,
+			"mtopi must report MEI major identity"
+		);
 
 		let wst = csr_write(&mut ctx, 0xFB0, val);
 		assert_eq!(wst, CSR_OK);
@@ -1503,5 +1533,28 @@ mod tests {
 		// pmpsplit (0x5C1)
 		assert_eq!(csr_write(&mut ctx, 0x5C1, 1), CSR_OK);
 		assert_eq!(ctx.state.pmpsplit, 1);
+	}
+
+	/// mdid 必须完整 64-bit 保存 — 修复前 `val as u8` 使 csrw mdid, 300 截断为 44,
+	/// csrw mdid, 256 截断为 0 (别名回 host). 这是 stress batch-4 (2000 并发飞地)
+	/// 挂死的根因: SUSPEND handler 读到 curr==0 误判 host 请求 → sbi_hart_hang.
+	#[test]
+	fn tee_mdid_full_width_write() {
+		let mut s = test_state();
+		let clint = test_clint(0);
+		let mut ctx = test_csr_ctx(&mut s, &clint);
+
+		// 300 > u8::MAX: 修复前截断为 44
+		assert_eq!(csr_write(&mut ctx, 0x5C0, 300), CSR_OK);
+		assert_eq!(ctx.state.mdid, 300);
+
+		// 256 ≡ 0 (mod 256): 修复前别名回 host (mdid=0), 绕过 PMP 隔离
+		assert_eq!(csr_write(&mut ctx, 0x5C0, 256), CSR_OK);
+		assert_eq!(ctx.state.mdid, 256);
+
+		// 读回与写一致
+		let (v, st) = csr_read(&mut ctx, 0x5C0);
+		assert_eq!(st, CSR_OK);
+		assert_eq!(v, 256);
 	}
 }

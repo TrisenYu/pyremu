@@ -258,6 +258,14 @@ class HartWithRegs:
         # 纯 Python 路径中由 sync_counters 递增.
         self._total_instrs: int = 0
 
+        # QEMU 一次性定时器 deadline (本 hart 指令计数空间, 0 = 未设定).
+        # 与 Rust HartState.stip_deadline/mtip_deadline 一一对应 (FFI 往返).
+        # Rust 侧由 write_stimecmp/write_mtimecmp 在写入 timecmp 时设定;
+        # Python 侧不设定 (单线程步骤路径无并发 mtime 膨胀, 共享比较已足够),
+        # 仅随 marshal/unmarshal 往返保持与 Rust 一致。
+        self._stip_deadline: int = 0
+        self._mtip_deadline: int = 0
+
         # CLINT MSIP 边沿诊断 (并发路径 sync_msip 更新)
         self.diag = HartDiag()
 
@@ -753,11 +761,16 @@ class HartWithRegs:
     def _eval_stip(self, stimecmp_val: int) -> None:
         """Immediately re-evaluate mip.STIP after stimecmp write.
 
-        Matches QEMU's riscv_timer_write_timecmp: on every CSR write to
-        stimecmp, STIP is recomputed immediately (not at the next
-        instruction boundary like sync_mtip does in the speedup execution engine).
+        Python 步骤路径: 单线程执行无并发 mtime 膨胀, 共享 mtime 比较即等价于
+        QEMU riscv_timer_write_timecmp (过去→置位, 未来→清除). Rust native 路径
+        由 csr.rs 的 write_stimecmp 承担同一语义并按 own 指令计数设定 deadline.
         This is critical for the kernel's stopi loop to exit.
         """
+        # Python 侧重算时使 Rust deadline 失效 (0 = 未设定): 之后若进入 native
+        # batch, 该 hart 定时器退化为共享比较. Python 写入只发生在单线程步骤/
+        # batch 退出后的补步, 共享比较正确; 失效可避免把陈旧的 Rust deadline
+        # 经 marshal 带回去造成错误判定.
+        self._stip_deadline = 0
         if self._interrupt_ctrl is not None:
             now = self._interrupt_ctrl.get_mtime()
             if stimecmp_val > 0 and now >= stimecmp_val:
@@ -927,14 +940,14 @@ class HartWithRegs:
 
 
 class TlbEntry(ctypes.Structure):
-    """Single TLB entry — must match Rust ``state::TlbEntry`` exactly (32 bytes)."""
+    """Single TLB entry — must match Rust ``state::TlbEntry`` exactly (40 bytes)."""
     _fields_ = [
         ("vpn", ctypes.c_uint64),
         ("ppn", ctypes.c_uint64),
         ("perm", ctypes.c_uint8),
         ("level", ctypes.c_uint8),
         ("valid", ctypes.c_uint8),
-        ("mdid", ctypes.c_uint8),
+        ("mdid", ctypes.c_uint64),
         ("tlb_epoch", ctypes.c_uint32),
         ("dirty", ctypes.c_uint8),
         ("accessed", ctypes.c_uint8),
@@ -1021,9 +1034,10 @@ class HartState(ctypes.Structure):
         ("waiting", ctypes.c_uint8),
         ("wfi_woken", ctypes.c_uint8),
         ("halted", ctypes.c_uint8),
-        ("mdid", ctypes.c_uint8),
+        # mdid 是完整 64-bit (u64 对齐后移到偏移 8), 字节块从 16B 涨到 24B
+        ("mdid", ctypes.c_uint64),
         ("pmpsplit", ctypes.c_uint8),
-        ("_pad", ctypes.c_uint8 * 6),
+        ("_pad", ctypes.c_uint8 * 7),
         # ---- Phase B: TLB entries (array-of-structs, 32 × 2) ----
         ("itlb", TlbEntry * TLB_SIZE),
         ("dtlb", TlbEntry * TLB_SIZE),
@@ -1048,6 +1062,11 @@ class HartState(ctypes.Structure):
         # ---- Phase H: AIA IMSIC register files ----
         ("imsic_m", ImsicFileC),
         ("imsic_s", ImsicFileC),
+        # ---- Phase I: per-hart one-shot timer deadlines (QEMU ACLINT 模型) ----
+        # 写入 timecmp 时在"本 hart 指令计数空间"固定的截止点 (0 = 未设定).
+        # 见 Rust write_mtimecmp/write_stimecmp + sync_mtip, 与 state.rs 同步.
+        ("stip_deadline", ctypes.c_uint64),
+        ("mtip_deadline", ctypes.c_uint64),
     ]
 
 
@@ -1133,6 +1152,12 @@ def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
     state.scounteren = hart.csrs["scounteren"].val if "scounteren" in hart.csrs else 0
     state.stimecmp = hart.csrs["stimecmp"].val if "stimecmp" in hart.csrs else 0
 
+    # ---- Phase I: one-shot timer deadlines (QEMU ACLINT 模型) ----
+    # 直接拷贝而非经写入路径重算 — Rust 侧写路径 (write_stimecmp/write_mtimecmp)
+    # 已在写入时刻固定 deadline, Python 侧步骤写入会经 _eval_stip 置 0 失效.
+    state.stip_deadline = hart._stip_deadline
+    state.mtip_deadline = hart._mtip_deadline
+
     # ---- Phase F: per-hart instruction counter ----
     state.total_instrs = hart._total_instrs
 
@@ -1196,6 +1221,12 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
         hart.csrs["scounteren"].val = state.scounteren
     hart._csr_write_raw("stimecmp", state.stimecmp)
 
+    # ---- Phase I: one-shot timer deadlines (QEMU ACLINT 模型) ----
+    # 直接拷贝回 Python — 与 marshal 对称, 保证 FFI 往返精确 (Rust 侧写路径
+    # 已设定的 deadline 原样带回, 供下一次 batch 继续使用).
+    hart._stip_deadline = state.stip_deadline
+    hart._mtip_deadline = state.mtip_deadline
+
     # ---- Phase F: per-hart instruction counter ----
     hart._total_instrs = state.total_instrs
 
@@ -1225,39 +1256,47 @@ def _marshal_imsic(hart: HartWithRegs, state: HartState) -> None:
         state.imsic_m.present = 0
         state.imsic_s.present = 0
         return
-    mf, sf = imsic._files[hart.id]
-    # Save eip snapshot so _unmarshal_imsic can detect daemon-added
-    # bits (injected by the RX daemon thread in the middle of acceleration)
-    # and preserve them across the marshal→unmarshal cycle.
-    # Without this, _unmarshal_imsic's Rust→Python copy overwrites daemon-injected eip bits.
-    hart._imsic_pre_m_eip = list(mf.eip)
-    hart._imsic_pre_s_eip = list(sf.eip)
-    # Marshal eip/eie + compute eip_ext_any for Rust fast-path.
-    # Mask IPI identities (1=S-IPI, 3=M-IPI) from word 0 — only
-    # external interrupts (>=6) count for eip_ext_any.
-    _ext_m, _ext_s = 0, 0
-    _mask0 = ~((1 << 1) | (1 << 3))  # exclude IID_S_IPI=1, IID_M_IPI=3
-    for j in range(64):
-        state.imsic_m.eip[j] = mf.eip[j]
-        state.imsic_m.eie[j] = mf.eie[j]
-        state.imsic_s.eip[j] = sf.eip[j]
-        state.imsic_s.eie[j] = sf.eie[j]
-        if j == 0:
-            if mf.eip[0] & _mask0: _ext_m = 1
-            if sf.eip[0] & _mask0: _ext_s = 1
-        else:
-            if mf.eip[j]: _ext_m = 1
-            if sf.eip[j]: _ext_s = 1
-    state.imsic_m.eidelivery = mf.eidelivery
-    state.imsic_m.eithreshold = mf.eithreshold
-    state.imsic_m.select = hart._imsic_select_m
-    state.imsic_m.present = 1  # IMSIC is wired
-    state.imsic_m.eip_ext_any = _ext_m
-    state.imsic_s.eidelivery = sf.eidelivery
-    state.imsic_s.eithreshold = sf.eithreshold
-    state.imsic_s.select = hart._imsic_select_s
-    state.imsic_s.present = 1  # IMSIC is wired
-    state.imsic_s.eip_ext_any = _ext_s
+    # 持锁: 读取 eip/eie 快照与 RX daemon 的 set_pending RMW 互斥,
+    # 避免 torn read (读到部分 word 已被 daemon 修改的不一致状态).
+    with imsic._lock:
+        mf, sf = imsic._files[hart.id]
+        # Save eip snapshot so _unmarshal_imsic can detect daemon-added
+        # bits (injected by the RX daemon thread in the middle of acceleration)
+        # and preserve them across the marshal→unmarshal cycle.
+        # Without this, _unmarshal_imsic's Rust→Python copy overwrites
+        # daemon-injected eip bits.
+        hart._imsic_pre_m_eip = list(mf.eip)
+        hart._imsic_pre_s_eip = list(sf.eip)
+        # Marshal eip/eie + compute eip_ext_any for Rust fast-path.
+        # Mask IPI identities (1=S-IPI, 3=M-IPI) from word 0 — only
+        # external interrupts (>=6) count for eip_ext_any.
+        _ext_m, _ext_s = 0, 0
+        _mask0 = ~((1 << 1) | (1 << 3))  # exclude IID_S_IPI=1, IID_M_IPI=3
+        for j in range(64):
+            state.imsic_m.eip[j] = mf.eip[j]
+            state.imsic_m.eie[j] = mf.eie[j]
+            state.imsic_s.eip[j] = sf.eip[j]
+            state.imsic_s.eie[j] = sf.eie[j]
+            if j == 0:
+                if mf.eip[0] & _mask0:
+                    _ext_m = 1
+                if sf.eip[0] & _mask0:
+                    _ext_s = 1
+            else:
+                if mf.eip[j]:
+                    _ext_m = 1
+                if sf.eip[j]:
+                    _ext_s = 1
+        state.imsic_m.eidelivery = mf.eidelivery
+        state.imsic_m.eithreshold = mf.eithreshold
+        state.imsic_m.select = hart._imsic_select_m
+        state.imsic_m.present = 1  # IMSIC is wired
+        state.imsic_m.eip_ext_any = _ext_m
+        state.imsic_s.eidelivery = sf.eidelivery
+        state.imsic_s.eithreshold = sf.eithreshold
+        state.imsic_s.select = hart._imsic_select_s
+        state.imsic_s.present = 1  # IMSIC is wired
+        state.imsic_s.eip_ext_any = _ext_s
 
 
 def _unmarshal_imsic(hart: HartWithRegs, state: HartState) -> None:
@@ -1272,25 +1311,30 @@ def _unmarshal_imsic(hart: HartWithRegs, state: HartState) -> None:
         hart._imsic_select_m = state.imsic_m.select
         hart._imsic_select_s = state.imsic_s.select
         return
-    mf, sf = imsic._files[hart.id]
-    # Compute daemon-added bits: bits set in Python between marshal and now
-    # that were NOT in the snapshot.  These must survive the
-    # Rust→Python copy.
-    pre_m = getattr(hart, '_imsic_pre_m_eip', None)
-    pre_s = getattr(hart, '_imsic_pre_s_eip', None)
-    for j in range(64):
-        daemon_m = mf.eip[j] & ~pre_m[j] if pre_m else 0
-        daemon_s = sf.eip[j] & ~pre_s[j] if pre_s else 0
-        mf.eip[j] = state.imsic_m.eip[j] | daemon_m
-        mf.eie[j] = state.imsic_m.eie[j]
-        sf.eip[j] = state.imsic_s.eip[j] | daemon_s
-        sf.eie[j] = state.imsic_s.eie[j]
-    mf.eidelivery = state.imsic_m.eidelivery
-    mf.eithreshold = state.imsic_m.eithreshold
-    sf.eidelivery = state.imsic_s.eidelivery
-    sf.eithreshold = state.imsic_s.eithreshold
-    hart._imsic_select_m = state.imsic_m.select
-    hart._imsic_select_s = state.imsic_s.select
-    # Update _any_ext cache — daemon may have set external interrupt bits.
-    mf._update_any_ext()
-    sf._update_any_ext()
+    # 持锁: 写回 eip/eie 与 RX daemon 的 set_pending RMW 互斥.
+    # 不持锁则 daemon 在 marshal→unmarshal 窗口注入的 eip 位可能被
+    # Rust 写回的旧值覆盖 (lost injection), 或在 daemon_m 计算时
+    # 读到 torn 状态.
+    with imsic._lock:
+        mf, sf = imsic._files[hart.id]
+        # Compute daemon-added bits: bits set in Python between marshal
+        # and now that were NOT in the snapshot.  These must survive the
+        # Rust→Python copy.
+        pre_m = getattr(hart, '_imsic_pre_m_eip', None)
+        pre_s = getattr(hart, '_imsic_pre_s_eip', None)
+        for j in range(64):
+            daemon_m = mf.eip[j] & ~pre_m[j] if pre_m else 0
+            daemon_s = sf.eip[j] & ~pre_s[j] if pre_s else 0
+            mf.eip[j] = state.imsic_m.eip[j] | daemon_m
+            mf.eie[j] = state.imsic_m.eie[j]
+            sf.eip[j] = state.imsic_s.eip[j] | daemon_s
+            sf.eie[j] = state.imsic_s.eie[j]
+        mf.eidelivery = state.imsic_m.eidelivery
+        mf.eithreshold = state.imsic_m.eithreshold
+        sf.eidelivery = state.imsic_s.eidelivery
+        sf.eithreshold = state.imsic_s.eithreshold
+        hart._imsic_select_m = state.imsic_m.select
+        hart._imsic_select_s = state.imsic_s.select
+        # Update _any_ext cache — daemon may have set external interrupt bits.
+        mf._update_any_ext()
+        sf._update_any_ext()

@@ -28,17 +28,12 @@ NATIVE_SRC = $(shell find $(NATIVE_DIR)/cpu $(NATIVE_DIR)/termio -type f -name '
 include emu-configs.mk
 
 # ---- 路径配置 ----
-hart_num = 2
+hart_num = 3
 kei-sav = $(firm_dir)/kei.sav.bin
 
 fw_payload     = $(elf_dir)/custom_opensbi_fw_payload.elf
 fw_jump        = $(elf_dir)/custom_opensbi_fw_jump.elf
 fw_dynamic     = $(elf_dir)/custom_opensbi_fw_dynamic.elf
-
-# TEE enclave stress test
-STRESS_SRC_DIR = tests/src-stress
-STRESS_BIN_DIR = build/src-stress
-STRESS_PROGS   = $(STRESS_BIN_DIR)/tee_stress $(STRESS_BIN_DIR)/stress_payload
 
 # custom-opensbi
 # Rust S-mode 可信管理程序 (嵌入到固件 .coffer_enclave_man 段)

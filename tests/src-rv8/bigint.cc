@@ -31,8 +31,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
-#include <iostream>
-#include <limits>
 #include <string>
 #include <vector>
 
@@ -126,7 +124,7 @@ struct Nat {
 	/*! set bit at bit offset */
 	void set_bit(size_t n);
 
-	/* 
+	/*
 	 * add, subtract, shifts and logical operators
 	 */
 
@@ -345,8 +343,8 @@ void Nat::set_bit(size_t n) {
 	limbs[word] |= (1ULL << (n & (limb_bits - 1)));
 }
 
-/* 
- * multiply and divide require add with carry, subtract  
+/*
+ * multiply and divide require add with carry, subtract
  * with borrow, left and right shift logical operators
  */
 

@@ -2,15 +2,17 @@
 # -*- coding: utf-8 -*-
 """短时间片抢占测试 — 验证抢占下进程交替执行与正确性."""
 
+from unittest import mock
+
 import pytest
 
-from pyremu.configs_aux import test_elf_dir
+from pyremu.configs_aux import examed_elf_dir
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import parse_firmware
 from tests.loader import MultiProgramLoader
 
-KERNEL_ELF = test_elf_dir("kernel.elf")
+KERNEL_ELF = examed_elf_dir("kernel.elf")
 
 
 def _make_emu(*procs: str):
@@ -42,6 +44,25 @@ class TestPreemptInterleave:
         out = loader.run()
         assert out.count("A") >= 50, f"A count too low: {out.count('A')}"
         assert out.count("B") >= 50, f"B count too low: {out.count('B')}"
+
+
+class TestPreemptPurePython:
+    """回归: 关闭 native 加速后, 纯 Python 路径下抢占交错仍成立.
+
+    ``_make_emu`` 构造 Emulator 时调用 ``_init_for_speedup_lib``, 其以公开的
+    ``native_available()`` 为门控 (emulator.py 构造期读该全局). patch 该公开
+    函数返回 False, 使 ``_speedup_hart_states`` 保持 None -> ``run()`` 走纯
+    Python ``step()`` 路径 — 无需触及私有库加载状态.
+    """
+
+    def test_interleaved_pure_python(self):
+        with mock.patch("pyremu.emulator.native_available", return_value=False):
+            emu, loader = _make_emu("u_prog_a_entry", "u_prog_b_entry")
+            assert emu._speedup_hart_states is None, "应走纯 Python 路径"
+            out = loader.run()
+        seq = "".join(c for c in out if c in "AB")
+        transitions = sum(1 for i in range(len(seq) - 1) if seq[i] != seq[i + 1])
+        assert transitions > 1, f"纯 Python 路径未交错, transitions={transitions}"
 
 
 class TestPreemptCorrectness:

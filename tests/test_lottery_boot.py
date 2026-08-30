@@ -10,7 +10,7 @@ import re
 
 import pytest
 
-from pyremu.configs_aux import path_join, test_elf_dir
+from pyremu.configs_aux import path_join, examed_elf_dir
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import FirmwareImage, parse_firmware
@@ -36,7 +36,7 @@ def _cached_firmware(path: str | PathLike) -> FirmwareImage | None:
     return parse_firmware(path)
 
 
-_LOTTERY_ELF = path_join(test_elf_dir(), "lottery_boot.elf")
+_LOTTERY_ELF = path_join(examed_elf_dir(), "lottery_boot.elf")
 # 固件在 1000 周期内即可完成彩票启动并输出全部关键行
 _LOTTERY_CYCLES = 1000
 

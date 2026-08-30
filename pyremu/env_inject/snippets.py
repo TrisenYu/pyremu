@@ -171,8 +171,8 @@ def imm64(rd: int, value: int) -> AsmSnippet:
     r"""生成将 64-bit 立即数加载到 rd 的片段.
 
     布局 (共 24 字节):
-        auipc rd, 0          # rd ← PC
-        ld    rd, 16(rd)     # rd ← mem[PC + 16]  (8 字节对齐的内联数据)
+        auipc rd, 0          # rd <- PC
+        ld    rd, 16(rd)     # rd <- mem[PC + 16]  (8 字节对齐的内联数据)
         jal   zero, 16       # 跳过数据池
         nop                  # 填充 (维持 8 字节对齐)
         .dword value         # 内联数据 (64-bit)
@@ -190,7 +190,7 @@ def imm64(rd: int, value: int) -> AsmSnippet:
             mask32(value),  # 数据低 32 位
             mask32(value >> 32),  # 数据高 32 位
         ],
-        desc=f"load x{rd} ← 0x{value:016x}",
+        desc=f"load x{rd} <- 0x{value:016x}",
     )
 
 

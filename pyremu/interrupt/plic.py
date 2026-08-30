@@ -36,6 +36,9 @@ RISC-V Platform-Level Interrupt Controller (PLIC).
 
 from __future__ import annotations
 
+import ctypes
+import threading
+
 from pyremu.memory.bus import Device
 
 # 诊断日志开关 (PYREMU_DIAG_VERBOSE=1): 打印 set_irq / claim / complete,
@@ -89,6 +92,15 @@ class PLIC(Device):
         # 处理不经 Python, complete 后无人再拉 set_irq).
         self._level: list[bool] = [False] * (num_sources + 1)
 
+        # FFI 持久数组 — 经 ctypes 直接暴露给 Rust batch 引擎, set_irq 每次
+        # 改线时同步写穿 (与 Python 列表同源)。Rust 内联仲裁 (plic_recompute_mip /
+        # plic_do_claim / plic_do_complete) 直接读写这两份数组; 设备线程 (RX
+        # drain) 与主线程 (guest MMIO 电平变化) 经 set_irq 保持实时同步 — 否则
+        # batch 起始快照覆盖 SEIP (UART 输入冻结), 且 complete 时陈旧 level
+        # 重挂起产生 spurious 中断风暴。
+        self._ffi_pending = (ctypes.c_uint8 * (num_sources + 1))()
+        self._ffi_level = (ctypes.c_uint8 * (num_sources + 1))()
+
         # _enable[c][i]: context c 启用 source i
         self._enable: list[list[bool]] = [
             [False] * (num_sources + 1) for _ in range(num_contexts)
@@ -108,13 +120,25 @@ class PLIC(Device):
         )
         self.size = last_context_end
 
+        # 并发安全: RX daemon (设备线程) 经 set_irq 写 pending/level, 主线程经
+        # get_pending_mip/read/write 读仲裁状态 — 共享状态访问需互斥.
+        self._lock = threading.Lock()
+
     # ---- 硬件集成 API (供模拟器其他组件调用) ----
 
     def set_irq(self, source: int, pending: bool) -> None:
-        """由设备模型调用: 设置中断源电平与挂起状态."""
-        if 0 < source <= self._num_sources:
-            self._level[source] = pending
-            self._pending[source] = pending
+        """由设备模型调用: 设置中断源电平与挂起状态.
+
+        level-triggered 语义 (对照 QEMU sifive_plic): pending 镜像电平, 非
+        边沿锁存 — deassert 时同时清除挂起, 由驱动保持数据源电平直到消费完成.
+        同时写穿 FFI 持久数组, 使 batch 内 Rust 内联仲裁实时看到电平变化.
+        """
+        with self._lock:
+            if 0 < source <= self._num_sources:
+                self._level[source] = pending
+                self._pending[source] = pending
+                self._ffi_pending[source] = 1 if pending else 0
+                self._ffi_level[source] = 1 if pending else 0
 
     def get_pending_mip(self, hart_id: int) -> int:
         """返回该 hart 的待处理外部中断 mip 位.
@@ -128,11 +152,12 @@ class PLIC(Device):
         m_ctx = 2 * hart_id
         s_ctx = m_ctx + 1
         mip = 0
-        if m_ctx < self._num_contexts and self._find_highest(m_ctx) > 0:
-            mip |= 1 << 11  # MEIP (M-context)
-        if s_ctx < self._num_contexts and self._find_highest(s_ctx) > 0:
-            mip |= 1 << 9  # SEIP (S-context)
-        return mip
+        with self._lock:
+            if m_ctx < self._num_contexts and self._find_highest(m_ctx) > 0:
+                mip |= 1 << 11  # MEIP (M-context)
+            if s_ctx < self._num_contexts and self._find_highest(s_ctx) > 0:
+                mip |= 1 << 9  # SEIP (S-context)
+            return mip
 
     # ---- 中断仲裁 ----
 
@@ -141,6 +166,13 @@ class PLIC(Device):
 
         条件: pending[i] AND enable[context][i] AND priority[i] > threshold[context]
         有多个时取最高优先级; 同优先级取最小 source id (RISC-V spec §7.3).
+
+        注意: 不检查 ``_claimed`` 状态.  PLIC 规范中 pending 是 per-source
+        (非 per-context), claim 操作原子清除 pending, 其他 context 自然看不到.
+        complete 后若 level 仍高则重挂 pending, 所有 context (含原 claimer)
+        均可再次 claim.  添加 _claimed 检查会阻止同一 context 重入 claim
+        (level 重挂场景) 或其他 context claim (多 hart 共享场景),
+        导致 MEIP/SEIP 断言但 claim 返回 0 的死锁.
         """
         threshold = self._threshold[context]
         best_source = 0
@@ -148,9 +180,6 @@ class PLIC(Device):
 
         for i in range(1, self._num_sources + 1):
             if not self._pending[i] or not self._enable[context][i]:
-                continue
-            # 该源已在该 context 上被 claim 但尚未 complete — 跳过
-            if self._claimed[context] == i:
                 continue
             pri = self._priority[i]
             if pri <= threshold:
@@ -167,15 +196,17 @@ class PLIC(Device):
     def read(self, offset: int, size: int) -> bytes:
         if size not in (2, 4):
             return b"\x00" * size
-        val = self._mmio_read(offset)
-        return val.to_bytes(size, "little")
+        with self._lock:
+            val = self._mmio_read(offset)
+            return val.to_bytes(size, "little")
 
     def write(self, offset: int, data: bytes) -> None:
         size = len(data)
         if size not in (2, 4):
             return
         val = int.from_bytes(data, "little")
-        self._mmio_write(offset, val)
+        with self._lock:
+            self._mmio_write(offset, val)
 
     def _mmio_read(self, offset: int) -> int:
         # Source priorities (0x000000 - 0x000FFC)

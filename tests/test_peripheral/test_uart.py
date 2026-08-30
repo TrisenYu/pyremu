@@ -16,6 +16,10 @@
 
 from __future__ import annotations
 
+import os
+import select
+import time
+
 import pytest
 
 from pyremu._native import native_available
@@ -283,6 +287,359 @@ class TestNativeUartPairRouting:
         emu._native_flush_uart()
         # 读索引应追平写索引 (只消费最后 ecap 个条目, 未卡死/未重复)
         assert termio.tx_log_rd == ecap + 4
+
+    def test_archive_only_no_stdout_reemit(self, tmp_path, monkeypatch):
+        """回归 (make emu-linux-sh): native 模式 stop()/flush 走 archive-only,
+        不得把 TX ring 重放到 stdout.
+
+        修复前 stop() 调 drain_tx_logs -> uart.write -> _write_reg(TXDATA),
+        _console_echo=False (native) 时直接 os.write(1, ...) — REPL 返回时把
+        ring 积压整段重放到控制台, 且与 CPU 引擎内联 try_write_fd 双写 stdout.
+        archive-only 只 record_tx_byte 回填行缓冲, tx_data() 与 hart 日志完整,
+        但 os.write(1) 一次也不得触发 (对照组 drain_tx_logs 必须触发).
+        """
+        emu = self._make_emu(tmp_path)
+        uart = emu.uart
+        termio = emu._termio
+        assert uart is not None
+        assert termio is not None
+        written: list[bytes] = []
+        monkeypatch.setattr(
+            "pyremu.peripheral.uart.os.write", lambda fd, b: written.append(b)
+        )
+        uart.set_console_echo(False)  # native 模式配置 (Rust 引擎负责即时输出)
+        for b in b"hi\n":
+            self._push_pair(emu, 0, b)
+
+        termio.drain_tx_logs_archive_only()
+
+        assert written == []  # 未重放 stdout
+        assert uart.tx_data() == b"hi\n"  # 行缓冲回填完整
+        uart.close_logs()
+        assert (tmp_path / "hart0.log").read_text() == "hi\n"
+
+        # 对照组: 普通 drain_tx_logs (旧 stop() 路径) 会重放 stdout
+        uart.tx_clear()
+        for b in b"YO":
+            self._push_pair(emu, 0, b)
+        termio.drain_tx_logs()
+        # 对照组完整重放 "YO"; 此前 "hi\n" 已被 archive-only 消费且未写 stdout
+        assert written == [b"Y", b"O"]
+
+
+class TestTxArchiveDaemonPollFallback:
+    """TX 归档 daemon 的 0.2s 轮询兜底 — 回归 (make emu-linux-sh hart 日志近乎为空).
+
+    回归背景: 修复前 ``_tx_archive_loop`` 在 select 超时 (0.2s) 后无条件落入
+    阻塞 ``os.read(notify_r, 256)``。而通知管道只有 Rust 引擎写 ``tx_notify_fd``
+    才可读, 实际恒为空 (state.rs 中该字段恒为 -1, Rust 从不写) → daemon 永久
+    阻塞在空管道读, ring buffer 永不归档; 仅剩 ``stop_tx_archive_thread`` 最终
+    排空的一小段, hart 日志与启动输出严重不符。
+
+    本测试验证: 通知管道为空 (无 Rust 通知) 时, daemon 仍靠 0.2s 轮询在
+    ``stop`` 之前把新 TX 条目归档到 hart 日志文件 — 修复前日志为空。
+    """
+
+    def _make_emu(self, tmp_path) -> Emulator:
+        cfg = PlatformConfig(
+            num_harts=2,
+            ram_size=8 * 1024 * 1024,
+            ram_base=0x8000_0000,
+            prog_cnt=0x8000_0000,
+            periph=PeripheralConfig(),
+        )
+        emu = Emulator(cfg)
+        if emu._termio is None:
+            pytest.skip("TerminalIO not available (非交互式 TTY 环境)")
+        uart = emu.uart
+        assert uart is not None
+        uart.set_hart_log_dir(str(tmp_path))
+        return emu
+
+    def _push_pair(self, emu: Emulator, hid: int, byte: int) -> None:
+        termio = emu._termio
+        if termio is None:
+            pytest.skip("TerminalIO not available (非交互式环境)")
+        ecap = termio.TX_CAP // 2
+        e = termio.tx_wr.value
+        termio.tx_buf[2 * (e % ecap)] = hid
+        termio.tx_buf[2 * (e % ecap) + 1] = byte
+        termio.tx_wr.value = (e + 1) & 0xFFFF_FFFF
+
+    def test_archive_daemon_drains_without_notify_pipe(self, tmp_path):
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        assert termio is not None
+        uart = emu.uart
+        assert uart is not None
+        try:
+            termio.start_tx_archive_thread()
+            # 推入 "hi\\n" 到 ring buffer — 无任何通知管道写入 (模拟 Rust 从不
+            # 写 tx_notify_fd 的真实场景). 行缓冲: 收到 \\n 时整段落盘.
+            self._push_pair(emu, 0, ord("h"))
+            self._push_pair(emu, 0, ord("i"))
+            self._push_pair(emu, 0, ord("\n"))
+
+            # 轮询等待 daemon 在 stop 之前归档 (0.2s 周期, 最多等 3s)
+            log_path = tmp_path / "hart0.log"
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                try:
+                    if log_path.read_text() == "hi\n":
+                        break
+                except FileNotFoundError:
+                    pass
+                time.sleep(0.05)
+            else:
+                thr = termio._tx_archive_thread
+                content = None
+                if log_path.exists():
+                    content = log_path.read_text(errors="replace")
+                nfds = len(os.listdir("/proc/self/fd"))
+                pytest.fail(
+                    "归档 daemon 未在轮询周期内将 TX 条目写入 hart 日志 — "
+                    "修复前阻塞在空通知管道读, ring buffer 永不归档"
+                    f"[diag: thread_alive={thr is not None and thr.is_alive()} "
+                    f"tx_log_rd={termio.tx_log_rd} tx_wr={termio.tx_wr.value} "
+                    f"log_exists={log_path.exists()} log_content={content!r} "
+                    f"open_fds={nfds} notify_r_fd={termio._tx_notify_r}]"
+                )
+            # 日志读索引已追平写索引 (stop 的最终排空前已消费)
+            assert termio.tx_log_rd == termio.tx_wr.value
+        finally:
+            termio.stop_tx_archive_thread()
+            uart.close_logs()
+
+    def test_archive_daemon_survives_high_fd_notify(self, tmp_path):
+        """select->poll 回归: 通知 fd >= 1024 时 select() 抛 ValueError 杀死
+        daemon (fd 泄漏场景下通知管道可升至 3k+), poll() 无此上限。
+
+        修复前 ``_tx_archive_loop`` 用 ``select.select([notify_r], ...)``, 而
+        select(2) 的 fd_set 位掩码只有 FD_SETSIZE=1024 位, fd >= 1024 直接抛
+        ``ValueError: filedescriptor out of range``, 被 ``except ... break``
+        吞掉后 daemon 静默死亡。本测试用 dup2 把通知读端强制推到 fd 1024,
+        修复前第一次 select 调用即退出, 日志永不归档; poll 版照常工作。
+        """
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        assert termio is not None
+        uart = emu.uart
+        assert uart is not None
+        high_fd = 1024
+        orig_r = termio._tx_notify_r
+        assert orig_r < high_fd, "测试环境 fd 已被占用, 无法 dup2 到 1024"
+        try:
+            # 把通知读端 dup2 到 fd 1024 — 模拟长进程 fd 增长后的高位通知管道
+            os.dup2(orig_r, high_fd)
+            termio._tx_notify_r = high_fd
+            termio.start_tx_archive_thread()
+            self._push_pair(emu, 0, ord("h"))
+            self._push_pair(emu, 0, ord("i"))
+            self._push_pair(emu, 0, ord("\n"))
+
+            log_path = tmp_path / "hart0.log"
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                try:
+                    if log_path.read_text() == "hi\n":
+                        break
+                except FileNotFoundError:
+                    pass
+                time.sleep(0.05)
+            else:
+                thr = termio._tx_archive_thread
+                pytest.fail(
+                    "高 fd 通知管道下归档 daemon 未工作 — "
+                    "修复前 select() 对 fd>=1024 抛 ValueError 静默退出"
+                    f"[diag: thread_alive={thr is not None and thr.is_alive()} "
+                    f"notify_r_fd={termio._tx_notify_r}]"
+                )
+            assert termio.tx_log_rd == termio.tx_wr.value
+        finally:
+            termio.stop_tx_archive_thread()
+            termio._tx_notify_r = orig_r
+            try:
+                os.close(high_fd)
+            except OSError:
+                pass
+            uart.close_logs()
+
+    def test_termio_stop_closes_pipe_fds(self, tmp_path):
+        """fd 泄漏回归: stop() 显式关闭 __init__ 创建的 6 个管道 fd.
+
+        修复前 3 个管道 (tx_notify / rx_notify / rx_drain) 从不关闭, 每实例
+        泄漏 6 个 fd; 全量测试套件下累积到 3k+ 触发 select() fd>=1024 上限
+        (见 test_archive_daemon_survives_high_fd_notify)。stop 后 fd 必须真正
+        释放 (os.fstat 抛 OSError) 且属性置 -1 (幂等)。
+        """
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        assert termio is not None
+        fd_names = (
+            "_tx_notify_r", "_tx_notify_w",
+            "_rx_notify_r", "_rx_notify_w",
+            "_rx_drain_r", "_rx_drain_w",
+        )
+        saved = {n: getattr(termio, n) for n in fd_names}
+        assert all(fd >= 0 for fd in saved.values())
+
+        termio.stop()
+
+        # 所有 fd 真正被关闭 (fstat 对已关闭 fd 抛 OSError)
+        for name, fd in saved.items():
+            with pytest.raises(OSError):
+                os.fstat(fd)
+            assert getattr(termio, name) == -1, f"{name} 应置 -1"
+        # 幂等: 再次 stop 不抛异常, 属性保持 -1
+        termio.stop()
+        for name in fd_names:
+            assert getattr(termio, name) == -1
+
+    def test_start_after_stop_recreates_pipes(self, tmp_path):
+        """回归: 调试器 REPL↔运行模式往返 (stop -> start) 必须重建管道.
+
+        用户报告 rvdbg ``continue`` 时 ``_tx_archive_loop`` / ``_rx_daemon_loop``
+        双双崩溃: ``ValueError: file descriptor cannot be a negative integer (-1)``。
+        根因: ``_enter_repl_mode`` 调 ``termio.stop()`` 关闭全部管道 (fd 置 -1),
+        随后 ``continue`` 的 ``_enter_run_mode`` 调 ``termio.start()``, 而 start()
+        不重建管道, daemon 线程捕获 fd=-1 后在 ``poll.register(-1)`` 崩溃。
+        修复后 start() 先重建管道, 全部读端 fd 恢复有效。
+        """
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        assert termio is not None
+
+        termio.stop()
+        for name in ("_tx_notify_r", "_rx_notify_r", "_rx_drain_r"):
+            assert getattr(termio, name) == -1, "stop() 后读端 fd 应置 -1"
+
+        try:
+            # 修复前: start() 不重建管道 -> 以下两行在 stop() 清理后即见
+            # daemon 线程 (Thread-1/Thread-2) 崩溃; 修复后 fd 全部恢复有效.
+            termio.start()
+            assert termio._tx_notify_r >= 0
+            assert termio._rx_notify_r >= 0
+            assert termio._rx_drain_r >= 0
+        finally:
+            termio.stop()
+
+    def test_daemon_entries_guard_closed_notify_fd(self, tmp_path):
+        """回归: 通知管道已关闭 (fd=-1) 时 daemon 入口不得抛 ValueError.
+
+        ``stop()`` 把读端 fd 置 -1 后, 若 daemon 线程仍在线程入口执行
+        ``poll.register(-1, POLLIN)`` 会抛未捕获 ValueError (用户报告的两个
+        线程双双崩溃)。修复后三个 daemon 入口与 start 方法在 fd<0 时直接返回,
+        不注册 poll、不启动线程。
+        """
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        assert termio is not None
+        termio.stop()  # 关闭全部管道, fd 置 -1
+
+        # start 方法: fd<0 时不启动线程, 也不改动 running 标志
+        termio.start_tx_archive_thread()
+        assert termio._tx_archive_thread is None
+        assert termio._tx_archive_running is False
+        termio.start_tx_drain_thread()
+        assert termio._tx_drain_thread is None
+        assert termio._tx_drain_running is False
+        termio.start_rx_daemon()
+        assert termio._rx_daemon_thread is None
+        assert termio._rx_daemon_running is False
+
+        # daemon 入口直接调用 (同步): 修复前在 poll.register(-1) 抛 ValueError
+        # (本测试即失败), 修复后经 fd 守卫直接返回.
+        termio._tx_archive_running = True
+        termio._tx_drain_running = True
+        termio._rx_daemon_running = True
+        termio._tx_archive_loop()
+        termio._tx_drain_loop()
+        termio._rx_daemon_loop()
+
+    def test_emulator_close_releases_termio_fds(self, tmp_path):
+        """Emulator 生命周期结束 (close) 释放 termio 管道 fd — 回归.
+
+        使用 Emulator 的调用方 (调试器退出 / 测试 teardown) 只需调一次
+        ``emu.close()`` 即释放 6 个管道 fd; 未显式 close 的实例由 __del__ 兜底.
+        """
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        assert termio is not None
+        saved = (
+            termio._tx_notify_r, termio._tx_notify_w,
+            termio._rx_notify_r, termio._rx_notify_w,
+            termio._rx_drain_r, termio._rx_drain_w,
+        )
+        assert all(fd >= 0 for fd in saved)
+
+        emu.close()
+
+        for fd in saved:
+            with pytest.raises(OSError):
+                os.fstat(fd)
+        assert emu._closed is True
+        # 幂等: 再次 close 不抛异常
+        emu.close()
+
+
+class TestRxDaemonLostNotifyFallback:
+    """RX daemon 通知丢失兜底 — 回归 (快速输入回显卡死).
+
+    回归背景: 修复前 ``_rx_daemon_loop`` 在 poll 超时后 ``if not ready: continue``
+    跳过排空。而 Rust termio 线程写 ring buffer 后向通知管道写 1 字节, 写端
+    非阻塞 — 突发输入时管道满 EAGAIN, 通知字节丢失; daemon 空等 0.5s 仍不排空,
+    输入滞留 ring buffer 直到主线程碰巧排空, 快速输入下表现为回显卡死。
+
+    本测试验证: 通知管道为空 (通知字节丢失), 但 ring buffer 已有数据时,
+    ``_rx_daemon_tick`` 走 poll 超时路径仍排空到 UART FIFO — 修复前数据滞留。
+    """
+
+    def _make_emu(self, tmp_path) -> Emulator:
+        cfg = PlatformConfig(
+            num_harts=2,
+            ram_size=8 * 1024 * 1024,
+            ram_base=0x8000_0000,
+            prog_cnt=0x8000_0000,
+            periph=PeripheralConfig(),
+        )
+        emu = Emulator(cfg)
+        if emu._termio is None:
+            pytest.skip("TerminalIO not available (非交互式 TTY 环境)")
+        uart = emu.uart
+        assert uart is not None
+        uart.set_hart_log_dir(str(tmp_path))
+        return emu
+
+    def _push_rx_ring(self, emu: Emulator, data: bytes) -> None:
+        """直接写入 RX ring buffer, 绕过 Rust termio 线程 (不写通知管道)."""
+        termio = emu._termio
+        if termio is None:
+            pytest.skip("TerminalIO not available")
+        for b in data:
+            idx = termio._rx_wr.value
+            termio._rx_buf[idx % termio.RX_CAP] = b
+            termio._rx_wr.value = (idx + 1) & 0xFFFF_FFFF
+
+    def test_rx_daemon_drains_on_timeout_without_notify(self, tmp_path):
+        """通知字节丢失时, 超时兜底仍排空 ring buffer — 修复前 continue 跳过."""
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        assert termio is not None
+        uart = emu.uart
+        assert uart is not None
+        try:
+            # ring buffer 已有数据, 但通知管道为空 (模拟通知字节丢失).
+            self._push_rx_ring(emu, b"hi")
+            assert termio._rx_wr.value != termio._rx_rd.value
+            poll = select.poll()
+            poll.register(termio._rx_notify_r, select.POLLIN)
+            # 空管道 -> poll 走 1ms 超时路径; 修复前该分支 continue, 数据滞留.
+            assert termio._rx_daemon_tick(termio._rx_notify_r, poll, timeout_ms=1)
+            assert bytes(uart._rx_fifo) == b"hi"
+            assert termio._rx_wr.value == termio._rx_rd.value
+        finally:
+            uart.close_logs()
+            termio.stop()
 
 
 # ============================================================

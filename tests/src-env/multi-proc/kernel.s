@@ -50,7 +50,10 @@
 .equ PS_READY,      1
 .equ PS_RUNNING,    2
 
-.equ TIMESLICE,     2000      // 每次调度分片 (cycles)
+.equ TIMESLICE,     100       // 每次调度分片 (mtime ticks; 模拟器 1 tick ≈ 100 指令)
+                              // 原 2000 tick ≈ 20 万指令, 远超 prog_a/prog_b 的
+                              // ~6 万指令体量, MTI 永不触发 -> test_interleaved 无交错.
+                              // 100 tick ≈ 1 万指令, 每进程被抢占多次, 抢占机制可测.
 
 .equ RBUF_SIZE,     64
 .equ RBUF_MASK,     63
@@ -214,13 +217,12 @@ save_gprs_to_frame:
 
 
 // ============================================================
-//  restore_gprs_from_frame — 从帧 GPR 区域恢复 x1-x31
-//    内核 ra 暂存于 72(sp), 函数末尾恢复
+//  restore_gprs_from_frame — 从帧 GPR 区域恢复 x2-x31 (不含 x1/ra)
+//    x1 由调用方 s_trap_restore_gprs 的后续步骤单独恢复:
+//    若此处先恢复 x1 再 ret, ret (jalr x0, 0(x1)) 会用内核返回地址
+//    覆盖 x1, 丢失用户 ra. 跳过 x1 后 x1 全程保持内核返回地址, ret 正常.
 // ============================================================
 restore_gprs_from_frame:
-    sd   ra, 72(sp)               // 暂存内核返回地址
-
-    ld   x1,  GPR_OFF + 0*8(sp)
     ld   t0,  GPR_OFF + 1*8(sp);  csrw sscratch, t0  // x2/sp
     ld   x3,  GPR_OFF + 2*8(sp)
     ld   x4,  GPR_OFF + 3*8(sp)
@@ -251,8 +253,6 @@ restore_gprs_from_frame:
     ld   x29, GPR_OFF +28*8(sp)
     ld   x30, GPR_OFF +29*8(sp)
     ld   x31, GPR_OFF +30*8(sp)
-
-    ld   ra, 72(sp)               // 恢复内核返回地址
     ret
 
 
@@ -349,10 +349,12 @@ setup_sv39:
     or   t0, t0, t1
     sd   t0, 128(t2)
 
-    // L3_main: 16 页 identity (代码/数据/BSS)
+    // L3_main: 16 页 identity (内核代码/数据/BSS), U=0
+    //   S 模式可自由取指/访存 (U=0 页不受 SUM 限制). U 程序已被链接到
+    //   独立 .uprog 区域, 见下方 U=1 循环.
     li   t0, 0x3000
     add  s1, s0, t0
-    li   t0, 0x000000002000001f
+    li   t0, 0x000000002000000f
     li   t1, 16
 1:
     sd   t0, 0(s1)
@@ -361,6 +363,35 @@ setup_sv39:
     add  t0, t0, t2
     addi t1, t1, -1
     bnez t1, 1b
+
+    // L3_main: U 程序专用页 identity 映射, U=1
+    //   范围 [__UPROG_START__, __UPROG_END__), 连续排列于 0x80020000 起.
+    //   Sv39 U-bit 规则 (RISC-V §4.3.2): U 模式进程只能执行 U=1 页,
+    //   而 S 模式永不从 U=1 页取指 (与 SUM 无关) — 故 U 程序必须独占
+    //   页面, 与内核页 (U=0) 分离, 页粒度 U 位才能同时服务两种模式.
+    la   t0, __UPROG_START__
+    la   t1, __UPROG_END__
+    li   t2, 0xfff               // 4095 超出 addi 12 位有符号范围, 用 li+add
+    add  t1, t1, t2              // 结束地址向上取整到页边界 (含 .uprog.bss)
+    srli t0, t0, 12              // t0 = start 页号 (identity: 页号 == VPN[0])
+    srli t1, t1, 12              // t1 = end 页号 (exclusive)
+    li   t2, 0x3000
+    add  s1, s0, t2              // s1 = L3_main
+    andi t2, t0, 0x1ff           // L3 索引 = 页号 & 0x1ff
+    slli t2, t2, 3               // 索引 × 8 字节
+    add  s1, s1, t2              // s1 = &L3_main[start_idx]
+    slli t3, t0, 10              // PTE 基 = (页号 << 10) | 0x1f (V|R|W|X|U)
+    li   t4, 0x1f
+    or   t3, t3, t4
+4:
+    beq  t0, t1, 5f
+    sd   t3, 0(s1)
+    addi s1, s1, 8
+    addi t0, t0, 1
+    li   t5, 0x400               // PPN += 1 -> PTE += (1 << 10)
+    add  t3, t3, t5
+    j    4b
+5:
 
     // 每进程 U 栈: pid 0..MAX_PROCS-1 各 1 页 (保护页在下方, 不映射)
     //   栈地址 = STACK_BASE_U + pid * 0x2000
@@ -582,10 +613,10 @@ terminate_current:
     li   t3, -1
     sw   t3, 0(t0)
 
-    // 设置 ra = s_trap_done: schedule_next 的 ret 将直接跳转到
-    // s_trap_done (恢复 trap 帧 -> sret 到新进程),
-    // 而非 sys_exit (会落入 s_trap_fault)
-    la   ra, s_trap_done
+    // 设置 ra = s_trap_done_switch: schedule_next 的 ret 将直接跳转到
+    // 切换路径 (恢复新进程寄存器 -> sret), 而非 sys_exit (会落入
+    // s_trap_fault). 用 _switch 变体: 已切换进程, 内核帧属旧进程不可恢复.
+    la   ra, s_trap_done_switch
     j    schedule_next
 
 
@@ -753,10 +784,22 @@ s_trap_interrupt:
 
 2:
     call schedule_next
-    // schedule_next 会跳转到 s_trap_done 或直接到新进程
+    // 已切换到新进程: 内核帧(0-64)仍是旧进程的 ra/fp/a0/... 值,
+    // 走 s_trap_done 的内核帧恢复会覆盖新进程寄存器, 故跳转
+    // s_trap_done_switch 跳过内核帧恢复 (寄存器已由 PCB 恢复).
+    j    s_trap_done_switch
 
-s_trap_done:
-    // PCB GPR -> 帧 (恢复当前进程的寄存器)
+// ============================================================
+//  s_trap_restore_gprs — 从当前进程 PCB 恢复寄存器:
+//    copy_gprs_from_pcb 把 PCB GPR 区搬入帧 GPR 区, 再 restore_gprs_from_frame
+//    恢复到 x2-x31. x1 (ra) 此处不恢复 (restore_gprs_from_frame 跳过 x1),
+//    交由调用方按路径恢复: syscall 路径 s_trap_done 从帧槽 0 恢复,
+//    切换路径 s_trap_done_switch 从帧 GPR 区恢复.
+//    返回地址暂存于 80(sp) (内核帧空闲槽, 位于 s3 与 GPR 区之间):
+//    内部 call 会 clobber ra, 必须在进入时保存、返回前恢复.
+// ============================================================
+s_trap_restore_gprs:
+    sd   ra, 80(sp)
     la   t0, current_pid
     lw   t1, 0(t0)
     bltz t1, 1f
@@ -766,9 +809,17 @@ s_trap_done:
     add  t3, t3, t2             // t3 = &PCB[current_pid]
     call copy_gprs_from_pcb
 1:
-    // 从帧恢复全部用户寄存器
     call restore_gprs_from_frame
-    // 内核帧恢复 (覆盖可能被 ECALL 修改的 a0 等)
+    ld   ra, 80(sp)
+    ret
+
+// ============================================================
+//  s_trap_done — syscall 返回路径: 恢复寄存器 + 内核帧
+// ============================================================
+s_trap_done:
+    call s_trap_restore_gprs
+    // 内核帧恢复: 传播 uart_getc 等 syscall 写入 16(sp) 的 a0 返回值,
+    // 并重载被 syscall 处理器 clobber 的 ra/fp/t0/t1/s2/s3
     ld   ra,  0(sp)
     ld   fp,  8(sp)
     ld   a0, 16(sp)
@@ -777,68 +828,84 @@ s_trap_done:
     ld   t1, 40(sp)
     ld   s2, 56(sp)
     ld   s3, 64(sp)
+    j    s_trap_sret
+
+// ============================================================
+//  s_trap_done_switch — 中断/退出切换路径: 跳过内核帧恢复
+//    已通过 schedule_next 切换到新进程, 内核帧(0-64)仍是旧进程的
+//    ra/fp/a0/... 值, 不能用于覆盖新进程寄存器. x2-x31 已由
+//    s_trap_restore_gprs 从新进程 PCB 恢复, x1 (ra) 因 restore_gprs_from_frame
+//    跳过 x1 保持内核返回地址, 故此处从帧 GPR 区单独恢复用户 ra.
+// ============================================================
+s_trap_done_switch:
+    call s_trap_restore_gprs
+    ld   x1, GPR_OFF + 0*8(sp)   // x1 = 新进程的用户 ra (帧 GPR 区)
+    j    s_trap_sret
+
+// 公共: 恢复 S 栈, 交换回用户 sp, 返回用户模式
+s_trap_sret:
     addi sp, sp, FRAME_SIZE
     csrrw sp, sscratch, sp     // sp = 用户 sp, sscratch = S 栈顶
     sret
 
 
-	// ============================================================
-	//  S 模式 trap handler (嵌套中断变体)
-	// ============================================================
-	s_trap_handler_nested_enabled:
-	    csrrw sp, sscratch, sp
-	    addi sp, sp, -88
-	    sd   ra,  0(sp)
-	    sd   fp,  8(sp)
-	    sd   a0, 16(sp)
-	    sd   a1, 24(sp)
-	    sd   t0, 32(sp)
-	    sd   t1, 40(sp)
-	    sd   s2, 56(sp)
-	    sd   s3, 64(sp)
-	    addi fp, sp, 88
-	    csrr t0, sscratch
-	    sd   t0, 72(sp)
-	    csrw sscratch, sp
-	    li   t0, (1 << 1)
-	    csrs sstatus, t0
-	    csrr t0, scause
-	    bltz t0, s_trap_interrupt
-	    andi t1, t0, 0xFF
-	    li   t2, 8
-	    bne  t1, t2, s_trap_fault
-	    li   t1, 0
-	    beq  a7, t1, sys_report_fib
-	    li   t1, 1
-	    beq  a7, t1, sys_exit
-	    li   t1, 2
-	    beq  a7, t1, sys_uart_putc
-	    li   t1, 3
-	    beq  a7, t1, sys_uart_puts
-	    li   t1, 4
-	    beq  a7, t1, sys_uart_getc
-	    li   t1, 5
-	    beq  a7, t1, sys_report_nq
-	    li   a0, 255
-	    j    sys_exit
+// ============================================================
+//  S 模式 trap handler (嵌套中断变体)
+// ============================================================
+s_trap_handler_nested_enabled:
+	csrrw sp, sscratch, sp
+	addi sp, sp, -88
+	sd   ra,  0(sp)
+	sd   fp,  8(sp)
+	sd   a0, 16(sp)
+	sd   a1, 24(sp)
+	sd   t0, 32(sp)
+	sd   t1, 40(sp)
+	sd   s2, 56(sp)
+	sd   s3, 64(sp)
+	addi fp, sp, 88
+	csrr t0, sscratch
+	sd   t0, 72(sp)
+	csrw sscratch, sp
+	li   t0, (1 << 1)
+	csrs sstatus, t0
+	csrr t0, scause
+	bltz t0, s_trap_interrupt
+	andi t1, t0, 0xFF
+	li   t2, 8
+	bne  t1, t2, s_trap_fault
+	li   t1, 0
+	beq  a7, t1, sys_report_fib
+	li   t1, 1
+	beq  a7, t1, sys_exit
+	li   t1, 2
+	beq  a7, t1, sys_uart_putc
+	li   t1, 3
+	beq  a7, t1, sys_uart_puts
+	li   t1, 4
+	beq  a7, t1, sys_uart_getc
+	li   t1, 5
+	beq  a7, t1, sys_report_nq
+	li   a0, 255
+	j    sys_exit
 
 
-	s_trap_done_nested_enabled:
-	    li   t0, (1 << 1)
-	    csrc sstatus, t0
-	    ld   t0, 72(sp)
-	    csrw sscratch, t0
-	    ld   ra,  0(sp)
-	    ld   fp,  8(sp)
-	    ld   a0, 16(sp)
-	    ld   a1, 24(sp)
-	    ld   t0, 32(sp)
-	    ld   t1, 40(sp)
-	    ld   s2, 56(sp)
-	    ld   s3, 64(sp)
-	    addi sp, sp, 88
-	    csrrw sp, sscratch, sp
-	    sret
+s_trap_done_nested_enabled:
+	li   t0, (1 << 1)
+	csrc sstatus, t0
+	ld   t0, 72(sp)
+	csrw sscratch, t0
+	ld   ra,  0(sp)
+	ld   fp,  8(sp)
+	ld   a0, 16(sp)
+	ld   a1, 24(sp)
+	ld   t0, 32(sp)
+	ld   t1, 40(sp)
+	ld   s2, 56(sp)
+	ld   s3, 64(sp)
+	addi sp, sp, 88
+	csrrw sp, sscratch, sp
+	sret
 
 
 // ============================================================
@@ -886,23 +953,54 @@ uart_poll:
     ret
 
 rbuf_put:
-    la   t0, rbuf_count; lw t1, 0(t0); li t2, RBUF_SIZE
+    la   t0, rbuf_count;
+	lw t1, 0(t0);
+	li t2, RBUF_SIZE
     bge t1, t2, rbuf_put_full
-    la   t0, rbuf_head; lw t2, 0(t0); andi t2, t2, RBUF_MASK
-    la   t0, rbuf; add t2, t0, t2; sb a1, 0(t2)
-    la   t0, rbuf_head; lw t2, 0(t0); addi t2, t2, 1; sw t2, 0(t0)
-    la   t0, rbuf_count; lw t2, 0(t0); addi t2, t2, 1; sw t2, 0(t0)
-    li   a0, 0; ret
-rbuf_put_full: li a0, 1; ret
+    la   t0, rbuf_head;
+	lw t2, 0(t0);
+	andi t2, t2, RBUF_MASK
+    la   t0, rbuf;
+	add t2, t0, t2;
+	sb a1, 0(t2)
+    la   t0, rbuf_head;
+	lw t2, 0(t0);
+	addi t2, t2, 1;
+	sw t2, 0(t0)
+    la   t0, rbuf_count;
+	lw t2, 0(t0);
+	addi t2, t2, 1;
+	sw t2, 0(t0)
+    li   a0, 0;
+	ret
+rbuf_put_full:
+	li a0, 1;
+	ret
 
 rbuf_get:
-    la   t0, rbuf_count; lw t1, 0(t0); beqz t1, rbuf_get_empty
-    la   t0, rbuf_tail; lw t2, 0(t0); andi t2, t2, RBUF_MASK
-    la   t0, rbuf; add t2, t0, t2; lbu a0, 0(t2)
-    la   t0, rbuf_tail; lw t2, 0(t0); addi t2, t2, 1; sw t2, 0(t0)
-    la   t0, rbuf_count; lw t2, 0(t0); addi t2, t2, -1; sw t2, 0(t0)
-    li   a1, 0; ret
-rbuf_get_empty: li a0, 0; li a1, 1; ret
+    la   t0, rbuf_count;
+	lw t1, 0(t0);
+	beqz t1, rbuf_get_empty
+    la   t0, rbuf_tail;
+	lw t2, 0(t0);
+	andi t2, t2, RBUF_MASK
+    la   t0, rbuf;
+	add t2, t0, t2;
+	lbu a0, 0(t2)
+    la   t0, rbuf_tail;
+	lw t2, 0(t0);
+	addi t2, t2, 1;
+	sw t2, 0(t0)
+    la   t0, rbuf_count;
+	lw t2, 0(t0);
+	addi t2, t2, -1;
+	sw t2, 0(t0)
+    li   a1, 0;
+	ret
+rbuf_get_empty:
+	li a0, 0;
+	li a1, 1;
+	ret
 
 uart_getc:
     addi sp, sp, -16
@@ -927,23 +1025,52 @@ uart_getc:
 //  uart_puts / uart_putdec
 // ============================================================
 uart_puts:
-    addi sp, sp, -16; sd ra, 0(sp); sd s0, 8(sp); mv s0, a0
-1:  lbu a0, 0(s0); beqz a0, 2f
-    call uart_putc; addi s0, s0, 1; j 1b
-2:  ld ra, 0(sp); ld s0, 8(sp); addi sp, sp, 16; ret
+    addi sp, sp, -16;
+	sd ra, 0(sp);
+	sd s0, 8(sp);
+	mv s0, a0
+1:
+	lbu a0, 0(s0);
+	beqz a0, 2f
+    call uart_putc;
+	addi s0, s0, 1; j 1b
+2:
+	ld ra, 0(sp);
+	ld s0, 8(sp);
+	addi sp, sp, 16;
+	ret
 
 uart_putdec:
-    addi sp, sp, -48; sd ra, 0(sp); sd s0, 8(sp); sd s1, 16(sp)
-    mv s0, a0; addi s1, sp, 40; sb zero, 0(s1); addi s1, s1, -1
+    addi sp, sp, -48;
+	sd ra, 0(sp);
+	sd s0, 8(sp);
+	sd s1, 16(sp)
+    mv s0, a0;
+	addi s1, sp, 40;
+	sb zero, 0(s1);
+	addi s1, s1, -1
     bnez s0, putdec_loop
-    li t0, '0'; sb t0, 0(s1); addi s1, s1, -1; j putdec_out
+    li t0, '0';
+	sb t0, 0(s1);
+	addi s1, s1, -1;
+	j putdec_out
 putdec_loop:
-    li t0, 10; divu t1, s0, t0; remu t2, s0, t0
-    addi t2, t2, '0'; sb t2, 0(s1); addi s1, s1, -1; mv s0, t1
+    li t0, 10;
+	divu t1, s0, t0;
+	remu t2, s0, t0
+    addi t2, t2, '0';
+	sb t2, 0(s1);
+	addi s1, s1, -1;
+	mv s0, t1
     bnez s0, putdec_loop
 putdec_out:
-    addi a0, s1, 1; call uart_puts
-    ld ra, 0(sp); ld s0, 8(sp); ld s1, 16(sp); addi sp, sp, 48; ret
+    addi a0, s1, 1;
+	call uart_puts
+    ld ra, 0(sp);
+	ld s0, 8(sp);
+	ld s1, 16(sp);
+	addi sp, sp, 48;
+	ret
 
 
 // ============================================================

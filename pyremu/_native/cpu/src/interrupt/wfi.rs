@@ -1,5 +1,5 @@
 // use std::time::Instant;
-use crate::concurrent::{ConcurrentClintCtx, FfiExtIrqCtx, ModuleState, StopInfo};
+use crate::concurrent::{ConcurrentClintCtx, FfiExtIrqCtx, ModuleState, StopInfo, WATCHDOG_POLL_US};
 use crate::interrupt::{clint::sync_msip, clint::sync_mtip, sync_imsic};
 use crate::state::{exit_reason, riscv_mode, HartState};
 use std::sync::atomic::Ordering;
@@ -47,10 +47,22 @@ pub(crate) fn wfi_sync_and_check(
 	// self-contained.  Without this, a hart in WFI never wakes for an
 	// IMSIC IPI because OpenSBI sets mie.MSIE (not mie.MEIE) and
 	// (mip & mie) evaluates to 0 even though MEIP=1.
-	if (state.mip.load(Ordering::Acquire) & (1 << 11)) != 0 && (state.mie & (1 << 11)) == 0 {
+	//
+	// Gate on IMSIC presence — in legacy PLIC mode (imsic not present)
+	// OpenSBI's PLIC irqchip has no process_hwirqs and never sets MEIE;
+	// a force-enabled MEIP would fire an M-mode external trap into an
+	// unprocessable irqchip (sbi_irqchip_process → SBI_ENODEV) and hang
+	// the boot.  The guest's mie is authoritative there.
+	if state.imsic_m.present != 0
+		&& (state.mip.load(Ordering::Acquire) & (1 << 11)) != 0
+		&& (state.mie & (1 << 11)) == 0
+	{
 		state.mie |= 1 << 11; // MEIE
 	}
-	if (state.mip.load(Ordering::Acquire) & (1 << 9)) != 0 && (state.mie & (1 << 9)) == 0 {
+	if state.imsic_s.present != 0
+		&& (state.mip.load(Ordering::Acquire) & (1 << 9)) != 0
+		&& (state.mie & (1 << 9)) == 0
+	{
 		state.mie |= 1 << 9; // SEIE
 	}
 
@@ -110,11 +122,13 @@ pub(crate) fn wfi_check_all_idle(
 
 	if earliest != u64::MAX {
 		// 全部 hart WFI 且有定时器截止时间。
-		// 快进 mtime 到截止时间, 使 sync_mtip 在下轮加速执行的入口
-		// 当检测到 mtime >= stimecmp 则置位 STIP 以唤醒 hart.
-		// advance_clock_source 按真实流逝时间推进 mtime
-		// 全部 vCPU 空闲时需要虚拟时钟直接跳到下一个定时器事件
-		unsafe { &*clint.mtime }.store(earliest, Ordering::Release);
+		// 不得在此把 mtime 快进到截止时间: 快进后 Python 侧 `_wfi_ticks_until_wake`
+		// 计算 remaining = 截止 - mtime = 0, `_wfi_sleep_if_idle` 的 wait 永不
+		// 阻塞 -> 全 hart WFI 空闲退化为 100% CPU 忙转 (宿主卡顿 / 键盘无响应),
+		// 且客机时钟以批量速度 (≈20×真实时间) 狂飙. 正确的实时事件驱动:
+		// 仅退出加速执行 (WFI_WAIT), 由 Python 侧休眠 (remaining/timebase, 上限
+		// _WFI_MAX_SLEEP), 睡眠期间按真实流逝时间推进 mtime (clint.tick),
+		// 定时器因而按真实节奏触发. 此处保持 mtime 不变, 让 Python 计算真实剩余.
 		module.request_stop(StopInfo {
 			reason: exit_reason::WFI_WAIT,
 			hart_id: hart_id as u8,
@@ -172,9 +186,12 @@ pub(crate) fn wfi_spin(
 	module.wfi_flags[hart_id].store(1, Ordering::Release);
 	module.wfi_count.fetch_add(1, Ordering::Release);
 
-	// 事件驱动阻塞: 阻塞 OS 线程直到被 unpark 唤醒 (解耦通知). 零 CPU
-	// 占用, IPI 零延迟. 定时器截止由软件看门狗线程周期性 unpark 本 hart;
-	// 本函数自身不做任何 park_timeout 轮询.
+	// 事件驱动阻塞: 以 park_timeout 自醒阻塞 (解耦通知的安全网). 外部
+	// unpark (MSIP 发送方/看门狗) 立即唤醒本 hart 获得零延迟投递; 自醒周期
+	// 与看门狗轮询周期对齐 (WATCHDOG_POLL_US = 5ms), 即使看门狗已退出且
+	// 最后一次 unpark 被其他路径消费, 本 hart 仍会自行醒来重新检查停止标志
+	// 与中断挂起, 杜绝"带着已置位 stop_flag 永久 park"的批次终结竞态 (曾导致
+	// Linux 启动间歇性停滞, run_harts 的 join 永不返回).
 	loop {
 		// ---- sync interrupts + check wake ----
 		let (woke, msip_pending) = wfi_sync_and_check(state, clint, uart_rx_notify, ext_irq);
@@ -201,12 +218,16 @@ pub(crate) fn wfi_spin(
 		// ---- all-idle detection (fast-forwards mtime to nearest deadline) ----
 		if module.all_in_wfi() {
 			match wfi_check_all_idle(state, hart_id, clint, module, msip_pending) {
-				Some(true) => break,
-				Some(false) => return false,
+				Some(true) => {
+					break;
+				}
+				Some(false) => {
+					return false;
+				}
 				None => {} // MSIP pending, keep spinning
 			}
 		}
-		std::thread::park();
+		std::thread::park_timeout(std::time::Duration::from_micros(WATCHDOG_POLL_US));
 	}
 
 	module.wfi_flags[hart_id].store(0, Ordering::Release);
@@ -219,6 +240,9 @@ mod tests {
 	use super::*;
 	use std::cell::Cell;
 	use std::sync::atomic::{AtomicU64, AtomicU8};
+	use std::sync::mpsc;
+	use std::sync::Arc;
+	use std::time::Duration;
 
 	/// Regression: ``wfi_check_all_idle`` 判定 ``any_hart_msip`` 时必须只看电平位
 	/// (bit 0). MSIP 字节还携带 Python 侧 edge counter (bits 7:1), 首个 IPI 之后
@@ -247,7 +271,7 @@ mod tests {
 			hart_threads: Cell::new(std::ptr::null()),
 			hart_states: Cell::new(std::ptr::null()),
 		};
-		let module = ModuleState::new(1, 1, 0, 0, vec![0]);
+		let module = ModuleState::new(1, 1, 0, 0, vec![0].into_boxed_slice());
 
 		// msip_pending=false (本 hart 无挂起 MSIP), 无定时器截止, 但 MSIP 字节的
 		// edge counter 非零. 修复后只看电平位 -> 正常退出 Some(false);
@@ -258,5 +282,73 @@ mod tests {
 			Some(false),
 			"edge counter 非零但电平位=0 时 WFI 应正常退出"
 		);
+	}
+
+	/// Regression: ``wfi_spin`` 停驻的 hart 在外部 unpark 全部消失 (看门狗已按
+	/// stop 退出, 最后一次 unpark 被消费) 后, 必须自行醒来重查 stop_flag 并退出.
+	///
+	/// 修复前 ``wfi_spin`` 使用无限 ``std::thread::park()``, 唤醒完全依赖看门狗
+	/// 每 5ms 的 unpark 或退出 hart 的完成信号; 当 hart 在最后一次 unpark 之后
+	/// park、且看门狗已消失时, 该 hart 会带着已置位的 stop_flag 永久睡眠,
+	/// ``run_harts`` 的 join 永不返回 (Linux 启动间歇性停滞). 修复后以
+	/// ``park_timeout(WATCHDOG_POLL_US)`` 自醒, 有界时间内必定重新检查 stop_flag.
+	#[test]
+	fn wfi_spin_exits_on_stop_without_any_unpark() {
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mhartid = 0;
+		state.mode = riscv_mode::M;
+		state.pc = 0x1000;
+		state.mip.store(0, Ordering::Release);
+		state.mie = 0;
+
+		let mtime = AtomicU64::new(0);
+		let mtimecmp = AtomicU64::new(0);
+		let msip = AtomicU8::new(0);
+		let clint = ConcurrentClintCtx {
+			base: 0x2000000,
+			mtime: &mtime as *const AtomicU64,
+			mtimecmp: &mtimecmp as *const AtomicU64,
+			msip: &msip as *const AtomicU8,
+			timebase_hz: 0,
+			num_harts: 1,
+			msip_pending: Cell::new(std::ptr::null()),
+			hart_threads: Cell::new(std::ptr::null()),
+			hart_states: Cell::new(std::ptr::null()),
+		};
+		// active_hart_num=4 > wfi_count=1 -> all_in_wfi() 为 false, 本 hart 不会走
+		// all-idle 快速退出 (WFI_WAIT) 分支, 而是真正 park 等待 -> 恰好落入
+		// park_timeout 自醒路径.
+		let module = Arc::new(ModuleState::new(1, 4, 0, 0, vec![0].into_boxed_slice()));
+		let module2 = Arc::clone(&module);
+		let (tx, rx) = mpsc::channel();
+
+		std::thread::spawn(move || {
+			let s = &mut state;
+			let result = wfi_spin(
+				s,
+				0,
+				&clint,
+				&module2,
+				std::ptr::null(),
+				std::ptr::null(),
+				std::ptr::null_mut(),
+			);
+			let _ = tx.send(result);
+		});
+
+		// 等 hart 进入 park 等待后, 仅置位 stop_flag, 不做任何 unpark.
+		std::thread::sleep(Duration::from_millis(50));
+		module.request_stop(StopInfo {
+			reason: exit_reason::TIMEOUT,
+			..StopInfo::empty()
+		});
+
+		// 有界等待: park_timeout(5ms) 应使 hart 在 ~5ms 内自行醒来并退出.
+		// 修复前 (无限 park) 此处 recv_timeout 超时 -> 回归暴露.
+		match rx.recv_timeout(Duration::from_millis(500)) {
+			Ok(false) => {}
+			Ok(v) => panic!("stop_flag 置位后 WFI hart 应返回 false (exit), 实际 {v:?}"),
+			Err(_) => panic!("stop_flag 置位后 WFI hart 未在有界时间内退出 (旧行为: 无限 park)"),
+		}
 	}
 }

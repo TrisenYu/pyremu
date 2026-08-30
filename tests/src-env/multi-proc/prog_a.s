@@ -1,7 +1,7 @@
 // U 模式程序 A — 输出 'A' 100 次, 然后 exit(0).
 // 用于抢占测试的最简样例.
 
-.section .text
+.section .uprog.text, "ax", @progbits
 .globl u_prog_a_entry
 
 u_prog_a_entry:
