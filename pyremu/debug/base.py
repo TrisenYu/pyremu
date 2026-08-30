@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """DebuggerBase — 调试器核心: 共享状态初始化、hart 访问、输出、信号处理."""

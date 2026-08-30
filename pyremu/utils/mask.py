@@ -1,4 +1,4 @@
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 """位宽掩码 — 将任意精度 Python int 截断为硬件位宽.
 

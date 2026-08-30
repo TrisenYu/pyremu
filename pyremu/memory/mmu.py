@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 # Created at 2026/06/06 星期六 17:07:57
 # Last modified at 2026/06/08 星期一

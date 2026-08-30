@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """StackWalkMixin — FP 链回溯、跨特权级边界帧、栈帧显示.

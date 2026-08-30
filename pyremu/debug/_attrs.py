@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 
 """共享属性声明 — 供 Pylance 理解 mixin 之间的跨类引用.
 

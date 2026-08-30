@@ -58,33 +58,11 @@ rvdbg[0] undo            # 快照回滚
 
 依赖 `prompt_toolkit` (Tab 补全, 历史) + `rich` (彩色格式化)。
 
-## 项目结构
-
-```
-pyremu/
-  emulator.py            # 多 hart 执行循环, native 并发调度
-  platform.py            # PlatformConfig 平台描述
-  core/                  # Hart, 解码器, trap 处理, 寄存器模型
-  memory/                # MMU, TLB, L2 缓存, PMP, 总线
-  peripheral/            # UART, virtio-blk, SPI, I2C, GPIO, watchdog等
-  interrupt/             # CLINT, PLIC, 中断控制器抽象, AIA
-  debug/                 # rvdbg 简易交互式调试器
-  utils/                 # 反汇编器, FDT 生成, ELF 解析
-  env_inject/            # 预加载 shellcode 注入
-  _native/               # Rust 加速执行引擎
-tests/                   # ~800 条测试
-examples/                # 编程式使用示例
-bsp/             # 第三方固件 & S-mode 运行时
-```
 
 ## 测试
 
 覆盖指令执行、内存翻译、异常/中断、外设、调试器命令、压缩指令差分验证等模块。
 运行: `make test` 或 `uv run pytest tests/`
-
-## 第三方代码
-
-- `bsp/rust_smode_entry/` — Rust 编写的 S-mode TEE 管理器，由 M-mode 加载到动态分配的物理内存中运行
 
 ## Rust Native 并发执行引擎
 
