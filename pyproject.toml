@@ -29,7 +29,7 @@ dependencies = [
     "pytest-timeout==2.4.0",
     "ruff==0.16.1",
     "typing-extensions==4.16.0",
-    "typing-inspection==0.4.2",
+    "typing-inspection==0.4.4",
     "wcwidth==0.8.2",
 ]
 
