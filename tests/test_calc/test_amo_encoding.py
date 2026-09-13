@@ -82,7 +82,7 @@ class TestAmoaddWExecution:
         return old_val, new_val, hart.gprs[5] & 0xFFFFFFFF
 
     def test_amoadd_w_aqrl_sub_1(self, _m_mode_hart):
-        """amoadd.w.aqrl: tlb_sync 从 1→0 (递减 1)."""
+        """amoadd.w.aqrl: tlb_sync 从 1->0 (递减 1)."""
         emu, hart = _m_mode_hart
         instr = _encode_amoadd_w(rd=5, rs1=10, rs2=11, aq=1, rl=1)
         old_val, new_val, rd_val = self._exec_amo(
@@ -104,7 +104,7 @@ class TestAmoaddWExecution:
         assert rd_val == 1
 
     def test_amoadd_w_twice_to_zero(self, _m_mode_hart):
-        """连续两次递减: 2→1→0."""
+        """连续两次递减: 2->1->0."""
         emu, hart = _m_mode_hart
         instr = _encode_amoadd_w(rd=5, rs1=10, rs2=11, aq=1, rl=1)
         pa = 0x80001000

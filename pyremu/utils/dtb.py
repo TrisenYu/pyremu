@@ -314,8 +314,8 @@ def _dtb_plic(
 #  导致 nr_parent_irqs=0 并终止驱动初始化。 合并在单一节点的
 #  <MEIP, SEIP, MEIP, SEIP> 使循环在 index=0 遇到 MEIP(11) 后立即停止。
 #  拆分为两个节点后:
-#    - M 节点 (<MEIP,...>) → S 核计数 0 → 失败 → imsic 释放
-#    - S 节点 (<SEIP,...>) → S 核计数 N → 成功 → eidelivery 正常置 1
+#    - M 节点 (<MEIP,...>) -> S 核计数 0 -> 失败 -> imsic 释放
+#    - S 节点 (<SEIP,...>) -> S 核计数 N -> 成功 -> eidelivery 正常置 1
 # ============================================================
 
 # M/S 模式对应的 CPU intc 中断号.
@@ -349,10 +349,10 @@ def _dtb_imsic_file(
     sw.property_u32("riscv,num-ids", 255)  # must satisfy (num_ids & 63) == 63
     sw.property_u32("riscv,guest-index-bits", 0)
     # 不设 hart-index-bits — QEMU virt DT 同样省略此属性.
-    # 内核默认 stride = PAGE_SIZE << guest_index_bits = 0x1000,
+    # 内核默认 stride = PAGE_SIZE << 受调试程序_index_bits = 0x1000,
     # 必须与 decode_imsic_addr 的实际布局一致 (连续排列, 每个 hart 一页).
     # hart-index-bits != 0 会使内核算出更大的 stride (0x2000/0x4000...),
-    # 导致写 seteipnum 偏移到错误的 hart → IPI 丢失 → SMP 死锁.
+    # 导致写 seteipnum 偏移到错误的 hart -> IPI 丢失 -> SMP 死锁.
     sw.property("reg", _encode_reg_4mib(base_addr, size))
     # 该 privilege level 对应的中断 — 每种各一个 per hart.
     ie: list[int] = []
@@ -372,7 +372,7 @@ def _dtb_aplic(
     aplic_phandle: int | None,
     imsic_phandle: int | None,
 ) -> None:
-    """aplic@ — 有线→MSI 桥, 经 msi-parent=<&imsic> 投递.
+    """aplic@ — 有线->MSI 桥, 经 msi-parent=<&imsic> 投递.
 
     APLIC does NOT have interrupts-extended because all interrupts are
     delivered as MSIs through the IMSIC identified by msi-parent.
@@ -537,7 +537,7 @@ def build_dtb(
         crng: 模拟随机数生成器实例 (None 则跳过 crng 节点).
         plic: PLIC 中断控制器实例 (legacy 模式).
         imsic: IMSIC 中断控制器实例 (AIA 模式).
-        aplic: APLIC 有线→MSI 桥实例 (AIA 模式).
+        aplic: APLIC 有线->MSI 桥实例 (AIA 模式).
         bootargs: 内核命令行参数, 写入 /chosen/bootargs.
         reserved_ranges: (base, size) 列表, 生成 /reserved-memory no-map 子节点.
 
@@ -564,7 +564,7 @@ def build_dtb(
 
     # ---- soc simple-bus — 挂载所有 MMIO 外设 ----
     # phandle 分配: CPU intc 占 [1..num_harts].
-    # 随后: AIA → IMSIC_M, IMSIC_S, APLIC 各一; legacy → PLIC.
+    # 随后: AIA -> IMSIC_M, IMSIC_S, APLIC 各一; legacy -> PLIC.
     page_stride = _PAGE_STRIDE_DTB
     next_phandle = len(cpu_phandles) + 1
     imsic_m_phandle: int | None = None
@@ -600,13 +600,13 @@ def build_dtb(
         # 2^hart_index_bits * PAGE_SIZE.  hart_index_bits =
         # ceil(log2(num_harts)), 即 (num_harts-1).bit_length().
         # 非 2 的幂 hart 数 (如 3, 5, 6, 7) 若不补齐,
-        # OpenSBI imsic_cold_irqchip_init 失败 → 无 irqchip →
+        # OpenSBI imsic_cold_irqchip_init 失败 -> 无 irqchip ->
         # sbi_irqchip_process 返回 SBI_ENODEV (-1000).
         if cfg.num_harts > 1:
             hart_index_bits = (cfg.num_harts - 1).bit_length()
         else:
             hart_index_bits = 0
-        padded_count = 1 << hart_index_bits  # ≥ num_harts 的 2 的幂
+        padded_count = 1 << hart_index_bits  # >= num_harts 的 2 的幂
         m_size = padded_count * page_stride
         # M 节点: M-files 范围, MEIP(11) 专用.
         _dtb_imsic_file(sw, cfg, imsic, imsic_m_phandle, cpu_phandles,

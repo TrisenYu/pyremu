@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 
 """测试 pyremu.debug.breakpoint — 断点设置/命中检查."""
 
@@ -326,3 +326,67 @@ class TestDispatchBp:
         dbg._dispatch_bp(["opcode", "0x13"])
         assert len(dbg._breakpoints) == 1
         assert dbg._breakpoints[0].kind == "opcode"
+
+
+class TestBpConditionParse:
+    """条件断点解析回归 — 数值曾误入比较符槽位或粘连在寄存器名上."""
+
+    @staticmethod
+    def _conds(dbg) -> tuple:
+        bp = dbg._breakpoints[-1]
+        return (bp.cond_type, bp.cond_reg, bp.cond_op, bp.cond_val)
+
+    def test_op_omitted_defaults_to_eq(self):
+        """缺省比较符 ('csr mepc 0x...') 应解析为相等比较."""
+        dbg = _make_bpdbg()
+        dbg._dispatch_bp(["if", "csr", "mepc", "0xffffffe000001000"])
+        assert len(dbg._breakpoints) == 1
+        assert self._conds(dbg) == ("csr", "mepc", "==", 0xFFFF_FFE0_0000_1000)
+
+    def test_single_eq_normalized(self):
+        """单等号 ('mepc = 0x...') 应归一化为相等比较."""
+        dbg = _make_bpdbg()
+        dbg._dispatch_bp(["if", "csr", "mepc", "=", "0xffffffe000001000"])
+        assert self._conds(dbg) == ("csr", "mepc", "==", 0xFFFF_FFE0_0000_1000)
+
+    def test_op_glued_to_reg(self):
+        """比较符粘连在寄存器名上 ('mepc==0x...') 也须正确拆分."""
+        dbg = _make_bpdbg()
+        dbg._dispatch_bp(["if", "csr", "mepc==0xffffffe000001000"])
+        assert self._conds(dbg) == ("csr", "mepc", "==", 0xFFFF_FFE0_0000_1000)
+
+    def test_less_than(self):
+        dbg = _make_bpdbg()
+        dbg._dispatch_bp(["if", "csr", "sepc", "<", "0x1000"])
+        assert self._conds(dbg) == ("csr", "sepc", "<", 0x1000)
+
+    def test_addr_bp_with_condition(self):
+        """地址断点附带条件 — 用于钉住 M 模式 trap 入口的特定 mepc."""
+        dbg = _make_bpdbg()
+        dbg.cmd_bp_set("0x80000428 if csr mepc == 0xffffffe000001000")
+        assert len(dbg._breakpoints) == 1
+        bp = dbg._breakpoints[0]
+        assert bp.kind == "addr"
+        assert bp.value == 0x80000428
+        assert self._conds(dbg) == ("csr", "mepc", "==", 0xFFFF_FFE0_0000_1000)
+
+    def test_missing_value_rejected(self):
+        """缺省比较符但无数值时应拒绝, 不创建残缺断点."""
+        dbg = _make_bpdbg()
+        dbg.cmd_bp_set("0x80000428 if csr mepc")
+        assert len(dbg._breakpoints) == 0
+
+    def test_garbage_value_rejected(self):
+        dbg = _make_bpdbg()
+        dbg._dispatch_bp(["if", "csr", "mepc", "==", "bogus"])
+        assert len(dbg._breakpoints) == 0
+
+    def test_parsed_cond_matches_mepc(self):
+        """解析后的条件能命中目标 mepc (修复前 cond_val 恒为 0 永不命中)."""
+        dbg = _make_bpdbg()
+        dbg._dispatch_bp(["if", "csr", "mepc", "0xffffffe000001000"])
+        bp = dbg._breakpoints[0]
+        dbg.hart.csrs["mepc"].val = 0xFFFF_FFE0_0000_1000
+        assert dbg._eval_bp_condition(dbg.hart, bp)
+        dbg.hart.csrs["mepc"].val = 0x80000428
+        assert not dbg._eval_bp_condition(dbg.hart, bp)

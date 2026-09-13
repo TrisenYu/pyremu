@@ -7,6 +7,7 @@
 #   ising     统计物理 (2D Ising 模型 Monte Carlo, Onsager 临界温度)
 #   fem       数值计算 (二维 Poisson 有限元, 二阶收敛)
 #   dsp    数字信号处理 (FFT 谱分析 + FIR 低通滤波 + OFDM 基带收发 + DTMF 音频检测)
+#   linalg 线性代数 (稠密 Cholesky 分解 + 求解, > 2 MiB 运行期内存)
 #
 #   knots  拓扑扭结 (Jones 多项式, libhomfly C 实现) — 非 Rust,
 #          独立 Makefile 构建 (见 knots/Makefile), 不在本 workspace 内.
@@ -14,14 +15,13 @@
 # 目标: riscv64gc-unknown-linux-musl (lp64d 硬浮点 ABI, 静态链接).
 # 交叉链接配置见 .cargo/config.toml; 链接工具链见 ../bsp/musl-gc-sysroot.
 [workspace]
-members = ["orbit", "chem", "graphene", "ising", "fem", "dsp"]
+members = ["orbit", "chem", "graphene", "ising", "fem", "dsp", "linalg"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 
-# 飞地内无 unwind 目标, panic 直接停机; LTO + 单 codegen-unit 减小静态体积
 [profile.release]
 panic = "abort"
 opt-level = 3

@@ -379,8 +379,8 @@ mod tests {
 		assert_eq!(check(&cfg, &addr, 4, 0x82FF_FFF0u64, 0, 0, 1, 0, 2, 1), 1);
 	}
 
-	/// 飞地 ID ≥ 256 时 PMP 隔离必须保持 — 修复前 mdid 参数是 u8, csrw mdid, 256
-	/// 截断为 0 (别名回 host), enclave_mode (mdid != 0) 判定失效 → 飞地可访问
+	/// 飞地 ID >= 256 时 PMP 隔离必须保持 — 修复前 mdid 参数是 u8, csrw mdid, 256
+	/// 截断为 0 (别名回 host), enclave_mode (mdid != 0) 判定失效 -> 飞地可访问
 	/// host 侧条目 [0, pmpsplit), 权限提升.
 	#[test]
 	fn test_enclave_split_high_mdid() {
@@ -397,7 +397,7 @@ mod tests {
 			0x8300_0000u64 >> 2,
 		];
 		// mdid=256 (u8 别名 0 = host): 访问 host 条目 0 的 TOR 范围 [0, 0x0010_0000)
-		// 必须 DENY. 修复前 enclave_mode=false → 条目 0 匹配 → 错误 ALLOW.
+		// 必须 DENY. 修复前 enclave_mode=false -> 条目 0 匹配 -> 错误 ALLOW.
 		assert_eq!(check(&cfg, &addr, 4, 0x0008_0000u64, 0, 0, 1, 0, 2, 256), 0);
 		// mdid=300 (u8 别名 44, 仍 != 0): 访问自身条目 3 范围应 ALLOW.
 		assert_eq!(check(&cfg, &addr, 4, 0x82FF_FFF0u64, 0, 0, 1, 0, 2, 300), 1);

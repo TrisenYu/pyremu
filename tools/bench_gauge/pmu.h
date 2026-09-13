@@ -1,5 +1,5 @@
 /*
- * SPDX-LICENSE-IDENTIFIER: GPL2.0
+ * SPDX-LICENSE-IDENTIFIER: MIT
  * (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
  *
  * PMU C 调用接口

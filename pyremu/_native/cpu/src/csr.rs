@@ -13,7 +13,8 @@ use crate::interrupt::{
 	compute_mtopi, compute_stopi, imsic_reg_read, imsic_reg_write, imsic_topei_claim_iid,
 	imsic_topei_peek, sync_imsic_one, IID_M_IPI, IID_S_IPI,
 };
-use crate::state::{exit_reason, riscv_mode, HartState, InstrToBeExec, PYREMU_AIA};
+use crate::ffi::InstrToBeExec;
+use crate::state::{exit_reason, riscv_mode, HartState, CFG_AIA};
 use crate::trap::deliver_illegal_instruction;
 
 // ============================================================
@@ -268,30 +269,30 @@ pub fn csr_read(ctx: &mut CsrContext, addr: u16) -> (u64, u8) {
 
         // TEE CSRs (mdid=0x5C0, pmpsplit=0x5C1) — memory domain ID
         // and PMP virtualization split register.
-        // mdid 是完整 64-bit: 收窄到 u8 会使 ≥256 的飞地 ID 别名回 0 (host),
+        // mdid 是完整 64-bit: 收窄到 u8 会使 >=256 的飞地 ID 别名回 0 (host),
         // 既绕过 PMP 隔离 (mdid!=0 判定失效), 又让 SUSPEND handler 误判 host.
         0x5C0 => (ctx.state.mdid, CSR_OK),
         0x5C1 => (ctx.state.pmpsplit as u64, CSR_OK),
 
-        // ---- AIA IMSIC CSRs (gated behind PYREMU_AIA) ----
+        // ---- AIA IMSIC CSRs (gated behind CFG_AIA) ----
         MISELECT => {
-            if PYREMU_AIA { (ctx.state.imsic_m.select as u64, CSR_OK) }
+            if CFG_AIA { (ctx.state.imsic_m.select as u64, CSR_OK) }
             else { (0, CSR_ILL) }
         }
         MIREG => {
-            if PYREMU_AIA { imsic_reg_read(&ctx.state.imsic_m, ctx.state.imsic_m.select) }
+            if CFG_AIA { imsic_reg_read(&ctx.state.imsic_m, ctx.state.imsic_m.select) }
             else { (0, CSR_ILL) }
         }
         SISELECT => {
-            if PYREMU_AIA { (ctx.state.imsic_s.select as u64, CSR_OK) }
+            if CFG_AIA { (ctx.state.imsic_s.select as u64, CSR_OK) }
             else { (0, CSR_ILL) }
         }
         SIREG => {
-            if PYREMU_AIA { imsic_reg_read(&ctx.state.imsic_s, ctx.state.imsic_s.select) }
+            if CFG_AIA { imsic_reg_read(&ctx.state.imsic_s, ctx.state.imsic_s.select) }
             else { (0, CSR_ILL) }
         }
         MTOPEI => {
-            if !PYREMU_AIA {
+            if !CFG_AIA {
                 return (0, CSR_ILL);
             }
             // mtopei (0x35C) reads the top IMSIC M-level external
@@ -310,7 +311,7 @@ pub fn csr_read(ctx: &mut CsrContext, addr: u16) -> (u64, u8) {
             return (raw, CSR_OK);
         }
         STOPEI => {
-            if !PYREMU_AIA {
+            if !CFG_AIA {
                 return (0, CSR_ILL);
             }
             // stopei (0x15C): S-mode counterpart of mtopei —
@@ -327,11 +328,11 @@ pub fn csr_read(ctx: &mut CsrContext, addr: u16) -> (u64, u8) {
             return (raw, CSR_OK);
         }
         0xFB0 /* mtopi */ => {
-            if PYREMU_AIA { compute_mtopi(ctx.state, ctx.mtime()) }
+            if CFG_AIA { compute_mtopi(ctx.state, ctx.mtime()) }
             else { (0, CSR_ILL) }
         }
         0xDB0 /* stopi */ => {
-            if PYREMU_AIA { compute_stopi(ctx.state, ctx.mtime()) }
+            if CFG_AIA { compute_stopi(ctx.state, ctx.mtime()) }
             else { (0, CSR_ILL) }
         }
         // Other AIA CSRs (mvien, mvip, etc.)
@@ -415,7 +416,7 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
             // timer (SSTC) / external interrupt controller.  Preserve them;
             // only allow writes to software-writable bits (SSIP, USIP).
             // STIP/SEIP mirror hardware state and must never be clobbered by
-            // a guest ``csrw mip`` — the SSTC timer and the external interrupt
+            // a 受调试程序 ``csrw mip`` — the SSTC timer and the external interrupt
             // controller are the sole owners of these bits.
             let ro_mask: u64 = (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 11);
             ctx.state.mip.store((ctx.state.mip.load(Ordering::Acquire) & ro_mask) | (val & !ro_mask), Ordering::Release);
@@ -435,9 +436,14 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
             CSR_OK
         }
         SIP => {
-            // sip is a restricted view of mip; only mideleg-delegated bits are writable
-            let mask = ctx.state.mideleg;
-            ctx.state.mip.store((ctx.state.mip.load(Ordering::Acquire) & !mask) | (val & mask), Ordering::Release);
+            // sip 是 mip 的只读视图, 唯一可写位是 SSIP (bit 1). 与 sie 不同,
+            // sip 并非对所有 mideleg 委派位都可写: STIP (bit 5) 由 SSTC 定时器
+            // 硬件驱动, SEIP (bit 9) 由 PLIC 硬件驱动, 均不得被 受调试程序 ``csrw sip``
+            // 覆写. 飞地上下文切换 (restore_csr_for_enclave 的 csr_write(CSR_SIP,
+            // saved)) 写回陈旧 sip, 若把 SEIP/STIP 一并覆写会丢失挂起的外设/定时器
+            // 中断 (飞地回归测试后输入冻结).
+            let wr_mask: u64 = 1 << 1; // SSIP 是唯一软件可写位
+            ctx.state.mip.store((ctx.state.mip.load(Ordering::Acquire) & !wr_mask) | (val & wr_mask), Ordering::Release);
             CSR_OK
         }
         STVEC   => { ctx.state.stvec = val; CSR_OK }
@@ -466,9 +472,9 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
 
         // time/timeh (0xC01/0xC81) — CLINT mtime 的只读镜像. 内核的
         // rdtime 惯用法 ``csrrs rd, time, x0`` 会回写原值, 写操作必须
-        // 静默忽略 (WARL). 否则落入 _ => CSR_EXIT → 每条 rdtime 都退出
-        // (~1.4ms/条) → 内核吞吐崩溃 → STI 处理尾部长于 tick 周期
-        // → 永久 STI 活锁, 启动阻塞在 vgaarb: loaded.
+        // 静默忽略 (WARL). 否则落入 _ => CSR_EXIT -> 每条 rdtime 都退出
+        // (~1.4ms/条) -> 内核吞吐崩溃 -> STI 处理尾部长于 tick 周期
+        // -> 永久 STI 活锁, 启动阻塞在 vgaarb: loaded.
         0xC01 | 0xC81 => CSR_OK,
 
         // cycle/instret (0xC00/0xC02/0xC80/0xC82) — 同为只读计数器,
@@ -518,28 +524,28 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
         // without Sdext they are WARL=0).
         0x7A0..=0x7AF => CSR_OK,
 
-        // ---- AIA IMSIC CSRs (gated behind PYREMU_AIA) ----
+        // ---- AIA IMSIC CSRs (gated behind CFG_AIA) ----
         MISELECT => {
-            if PYREMU_AIA { ctx.state.imsic_m.select = val as u32; CSR_OK }
+            if CFG_AIA { ctx.state.imsic_m.select = val as u32; CSR_OK }
             else { CSR_ILL }
         }
         MIREG => {
-            if PYREMU_AIA {
+            if CFG_AIA {
                 let select = ctx.state.imsic_m.select;
                 let rc = imsic_reg_write(&mut ctx.state.imsic_m, select, val);
                 // MIREG write may have changed eip/eie/eidelivery/eithreshold
-                // → MEIP/SEIP may need updating.  Without per-instruction
+                // -> MEIP/SEIP may need updating.  Without per-instruction
                 // sync_imsic, the next check_pending_interrupts would use stale mip.
                 sync_imsic_one(ctx.state, true);
                 rc
             } else { CSR_ILL }
         }
         SISELECT => {
-            if PYREMU_AIA { ctx.state.imsic_s.select = val as u32; CSR_OK }
+            if CFG_AIA { ctx.state.imsic_s.select = val as u32; CSR_OK }
             else { CSR_ILL }
         }
         SIREG => {
-            if PYREMU_AIA {
+            if CFG_AIA {
                 let select = ctx.state.imsic_s.select;
                 let rc = imsic_reg_write(&mut ctx.state.imsic_s, select, val);
                 sync_imsic_one(ctx.state, false);
@@ -547,7 +553,7 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
             } else { CSR_ILL }
         }
         MTOPEI | STOPEI => {
-            if !PYREMU_AIA {
+            if !CFG_AIA {
                 return CSR_ILL;
             }
             // Writing to mtopei/stopei claims the IID encoded in the
@@ -569,7 +575,7 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
             return CSR_OK;
         }
         0xFB0 /* mtopi */ => {
-            if !PYREMU_AIA {
+            if !CFG_AIA {
                 return CSR_ILL;
             }
             let iid = ((val >> 16) & 0x7FF) as u32;
@@ -586,8 +592,8 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
                 // sbi_timer_process() may have already programmed
                 // a future deadline.  Unconditional bump_mtimecmp(4)
                 // overwrites that deadline, causing MTIP to re-fire
-                // every ~4 instructions → infinite M-mode trap loop
-                // → 22x slowdown → RCU stall.
+                // every ~4 instructions -> infinite M-mode trap loop
+                // -> 22x slowdown -> RCU stall.
                 ctx.state.mip.fetch_and(!(1 << 7), Ordering::AcqRel);
                 let cur = ctx.mtime();
                 let cmp = unsafe {
@@ -610,7 +616,7 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
             return CSR_OK;
         }
         0xDB0 /* stopi */ => {
-            if !PYREMU_AIA {
+            if !CFG_AIA {
                 return CSR_ILL;
             }
             let iid = ((val >> 16) & 0x7FF) as u32;
@@ -630,7 +636,7 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
                     ctx.state.stimecmp = now + 4;
                     // bump 后 stimecmp 为未来值: 按 QEMU 语义设定一次性 deadline.
                     // 不设定则 sync_mtip 活跃分支退化为共享 mtime 比较, 会被其他
-                    // 活跃 hart 的进度膨胀提前置位 → mret 后立即再 trap 的活锁.
+                    // 活跃 hart 的进度膨胀提前置位 -> mret 后立即再 trap 的活锁.
                     write_stimecmp(ctx.state, now, ctx.state.stimecmp, ctx.clint.timebase_hz);
                 }
             } else if iid == 9 {
@@ -805,7 +811,7 @@ pub fn handle_csr(
 		}
 		// After claim, re-sync the IMSIC file to update mip (MEIP/SEIP).
 		// Without per-instruction sync_imsic, the next check_pending_interrupts
-		// would see a stale MEIP/SEIP → spurious trap.
+		// would see a stale MEIP/SEIP -> spurious trap.
 		sync_imsic_one(ctx.state, is_mfile);
 		if rd != 0 {
 			write_gpr(ctx.state, rd, old_val);
@@ -827,7 +833,7 @@ pub fn handle_csr(
 	}
 
 	// STIMECMP 写路径的 mip.STIP 立即更新已由 csr_write 内的 write_stimecmp
-	// 完成 (0→清, 过去→置位, 未来→清+设定 deadline), 与 QEMU 语义逐行一致;
+	// 完成 (0->清, 过去->置位, 未来->清+设定 deadline), 与 QEMU 语义逐行一致;
 	// 此处不再重复基于共享 mtime 的重新比较 — 那会与 deadline 模型矛盾
 	// (跨 batch 边界的共享 mtime 膨胀会把刚设定的未来定时器重新推成"已到期").
 	// sync_mtip 仍在下一指令边界运行, 但 stopi 在此之前读到的 mip.STIP
@@ -1088,7 +1094,41 @@ mod tests {
 		);
 	}
 
-	/// mip (0x344) 的只读位 (STIP/SEIP) 不得被 guest ``csrw mip`` 覆写.
+	/// sip (0x144) 与 sie 不同: 只有 SSIP (bit 1) 可写, STIP/SEIP 由 SSTC
+	/// 定时器 / PLIC 硬件驱动, 不得被 ``csrw sip`` 覆写. 修复前 mask=mideleg,
+	/// 当 STIP/SEIP 已委派到 S 时, 飞地上下文切换写回陈旧 sip 会清掉挂起中断.
+	#[test]
+	fn write_sip_preserves_stip_and_seip() {
+		let mut s = test_state();
+		// STIP/SEIP/SSIP 全部委派到 S — 旧 buggy 实现 (mask=mideleg) 会全清.
+		s.mideleg = (1 << 5) | (1 << 9) | (1 << 1);
+		s.mip
+			.store((1 << 5) | (1 << 9) | (1 << 1), Ordering::Release);
+		{
+			let clint = test_clint(0);
+			let mut ctx = test_csr_ctx(&mut s, &clint);
+			let st = csr_write(&mut ctx, SIP, 0); // 尝试清除全部 pending 位
+			assert_eq!(st, CSR_OK);
+		}
+		let mip = s.mip.load(Ordering::Acquire);
+		assert_eq!(
+			mip & (1 << 5),
+			1 << 5,
+			"STIP is hardware-driven, must be preserved through sip write"
+		);
+		assert_eq!(
+			mip & (1 << 9),
+			1 << 9,
+			"SEIP is hardware-driven, must be preserved through sip write"
+		);
+		assert_eq!(
+			mip & (1 << 1),
+			0,
+			"SSIP is the only writable bit through sip, must be cleared"
+		);
+	}
+
+	/// mip (0x344) 的只读位 (STIP/SEIP) 不得被 受调试程序 ``csrw mip`` 覆写.
 	/// 修复前 ro_mask 缺 STIP(5)/SEIP(9), 一条 ``csrw mip, 0`` 会清掉
 	/// SSTC 定时器/外部中断的 pending 位, 破坏定时器状态.
 	#[test]
@@ -1330,12 +1370,12 @@ mod tests {
 	}
 
 	// ============================================================
-	//  AIA CSR 门控 — 用编译期 PYREMU_AIA 分发期望值
+	//  AIA CSR 门控 — 用编译期 CFG_AIA 分发期望值
 	// ============================================================
 	//
-	// PYREMU_AIA=false (默认) → 全部 AIA CSR 返回 CSR_ILL, 防止内核
+	// CFG_AIA=false (默认) -> 全部 AIA CSR 返回 CSR_ILL, 防止内核
 	// 探测到不存在的 IMSIC 硬件后崩溃.
-	// PYREMU_AIA=true  → CSR_OK, IMSIC 寄存器可正常读写.
+	// CFG_AIA=true  -> CSR_OK, IMSIC 寄存器可正常读写.
 	//
 	// 用条件断言而非硬编码期望值, 确保测试在两种构建配置下都正确.
 
@@ -1351,7 +1391,7 @@ mod tests {
 	];
 
 	fn aia_expected_status() -> u8 {
-		if PYREMU_AIA {
+		if CFG_AIA {
 			CSR_OK
 		} else {
 			CSR_ILL
@@ -1390,7 +1430,7 @@ mod tests {
 	/// 回归: 回写后 eip 位必须保持 pending。
 	#[test]
 	fn stopi_write_back_does_not_claim_external_eip() {
-		if !PYREMU_AIA {
+		if !CFG_AIA {
 			return; // 仅 AIA 构建下有意义
 		}
 		let mut s = test_state();
@@ -1400,11 +1440,11 @@ mod tests {
 		// 准备 S-file: eidelivery=1, eie/eip 置位 IID=10 (外部中断).
 		ctx.state.imsic_s.present = 1;
 		ctx.state.imsic_s.eidelivery = 1;
-		ctx.state.imsic_s.eip_ext_any = 1;
+		ctx.state.imsic_s.eip_ext_any.store(1, Ordering::Relaxed);
 		ctx.state.imsic_s.eie[0].store(1 << 10, Ordering::Relaxed);
 		ctx.state.imsic_s.eip[0].store(1 << 10, Ordering::Relaxed);
 
-		// csrr stopi → (9 << 16) | prio (SEI major identity).
+		// csrr stopi -> (9 << 16) | prio (SEI major identity).
 		let (val, st) = csr_read(&mut ctx, 0xDB0);
 		assert_eq!(st, CSR_OK);
 		assert_eq!(
@@ -1426,7 +1466,7 @@ mod tests {
 	/// mtopi (0xFB0) 回写必须 no-op (QEMU 中 MTOPI 为只读 CSR). 对称于 stopi.
 	#[test]
 	fn mtopi_write_back_does_not_claim_external_eip() {
-		if !PYREMU_AIA {
+		if !CFG_AIA {
 			return; // 仅 AIA 构建下有意义
 		}
 		let mut s = test_state();
@@ -1435,7 +1475,7 @@ mod tests {
 
 		ctx.state.imsic_m.present = 1;
 		ctx.state.imsic_m.eidelivery = 1;
-		ctx.state.imsic_m.eip_ext_any = 1;
+		ctx.state.imsic_m.eip_ext_any.store(1, Ordering::Relaxed);
 		ctx.state.imsic_m.eie[0].store(1 << 10, Ordering::Relaxed);
 		ctx.state.imsic_m.eip[0].store(1 << 10, Ordering::Relaxed);
 
@@ -1456,7 +1496,7 @@ mod tests {
 		);
 	}
 
-	/// handle_csr: AIA CSR 读 — 若 !PYREMU_AIA 则应投递 IllInstr.
+	/// handle_csr: AIA CSR 读 — 若 !CFG_AIA 则应投递 IllInstr.
 	#[test]
 	fn handle_csr_aia_miselect_read() {
 		let mut s = test_state();
@@ -1465,11 +1505,11 @@ mod tests {
 		let mut ctx = test_csr_ctx(&mut s, &clint);
 		// csrrs t0, miselect, x0  (funct3=CSRRS, rd=5, rs1=0, csr=0x350)
 		let advance = handle_csr(&mut ctx, 5, 0, MISELECT, 0b010, 0x3502F073u32, &mut r);
-		if PYREMU_AIA {
-			assert_eq!(advance, 4, "AIA enabled → normal advance");
+		if CFG_AIA {
+			assert_eq!(advance, 4, "AIA enabled -> normal advance");
 			assert_eq!(ctx.state.mcause, 0, "mcause must not be set");
 		} else {
-			assert_eq!(advance, 0, "AIA disabled → IllInstr redirects PC");
+			assert_eq!(advance, 0, "AIA disabled -> IllInstr redirects PC");
 			assert_eq!(
 				ctx.state.mcause & 0x7FFF_FFFF_FFFF_FFFF,
 				2,
@@ -1478,7 +1518,7 @@ mod tests {
 		}
 	}
 
-	/// handle_csr: AIA CSR 写 → !PYREMU_AIA 时 IllInstr.
+	/// handle_csr: AIA CSR 写 -> !CFG_AIA 时 IllInstr.
 	#[test]
 	fn handle_csr_aia_miselect_write() {
 		let mut s = test_state();
@@ -1488,17 +1528,17 @@ mod tests {
 		let mut ctx = test_csr_ctx(&mut s, &clint);
 		// csrrw x0, miselect, a0  (funct3=CSRRW, rd=0, rs1=10, csr=0x350)
 		let advance = handle_csr(&mut ctx, 0, 10, MISELECT, 0b001, 0x35051073u32, &mut r);
-		if PYREMU_AIA {
-			assert_eq!(advance, 4, "AIA enabled → normal advance");
+		if CFG_AIA {
+			assert_eq!(advance, 4, "AIA enabled -> normal advance");
 			assert_eq!(ctx.state.imsic_m.select, 0x70, "miselect stored");
 		} else {
-			assert_eq!(advance, 0, "AIA disabled → IllInstr redirects PC");
+			assert_eq!(advance, 0, "AIA disabled -> IllInstr redirects PC");
 			assert_eq!(ctx.state.mcause & 0x7FFF_FFFF_FFFF_FFFF, 2);
 		}
 	}
 
 	/// handle_csr: mtopi (0xFB0) — OpenSBI 用 csr_read_allowed(CSR_MTOPI) 探测
-	/// AIA 存在性. !PYREMU_AIA 时此读必须触发 IllInstr 并设置 mcause.
+	/// AIA 存在性. !CFG_AIA 时此读必须触发 IllInstr 并设置 mcause.
 	#[test]
 	fn handle_csr_mtopi_read() {
 		let mut s = test_state();
@@ -1508,10 +1548,10 @@ mod tests {
 		let mut ctx = test_csr_ctx(&mut s, &clint);
 		// csrrs t1, mtopi, x0  (funct3=CSRRS, rd=6, rs1=0, csr=0xFB0)
 		let advance = handle_csr(&mut ctx, 6, 0, 0xFB0, 0b010, 0xFB032F73u32, &mut r);
-		if PYREMU_AIA {
-			assert_eq!(advance, 4, "AIA enabled → normal advance");
+		if CFG_AIA {
+			assert_eq!(advance, 4, "AIA enabled -> normal advance");
 		} else {
-			assert_eq!(advance, 0, "AIA disabled → IllInstr redirects PC");
+			assert_eq!(advance, 0, "AIA disabled -> IllInstr redirects PC");
 			assert_eq!(ctx.state.mcause & 0x7FFF_FFFF_FFFF_FFFF, 2);
 			assert_ne!(ctx.state.mepc, 0, "mepc must be saved by trap delivery");
 		}
@@ -1537,7 +1577,7 @@ mod tests {
 
 	/// mdid 必须完整 64-bit 保存 — 修复前 `val as u8` 使 csrw mdid, 300 截断为 44,
 	/// csrw mdid, 256 截断为 0 (别名回 host). 这是 stress batch-4 (2000 并发飞地)
-	/// 挂死的根因: SUSPEND handler 读到 curr==0 误判 host 请求 → sbi_hart_hang.
+	/// 挂死的根因: SUSPEND handler 读到 curr==0 误判 host 请求 -> sbi_hart_hang.
 	#[test]
 	fn tee_mdid_full_width_write() {
 		let mut s = test_state();

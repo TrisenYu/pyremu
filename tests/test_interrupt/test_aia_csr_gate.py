@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 
 """AIA CSR 门控测试 — 验证 PYREMU_AIA=0/1 时 8 个 AIA CSR 的可达性.
 
@@ -9,8 +9,8 @@
   siselect (0x150), sireg (0x151), stopei (0x15C),  stopi (0xDB0).
 
 行为:
-  PYREMU_AIA=0 → 全部触发 IllInstr.
-  PYREMU_AIA=1 → 全部可正常访问 (IMSIC 接管进一步的读写语义).
+  PYREMU_AIA=0 -> 全部触发 IllInstr.
+  PYREMU_AIA=1 -> 全部可正常访问 (IMSIC 接管进一步的读写语义).
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ class TestAiaCsrGateCheckAccess:
         assert len(unique) == 1, f"AIA CSR implemented flags must be uniform: {states}"
 
     def test_mmode_access_consistent(self) -> None:
-        """M 模式: implemented=False → CsrAccessError, True → 通过.
+        """M 模式: implemented=False -> CsrAccessError, True -> 通过.
         mtopi (0xFB0) / stopi (0xDB0) 为只读 CSR, 写操作应报 readonly."""
         M = RiscvMode.M.value
         for addr in _AIA_CSRS:
@@ -130,7 +130,7 @@ class TestAiaCsrGateInstruction:
 
     @staticmethod
     def _csrrs(rd: int, csr: int, rs1: int) -> int:
-        """CSRRS rd, csr, rs1 (funct3=2). rs1=0 → csrr pseudo-instruction."""
+        """CSRRS rd, csr, rs1 (funct3=2). rs1=0 -> csrr pseudo-instruction."""
         return (
             ((csr & 0xFFF) << 20) | ((rs1 & 0x1F) << 15)
             | (2 << 12) | ((rd & 0x1F) << 7) | 0x73

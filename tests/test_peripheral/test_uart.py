@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """UART 多 hart 行缓冲 + 每 hart 日志文件 + 控制台回显所有权测试.
@@ -22,7 +22,7 @@ import time
 
 import pytest
 
-from pyremu._native import native_available
+from pyremu._native import FfiUartCtx, native_available
 from pyremu.emulator import Emulator
 from pyremu.interrupt.plic import PLIC
 from pyremu.peripheral.uart import IP_RXWM, IP_TXWM, UART
@@ -332,7 +332,7 @@ class TestTxArchiveDaemonPollFallback:
 
     回归背景: 修复前 ``_tx_archive_loop`` 在 select 超时 (0.2s) 后无条件落入
     阻塞 ``os.read(notify_r, 256)``。而通知管道只有 Rust 引擎写 ``tx_notify_fd``
-    才可读, 实际恒为空 (state.rs 中该字段恒为 -1, Rust 从不写) → daemon 永久
+    才可读, 实际恒为空 (state.rs 中该字段恒为 -1, Rust 从不写) -> daemon 永久
     阻塞在空管道读, ring buffer 永不归档; 仅剩 ``stop_tx_archive_thread`` 最终
     排空的一小段, hart 日志与启动输出严重不符。
 
@@ -651,7 +651,7 @@ class TestTxWatermarkInterrupt:
     """TX watermark 电平中断: txcnt>0 时 IP.txwm 恒置位 (FIFO 即时排空模型).
 
     回归背景: 旧实现 IP.txwm 依赖 Python TXDATA 写路径锁存, 而 Linux 启动后
-    TXDATA 写由 Rust 批量引擎 inline 处理 (不经 Python `_write_reg`) →
+    TXDATA 写由 Rust 批量引擎 inline 处理 (不经 Python `_write_reg`) ->
     IP.txwm 恒为 0; sifive 驱动 start_tx 使能 IE.txwm 后永远等不到中断,
     用户态 tty 输出 (shell 提示符 / 输入回显) 全部滞留内核 TX 环形缓冲,
     仅内核 printk (轮询 console 路径) 可见。且旧 `_update_plic_rx` 只按
@@ -716,7 +716,7 @@ class TestRxWatermarkInterrupt:
     回归背景: 旧实现误从 bits[2:0] 取 rxcnt — Linux sifive 驱动 probe 写
     rxctrl = RXEN|(0<<16) = 0x1, 旧代码读到 rxcnt=1 (rxen 位), 单字节输入
     (FIFO 占用 1, 不满足 1>1) 永不触发 RX 中断。交互终端中逐字符输入产生
-    单字节滞留: 尾字节 (如命令后的 \\n) 永远不被客机读取, 表现为输入冻结
+    单字节滞留: 尾字节 (如命令后的 \\n) 永远不被受调试程序读取, 表现为输入冻结
     (zsh 下 UP ARROW 召回命令后回车无响应)。对照 QEMU sifive_uart:
     SIFIVE_UART_GET_RXCNT(rxctrl) = ((rxctrl) >> 16) & 0x7。
     """
@@ -742,7 +742,7 @@ class TestRxWatermarkInterrupt:
     def test_rxwm_single_byte_raises_plic_line(self):
         """rxctrl=RXEN + IE.rxwm 使能时, 单字节 preload 必须拉高 PLIC 线.
 
-        锁定冻结场景: 尾字节滞留 FIFO 且 PLIC 不挂起 ->客机永不读取。
+        锁定冻结场景: 尾字节滞留 FIFO 且 PLIC 不挂起 ->受调试程序永不读取。
         """
         plic = PLIC(base_addr=0x0C00_0000, num_sources=4, num_contexts=2)
         uart = UART(base=0x1000_0000, plic=plic, irq=1)
@@ -763,7 +763,7 @@ class TestRxWatermarkInterrupt:
     def test_rxctrl_write_reevaluates_plic_line(self):
         """降低 rxcnt 使既有 FIFO 内容满足触发条件 ->写 RXCTRL 立即拉高 PLIC.
 
-        旧实现 RXCTRL 写路径不调用 _update_plic_irq ->中断线状态滞后。
+        旧实现 RXCTRL 写路径不调用 _publish_state ->中断线状态滞后。
         """
         plic = PLIC(base_addr=0x0C00_0000, num_sources=4, num_contexts=2)
         uart = UART(base=0x1000_0000, plic=plic, irq=1)
@@ -774,3 +774,44 @@ class TestRxWatermarkInterrupt:
         # 驱动重写 rxcnt=0 ->既有字节立即满足触发条件
         uart.write(self.REG_RXCTRL, self.RXEN.to_bytes(4, "little"))
         assert plic._pending[1], "rxcnt 降低后既有 FIFO 数据必须立即触发中断"
+
+
+class TestUartNativeRegsPublish:
+    """UART 寄存器字段与 native 侧持久上下文的同步.
+
+    加速执行期间 Rust 内联应答 guest 的 IP/IE 读, 数据源是持久上下文而非
+    每轮 marshal 的快照; 设备侧状态变化必须即时同步, 否则 batch 内新到的
+    RX 数据对 guest 不可见 (中断服务程序读 IP 得 rxwm=0 而不读 RXDATA)。
+    """
+
+    def test_register_fields_follow_device_state(self):
+        """无需重新 marshal, 寄存器字段随设备状态变化即时更新."""
+        ctx = FfiUartCtx()
+        uart = UART(base=0x1000_0000)
+        uart._ffi_ctx = ctx
+        uart._ie = 1 << 1
+        uart.preload(b"AB")
+        assert ctx.rx_fifo_len == 2
+        assert ctx.ie == 1 << 1
+        # guest 读走一个字节 (RXDATA 偏移 0x04) 后水位同步下降
+        uart.read(0x04, 1)
+        assert ctx.rx_fifo_len == 1
+        uart.clear_rx()
+        assert ctx.rx_fifo_len == 0
+        # 使能位与阈值寄存器写入同样即时可见
+        uart.write(0x10, (0).to_bytes(4, "little"))
+        assert ctx.ie == 0
+        uart.write(0x08, (1 << 16).to_bytes(4, "little"))
+        assert ctx.txctrl == 1 << 16
+        uart.write(0x0C, (1 << 16).to_bytes(4, "little"))
+        assert ctx.rxctrl == 1 << 16
+
+    def test_missing_context_is_noop(self):
+        """未启用加速库 (无 _ffi_ctx) 时状态变化不得抛异常."""
+        uart = UART(base=0x1000_0000)
+        assert uart._ffi_ctx is None
+        uart._ie = 1 << 1
+        uart.preload(b"AB")
+        uart.read(0x04, 1)
+        uart.clear_rx()
+        assert uart._ffi_ctx is None

@@ -1,4 +1,4 @@
-// SPDX-LICENSE-IDENTIFIER: GPL2.0
+// SPDX-LICENSE-IDENTIFIER: MIT
 // (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 // M 模式 -> S 模式启动移交: 模拟 OpenSBI 将控制权移交给操作系统的 boot 片段.

@@ -1,5 +1,8 @@
 // use std::time::Instant;
-use crate::concurrent::{ConcurrentClintCtx, FfiExtIrqCtx, ModuleState, StopInfo, WATCHDOG_POLL_US};
+use crate::ffi::FfiExtIrqCtx;
+use crate::concurrent::{
+	ConcurrentClintCtx, ModuleState, StopInfo, WATCHDOG_POLL_US,
+};
 use crate::interrupt::{clint::sync_msip, clint::sync_mtip, sync_imsic};
 use crate::state::{exit_reason, riscv_mode, HartState};
 use std::sync::atomic::Ordering;
@@ -51,8 +54,8 @@ pub(crate) fn wfi_sync_and_check(
 	// Gate on IMSIC presence — in legacy PLIC mode (imsic not present)
 	// OpenSBI's PLIC irqchip has no process_hwirqs and never sets MEIE;
 	// a force-enabled MEIP would fire an M-mode external trap into an
-	// unprocessable irqchip (sbi_irqchip_process → SBI_ENODEV) and hang
-	// the boot.  The guest's mie is authoritative there.
+	// unprocessable irqchip (sbi_irqchip_process -> SBI_ENODEV) and hang
+	// the boot.  The 受调试程序's mie is authoritative there.
 	if state.imsic_m.present != 0
 		&& (state.mip.load(Ordering::Acquire) & (1 << 11)) != 0
 		&& (state.mie & (1 << 11)) == 0
@@ -72,7 +75,7 @@ pub(crate) fn wfi_sync_and_check(
 	// In M-mode, exclude delegated (S-level) interrupts from the wake
 	// check.  Delegated interrupts (SEI, SSI, STI) are invisible to
 	// mtopi and cannot be handled by the M-mode trap handler, so waking
-	// for them creates an infinite WFI→wake→skip→WFI loop.  They will
+	// for them creates an infinite WFI->wake->skip->WFI loop.  They will
 	// be delivered when the hart drops to S-mode.
 	// Non-delegatable M-level interrupts (MEI, MSI, MTI) always wake.
 	let other_pending = if state.mode == riscv_mode::M {
@@ -122,10 +125,7 @@ pub(crate) fn wfi_check_all_idle(
 
 	if earliest != u64::MAX {
 		// 全部 hart WFI 且有定时器截止时间。
-		// 不得在此把 mtime 快进到截止时间: 快进后 Python 侧 `_wfi_ticks_until_wake`
-		// 计算 remaining = 截止 - mtime = 0, `_wfi_sleep_if_idle` 的 wait 永不
-		// 阻塞 -> 全 hart WFI 空闲退化为 100% CPU 忙转 (宿主卡顿 / 键盘无响应),
-		// 且客机时钟以批量速度 (≈20×真实时间) 狂飙. 正确的实时事件驱动:
+		// 不得在此把 mtime 快进到截止时间
 		// 仅退出加速执行 (WFI_WAIT), 由 Python 侧休眠 (remaining/timebase, 上限
 		// _WFI_MAX_SLEEP), 睡眠期间按真实流逝时间推进 mtime (clint.tick),
 		// 定时器因而按真实节奏触发. 此处保持 mtime 不变, 让 Python 计算真实剩余.

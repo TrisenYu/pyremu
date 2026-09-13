@@ -406,12 +406,22 @@ class HartWithRegs:
             old_mie = self._csr_read_raw("mie")
             new_mie = (old_mie & ~mideleg) | (val & mideleg)
             self._csr_write_raw("mie", new_mie)
-        elif csr_name == "sip":
-            # sip 是 mip 的受限视图 — 只有 mideleg 委派的位可通过 S 模式写
-            # (大多数中断是只读的, 但 SSIP 可被 S 模式软件置位/清除)
-            mideleg = self._csr_read_raw("mideleg")
+        elif csr_name == "mip":
+            # mip 的硬件驱动位 (MSIP/STIP/MTIP/SEIP/MEIP) 只读, 由 CLINT / SSTC
+            # 定时器 / 外部中断控制器 (PLIC) 独占; 仅 SSIP (bit 1) 与 USIP (bit 0)
+            # 可被软件写入 (与 Rust csr.rs 的 ro_mask 一致).
+            ro_mask = (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 11)
             old_mip = self._csr_read_raw("mip")
-            new_mip = (old_mip & ~mideleg) | (val & mideleg)
+            new_mip = (old_mip & ro_mask) | (val & ~ro_mask)
+            self._csr_write_raw("mip", new_mip)
+        elif csr_name == "sip":
+            # sip 是 mip 的只读视图 — 唯一可写位是 SSIP (bit 1). 与 sie 不同,
+            # sip 并非对所有 mideleg 委派位都可写: STIP (bit 5) 由 SSTC 定时器
+            # 硬件驱动, SEIP (bit 9) 由 PLIC 硬件驱动, 均不得被 `csrw sip` 覆写.
+            # 飞地上下文切换 (csr_write(CSR_SIP, saved)) 写回陈旧 sip, 覆写
+            # SEIP/STIP 会丢失挂起的外设/定时器中断 (飞地回归测试后输入冻结).
+            old_mip = self._csr_read_raw("mip")
+            new_mip = (old_mip & ~(1 << 1)) | (val & (1 << 1))
             self._csr_write_raw("mip", new_mip)
         elif self._imsic is not None and csr_name == "miselect":
             self._imsic_select_m = mask32(val)
@@ -762,7 +772,7 @@ class HartWithRegs:
         """Immediately re-evaluate mip.STIP after stimecmp write.
 
         Python 步骤路径: 单线程执行无并发 mtime 膨胀, 共享 mtime 比较即等价于
-        QEMU riscv_timer_write_timecmp (过去→置位, 未来→清除). Rust native 路径
+        QEMU riscv_timer_write_timecmp (过去->置位, 未来->清除). Rust native 路径
         由 csr.rs 的 write_stimecmp 承担同一语义并按 own 指令计数设定 deadline.
         This is critical for the kernel's stopi loop to exit.
         """
@@ -794,7 +804,7 @@ class HartWithRegs:
         if self._imsic is not None:
             topei = self._imsic.peek_topei(self.id, 'M')
             if topei != 0:
-                # All IMSIC M-file interrupts (IPI + external) → MEI=11.
+                # All IMSIC M-file interrupts (IPI + external) -> MEI=11.
                 # The IPI minor identity (1) is NOT a major identity — the
                 # IMSIC delivers it via MEIP, and the minor identity is
                 # revealed only via MTOPEI.
@@ -827,7 +837,7 @@ class HartWithRegs:
         if self._imsic is not None:
             topei = self._imsic.peek_topei(self.id, 'S')
             if topei != 0:
-                # All IMSIC S-file interrupts (IPI + external) → SEI=9.
+                # All IMSIC S-file interrupts (IPI + external) -> SEI=9.
                 # The IPI minor identity (1) is NOT a major identity — the
                 # IMSIC delivers it via SEIP, and the minor identity is
                 # revealed only via STOPEI.
@@ -836,7 +846,7 @@ class HartWithRegs:
         if (self.mip_val & self.mie_val) & (1 << 1):
             val = (1 << 16) | 1
             # Clear SSIP — mirrors Rust compute_stopi.
-            # In AIA mode SSIP normally comes through IMSIC S-file (eip[1] →
+            # In AIA mode SSIP normally comes through IMSIC S-file (eip[1] ->
             # STOPEI claim), but when falling through to this legacy path the
             # bit must be cleared to prevent re-delivery.
             self.mip_val &= ~(1 << 1)
@@ -849,13 +859,8 @@ class HartWithRegs:
                 return val
         return 0
 
-    # ----------------------------------------------------------
-    #  mdid — 内存域 ID (TEE 飞地/服务标识, M 模式管理器维护)
-    # ----------------------------------------------------------
-
     @property
     def mdid_val(self) -> int:
-        """读取 mdid CSR (内存域 ID) — 缓存避免每周期 pydantic dict 查找."""
         return self._mdid_val
 
     @mdid_val.setter
@@ -863,10 +868,6 @@ class HartWithRegs:
         val = mask64(v)
         self._mdid_val = val
         self.csrs["mdid"].val = val
-
-    # ----------------------------------------------------------
-    #  pmpsplit — PMP 条目拆分 (TEE 飞地 PMP 虚拟化)
-    # ----------------------------------------------------------
 
     @property
     def pmpsplit_val(self) -> int:
@@ -1097,6 +1098,7 @@ EXIT_WFI_WAIT = 5
 EXIT_ERROR = 6
 EXIT_BREAKPOINT = 7
 EXIT_TIMEOUT = 8
+EXIT_RX_WAIT = 9
 
 
 # ============================================================
@@ -1262,8 +1264,8 @@ def _marshal_imsic(hart: HartWithRegs, state: HartState) -> None:
         mf, sf = imsic._files[hart.id]
         # Save eip snapshot so _unmarshal_imsic can detect daemon-added
         # bits (injected by the RX daemon thread in the middle of acceleration)
-        # and preserve them across the marshal→unmarshal cycle.
-        # Without this, _unmarshal_imsic's Rust→Python copy overwrites
+        # and preserve them across the marshal->unmarshal cycle.
+        # Without this, _unmarshal_imsic's Rust->Python copy overwrites
         # daemon-injected eip bits.
         hart._imsic_pre_m_eip = list(mf.eip)
         hart._imsic_pre_s_eip = list(sf.eip)
@@ -1277,16 +1279,10 @@ def _marshal_imsic(hart: HartWithRegs, state: HartState) -> None:
             state.imsic_m.eie[j] = mf.eie[j]
             state.imsic_s.eip[j] = sf.eip[j]
             state.imsic_s.eie[j] = sf.eie[j]
-            if j == 0:
-                if mf.eip[0] & _mask0:
-                    _ext_m = 1
-                if sf.eip[0] & _mask0:
-                    _ext_s = 1
-            else:
-                if mf.eip[j]:
-                    _ext_m = 1
-                if sf.eip[j]:
-                    _ext_s = 1
+            if (mf.eip[0] & _mask0) or (j != 0 and mf.eip[j]):
+                _ext_m = 1
+            if (sf.eip[0] & _mask0) or (j != 0 and sf.eip[j]):
+                _ext_s = 1
         state.imsic_m.eidelivery = mf.eidelivery
         state.imsic_m.eithreshold = mf.eithreshold
         state.imsic_m.select = hart._imsic_select_m
@@ -1303,7 +1299,7 @@ def _unmarshal_imsic(hart: HartWithRegs, state: HartState) -> None:
     """Copy Rust ``HartState`` IMSIC fields back into Python IMSIC object.
 
     Preserves eip bits that were injected by the daemon thread (e.g. UART
-    RX → APLIC → IMSIC) during the speedup execution — these are not known to
+    RX -> APLIC -> IMSIC) during the speedup execution — these are not known to
     Rust and would be lost if we simply replaced Python eip with Rust eip.
     """
     imsic = hart._imsic
@@ -1312,14 +1308,14 @@ def _unmarshal_imsic(hart: HartWithRegs, state: HartState) -> None:
         hart._imsic_select_s = state.imsic_s.select
         return
     # 持锁: 写回 eip/eie 与 RX daemon 的 set_pending RMW 互斥.
-    # 不持锁则 daemon 在 marshal→unmarshal 窗口注入的 eip 位可能被
+    # 不持锁则 daemon 在 marshal->unmarshal 窗口注入的 eip 位可能被
     # Rust 写回的旧值覆盖 (lost injection), 或在 daemon_m 计算时
     # 读到 torn 状态.
     with imsic._lock:
         mf, sf = imsic._files[hart.id]
         # Compute daemon-added bits: bits set in Python between marshal
         # and now that were NOT in the snapshot.  These must survive the
-        # Rust→Python copy.
+        # Rust->Python copy.
         pre_m = getattr(hart, '_imsic_pre_m_eip', None)
         pre_s = getattr(hart, '_imsic_pre_s_eip', None)
         for j in range(64):

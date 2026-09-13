@@ -1,13 +1,9 @@
-# Last modified at 2026/07/14 星期二 11:02:21
 phony =
 
-# ===================================================================
-# Pyremu 顶层 makefile
-# ===================================================================
-# 主要入口: make emu — 自动构建固件 -> 更新 kei.sav -> 启动调试器
+# 主要入口: make emu-linux-sh — 自动构建固件 -> 更新 kei.sav -> 启动调试器
 #
 # 构建依赖链:
-#   rust_smode_entry.bin -> custom-opensbi (distclean + 全量编译)
+#   rust_smode_entry.bin -> opensbi (distclean + 全量编译)
 #       -> 拷贝 fw_*.elf 到 tests/ -> kei.sav 符号更新 -> 启动调试器
 #
 # make build-native — 编译 Rust cdylib 加速库 (pyremu/_native/libdecode.so)
@@ -44,22 +40,27 @@ phony += __pyenv-check
 
 # CARGO_FLAGS 变化时强制重建 native .so (需求: PYREMU_TRACE_SRET / PYREMU_DIAG_LOG
 # 设为非零/非空值时启用 --features diagnostic, 否则不启用).
-# 若仅依赖 $(NATIVE_SRC) 时间戳, 修改环境变量后 make 不会重建 → 旧的
-# (不含 diagnostic) .so 被继续使用 → 诊断日志静默缺失.
-NATIVE_CONFIG_GEN = $(NATIVE_DIR)/cpu/src/config_gen.rs
+# 若仅依赖加速库项目更新的时间戳, 修改环境变量后 make 不会重建 -> 旧的
+# (不含 diagnostic) .so 被继续使用 -> 诊断日志静默缺失.
+CONFIG_GEN_RS = $(NATIVE_DIR)/cpu/src/configs_gen.rs
 
 # 由 configs.mk 生成 Rust 常量定义 — 照搬 rust_smode_entry/Makefile 模式.
-$(NATIVE_CONFIG_GEN): FORCE
+# 开关类配置的命名: 工程根目录的 PYREMU_XXX -> Rust 侧 CFG_XXX
+# (去掉 PYREMU_ 前缀, 保持 SCREAMING_SNAKE_CASE 常量命名惯例),
+# 使同一份配置在两处都以各自语言的惯用形式出现.
+$(CONFIG_GEN_RS): FORCE
 	@rm -f $@.tmp
 	@echo '// generated from configs.mk by Makefile — do not edit' >> $@.tmp
 	@echo 'pub const TLB_ENTRIES: usize = $(TLB_ENTRIES);' >> $@.tmp
-	@echo 'pub const PYREMU_AIA: bool = $(if $(filter 1,$(PYREMU_AIA)),true,false);' >> $@.tmp
-	@echo 'pub const PYREMU_H_EXT: bool = $(if $(filter 1,$(PYREMU_H_EXT)),true,false);' >> $@.tmp
+	@echo 'pub const CFG_NO_TLB: bool = $(if $(filter 1,$(PYREMU_NO_TLB)),true,false);' >> $@.tmp
+	@echo 'pub const CFG_NO_L2: bool = $(if $(filter 1,$(PYREMU_NO_L2)),true,false);' >> $@.tmp
+	@echo 'pub const CFG_AIA: bool = $(if $(filter 1,$(PYREMU_AIA)),true,false);' >> $@.tmp
+	@echo 'pub const CFG_H_EXT: bool = $(if $(filter 1,$(PYREMU_H_EXT)),true,false);' >> $@.tmp
 	@echo 'pub const IMSIC_M_BASE: u64 = $(IMSIC_M_BASE);' >> $@.tmp
 	@echo 'pub const IMSIC_S_BASE: u64 = $(IMSIC_S_BASE);' >> $@.tmp
 	@cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
 
-$(NATIVE_SO) $(TERMIO_SO): $(NATIVE_SRC) $(NATIVE_CONFIG_GEN)
+$(NATIVE_SO) $(TERMIO_SO): $(NATIVE_SRC) $(CONFIG_GEN_RS)
 	@$(MAKE) -C pyremu
 	cargo build --release --manifest-path $(NATIVE_DIR)/Cargo.toml --workspace $(CARGO_FLAGS)
 	install -m 755 $(NATIVE_DIR)/target/release/libdecode.so $(NATIVE_SO)
@@ -79,7 +80,7 @@ phony += FORCE
 
 
 # ---- Rust S-mode Runtime ----
-# 编译 rust_smode_entry.bin, 供 custom-opensbi 嵌入 .coffer_enclave_man 段
+# 编译 rust_smode_entry.bin, 供 opensbi 嵌入 .coffer_enclave_man 段
 $(RUST_SMODE_BIN): $(wildcard $(RUST_SMODE_DIR)/src/*.rs) $(wildcard $(RUST_SMODE_DIR)/src/**/*.rs)
 	$(MAKE) -C $(RUST_SMODE_DIR) build
 
@@ -87,22 +88,43 @@ build-rust: $(RUST_SMODE_BIN)
 phony += build-rust
 
 # 对bsp/opensbi的编译配置
+
+# 按 DBG_MEM_INTERACT 开关同步 CONFIG_DBG_MEM_INTERACT 到 opensbi 平台 defconfig。
+# 通过 $(shell ...) 在 make 解析阶段执行 (任何目标求值之前), 从而在 make 判定 fw_*.elf
+# 是否过期之前就更新 defconfig 的 mtime: defconfig 属于 FW_SRC_DEPS, 其 mtime 变化会令
+# fw_*.elf 过期并重编, 开关切换后无需手动 distclean 即生效。
+define dbg_mem_sync_sh
+if [ "$(DBG_MEM_INTERACT)" = "1" ]; then \
+	grep -qx 'CONFIG_DBG_MEM_INTERACT=y' \
+		$(FW_SRC_DIR)/platform/generic/configs/defconfig \
+		|| echo 'CONFIG_DBG_MEM_INTERACT=y' \
+			>> $(FW_SRC_DIR)/platform/generic/configs/defconfig; \
+else \
+	grep -q '^CONFIG_DBG_MEM_INTERACT=' \
+		$(FW_SRC_DIR)/platform/generic/configs/defconfig \
+		&& sed -i '/^CONFIG_DBG_MEM_INTERACT=/d' \
+			$(FW_SRC_DIR)/platform/generic/configs/defconfig; \
+fi
+endef
+__dbg_mem_sync := $(shell $(dbg_mem_sync_sh))
+
 $(FW_BUILD_DIR)/fw_payload.elf: $(RUST_SMODE_BIN) $(FW_SRC_DEPS)
 	$(MAKE) -C $(FW_SRC_DIR) distclean
 	$(MAKE) -C $(FW_SRC_DIR) $(FW_MAKE_FLAGS) -j$$(nproc)
 
-$(FW_BUILD_DIR)/fw_jump.elf: $(FW_SRC_DEPS)
+# fw_jump 同样内嵌 rust_smode_entry.bin (firmware/objects.mk _ENCLAVE_DEFAULT),
+$(FW_BUILD_DIR)/fw_jump.elf: $(RUST_SMODE_BIN) $(FW_SRC_DEPS)
 	$(MAKE) -C $(FW_SRC_DIR) distclean
 	$(MAKE) -C $(FW_SRC_DIR) $(FW_JUMP_FLAGS) -j$$(nproc)
 
 build-fw: $(FW_BUILD_DIR)/fw_payload.elf
 phony += build-fw
 
-build-fw-jump: $(FW_BUILD_DIR)/fw_jump.elf
+build-fw-jump: $(fw_jump)
 phony += build-fw-jump
 
 # ---- 固件产物拷贝 ----
-# 将 custom-opensbi 构建产物复制到 tests/ 目录, 供模拟器加载
+# 将 opensbi 构建产物复制到 tests/ 目录, 供模拟器加载
 # 当构建产物比 tests/ 中的副本更新时自动触发
 $(fw_payload): $(FW_BUILD_DIR)/fw_payload.elf
 	@mkdir -p $(elf_dir)
@@ -111,9 +133,15 @@ $(fw_payload): $(FW_BUILD_DIR)/fw_payload.elf
 	cp $(FW_BUILD_DIR)/fw_dynamic.elf $(fw_dynamic)
 	@echo "固件已拷贝: $(fw_payload)"
 
+# fw_jump 独立拷贝规则: 仅重编 fw_jump (make build-fw-jump) 时也刷新部署副本,
+# 避免 fw_jump.elf 已更新而 build/elf/custom_opensbi_fw_jump.elf 仍旧的情况.
+$(fw_jump): $(FW_BUILD_DIR)/fw_jump.elf
+	@mkdir -p $(elf_dir)
+	cp $(FW_BUILD_DIR)/fw_jump.elf $(fw_jump)
+	@echo "固件已拷贝: $(fw_jump)"
+
 # ---- kei.sav 构建 ----
-# 依赖固件 ELF (提取符号地址), 自动更新 coldboot_done 等硬编码地址
-# 当固件副本更新时自动触发
+# 依赖固件产物, 保证启动模拟器前固件已就位 (kei.sav 本身已不再从固件 ELF 提取符号)
 ${kei-sav}: $(fw_payload)
 	$(MAKE) -C bsp/kei-boot kei-sav
 
@@ -125,7 +153,7 @@ emu: ${kei-sav} __pyenv-check
 phony += emu
 
 $(fw_payload_linux): $(RUST_SMODE_BIN) $(FW_SRC_DEPS)
-	@echo "构建 custom-opensbi + Linux 内核 payload..."
+	@echo "构建 opensbi + Linux 内核 payload..."
 	$(MAKE) -C $(FW_SRC_DIR) distclean $(FW_MAKE_FLAGS) \
 		FW_PAYLOAD_PATH=$(realpath $(LINUX_IMG))
 	$(MAKE) -C $(FW_SRC_DIR) $(FW_MAKE_FLAGS) \
@@ -171,6 +199,17 @@ build-initramfs: $(INITRAMFS)
 phony += build-initramfs
 
 
+# ---- 设备树: 生成 DTB 并还原 DTS ----
+# 用 tools/dump_dtb.py 构造平台预设 -> build_dtb() 落盘 build/emu.dtb,
+# 再用 dtc 还原为人类可读的 build/emu.dts。
+dtb: __pyenv-check
+	@mkdir -p $(bins_dir)
+	PYTHONPATH=$(CURDIR) uv run python tools/dump_dtb.py $(bins_dir)/emu.dtb
+	dtc -I dtb -O dts $(bins_dir)/emu.dtb -o $(bins_dir)/emu.dts
+	@echo "  -> $(bins_dir)/emu.dtb + $(bins_dir)/emu.dts"
+phony += dtb
+
+
 # ---- 测试 ----
 # 限制: 4 GiB 虚拟内存, --ignore 排除 ordering-dependent 失败.
 # 详见 memory/test-constraints.md 与 memory/ordering-dependent-native-batch-failures.md.
@@ -185,7 +224,7 @@ test: __pyenv-check test-build
 phony += test
 
 # timeout 600
-cov-test: __pyenv-check
+cov-test: __pyenv-check test-build
 	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 uv run pytest -v -x \
 		--cov=pyremu --cov-report=term --ignore=tests/test_multihart_diff.py --full-trace
 phony += cov-test

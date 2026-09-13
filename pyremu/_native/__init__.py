@@ -203,7 +203,9 @@ try:
     # Phase 5: concurrent thread-per-hart execution engine
     _lib.run_parallel.argtypes = [
         ctypes.c_void_p,   # hart: *const FfiHartCtx
-        ctypes.c_void_p,   # ffi: *const FfiPeriphCtx
+        ctypes.c_void_p,   # mem_ctx: *const FfiMemCtx
+        ctypes.c_void_p,   # intr_ctx: *const FfiInterruptCtx
+        ctypes.c_void_p,   # dev_ctx: *const FfiDevicesCtx
         ctypes.c_void_p,   # bp: *const FfiBpCtx
         ctypes.c_void_p,   # tlb: *mut FfiTlbCtx
     ]
@@ -870,8 +872,8 @@ class FfiClintCtx(ctypes.Structure):
     ]
 
 
-class FfiDevCtx(ctypes.Structure):
-    """Device MMIO context — matches Rust ``FfiDevCtx``."""
+class DevMMIOAddrInfo(ctypes.Structure):
+    """Device MMIO address ranges — matches Rust ``DevMMIOAddrInfo``."""
     _fields_ = [
         ("bases", ctypes.c_void_p),
         ("ends", ctypes.c_void_p),
@@ -970,17 +972,29 @@ class FfiHartCtx(ctypes.Structure):
     ]
 
 
-class FfiPeriphCtx(ctypes.Structure):
-    """Grouped peripheral / memory context — matches Rust ``FfiPeriphCtx``."""
+class FfiMemCtx(ctypes.Structure):
+    """内存与保护上下文 — matches Rust ``FfiMemCtx``."""
     _fields_ = [
         ("mem", ctypes.c_void_p),
         ("pmp", ctypes.c_void_p),
+    ]
+
+
+class FfiInterruptCtx(ctypes.Structure):
+    """中断控制器上下文 — matches Rust ``FfiInterruptCtx``."""
+    _fields_ = [
         ("clint", ctypes.c_void_p),
+        ("plic", ctypes.c_void_p),
+    ]
+
+
+class FfiDevicesCtx(ctypes.Structure):
+    """设备上下文 — matches Rust ``FfiDevicesCtx``."""
+    _fields_ = [
         ("dev", ctypes.c_void_p),
         ("uart", ctypes.c_void_p),
         ("virtio", ctypes.c_void_p),
         ("watchdog", ctypes.c_void_p),
-        ("plic", ctypes.c_void_p),
     ]
 
 
@@ -1121,12 +1135,12 @@ class UartInfo:
     """UART context — lets Rust buffer sbi_printf output inline
     and handle IE/IP/TXCTRL register reads without exiting from speedup lib"""
     __slots__ = ("base", "tx_buf", "tx_wr", "ie", "txctrl", "rxctrl",
-                 "rx_fifo_len", "tx_notify_fd", "no_stdout", "rx_notify")
+                 "rx_fifo_len", "tx_notify_fd", "no_stdout", "rx_notify", "ffi")
 
     def __init__(self, base: int = 0, tx_buf=None, tx_wr=None,
                  ie: int = 0, txctrl: int = 0, rxctrl: int = 0, rx_fifo_len: int = 0,
                  tx_notify_fd: int = -1, no_stdout: int = 0,
-                 rx_notify=None):
+                 rx_notify=None, ffi=None):
         self.base = base
         self.tx_buf = tx_buf
         self.tx_wr = tx_wr
@@ -1137,6 +1151,9 @@ class UartInfo:
         self.tx_notify_fd = tx_notify_fd
         self.no_stdout = no_stdout
         self.rx_notify = rx_notify
+        # 持久 ctypes FfiUartCtx — 由 Emulator 持有并注入 UART 设备, 设备侧
+        # 状态变化时直接改写其寄存器字段; 提供时不再每轮重建快照.
+        self.ffi = ffi
 
 
 class VirtIOInfo:
@@ -1144,9 +1161,9 @@ class VirtIOInfo:
     accesses inline; only QueueNotify exits to Python.
 
     Carries the full runtime state of the virtio-blk MMIO register file
-    across speedup process.  Without this, dynamic state written by the guest
+    across speedup process.  Without this, dynamic state written by the 受调试程序
     (queue descriptors, feature negotiation, InterruptStatus, etc.) is
-    silently reset to zero, and the guest sees a dead device.
+    silently reset to zero, and the 受调试程序 sees a dead device.
     """
     __slots__ = (
         "base", "capacity", "queue_num_max",
@@ -1272,18 +1289,20 @@ def run_parallel(
     clint_ffi.base = clint.base if clint is not None else 0
     clint_ffi.timebase_hz = clint.timebase_hz if clint is not None else 0
 
-    # --- FfiDevCtx ---
-    dev_ffi = FfiDevCtx()
+    # --- DevMMIOAddrInfo ---
+    dev_ffi = DevMMIOAddrInfo()
     if dev is not None and dev.bases is not None and dev.ends is not None:
         dev_ffi.bases = ctypes.cast(dev.bases, ctypes.c_void_p).value
         dev_ffi.ends = ctypes.cast(dev.ends, ctypes.c_void_p).value
         dev_ffi.num = len(dev.bases)
 
     # --- FfiUartCtx ---
-    uart_ffi = FfiUartCtx()
+    # 调用方提供持久上下文时直接复用 (其寄存器字段由设备侧持续改写, 见
+    # UART._publish_native_regs); 否则按参数值构建一次性快照.
+    uart_ffi = uart.ffi if uart is not None and uart.ffi is not None else FfiUartCtx()
     _tx_buf = None
     _tx_wr = None
-    if uart is not None:
+    if uart is not None and uart.ffi is None:
         uart_ffi.base = uart.base
         if uart.tx_buf is not None:
             _tx_buf = uart.tx_buf
@@ -1358,13 +1377,21 @@ def run_parallel(
         if ext_irq is not None else 0
     )
 
-    _periph_ctx = FfiPeriphCtx()
-    _periph_ctx.mem = ctypes.addressof(mem)
-    _periph_ctx.pmp = ctypes.addressof(pmp_ffi)
-    _periph_ctx.clint = ctypes.addressof(clint_ffi)
-    _periph_ctx.dev = ctypes.addressof(dev_ffi)
-    _periph_ctx.uart = ctypes.addressof(uart_ffi)
-    _periph_ctx.virtio = (
+    _mem_ctx = FfiMemCtx()
+    _mem_ctx.mem = ctypes.addressof(mem)
+    _mem_ctx.pmp = ctypes.addressof(pmp_ffi)
+
+    _intr_ctx = FfiInterruptCtx()
+    _intr_ctx.clint = ctypes.addressof(clint_ffi)
+    _intr_ctx.plic = (
+        ctypes.cast(_plic_ffi_ptr, ctypes.c_void_p).value
+        if _plic_ffi_ptr else 0
+    )
+
+    _dev_ctx = FfiDevicesCtx()
+    _dev_ctx.dev = ctypes.addressof(dev_ffi)
+    _dev_ctx.uart = ctypes.addressof(uart_ffi)
+    _dev_ctx.virtio = (
         ctypes.cast(_virtio_ffi_ptr, ctypes.c_void_p).value
         if _virtio_ffi_ptr else 0
     )
@@ -1375,13 +1402,9 @@ def run_parallel(
     if watchdog_timeout_ns:
         _watchdog_ffi.timeout_ns = int(watchdog_timeout_ns) & 0xFFFF_FFFF_FFFF_FFFF
         _watchdog_ffi_ptr = ctypes.pointer(_watchdog_ffi)
-    _periph_ctx.watchdog = (
+    _dev_ctx.watchdog = (
         ctypes.cast(_watchdog_ffi_ptr, ctypes.c_void_p).value
         if _watchdog_ffi_ptr else 0
-    )
-    _periph_ctx.plic = (
-        ctypes.cast(_plic_ffi_ptr, ctypes.c_void_p).value
-        if _plic_ffi_ptr else 0
     )
 
     _bp_ctx = FfiBpCtx()
@@ -1396,7 +1419,9 @@ def run_parallel(
 
     _lib.run_parallel(
         ctypes.byref(_hart_ctx),
-        ctypes.byref(_periph_ctx),
+        ctypes.byref(_mem_ctx),
+        ctypes.byref(_intr_ctx),
+        ctypes.byref(_dev_ctx),
         ctypes.byref(_bp_ctx),
         ctypes.byref(_tlb_ctx),
     )

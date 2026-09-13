@@ -4,8 +4,8 @@ pub mod plic;
 pub mod uart;
 pub mod virtio;
 
-use crate::state::FfiPlicCtx;
-use crate::state::FfiVirtIoCtx;
+use crate::ffi::FfiPlicCtx;
+use crate::ffi::FfiVirtIoCtx;
 
 /// Device MMIO address ranges (base + end per device).
 pub struct DevCtx {

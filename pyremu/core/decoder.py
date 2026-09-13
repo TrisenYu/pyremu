@@ -432,14 +432,13 @@ class Hart(HartWithRegs):
                 result = v1 | v2
                 if part2 == 1:
                     result = mask64(_trunc_rem(_sint64(v1).value, _sint64(v2).value))
-        else:  # part1 == 0b111
-            if part2 not in {0, 1}:
-                # Zbb: andn (0x20), maxu (0x05)
-                result = _zbb_alu(part1, part2, v1, v2)
-            else:
-                result = v1 & v2
-                if part2 == 1:
-                    result = mask64(_trunc_rem(_uint64(v1).value, _uint64(v2).value))
+        elif part2 not in {0, 1}: # part1 == 0b111
+            # Zbb: andn (0x20), maxu (0x05)
+            result = _zbb_alu(part1, part2, v1, v2)
+        else:
+            result = v1 & v2
+            if part2 == 1:
+                result = mask64(_trunc_rem(_uint64(v1).value, _uint64(v2).value))
         if f.rd != 0:
             self.gprs[f.rd] = result
         return 4
@@ -1611,10 +1610,10 @@ class Hart(HartWithRegs):
             try:
                 return self.handle_compressed(mask16(instr))
             except MemoryAccessFault:
-                return 0
+                pass
             except (ValueError, NotImplementedError, CsrAccessError):
                 deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
-                return 0
+            return 0
 
         # 32-bit 标准指令 — 所有未识别的编码一律触发非法指令陷态
         opcode = f.opcode
@@ -1625,14 +1624,13 @@ class Hart(HartWithRegs):
             return 0
 
         try:
-            handler = getattr(self, method_name)
-            return handler(instr)
+            return getattr(self, method_name)(instr)
         except MemoryAccessFault:
-            return 0
+            pass
         except (ValueError, NotImplementedError, CsrAccessError):
             # 操作码合法但编码字段无效 (如非法 funct3/funct12/nzuimm=0 等)
             deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
-            return 0
+        return 0
 
 
 """

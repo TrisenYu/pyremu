@@ -15,7 +15,7 @@
 //! 维护 (``plic_recompute_mip``); AIA 模式 (IMSIC present) 的 mip 由 IMSIC 驱动,
 //! Python 侧 ``_native_sync_plic_mip`` 在边界处合并 PLIC 兜底.
 
-use crate::state::FfiPlicCtx;
+use crate::ffi::FfiPlicCtx;
 use crate::state::HartState;
 use std::sync::atomic::Ordering;
 
@@ -72,10 +72,12 @@ pub(crate) fn plic_pending_mip(plic: &FfiPlicCtx, hart_id: u32) -> u64 {
 	let m_ctx = 2 * hart_id;
 	let s_ctx = m_ctx + 1;
 	let mut mip: u64 = 0;
-	if (m_ctx as usize) < plic.num_contexts as usize && plic_find_highest(plic, m_ctx as usize) > 0 {
+	if (m_ctx as usize) < plic.num_contexts as usize && plic_find_highest(plic, m_ctx as usize) > 0
+	{
 		mip |= 1 << 11; // MEIP
 	}
-	if (s_ctx as usize) < plic.num_contexts as usize && plic_find_highest(plic, s_ctx as usize) > 0 {
+	if (s_ctx as usize) < plic.num_contexts as usize && plic_find_highest(plic, s_ctx as usize) > 0
+	{
 		mip |= 1 << 9; // SEIP
 	}
 	mip
@@ -93,16 +95,15 @@ fn plic_recompute_mip(state: &mut HartState, plic: &FfiPlicCtx) {
 	let plic_mip = plic_pending_mip(plic, state.mhartid as u32);
 	let ext_mask: u64 = (1 << 11) | (1 << 9);
 	let cur = state.mip.load(Ordering::Acquire);
-	state.mip.store((cur & !ext_mask) | plic_mip, Ordering::Release);
+	state
+		.mip
+		.store((cur & !ext_mask) | plic_mip, Ordering::Release);
 }
 
 /// 与 M 模式无关的 MEIP/SEIP 同步 — 供 step_interrupts 在 ext_irq 置位后核对.
 /// 返回 true 表示已执行 (调用方无需再走其它路径).  ``plic`` 为原始指针,
 /// null 或 IMSIC 在场时视为未执行.
-pub(crate) fn plic_sync_mip_if_legacy(
-	state: &mut HartState,
-	plic: *mut FfiPlicCtx,
-) -> bool {
+pub(crate) fn plic_sync_mip_if_legacy(state: &mut HartState, plic: *mut FfiPlicCtx) -> bool {
 	if plic.is_null() {
 		return false;
 	}
@@ -143,7 +144,11 @@ fn plic_read_enable_word(context: u64, word_idx: u64, plic: &FfiPlicCtx) -> Opti
 	if (word_idx as usize) >= num_words {
 		return Some(0);
 	}
-	let v = unsafe { *plic.enable.add((context as usize) * num_words + word_idx as usize) };
+	let v = unsafe {
+		*plic
+			.enable
+			.add((context as usize) * num_words + word_idx as usize)
+	};
 	Some(v as u64)
 }
 
@@ -168,7 +173,11 @@ fn plic_write_enable_word(context: u64, word_idx: u64, val: u64, plic: &FfiPlicC
 	if word_idx == 0 {
 		mask &= !1u32; // source 0 保留
 	}
-	unsafe { *plic.enable.add((context as usize) * num_words + word_idx as usize) = (val as u32) & mask };
+	unsafe {
+		*plic
+			.enable
+			.add((context as usize) * num_words + word_idx as usize) = (val as u32) & mask
+	};
 }
 
 /// Claim: 返回最高优先级待处理源, 清除 pending, 记录 claimed.
@@ -225,9 +234,7 @@ pub(crate) fn try_handle_plic_concurrent(
 	if !is_write {
 		let val = plic_mmio_read(offset, plic);
 		// Claim 清除了 pending — 立即重算 mip, 避免延后到 step_interrupts 才清 MEIP.
-		if offset % PLIC_CONTEXT_STRIDE == PLIC_CTX_CLAIM_OFF
-			&& offset >= PLIC_CONTEXT_BASE
-		{
+		if offset % PLIC_CONTEXT_STRIDE == PLIC_CTX_CLAIM_OFF && offset >= PLIC_CONTEXT_BASE {
 			plic_recompute_mip(state, plic);
 		}
 		Some(val)
@@ -270,9 +277,7 @@ fn plic_mmio_read(offset: u64, plic: &FfiPlicCtx) -> u64 {
 		return 0;
 	}
 	match ctx_off {
-		PLIC_CTX_THRESHOLD_OFF => {
-			(unsafe { *plic.threshold.add(context as usize) } & 0x7) as u64
-		}
+		PLIC_CTX_THRESHOLD_OFF => (unsafe { *plic.threshold.add(context as usize) } & 0x7) as u64,
 		PLIC_CTX_CLAIM_OFF => plic_do_claim(context as usize, plic) as u64,
 		_ => 0,
 	}
@@ -321,7 +326,18 @@ mod tests {
 	use super::*;
 
 	/// 构造一个最小 PLIC FFI 上下文 (内存由测试持有).
-	fn make_plic(num_sources: usize, num_contexts: usize) -> (Box<[u8]>, Box<[u8]>, Box<[u8]>, Box<[u32]>, Box<[u8]>, Box<[u32]>, FfiPlicCtx) {
+	fn make_plic(
+		num_sources: usize,
+		num_contexts: usize,
+	) -> (
+		Box<[u8]>,
+		Box<[u8]>,
+		Box<[u8]>,
+		Box<[u32]>,
+		Box<[u8]>,
+		Box<[u32]>,
+		FfiPlicCtx,
+	) {
 		let num_words = (num_sources + 31) / 32;
 		let mut priority = vec![0u8; num_sources + 1].into_boxed_slice();
 		let mut pending = vec![0u8; num_sources + 1].into_boxed_slice();
@@ -384,7 +400,14 @@ mod tests {
 		assert_eq!(get_claimed(&plic, 0), 10);
 
 		// complete source 10 (ctx 0), level 仍高 -> 重挂 pending
-		let _ = try_handle_plic_concurrent(plic.base + PLIC_CONTEXT_BASE + PLIC_CTX_CLAIM_OFF, true, 10, 4, &mut state, plic_ptr(&mut plic));
+		let _ = try_handle_plic_concurrent(
+			plic.base + PLIC_CONTEXT_BASE + PLIC_CTX_CLAIM_OFF,
+			true,
+			10,
+			4,
+			&mut state,
+			plic_ptr(&mut plic),
+		);
 		assert_eq!(pending[10], 1, "电平仍高时 complete 应重挂 pending");
 		assert_eq!(get_claimed(&plic, 0), 0);
 	}
@@ -407,7 +430,14 @@ mod tests {
 			&mut state,
 			plic_ptr(&mut plic),
 		);
-		let _ = try_handle_plic_concurrent(plic.base + PLIC_CONTEXT_BASE + PLIC_CTX_CLAIM_OFF, true, 10, 4, &mut state, plic_ptr(&mut plic));
+		let _ = try_handle_plic_concurrent(
+			plic.base + PLIC_CONTEXT_BASE + PLIC_CTX_CLAIM_OFF,
+			true,
+			10,
+			4,
+			&mut state,
+			plic_ptr(&mut plic),
+		);
 		assert_eq!(pending[10], 0, "level=0 时 complete 不应重挂 pending");
 	}
 
@@ -447,13 +477,31 @@ mod tests {
 		state.mip.store(1 << 11, Ordering::Release);
 
 		// claim
-		let _ = try_handle_plic_concurrent(plic.base + PLIC_CONTEXT_BASE + PLIC_CTX_CLAIM_OFF, false, 0, 4, &mut state, plic_ptr(&mut plic));
-		assert_eq!(state.mip.load(Ordering::Acquire) & (1 << 11), 0, "claim 后 MEIP 应立即清除");
+		let _ = try_handle_plic_concurrent(
+			plic.base + PLIC_CONTEXT_BASE + PLIC_CTX_CLAIM_OFF,
+			false,
+			0,
+			4,
+			&mut state,
+			plic_ptr(&mut plic),
+		);
+		assert_eq!(
+			state.mip.load(Ordering::Acquire) & (1 << 11),
+			0,
+			"claim 后 MEIP 应立即清除"
+		);
 
 		// 重新挂起 source 3 (设备再次 raise) -> 下一 ext_irq 轮询置 MEIP, sync 核对保持
 		pending[3] = 1;
 		state.mip.store(1 << 11, Ordering::Release);
-		assert!(plic_sync_mip_if_legacy(&mut state, plic_ptr(&mut plic)), "legacy 且 mip 置位时应执行核对");
-		assert_ne!(state.mip.load(Ordering::Acquire) & (1 << 11), 0, "有 pending 时 MEIP 保持");
+		assert!(
+			plic_sync_mip_if_legacy(&mut state, plic_ptr(&mut plic)),
+			"legacy 且 mip 置位时应执行核对"
+		);
+		assert_ne!(
+			state.mip.load(Ordering::Acquire) & (1 << 11),
+			0,
+			"有 pending 时 MEIP 保持"
+		);
 	}
 }

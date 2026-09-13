@@ -95,7 +95,7 @@ class PLIC(Device):
         # FFI 持久数组 — 经 ctypes 直接暴露给 Rust batch 引擎, set_irq 每次
         # 改线时同步写穿 (与 Python 列表同源)。Rust 内联仲裁 (plic_recompute_mip /
         # plic_do_claim / plic_do_complete) 直接读写这两份数组; 设备线程 (RX
-        # drain) 与主线程 (guest MMIO 电平变化) 经 set_irq 保持实时同步 — 否则
+        # drain) 与主线程 (受调试程序 MMIO 电平变化) 经 set_irq 保持实时同步 — 否则
         # batch 起始快照覆盖 SEIP (UART 输入冻结), 且 complete 时陈旧 level
         # 重挂起产生 spurious 中断风暴。
         self._ffi_pending = (ctypes.c_uint8 * (num_sources + 1))()

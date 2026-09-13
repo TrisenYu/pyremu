@@ -5,7 +5,9 @@
 
 use crate::concurrent::{ConcurrentClintCtx, ModuleState};
 use crate::hart_sched::read_gpr;
+use crate::interrupt::clint::write_mtimecmp;
 use crate::interrupt::imsic_clear_ipi_on_trap;
+use crate::ffi::FfiDevCtx;
 use crate::state::{riscv_mode, HartState};
 use std::sync::atomic::Ordering;
 // ============================================================
@@ -214,14 +216,14 @@ pub fn deliver_trap_mmode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	// (imsic_ipi_device has no ipi_clear callback).  OpenSBI does NOT use
 	// the MTOPI dispatch loop for MSIP (cause 3) either — it directly
 	// calls sbi_ipi_process().  Without clearing here, MSIP stays set
-	// forever → infinite re-delivery loop on every instruction boundary.
+	// forever -> infinite re-delivery loop on every instruction boundary.
 	let is_interrupt = (code >> 63) != 0;
 	let exc_code = code & 0x7FFF_FFFF_FFFF_FFFFu64;
 
 	// In AIA mode (eidelivery==1), OpenSBI dispatches via MTOPI
-	// (sbi_trap_aia_irq) which reads compute_mtopi → clears MSIP there.
-	// If we clear MSIP and IMSIC eip here, MTOPI sees nothing → IPI is
-	// lost → RCU stall and SMP boot timeout.
+	// (sbi_trap_aia_irq) which reads compute_mtopi -> clears MSIP there.
+	// If we clear MSIP and IMSIC eip here, MTOPI sees nothing -> IPI is
+	// lost -> RCU stall and SMP boot timeout.
 	//
 	// In legacy mode (eidelivery==0), OpenSBI dispatches via mcause and
 	// clears the CLINT level bit via sbi_ipi_raw_clear.  MSIP must be
@@ -307,9 +309,17 @@ pub(crate) fn priv_ecall_concurrent(
 	_instr: u32,
 	clint: &ConcurrentClintCtx,
 	_module: &ModuleState,
+	dev: &dyn FfiDevCtx,
 ) -> u64 {
 	let a7 = read_gpr(state, 17);
 	let a6 = read_gpr(state, 16);
+
+	// 设备快速路径 (如 UART sbi_putchar) — 直接内联处理, 避免 MMIO batch 退出.
+	// 每个字符一次 batch 退出 (~1-5 ms marshal/unmarshal) 是飞地输出密集时
+	// 数百倍减速的根因之一. 新设备只需实现 FfiDevCtx trait, 无需修改此处分发逻辑.
+	if let Some(advance) = dev.try_ecall(state, a7, a6) {
+		return advance;
+	}
 
 	if a7 == 0x54494D45 && a6 == 0 {
 		// SBI_TIME set_timer — programs the M-mode mtimecmp comparator
@@ -321,6 +331,13 @@ pub(crate) fn priv_ecall_concurrent(
 		let hid = state.mhartid as usize;
 		if hid < clint.num_harts as usize {
 			unsafe { &*clint.mtimecmp.add(hid) }.store(stime_val, Ordering::Release);
+			// 与 CLINT MMIO 写路径 (write_mtimecmp_for_target) 对齐: 设定一次性
+			// mtip_deadline。否则 mtip_deadline 保持 0, sync_mtip 落入共享 mtime
+			// 比较分支, 被其他活跃 hart 经 fetch_max 推高的共享 mtime 过早触发 ->
+			// mret 后立即再次 trap 的活锁 (飞地走 sbi_set_timer, 而非 SSTC stimecmp,
+			// 是唯一命中此坏路径的调用方)。
+			let now = unsafe { &*clint.mtime }.load(Ordering::Acquire);
+			write_mtimecmp(state, now, stime_val, clint.timebase_hz);
 		}
 		state.gprs[10] = 0;
 		return 4;
@@ -427,6 +444,9 @@ pub(crate) fn priv_wfi_concurrent(state: &mut HartState, instr: u32) -> u64 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::ffi::FfiUartCtx;
+	use std::cell::Cell;
+	use std::sync::atomic::{AtomicU64, AtomicU8};
 
 	fn default_state() -> HartState {
 		let mut s: HartState = unsafe { std::mem::zeroed() };
@@ -615,8 +635,8 @@ mod tests {
 	//  In AIA mode sbi_ipi_raw_clear(false) is a no-op (imsic_ipi_device
 	//  has no ipi_clear callback), so deliver_trap_mmode / deliver_trap
 	//  MUST clear MSIP/SSIP unconditionally.  The old code had an
-	//  AIA-mode exception that skipped the clear → MSIP stayed set
-	//  forever → infinite re-delivery loop.
+	//  AIA-mode exception that skipped the clear -> MSIP stayed set
+	//  forever -> infinite re-delivery loop.
 
 	#[test]
 	fn msip_cleared_in_deliver_trap_mmode() {
@@ -664,18 +684,75 @@ mod tests {
 	fn msip_cleared_for_non_mmode_interrupt_in_deliver_trap() {
 		// When an interrupt fires while not in M-mode and is NOT delegated,
 		// deliver_trap switches to deliver_trap_mmode.  Verify MSIP is
-		// cleared on the S→M transition path.
+		// cleared on the S->M transition path.
 		let mut s = default_state();
 		s.mode = riscv_mode::S;
 		s.mip.store(1 << 3, Ordering::Release); // MSIP set — not delegatable
 		s.mstatus |= 1 << 1; // SIE = 1
-					   // MSIP is non-delegatable, so it goes through deliver_trap→M-mode
+					   // MSIP is non-delegatable, so it goes through deliver_trap->M-mode
 					   // path, which calls _trap_deliver_mmode internally.
 		deliver_trap(&mut s, mcause_val(3, true), 0);
 		assert_eq!(
 			s.mip.load(Ordering::Acquire) & (1 << 3),
 			0,
 			"MSIP must be cleared in deliver_trap non-delegated M-interrupt path"
+		);
+	}
+
+	// ============================================================
+	//  Regression: sbi_set_timer fast path must set mtip_deadline
+	// ============================================================
+	//
+	//  旧实现只写 CLINT mtimecmp, 不设 mtip_deadline -> sync_mtip 落入
+	//  共享 mtime 比较分支, 被其他活跃 hart 经 fetch_max 推高的共享 mtime
+	//  过早触发 -> mret 后立即再 trap 的活锁。飞地走 sbi_set_timer (而非
+	//  SSTC stimecmp), 是唯一命中此坏路径的调用方。
+
+	#[test]
+	fn sbi_set_timer_fast_path_sets_mtip_deadline() {
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mhartid = 0;
+		state.total_instrs = 1000;
+		// a0 = 目标绝对时间 (未来值), a6 = 0, a7 = SBI_TIME (0x54494D45).
+		state.gprs[10] = 11000;
+		state.gprs[16] = 0;
+		state.gprs[17] = 0x5449_4D45;
+
+		let mtime = AtomicU64::new(1000);
+		let mtimecmp = AtomicU64::new(0);
+		let msip = AtomicU8::new(0);
+
+		let clint = ConcurrentClintCtx {
+			base: 0x2000000,
+			mtime: &mtime as *const AtomicU64,
+			mtimecmp: &mtimecmp as *const AtomicU64,
+			msip: &msip as *const AtomicU8,
+			num_harts: 1,
+			msip_pending: Cell::new(std::ptr::null()),
+			hart_threads: Cell::new(std::ptr::null()),
+			hart_states: Cell::new(std::ptr::null()),
+			timebase_hz: 10_000_000,
+		};
+		let module = ModuleState::new(1, 1, 0, 0, vec![0].into_boxed_slice());
+		let uart: FfiUartCtx = unsafe { std::mem::zeroed() };
+
+		let advance = priv_ecall_concurrent(&mut state, 0, &clint, &module, &uart);
+
+		assert_eq!(advance, 4, "sbi_set_timer 应返回 advance=4");
+		assert_eq!(state.gprs[10], 0, "a0 应清零为 0");
+		assert_eq!(mtimecmp.load(Ordering::Acquire), 11000, "mtimecmp 应被写入");
+		assert_ne!(
+			state.mtip_deadline, 0,
+			"sbi_set_timer 必须设定 mtip_deadline (回归: 曾为 0 -> 共享 mtime 活锁)"
+		);
+		assert!(
+			state.mtip_deadline > state.total_instrs,
+			"deadline 必须落在未来, 而非立即到期"
+		);
+		assert_eq!(
+			state.mip.load(Ordering::Acquire) & (1 << 7),
+			0,
+			"未来定时器不应立即置位 MTIP"
 		);
 	}
 }

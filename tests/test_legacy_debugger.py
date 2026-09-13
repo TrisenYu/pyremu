@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """调试器 (rvdb) 测试: 状态快照, 指令回滚, 命令方法, REPL 分发."""
@@ -781,7 +781,7 @@ class TestCmdDisasm:
         dbg.cmd_disasm("0x80000ff0", "4")
         step_after_first = dbg._disasm_base_step
         # 4 条 nop 之后步数到达 ref_pc, next_base 应为 0
-        assert step_after_first <= 0, f"ref_pc 之前 base_step 应 ≤0, 实际 {step_after_first}"
+        assert step_after_first <= 0, f"ref_pc 之前 base_step 应 <=0, 实际 {step_after_first}"
 
         # 模拟 Enter 重复: 推进到 ref_pc 所在块
         dbg._disasm_next_addr = 0x80001000
@@ -805,7 +805,7 @@ class TestCmdDisasm:
         # 不应挂死, 且 _disasm_next_addr 应从对齐后的地址计算
         # (没有异常即通过)
         assert dbg._disasm_next_addr is not None
-        # 对齐后应从 0x80000FF0 开始, next_addr ≥ 0x80000FF0 + 4*nop
+        # 对齐后应从 0x80000FF0 开始, next_addr >= 0x80000FF0 + 4*nop
         assert dbg._disasm_next_addr >= 0x80000FF0 + 4, (
             f"应从对齐地址开始反汇编, next_addr=0x{dbg._disasm_next_addr:x}"
         )
@@ -1030,7 +1030,7 @@ class TestCmdSymbols:
         assert name == "fdt_next_tag"
 
     def test_resolve_symbol_range_exact_match(self):
-        """范围匹配: start ≤ addr < end -> 返回正确的包含符号."""
+        """范围匹配: start <= addr < end -> 返回正确的包含符号."""
         dbg = _make_dbg()
         # 模拟 vmlinux 中的场景: aio_complete_rw 和 vfs_coredump 距离 60KB+
         syms = {"aio_complete_rw": 0x1000, "vfs_coredump": 0x11000}
@@ -1169,7 +1169,7 @@ class TestCmdSymbols:
     def test_find_segment_gap_just_after_segment_returns_none(self):
         """紧接段末尾之后的地址返回 None.
 
-        旧实现会在距离 ≤ 1 MiB 时返回最近前驱段,
+        旧实现会在距离 <= 1 MiB 时返回最近前驱段,
         这对栈回溯是有害的 — 返回错误的段名比无段名更误导.
         """
         image = FirmwareImage(
@@ -1934,7 +1934,7 @@ class TestStackWalk:
 
     @pytest.mark.skip(
         reason=(
-            "Bare 翻译下 SPP=U + RAM sepc 无法与合法 S→U trap 现场区分: "
+            "Bare 翻译下 SPP=U + RAM sepc 无法与合法 S->U trap 现场区分: "
             "同寄存器状态在 test_smode_to_umode_boundary / "
             "test_fallback_trap_offsets_for_s_to_u 中被断言为'应生成边界帧'。"
             "二者矛盾, 代码选择保留边界帧 (Bare 下 U-mode PA 即 RAM 地址属合法 "
@@ -1947,8 +1947,8 @@ class TestStackWalk:
         原意图: M->S 启动后 SPP=0, sepc 仍保留 M 模式设置的内核入口 PA
         (如 0x80201048), 这不是真实 trap 现场, 不应显示为边界帧。
 
-        但在 Bare 翻译下该状态与合法 S→U trap 现场完全同构 (SPP=U + RAM
-        sepc), 无法仅凭寄存器状态区分, 故与上述 S→U 边界帧测试直接矛盾。
+        但在 Bare 翻译下该状态与合法 S->U trap 现场完全同构 (SPP=U + RAM
+        sepc), 无法仅凭寄存器状态区分, 故与上述 S->U 边界帧测试直接矛盾。
         """
         dbg = _make_dbg(ram_size=0x800000)
         h = dbg.hart
@@ -2085,7 +2085,7 @@ class TestStackWalk:
 
 
 class TestUmodeBacktrace:
-    """U-mode 直接回溯与 S→U 边界帧恢复."""
+    """U-mode 直接回溯与 S->U 边界帧恢复."""
 
     @staticmethod
     def _make_dbg(ram_size: int = 0x10000, ram_base: int = 0x80000000) -> Debugger:
@@ -2119,7 +2119,7 @@ class TestUmodeBacktrace:
         bus.write(0x8000F100 - 8, (0).to_bytes(8, "little"))
 
         frames = dbg._walk_frame_chain()
-        assert len(frames) >= 3, f"应有 ≥3 帧 (含 RA 推断), 但只有 {len(frames)}"
+        assert len(frames) >= 3, f"应有 >=3 帧 (含 RA 推断), 但只有 {len(frames)}"
         for i, f in enumerate(frames):
             assert f.mode == "U", f"帧 #{i} mode={f.mode!r}, 预期 U"
         assert frames[0].pc == 0x80001000
@@ -2159,7 +2159,7 @@ class TestUmodeBacktrace:
         assert "RA 推断" in frames[1].note
         assert frames[1].fp == 0  # 推断帧无有效 FP
 
-    # ---------- S→U 边界帧恢复 ----------
+    # ---------- S->U 边界帧恢复 ----------
 
     def test_smode_to_umode_boundary(self):
         """S-mode 下 SPP=U: 从 sepc 恢复 U-mode FP 链."""
@@ -2214,14 +2214,14 @@ class TestUmodeBacktrace:
 
         umode_frames = [f for f in frames if f.mode == "U"]
         assert len(umode_frames) >= 1, (
-            f"应有 ≥1 个 U-mode 帧, 实际帧列表: "
+            f"应有 >=1 个 U-mode 帧, 实际帧列表: "
             f"{[(f.idx, f.mode, hex(f.pc)) for f in frames]}"
         )
 
     # ---------- Fallback trap offsets ----------
 
     def test_fallback_trap_offsets_for_s_to_u(self):
-        """S→U 边界且 stvec 无 sd x1/sd x8 时, 回退到常见布局扫描."""
+        """S->U 边界且 stvec 无 sd x1/sd x8 时, 回退到常见布局扫描."""
         dbg = self._make_dbg(ram_size=0x30000, ram_base=0x80000000)
         h = dbg.hart
         bus = dbg._emu.bus
@@ -2289,7 +2289,7 @@ class TestUmodeBacktrace:
 
         frames = dbg._walk_frame_chain()
         assert len(frames) >= 2, (
-            f"fallback 应回退到仅 PC 帧 (≥2 帧), 但只有 {len(frames)}: "
+            f"fallback 应回退到仅 PC 帧 (>=2 帧), 但只有 {len(frames)}: "
             f"{[(f.idx, f.mode, f.note) for f in frames]}"
         )
         last = frames[-1]

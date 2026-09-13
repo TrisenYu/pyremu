@@ -28,11 +28,11 @@ TrapType = Enum("TrapType", (
     "InstrPageFault",  # 12: 指令页错误
     "LdPageFault",  # 13: 载入页错误
     "StPageFault",  # 15: 存储页错误
-    # H-extension guest-page faults (RISC-V privileged spec §8.6.2)
-    "InstrGuestPageFault",  # 20: 指令 guest-physical 页错误
-    "LdGuestPageFault",  # 21: 载入 guest-physical 页错误
+    # H-extension 受调试程序-page faults (RISC-V privileged spec §8.6.2)
+    "InstrGuestPageFault",  # 20: 指令 受调试程序-physical 页错误
+    "LdGuestPageFault",  # 21: 载入 受调试程序-physical 页错误
     "VirtualInstruction",  # 22: 虚拟指令 (HLVID emulation)
-    "StGuestPageFault",  # 23: 存储 guest-physical 页错误
+    "StGuestPageFault",  # 23: 存储 受调试程序-physical 页错误
     # === 中断 (Interrupt) — mcause bit 63 置 1 ===
     "SoftInterrupt",  # 软件中断 (通用)
     "UmodeSoftInterrupt",  # 0: U 模式软件中断
@@ -47,7 +47,7 @@ TrapType = Enum("TrapType", (
     "HmodeSoftInterrupt",  # 2 (interrupt):  HS-mode 软件中断
     "HmodeTimerInterrupt",  # 6 (interrupt):  HS-mode 定时器中断
     "HmodeExternInterrupt",  # 10 (interrupt): HS-mode 外部中断
-    "VSmodeSoftInterrupt",  # 2 (interrupt):  VS-mode 软件中断 (same encoding as HS, context-dependent)
+    "VSmodeSoftInterrupt",  # 2 (interrupt):  VS-mode 软件中断
     "VSmodeTimerInterrupt",  # 6 (interrupt):  VS-mode 定时器中断
     "VSmodeExternInterrupt",  # 10 (interrupt): VS-mode 外部中断
 ))
@@ -71,12 +71,12 @@ _TRAP_CAUSE_CODE: dict[TrapType, int] = {
     TrapType.StAccessFault: 7,
     TrapType.EcallFromUmode: 8,
     TrapType.EcallFromSmode: 9,
-    TrapType.EcallFromHmode: 10,  # HS-mode ecall → 10 (reserved in spec; used here)
+    TrapType.EcallFromHmode: 10,  # HS-mode ecall -> 10 (reserved in spec; used here)
     TrapType.EcallFromMmode: 11,
     TrapType.InstrPageFault: 12,
     TrapType.LdPageFault: 13,
     TrapType.StPageFault: 15,
-    # H-extension guest-page faults
+    # H-extension 受调试程序-page faults
     TrapType.InstrGuestPageFault: 20,
     TrapType.LdGuestPageFault: 21,
     TrapType.VirtualInstruction: 22,

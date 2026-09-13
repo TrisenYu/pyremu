@@ -12,9 +12,13 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo '' >> $@.tmp
 	@echo '# arguments for emulator' >> $@.tmp
 	@echo 'TLB_ENTRIES = $(TLB_ENTRIES)' >> $@.tmp
-	@echo 'NATIVE_MAX_INSTRS = $(NATIVE_MAX_INSTRS)' >> $@.tmp
 # mcycle 计数频率
 	@echo 'CPU_FREQ_HZ = $(CPU_FREQ_HZ)' >> $@.tmp
+	@echo 'DEFAULT_TIMEOUT = $(DEFAULT_TIMEOUT)' >> $@.tmp
+	@echo 'WFI_MAX_SLEEP = $(WFI_MAX_SLEEP)' >> $@.tmp
+	@echo 'VIRTIO_PROCESS_BATCH = $(VIRTIO_PROCESS_BATCH)' >> $@.tmp
+	@echo 'FAST_LOAD_THRESHOLD = $(FAST_LOAD_THRESHOLD)' >> $@.tmp
+	@echo 'NS_PER_INSTR = $(NS_PER_INSTR)' >> $@.tmp
 	@echo '' >> $@.tmp
 # 诊断用相关定义
 	@echo 'PYREMU_NATIVE_SPEEDUP = $(PYREMU_NATIVE_SPEEDUP)' >> $@.tmp
@@ -33,6 +37,7 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo 'WFI_WATCHDOG_MS = $(WFI_WATCHDOG_MS)' >> $@.tmp
 	@echo 'PYREMU_H_EXT = $(PYREMU_H_EXT)' >> $@.tmp
 	@echo 'PYREMU_NO_L2 = $(PYREMU_NO_L2)' >> $@.tmp
+	@echo 'PYREMU_NO_TLB = $(PYREMU_NO_TLB)' >> $@.tmp
 # 启动所需二进制相关路径
 	@echo '' >> $@.tmp
 	@echo 'BINS_DIR = "$(bins_dir)"' >> $@.tmp

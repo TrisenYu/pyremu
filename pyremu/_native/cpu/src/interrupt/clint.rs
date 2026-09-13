@@ -60,11 +60,7 @@ pub(crate) fn write_stimecmp(state: &mut HartState, now_mtime: u64, val: u64, ti
 /// 原子/对齐 u64 读写, 良性竞争)。``hart_states`` 未初始化时跳过设定 (MTIP
 /// 退化为共享 mtime 比较, 与旧行为一致)。
 #[inline]
-pub(crate) fn write_mtimecmp_for_target(
-	clint: &ConcurrentClintCtx,
-	target: usize,
-	val: u64,
-) {
+pub(crate) fn write_mtimecmp_for_target(clint: &ConcurrentClintCtx, target: usize, val: u64) {
 	let now = unsafe { &*clint.mtime }.load(Ordering::Acquire);
 	let hart_states = clint.hart_states.get();
 	if !hart_states.is_null() && target < clint.num_harts as usize {
@@ -85,7 +81,7 @@ pub(crate) fn sync_mtip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 	if state.waiting != 0 {
 		// 等待中的 hart 用共享 mtime 持续比较 (唤醒语义): 其他 hart 的进度也
 		// 会推进共享 mtime 让本 hart 醒来 — 这正是 WFI 等待定时器应有的行为
-		// (guest 的 rdtime = 共享 mtime, 定时器到期即在共享时间中越过 mtimecmp)。
+		// (受调试程序 的 rdtime = 共享 mtime, 定时器到期即在共享时间中越过 mtimecmp)。
 		if cmp > 0 && cur_mtime >= cmp {
 			state.mip.fetch_or(1 << 7, Ordering::AcqRel);
 		} else {
@@ -144,7 +140,7 @@ pub(crate) fn sync_mtip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 /// Additionally samples the CLINT level bit (level-triggered, matches real
 /// SiFive CLINT / ACLINT MSWI hardware).  ``mip.MSIP`` is never cleared here —
 /// ``deliver_trap`` for MSI (cause 3) clears MSIP when the trap is taken,
-/// and the guest clears the CLINT level bit via ``sbi_ipi_raw_clear`` so
+/// and the 受调试程序 clears the CLINT level bit via ``sbi_ipi_raw_clear`` so
 /// future calls see level=0 and stop re-setting MSIP.
 ///
 /// **AIA mode with SMAIA** (``present != 0 && eidelivery != 0``):
@@ -154,17 +150,17 @@ pub(crate) fn sync_mtip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 ///
 /// 1. ``try_handle_imsic_concurrent`` sets both IMSIC eip AND CLINT MSIP
 ///    (``msip_pending`` edge) for IPI identities (1/3).
-/// 2. ``sync_imsic`` maps the IMSIC eip → MEIP.
+/// 2. ``sync_imsic`` maps the IMSIC eip -> MEIP.
 /// 3. MEI (cause 11) has priority over MSI (cause 3), so MEI fires first.
 /// 4. ``deliver_trap`` for MEI clears MEIP but NOT MSIP — MSIP stays set.
-/// 5. ``sbi_trap_aia_irq()`` dispatches via MTOPI: MEI → MTOPEI claim →
+/// 5. ``sbi_trap_aia_irq()`` dispatches via MTOPI: MEI -> MTOPEI claim ->
 ///    ``sbi_ipi_process()`` (clears CLINT level).  MTOPI then sees MSIP
-///    still set → IID=3 → ``sbi_ipi_process()`` again (``ipi_type`` is 0,
-///    no-op).  MSIP stays set → **infinite MTOPI loop**.
+///    still set -> IID=3 -> ``sbi_ipi_process()`` again (``ipi_type`` is 0,
+///    no-op).  MSIP stays set -> **infinite MTOPI loop**.
 ///
 /// Clearing stale MSIP when both channels are quiesced breaks the loop.
 /// The clear is gated on ``!had_edge`` (no new edge in this call) AND
-/// CLINT level == 0 (guest cleared it).  A new IPI arriving concurrently
+/// CLINT level == 0 (受调试程序 cleared it).  A new IPI arriving concurrently
 /// sets the CLINT level bit before ``msip_pending``, so the level check
 /// sees 1 and skips the clear; the edge is consumed next call.
 #[inline]
@@ -218,13 +214,13 @@ pub(crate) fn sync_msip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 		return;
 	}
 
-	// ----- legacy: level-triggered CLINT MSIP → mip.MSIP -----
+	// ----- legacy: level-triggered CLINT MSIP -> mip.MSIP -----
 	if hid >= clint.num_harts as usize {
 		return;
 	}
 	// Level-triggered (legacy mode): mip.MSIP directly follows the CLINT
 	// level bit.  Read-only — do NOT clear the level bit here.  The
-	// level persists until the guest's M-mode handler writes 0 to CLINT
+	// level persists until the 受调试程序's M-mode handler writes 0 to CLINT
 	// MSIP (sbi_ipi_raw_clear), which triggers the actual clear via
 	// try_handle_clint_concurrent.
 	let raw = unsafe { &*clint.msip.add(hid) }.load(Ordering::Acquire);

@@ -24,7 +24,7 @@ magic 检查失败, 返回 -9 (FDT_ERR_BADVERSION), 固件进入 `0x1F9D4` WFI �
 无限个前导 1, 与通过 `LUI`+`ADDI` 路径的正 64-bit 值在 `==` 比较下不相等。
 硬件中两值为同一 64-bit 比特模式, 但 `BNE` 误判为不等。
 
-**修复**: `decoder.py:_sext()` 对 `bits≤64` 归一化到 `[0, 2^64)` 无符号范围。
+**修复**: `decoder.py:_sext()` 对 `bits<=64` 归一化到 `[0, 2^64)` 无符号范围。
 `disassem.py:_fmt_imm()` 同步处理规范化值的有符号显示。
 
 ### Bug #2: C.ADD 被当作 C.MV 执行

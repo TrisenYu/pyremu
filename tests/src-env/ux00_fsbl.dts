@@ -1,6 +1,6 @@
 /* Copyright (c) 2018 SiFive, Inc */
 /* SPDX-License-Identifier: Apache-2.0 */
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* SPDX-License-Identifier: MIT-or-later */
 /* See the file LICENSE for further information */
 
 /dts-v1/;

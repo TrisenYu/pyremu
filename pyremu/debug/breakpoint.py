@@ -8,6 +8,8 @@
 依赖 DebuggerBase + MemoryMixin + SymbolMixin.
 """
 
+import re
+
 from rich.table import Table
 
 from pyremu._native import decode_fields
@@ -18,6 +20,39 @@ from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.types import Breakpoint
 from pyremu.debug.utils import _INSTR_BP_NAMES, _KNOWN_OPCODES, check_rv64_addr, hex_addr
 from pyremu.utils.wrapper import seize_val_err
+
+
+def _parse_bp_condition(text: str) -> tuple[str, str, str, int] | None:
+    """解析 "reg/csr <name> [比较符] <值>" 形式的断点条件.
+
+    比较符可缺省 (缺省视为相等), 也可能与寄存器名或数值粘连, 例如:
+        csr mepc == 0x1000    标准形式
+        csr mepc 0x1000       缺省比较符, 视为相等
+        csr mepc==0x1000      比较符粘连在寄存器名之后
+        csr mepc = 0x1000     单等号, 归一化后视为相等
+
+    解析失败返回 None (缺省比较符要求数值必须存在).
+    """
+    parts = text.split(None, 1)
+    if len(parts) != 2 or parts[0] not in ("reg", "csr"):
+        return None
+    m = re.match(
+        r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?:\s*(?P<op>==|!=|<=|>=|=|<|>))?"
+        r"(?:\s*(?P<val>-?0[xX][0-9a-fA-F]+|-?[0-9]+))?"
+        r"\s*$",
+        parts[1],
+    )
+    if m is None or m.group("val") is None:
+        return None
+    try:
+        cond_val = int(m.group("val"), 0)
+    except ValueError:
+        return None
+    cond_op = m.group("op") or "=="
+    if cond_op == "=":
+        cond_op = "=="
+    return (parts[0], m.group("name"), cond_op, cond_val)
 
 
 class BreakpointMixin(SharedMixinAttrs):
@@ -86,6 +121,10 @@ class BreakpointMixin(SharedMixinAttrs):
             return actual < c
         elif bp.cond_op == ">":
             return actual > c
+        elif bp.cond_op == "<=":
+            return actual <= c
+        elif bp.cond_op == ">=":
+            return actual >= c
         return actual == c
 
     # ----------------------------------------------------------
@@ -221,19 +260,22 @@ class BreakpointMixin(SharedMixinAttrs):
     def cmd_bp_set(self, rest: str) -> None:
         """设置断点: bp <addr> | bp <symbol> | bp <type>.
 
-        支持条件: bp <addr> if reg <name> <op> <val>
-                  bp <addr> if csr <name> <op> <val>
+        支持条件 (比较符可缺省, 视为相等):
+                  bp <addr> if reg <name> [<op>] <val>
+                  bp <addr> if csr <name> [<op>] <val>
         """
         cond_type, cond_reg, cond_op, cond_val = "", "", "==", 0
         parts = rest.split(None, 2)
         if len(parts) >= 3 and parts[1] == "if":
+            parsed = _parse_bp_condition(parts[2])
+            if parsed is None:
+                self._err(
+                    f"无法解析条件: '{parts[2]}'"
+                    " (用法: reg/csr <name> [==|!=|<|>|<=|>=] <值>)"
+                )
+                return
+            cond_type, cond_reg, cond_op, cond_val = parsed
             rest = parts[0]
-            cond_parts = parts[2].split(None, 3)
-            if len(cond_parts) >= 3 and cond_parts[0] in ("reg", "csr"):
-                cond_type = cond_parts[0]
-                cond_reg = cond_parts[1]
-                cond_op = cond_parts[2] if len(cond_parts) >= 3 else "=="
-                cond_val = int(cond_parts[3], 0) if len(cond_parts) >= 4 else 0
 
         # 1) 符号名
         if self._try_set_symbol_bp(rest):
@@ -244,7 +286,7 @@ class BreakpointMixin(SharedMixinAttrs):
             self._breakpoints[-1].cond_op = cond_op
             self._breakpoints[-1].cond_val = cond_val
             self._breakpoints[-1].desc += (
-                f" if {cond_type} {cond_reg}{cond_op}0x{cond_val:x}"
+                f" if {cond_type} {cond_reg} {cond_op} 0x{cond_val:x}"
             )
             self._console.print(
                 f"    条件: {cond_type} {cond_reg} {cond_op} 0x{cond_val:x}"
@@ -259,7 +301,7 @@ class BreakpointMixin(SharedMixinAttrs):
             desc = hex_addr(addr)
             label = "断点"
             if cond_type:
-                desc += f" if {cond_type} {cond_reg}{cond_op}0x{cond_val:x}"
+                desc += f" if {cond_type} {cond_reg} {cond_op} 0x{cond_val:x}"
                 label = "条件断点"
             bp = Breakpoint(
                 kind="addr",
@@ -378,12 +420,14 @@ class BreakpointMixin(SharedMixinAttrs):
         elif sub == "clear":
             self.cmd_bp_clear()
         elif sub == "if":
-            if not (len(rest) >= 4 and rest[1] in ("reg", "csr")):
-                self._warn("用法: bp if reg/csr <name> <op> <val>")
+            parsed = _parse_bp_condition(" ".join(rest[1:]))
+            if parsed is None:
+                self._warn(
+                    "用法: bp if reg/csr <name> [==|!=|<|>|<=|>=] <值>"
+                )
                 return
-            ct, cr, co = rest[1], rest[2], rest[3] if len(rest) > 3 else "=="
-            cv = int(rest[4], 0) if len(rest) > 4 else 0
-            desc = f"if {ct} {cr}{co}0x{cv:x}"
+            ct, cr, co, cv = parsed
+            desc = f"if {ct} {cr} {co} 0x{cv:x}"
             bp = Breakpoint(
                 kind="cond", value=0, desc=desc,
                 cond_type=ct, cond_reg=cr, cond_op=co, cond_val=cv,

@@ -1,0 +1,95 @@
+/* tee_enclave.h - Linux TEE enclave driver userspace interface
+ *
+ * /dev/tee_enclave: ioctl-based enclave lifecycle management.
+ * SBI ecall (ext_id=0x20221222) bridges to OpenSBI M-mode enclave extension.
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef TEE_ENCLAVE_H
+#define TEE_ENCLAVE_H
+
+#include <stdint.h>
+#include <sys/ioctl.h>
+
+#define TEE_DEVICE_PATH "/dev/tee_enclave"
+
+/* ---- SBI function IDs (from custom-opensbi-rs) ---- */
+
+#define SBI_ENCLAVE_CREATE			  400
+#define SBI_ENCLAVE_ENTER			  401
+#define SBI_ENCLAVE_SHUTDOWN		  403
+#define SBI_ENCLAVE_SUSPEND			  404
+#define SBI_ENCLAVE_RESUME			  405
+#define SBI_ENCLAVE_GET_ID			  407
+#define SBI_ENCLAVE_GET_HARTID		  408
+#define SBI_ENCLAVE_GET_AVAILABLE_MEM 409
+#define SBI_ENCLAVE_MEM_ALLOC		  500
+
+/* ---- ioctl command codes ---- */
+
+#define TEE_IOC_MAGIC 'T'
+
+/* Create a new enclave.  Returns enclave_id; does NOT return if successful
+ * (execution transfers into enclave).  Caller sees return only on error. */
+#define TEE_IOC_CREATE _IO(TEE_IOC_MAGIC, 0)
+
+/* Enter an existing enclave with a payload.
+ * Returns only when the enclave hands control back to the host (suspended /
+ * exited / aborted / host-requested teardown), or on a call-time error. */
+#define TEE_IOC_ENTER _IOW(TEE_IOC_MAGIC, 1, struct tee_enter_args)
+
+/* Query current mdid (0 = host). */
+#define TEE_IOC_GET_ID _IOR(TEE_IOC_MAGIC, 2, uint64_t)
+
+/* Query available memory pool (2 MiB units). */
+#define TEE_IOC_GET_MEM _IOR(TEE_IOC_MAGIC, 3, struct tee_mem_info)
+
+/* Suspend current enclave, returning to host.  Only valid inside enclave. */
+#define TEE_IOC_SUSPEND _IO(TEE_IOC_MAGIC, 4)
+
+/* Resume a previously suspended enclave by id.
+ * Returns under the same rules as TEE_IOC_ENTER (see tee_run_state). */
+#define TEE_IOC_RESUME _IOW(TEE_IOC_MAGIC, 5, uint64_t)
+
+/* Shutdown current enclave (clears memory, frees slot, mfence.did). */
+#define TEE_IOC_SHUTDOWN _IO(TEE_IOC_MAGIC, 6)
+
+/* ---- ENTER / RESUME 的 ioctl 返回值 (运行状态) ----
+ *
+ * M 模式把控制交还 host 时, 按 SBI 返回规范把本次运行的状态枚举填入 a1
+ * (sbiret.value), a0 仅在调用期出错时为负错误码。驱动据此把 ENTER/RESUME 的
+ * ioctl 返回值定义为下面的 tee_run_state 枚举值:
+ *
+ *   rc >= 0 : 控制已交还 host, rc 即枚举值, 含义见 enum tee_run_state;
+ *   rc <  0 : 调用期失败 (errno), 载荷未被转入运行, 无状态可读.
+ *
+ * 该枚举描述"飞地此刻处于什么情形"(发起方 + 退出码), 而不是成功/失败结论,
+ * 调用方据此决定继续 RESUME、判成功或判失败.
+ *
+ *   数值须与 bsp/custom-opensbi/lib/enclave_ext/ext_ecall.c 的
+ *   ENCLAVE_RUN_* 枚举保持一致, 修改需两侧同步. */
+enum tee_run_state {
+	TEE_RUN_SUSPENDED   = 0, /* 时间片配额让出: 载荷存活挂起, 应 RESUME 继续 (非终止) */
+	TEE_RUN_EXITED      = 1, /* 载荷自行结束 (SHUTDOWN), 退出码 0: 自然跑完 */
+	TEE_RUN_EXITED_ERR  = 2, /* 载荷自行结束 (SHUTDOWN), 退出码非 0: 载荷自报出错 */
+	TEE_RUN_ABORTED     = 3, /* 载荷违规访问, 被 M 模式强制终止, 非自行退出 */
+	TEE_RUN_HOST_KILL   = 4, /* host 请求拆除, 载荷未运行到退出 */
+};
+
+/* ---- parameter structures ---- */
+
+struct tee_enter_args {
+	uint64_t enclave_id;   /* target enclave id (from CREATE) */
+	uint64_t payload_ptr;  /* userspace pointer to payload data */
+	uint64_t payload_size; /* payload size in bytes */
+	uint64_t argc;		   /* argument count for enclave entry */
+	uint64_t argv_ptr;	   /* userspace pointer to argv array */
+};
+
+struct tee_mem_info {
+	uint64_t free_total;	 /* free 2 MiB partitions */
+	uint64_t max_contiguous; /* largest contiguous run */
+};
+
+#endif /* TEE_ENCLAVE_H */

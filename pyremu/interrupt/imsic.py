@@ -293,7 +293,7 @@ class _ImsicFile:
                 self.eip[idx + 1] = mask32(val >> 32)
             self._update_any_ext()
             return
-        # Per-bit eip/eie manipulation: write minor IID → set/clear bit.
+        # Per-bit eip/eie manipulation: write minor IID -> set/clear bit.
         if select == _SEL_SETEIPNUM:
             eip_num = val & 0x7FF
             if eip_num < _MAX_INTERRUPT_IDS:
@@ -362,7 +362,7 @@ class IMSIC(Device):
             _hib = (num_harts - 1).bit_length()
         else:
             _hib = 0
-        self._padded_file_count = 1 << _hib  # ≥ num_harts 的 2 的幂
+        self._padded_file_count = 1 << _hib  # >= num_harts 的 2 的幂
         self._padded_region = self._padded_file_count * _PAGE_STRIDE
         self.size = 2 * self._padded_region  # M 区 + S 区
         self.base_addr = m_base_addr  # 保留旧接口兼容
@@ -439,8 +439,8 @@ class IMSIC(Device):
         读取中断 identity 并 dispatch。
 
         **直接映射, 无跨文件路由**: ``seteipnum = N`` 在被寻址的 interrupt
-        file 中置 ``eip[N]`` 并驱动该文件的 external 中断线 (M-file → MEIP,
-        S-file → SEIP)。写入的值是 MINOR identity (外部中断编号), 不是 MAJOR
+        file 中置 ``eip[N]`` 并驱动该文件的 external 中断线 (M-file -> MEIP,
+        S-file -> SEIP)。写入的值是 MINOR identity (外部中断编号), 不是 MAJOR
         identity (中断 cause)。OpenSBI 通过向目标 hart 的 M-file 写 minor
         identity 1 (``IMSIC_IPI_ID``) 发送 IPI, 接收方 M-mode 经 ``MTOPEI``
         读取并 dispatch 到 ``sbi_ipi_process``; 若将 M-file 的 IID=1 路由到
@@ -525,7 +525,7 @@ class IMSIC(Device):
         """清除指定 hart 的指定 privilege IMSIC file 的 pending 位.
 
         供 APLIC set_irq(source, False) 在设备撤除 level-triggered
-        中断时调用, 将 IMSIC eip 同步清除 (guest 已通过 stopei claim,
+        中断时调用, 将 IMSIC eip 同步清除 (受调试程序 已通过 stopei claim,
         但设备端仍需通知 IMSIC 中断已不存在).
         """
         with self._lock:
@@ -536,7 +536,7 @@ class IMSIC(Device):
     def clear_ipi_on_trap(self, hart_id: int, exc_code: int) -> None:
         """清除软件中断 trap 入口对应的 IMSIC eip 位 (legacy 路径).
 
-        exc_code: 3 (MSIP→M-file IID=3) 或 1 (SSIP→S-file IID=1).
+        exc_code: 3 (MSIP->M-file IID=3) 或 1 (SSIP->S-file IID=1).
         仅当 eidelivery==0 时清除 — eidelivery==1 的 AIA 路径经 MTOPEI/STOPEI
         claim, 不走此处 (与 trap_handler._imsic_clear_ipi_on_trap 原语义一致).
         """
@@ -583,7 +583,7 @@ class IMSIC(Device):
           IID=0: no-op
           IID=1 (SSIP):  清 IMSIC S-file eip[1] + mip.SSIP
           IID=5 (STIP):  清 mip.STIP (bump stimecmp 由调用方负责)
-          IID=9 (SEIP):  清 IMSIC S-file 最高 eip (major→top claim)
+          IID=9 (SEIP):  清 IMSIC S-file 最高 eip (major->top claim)
           其他外部 IID:  清 IMSIC S-file 指定 eip + mip.SEIP
         """
         with self._lock:

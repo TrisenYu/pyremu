@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 
 """多 hart 集成测试: 验证多核启动 + 定时器中断."""
 
@@ -8,7 +8,7 @@ import struct
 
 import pytest
 
-from pyremu.configs_aux import path_join, examed_elf_dir
+from pyremu.configs_aux import examed_elf_dir, path_join
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import parse_firmware

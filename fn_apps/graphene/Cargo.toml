@@ -1,9 +1,16 @@
 # 凝聚态电子结构载荷
 #
-# 石墨烯紧束缚能带: 蜂窝晶格最近邻跳跃, Dirac 锥与费米速度。无外部依赖。
+# 石墨烯紧束缚能带: 蜂窝晶格最近邻跳跃, Dirac 锥与费米速度。哈密顿量用
+# nalgebra 的复数 Matrix2 表示并做 Hermitian 对角化 (SymmetricEigen), 复数类型
+# 复用 num-complex; 态密度在倒空间布里渊区网格采样。
 #
-# 自检: K 点 E=0 (无带隙); 费米速度 vF=3ta/2; Γ 点 E=3t, M 点 E=t。
+# 自检: K 点 E=0 (无带隙); 费米速度 vF=3ta/2; 态密度归一化 ∫ρ(E)dE = 2,
+#       van Hove 奇点峰位 E ≈ t。
 [package]
 name = "graphene"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+nalgebra = "0.34"
+num-complex = "0.4"

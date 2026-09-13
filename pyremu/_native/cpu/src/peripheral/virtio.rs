@@ -15,7 +15,7 @@ use super::DevCtx;
 /// are deliberately NOT advertised: the Python-side virtqueue processor
 /// (_process_descriptor_chain) does not implement avail_event writes or
 /// indirect-descriptor-table traversal.  Advertising either feature causes
-/// the guest driver to take code paths that break on our device.
+/// the 受调试程序 driver to take code paths that break on our device.
 /// Without them the driver falls back to flags-based notification
 /// (VRING_USED_F_NO_NOTIFY) and direct descriptor chains — both of which
 /// work correctly.
@@ -55,14 +55,14 @@ pub fn try_handle_virtio(
 
 /// Handle virtio-blk MMIO writes inline.  See ``try_handle_virtio`` for the
 /// return-value contract.
-fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::state::FfiVirtIoCtx) -> Option<u64> {
+fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::ffi::FfiVirtIoCtx) -> Option<u64> {
 	match offset {
 		// DeviceFeaturesSel (0x014) — page selector
 		0x014 => unsafe {
 			(*raw).device_features_sel = write_data as u32;
 			Some(0)
 		},
-		// DriverFeatures (0x020) — guest features for selected page
+		// DriverFeatures (0x020) — 受调试程序 features for selected page
 		0x020 => unsafe {
 			let sel = (*raw).driver_features_sel;
 			let mask = (write_data as u64 & 0xFFFF_FFFF) << (sel * 32);
@@ -94,9 +94,9 @@ fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::state::FfiVirtIoC
 		// (return None).  Without this, AIA-mode harts (where interrupt
 		// handling is CSR-based and inline) would defer queue processing
 		// to the next round, adding multi-second latency.
-		// notify_pending triggers _native_unmarshal_virtio → _process_queue(),
+		// notify_pending triggers _native_unmarshal_virtio -> _process_queue(),
 		// and the MMIO exit triggers Python re-execution of the store
-		// → _mmio_write → _process_queue() as a redundant but safe fallback.
+		// -> _mmio_write -> _process_queue() as a redundant but safe fallback.
 		0x050 => unsafe {
 			(*raw).notify_pending = 1;
 			None
@@ -108,7 +108,7 @@ fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::state::FfiVirtIoC
 		},
 		// InterruptACK (0x064) — 清空中断位.
 		// 若 ACK 后 ISR 归零 (old 非零且被全清), 必须同步拉低 PLIC IRQ 电平,
-		// 否则 guest 紧随其后的 PLIC complete 内联执行时看到陈旧高电平 ->
+		// 否则 受调试程序 紧随其后的 PLIC complete 内联执行时看到陈旧高电平 ->
 		// 重挂 pending -> 虚假中断 (kernel "irq N: nobody cared"). 故返回 None
 		// 强制 MMIO 退出, 由 Python _mmio_write 在 complete 之前调用
 		// _lower_irq_if_idle 拉低电平.  仅清除部分中断位时无需拉低电平, 内联处理.
@@ -120,7 +120,7 @@ fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::state::FfiVirtIoC
 			}
 			unsafe { (*raw).interrupt_status = new };
 			Some(0)
-		},
+		}
 		// Status (0x070) — writing 0 resets the device
 		0x070 => {
 			if write_data != 0 {
@@ -184,7 +184,7 @@ fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::state::FfiVirtIoC
 
 /// Handle virtio-blk MMIO reads inline.  See ``try_handle_virtio`` for the
 /// return-value contract.
-fn virtio_read(offset: u64, raw: *mut crate::state::FfiVirtIoCtx) -> Option<u64> {
+fn virtio_read(offset: u64, raw: *mut crate::ffi::FfiVirtIoCtx) -> Option<u64> {
 	match offset {
 		// MagicValue (0x000)
 		0x000 => Some(0x74726976),
@@ -225,7 +225,7 @@ fn virtio_read(offset: u64, raw: *mut crate::state::FfiVirtIoCtx) -> Option<u64>
 mod tests {
 	use super::try_handle_virtio;
 	use crate::peripheral::DevCtx;
-	use crate::state::FfiVirtIoCtx;
+	use crate::ffi::FfiVirtIoCtx;
 
 	fn make_dev(ctx: &mut FfiVirtIoCtx) -> DevCtx {
 		DevCtx {

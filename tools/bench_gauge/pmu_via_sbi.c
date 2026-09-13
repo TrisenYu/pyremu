@@ -1,5 +1,5 @@
 /*
- * SPDX-LICENSE-IDENTIFIER: GPL2.0
+ * SPDX-LICENSE-IDENTIFIER: MIT
  * (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
  *
  * SBI PMU 扩展封装 — S-mode 性能测量

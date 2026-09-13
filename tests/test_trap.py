@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """Trap 处理测试: cause code 映射、ECALL/EBREAK/MRET/SRET 流程."""
@@ -201,6 +201,113 @@ class TestEcallEbreak:
         trap_ebreak(hart)
         assert hart.mcause_val == 3, "ebreak -> mcause=3"
         assert hart.mtval_val == 0x2000, "mtval 应保存断点地址"
+
+
+class TestSemihostingEbreak:
+    """带 marker 的 semihosting ebreak 须与 native 引擎一致内联服务.
+
+    修复前 python 引擎只识别 SYS_EXIT (a0=0x18), SYS_WRITE/SYS_WRITEC 的
+    ebreak 被投递为普通断点 trap — 当固件在持有 console_out_lock 的 M 模式
+    打印路径内执行 semihosting 写时, 嵌套 trap 使控制台锁无法释放, 造成自旋
+    锁死锁. 本类锁定通用 semihosting 服务的回归底线.
+    """
+
+    _PRE = 0x01F01013  # slli x0, x0, 0x1f
+    _POST = 0x40705013  # srai x0, x0, 7
+    _EBREAK_PC = 0x80001000
+
+    @pytest.fixture
+    def sh(self):
+        bus = Bus(ram_size=0x100000, ram_base=0x80000000)
+        hart = Hart(id=0)
+        inject_memory_backend(hart, bus.read, bus.write)
+        hart.bus = bus
+        hart.csrs["mtvec"].val = 0x80010000
+        return hart, bus
+
+    @staticmethod
+    def _put(bus: Bus, addr: int, data: bytes) -> None:
+        off = addr - bus.ram_base
+        bus._ram[off:off + len(data)] = data
+
+    def _place_ebreak(self, bus: Bus) -> None:
+        """在 hart.pc 两侧写入 semihosting marker (中段 4 字节内容不限)."""
+        self._put(bus, self._EBREAK_PC - 4, struct.pack("<I", self._PRE))
+        self._put(bus, self._EBREAK_PC + 4, struct.pack("<I", self._POST))
+
+    def test_non_marker_ebreak_still_traps(self, sh):
+        """无 marker 的 ebreak 维持断点 trap 语义."""
+        hart, _ = sh
+        hart.pc = self._EBREAK_PC
+        trap_ebreak(hart)
+        assert hart.mcause_val == 3, "普通 ebreak -> mcause=3"
+
+    def test_sys_write_emits_and_advances(self, sh, capfd):
+        """SYS_WRITE (op=0x5) 读到 RAM 缓冲 -> 写到 stderr, a0=0, pc 前进 8."""
+        hart, bus = sh
+        self._place_ebreak(bus)
+        param, buf = 0x80002000, 0x80003000
+        text = b"hello semihost\n"
+        self._put(bus, buf, text)
+        self._put(bus, param, struct.pack("<QQQ", 1, buf, len(text)))
+        hart.pc = self._EBREAK_PC
+        hart.gprs[10] = 0x05
+        hart.gprs[11] = param
+        trap_ebreak(hart)
+        assert text in capfd.readouterr().err.encode()
+        assert hart.gprs[10] == 0, "SYS_WRITE 成功 -> a0=0"
+        assert hart.pc == self._EBREAK_PC + 8, "越过 ebreak + 退出 marker"
+        assert hart.mcause_val == 0, "不得投递断点 trap"
+
+    def test_sys_write_oob_buffer_returns_minus1(self, sh, capfd):
+        """缓冲为 S-mode VA (超出 RAM) -> -1, 不输出 — 与 native 越界语义一致."""
+        hart, bus = sh
+        self._place_ebreak(bus)
+        param = 0x80002000
+        va = 0xFFFF_FFE0_0000_0000  # 飞地 DBCN 打印常传 S-mode VA
+        self._put(bus, param, struct.pack("<QQQ", 1, va, 5))
+        hart.pc = self._EBREAK_PC
+        hart.gprs[10] = 0x05
+        hart.gprs[11] = param
+        trap_ebreak(hart)
+        assert hart.gprs[10] == 0xFFFF_FFFF_FFFF_FFFF, "越界缓冲 -> -1"
+        assert hart.pc == self._EBREAK_PC + 8
+        assert capfd.readouterr().err == ""
+
+    def test_sys_writec_emits_single_char(self, sh, capfd):
+        """SYS_WRITEC (op=0x3) 参数指向 RAM 中单个字符."""
+        hart, bus = sh
+        self._place_ebreak(bus)
+        param = 0x80002000
+        self._put(bus, param, b"Z")
+        hart.pc = self._EBREAK_PC
+        hart.gprs[10] = 0x03
+        hart.gprs[11] = param
+        trap_ebreak(hart)
+        assert capfd.readouterr().err == "Z"
+        assert hart.gprs[10] == 0
+        assert hart.pc == self._EBREAK_PC + 8
+
+    def test_sys_exit_sets_stop_flag_not_trap(self, sh):
+        """SYS_EXIT (op=0x18) 维持停机标记, 不投递断点 trap."""
+        hart, bus = sh
+        self._place_ebreak(bus)
+        hart.pc = self._EBREAK_PC
+        hart.gprs[10] = 0x18
+        trap_ebreak(hart)
+        assert getattr(hart, "_semihosting_sys_exit", False) is True
+        assert hart.mcause_val == 0, "SYS_EXIT 不得投递断点 trap"
+
+    def test_unknown_op_returns_minus1(self, sh, capfd):
+        """native 不识别操作码 -> -1, 空写, pc 前进 8."""
+        hart, bus = sh
+        self._place_ebreak(bus)
+        hart.pc = self._EBREAK_PC
+        hart.gprs[10] = 0x63
+        trap_ebreak(hart)
+        assert hart.gprs[10] == 0xFFFF_FFFF_FFFF_FFFF
+        assert hart.pc == self._EBREAK_PC + 8
+        assert capfd.readouterr().err == ""
 
 
 # ============================================================
@@ -2902,6 +3009,41 @@ class TestSstatusMstatusLinkage:
         )
 
 
+class TestSipMipReadonlyMask:
+    """验证 sip (0x144) / mip (0x344) 的硬件只读位不得被软件覆写.
+
+    与 sie 不同, sip 并非对所有 mideleg 委派位都可写: 唯一可写位是 SSIP (bit 1),
+    STIP (bit 5) 由 SSTC 定时器、SEIP (bit 9) 由 PLIC 硬件驱动. 飞地上下文切换
+    (csr_write(CSR_SIP, saved)) 写回陈旧 sip, 若把 SEIP/STIP 一并覆写会丢失挂起的
+    外设/定时器中断 (飞地回归测试后输入冻结)."""
+
+    @pytest.fixture
+    def hart(self) -> Hart:
+        h = Hart(id=0)
+        h.pc = 0x1000
+        h.mode = RiscvMode.S
+        return h
+
+    def test_csrw_sip_preserves_stip_and_seip(self, hart):
+        """`csrw sip, 0` 只清除 SSIP, 保留硬件驱动的 STIP/SEIP."""
+        hart.csrs["mideleg"].val = (1 << 5) | (1 << 9) | (1 << 1)  # STIP/SEIP/SSIP 委派
+        hart.csrs["mip"].val = (1 << 5) | (1 << 9) | (1 << 1)
+        hart.write_csr(0x144, 0)  # csrw sip, 0
+        mip = hart.mip_val
+        assert mip & (1 << 5), "STIP 由 SSTC 硬件驱动, 不得被 csrw sip 覆写"
+        assert mip & (1 << 9), "SEIP 由 PLIC 硬件驱动, 不得被 csrw sip 覆写"
+        assert not (mip & (1 << 1)), "SSIP 是 sip 唯一可写位, 应被清除"
+
+    def test_csrw_mip_preserves_stip_and_seip(self, hart):
+        """`csrw mip, 0` 只清除软件可写位 (SSIP/USIP), 保留硬件只读位."""
+        hart.csrs["mip"].val = (1 << 5) | (1 << 9) | (1 << 1)
+        hart.write_csr(0x344, 0)  # csrw mip, 0
+        mip = hart.mip_val
+        assert mip & (1 << 5), "STIP 只读, 不得被 csrw mip 覆写"
+        assert mip & (1 << 9), "SEIP 只读, 不得被 csrw mip 覆写"
+        assert not (mip & (1 << 1)), "SSIP 软件可写, 应被清除"
+
+
 class TestStimecmpClintSync:
     """验证 stimecmp 与 CLINT mtimecmp 互相独立 (匹配 QEMU / 真实硬件).
 
@@ -3484,7 +3626,7 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         hart.pc += advance
 
         advance = hart.exec_instr(ld_instr)
-        assert advance == 0, f"LD→page fault 后 advance 应为 0, 实际={advance}"
+        assert advance == 0, f"LD->page fault 后 advance 应为 0, 实际={advance}"
         assert hart.gprs[13] == saved_val, (
             f"LdPageFault 后 a3 被清零! 期望={saved_val:#x}, 实际={hart.gprs[13]:#x}"
         )
@@ -3515,7 +3657,7 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         hart.pc += advance
 
         advance = hart.exec_instr(sd_instr)
-        assert advance == 0, f"SD→page fault 后 advance 应为 0, 实际={advance}"
+        assert advance == 0, f"SD->page fault 后 advance 应为 0, 实际={advance}"
         assert hart.mode == RiscvMode.S
 
     def test_cld_pagefault_preserves_rd(self, hart, ram_ctx):
@@ -3545,7 +3687,7 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         hart.pc += advance
 
         advance = hart.exec_instr(c_ld)
-        assert advance == 0, f"C.LD→page fault 后 advance 应为 0, 实际={advance}"
+        assert advance == 0, f"C.LD->page fault 后 advance 应为 0, 实际={advance}"
         assert hart.gprs[10] == saved_val, (
             f"C.LD page fault 后 a0 被清零! 期望={saved_val:#x}, 实际={hart.gprs[10]:#x}"
         )
@@ -3576,7 +3718,7 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         hart.pc += advance
 
         advance = hart.exec_instr(c_sd)
-        assert advance == 0, f"C.SD→page fault 后 advance 应为 0, 实际={advance}"
+        assert advance == 0, f"C.SD->page fault 后 advance 应为 0, 实际={advance}"
         assert hart.mode == RiscvMode.S
 
     def test_lr_pagefault_preserves_rd(self, hart, ram_ctx):
@@ -3606,7 +3748,7 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         hart.pc += advance
 
         advance = hart.exec_instr(lr_w)
-        assert advance == 0, f"LR.W→page fault 后 advance 应为 0, 实际={advance}"
+        assert advance == 0, f"LR.W->page fault 后 advance 应为 0, 实际={advance}"
         assert hart.gprs[10] == saved_val, (
             f"LR.W page fault 后 a0 被清零! 期望={saved_val:#x}, 实际={hart.gprs[10]:#x}"
         )

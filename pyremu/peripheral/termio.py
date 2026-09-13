@@ -79,7 +79,7 @@ class TerminalIO:
         # 新到达的 UART 数据。None 时退化为仅置 ext_irq 通知位 (独立使用场景)。
         self._on_irq = on_irq
 
-        # TX 环形缓冲 — CPU hart 线程写入 (客机 TXDATA, 条目 = [hart_id, byte]),
+        # TX 环形缓冲 — CPU hart 线程写入 (受调试程序 TXDATA, 条目 = [hart_id, byte]),
         # Rust termio 线程经 tx_drain 排空到 stdout; Python 经 _tx_log_rd 归档日志。
         self._tx_buf = (ctypes.c_uint8 * self.TX_CAP)()
         self._tx_wr = ctypes.c_uint32(0)     # 写索引 (CPU 引擎独占, 单调 u32)
@@ -631,7 +631,7 @@ class TerminalIO:
         self.drain_rx()
 
     def _rx_daemon_tick(self, notify_r: int, poll: select.poll, timeout_ms: int = 500) -> bool:
-        """单次 RX daemon 迭代: 等待通知 (≤ timeout_ms), 无论是否就绪都排空 ring.
+        """单次 RX daemon 迭代: 等待通知 (<= timeout_ms), 无论是否就绪都排空 ring.
 
         事件驱动 + 超时兜底双重保障:
         - 通知到达 -> poll 立即返回 -> 排空 ring buffer 到 UART FIFO.

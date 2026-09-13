@@ -21,10 +21,11 @@ use crate::hart_sched::*;
 #[allow(unused)]
 use crate::diag;
 
-use crate::state::{
-	exit_reason, FfiClintCtx, FfiDevCtx, FfiPlicCtx, FfiPmpCtx, FfiUartCtx, FfiVirtIoCtx,
-	FfiWatchdogCtx, HartState, InstrToBeExec, MemCtx,
+use crate::ffi::{
+	FfiBpCtx, FfiClintCtx, FfiDevicesCtx, FfiExtIrqCtx, FfiHartCtx, FfiInterruptCtx,
+	FfiMemCtx, FfiPlicCtx, FfiTlbCtx, FfiUartCtx, FfiVirtIoCtx, InstrToBeExec, EMPTY_UART,
 };
+use crate::state::{exit_reason, HartState};
 
 // ============================================================
 //  Send/Sync wrappers for FFI raw pointers
@@ -237,10 +238,10 @@ pub struct ModuleState {
 	pub time_base_val: u64,
 	/// 每 hart 本轮加速执行起始时的指令计数 (marshal 时快照).
 	/// ``advance_clock_source`` 用 ``state.total_instrs - instr_ref_num[hid]``
-	/// 计算本轮已执行的指令增量并换算 mtime tick — guest 时钟随已执行指令推进,
+	/// 计算本轮已执行的指令增量并换算 mtime tick — 受调试程序 时钟随已执行指令推进,
 	/// 与主机单调时钟无关. 低速模拟 (2.5~6 MIPS) 下若 mtime 跟随真实流逝, 内核
-	/// HZ=250 的定时器 tick (每 4ms 客机时间) 只隔 ~1e4 条指令, tick 处理路径
-	/// (实测 ≤5e4 条) 超长即陷入 mret 后立即再 trap 的活锁; 按指令推进
+	/// HZ=250 的定时器 tick (每 4ms 受调试程序时间) 只隔 ~1e4 条指令, tick 处理路径
+	/// (实测 <=5e4 条) 超长即陷入 mret 后立即再 trap 的活锁; 按指令推进
 	/// (每指令 20ns, tick 间隔 2e5 条指令 = 4× 余量, 永不风暴) 消除该活锁,
 	/// 同时 rdtime 预算循环 (如内核 unaligned-access 测速, 8ms = 80000 ticks =
 	/// 4e6 条指令) 仍可完成.
@@ -299,89 +300,9 @@ impl ModuleState {
 	}
 }
 
-//  FFI structs (grouped parameters for run_parallel)
-// ============================================================
-
-/// Hart execution parameters passed across the FFI boundary.
-#[repr(C)]
-/// Shared external-interrupt context owned by Python, polled by Rust.
-///
-/// PLIC and device state lives on the Python side.  When a device raises
-/// (or lowers) an interrupt, Python updates this struct.  Rust checks
-/// ``pending`` periodically inside the hart loop; when set it exits,
-/// Python can call ``_native_sync_plic_mip()`` to update each
-/// hart's ``mip`` with the latest PLIC-driven MEIP/SEIP bits.
-#[repr(C)]
-pub struct FfiExtIrqCtx {
-	/// Non-zero: at least one external interrupt source is asserted and
-	/// the PLIC state may have changed.  Rust exits on next check.
-	pub pending: u8,
-	/// Bitmap of pending interrupt sources.  Bit *i* corresponds to PLIC
-	/// interrupt source *i* (1 = UART, 2 = VirtIO, …).  Updated atomically
-	/// by Python; currently informational, may drive inline delivery later.
-	pub sources: u32,
-	/// Highest priority among currently-pending sources, or 0 if none.
-	/// Rust may skip and exit when priority <= the current hart's
-	/// PLIC threshold (not yet implemented — always exits when pending≠0).
-	pub max_priority: u8,
-	pub _pad: [u8; 2],
-}
-
-#[repr(C)]
-pub struct FfiHartCtx {
-	pub states: *mut HartState,
-	pub num_harts: u32,
-	pub instr_group: *mut InstrToBeExec,
-	pub stop_flag: *const u8,
-	pub ext_irq: *mut FfiExtIrqCtx,
-}
-
-/// Peripheral / memory contexts passed across the FFI boundary.
-#[repr(C)]
-pub struct FfiPeriphCtx {
-	pub mem: *const MemCtx,
-	pub pmp: *const FfiPmpCtx,
-	pub clint: *const FfiClintCtx,
-	pub dev: *const FfiDevCtx,
-	pub uart: *const FfiUartCtx,
-	pub virtio: *const FfiVirtIoCtx,
-	pub watchdog: *const FfiWatchdogCtx,
-	pub plic: *const FfiPlicCtx,
-}
-
-/// Breakpoint configuration passed across the FFI boundary.
-#[repr(C)]
-pub struct FfiBpCtx {
-	pub addrs: *const u64,
-	pub count: u32,
-}
-
-/// TLB generation counter passed across the FFI boundary (mutable —
-/// Rust writes back the values so they persist across calls).
-#[repr(C)]
-pub struct FfiTlbCtx {
-	pub gen: *mut u64,
-	pub gen_per_hart: *mut u64,
-}
-
 // ============================================================
 //  FFI entry point helpers
 // ============================================================
-
-/// Empty UART context for when no UART is configured.
-static EMPTY_UART: FfiUartCtx = FfiUartCtx {
-	base: 0,
-	tx_buf: std::ptr::null_mut(),
-	tx_cap: 0,
-	tx_wr: std::ptr::null_mut(),
-	ie: 0,
-	txctrl: 0,
-	rxctrl: 0,
-	rx_fifo_len: 0,
-	tx_notify_fd: -1,
-	no_stdout: 0,
-	rx_notify: std::ptr::null_mut(),
-};
 
 #[inline]
 unsafe fn init_instr_group(instr_group: *mut InstrToBeExec) {
@@ -632,42 +553,22 @@ unsafe fn writeback_mtime(clint_raw: &FfiClintCtx, cc_clint: &ConcurrentClintCtx
 /// 纳秒/秒 — Duration 换算为时钟 tick 的定义性常数.
 const NS_PER_SEC: u64 = 1_000_000_000;
 
-/// 指令计数推进的换算比率 — 每指令多少纳秒 guest 时间.
+/// 指令计数推进的换算比率 — 每指令多少纳秒 受调试程序 时间.
 ///
-/// 取值 20ns/instr (2026-08-26 实证):
-///   - **上界约束 (防 tick 风暴)**: HZ=250 的 4ms tick 预算 = 4e6/NS_PER_INSTR 条指令.
-///     kernel 单个 trap 路径实测上限 ~5e4 条 (stall_dbg_stack), 因此 NS_PER_INSTR 必须
-///     ≤ 80 (预算 ≥ 5e4); 取 20 → 预算 2e5 条 = 4× 余量, 永不风暴.
-///     曾实证 1ns 能启动但 busy 相位客机时钟仅 ~0.0045× 真实 (4.5 MIPS × 1ns),
-///     systemd 剩余 ~2s 客机时间需 10+ 分钟墙钟 → 120s 上限内到不了 zsh
-///     (stall_dbg_1ns_userspace.log: hart2 在 U 模式跑 systemd, 无死锁, 纯粹太慢).
-///   - **下界约束 (防活锁)**: 任何 >= 100ns/instr 的值把预算压到 ≤ 4e4 条, 在 legacy
-///     PLIC 相位后 (sched_tick + update_vsyscall + timekeeping + tracing) mret 后
-///     立即再 trap 的活锁, kernel_init 被饿死 (stall_dbg_stack.log, 200ns/500ns 实测停滞).
-///   - **实时分量不可取**: min(real, instr) 在空闲批次 instr_delta=0 时取 real, 与
-///     Python _wfi_sleep_if_idle 的 clint.tick 实时补偿叠加成 ~2× real 双倍计数
-///     (实测 mtime 1.65× 真实流逝), 重新制造风暴压力.
-/// 空闲相位由 WFI 实时补偿 (Python 侧 clint.tick) 保持 1× 真实; busy 相位以
-/// ~0.09× 真实 (20ns @ 4.5 MIPS) 推进 — systemd 剩余客机时间 ~2s ≈ 22s 墙钟.
+/// 取值 20ns/instr:
 pub const NS_PER_INSTR: u64 = 20;
 
 /// 按指令计数推进 mtime (纯指令源, 无实时分量).
 ///
 /// mtime = time_base_val + instr_delta * NS_PER_INSTR * tb / 1e9
 ///
-/// - 单一时钟源: mtime 只随已执行指令推进, 与主机流逝解耦. WFI 空闲期由
-///   Python 侧 ``_wfi_sleep_if_idle`` 按真实流逝 ``clint.tick`` 补偿 — 双源
-///   不会叠加 (曾引入 min(real, instr) 混合模型: 空闲批次 instr_delta=0 时取
-///   real, 与 clint.tick 补偿叠加成 ~2× real 双倍计数, mtime 实测 1.65× 真实
-///   流逝, 重新制造风暴压力).
-/// - 预算安全: NS_PER_INSTR=20 (20ns/instr) 下 HZ=250 的 4ms tick 预算 2e5 条
-///   指令, 4× kernel trap 路径实测上限 (~5e4), 永不陷入 mret 后立即再 trap
-///   的活锁 (曾以 200ns/instr 预算 2e4 条实测仍停滞: legacy PLIC 相位后
-///   sched_tick + update_vsyscall + timekeeping + tracing 路径过长, kernel_init
-///   被饿死, 见 stall_dbg_stack.log).
-/// - 单调性: instr_delta 单调, ``fetch_max`` 保证多 hart 并发推进取最大值, 且
-///   不被 Python 侧 ``_wfi_sleep_if_idle`` 的睡眠补偿 (clint.tick) 回退.
-pub(crate) fn advance_clock_source(module: &ModuleState, clint: &ConcurrentClintCtx, state: &HartState) {
+/// - 单一时钟源
+/// - 单调
+pub(crate) fn advance_clock_source(
+	module: &ModuleState,
+	clint: &ConcurrentClintCtx,
+	state: &HartState,
+) {
 	if clint.timebase_hz == 0 {
 		return;
 	}
@@ -710,7 +611,7 @@ pub(crate) fn timer_deadline_own(
 	if timecmp == 0 || timecmp <= now_mtime {
 		return 0;
 	}
-	// 每指令推进 timebase * NS_PER_INSTR / 1e9 tick (20ns/instr @ 10MHz → 0.2 tick/instr).
+	// 每指令推进 timebase * NS_PER_INSTR / 1e9 tick (20ns/instr @ 10MHz -> 0.2 tick/instr).
 	let ticks_per_instr_scale = timebase_hz.saturating_mul(NS_PER_INSTR);
 	if ticks_per_instr_scale == 0 {
 		return 0;
@@ -733,13 +634,17 @@ pub(crate) fn timer_deadline_own(
 #[allow(dead_code)]
 pub unsafe extern "C" fn run_parallel(
 	hart: *const FfiHartCtx,
-	ffi: *const FfiPeriphCtx,
+	mem_ctx: *const FfiMemCtx,
+	intr_ctx: *const FfiInterruptCtx,
+	dev_ctx: *const FfiDevicesCtx,
 	bp: *const FfiBpCtx,
 	tlb: *mut FfiTlbCtx,
 ) {
 	// 1. Unpack FFI structs
 	let hart = unsafe { &*hart };
-	let ffi = unsafe { &*ffi };
+	let mem_ctx = unsafe { &*mem_ctx };
+	let intr_ctx = unsafe { &*intr_ctx };
+	let dev_ctx = unsafe { &*dev_ctx };
 	let states = hart.states;
 	let num_harts = hart.num_harts;
 
@@ -747,11 +652,11 @@ pub unsafe extern "C" fn run_parallel(
 	let (mem, pmp_raw, clint_raw, dev_raw, cc_clint, active) = unsafe {
 		init_instr_group(hart.instr_group);
 		(
-			&*ffi.mem,
-			&*ffi.pmp,
-			&*ffi.clint,
-			&*ffi.dev,
-			ConcurrentClintCtx::from_ffi(&*ffi.clint, num_harts),
+			&*mem_ctx.mem,
+			&*mem_ctx.pmp,
+			&*intr_ctx.clint,
+			&*dev_ctx.dev,
+			ConcurrentClintCtx::from_ffi(&*intr_ctx.clint, num_harts),
 			count_active(states, num_harts),
 		)
 	};
@@ -791,17 +696,17 @@ pub unsafe extern "C" fn run_parallel(
 	cc_clint.msip_pending.set(module.msip_pending.as_ptr());
 
 	// 时钟源超时时间 (ns, 0 = 禁用) — 由 FfiWatchdogCtx 注入.
-	let timeout_ns = if ffi.watchdog.is_null() {
+	let timeout_ns = if dev_ctx.watchdog.is_null() {
 		0
 	} else {
-		unsafe { (*ffi.watchdog).timeout_ns }
+		unsafe { (*dev_ctx.watchdog).timeout_ns }
 	};
 
 	// 4. Build shared contexts
-	let virtio_raw: *mut FfiVirtIoCtx = if ffi.virtio.is_null() {
+	let virtio_raw: *mut FfiVirtIoCtx = if dev_ctx.virtio.is_null() {
 		std::ptr::null_mut()
 	} else {
-		ffi.virtio as *mut FfiVirtIoCtx
+		dev_ctx.virtio as *mut FfiVirtIoCtx
 	};
 	let shared_mem = SharedMemCtx {
 		ram: mem.ram,
@@ -816,10 +721,10 @@ pub unsafe extern "C" fn run_parallel(
 		addr: pmp_raw.addr,
 		num: pmp_raw.num,
 	};
-	let plic_raw: *mut FfiPlicCtx = if ffi.plic.is_null() {
+	let plic_raw: *mut FfiPlicCtx = if intr_ctx.plic.is_null() {
 		std::ptr::null_mut()
 	} else {
-		ffi.plic as *mut FfiPlicCtx
+		intr_ctx.plic as *mut FfiPlicCtx
 	};
 	let shared_dev = SharedDevCtx {
 		bases: dev_raw.bases,
@@ -845,7 +750,7 @@ pub unsafe extern "C" fn run_parallel(
 			shared_pmp,
 			shared_dev,
 			&cc_clint,
-			ffi.uart,
+			dev_ctx.uart,
 			&module,
 			build_bps(bp),
 			timeout_ns,
@@ -867,7 +772,8 @@ mod tests {
 	use super::*;
 	// Items extracted from this file into sibling modules — bring them
 	// back in scope so tests can reference them directly.
-	use crate::state::{riscv_mode, PYREMU_AIA};
+	use crate::ffi::{DevMMIOAddrInfo, FfiPmpCtx, FfiWatchdogCtx, MemCtx};
+	use crate::state::{riscv_mode, CFG_AIA};
 	use std::mem;
 
 	fn make_state(pc: u64, hart_id: u64) -> HartState {
@@ -877,53 +783,6 @@ mod tests {
 		s.pc = pc;
 		s.mhartid = hart_id;
 		s
-	}
-
-	/// Convenience: call ``run_parallel`` with individual args (for tests).
-	unsafe fn call_run_parallel(
-		states: *mut HartState,
-		num_harts: u32,
-		instr_group: *mut InstrToBeExec,
-		mem: *const MemCtx,
-		pmp: *const FfiPmpCtx,
-		clint: *const FfiClintCtx,
-		dev: *const FfiDevCtx,
-		uart: *const FfiUartCtx,
-		virtio: *const FfiVirtIoCtx,
-		watchdog: *const FfiWatchdogCtx,
-		bp_addrs: *const u64,
-		bp_count: u32,
-		stop_flag: *const u8,
-		ext_irq: *mut FfiExtIrqCtx,
-		tlb_gen: *mut u64,
-		tlb_gen_per_hart: *mut u64,
-	) {
-		let hart = FfiHartCtx {
-			states,
-			num_harts,
-			instr_group,
-			stop_flag,
-			ext_irq,
-		};
-		let periph = FfiPeriphCtx {
-			mem,
-			pmp,
-			clint,
-			dev,
-			uart,
-			virtio,
-			watchdog,
-			plic: std::ptr::null(),
-		};
-		let bp = FfiBpCtx {
-			addrs: bp_addrs,
-			count: bp_count,
-		};
-		let mut tlb = FfiTlbCtx {
-			gen: tlb_gen,
-			gen_per_hart: tlb_gen_per_hart,
-		};
-		run_parallel(&hart, &periph, &bp, &mut tlb);
 	}
 
 	fn write_u32_le(buf: &mut [u8], offset: usize, val: u32) {
@@ -953,7 +812,7 @@ mod tests {
 		};
 		let dev_bases: [u64; 0] = [];
 		let dev_ends: [u64; 0] = [];
-		let dev = FfiDevCtx {
+		let dev = DevMMIOAddrInfo {
 			bases: dev_bases.as_ptr(),
 			ends: dev_ends.as_ptr(),
 			num: 0,
@@ -981,24 +840,36 @@ mod tests {
 			base: 0,
 			timebase_hz: 0, // 单元测试禁用 clock-source 推进, 保持确定性
 		};
-		call_run_parallel(
+		let hart = FfiHartCtx {
 			states,
-			num,
+			num_harts: num,
 			instr_group,
-			&mem as *const MemCtx,
-			&pmp as *const FfiPmpCtx,
-			&clint as *const FfiClintCtx,
-			&dev as *const FfiDevCtx,
-			std::ptr::null(),     // uart
-			std::ptr::null(),     // virtio
-			std::ptr::null(),     // watchdog
-			std::ptr::null(),     // bp_addrs
-			0,                    // bp_count
-			std::ptr::null(),     // stop_flag
-			std::ptr::null_mut(), // ext_irq
-			std::ptr::null_mut(),
-			std::ptr::null_mut(),
-		);
+			stop_flag: std::ptr::null(),
+			ext_irq: std::ptr::null_mut(),
+		};
+		let mem_ctx = FfiMemCtx {
+			mem: &mem,
+			pmp: &pmp,
+		};
+		let intr_ctx = FfiInterruptCtx {
+			clint: &clint,
+			plic: std::ptr::null(),
+		};
+		let dev_ctx = FfiDevicesCtx {
+			dev: &dev,
+			uart: std::ptr::null(),
+			virtio: std::ptr::null(),
+			watchdog: std::ptr::null(),
+		};
+		let bp = FfiBpCtx {
+			addrs: std::ptr::null(),
+			count: 0,
+		};
+		let mut tlb = FfiTlbCtx {
+			gen: std::ptr::null_mut(),
+			gen_per_hart: std::ptr::null_mut(),
+		};
+		run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 	}
 
 	#[test]
@@ -1032,16 +903,16 @@ mod tests {
 
 	/// Regression: WFI 阻塞时 stimecmp (SSTC) 截止必须在 legacy (非 AIA) 模式下
 	/// 被识别并以 WFI_WAIT 退出加速执行 (mtime 不再快进 — Python 侧据真实剩余
-	/// 休眠并按流逝时间补偿 mtime). 修复前 ``run_parallel`` 仅在 ``PYREMU_AIA`` 下
+	/// 休眠并按流逝时间补偿 mtime). 修复前 ``run_parallel`` 仅在 ``CFG_AIA`` 下
 	/// 设置 ``hart_states``, legacy 模式下该指针恒为 null, ``wfi_check_all_idle`` 扫描不到
-	/// stimecmp → mtime 不推进 → 用 usleep_range() (SSTC) 睡眠的 hart 永不唤醒,
+	/// stimecmp -> mtime 不推进 -> 用 usleep_range() (SSTC) 睡眠的 hart 永不唤醒,
 	/// 辅助核上线握手 (cpuhp_ap_sync_alive) 死锁.
 	#[test]
 	fn wfi_stimecmp_deadline_exits_wfi_wait_in_legacy_mode() {
-		// 本测试明确覆盖 legacy 模式 (PYREMU_AIA=false) 下的 stimecmp 唤醒路径 —
-		// 修复前 ``run_parallel`` 以 PYREMU_AIA 门控 hart_states, legacy 模式下指针恒为
+		// 本测试明确覆盖 legacy 模式 (CFG_AIA=false) 下的 stimecmp 唤醒路径 —
+		// 修复前 ``run_parallel`` 以 CFG_AIA 门控 hart_states, legacy 模式下指针恒为
 		// null 导致 stimecmp 不可见. AIA 构建下该路径走 IMSIC 分支, 跳过本测试.
-		if PYREMU_AIA {
+		if CFG_AIA {
 			return;
 		}
 
@@ -1063,7 +934,7 @@ mod tests {
 		};
 		let dev_bases: [u64; 0] = [];
 		let dev_ends: [u64; 0] = [];
-		let dev = FfiDevCtx {
+		let dev = DevMMIOAddrInfo {
 			bases: dev_bases.as_ptr(),
 			ends: dev_ends.as_ptr(),
 			num: 0,
@@ -1094,24 +965,36 @@ mod tests {
 
 		let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
 		unsafe {
-			call_run_parallel(
-				&mut state as *mut HartState,
-				1,
-				&mut instr_group as *mut InstrToBeExec,
-				&mem as *const MemCtx,
-				&pmp as *const FfiPmpCtx,
-				&clint as *const FfiClintCtx,
-				&dev as *const FfiDevCtx,
-				std::ptr::null(),     // uart
-				std::ptr::null(),     // virtio
-				std::ptr::null(),     // watchdog
-				std::ptr::null(),     // bp_addrs
-				0,                    // bp_count
-				std::ptr::null(),     // stop_flag
-				std::ptr::null_mut(), // ext_irq
-				std::ptr::null_mut(), // tlb_gen
-				std::ptr::null_mut(), // tlb_gen_per_hart
-			);
+			let hart = FfiHartCtx {
+				states: &mut state as *mut HartState,
+				num_harts: 1,
+				instr_group: &mut instr_group as *mut InstrToBeExec,
+				stop_flag: std::ptr::null(),
+				ext_irq: std::ptr::null_mut(),
+			};
+			let mem_ctx = FfiMemCtx {
+				mem: &mem,
+				pmp: &pmp,
+			};
+			let intr_ctx = FfiInterruptCtx {
+				clint: &clint,
+				plic: std::ptr::null(),
+			};
+			let dev_ctx = FfiDevicesCtx {
+				dev: &dev,
+				uart: std::ptr::null(),
+				virtio: std::ptr::null(),
+				watchdog: std::ptr::null(),
+			};
+			let bp = FfiBpCtx {
+				addrs: std::ptr::null(),
+				count: 0,
+			};
+			let mut tlb = FfiTlbCtx {
+				gen: std::ptr::null_mut(),
+				gen_per_hart: std::ptr::null_mut(),
+			};
+			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}
 		assert_eq!(
 			mtime_val, 0,
@@ -1122,6 +1005,151 @@ mod tests {
             instr_group.exit_reason, exit_reason::WFI_WAIT,
             "stimecmp 截止必须被识别并以 WFI_WAIT 退出 (legacy 模式) — hart_states 必须在非 AIA 下也设置"
         );
+	}
+
+	/// 构造「受调试程序 在无限循环中执行, 且 termio 已置位 RX 通知」的单 hart 加速
+	/// 执行场景, 返回 (退出原因, 本轮指令数)。``imsic_owns`` 决定 IMSIC 是否存在
+	/// 且已开启投递 (eidelivery 非 0)。
+	///
+	/// 看门狗超时 300 ms 用于界定「引擎忽略 RX 通知」的行为: 受调试程序 的无限
+	/// 循环使本轮永不自然结束, 忽略通知时只能由看门狗以 TIMEOUT 收场, 测试因此
+	/// 以断言失败而非挂起的形式暴露回归。
+	unsafe fn run_rx_notify_case(imsic_owns: bool) -> (u8, u64) {
+		let mut ram = vec![0u8; 256];
+		write_u32_le(&mut ram, 0, 0x0000_006F); // jal x0, 0: 原地无限循环
+
+		let mut state = make_state(0, 0);
+		state.mode = riscv_mode::M;
+		state.mie = 0;
+		state.mip.store(0, Ordering::Release);
+		if imsic_owns {
+			state.imsic_s.present = 1;
+			state.imsic_s.eidelivery = 1;
+		}
+
+		// termio 线程发现 stdin 新字节后置位的通知位.
+		let mut rx_notify: u8 = 1;
+		let uart = FfiUartCtx {
+			base: 0,
+			tx_buf: std::ptr::null_mut(),
+			tx_cap: 0,
+			tx_wr: std::ptr::null_mut(),
+			ie: 0,
+			txctrl: 0,
+			rxctrl: 0,
+			rx_fifo_len: 0,
+			tx_notify_fd: -1,
+			no_stdout: 0,
+			rx_notify: &mut rx_notify as *mut u8,
+		};
+		let watchdog = FfiWatchdogCtx {
+			timeout_ns: 300_000_000,
+		};
+
+		let mem = MemCtx {
+			ram: ram.as_mut_ptr(),
+			ram_size: ram.len() as u64,
+			ram_base: 0,
+			shadow_base: 0,
+			shadow_size: 0,
+		};
+		let dev_bases: [u64; 0] = [];
+		let dev_ends: [u64; 0] = [];
+		let dev = DevMMIOAddrInfo {
+			bases: dev_bases.as_ptr(),
+			ends: dev_ends.as_ptr(),
+			num: 0,
+		};
+		// 单个 TOR 条目覆盖全地址空间 (R/W/X), 避免 pmp_ok 因 num==0 拒绝访问.
+		let mut pmp_cfg: [u8; 1] = [0x0F];
+		let mut pmp_addr: [u64; 1] = [u64::MAX];
+		let pmp = FfiPmpCtx {
+			cfg: pmp_cfg.as_mut_ptr(),
+			addr: pmp_addr.as_mut_ptr(),
+			num: 1,
+			pmpsplit: 0,
+		};
+		let mut mtimecmp_vec: Vec<u64> = vec![u64::MAX; 1];
+		let mut msip_vec: Vec<u8> = vec![0u8; 1];
+		let mut mtime_val: u64 = 0;
+		let clint = FfiClintCtx {
+			mtime: &mut mtime_val as *mut u64,
+			mtimecmp: mtimecmp_vec.as_mut_ptr(),
+			msip: msip_vec.as_mut_ptr(),
+			base: 0,
+			timebase_hz: 0, // 禁用 clock-source 推进, 保持确定性
+		};
+
+		let mut instr_group: InstrToBeExec = mem::zeroed();
+		let hart = FfiHartCtx {
+			states: &mut state as *mut HartState,
+			num_harts: 1,
+			instr_group: &mut instr_group as *mut InstrToBeExec,
+			stop_flag: std::ptr::null(),
+			ext_irq: std::ptr::null_mut(),
+		};
+		let mem_ctx = FfiMemCtx {
+			mem: &mem,
+			pmp: &pmp,
+		};
+		let intr_ctx = FfiInterruptCtx {
+			clint: &clint,
+			plic: std::ptr::null(),
+		};
+		let dev_ctx = FfiDevicesCtx {
+			dev: &dev,
+			uart: &uart,
+			virtio: std::ptr::null(),
+			watchdog: &watchdog,
+		};
+		let bp = FfiBpCtx {
+			addrs: std::ptr::null(),
+			count: 0,
+		};
+		let mut tlb = FfiTlbCtx {
+			gen: std::ptr::null_mut(),
+			gen_per_hart: std::ptr::null_mut(),
+		};
+		run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
+		(instr_group.exit_reason, instr_group.total_instrs)
+	}
+
+	/// Regression: termio 写入 stdin 字节并置位 RX 通知时, 若 IMSIC 独占外部中断
+	/// 线路 (eidelivery 非 0), 引擎必须在执行任何指令之前退出本轮加速执行。
+	///
+	/// 字节到达受调试程序 需经 Python 侧两步搬运: RX 线程把 ring buffer 的字节
+	/// 搬进 UART FIFO, APLIC 再把中断注入 IMSIC 的 eip。这两步在单轮加速执行内
+	/// 都不可见, 且 ``sync_ext_irq_mip`` 在 IMSIC 独占线路时不置 SEIP, 引擎读到的
+	/// eip 又是 marshal 时刻的快照, 故本轮无法投递中断, 必须退出让 Python 搬运;
+	/// 下一轮 ``_native_sync_plic_mip`` 依据新的 eip 置 SEIP, 受调试程序 随即取走数据。
+	///
+	/// 修复前 (e904ba4 删除了 ``hart_worker`` 的 RX 通知退出) 该通知被完全忽略,
+	/// 输入要等到本轮加速执行自然结束才被处理 — 交互式控制台下单轮长达数秒,
+	/// 表现为 AIA 模式下 zsh 收不到键盘输入。
+	#[test]
+	fn rx_notify_exits_batch_when_imsic_owns_ext_line() {
+		let (reason, instrs) = unsafe { run_rx_notify_case(true) };
+		assert_eq!(
+			reason,
+			exit_reason::RX_WAIT,
+			"IMSIC 独占外部中断线路时, RX 通知必须让引擎立即退出本轮; \
+             否则输入要等本轮自然结束 (数秒) 才被搬运, AIA 模式下表现为无键盘输入"
+		);
+		assert_eq!(instrs, 0, "退出判定在指令循环之前, 本轮不得执行任何指令");
+	}
+
+	/// 互补用例: IMSIC 未占用外部中断线路 (legacy PLIC 模式) 时, RX 通知不得
+	/// 触发退出 — ``sync_ext_irq_mip`` 已在本轮内联置位 SEIP, 受调试程序 在轮内
+	/// 即可取走字节; 退出会砍掉 legacy 模式的输入吞吐。此处受调试程序 无限循环,
+	/// 唯一的结束方式是看门狗超时, 故以 TIMEOUT 锁定「未退出」这一行为。
+	#[test]
+	fn rx_notify_does_not_exit_batch_without_imsic() {
+		let (reason, _) = unsafe { run_rx_notify_case(false) };
+		assert_eq!(
+			reason,
+			exit_reason::TIMEOUT,
+			"IMSIC 未占用外部中断线路时不得为 RX 通知退出本轮 (内联置位已足够)"
+		);
 	}
 
 	/// Test that ECALL delivers trap inline: mode -> M, PC -> mtvec,
@@ -1356,7 +1384,7 @@ mod tests {
 		// Custom device MMIO: cover [dev_addr, dev_addr+8)
 		let dev_bases: [u64; 1] = [dev_addr];
 		let dev_ends: [u64; 1] = [dev_addr + 8];
-		let dev = FfiDevCtx {
+		let dev = DevMMIOAddrInfo {
 			bases: dev_bases.as_ptr(),
 			ends: dev_ends.as_ptr(),
 			num: 1,
@@ -1392,24 +1420,36 @@ mod tests {
 		};
 		let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
 		unsafe {
-			call_run_parallel(
-				states.as_mut_ptr(),
-				2,
-				&mut instr_group as *mut InstrToBeExec,
-				&mem as *const MemCtx,
-				&pmp as *const FfiPmpCtx,
-				&clint as *const FfiClintCtx,
-				&dev as *const FfiDevCtx,
-				std::ptr::null(),     // uart
-				std::ptr::null(),     // virtio
-				std::ptr::null(),     // watchdog
-				std::ptr::null(),     // bp_addrs
-				0,                    // bp_count
-				std::ptr::null(),     // stop_flag
-				std::ptr::null_mut(), // ext_irq
-				std::ptr::null_mut(),
-				std::ptr::null_mut(),
-			);
+			let hart = FfiHartCtx {
+				states: states.as_mut_ptr(),
+				num_harts: 2,
+				instr_group: &mut instr_group as *mut InstrToBeExec,
+				stop_flag: std::ptr::null(),
+				ext_irq: std::ptr::null_mut(),
+			};
+			let mem_ctx = FfiMemCtx {
+				mem: &mem,
+				pmp: &pmp,
+			};
+			let intr_ctx = FfiInterruptCtx {
+				clint: &clint,
+				plic: std::ptr::null(),
+			};
+			let dev_ctx = FfiDevicesCtx {
+				dev: &dev,
+				uart: std::ptr::null(),
+				virtio: std::ptr::null(),
+				watchdog: std::ptr::null(),
+			};
+			let bp = FfiBpCtx {
+				addrs: std::ptr::null(),
+				count: 0,
+			};
+			let mut tlb = FfiTlbCtx {
+				gen: std::ptr::null_mut(),
+				gen_per_hart: std::ptr::null_mut(),
+			};
+			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}
 
 		// Store to device MMIO should trigger an exit with MMIO reason.
@@ -1483,7 +1523,7 @@ mod tests {
 		};
 		let dev_bases: [u64; 0] = [];
 		let dev_ends: [u64; 0] = [];
-		let dev = FfiDevCtx {
+		let dev = DevMMIOAddrInfo {
 			bases: dev_bases.as_ptr(),
 			ends: dev_ends.as_ptr(),
 			num: 0,
@@ -1510,24 +1550,36 @@ mod tests {
 			base: clint_base,
 			timebase_hz: 0, // 单元测试禁用 clock-source 推进, 保持确定性
 		};
-		call_run_parallel(
+		let hart = FfiHartCtx {
 			states,
-			num,
+			num_harts: num,
 			instr_group,
-			&mem as *const MemCtx,
-			&pmp as *const FfiPmpCtx,
-			&clint as *const FfiClintCtx,
-			&dev as *const FfiDevCtx,
-			std::ptr::null(),     // uart
-			std::ptr::null(),     // virtio
-			std::ptr::null(),     // watchdog
-			std::ptr::null(),     // bp_addrs
-			0,                    // bp_count
-			std::ptr::null(),     // stop_flag
-			std::ptr::null_mut(), // ext_irq
-			std::ptr::null_mut(),
-			std::ptr::null_mut(),
-		);
+			stop_flag: std::ptr::null(),
+			ext_irq: std::ptr::null_mut(),
+		};
+		let mem_ctx = FfiMemCtx {
+			mem: &mem,
+			pmp: &pmp,
+		};
+		let intr_ctx = FfiInterruptCtx {
+			clint: &clint,
+			plic: std::ptr::null(),
+		};
+		let dev_ctx = FfiDevicesCtx {
+			dev: &dev,
+			uart: std::ptr::null(),
+			virtio: std::ptr::null(),
+			watchdog: std::ptr::null(),
+		};
+		let bp = FfiBpCtx {
+			addrs: std::ptr::null(),
+			count: 0,
+		};
+		let mut tlb = FfiTlbCtx {
+			gen: std::ptr::null_mut(),
+			gen_per_hart: std::ptr::null_mut(),
+		};
+		run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 	}
 
 	/// Verify that a store to CLINT MSIP succeeds without traps.
@@ -1547,9 +1599,9 @@ mod tests {
 		// 0x10: addi t1, x0, 1          ->t1 = 1
 		// 0x14: sw   t1, 0(t0)          ->write MSIP=1 for hart 0
 		// 0x18: addi t2, x0, 0x42       ->t2 = 0x42 (proves CLINT write OK)
-		// 0x1C: wfi                      ->enter WFI, MSIP pending → trap
+		// 0x1C: wfi                      ->enter WFI, MSIP pending -> trap
 		// 0x20: wfi                      ->reached after MSI handler mrets;
-		//                                    MSIP cleared → all-idle 退出
+		//                                    MSIP cleared -> all-idle 退出
 		write_u32_le(&mut ram, 0x00, 0x04200293); // addi t0, x0, 0x42
 		write_u32_le(&mut ram, 0x04, 0x00502023); // sw t0, 0(x0) — RAM store to PA 0
 		write_u32_le(&mut ram, 0x08, 0x020002B7); // lui t0, 0x2000 ->t0 = 0x2000000
@@ -1614,7 +1666,7 @@ mod tests {
 	/// (which does MRET), and execute the marker instruction after WFI.
 	/// Hart 1's t0 MUST be 0x42 — proving the MSI was
 	/// delivered, the trap handler ran, and execution resumed at the
-	/// instruction following WFI.  Both harts then idle → WFI_WAIT exit
+	/// instruction following WFI.  Both harts then idle -> WFI_WAIT exit
 	/// (no instruction quota).
 	#[test]
 	fn cross_hart_msip_wakes_target() {
@@ -1781,7 +1833,7 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 		};
-		let dev = FfiDevCtx {
+		let dev = DevMMIOAddrInfo {
 			bases: [].as_ptr(),
 			ends: [].as_ptr(),
 			num: 0,
@@ -1804,24 +1856,36 @@ mod tests {
 		};
 
 		unsafe {
-			call_run_parallel(
-				&mut state,
-				1,
-				&mut instr_group,
-				&mem,
-				&pmp,
-				&clint,
-				&dev,
-				std::ptr::null(),
-				std::ptr::null(),
-				std::ptr::null(),
-				std::ptr::null(),
-				0,
-				std::ptr::null(),
-				std::ptr::null_mut(),
-				std::ptr::null_mut(),
-				std::ptr::null_mut(),
-			);
+			let hart = FfiHartCtx {
+				states: &mut state,
+				num_harts: 1,
+				instr_group: &mut instr_group,
+				stop_flag: std::ptr::null(),
+				ext_irq: std::ptr::null_mut(),
+			};
+			let mem_ctx = FfiMemCtx {
+				mem: &mem,
+				pmp: &pmp,
+			};
+			let intr_ctx = FfiInterruptCtx {
+				clint: &clint,
+				plic: std::ptr::null(),
+			};
+			let dev_ctx = FfiDevicesCtx {
+				dev: &dev,
+				uart: std::ptr::null(),
+				virtio: std::ptr::null(),
+				watchdog: std::ptr::null(),
+			};
+			let bp = FfiBpCtx {
+				addrs: std::ptr::null(),
+				count: 0,
+			};
+			let mut tlb = FfiTlbCtx {
+				gen: std::ptr::null_mut(),
+				gen_per_hart: std::ptr::null_mut(),
+			};
+			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}
 
 		// BLTZ should have branched ->s2 = 42
@@ -1875,40 +1939,58 @@ mod tests {
 
 		let mut instr_group: InstrToBeExec = unsafe { std::mem::zeroed() };
 		unsafe {
-			call_run_parallel(
-				states.as_mut_ptr(),
-				2,
-				&mut instr_group,
-				&MemCtx {
-					ram: ram.as_mut_ptr(),
-					ram_size: 4096,
-					ram_base: 0,
-					shadow_base: 0,
-					shadow_size: 0,
-				},
-				&pmp,
-				&FfiClintCtx {
-					mtime: &mut 0u64,
-					mtimecmp: &mut [u64::MAX, u64::MAX][0],
-					msip: &mut [0u8, 0u8][0],
-					base: 0,
-					timebase_hz: 0,
-				},
-				&FfiDevCtx {
-					bases: [].as_ptr(),
-					ends: [].as_ptr(),
-					num: 0,
-				},
-				std::ptr::null(),
-				std::ptr::null(),
-				std::ptr::null(),
-				std::ptr::null(),
-				0,
-				std::ptr::null(),
-				std::ptr::null_mut(),
-				std::ptr::null_mut(),
-				std::ptr::null_mut(),
-			);
+			let mem = MemCtx {
+				ram: ram.as_mut_ptr(),
+				ram_size: 4096,
+				ram_base: 0,
+				shadow_base: 0,
+				shadow_size: 0,
+			};
+			let dev = DevMMIOAddrInfo {
+				bases: [].as_ptr(),
+				ends: [].as_ptr(),
+				num: 0,
+			};
+			let mut clint_mtime: u64 = 0;
+			let mut clint_mtimecmp = [u64::MAX, u64::MAX];
+			let mut clint_msip = [0u8, 0u8];
+			let clint = FfiClintCtx {
+				mtime: &mut clint_mtime,
+				mtimecmp: clint_mtimecmp.as_mut_ptr(),
+				msip: clint_msip.as_mut_ptr(),
+				base: 0,
+				timebase_hz: 0,
+			};
+			let hart = FfiHartCtx {
+				states: states.as_mut_ptr(),
+				num_harts: 2,
+				instr_group: &mut instr_group,
+				stop_flag: std::ptr::null(),
+				ext_irq: std::ptr::null_mut(),
+			};
+			let mem_ctx = FfiMemCtx {
+				mem: &mem,
+				pmp: &pmp,
+			};
+			let intr_ctx = FfiInterruptCtx {
+				clint: &clint,
+				plic: std::ptr::null(),
+			};
+			let dev_ctx = FfiDevicesCtx {
+				dev: &dev,
+				uart: std::ptr::null(),
+				virtio: std::ptr::null(),
+				watchdog: std::ptr::null(),
+			};
+			let bp = FfiBpCtx {
+				addrs: std::ptr::null(),
+				count: 0,
+			};
+			let mut tlb = FfiTlbCtx {
+				gen: std::ptr::null_mut(),
+				gen_per_hart: std::ptr::null_mut(),
+			};
+			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}
 		println!(
 			"exit_reason={} exit_hart={} total={}",

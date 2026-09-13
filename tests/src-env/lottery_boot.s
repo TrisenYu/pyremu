@@ -1,4 +1,4 @@
-// SPDX-LICENSE-IDENTIFIER: GPL2.0
+// SPDX-LICENSE-IDENTIFIER: MIT
 // OpenSBI 风格彩票启动 — 多 hart 竞争互斥锁 (AMOSWAP)
 //
 //   冷启动 hart (抢到锁):

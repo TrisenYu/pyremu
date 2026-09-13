@@ -94,7 +94,7 @@ class UART(Device):
         # 数据 buffer
         self._tx_buf: list[int] = []  # 已发送字节 (调试用)
         # RX FIFO — 固定 8 字节, 对照 QEMU s->rx_fifo[8] + s->rx_fifo_len
-        self._rx_fifo: list[int] = []  # 待接收字节 (len ≤ RX_FIFO_SIZE)
+        self._rx_fifo: list[int] = []  # 待接收字节 (len <= RX_FIFO_SIZE)
         self._rx_lock = threading.Lock()  # daemon reader 线程与主线程共享 _rx_fifo
 
         # 当前 MMIO 写者 hart ID — 由 _wrap_phy_write_for_uart 在 hart
@@ -104,6 +104,10 @@ class UART(Device):
         # Terminal I/O 反向引用 — 由 Emulator._init_for_speedup_lib 注入,
         # 用于调试器/模拟器直连路径管理终端所有权。
         self.termio: object | None = None
+
+        # native 侧寄存器上下文 (FfiUartCtx, 由 Emulator 注入): 加速执行期间
+        # 受调试程序 读 IP (0x14) 由 Rust 内联应答, 数据源即本对象, 状态变化时需同步。
+        self._ffi_ctx: object | None = None
 
         # 控制台回显开关 — 单一输出 owner 原则 (QEMU chardev 模型):
         # native termio 线程运行期间为 False (Rust 已直写 stdout),
@@ -205,13 +209,26 @@ class UART(Device):
         """
         return bool(self._ip_value() & self._ie)
 
-    def _update_plic_irq(self) -> None:
-        """根据 IP 水位状态与 IE 使能同步 PLIC 中断线 (电平语义).
+    def _publish_native_regs(self) -> None:
+        """把寄存器当前值同步到 native 侧上下文 (未启用加速库时为空操作)."""
+        ctx = self._ffi_ctx
+        if ctx is None:
+            return
+        with self._rx_lock:
+            fifo_len = len(self._rx_fifo)
+        ctx.ie = self._ie
+        ctx.txctrl = self._txctrl
+        ctx.rxctrl = self._rxctrl
+        ctx.rx_fifo_len = fifo_len
 
-        pending = (IP & IE) != 0 — TX 与 RX 任一满足即拉高; RXDATA 读空 /
-        IE 关闭 / txcnt 清零时拉低。PLIC claim 后重新拉高由各读写路径
-        调用本方法恢复 (level-triggered)。
+    def _publish_state(self) -> None:
+        """单一状态变化入口: 同步 native 侧寄存器值, 并更新 PLIC 中断线电平.
+
+        PLIC 为电平语义, pending = (IP & IE) != 0 — TX 与 RX 任一满足即拉高;
+        RXDATA 读空 / IE 关闭 / txcnt 清零时拉低。PLIC claim 后重新拉高由各读写
+        路径调用本方法恢复 (level-triggered)。
         """
+        self._publish_native_regs()
         if self._plic is None or self._irq <= 0:
             return
         self._plic.set_irq(self._irq, self.irq_asserted())
@@ -233,7 +250,7 @@ class UART(Device):
                 self._rx_fifo.append(b)
                 accepted += 1
         if accepted > 0:
-            self._update_plic_irq()
+            self._publish_state()
         return accepted
 
     def clear_rx(self) -> None:
@@ -244,7 +261,7 @@ class UART(Device):
         """
         with self._rx_lock:
             self._rx_fifo.clear()
-        self._update_plic_irq()
+        self._publish_state()
 
     def tx_data(self) -> bytes:
         """返回已发送的全部字节 (调试用)."""
@@ -291,7 +308,7 @@ class UART(Device):
                     return UART_RXFIFO_EMPTY
                 b = self._rx_fifo.pop(0)
             self._accept_input()
-            self._update_plic_irq()
+            self._publish_state()
             return b
         if offset == REG_TXDATA:
             return 0  # TXDATA 只写; full 位 (bit31) 恒 0 — FIFO 即时排空
@@ -331,17 +348,17 @@ class UART(Device):
             # txcnt (bits[18:16]) 变化影响 txwm 水位条件 — 若 IE.txwm 已使能,
             # 此处需立即拉高/拉低 PLIC (驱动 probe 先写 txcnt 后开中断,
             # 但顺序不可假设).
-            self._update_plic_irq()
+            self._publish_state()
             return
         if offset == REG_RXCTRL:
             self._rxctrl = val
             # rxcnt (bits[18:16]) 是 IP.rxwm 的比较阈值, 其变化可直接改变
             # 中断触发条件 — 与 TXCTRL 路径同理, 写后必须同步 PLIC 中断线.
-            self._update_plic_irq()
+            self._publish_state()
             return
         if offset == REG_IE:
             self._ie = val & 3
-            self._update_plic_irq()
+            self._publish_state()
             return
         if offset == REG_IP:
             # SiFive spec: IP 只读 (水位条件电平语义), 写入忽略.

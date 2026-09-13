@@ -29,19 +29,19 @@ vendor/qemu-10.2.0/hw/intc/riscv_aplic.c):
     +0x1fdc            clrienum
     +0x2000            setipnum_le    — 单源置 pending (小端, 供 EOI retrigger)
     +0x3000            genmsi
-    +0x3004 + (i-1)*4  target[i]      — (hart_idx << 18) | (guest_idx << 12) | eiid
+    +0x3004 + (i-1)*4  target[i]      — (hart_idx << 18) | (受调试程序_idx << 12) | eiid
     +0x4000            IDC 结构 (MSI 模式不使用)
 
 关键语义 (与 QEMU 对齐):
 
 - **sourcecfg[i]** 仅编码 SM 触发类型 (``SM_LEVEL_HIGH`` 等), **不含** 目标 hart
   或 EIID — 这些信息在 **target[i]** 寄存器中。
-- **target[i]** = ``(hart_idx << 18) | (guest_idx << 12) | eiid``: 指定该源
+- **target[i]** = ``(hart_idx << 18) | (受调试程序_idx << 12) | eiid``: 指定该源
   触发时向 ``hart_idx`` 的 IMSIC 投递 ``eiid`` 外部中断身份。
 - **MSI 投递**: 当 pending 且 enabled 且 ``domaincfg.IE`` 时, 清除 pending,
   调用 ``IMSIC.set_ip_number(hart_idx, 'S', eiid)`` 置 S-file eip。本 APLIC 的
   ``msi-parent`` 为 S-mode IMSIC 节点 (见 dtb.py), 故投递到 S-file。
-- **电平触发**: 外设拉高电平 → 置 pending → 投递; guest EOI 后写 ``setipnum``
+- **电平触发**: 外设拉高电平 -> 置 pending -> 投递; 受调试程序 EOI 后写 ``setipnum``
   retrigger (``aplic_msi_irq_eoi``) 以在电平仍高时重新投递。
 """
 
@@ -104,7 +104,7 @@ _STATE_PENDING = 1 << 0
 
 
 class APLIC(Device):
-    """RISC-V AIA APLIC — 有线 → MSI 桥 (MSI 投递模式)。
+    """RISC-V AIA APLIC — 有线 -> MSI 桥 (MSI 投递模式)。
 
     外设调用 ``set_irq(source_num, level)`` 时, 依据 ``sourcecfg`` 的 SM 触发
     类型更新 pending, 并在 pending & enabled & domaincfg.IE 时经 ``target``
@@ -124,7 +124,7 @@ class APLIC(Device):
 
         # sourcecfg[i]: SM 触发类型 (bits[9:0]).
         self._sourcecfg: list[int] = [0] * (num_sources + 1)
-        # target[i]: (hart_idx << 18) | (guest_idx << 12) | eiid.
+        # target[i]: (hart_idx << 18) | (受调试程序_idx << 12) | eiid.
         self._target: list[int] = [0] * (num_sources + 1)
         # state[i]: input(bit8) | enabled(bit1) | pending(bit0).
         self._state: list[int] = [0] * (num_sources + 1)
@@ -146,8 +146,8 @@ class APLIC(Device):
         等价 QEMU ``riscv_aplic_request(irq, level)``: 依据 SM 触发类型与电平
         变化决定是否置 pending, 并尝试 MSI 投递。
 
-        - level=True  → 输入电平拉高 (设备断言中断线)
-        - level=False → 输入电平拉低 (设备撤除中断线)
+        - level=True  -> 输入电平拉高 (设备断言中断线)
+        - level=False -> 输入电平拉低 (设备撤除中断线)
         """
         with self._lock:
             if not (0 < source_num <= self.num_sources):
@@ -253,7 +253,7 @@ class APLIC(Device):
             # 若丢弃 DM 会误报 "unable to write 0x104 in domaincfg".
             self._domaincfg = val & (_DOMAINCFG_IE | _DOMAINCFG_DM)
             if self._domaincfg & _DOMAINCFG_IE:
-                # IE 0→1: 投递所有已 pending 且 enabled 的源
+                # IE 0->1: 投递所有已 pending 且 enabled 的源
                 for src in range(1, self.num_sources + 1):
                     self._deliver_from_source(src)
             return

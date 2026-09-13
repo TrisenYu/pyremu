@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 
 """APLIC (Advanced Platform Level Interrupt Controller) 单元测试 — AIA MSI 模式.
 
@@ -104,10 +104,10 @@ class TestAplicMMIO:
 
 
 class TestAplicRouting:
-    """sourcecfg + target → set_irq → IMSIC S-file 投递."""
+    """sourcecfg + target -> set_irq -> IMSIC S-file 投递."""
 
     def test_edge_trigger_delivers_seip(self):
-        """边沿触发: 外设拉高电平 → 投递到 hart 0 S-file eiid."""
+        """边沿触发: 外设拉高电平 -> 投递到 hart 0 S-file eiid."""
         a = _make_aplic()
         imsic = a._imsic
         imsic.csr_write(0, 'S', 0x70, 1)  # S-file eidelivery=1
@@ -165,7 +165,7 @@ class TestAplicSetipnum:
     """setipnum 单源置 pending — 供 EOI retrigger 使用."""
 
     def test_setipnum_retriggers_delivery(self):
-        """setipnum → 置 pending → 投递 MSI."""
+        """setipnum -> 置 pending -> 投递 MSI."""
         a = _make_aplic()
         imsic = a._imsic
         imsic.csr_write(0, 'S', 0x70, 1)
@@ -226,6 +226,6 @@ class TestAplicDomaincfg:
         _w(a, _DOMAINCFG, 0)  # IE=0
         a.set_irq(1, True)
         assert imsic.get_pending_mip(0) == 0, "IE=0 should block delivery"
-        # 恢复 IE=1 → 投递 pending 源
+        # 恢复 IE=1 -> 投递 pending 源
         _w(a, _DOMAINCFG, 1 << 8)
         assert imsic.get_pending_mip(0) & (1 << 9), "IE re-enable should deliver"

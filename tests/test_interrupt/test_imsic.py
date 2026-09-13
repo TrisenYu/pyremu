@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 
 """IMSIC (Incoming MSI Controller) 单元测试 — Phase 1 AIA 实现."""
 
@@ -105,7 +105,7 @@ class TestImsicMMIO:
 
 
 class TestImsicCSR:
-    """AIA CSR 间接访问 (miselect→mireg)."""
+    """AIA CSR 间接访问 (miselect->mireg)."""
 
     def test_eidelivery_roundtrip(self):
         """miselect=0x70 -> mireg 读写 eidelivery."""
@@ -158,7 +158,7 @@ class TestImsicCSR:
         imsic.set_ip_number(0, 'M', 63)   # word 1, bit 31
         val = imsic.csr_read(0, 'M', 0x80)  # select eip0 -> eip[0] | (eip[1] << 32)
         assert val & (1 << 10), "eip[0] bit 10 (IID 10) should be set"
-        assert val & (1 << 63), "eip[1] bit 31 (IID 63) → mireg bit 63 should be set"
+        assert val & (1 << 63), "eip[1] bit 31 (IID 63) -> mireg bit 63 should be set"
 
     def test_unknown_select_reads_zero(self):
         """未注册的 select 读返回 0."""
@@ -176,11 +176,11 @@ class TestImsicPriority:
     """IMSIC 优先级阈值 (eithreshold) 与多中断仲裁."""
 
     def test_eithreshold_filters_low_priority(self):
-        """eithreshold=5: 优先级 ≤5 的中断不触发 pending."""
+        """eithreshold=5: 优先级 <=5 的中断不触发 pending."""
         imsic = _make_imsic()
         imsic.csr_write(0, 'M', 0x70, 1)
         imsic.csr_write(0, 'M', 0x72, 5)  # threshold=5
-        # IID=5 has priority 5, NOT > threshold 5 → filtered by topei
+        # IID=5 has priority 5, NOT > threshold 5 -> filtered by topei
         imsic.csr_write(0, 'M', 0xC0, 1 << 5)  # enable identity 5
         imsic.set_ip_number(0, 'M', 5)
         topei = imsic.read_topei(0, 'M')
@@ -193,14 +193,14 @@ class TestImsicPriority:
         Regression test: sync_imsic (Rust) and get_pending_mip (Python)
         previously used a raw eip&eie scan (imsic_has_any / has_pending)
         that ignored eithreshold.  compute_stopi / _read_stopi used the
-        threshold-aware topei_peek.  SEIP=1 + stopi→IID=5(timer) caused
-        an infinite SEI→timer→SEI loop in riscv_intc_aia_irq.
+        threshold-aware topei_peek.  SEIP=1 + stopi->IID=5(timer) caused
+        an infinite SEI->timer->SEI loop in riscv_intc_aia_irq.
         """
         imsic = _make_imsic()
         # S-file: eidelivery=1, threshold=20
         imsic.csr_write(0, 'S', 0x70, 1)
         imsic.csr_write(0, 'S', 0x72, 20)
-        # Enable & pend IID=10 (prio=10 ≤ threshold=20)
+        # Enable & pend IID=10 (prio=10 <= threshold=20)
         imsic.csr_write(0, 'S', 0xC0, 1 << 10)
         imsic.set_ip_number(0, 'S', 10)
 
@@ -208,7 +208,7 @@ class TestImsicPriority:
             "get_pending_mip must be 0 when interrupt is masked by eithreshold"
         )
 
-        # Lower threshold below priority → SEIP should appear
+        # Lower threshold below priority -> SEIP should appear
         imsic.csr_write(0, 'S', 0x72, 5)
         assert imsic.get_pending_mip(0) & (1 << 9), (
             "SEIP must be set after lowering eithreshold below priority"
@@ -343,7 +343,7 @@ class TestMtopi:
 
         assert h.mip_val & (1 << 3), "MSIP should be pending"
 
-        # Read mtopi → should return (IRQ_M_SOFT << 16) | priority
+        # Read mtopi -> should return (IRQ_M_SOFT << 16) | priority
         mtopi = h.read_csr(0xFB0)
         iid = (mtopi >> 16) & 0xFFFF
         assert iid == 3, (
@@ -382,7 +382,7 @@ class TestMtopi:
         assert imsic is not None, "IMSIC must be present in AIA mode"
         imsic.write(0x000, (1).to_bytes(4, 'little'))  # hart 0 M-file seteipnum
 
-        # M-file + IID=1 stays in M-file (no cross-file routing) → MEIP, not SEIP.
+        # M-file + IID=1 stays in M-file (no cross-file routing) -> MEIP, not SEIP.
         imsic_mip = imsic.get_pending_mip(h.id)
         assert (imsic_mip & (1 << 11)) != 0, (
             f"MEIP should be set when M-file eip[1] is set, got mip={imsic_mip:#x}"
@@ -457,7 +457,7 @@ class TestStopi:
 
         assert h.mip_val & (1 << 1), "SSIP should be pending"
 
-        # Read stopi → should return (IRQ_S_SOFT << 16) | priority
+        # Read stopi -> should return (IRQ_S_SOFT << 16) | priority
         stopi = h.read_csr(0xDB0)
         iid = (stopi >> 16) & 0xFFFF
         assert iid == 1, (
@@ -493,13 +493,13 @@ class TestStopi:
         assert imsic is not None, "IMSIC must be present in AIA mode"
         imsic.write(0x2000, (21).to_bytes(4, 'little'))  # hart 0 S-file seteipnum
 
-        # Sync IMSIC → mip bits
+        # Sync IMSIC -> mip bits
         imsic_mip = imsic.get_pending_mip(h.id)
         assert imsic_mip & (1 << 9), (
             f"SEIP should be set by IMSIC S-file interrupt, got mip={imsic_mip:#x}"
         )
 
-        # Read stopi → should return MAJOR identity IID=9 (IRQ_S_EXT).
+        # Read stopi -> should return MAJOR identity IID=9 (IRQ_S_EXT).
         # Per AIA spec §5.3, stopi reports the major identity; the minor
         # identity (actual device IID=21) is read from STOPEI (0x15C).
         stopi = h.read_csr(0xDB0)
@@ -518,7 +518,7 @@ class TestStopi:
         )
 
     def test_stopi_reports_stip_as_iid_5(self):
-        """STIP pending → stopi reports IID=5 (IRQ_S_TIMER).
+        """STIP pending -> stopi reports IID=5 (IRQ_S_TIMER).
 
         STIP is computed from LIVE mtime & stimecmp (not cached mip_val),
         matching the Rust batch engine's sync_mtip behaviour.  Using live
@@ -535,12 +535,12 @@ class TestStopi:
         h.mode = RiscvMode.S
         h.csrs["mie"].val |= 1 << 5   # STIE
 
-        # Set stimecmp in the past → hardware STIP = 1
+        # Set stimecmp in the past -> hardware STIP = 1
         h.csrs["stimecmp"].val = 100
         assert h.interrupt_ctrl, "empty aia interrupt controller"
         h.interrupt_ctrl.tick(200)
 
-        # Read stopi → should return (IRQ_S_TIMER << 16) | priority
+        # Read stopi -> should return (IRQ_S_TIMER << 16) | priority
         stopi = h.read_csr(0xDB0)
         iid = (stopi >> 16) & 0xFFFF
         assert iid == 5, (
@@ -556,7 +556,7 @@ class TestStopi:
         then re-reads stopi.  stopi must return 0 so the while loop in
         riscv_intc_aia_irq() exits.  Before the fix, stopi read stale
         mip_val.STIP=1 (set by check_pending_interrupts during the
-        initial trap) and never returned 0 → infinite loop.
+        initial trap) and never returned 0 -> infinite loop.
         """
         if not PYREMU_AIA:
             pytest.skip("stopi is readable only when PYREMU_AIA=1")
@@ -585,7 +585,7 @@ class TestStopi:
         """MTIP (bit 7) alone must NOT be reported by stopi.
 
         mtimecmp is frozen during native batch execution; if stopi
-        checked it, a timer tick would never clear → infinite loop.
+        checked it, a timer tick would never clear -> infinite loop.
         Only STIP (bit 5, from state.stimecmp) is authoritative for
         S-mode timer interrupts.
         """
@@ -597,7 +597,7 @@ class TestStopi:
         h.pc = 0x40000000
         h.mode = RiscvMode.S
         h.csrs["mie"].val |= 1 << 7   # MTIE
-        h.csrs["mideleg"].val |= 1 << 7  # delegate MTIP → S-mode
+        h.csrs["mideleg"].val |= 1 << 7  # delegate MTIP -> S-mode
 
         # Set MTIP only (STIP is 0)
         h.mip_val |= 1 << 7
@@ -606,7 +606,7 @@ class TestStopi:
         assert h.mip_val & (1 << 7), "MTIP should be pending"
         assert not (h.mip_val & (1 << 5)), "STIP should NOT be pending"
 
-        # Read stopi → should return 0 (MTIP is deliberately ignored)
+        # Read stopi -> should return 0 (MTIP is deliberately ignored)
         stopi = h.read_csr(0xDB0)
         assert stopi == 0, (
             f"stopi must ignore MTIP (bit 7), got stopi={stopi:#x}"
@@ -700,7 +700,7 @@ class TestImsicHartIntegration:
         h = emu.harts[0]
         h.write_csr(0x150, 0x70)        # siselect = eidelivery
         assert h._imsic_select_s == 0x70
-        h.write_csr(0x151, 1)           # sireg → S-file eidelivery=1
+        h.write_csr(0x151, 1)           # sireg -> S-file eidelivery=1
         assert h.read_csr(0x151) == 1
 
     def test_mireg_ignored_without_imsic(self):
@@ -738,7 +738,7 @@ class TestImsicConfig:
 
 
 # ============================================================
-#  IPI 投递: M-file → MEIP, S-file → SEIP (无跨文件路由)
+#  IPI 投递: M-file -> MEIP, S-file -> SEIP (无跨文件路由)
 # ============================================================
 
 
@@ -746,13 +746,13 @@ class TestImsicIpi:
     """IMSIC IPI 通过 MEIP/SEIP 外部中断线投递 (AIA 规范).
 
     All IMSIC interrupts (software IPI minor identity 1 and external IID>=6)
-    drive MEIP/SEIP via the file they were written to — M-file → MEIP,
-    S-file → SEIP, with no cross-file routing.  M-mode handler reads MTOPEI
+    drive MEIP/SEIP via the file they were written to — M-file -> MEIP,
+    S-file -> SEIP, with no cross-file routing.  M-mode handler reads MTOPEI
     for the minor identity; S-mode handler reads STOPE/STOPEI.
     """
 
     def test_mfile_ipi_sets_meip(self):
-        """M-file seteipnum IID=3 pending → get_pending_mip 设置 MEIP.
+        """M-file seteipnum IID=3 pending -> get_pending_mip 设置 MEIP.
 
         All IMSIC interrupts (including IPIs) drive the external interrupt
         line when eidelivery=1 per AIA spec.  A ``seteipnum`` write stays in
@@ -769,7 +769,7 @@ class TestImsicIpi:
         )
 
     def test_sfile_ipi_sets_seip(self):
-        """S-file IPI IID=3 pending → get_pending_mip 设置 SEIP.
+        """S-file IPI IID=3 pending -> get_pending_mip 设置 SEIP.
 
         All IMSIC interrupts drive the external interrupt line per AIA spec.
         """
@@ -784,7 +784,7 @@ class TestImsicIpi:
         )
 
     def test_ext_interrupt_sets_meip(self):
-        """M-file 外部中断 (>=6) → get_pending_mip 返回 MEIP."""
+        """M-file 外部中断 (>=6) -> get_pending_mip 返回 MEIP."""
         imsic = _make_imsic()
         imsic.csr_write(0, 'M', 0x70, 1)
         imsic.csr_write(0, 'M', 0xC0, 1 << 10)  # eie bit 10
@@ -793,7 +793,7 @@ class TestImsicIpi:
         assert mip & (1 << 11), f"MEIP should be set for ext int, got mip={mip:#x}"
 
     def test_mixed_ipi_and_ext(self):
-        """IPI (IID=1) + 外部中断 (IID=10) 同时写 M-file → MEIP 置位, SEIP 不置位.
+        """IPI (IID=1) + 外部中断 (IID=10) 同时写 M-file -> MEIP 置位, SEIP 不置位.
 
         Both a software IPI minor identity (1) and an external interrupt (10)
         written to the M-file stay in the M-file (no cross-file routing) and
@@ -802,8 +802,8 @@ class TestImsicIpi:
         imsic = _make_imsic()
         imsic.csr_write(0, 'M', 0x70, 1)  # M-file eidelivery=1
         imsic.csr_write(0, 'M', 0xC0, (1 << 1) | (1 << 10))  # eie: enable IID=1,10
-        imsic.write(0x000, (1).to_bytes(4, 'little'))   # M-file IID=1 → stays in M-file
-        imsic.write(0x000, (10).to_bytes(4, 'little'))  # M-file IID=10 → stays in M-file
+        imsic.write(0x000, (1).to_bytes(4, 'little'))   # M-file IID=1 -> stays in M-file
+        imsic.write(0x000, (10).to_bytes(4, 'little'))  # M-file IID=10 -> stays in M-file
         mip = imsic.get_pending_mip(0)
         assert mip & (1 << 11), f"MEIP should be set (from IID=1,10 in M-file), got mip={mip:#x}"
         assert not (mip & (1 << 9)), (
@@ -811,7 +811,7 @@ class TestImsicIpi:
         )
 
     def test_clreipnum_ipi_clears_pending(self):
-        """clreipnum identity 1 → M-file pending 清除, MEIP cleared.
+        """clreipnum identity 1 -> M-file pending 清除, MEIP cleared.
 
         Regression: clreipnum mirrors seteipnum's direct mapping — ``clreipnum = 1``
         written to the M-file clears M-file eip[1] (not the S-file).
@@ -820,7 +820,7 @@ class TestImsicIpi:
         imsic.csr_write(0, 'M', 0x70, 1)  # M-file eidelivery=1
         imsic.csr_write(0, 'M', 0xC0, 1 << 1)
         imsic.write(0x000, (1).to_bytes(4, 'little'))
-        # M-file IID=1 stays in M-file → MEIP, M-file topei reports pending IPI.
+        # M-file IID=1 stays in M-file -> MEIP, M-file topei reports pending IPI.
         assert (imsic.get_pending_mip(0) & (1 << 11)) != 0, "MEIP should be set for IPI IID=1"
         assert imsic.peek_topei(0, 'M') != 0, "M-file topei should report pending IPI"
         imsic.write(0x008, (1).to_bytes(4, 'little'))  # clreipnum 1 on M-file

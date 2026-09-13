@@ -1,7 +1,7 @@
 //! IMSIC (Incoming MSI Controller) inline handling for the speedup engine.
 //!
 //! **AIA-mode delivery** (``eidelivery == 1``): ALL IMSIC interrupts — IPIs
-//! (minor identity 1, OpenSBI's ``IMSIC_IPI_ID``) and external (IID ≥ 6) —
+//! (minor identity 1, OpenSBI's ``IMSIC_IPI_ID``) and external (IID >= 6) —
 //! drive the hart's external interrupt lines (MEIP for M-file, SEIP for
 //! S-file).  A ``seteipnum = N`` doorbell write sets ``eip[N]`` in the
 //! addressed file, with **no cross-file routing** — the value is a MINOR
@@ -14,7 +14,7 @@
 //! The Python-side ``trap_handler.py`` manages the IMSIC eip life-cycle.
 
 use crate::concurrent::ConcurrentClintCtx;
-use crate::state::{HartState, ImsicFile, PYREMU_AIA};
+use crate::state::{HartState, ImsicFile, CFG_AIA};
 use core::sync::atomic::Ordering;
 
 use std::thread::Thread;
@@ -37,11 +37,13 @@ pub(crate) const IID_M_IPI: u32 = 3; // legacy M-file IPI minor identity
 /// Caller must ensure *hart* is within bounds and ``hart_states`` is valid.
 ///
 /// **Concurrency**: this function may be called from a different OS thread
-/// than the target hart's speedup loop.  Only ``AtomicU32`` / ``AtomicU64``
-/// fields are accessed (via shared reference), never plain fields.
-/// ``eip_ext_any`` is NOT updated here — the owning hart's thread refreshes
-/// it lazily.  This is safe because IPI IIDs (1, 3) bypass the
-/// ``eip_ext_any`` fast-out in ``imsic_topei_peek``.
+/// than the target hart's speedup loop.  Only atomic fields are accessed
+/// (via shared reference), never plain fields.  ``eip_ext_any`` 因此改为
+/// ``AtomicU8``: 外部 IID (设备 MSI 经 ``seteipnum`` 注入) 必须同时置位该
+/// 缓存 — 属主 hart 的 ``imsic_topei_peek`` 以它为快速排除条件, 不置位则
+/// ``imsic_topei_peek`` 返回 0, 属主 hart 读到 MEIP/SEIP 已置起却读
+/// ``mtopi``/``stopei`` 得到 0 的 "有中断线、无 identity" 状态.
+/// IPI IID (1, 3) 另有快速路径绕过该缓存, 不受影响.
 #[inline]
 pub(crate) fn imsic_eip_set(
 	hart_states: *const HartState,
@@ -52,13 +54,13 @@ pub(crate) fn imsic_eip_set(
 	if hart_states.is_null() {
 		return;
 	}
-	// Shared reference: all accessed fields are atomic (eip, mip).
+	// Shared reference: all accessed fields are atomic (eip, eip_ext_any, mip).
 	// Never create &mut to another thread's HartState.
 	let target = unsafe { &*(hart_states.add(hart) as *const HartState) };
-	let eip_array = if file_off == 0x0000 {
-		&target.imsic_m.eip
+	let (eip_array, eip_ext_any) = if file_off == 0x0000 {
+		(&target.imsic_m.eip, &target.imsic_m.eip_ext_any)
 	} else {
-		&target.imsic_s.eip
+		(&target.imsic_s.eip, &target.imsic_s.eip_ext_any)
 	};
 	let mip_bit: u64 = if file_off == 0x0000 { 1 << 11 } else { 1 << 9 };
 	let word = (eip_num >> 5) as usize;
@@ -67,6 +69,11 @@ pub(crate) fn imsic_eip_set(
 	}
 	let bit = eip_num & 31;
 	eip_array[word].fetch_or(1u32 << bit, Ordering::Release);
+	// 置位该文件的 eip 缓存: 属主 hart 的 imsic_topei_peek 以它为快速排除
+	// 条件, 不置位则外部 IID 的注入对该 hart 不可见 (见函数注释). 语义与
+	// imsic_update_eip_ext_any 一致 — 任一 eip 位非 0 即为 1, 软件中断位
+	// 也计入, 故此处无需按 IID 区分.
+	eip_ext_any.fetch_or(1, Ordering::Release);
 	// All IMSIC interrupts (software and external) route through the
 	// hart's external interrupt lines (MEIP/SEIP) per AIA spec.
 	// The legacy MSIP/SSIP mechanism is NOT used for IMSIC IPIs.
@@ -124,7 +131,7 @@ pub(crate) fn imsic_eip_clear(
 /// Decoded IMSIC MMIO target.
 pub(crate) struct ImsicAddr {
 	pub(crate) hart: usize,
-	/// ``true`` → S-file, ``false`` → M-file.
+	/// ``true`` -> S-file, ``false`` -> M-file.
 	pub(crate) is_sfile: bool,
 	/// Offset within the 4 KiB page (0x0000 = seteipnum, 0x0008 = clreipnum).
 	pub(crate) reg_off: u64,
@@ -263,7 +270,7 @@ pub(crate) fn try_handle_imsic_concurrent(
 	_state: &HartState,
 	clint: &ConcurrentClintCtx,
 ) -> bool {
-	if !PYREMU_AIA {
+	if !CFG_AIA {
 		return false;
 	}
 	let addr = match decode_imsic_addr(pa, clint.num_harts as u64) {
@@ -302,7 +309,7 @@ pub(crate) fn try_handle_imsic_concurrent(
 /// accumulates to ~1 s — exactly the ``cpu_up`` timeout.
 #[inline]
 pub(crate) fn try_handle_imsic_read_concurrent(pa: u64, num_harts: u32) -> Option<u64> {
-	if !PYREMU_AIA {
+	if !CFG_AIA {
 		return None;
 	}
 	decode_imsic_addr(pa, num_harts as u64).map(|_| 0)
@@ -313,33 +320,33 @@ pub(crate) fn try_handle_imsic_read_concurrent(pa: u64, num_harts: u32) -> Optio
 // ============================================================
 
 /// Recompute the ``eip_ext_any`` cached flag after eip[] is modified.
-/// Called from CSR write (mireg→eip) and topei claim paths — not from
+/// Called from CSR write (mireg->eip) and topei claim paths — not from
 /// the hot instruction-boundary ``sync_imsic`` path.
 pub(crate) fn imsic_update_eip_ext_any(file: &mut ImsicFile) {
 	for i in 0..file.eip.len() {
 		let eip = file.eip[i].load(Ordering::Acquire);
 		if eip != 0 {
-			file.eip_ext_any = 1;
+			file.eip_ext_any.store(1, Ordering::Release);
 			return;
 		}
 	}
-	file.eip_ext_any = 0;
+	file.eip_ext_any.store(0, Ordering::Release);
 }
 
-/// Sync IMSIC eip/eie → hart mip bits.
+/// Sync IMSIC eip/eie -> hart mip bits.
 ///
 /// All IMSIC interrupts (software and external) route through the
 /// hart's external interrupt lines (MEIP/SEIP), not through the legacy
 /// MSIP/SSIP bits.  This matches OpenSBI's dispatch: ``sbi_trap_aia_irq``
-/// dispatches ALL IMSIC interrupts via ``case IRQ_M_EXT`` →
-/// ``sbi_irqchip_process()`` → ``imsic_process_hwirqs()``, which uses
+/// dispatches ALL IMSIC interrupts via ``case IRQ_M_EXT`` ->
+/// ``sbi_irqchip_process()`` -> ``imsic_process_hwirqs()``, which uses
 /// ``csr_swap(CSR_MTOPEI)`` to claim the interrupt and then dispatches
 /// to ``sbi_ipi_process()`` (for IID=1) or the external handler.
 ///
 /// The legacy MSIP/SSIP bits are reserved for CLINT-sourced software
 /// interrupts in non-AIA mode.
 ///
-/// Sync IMSIC eip/eie → hart mip bits.
+/// Sync IMSIC eip/eie -> hart mip bits.
 ///
 /// Per AIA spec, each IMSIC interrupt file independently controls its
 /// external interrupt line when ``eidelivery == 1``:
@@ -353,11 +360,11 @@ pub(crate) fn imsic_update_eip_ext_any(file: &mut ImsicFile) {
 /// Uses ``imsic_topei_peek()`` (not a raw eip&eie scan) so that the
 /// eithreshold and IID-range filters are applied consistently with
 /// ``compute_stopi`` / ``compute_mtopi``.  A mismatch here causes an
-/// infinite SEI→timer→sret→SEI loop in the kernel.
+/// infinite SEI->timer->sret->SEI loop in the kernel.
 ///
 /// No-op in legacy mode (both files ``present == 0``).
 pub(crate) fn sync_imsic(state: &mut HartState) {
-	// ---- M-file → MEIP (bit 11) ----
+	// ---- M-file -> MEIP (bit 11) ----
 	if state.imsic_m.present != 0 {
 		let (topei_val, _) = imsic_topei_peek(&state.imsic_m);
 		if state.imsic_m.eidelivery != 0 {
@@ -370,7 +377,7 @@ pub(crate) fn sync_imsic(state: &mut HartState) {
 				state.mip.fetch_and(!(1 << 11), Ordering::AcqRel);
 			}
 		} else if topei_val != 0 {
-			// eidelivery=0 → imsic_topei_peek only returns IPI bits
+			// eidelivery=0 -> imsic_topei_peek only returns IPI bits
 			// (IID=1,3).  Set MEIP so the hart wakes from WFI / sees
 			// the pending IPI.  Never clear here — legacy PLIC may be
 			// driving MEIP independently.
@@ -378,7 +385,7 @@ pub(crate) fn sync_imsic(state: &mut HartState) {
 		}
 	}
 
-	// ---- S-file → SEIP (bit 9) ----
+	// ---- S-file -> SEIP (bit 9) ----
 	if state.imsic_s.present != 0 {
 		let (topei_val, _) = imsic_topei_peek(&state.imsic_s);
 		if state.imsic_s.eidelivery != 0 {
@@ -395,7 +402,7 @@ pub(crate) fn sync_imsic(state: &mut HartState) {
 
 /// Sync a single IMSIC file to its mip bit after an inline state change
 /// (CSR write or cross-hart operation).  Caller passes ``true`` for *mfile*
-/// to update MEIP (bit 11), ``false`` for S-file → SEIP (bit 9).
+/// to update MEIP (bit 11), ``false`` for S-file -> SEIP (bit 9).
 ///
 /// When ``target`` is ``None``, updates *state*'s own mip — used after
 /// CSR writes on the local hart.  When ``target`` is a raw pointer, updates
@@ -513,7 +520,7 @@ pub(crate) fn imsic_reg_write(file: &mut ImsicFile, select: u32, val: u64) -> u8
 			}
 			0
 		}
-		// Per-bit eip/eie manipulation: write minor IID → set/clear bit.
+		// Per-bit eip/eie manipulation: write minor IID -> set/clear bit.
 		_SEL_SETEIPNUM => {
 			let eip_num = val as u32;
 			if eip_num < _MAX_IID {
@@ -582,7 +589,7 @@ pub(crate) fn imsic_topei_peek(file: &ImsicFile) -> (u64, u8) {
 	}
 
 	// External interrupts require eidelivery.
-	if file.eidelivery == 0 || file.eip_ext_any == 0 {
+	if file.eidelivery == 0 || file.eip_ext_any.load(Ordering::Acquire) == 0 {
 		return (0, 0);
 	}
 	let eie0 = file.eie[0].load(Ordering::Acquire);
@@ -714,10 +721,10 @@ mod tests {
 	fn sync_imsic_clears_seip_when_all_below_eithreshold() {
 		// If the only pending+enabled IMSIC interrupt has priority <=
 		// eithreshold, SEIP must NOT be set.  Otherwise sync_imsic
-		// and compute_stopi disagree → infinite SEI→timer loop.
+		// and compute_stopi disagree -> infinite SEI->timer loop.
 		let mut state = make_state();
 		state.imsic_s.eithreshold = 100; // high threshold
-								   // Pending interrupt at IID=21 → priority = 21 & 0xFF = 21
+								   // Pending interrupt at IID=21 -> priority = 21 & 0xFF = 21
 		state.imsic_s.eie[0].fetch_or(1 << 21, Ordering::Relaxed);
 		state.imsic_s.eip[0].fetch_or(1 << 21, Ordering::Relaxed);
 		imsic_update_eip_ext_any(&mut state.imsic_s);
@@ -732,7 +739,7 @@ mod tests {
 
 	#[test]
 	fn sync_imsic_sets_seip_when_interrupt_above_eithreshold() {
-		// Threshold lower than priority → SEIP must be set.
+		// Threshold lower than priority -> SEIP must be set.
 		let mut state = make_state();
 		state.imsic_s.eithreshold = 0;
 		state.imsic_s.eie[0].fetch_or(1 << 21, Ordering::Relaxed);
@@ -752,7 +759,7 @@ mod tests {
 		// Same check for M-file (MEIP).
 		let mut state = make_state();
 		state.imsic_m.eithreshold = 200;
-		// Pending at IID=100 → priority = 100 & 0xFF = 100
+		// Pending at IID=100 -> priority = 100 & 0xFF = 100
 		let word = (100 / 32) as usize;
 		let bit = 100 % 32;
 		state.imsic_m.eie[word].fetch_or(1 << bit, Ordering::Relaxed);
@@ -766,7 +773,7 @@ mod tests {
 			"MEIP must be 0 when IMSIC int is below eithreshold"
 		);
 
-		// Lower threshold → MEIP should appear
+		// Lower threshold -> MEIP should appear
 		state.imsic_m.eithreshold = 50;
 		sync_imsic(&mut state);
 		assert_eq!(
@@ -811,7 +818,7 @@ mod tests {
 		imsic_update_eip_ext_any(&mut state.imsic_s);
 
 		// Pre-set MEIP (simulating ext_irq drain in main loop).
-		// M-file is not driving MEIP → sync_imsic must leave it alone.
+		// M-file is not driving MEIP -> sync_imsic must leave it alone.
 		state.mip.fetch_or(1 << 11, Ordering::AcqRel);
 
 		sync_imsic(&mut state);
@@ -840,7 +847,7 @@ mod tests {
 		state.imsic_s.present = 1;
 		state.imsic_s.eidelivery = 1;
 
-		// First: pending → SEIP set
+		// First: pending -> SEIP set
 		state.imsic_s.eie[0].store(1 << 21, Ordering::Relaxed);
 		state.imsic_s.eip[0].store(1 << 21, Ordering::Relaxed);
 		imsic_update_eip_ext_any(&mut state.imsic_s);
@@ -954,7 +961,7 @@ mod tests {
 	fn ipi_claimable_without_eidelivery() {
 		// IPIs must be claimable (eip cleared) even with eidelivery=0.
 		// Without this, a pending IPI is reported by compute_stopi/mtopi
-		// forever → infinite dispatch loop.
+		// forever -> infinite dispatch loop.
 		let mut state = make_state_no_delivery();
 		state.imsic_s.eip[0].store(1 << IID_S_IPI, Ordering::Relaxed);
 
@@ -1006,7 +1013,7 @@ mod tests {
 		);
 	}
 
-	// ---- sync_imsic: IPI → mip bits ----
+	// ---- sync_imsic: IPI -> mip bits ----
 
 	#[test]
 	fn sync_imsic_sets_seip_for_ipi_without_eidelivery() {
@@ -1025,7 +1032,7 @@ mod tests {
 
 	#[test]
 	fn sync_imsic_sets_meip_for_ipi_without_eidelivery() {
-		// Same as above but for M-file IPI (IID=3) → MEIP.
+		// Same as above but for M-file IPI (IID=3) -> MEIP.
 		let mut state = make_state_no_delivery();
 		state.imsic_m.eip[0].store(1 << IID_M_IPI, Ordering::Relaxed);
 
@@ -1056,7 +1063,7 @@ mod tests {
 
 	#[test]
 	fn sync_imsic_clears_seip_after_ipi_claim() {
-		// Set IPI → sync_imsic sets SEIP → claim IPI → sync_imsic clears SEIP.
+		// Set IPI -> sync_imsic sets SEIP -> claim IPI -> sync_imsic clears SEIP.
 		// This verifies the full IPI lifecycle through sync_imsic with eidelivery.
 		let mut state = make_state_no_delivery();
 		state.imsic_s.eidelivery = 1; // enable clearing
@@ -1084,7 +1091,7 @@ mod tests {
 
 	#[test]
 	fn compute_stopi_reports_ipi_without_eidelivery() {
-		// compute_stopi calls topei_peek → IPI fast-path → maps the IPI
+		// compute_stopi calls topei_peek -> IPI fast-path -> maps the IPI
 		// minor identity (1) to the SEI major identity (9).  The IMSIC
 		// delivers the IPI via SEIP, so stopi must report IID=9 (SEI) —
 		// never SSI (1) — even without eidelivery.  The minor identity is
@@ -1187,7 +1194,7 @@ mod tests {
 
 	#[test]
 	fn seteipnum_mfile_iid3_stays_in_mfile() {
-		// M-file seteipnum with IID=3 → stays in M-file (M-mode IPI).
+		// M-file seteipnum with IID=3 -> stays in M-file (M-mode IPI).
 		let state = make_state_no_delivery();
 		let states = &state as *const HartState;
 		let result = imsic_handle_seteipnum(states, std::ptr::null(), 1, 0, 0x0000, IID_M_IPI);
@@ -1207,7 +1214,7 @@ mod tests {
 
 	#[test]
 	fn seteipnum_sfile_iid1_stays_in_sfile() {
-		// S-file seteipnum with IID=1 → stays in S-file (S-mode IPI).
+		// S-file seteipnum with IID=1 -> stays in S-file (S-mode IPI).
 		let state = make_state_no_delivery();
 		let states = &state as *const HartState;
 		let result = imsic_handle_seteipnum(states, std::ptr::null(), 1, 0, 0x1000, IID_S_IPI);
@@ -1266,6 +1273,44 @@ mod tests {
 		// (The function checks is_null and returns early.)
 		imsic_eip_set(std::ptr::null(), 0, 0x0000, IID_M_IPI);
 		// If we reach here, it didn't crash
+	}
+
+	/// 跨 hart 注入外部 IID 必须同时置位 eip_ext_any.
+	///
+	/// 设备 MSI (Linux 的 MSI-X) 以 MMIO 写 ``seteipnum`` 落到目标 hart 的
+	/// interrupt file, 走 ``imsic_handle_seteipnum`` -> ``imsic_eip_set``.
+	/// 属主 hart 的 ``imsic_topei_peek`` 以 ``eip_ext_any`` 为外部中断的快速
+	/// 排除条件, 未置位时即使 eip/eie 都已就绪也返回 0 — 属主 hart 于是看到
+	/// MEIP/SEIP 已置起、``mtopi``/``stopei`` 却读出 0 的 "有中断线、无
+	/// identity" 状态, 在 AIA 模式 (eidelivery != 0) 下形成虚假外部中断.
+	///
+	/// 回归: 修复前 ``imsic_eip_set`` 只置 eip 与 mip, 本测试的 peek 断言
+	/// 读到 0 而失败.
+	#[test]
+	fn eip_set_external_iid_marks_eip_ext_any() {
+		// IID=9 落在外部中断范围 (>= 6) 且非 IPI 保留位 (1 / 3).
+		const IID_EXT: u32 = 9;
+		let state = make_state();
+		state.imsic_s.eie[0].store(1 << IID_EXT, Ordering::Relaxed);
+		let states = &state as *const HartState;
+
+		imsic_eip_set(states, 0, 0x1000, IID_EXT);
+
+		assert_eq!(
+			state.imsic_s.eip_ext_any.load(Ordering::Acquire),
+			1,
+			"注入外部 IID 后 eip_ext_any 必须为 1"
+		);
+		let (topei_val, _) = imsic_topei_peek(&state.imsic_s);
+		assert_ne!(
+			topei_val, 0,
+			"注入外部 IID 后 imsic_topei_peek 必须读出 identity"
+		);
+		assert_eq!(
+			(topei_val >> 16) & 0x7FF,
+			IID_EXT as u64,
+			"读出的 minor identity 应为注入的 IID"
+		);
 	}
 
 	#[test]
@@ -1337,7 +1382,7 @@ mod tests {
 	}
 
 	// ============================================================
-	//  Multi-hart integration: cross-hart IPI → compute_stopi/mtopi
+	//  Multi-hart integration: cross-hart IPI -> compute_stopi/mtopi
 	// ============================================================
 
 	fn make_hart1_state() -> HartState {
@@ -1391,7 +1436,7 @@ mod tests {
 			"S-file eip must have IID=1"
 		);
 
-		// Hart 1 kernel reads stopi → compute_stopi
+		// Hart 1 kernel reads stopi -> compute_stopi
 		let (stopi_val, _) = compute_stopi(&mut h1, 0);
 		assert_ne!(stopi_val, 0, "stopi must report pending interrupt");
 		assert_eq!(
@@ -1420,7 +1465,7 @@ mod tests {
 			"MEIP must be set after cross-hart M-mode IPI"
 		);
 
-		// Hart 1 OpenSBI reads mtopi → compute_mtopi
+		// Hart 1 OpenSBI reads mtopi -> compute_mtopi
 		let (mtopi_val, _) = compute_mtopi(&mut h1, 0);
 		assert_ne!(mtopi_val, 0, "mtopi must report pending interrupt");
 		assert_eq!(
@@ -1445,7 +1490,7 @@ mod tests {
 		sync_imsic(&mut h1);
 
 		// Manually set STIP (sync_mtip would do this at the instruction boundary).
-		// stimecmp=50, mtime=100 → mtime > stimecmp → STIP pending.
+		// stimecmp=50, mtime=100 -> mtime > stimecmp -> STIP pending.
 		h1.mip.fetch_or(1 << 5, Ordering::AcqRel);
 
 		// compute_stopi: check priority order.
@@ -1467,7 +1512,7 @@ mod tests {
 
 		// Now the kernel claims the IPI via stopi write.
 		imsic_topei_claim_iid(&mut h1.imsic_s, IID_S_IPI);
-		sync_imsic_one(&mut h1, false); // mfile=false → S-file → SEIP
+		sync_imsic_one(&mut h1, false); // mfile=false -> S-file -> SEIP
 								  // After claim: clear SEIP as the csr_write(stopi) path does.
 		h1.mip.fetch_and(!(1 << 9), Ordering::AcqRel);
 
@@ -1512,11 +1557,11 @@ mod tests {
 			"stopi reports IID=5 when mtime == stimecmp (>= comparison)"
 		);
 
-		// mtime = 49: mtime < stimecmp → STIP not set → stopi returns 0.
+		// mtime = 49: mtime < stimecmp -> STIP not set -> stopi returns 0.
 		let (val2, _) = compute_stopi(&mut h1, 49);
 		assert_eq!(val2, 0, "stopi returns 0 when mtime < stimecmp");
 
-		// mtime = 51: mtime > stimecmp → STIP reported.
+		// mtime = 51: mtime > stimecmp -> STIP reported.
 		let (val3, _) = compute_stopi(&mut h1, 51);
 		assert_eq!(
 			(val3 >> 16) as u32,
@@ -1538,7 +1583,7 @@ mod tests {
 		h1.mip.fetch_or(1 << 9, Ordering::AcqRel); // SEIP
 		sync_imsic(&mut h1);
 
-		// Hart 1 reads stopi (S-file view) → sees the S-file IPI.
+		// Hart 1 reads stopi (S-file view) -> sees the S-file IPI.
 		let (val, _) = compute_stopi(&mut h1, 0);
 		assert_eq!(
 			(val >> 16) as u32,
@@ -1546,7 +1591,7 @@ mod tests {
 			"stopi sees IID=9 (SEI) pending in the S-file"
 		);
 
-		// compute_mtopi (M-file view) → M-file has nothing, no cross-file leak.
+		// compute_mtopi (M-file view) -> M-file has nothing, no cross-file leak.
 		let (mtopi_val, _) = compute_mtopi(&mut h1, 0);
 		assert_eq!(
 			mtopi_val, 0,
@@ -1556,8 +1601,8 @@ mod tests {
 
 	#[test]
 	fn multi_hart_stopi_ipi_claim_then_recheck() {
-		// Full lifecycle: IPI arrives → stopi reports IID=1 → kernel writes stopi
-		// (claim) → stopi returns 0 (nothing left).
+		// Full lifecycle: IPI arrives -> stopi reports IID=1 -> kernel writes stopi
+		// (claim) -> stopi returns 0 (nothing left).
 		let _h0 = make_hart0_state();
 		let mut h1 = make_hart1_state();
 
@@ -1565,13 +1610,13 @@ mod tests {
 		h1.imsic_s.eip[0].store(1 << IID_S_IPI, Ordering::Relaxed);
 		sync_imsic(&mut h1);
 
-		// Step 1: stopi read → IID=9 (SEI)
+		// Step 1: stopi read -> IID=9 (SEI)
 		let (val1, _) = compute_stopi(&mut h1, 0);
-		assert_eq!((val1 >> 16) as u32, 9, "first stopi → IID=9 (SEI)");
+		assert_eq!((val1 >> 16) as u32, 9, "first stopi -> IID=9 (SEI)");
 
 		// Step 2: kernel writes stopi (claim IID=1 in S-file).
 		imsic_topei_claim_iid(&mut h1.imsic_s, IID_S_IPI);
-		sync_imsic_one(&mut h1, false); // S-file → SEIP
+		sync_imsic_one(&mut h1, false); // S-file -> SEIP
 		h1.mip.fetch_and(!(1 << 9), Ordering::AcqRel);
 
 		// Step 3: SEIP cleared, eip cleared.
@@ -1580,7 +1625,7 @@ mod tests {
 			0,
 			"SEIP must be 0 after claim + sync"
 		);
-		// Step 4: next stopi read → 0 (nothing pending).
+		// Step 4: next stopi read -> 0 (nothing pending).
 		let (val2, _) = compute_stopi(&mut h1, 0);
 		assert_eq!(val2, 0, "stopi returns 0 after IPI is claimed");
 	}
@@ -1628,9 +1673,9 @@ mod tests {
 			"mtopi must report IID=11 (MEI, IMSIC M-file) before MTIP"
 		);
 
-		// Claim the IPI → now compute_mtopi should see MTIP.
+		// Claim the IPI -> now compute_mtopi should see MTIP.
 		imsic_topei_claim_iid(&mut h1.imsic_m, IID_M_IPI);
-		sync_imsic_one(&mut h1, true); // M-file → MEIP
+		sync_imsic_one(&mut h1, true); // M-file -> MEIP
 		h1.mip.fetch_and(!(1 << 11), Ordering::AcqRel); // clear MEIP
 
 		let (val2, _) = compute_mtopi(&mut h1, 0);
@@ -1646,7 +1691,7 @@ mod tests {
 	fn multi_hart_mtopi_spurious_mei_cleanup() {
 		// When ext_irq sets MEIP but IMSIC M-file has nothing pending,
 		// the step_interrupts cleanup must correctly clear MEIP.
-		// Regression test for the ext_irq → MEIP → cleanup flip-flop.
+		// Regression test for the ext_irq -> MEIP -> cleanup flip-flop.
 		let h1 = make_hart1_state();
 
 		// Simulate ext_irq drain setting MEIP (done by main loop at top of
@@ -1680,7 +1725,7 @@ mod tests {
 
 		// After cleanup, check_pending_interrupts must NOT deliver MEI.
 		let mip = h1.mip.load(Ordering::Acquire);
-		assert_eq!(mip & (1 << 11), 0, "MEIP cleared → no MEI");
+		assert_eq!(mip & (1 << 11), 0, "MEIP cleared -> no MEI");
 	}
 
 	/// When an S-file IPI is pending and SEI is NOT delegated (mideleg[9]=0),
@@ -1688,14 +1733,14 @@ mod tests {
 	/// (0xFB0), which calls compute_mtopi.  compute_mtopi only checks the
 	/// IMSIC M-file — it can NOT see the S-file IPI.  So mtopi returns 0,
 	/// OpenSBI MRETs without clearing SEIP, and the next instruction triggers
-	/// another M-mode SEI trap → infinite spurious-SEI loop.
+	/// another M-mode SEI trap -> infinite spurious-SEI loop.
 	///
 	/// This test verifies the diagnostic: mtopi=0 when M-file is empty but
 	/// S-file has a pending IPI with mideleg[9]=0.
 	#[test]
 	fn multi_hart_mtopi_zero_when_sfile_ipi_not_delegated() {
 		let mut h1 = make_hart1_state();
-		// SEI NOT delegated → M-mode trap for SEI
+		// SEI NOT delegated -> M-mode trap for SEI
 		h1.mideleg &= !(1 << 9);
 		// S-file IPI pending
 		h1.imsic_s.eip[0].store(1 << IID_S_IPI, Ordering::Relaxed);
@@ -1712,11 +1757,11 @@ mod tests {
 		h1.mode = riscv_mode::S;
 		h1.mstatus = 0; // SIE=0, SPIE=0, SPP=0
 
-		// check_pending_interrupts: SEIP & SEIE (=0 initially) → nothing.
+		// check_pending_interrupts: SEIP & SEIE (=0 initially) -> nothing.
 		// But step_interrupts force-enables SEIE when SEIP is pending.
 		h1.mie |= 1 << 9; // force-enable SEIE
 
-		// Now: SEIP=1, SEIE=1, mideleg[9]=0 → SEI NOT delegated → M-mode trap.
+		// Now: SEIP=1, SEIE=1, mideleg[9]=0 -> SEI NOT delegated -> M-mode trap.
 		let result = check_pending_interrupts(&h1);
 		assert!(result.is_some(), "interrupt must be pending");
 		let (cause, is_m_mode) = result.unwrap();
@@ -1724,7 +1769,7 @@ mod tests {
 		assert!(is_m_mode, "SEI delivered to M-mode when mideleg[9]=0");
 
 		// Now simulate OpenSBI M-mode handler reading mtopi.
-		// compute_mtopi checks M-file only → returns 0.
+		// compute_mtopi checks M-file only -> returns 0.
 		let (mtopi_val, _) = compute_mtopi(&mut h1, 0);
 		assert_eq!(
 			mtopi_val, 0,
@@ -1733,7 +1778,7 @@ mod tests {
 		);
 
 		// After mtopi=0, OpenSBI does MRET without clearing SEIP.
-		// SEIP is still set → next instruction triggers SEI again → loop!
+		// SEIP is still set -> next instruction triggers SEI again -> loop!
 		assert_eq!(
 			h1.mip.load(Ordering::Acquire) & (1 << 9),
 			1 << 9,
@@ -1744,7 +1789,7 @@ mod tests {
 	/// When SEI IS delegated (mideleg[9]=1) but S-mode has interrupts
 	/// disabled (SIE=0), check_pending_interrupts must SKIP the SEI, not
 	/// fall through to M-mode delivery.  Falling through to M-mode with an
-	/// S-file-only IPI would cause the same mtopi=0 → MRET → SEI loop
+	/// S-file-only IPI would cause the same mtopi=0 -> MRET -> SEI loop
 	/// verified by multi_hart_mtopi_zero_when_sfile_ipi_not_delegated.
 	#[test]
 	fn multi_hart_sei_skipped_when_sie_zero_delegated() {
@@ -1761,7 +1806,7 @@ mod tests {
 		h1.mie |= 1 << 9; // force-enable SEIE (done by step_interrupts)
 
 		// check_pending_interrupts: SEIP=1, SEIE=1, mideleg[9]=1
-		// → delegated to S-mode → SIE=0 → SKIP (continue)
+		// -> delegated to S-mode -> SIE=0 -> SKIP (continue)
 		let result = check_pending_interrupts(&h1);
 		assert!(
 			result.is_none(),
@@ -1783,7 +1828,7 @@ mod tests {
 
 	#[test]
 	fn decode_imsic_addr_pads_non_power_of_two_harts() {
-		// 3 harts → padded count = 4.  M-files occupy [0, 0x4000),
+		// 3 harts -> padded count = 4.  M-files occupy [0, 0x4000),
 		// S-files occupy [0x4000, 0x8000) — matching DTB/Python.
 		let base = crate::state::IMSIC_M_BASE;
 
@@ -1814,7 +1859,7 @@ mod tests {
 
 	#[test]
 	fn decode_imsic_addr_power_of_two_harts_unchanged() {
-		// 4 harts → padded count = 4 (identical to raw count).
+		// 4 harts -> padded count = 4 (identical to raw count).
 		let base = crate::state::IMSIC_M_BASE;
 		for hart in 0..4 {
 			let a = decode_imsic_addr(base + (hart * 0x1000), 4).unwrap();

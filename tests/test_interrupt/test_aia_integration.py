@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 
 """AIA 集成测试 — emulator + IMSIC + APLIC 端到端."""
 
@@ -88,15 +88,15 @@ class TestAiaEmulator:
 
 
 # ============================================================
-#  中断投递: UART → APLIC → IMSIC → check_pending_interrupts
+#  中断投递: UART -> APLIC -> IMSIC -> check_pending_interrupts
 # ============================================================
 
 
 class TestAiaInterruptDelivery:
-    """端到端中断投递: 外设 → APLIC → IMSIC → hart mip."""
+    """端到端中断投递: 外设 -> APLIC -> IMSIC -> hart mip."""
 
     def test_uart_irq_raises_seip(self):
-        """UART 写 → APLIC set_irq → IMSIC S-file → get_pending_mip 返回 SEIP.
+        """UART 写 -> APLIC set_irq -> IMSIC S-file -> get_pending_mip 返回 SEIP.
 
         Device interrupts route to S-mode (delegate=True) so the kernel's
         IMSIC driver handles them directly without M-mode forwarding.
@@ -106,12 +106,12 @@ class TestAiaInterruptDelivery:
         # 使能 IMSIC S-file eie for IID=20 (UART via APLIC)
         emu.imsic.csr_write(0, 'S', 0x70, 1)  # eidelivery=1
         emu.imsic.csr_write(0, 'S', 0xC0, 1 << 20)  # eie: enable identity 20
-        # 配置 APLIC source 10 → hart 0 S-file IID 20 (经 MMIO, 模拟内核流程)
+        # 配置 APLIC source 10 -> hart 0 S-file IID 20 (经 MMIO, 模拟内核流程)
         emu.aplic.write(0x3004 + (10 - 1) * 4, (20).to_bytes(4, "little"))  # target[10]
         emu.aplic.write(0x0004 + (10 - 1) * 4, (0x6).to_bytes(4, "little"))  # sourcecfg[10] LEVEL_HIGH
         emu.aplic.write(0x1EDC, (10).to_bytes(4, "little"))  # setienum source 10
 
-        # 触发 UART 中断: 经 APLIC source 10 → S-file IID=20
+        # 触发 UART 中断: 经 APLIC source 10 -> S-file IID=20
         emu.aplic.set_irq(10, True)
 
         mip = emu.imsic.get_pending_mip(0)
@@ -126,7 +126,7 @@ class TestAiaInterruptDelivery:
         imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
         imsic.csr_write(0, 'M', 0xC0, 1 << 10)  # eie bit 10
         imsic.set_ip_number(0, 'M', 10)  # 注入 MSI
-        emu._native_sync_plic_mip()  # IMSIC path: get_pending_mip → mip
+        emu._native_sync_plic_mip()  # IMSIC path: get_pending_mip -> mip
         hart.mie = True  # 全局 MIE=1
         hart.csrs["mie"].val = 1 << 11  # MEIE=1
         result = check_pending_interrupts(hart)
@@ -208,7 +208,7 @@ class TestAiaTopei:
         imsic.csr_write(0, 'M', 0xC0, 1 << 15)
         imsic.set_ip_number(0, 'M', 15)
         assert imsic.get_pending_mip(0) & (1 << 11), "MEIP before claim"
-        # read topei → claim
+        # read topei -> claim
         imsic.read_topei(0, 'M')
         assert imsic.get_pending_mip(0) == 0, "MEIP should be clear after claim"
 

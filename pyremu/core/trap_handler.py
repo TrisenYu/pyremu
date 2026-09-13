@@ -20,6 +20,7 @@ Public functions:
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from pyremu.core.hart import (
@@ -89,8 +90,8 @@ def _update_hw_mip(hart: HartWithRegs, hw_mip_bits: int) -> None:
 def _imsic_clear_ipi_on_trap(hart: HartWithRegs, exc_code: int) -> None:
     """Clear mip + IMSIC eip for software interrupt trap entry.
 
-    ``mip`` bit = ``1 << exc_code`` (MSIP=3→mip[3], SSIP=1→mip[1]).
-    IMSIC: MSIP→M-file IID=3, SSIP→S-file IID=1.
+    ``mip`` bit = ``1 << exc_code`` (MSIP=3->mip[3], SSIP=1->mip[1]).
+    IMSIC: MSIP->M-file IID=3, SSIP->S-file IID=1.
     In AIA mode (eidelivery==1) eip is claimed via MTOPEI/STOPEI, not here.
     """
     hart.mip_val &= ~(1 << exc_code)
@@ -303,24 +304,65 @@ def trap_ecall(
     deliver_trap(hart, cause, tval=hart.pc, is_interrupt=False)
 
 
-# ---- RISC-V semihosting 停机序列 (QEMU 裸机测试约定) ----
-# 固件停机序列: ``li a0, 0x18; slli x0,x0,0x1f; ebreak; srai x0,x0,7``.
+# ---- RISC-V semihosting 序列 (ARM/QEMU 约定) ----
+# 调用序列: ``slli x0,x0,0x1f; ebreak; srai x0,x0,7`` (操作码在 a0, 参数块指针在 a1).
 # marker 指令编码与 Rust 引擎 handlers.rs 的 SEMIHOSTING_PRE/POST 保持一致.
+# native 引擎 (try_semihosting) 对带 marker 的 ebreak 一律内联服务 (SYS_WRITE /
+# SYS_WRITEC / SYS_OPEN / SYS_ISTTY …), 仅 SYS_EXIT 触发 run() 停机; 纯 Python
+# 引擎此前只识别 SYS_EXIT, 其余操作被当作普通断点 trap 投递. 当固件在 M 模式
+# 控制台打印路径 (sbi_nputs 已持有 console_out_lock) 内执行 semihosting 写时,
+# 该 trap 使控制台锁在嵌套的 M 处理中无法释放, 造成自旋锁死锁. 故此处补齐与
+# native 对齐的通用 semihosting 服务.
+_SEMIHOSTING_SYS_OPEN: int = 0x01
+_SEMIHOSTING_SYS_WRITEC: int = 0x03
+_SEMIHOSTING_SYS_WRITE: int = 0x05
+_SEMIHOSTING_SYS_ISTTY: int = 0x09
 _SEMIHOSTING_SYS_EXIT: int = 0x18
 _SEMIHOSTING_PRE: int = 0x01F01013  # slli x0, x0, 0x1f
 _SEMIHOSTING_POST: int = 0x40705013  # srai x0, x0, 7
+# native semihosting_dispatch 对不可识别的操作码 / 非法参数一律返回 -1.
+_SEMIHOSTING_ERR: int = 0xFFFF_FFFF_FFFF_FFFF  # -1 (64-bit 规范化)
 
 
-def _is_semihosting_sys_exit(
+def _semihosting_write_stderr(data: bytes) -> None:
+    """semihosting 输出写到 stderr (fd 2), 与 native 策略一致.
+
+    避免污染 stdout 上的调试器 TUI 与 UART 转发行; os.write 绕过 Python
+    stdio 缓冲, 与 Rust 侧 write(2, ...) 等价.
+    """
+    try:
+        os.write(2, data)
+    except (OSError, ValueError):
+        pass
+
+
+def _sh_read_ram(
+    hart: HartWithRegs,
+    pa: int,
+    size: int,
+) -> bytes:
+    """读物理 RAM *size* 字节; 越界返回全零 — 对齐 native read_ram_u64/u8.
+
+    native 仅在 ``[ram_base, ram_base + ram_size)`` 内读, 越界视为 0;
+    设备 MMIO 地址同样不在此范围, 一并视为越界.
+    """
+    bus = hart._bus
+    if bus is None or size < 1:
+        return b"\x00" * size
+    if not bus.is_ram_addr(pa) or not bus.is_ram_addr(pa + size - 1):
+        return b"\x00" * size
+    ram: bytearray = bus._ram
+    off = pa - bus.ram_base
+    return bytes(ram[off:off + size])
+
+
+def _semihosting_markers_match(
     hart: HartWithRegs,
 ) -> bool:
-    """检测 ebreak 处是否为 semihosting SYS_EXIT 停机序列.
+    """检测 hart.pc 处的 ebreak 是否处于 semihosting marker 序列中.
 
-    ebreak 前后各 4 字节必须是指定 marker (slli/srai x0), 且 a0 == 0x18.
     identity (VA=PA) 映射下 pc 即物理地址, 直接经 Bus 读取固件字节.
     """
-    if hart.gprs[10] != _SEMIHOSTING_SYS_EXIT:
-        return False
     bus = hart._bus
     if bus is None:
         return False
@@ -333,15 +375,60 @@ def _is_semihosting_sys_exit(
     )
 
 
+def _semihosting_service(
+    hart: HartWithRegs,
+) -> None:
+    """服务带 marker 的 ebreak — 与 native try_semihosting 语义对齐.
+
+    按 a0 操作码分发, 结果写回 a0, 并将 pc 前进 8 (越过 ebreak + 退出 marker),
+    使序列余下的 ``sext.w/bltz`` 等指令自然处理返回值. SYS_EXIT 除外: 置停机
+    标记供 run() 返回 (与既有 python 语义一致), 不投递断点 trap.
+    """
+    op = hart.gprs[10]
+    param = hart.gprs[11]
+    if op == _SEMIHOSTING_SYS_EXIT:
+        hart._semihosting_sys_exit = True
+        return
+    if op == _SEMIHOSTING_SYS_WRITEC:
+        # 参数块指向单个字符 (SYS_WRITEC)
+        ch = _sh_read_ram(hart, param, 1)[0]
+        _semihosting_write_stderr(bytes([ch]))
+        hart.gprs[10] = 0
+    elif op == _SEMIHOSTING_SYS_WRITE:
+        # 参数块: fd / buf 物理地址 / 长度
+        fd = int.from_bytes(_sh_read_ram(hart, param, 8), "little")
+        buf_addr = int.from_bytes(_sh_read_ram(hart, param + 8, 8), "little")
+        length = int.from_bytes(_sh_read_ram(hart, param + 16, 8), "little")
+        bus = hart._bus
+        if length == 0:
+            hart.gprs[10] = 0
+        elif fd not in (1, 2):
+            hart.gprs[10] = _SEMIHOSTING_ERR
+        elif bus is None or not bus.is_ram_addr(buf_addr) or \
+                not bus.is_ram_addr(buf_addr + length - 1):
+            hart.gprs[10] = _SEMIHOSTING_ERR
+        else:
+            _semihosting_write_stderr(_sh_read_ram(hart, buf_addr, length))
+            hart.gprs[10] = 0
+    elif op == _SEMIHOSTING_SYS_OPEN:
+        # 返回合法 fd, 令固件的探测认为有宿主 (与 native 一致)
+        hart.gprs[10] = 1
+    elif op == _SEMIHOSTING_SYS_ISTTY:
+        fd = int.from_bytes(_sh_read_ram(hart, param, 8), "little")
+        hart.gprs[10] = 1 if fd <= 2 else 0
+    else:
+        hart.gprs[10] = _SEMIHOSTING_ERR
+    hart.pc = mask64(hart.pc + 8)
+
+
 def trap_ebreak(
     hart: HartWithRegs,
 ) -> None:
     """EBREAK: 断点异常."""
-    # semihosting SYS_EXIT (停机序列) — 不投递断点 trap, 置停机标记供 run()
-    # 返回. native 引擎 (try_semihosting) 在此情形同样直接停机而非投递 trap;
-    # 纯 Python 路径若无此检测, 固件停机序列会退化为 WFI 自旋, run() 永不返回.
-    if _is_semihosting_sys_exit(hart):
-        hart._semihosting_sys_exit = True
+    # semihosting marker 序列 — 不投递断点 trap, 由 _semihosting_service 内联
+    # 服务 (SYS_EXIT 置停机标记供 run() 返回). native 引擎行为一致, 详见上.
+    if _semihosting_markers_match(hart):
+        _semihosting_service(hart)
         return
     deliver_trap(hart, TrapType.Breakpoint, tval=hart.pc, is_interrupt=False)
 
@@ -603,13 +690,13 @@ def check_pending_interrupts(hart: HartWithRegs) -> bool:
 
     # 3. 外部中断: IMSIC (AIA) 或 PLIC (legacy) — MEIP/SEIP
     #    IMSIC 通过 eidelivery 控制当前谁在驱动外部中断线:
-    #    eidelivery=1 → MSI 模式, IMSIC eip/eie 驱动 MEIP/SEIP.
-    #    eidelivery=0 → legacy 模式, ext_irq drain 驱动 MEIP/SEIP.
+    #    eidelivery=1 -> MSI 模式, IMSIC eip/eie 驱动 MEIP/SEIP.
+    #    eidelivery=0 -> legacy 模式, ext_irq drain 驱动 MEIP/SEIP.
     #
     #    Always query IMSIC when present — get_pending_mip's raw-eip
     #    fallback correctly reports IPIs (IID=1,3) even when eidelivery=0.
     #    Without this, cross-hart IPIs sent before the kernel sets
-    #    eidelivery=1 are invisible → SMP boot stalls until the ~1 s
+    #    eidelivery=1 are invisible -> SMP boot stalls until the ~1 s
     #    cpu_up timeout expires.  PLIC is still consulted as a fallback
     #    when IMSIC reports nothing.
     ext_mip = 0
@@ -732,13 +819,13 @@ def check_pending_interrupts_nested_enabled(
 
     # 3. 外部中断: IMSIC (AIA) 或 PLIC (legacy) — MEIP/SEIP
     #    IMSIC 通过 eidelivery 控制当前谁在驱动外部中断线:
-    #    eidelivery=1 → MSI 模式, IMSIC eip/eie 驱动 MEIP/SEIP.
-    #    eidelivery=0 → legacy 模式, ext_irq drain 驱动 MEIP/SEIP.
+    #    eidelivery=1 -> MSI 模式, IMSIC eip/eie 驱动 MEIP/SEIP.
+    #    eidelivery=0 -> legacy 模式, ext_irq drain 驱动 MEIP/SEIP.
     #
     #    Always query IMSIC when present — get_pending_mip's raw-eip
     #    fallback correctly reports IPIs (IID=1,3) even when eidelivery=0.
     #    Without this, cross-hart IPIs sent before the kernel sets
-    #    eidelivery=1 are invisible → SMP boot stalls until the ~1 s
+    #    eidelivery=1 are invisible -> SMP boot stalls until the ~1 s
     #    cpu_up timeout expires.  PLIC is still consulted as a fallback
     #    when IMSIC reports nothing.
     ext_mip = 0

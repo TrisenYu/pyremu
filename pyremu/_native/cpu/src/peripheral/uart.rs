@@ -1,4 +1,4 @@
-use crate::state::FfiUartCtx;
+use crate::ffi::FfiUartCtx;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// 非阻塞写单字节到 fd: 先 poll(POLLOUT, timeout=0) 探测可写性, 可写才 write.
@@ -30,7 +30,7 @@ fn handle_uart_read(offset: u64, uart: &FfiUartCtx) -> Option<u64> {
 		0x10 => Some(uart.ie as u64),
 		0x14 => {
 			// TXWM: TX FIFO 恒空 -> 若 txcnt > 0 则水位条件恒满足.
-			// 必须检查 txcnt, 不可硬编码为 1 — 否则客机驱动关 TX 中断
+			// 必须检查 txcnt, 不可硬编码为 1 — 否则受调试程序驱动关 TX 中断
 			// (txcnt=0) 时 Rust 侧仍返回 TXWM=1, 与 Python _ip_value 矛盾,
 			// 否则生成无法清除的虚假 TX 中断而引发 PLIC 中断风暴.
 			let txcnt = (uart.txctrl >> 16) & 0x7;
@@ -66,38 +66,38 @@ pub(crate) fn try_handle_uart_concurrent(
 	}
 
 	// TXDATA: ring buffer (log archive) + direct stdout (参照 QEMU fd_chr_write).
-	if offset == 0 && uart.tx_buf as usize != 0 {
-		let ecap = uart.tx_cap / 2;
-		if ecap <= 0 {
-			return Some(0);
-		}
-		let wr_atomic = unsafe { &*(uart.tx_wr as *const AtomicU32) };
-		while UART_TX_LOCK
-			.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-			.is_err()
-		{
-			std::hint::spin_loop();
-		}
-		let w = wr_atomic.load(Ordering::Relaxed);
-		let e = (w % ecap) as usize;
-		let byte = write_data as u8;
-		unsafe {
-			*uart.tx_buf.add(2 * e) = hid;
-			*uart.tx_buf.add(2 * e + 1) = byte;
-		}
-		wr_atomic.store(w.wrapping_add(1), Ordering::Release);
-		UART_TX_LOCK.store(false, Ordering::Release);
-		// Python TX (_tx_callback) 负责 stdout 时 (no_stdout=1):
-		// 仅写 ring buffer, 由 drain_tx_logs->_flush_hart->_tx_callback 输出.
-		if uart.no_stdout == 0 {
-			// 非阻塞写 stdout — 对端不可写时丢弃, 绝不阻塞 CPU 引擎线程
-			// (见 try_write_fd 注释).
-			try_write_fd(libc::STDOUT_FILENO, byte);
-		}
-		return Some(0);
+	if !(offset == 0 && uart.tx_buf as usize != 0) {
+		return None;
 	}
 	// IE, TXCTRL, RXCTRL, IP, DIV -> Python for PLIC updates.
-	return None;
+	let ecap = uart.tx_cap / 2;
+	if ecap <= 0 {
+		return Some(0);
+	}
+	let wr_atomic = unsafe { &*(uart.tx_wr as *const AtomicU32) };
+	while UART_TX_LOCK
+		.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+		.is_err()
+	{
+		std::hint::spin_loop();
+	}
+	let w = wr_atomic.load(Ordering::Relaxed);
+	let e = (w % ecap) as usize;
+	let byte = write_data as u8;
+	unsafe {
+		*uart.tx_buf.add(2 * e) = hid;
+		*uart.tx_buf.add(2 * e + 1) = byte;
+	}
+	wr_atomic.store(w.wrapping_add(1), Ordering::Release);
+	UART_TX_LOCK.store(false, Ordering::Release);
+	// Python TX (_tx_callback) 负责 stdout 时 (no_stdout=1):
+	// 仅写 ring buffer, 由 drain_tx_logs->_flush_hart->_tx_callback 输出.
+	if uart.no_stdout == 0 {
+		// 非阻塞写 stdout — 对端不可写时丢弃, 绝不阻塞 CPU 引擎线程
+		// (见 try_write_fd 注释).
+		try_write_fd(libc::STDOUT_FILENO, byte);
+	}
+	return Some(0);
 }
 
 pub(crate) static UART_TX_LOCK: AtomicBool = AtomicBool::new(false);
@@ -122,18 +122,17 @@ mod tests {
 		// 填满管道直到 EAGAIN (Linux 管道容量 64 KiB, 对端未读).
 		let mut data = [0u8; 4096];
 		loop {
-			let n = unsafe {
-				libc::write(w, data.as_mut_ptr() as *const libc::c_void, data.len())
-			};
-			if n < 0 {
-				let err = std::io::Error::last_os_error();
-				assert_eq!(
-					err.kind(),
-					std::io::ErrorKind::WouldBlock,
-					"管道应被填满 (EAGAIN), 实际: {err}"
-				);
-				break;
+			let n = unsafe { libc::write(w, data.as_mut_ptr() as *const libc::c_void, data.len()) };
+			if n >= 0 {
+				continue;
 			}
+			let err = std::io::Error::last_os_error();
+			assert_eq!(
+				err.kind(),
+				std::io::ErrorKind::WouldBlock,
+				"管道应被填满 (EAGAIN), 实际: {err}"
+			);
+			break;
 		}
 		// 管道已满: poll(POLLOUT) 报告不可写 -> 丢弃字节 (返回 0), 且不阻塞.
 		assert_eq!(try_write_fd(w, b'x'), 0, "满管道必须丢弃而非阻塞");

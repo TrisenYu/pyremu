@@ -1,3 +1,6 @@
+## make LLVM=1 HOSTCC=gcc ARCH=riscv LLVM_PREFIX=/opt/custom-llvm/bin/ PATH="/opt/custom-llvm/bin:$PATH" CROSS_COMPILE=riscv64-unknown-linux-gnu- -j8
+# make HOSTCC=gcc ARCH=riscv CROSS_COMPILE=riscv64-linux-gnu- -j8
+
 #
 # Automatically generated file; DO NOT EDIT.
 # Linux/riscv 7.2.0-rc2 Kernel Configuration

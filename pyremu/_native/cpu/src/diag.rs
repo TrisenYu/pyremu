@@ -5,10 +5,11 @@
 //! call sites stay clean (no ``#[cfg]`` at every caller) and the compiler
 //! eliminates the dead stores.
 #[cfg(feature = "diagnostic")]
-use std::sync::atomic::{AtomicU32, Ordering};
-#[cfg(feature = "diagnostic")]
 use std::io::Write;
+#[cfg(feature = "diagnostic")]
+use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::pmp::PmpCtx;
 use crate::state::{HartDiag, HartState};
 use crate::translate::WalkCtx;
 // ============================================================
@@ -84,6 +85,80 @@ pub fn msie_cleared_at(_diag: &mut HartDiag, _pc: u64) {
 	#[cfg(feature = "diagnostic")]
 	{
 		_diag.msie_cleared_at_pc = _pc;
+	}
+}
+
+// ============================================================
+//  取指故障上下文
+// ============================================================
+
+/// 取指故障 (INSTR_ACCESS_FAULT) 的完整判定上下文: 翻译结果, itlb 同 VPN 条目,
+/// 以及全部 PMP 条目. 用于区分「翻译出的物理页错误」与「PMP 未覆盖正确物理页」.
+///
+/// 由 ``PYREMU_TRACE_FETCH=N`` 门控 (记录前 N 次故障), 写 PYREMU_DIAG_LOG.
+#[inline(always)]
+#[allow(unused)]
+#[allow(dead_code)]
+pub fn fetch_fault(_state: &HartState, _pmp: &PmpCtx, _pc: u64, _pa: u64, _reason: &str) {
+	#[cfg(feature = "diagnostic")]
+	{
+		static REMAINING: AtomicU32 = AtomicU32::new(u32::MAX);
+		let v = REMAINING.load(Ordering::Relaxed);
+		let remaining = if v == u32::MAX {
+			let init: u32 = std::env::var("PYREMU_TRACE_FETCH")
+				.ok()
+				.and_then(|s| s.parse().ok())
+				.unwrap_or(0);
+			REMAINING.store(init, Ordering::Relaxed);
+			init
+		} else {
+			v
+		};
+		if remaining == 0 {
+			return;
+		}
+		REMAINING.store(remaining - 1, Ordering::Relaxed);
+
+		log_line(&format!(
+			"[fetch-fault] reason={} pc={:#x} pa={:#x} mode={} mmu={} mdid={} split={} \
+             satp={:#x} mstatus={:#x}",
+			_reason,
+			_pc,
+			_pa,
+			_state.mode,
+			_state.mmu_mode,
+			_state.mdid,
+			_state.pmpsplit,
+			_state.satp,
+			_state.mstatus,
+		));
+		// 同一 VPN 的 itlb 条目: 若其页帧与 pa 一致, 即故障源于 TLB 命中的旧翻译.
+		let vpn = _pc >> 12;
+		for (i, e) in _state.itlb.iter().enumerate() {
+			if e.valid != 0 && e.vpn == vpn {
+				log_line(&format!(
+					"[fetch-fault] itlb[{}] vpn={:#x} ppn={:#x} level={} perm={:#x} \
+                     mdid={} asid={} dirty={}",
+					i, e.vpn, e.ppn, e.level, e.perm, e.mdid, e.asid, e.dirty
+				));
+			}
+		}
+		// 同 VPN 的 dtlb 条目 (取指命中 itlb, 但对照可见两表是否同期刷新).
+		for (i, e) in _state.dtlb.iter().enumerate() {
+			if e.valid != 0 && e.vpn == vpn {
+				log_line(&format!(
+					"[fetch-fault] dtlb[{}] vpn={:#x} ppn={:#x} level={} perm={:#x} \
+                     mdid={} asid={} dirty={}",
+					i, e.vpn, e.ppn, e.level, e.perm, e.mdid, e.asid, e.dirty
+				));
+			}
+		}
+		let num = _pmp.num as usize;
+		for i in 0..num {
+			let cfg = unsafe { *_pmp.cfg.add(i) };
+			let addr = unsafe { *_pmp.addr.add(i) };
+			log_line(&format!("[fetch-fault] pmp[{}] cfg={:#04x} addr={:#x}", i, cfg, addr));
+		}
 	}
 }
 
@@ -184,10 +259,7 @@ pub fn sret_to_umode(_state: &HartState, _ctx: &WalkCtx) {
 #[inline(always)]
 #[allow(unused)]
 #[allow(dead_code)]
-fn read_user_stack_from_sp(
-	_state: &HartState,
-	_ctx: &WalkCtx,
-) -> [u64; 64] {
+fn read_user_stack_from_sp(_state: &HartState, _ctx: &WalkCtx) -> [u64; 64] {
 	let mut out = [0u64; 64];
 	let sp = _state.gprs[2];
 	for i in 0..64u64 {

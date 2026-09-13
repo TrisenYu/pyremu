@@ -20,7 +20,7 @@ use core::cell::Cell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::mmu::{pte_parse, sv39_decompose_va};
-use crate::state::{riscv_mode, HartState, TlbEntry, TLB_ENTRIES};
+use crate::state::{riscv_mode, HartState, TlbEntry, CFG_NO_TLB, TLB_ENTRIES};
 
 // ============================================================
 //  Page-table walk context
@@ -878,23 +878,6 @@ pub fn translate_va(
 		(&mut state.dtlb, &ctx.dtlb_hand)
 	};
 
-	// ---- TLB bypass (PYREMU_NO_TLB=1) ----
-	// Force page walk on every translation, identical to NO_L2 for L2 cache.
-	static NO_TLB: AtomicU64 = AtomicU64::new(u64::MAX);
-	let no_tlb = {
-		let v = NO_TLB.load(Ordering::Relaxed);
-		if v == u64::MAX {
-			let val: u64 = std::env::var("PYREMU_NO_TLB")
-				.ok()
-				.and_then(|s| s.parse().ok())
-				.unwrap_or(0);
-			NO_TLB.store(val, Ordering::Relaxed);
-			val
-		} else {
-			v
-		}
-	};
-
 	// ---- TLB lookup ----
 	let asid = ((state.satp >> 44) & 0xFFFF) as u16;
 
@@ -909,7 +892,10 @@ pub fn translate_va(
 		Some(unsafe { &*ctx.tlb_gen }.load(Ordering::Acquire))
 	};
 
-	let reuse_idx = if no_tlb != 0 {
+	let reuse_idx = if CFG_NO_TLB {
+		// 启用后完全停用 TLB: 既不查询也不填充, 每次地址翻译都完整遍历 Sv39
+		// 页表, 用于隔离地址翻译相关的性能问题. 该常量由 emu-configs.mk 经
+		// Makefile 生成到 configs_gen.rs, 与 Python 侧的 CFG_NO_TLB 同源.
 		None
 	} else {
 		match tlb_probe(
@@ -954,8 +940,8 @@ pub fn translate_va(
 		}
 	};
 
-	// ---- Insert into TLB (only if gen is still valid) ----
-	if gen_valid {
+	// ---- Insert into TLB (only if gen is still valid and TLB is enabled) ----
+	if gen_valid && !CFG_NO_TLB {
 		let tlb_mut = if is_execute {
 			&mut state.itlb
 		} else {
@@ -1239,7 +1225,7 @@ mod tests {
 	fn sv39_walk_allows_fetch_of_xonly_leaf() {
 		// 回归: X-only 页 (R=0, W=0, X=1) 必须允许取指.
 		// 修复前 walk_l0 对取指也强制 PTE_R, 使 runtime 的 X-only text
-		// (trap_vector 高 VA 映射) 取指被误判 InstrPageFault → Batch-20 trap loop.
+		// (trap_vector 高 VA 映射) 取指被误判 InstrPageFault -> Batch-20 trap loop.
 		let mut ram = vec![0u8; 0x3000];
 		let va = 0xffff_ffe0_0000_1000u64; // 与 enclave trap_vector 同型的高 VA
 		let pa = 0x8ae0_1000u64;
@@ -1271,14 +1257,14 @@ mod tests {
 
 		// 数据读 (is_execute=false, is_write=false): R=0 页不可读, 仍应失败.
 		let load = sv39_walk(&ctx, satp, va, false, false);
-		assert!(
-			load.is_none(),
-			"X-only leaf 数据读仍应被拒绝 (需要 PTE_R)"
-		);
+		assert!(load.is_none(), "X-only leaf 数据读仍应被拒绝 (需要 PTE_R)");
 
 		// 写 (is_write=true): R&W 均缺, 仍应失败.
 		let store = sv39_walk(&ctx, satp, va, true, false);
-		assert!(store.is_none(), "X-only leaf 写仍应被拒绝 (需要 PTE_R|PTE_W)");
+		assert!(
+			store.is_none(),
+			"X-only leaf 写仍应被拒绝 (需要 PTE_R|PTE_W)"
+		);
 	}
 
 	#[test]

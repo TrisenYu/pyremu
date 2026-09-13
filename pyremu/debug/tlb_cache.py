@@ -165,7 +165,7 @@ class TlbCacheMixin(SharedMixinAttrs):
             st_str, _, ed_str = arg.partition("-")
             st, ed = int(st_str, 0), int(ed_str, 0)
             if st < 0 or ed <= st:
-                self._err(f"范围需满足 0 ≤ start < end, 得到 {st}-{ed}")
+                self._err(f"范围需满足 0 <= start < end, 得到 {st}-{ed}")
                 return
             self._show_tlb("ITLB", h.itlb, start_entry=st, end_entry=ed)
             self._show_tlb("DTLB", h.dtlb, start_entry=st, end_entry=ed)

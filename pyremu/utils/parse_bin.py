@@ -135,7 +135,7 @@ def _parse_symtab_raw(
 ) -> tuple[dict[str, int], list[tuple[int, int, str]]]:
     """直接从 ELF 文件解析 .symtab + .strtab, 不依赖 LIEF.
 
-    绕过 LIEF (≤0.17) 的 1,000,000 符号默认上限.
+    绕过 LIEF (<=0.17) 的 1,000,000 符号默认上限.
     大文件 (~1.8M 符号) 约 0.5s.
 
     Args:

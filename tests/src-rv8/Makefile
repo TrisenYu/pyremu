@@ -25,9 +25,9 @@ ifeq ($(TARGET),host)
 	STRIP   = strip
 else
 	OUT_DIR = bin/riscv64
-	CC      = /opt/custom-llvm/bin/clang
-	CXX     = /opt/custom-llvm/bin/clang++
-	STRIP   = /opt/custom-llvm/bin/llvm-strip
+	CC      = clang
+	CXX     = clang++
+	STRIP   = llvm-strip
 endif
 
 PROGRAMS   = aes bigint dhrystone miniz norx primes qsort sha512

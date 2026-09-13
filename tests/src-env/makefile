@@ -1,8 +1,7 @@
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 # 测试汇编构建 — dispatches to subdirectory builds.
 
-custom_bin_dir=/opt/custom-llvm/bin
 elf_dir=../../build/elf
 
 phony = all

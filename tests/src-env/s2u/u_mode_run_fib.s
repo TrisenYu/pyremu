@@ -1,4 +1,4 @@
-// SPDX-LICENSE-IDENTIFIER: GPL2.0
+// SPDX-LICENSE-IDENTIFIER: MIT
 // (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 // M -> S -> U 特权级切换 + Sv39 栈保护 + UART 输入 + 递归 Fibonacci.

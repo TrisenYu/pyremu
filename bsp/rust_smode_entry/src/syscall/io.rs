@@ -1,45 +1,51 @@
-//! I/O 类系统调用: read(63), write(64), writev(66), close(57), lseek(62)。
+//! 控制台底层 I/O 原语。
+//!
+//! 文件描述符 0/1/2 为控制台 (标准输入/输出/错误), 由 fs.rs 的文件系统层在
+//! 处理 read/write/writev/readv/ppoll 时特殊路由到这里; 本模块只提供两块最底层的
+//! 搬运原语与输入源, 不持有任何 fd 状态。输入源是恒为空的内建桩, 见 uart_getc。
 
-use crate::uart;
+use crate::ecall_aux;
 
-use super::ENOSYS;
+/// 控制台写入的分块字节数。
+const CONSOLE_CHUNK: usize = 256;
 
-// ---------------------------------------------------------------
-//  辅助
-// ---------------------------------------------------------------
-
-#[inline]
-fn is_stdio(fd: u64) -> bool {
-    fd <= 2
+/// 非阻塞接收一个字节。
+///
+/// 飞地没有字符输入源: SBI legacy 不提供非阻塞 RX, 也未定义可用的输入 ecall。
+/// 恒返回 None (无数据), 由调用方按文件结束处理。若改为 panic 或空转,
+/// 任何读取标准输入的载荷都会挂死而不是正常结束。
+#[allow(unused)]
+fn uart_getc() -> Option<u8> {
+    None
 }
 
-// ---------------------------------------------------------------
-//  write handler (64)
-// ---------------------------------------------------------------
-
-pub fn write_handler(fd: u64, buf: *const u8, len: u64) -> u64 {
-    if fd != 1 && fd != 2 {
-        return ENOSYS;
-    }
-
-    let mut written = 0;
-    while written < len {
-        let b = unsafe { buf.add(written as usize).read_volatile() };
-        uart::uart_putc(b);
-        written += 1;
+/// 把 *len* 个字节送交控制台。逐块拷贝到运行时栈上再经 DBCN 输出:
+/// DBCN 把缓冲区地址按物理地址解释, 而载荷缓冲区是只在其自身页表中有效的
+/// U 模式虚拟地址, 直接传入会落到无关物理内存。拷进栈缓冲后地址由
+/// va_to_pa 折算, 与运行时自身的诊断输出走同一条已验证的路径。
+/// 每块一次 ecall, 由 M-mode 的控制台锁保证整块原子写出, 不与其他 hart 交织。
+pub(crate) unsafe fn console_write_bytes(buf: *const u8, len: u64) -> u64 {
+    let mut chunk = [0u8; CONSOLE_CHUNK];
+    let mut off: u64 = 0;
+    while off < len {
+        let n = core::cmp::min(CONSOLE_CHUNK as u64, len - off) as usize;
+        for i in 0..n {
+            chunk[i] = unsafe { buf.add((off + i as u64) as usize).read_volatile() };
+        }
+        ecall_aux::sbi_console_write(&chunk[..n]);
+        off += n as u64;
     }
     len
 }
 
-// ---------------------------------------------------------------
-//  read handler (63)
-// ---------------------------------------------------------------
-
-/// 从 UART 阻塞读取字节到 buf，遇换行或满 len 返回。
-unsafe fn read_stdin(buf: *mut u8, len: u64) -> u64 {
+/// 从控制台读取字节到 buf, 遇换行或满 len 返回。
+///
+/// 输入源耗尽 (飞地没有字符输入通道) 时立即返回已读字节数的 0 值, 即文件结束,
+/// 使读取方按 EOF 收尾而不是停留在等待中。
+pub(crate) unsafe fn read_stdin(buf: *mut u8, len: u64) -> u64 {
     let mut count = 0;
     while count < len {
-        match uart::uart_getc() {
+        match uart_getc() {
             Some(b) => {
                 unsafe { buf.add(count as usize).write_volatile(b) };
                 count += 1;
@@ -47,57 +53,8 @@ unsafe fn read_stdin(buf: *mut u8, len: u64) -> u64 {
                     break;
                 }
             }
-            None => continue,
+            None => break,
         }
     }
     count
-}
-
-pub fn read_handler(fd: u64, buf: *mut u8, len: u64) -> u64 {
-    if !is_stdio(fd) {
-        return ENOSYS;
-    }
-    if fd != 0 {
-        return ENOSYS;
-    }
-    unsafe { read_stdin(buf, len) }
-}
-
-// ---------------------------------------------------------------
-//  writev handler (66) — musl __stdio_write 使用 writev 而非 write
-// ---------------------------------------------------------------
-
-pub fn writev_handler(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
-    if fd != 1 && fd != 2 {
-        return ENOSYS;
-    }
-
-    let mut total: u64 = 0;
-    for i in 0..iovcnt {
-        let slot = iov_ptr.wrapping_add(i.wrapping_mul(16));
-        let iov_base = unsafe { (slot as *const u64).read_volatile() };
-        let iov_len = unsafe { (slot.wrapping_add(8) as *const u64).read_volatile() };
-        for j in 0..iov_len {
-            let b = unsafe { (iov_base as *const u8).add(j as usize).read_volatile() };
-            uart::uart_putc(b);
-        }
-        total = total.wrapping_add(iov_len);
-    }
-    total
-}
-
-// ---------------------------------------------------------------
-//  close handler (57)
-// ---------------------------------------------------------------
-
-pub fn close_handler(_fd: u64) -> u64 {
-    0 // 飞地无 fd 管理，直接返回成功
-}
-
-// ---------------------------------------------------------------
-//  lseek handler (62)
-// ---------------------------------------------------------------
-
-pub fn lseek_handler(_fd: u64, _offset: u64, _whence: u64) -> u64 {
-    0 // musl __stdio_exit flush 后调, 返回 0 即可
 }

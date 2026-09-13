@@ -16,11 +16,10 @@ from typing import Callable
 
 from pyremu._native import (
     native_available,
-    pte_assemble_pa as _native_pte_assemble_pa,
-    pte_parse as _native_pte_parse,
-    sv39_decompose_va as _native_sv39_decompose_va,
+    pte_assemble_pa,
+    pte_parse,
+    sv39_decompose_va as native_sv39_decompose_va,
 )
-
 from pyremu.utils.mask import mask64
 
 # ============================================================
@@ -267,7 +266,7 @@ _NATIVE_MMU = native_available()
 def _sv39_vpn(va: int) -> tuple:
     """将 39 位虚拟地址分解为 (vpn2, vpn1, vpn0)."""
     if _NATIVE_MMU:
-        v = _native_sv39_decompose_va(va)
+        v = native_sv39_decompose_va(va)
         return v.vpn2, v.vpn1, v.vpn0
     return (
         (va >> 30) & 0x1FF,
@@ -316,7 +315,7 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
     raw = _read_pte(table_addr + vpn[0] * 8, mem_read_phy)
 
     if _NATIVE_MMU:
-        l1 = _native_pte_parse(raw)
+        l1 = pte_parse(raw)
         if not l1.is_ptr:
             return False, 0, 0, 0
     else:
@@ -330,12 +329,12 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
     raw = _read_pte(table_addr + vpn[1] * 8, mem_read_phy)
 
     if _NATIVE_MMU:
-        l2 = _native_pte_parse(raw)
+        l2 = pte_parse(raw)
         if not l2.v:
             return False, 0, 0, 0
         if l2.is_leaf:
             # 2 MiB 大页 — Rust 计算合并 PPN
-            ppn = _native_pte_assemble_pa(l2.ppn, va, level=1) >> 12
+            ppn = pte_assemble_pa(l2.ppn, va, level=1) >> 12
             return True, ppn, l2.perm, 2 * 1024 * 1024
         if not l2.is_ptr:
             return False, 0, 0, 0
@@ -354,7 +353,7 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
     raw = _read_pte(table_addr + vpn[2] * 8, mem_read_phy)
 
     if _NATIVE_MMU:
-        l3 = _native_pte_parse(raw)
+        l3 = pte_parse(raw)
         if not l3.v or not l3.is_leaf:
             return False, 0, 0, 0
         return True, l3.ppn, l3.perm, PAGE_SIZE

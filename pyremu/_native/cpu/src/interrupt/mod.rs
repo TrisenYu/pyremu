@@ -2,7 +2,8 @@ pub(crate) mod clint;
 pub(crate) mod imsic;
 pub(crate) mod wfi;
 
-use crate::concurrent::{ConcurrentClintCtx, FfiExtIrqCtx};
+use crate::concurrent::ConcurrentClintCtx;
+use crate::ffi::FfiExtIrqCtx;
 use crate::state::{riscv_mode, HartState};
 use std::sync::atomic::Ordering;
 
@@ -34,16 +35,16 @@ pub(crate) fn check_pending_interrupts(state: &HartState) -> Option<(u64, bool)>
 	//
 	// 委派完全遵循 mideleg (与 Python check_pending_interrupts 一致):
 	// 任一中断只要 mideleg 对应位置位, 就按 S 级中断处理 —
-	//    S/U 模式 + S 级全局使能 → 投递到 S 模式
-	//    M 模式 → 保持挂起 (委派中断永不投递到 M 模式, 等 hart 降到 S/U)
+	//    S/U 模式 + S 级全局使能 -> 投递到 S 模式
+	//    M 模式 -> 保持挂起 (委派中断永不投递到 M 模式, 等 hart 降到 S/U)
 	// mideleg 位清零的中断 (如 OpenSBI 复位默认 0) 一律投递到 M 模式.
 	//
 	// 早期实现将 MEI/MSI/MTI 硬编码为不可委派 ("M-mode first" 模型,
 	// 给 OpenSBI 的 M 模式定时器处理 + 软件注入 STI 用). 但这不符合
 	// RISC-V 规范 §3.1.9 — mideleg[7] 置位时 MTI 必须能直接委派为 STI
-	// 投递到 S 模式. 硬编码导致裸核内核 (设 mideleg=0x80 期待 MTI→STI)
-	// 在 native 模式下 MTI 永远进 M 模式: m_trap_handler skip+4 → mret →
-	// MTIP 仍悬置 → 死循环. 改为按 mideleg 动态判定.
+	// 投递到 S 模式. 硬编码导致裸核内核 (设 mideleg=0x80 期待 MTI->STI)
+	// 在 native 模式下 MTI 永远进 M 模式: m_trap_handler skip+4 -> mret ->
+	// MTIP 仍悬置 -> 死循环. 改为按 mideleg 动态判定.
 	let checks: [(u64, u64); 6] = [
 		(MIE_MEIE, 11),
 		(MIE_MSIE, 3),
@@ -101,7 +102,7 @@ pub(crate) fn check_pending_interrupts(state: &HartState) -> Option<(u64, bool)>
 pub(crate) fn compute_mtopi(state: &mut HartState, _mtime: u64) -> (u64, u8) {
 	let mip_mie = state.mip.load(Ordering::Acquire) & state.mie;
 
-	// 1. IMSIC M-file: ALL interrupts (IPI + external) → IID=11 (MEI major
+	// 1. IMSIC M-file: ALL interrupts (IPI + external) -> IID=11 (MEI major
 	//    identity).  The IMSIC IPI is delivered via MEIP exactly like an
 	//    external interrupt — its minor identity (1) is NOT a major identity.
 	//    Per QEMU's riscv_imsic_update, every pending IMSIC interrupt raises
@@ -113,7 +114,7 @@ pub(crate) fn compute_mtopi(state: &mut HartState, _mtime: u64) -> (u64, u8) {
 		let prio = raw & 0xFF;
 		return ((11u64 << 16) | prio, 0);
 	}
-	// 2. MSIP → IID=3 (IRQ_M_SOFT)
+	// 2. MSIP -> IID=3 (IRQ_M_SOFT)
 	if (mip_mie & (1 << 3)) != 0 {
 		let val = 3u64 << 16 | 1;
 		// Clear MSIP now — sbi_ipi_raw_clear(false) is a no-op in AIA
@@ -121,7 +122,7 @@ pub(crate) fn compute_mtopi(state: &mut HartState, _mtime: u64) -> (u64, u8) {
 		state.mip.fetch_and(!(1 << 3), Ordering::AcqRel);
 		return (val, 0);
 	}
-	// 3. MTIP → IID=7 (IRQ_M_TIMER)
+	// 3. MTIP -> IID=7 (IRQ_M_TIMER)
 	if (mip_mie & (1 << 7)) != 0 {
 		let val = 7u64 << 16 | 1;
 		return (val, 0);
@@ -143,7 +144,7 @@ pub(crate) fn compute_mtopi(state: &mut HartState, _mtime: u64) -> (u64, u8) {
 pub(crate) fn compute_stopi(state: &mut HartState, mtime: u64) -> (u64, u8) {
 	let mip_mie = state.mip.load(Ordering::Acquire) & state.mie;
 
-	// 1. IMSIC S-file: ALL interrupts (IPI + external) → IID=9 (SEI major
+	// 1. IMSIC S-file: ALL interrupts (IPI + external) -> IID=9 (SEI major
 	//    identity).  The IMSIC IPI is delivered via SEIP exactly like an
 	//    external interrupt — its minor identity (1) is NOT a major identity.
 	//    Per QEMU's riscv_imsic_update, every pending IMSIC interrupt raises
@@ -155,22 +156,22 @@ pub(crate) fn compute_stopi(state: &mut HartState, mtime: u64) -> (u64, u8) {
 		let prio = raw & 0xFF;
 		return ((9u64 << 16) | prio, 0);
 	}
-	// 2. SSIP → IID=1 (IRQ_S_SOFT)
+	// 2. SSIP -> IID=1 (IRQ_S_SOFT)
 	if (mip_mie & (1 << 1)) != 0 {
 		let val = 1u64 << 16 | 1;
 		// Clear SSIP now — mirrors compute_mtopi's MSIP clearing.
-		// In AIA mode SSIP comes from the IMSIC S-file (eip[1] → STOPEI claim),
+		// In AIA mode SSIP comes from the IMSIC S-file (eip[1] -> STOPEI claim),
 		// but when falling through to this legacy path the bit must be cleared
 		// to prevent re-delivery.
 		state.mip.fetch_and(!(1 << 1), Ordering::AcqRel);
 		return (val, 0);
 	}
-	// 3. STIP → IID=5 (IRQ_S_TIMER)
+	// 3. STIP -> IID=5 (IRQ_S_TIMER)
 	//
 	// 与 sync_mtip 活跃分支一致的判定: 已设定 deadline (write_stimecmp 写入
 	// 未来值) 时按本 hart 指令计数空间判定, 与共享 mtime 跨 batch 膨胀解耦 —
 	// 否则其他活跃 hart 的进度会把刚 claim 后 bump 到 mtime+4 的 stimecmp
-	// 重新推成"已到期", stopi 立即再次报告 STI → 活锁。
+	// 重新推成"已到期", stopi 立即再次报告 STI -> 活锁。
 	// 未设定 deadline (deadline==0, Python 步骤路径/写入即到期) 时退化为
 	// 共享比较 (旧行为)。claim 路径 (csrw stopi IID=5) bump stimecmp 后经
 	// write_stimecmp 设定 deadline, 故 stopi 在 claim 后的重读回到 0。
@@ -256,7 +257,8 @@ pub(crate) fn sync_ext_irq_mip(state: &mut HartState, ext_irq: *mut FfiExtIrqCtx
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::concurrent::{ConcurrentClintCtx, FfiExtIrqCtx};
+	use crate::concurrent::ConcurrentClintCtx;
+use crate::ffi::FfiExtIrqCtx;
 	use crate::state::{riscv_mode, HartState};
 	use std::cell::Cell;
 	use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -362,9 +364,9 @@ mod tests {
 
 	/// Regression: MTI (cause 7) 在 mideleg[7]=1 时必须按 S 级中断 (STI) 投递到
 	/// S 模式, 而不是硬编码投递到 M 模式. 早期 "M-mode first" 模型将
-	/// MEI/MSI/MTI 硬编码为不可委派: 裸核内核设 mideleg=0x80 期待 MTI→STI,
-	/// 但 native 模式 MTI 永远进 M 模式 → m_trap_handler skip+4 → mret →
-	/// MTIP 仍悬置 → 死循环. 修复后 check_pending_interrupts 按 mideleg 动态判定
+	/// MEI/MSI/MTI 硬编码为不可委派: 裸核内核设 mideleg=0x80 期待 MTI->STI,
+	/// 但 native 模式 MTI 永远进 M 模式 -> m_trap_handler skip+4 -> mret ->
+	/// MTIP 仍悬置 -> 死循环. 修复后 check_pending_interrupts 按 mideleg 动态判定
 	/// (RISC-V 规范 §3.1.9).
 	#[test]
 	fn mti_delegated_to_s_when_mideleg_set() {
@@ -387,7 +389,7 @@ mod tests {
 		assert_eq!(
 			state.mode,
 			riscv_mode::S,
-			"委派中断应投递到 S 模式而非 M 模式 (修复前硬编码投递 M → 死循环)"
+			"委派中断应投递到 S 模式而非 M 模式 (修复前硬编码投递 M -> 死循环)"
 		);
 		assert_eq!(state.pc, 0x80004000, "应跳转 stvec (S 模式 handler)");
 		assert_eq!(state.scause, mcause_val(7, true), "scause 应为 STI");
@@ -439,7 +441,10 @@ mod tests {
 		legacy.imsic_m.present = 0;
 		legacy.imsic_s.present = 0;
 		legacy.mip.store(0, Ordering::Release);
-		assert!(sync_ext_irq_mip(&mut legacy, ext_ptr), "legacy 模式 ext_irq 应被消费");
+		assert!(
+			sync_ext_irq_mip(&mut legacy, ext_ptr),
+			"legacy 模式 ext_irq 应被消费"
+		);
 		assert_ne!(
 			legacy.mip.load(Ordering::Acquire) & (1 << 11),
 			0,
@@ -458,7 +463,10 @@ mod tests {
 		aia.imsic_s.present = 1;
 		aia.imsic_s.eidelivery = 1;
 		aia.mip.store(0, Ordering::Release);
-		assert!(sync_ext_irq_mip(&mut aia, ext_ptr), "AIA 模式 ext_irq 应被消费");
+		assert!(
+			sync_ext_irq_mip(&mut aia, ext_ptr),
+			"AIA 模式 ext_irq 应被消费"
+		);
 		assert_eq!(
 			aia.mip.load(Ordering::Acquire) & ((1 << 11) | (1 << 9)),
 			0,
@@ -472,11 +480,15 @@ mod tests {
 		aia_off.imsic_s.present = 1;
 		aia_off.imsic_s.eidelivery = 0;
 		aia_off.mip.store(0, Ordering::Release);
-		assert!(sync_ext_irq_mip(&mut aia_off, ext_ptr), "eidelivery=0 时 ext_irq 应被消费");
+		assert!(
+			sync_ext_irq_mip(&mut aia_off, ext_ptr),
+			"eidelivery=0 时 ext_irq 应被消费"
+		);
 		assert_ne!(
 			aia_off.mip.load(Ordering::Acquire) & (1 << 9),
 			0,
 			"eidelivery=0 时 ext_irq 应内联置位 SEIP (回退 legacy 线路)"
 		);
 	}
+
 }

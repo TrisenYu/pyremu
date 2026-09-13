@@ -42,7 +42,7 @@ from pyremu import configs_gen
 class InterruptMode(Enum):
     """中断子系统模式."""
     LEGACY = "legacy"  # CLINT (MSIP+MTIP) + PLIC (MEIP+SEIP)
-    AIA = "aia"        # CLINT (MTIP only) + IMSIC (MSIP+MEIP+SEIP) + APLIC (wired→MSI)
+    AIA = "aia"        # CLINT (MTIP only) + IMSIC (MSIP+MEIP+SEIP) + APLIC (wired->MSI)
 
 
 COMPILE_OPTS: str = "rv64imacfd_sstc_zicsr_zifencei"

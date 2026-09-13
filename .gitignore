@@ -1,31 +1,39 @@
-# Python-generated files
-*.py[oc]
-wheels/
+# files should be invisible
+*.bin
 *.egg-info
-*.prof
-# Native extension build artifacts (platform-specific, not committed)
-*.so
+*.elf
+*.exe
 *.dll
 *.dylib
-*.pyd
+*.ll
+*.prof
+*.py[cdo]
+*.o
+*.[ks]o
+
 **/bin/
 **/build/
+# Generated config
+**/configs_gen.*
 **/dist/
 **/target/
 **/*node_modules
 **/__pycache__/
+**/wheels/
 # serial log output
 **/output/
 
+to-read/*
+
 # Virtual environments
 .DS_Store
-.venv
-.vscode
-.pytest_cache
-.ruff_cache
+.venv/
+.vscode/
+.pytest_cache/
+.ruff_cache/
 .coverage
-.claude
-.codex
+.claude/
+.codex/
 
 vendor/*
 !vendor/riscv-tests
@@ -34,19 +42,8 @@ vendor/*
 
 bsp/*
 !bsp/rust_smode_entry/
-!bsp/rust_payloads/
+!bsp/tee_aux_tools/
 !bsp/kei-boot/
-!bsp/setup-rootfs/
-# Large build artifacts (bsp)
-bsp/setup-rootfs/debootstrap/riscv-sd.ext4
-bsp/setup-rootfs/debootstrap/debian-riscv-initrd.cpio.gz
-bsp/setup-rootfs/debootstrap/tmp-rootfs/
-bsp/setup-rootfs/busybox-1.38.0/
+!bsp/setup-rootfs/local-build.sh
 !bsp/.linux-config
-!bsp/tee_enclave_drv
-
-to-read/*
-
-# Generated config
-pyremu/configs_gen.py
-pyremu/_native/cpu/src/config_gen.rs
+!bsp/build-*.sh

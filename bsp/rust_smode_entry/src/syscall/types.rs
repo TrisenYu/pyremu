@@ -15,6 +15,7 @@ pub struct Timeval {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Timespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,

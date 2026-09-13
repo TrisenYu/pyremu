@@ -1,13 +1,12 @@
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 # 测试固件构建 — 统一入口, 由顶层 makefile 的 `make test` 自动调用.
 
-custom_bin_dir = /opt/custom-llvm/bin
 tests_dir      = build
 elf_dir        = $(tests_dir)/elf
 bin_dir        = $(tests_dir)/firm-bin
-llvm_mc  = $(custom_bin_dir)/llvm-mc
-lld      = $(custom_bin_dir)/ld.lld
+llvm_mc  = llvm-mc
+lld      = ld.lld
 ASFLAGS  = --arch=riscv64 --triple=riscv64 --mattr=+m,+a
 
 

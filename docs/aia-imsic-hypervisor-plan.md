@@ -19,7 +19,7 @@ pyremu/
 ```
 
 **一条配置，两侧消费**：
-- **Rust**: `build.rs` → `toml` crate 解析 → 写入 `OUT_DIR/config_gen.rs` → `include!` 宏嵌入
+- **Rust**: `build.rs` -> `toml` crate 解析 -> 写入 `OUT_DIR/config_gen.rs` -> `include!` 宏嵌入
 - **Python**: `tomllib` (标准库 3.11+) 直接读取 TOML，无需代码生成
 
 ## 配置文件 (config/qemu_virt.toml)
@@ -220,7 +220,7 @@ class PlatformConfig:
         )
 ```
 
-**不再需要** Python 侧生成常量文件 — Python 代码和 Rust `build.rs` 从**同一份 TOML** 各自提取所需信息。修改配置只需编辑 TOML → 重新 `cargo build`。
+**不再需要** Python 侧生成常量文件 — Python 代码和 Rust `build.rs` 从**同一份 TOML** 各自提取所需信息。修改配置只需编辑 TOML -> 重新 `cargo build`。
 
 ## CLINT+PLIC 与 AIA 的共存 (编译时确定)
 
@@ -228,12 +228,12 @@ class PlatformConfig:
 |------|-------------|-----------|
 | IPI | CLINT MSIP (`CLINT_BASE + 4*hid`) | IMSIC `seteipnum` (`IMSIC_BASE + hid*stride`) |
 | 定时器 | CLINT MTIMECMP + mtime | Sstc `stimecmp` + mtime (共享) |
-| 外部中断 | PLIC claim/complete | APLIC → IMSIC MSI |
+| 外部中断 | PLIC claim/complete | APLIC -> IMSIC MSI |
 | 优先级 | PLIC priority | IMSIC `eithreshold` |
 | Rust 同步函数 | `sync_msip()` / `sync_plic()` | `sync_imsic()` |
 | **编译产物差异** | 链接 `clint.rs` + `plic.rs` | 链接 `imsic.rs` + `aplic.rs` |
 
-`INTR_MODE` 是编译时常量 → `match` 表达式在优化后消除死分支 →
+`INTR_MODE` 是编译时常量 -> `match` 表达式在优化后消除死分支 ->
 legacy 模式的二进制不包含 IMSIC 代码，aia 模式不包含 CLINT MSIP/PLIC 代码。**零运行时开销**。
 
 ## 实施阶段
@@ -246,17 +246,17 @@ legacy 模式的二进制不包含 IMSIC 代码，aia 模式不包含 CLINT MSIP
 
 **0b. `build.rs` 代码生成器**:
 - 依赖: `toml` crate (build-dependency only)
-- 生成: `config_gen.rs` → `OUT_DIR`
+- 生成: `config_gen.rs` -> `OUT_DIR`
 - `cargo:rerun-if-changed` 指向 TOML 和 build.rs
 
 **0c. 重构现有 Rust 代码**:
 - 删除 `FfiClintCtx.base`, `FfiDevCtx.bases/ends`, `SharedMemCtx.ram_base` 等
-  运行时地址参数 → 替换为 `config_gen::CLINT_BASE` 等编译时常量
+  运行时地址参数 -> 替换为 `config_gen::CLINT_BASE` 等编译时常量
 - `ram_base` / `ram_size` 保留为运行时参数 (RAM 由 Python bytearray 提供,
   地址可能动态)
 
 **0d. Python 迁移**:
-- `PlatformConfig.from_toml()` → 用 `tomllib` 读配置
+- `PlatformConfig.from_toml()` -> 用 `tomllib` 读配置
 - 保留 `PlatformConfig` dataclass 作为运行时对象
 - 删除重复的预设常量
 
@@ -271,7 +271,7 @@ Rust 侧 `cpu/src/peripheral/imsic.rs`:
 
 Rust 侧 `cpu/src/peripheral/aplic.rs`:
 - `struct Aplic`: sourcecfg[N], target[N], setip/clrip, genmsi
-- `setip(source_id)` → 查 target → 写目标 hart IMSIC `seteipnum`
+- `setip(source_id)` -> 查 target -> 写目标 hart IMSIC `seteipnum`
 
 ### Phase 3: H-mode + 两阶段翻译 (~3 周)
 

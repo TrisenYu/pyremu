@@ -44,6 +44,48 @@ python examples/demo_emulator.py
 | **平台** | FDT 设备树生成, PlatformConfig 预设 (qemu_virt / sifive_u54) |
 
 
+## 项目结构
+
+```
+pyremu/
+├── emulator.py            多 hart 执行循环 (run: 并发加速执行; step: 逐指令交错, 停止条件)
+├── debugger.py            rvdb 交互式调试器入口
+├── platform.py            PlatformConfig 平台配置 (预设dataclass，一定程度支持从JSON/TOML/YAML解析得到)
+├── core/                  处理器核心: hart / decoder / trap_handler / mem_check_aux / 寄存器
+├── memory/                内存子系统: mmu (仅Sv39)/tlb/l2cache(MESI)/bus/pmp
+├── peripheral/            外设: uart / virtio_blk / spi / i2c / gpio / watchdog / termio
+├── interrupt/             中断: controller / clint / plic / aplic / imsic / aia
+├── utils/                 工具: disassem (反汇编) / parse_bin (固件解析) / dtb (设备树)
+├── debug/                 调试器实现 (REPL 命令分发, 栈回溯, 断点)
+├── env_inject/            运行时注入 (shellcode 预加载)
+└── _native/               Rust 并发执行引擎 (libdecode.so + libtermio.so)
+
+bsp/                       板级支持包
+├── rust_smode_entry/      S-mode 飞地运行时 (U-mode 系统调用 ->SBI ecall) 
+├── tee_aux_tools/         TEE 辅助工具源 (驱动 + /eval 评测套件)
+│   ├── linux-driver/        Linux 飞地内核驱动 (/dev/tee_enclave)
+│   ├── cache-probe-exploit/ TEE 评测套件 (缓存侧信道等, 部署为 /eval/cache-probe-exploit)
+│   └── stress-test/         TEE 压力测试套件 (部署为 /eval/stress-test)
+├── linux/                 内核源码树 (供驱动模块构建)
+├── musl-gc-sysroot/       musl sysroot 产物 (rv64gc/lp64d, 由 build-musl-sysroot.sh 生成)
+└── setup-rootfs/          根文件系统构建 (debootstrap + 测试程序/驱动打包)
+
+fn_apps/                   飞地可信应用载荷 (Rust + C, 静态 musl 链接)
+├── orbit/ chem/ graphene/ ising/ fem/ dsp/   Rust 计算载荷
+├── knots/                 C 计算载荷
+└── bin/                   构建产物 (供飞地加载)
+
+tests/                     pytest 套件 + 测试源码
+├── test_*.py              单元/集成测试 (trap / mmu / pmp / tlb / clint / emulator / debugger ...)
+└── src-*/                 src-env (汇编) / src-alg (算法基准) / src-rv8 (toy, 部署为 /eval/toy-progs)
+
+examples/                  编程式使用示例 (纯 Python API / M->S / S->U 演示)
+docs/                      设计文档与 CHANGELOG (CHANGELOG.md 为索引, 条目按月归档于 docs/changelogs/)
+tools/                     开发辅助脚本 (性能分析等)
+vendor/                    第三方子模块 (musl 等)
+```
+
+
 ## 交互式调试器 (rvdb)
 
 ```

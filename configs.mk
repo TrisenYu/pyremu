@@ -11,7 +11,7 @@ elf_dir     = $(bins_dir)/elf
 firm_dir    = $(bins_dir)/firm-bin
 linux_dir   = $(bsp_dir)/linux
 
-# ---- Native 加速库 (Rust cdylib -> ctypes) ----
+# ---- 执行加速库 (Rust cdylib -> ctypes) ----
 NATIVE_DIR     = pyremu/_native
 NATIVE_SO      = $(NATIVE_DIR)/libdecode.so
 TERMIO_SO      = $(NATIVE_DIR)/libtermio.so
@@ -35,8 +35,8 @@ fw_payload     = $(elf_dir)/custom_opensbi_fw_payload.elf
 fw_jump        = $(elf_dir)/custom_opensbi_fw_jump.elf
 fw_dynamic     = $(elf_dir)/custom_opensbi_fw_dynamic.elf
 
-# custom-opensbi
-# Rust S-mode 可信管理程序 (嵌入到固件 .coffer_enclave_man 段)
+# opensbi
+# Rust S-mode 可信管理程序 (相应的段将嵌入到固件)
 FW_SRC_DIR     = $(bsp_dir)/custom-opensbi
 RUST_SMODE_DIR = $(bsp_dir)/rust_smode_entry
 FW_BUILD_DIR   = $(FW_SRC_DIR)/build/platform/generic/firmware
@@ -49,10 +49,10 @@ pyargs = --ram-base=0x80000000 \
 	$(fw_payload)
 
 # ---- 固件构建 ----
-# 全量编译 custom-opensbi (generic 平台, 跳过 BSS 清零).
+# 全量编译 opensbi (generic 平台, 跳过 BSS 清零).
 # 依赖:
 #   - Rust S-mode runtime (嵌入 .coffer_enclave_man 段)
-#   - custom-opensbi 自身全部源码 (firmware/lib/include/platform/Kconfig/scripts)
+#   - opensbi 自身全部源码 (firmware/lib/include/platform/Kconfig/scripts)
 # 当任一依赖更新或产物缺失时自动触发 distclean + 全量重编译.
 FW_SRC_DEPS := $(FW_SRC_DIR)/Makefile
 FW_SRC_DEPS += $(shell find $(FW_SRC_DIR)/firmware $(FW_SRC_DIR)/lib -type f 2>/dev/null)
@@ -64,6 +64,12 @@ fw_basic_flag := PLATFORM=generic
 fw_basic_flag += PLATFORM_RISCV_XLEN=64
 fw_basic_flag += PLATFORM_RISCV_ABI=lp64
 fw_basic_flag += FW_SKIP_BSS_ZERO=1
+
+# 实验性调试扩展: make emu-linux-sh DBG_MEM_INTERACT=1 时开启 M-mode 侧内存
+# 申请/释放统计，这对应 lib/enclave_ext/Kconfig 的 CONFIG_DBG_MEM_INTERACT
+# 该开关在 makefile 的 opensbi 构建规则中把 CONFIG_DBG_MEM_INTERACT=y 注入平台
+# defconfig, 经 distclean 后重新生成的 .config 生效; 置 0 时设置为n/完整移除.
+DBG_MEM_INTERACT ?= 0
 
 # 仅当 configs.mk / 命令行显式定义了保留内存区域时才覆盖 Kconfig 默认值.
 ifdef RESERVED_MEM_BASE
@@ -97,6 +103,7 @@ fw_jump_elf      = $(elf_dir)/custom_opensbi_fw_jump.elf
 ROOTFS_DIR ?= $(bsp_dir)/rootfs
 INITRAMFS   = $(bins_dir)/initramfs.cpio.gz
 INITRD     ?=
+
 # DISK: virtio-blk 磁盘镜像 (ext4/raw), 挂载为 /dev/vda。默认指向 debootstrap 生成的
 #   rootfs; 文件不存在时自动跳过 (回退到无根文件系统, 即 VFS panic)。root 所有的镜像
 #   自动只读打开。覆盖: make emu-linux DISK=/path/to/other.ext4
@@ -128,7 +135,7 @@ disk_args       = $(if $(wildcard $(DISK)),--disk=$(DISK))
 
 
 # ---- 工具链参考 (供手动使用) ----
-opt-cc      = /opt/custom-llvm/bin/clang
+opt-cc      = clang
 opt-src-dir = $(PWD)/tests/src/
 opt-bin-dir = $(PWD)/$(bins_dir)/
 

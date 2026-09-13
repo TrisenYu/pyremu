@@ -57,7 +57,7 @@ class SymbolMixin(SharedMixinAttrs):
     ) -> str | None:
         """在符号表中查找包含 *addr* 的函数符号.
 
-        优先使用地址范围做精确包含匹配 (start ≤ addr < end);
+        优先使用地址范围做精确包含匹配 (start <= addr < end);
         无范围信息时回退到最近前驱符号 (相差 > 64 KiB 视为不匹配).
         """
         # 1) 范围查找: 二分搜索

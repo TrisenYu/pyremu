@@ -1,0 +1,13 @@
+{
+    "name": "malformed-sample",
+    "version": "1.0.0",
+    "private": true,
+    "dependencies": {
+        "libc": "^2.1.0",
+        "libm": "^1.4.0",
+    },
+    "scripts": {
+        "build": "make -j4",
+        "test": "make check",
+    }
+}

@@ -20,11 +20,22 @@ RESERVED_MEM_SIZE    ?= 0x10000000
 # 通过 makefile 生成 pyremu/configs_gen.py, 替代各处硬编码与 os.environ.get.
 # TLB 条目数
 TLB_ENTRIES          ?= 256
-# 单次 native batch 最大指令数
-NATIVE_MAX_INSTRS    ?= 100000
 
 # mtime/mcycle 随宿主机时间推进
 CPU_FREQ_HZ          ?= 1000000000
+
+# 调试器 run/continue 的时钟源超时 (秒), 0 = 禁用
+DEFAULT_TIMEOUT      ?= 3600
+
+# ---- 运行时调优 ----
+# WFI 空转单次睡眠上限 (秒), 降低宿主机 CPU 占用
+WFI_MAX_SLEEP        ?= 0.2
+# virtio 单次 _process_queue 最多处理描述符数, 拆小批避免长时间占用主线程
+VIRTIO_PROCESS_BATCH ?= 16
+# 段加载阈值 (字节): 不超过阈值的段走 L2 缓存, 更大段直写 RAM
+FAST_LOAD_THRESHOLD  ?= 0x200000
+# mtime 指令计数源的每指令纳秒数
+NS_PER_INSTR         ?= 20
 
 # ---- 中断子系统 ----
 # 1 = AIA (IMSIC+APLIC); 0 = legacy PLIC
@@ -41,7 +52,7 @@ APLIC_BASE           ?= 0x0C000000
 WFI_WATCHDOG_MS      ?= 5
 
 # ---- 诊断开关 (可通过环境变量在运行时覆盖) ----
-PYREMU_DIAG_LOG      ?= /tmp/sret_py.log
+PYREMU_DIAG_LOG      ?= /tmp/pyremu_diag.log
 PYREMU_DIAG_VERBOSE  ?= 0
 # 1 = 打印 virqueue 请求等详细诊断
 PYREMU_TRACE_SRET    ?= 0
@@ -54,5 +65,7 @@ PYREMU_AIA_DIAG_INTERVAL ?= 100
 # AIA 诊断打印间隔 (批次), 0 = 禁用
 PYREMU_NO_L2         ?= 0
 # 1 = 禁用 L2 缓存
+# 1 = 停用 TLB: 每次地址翻译都完整遍历 Sv39 页表, 不做映射缓存.
+PYREMU_NO_TLB        ?= 0
 
 export

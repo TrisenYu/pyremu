@@ -33,7 +33,7 @@ pub struct TermIoHandle {
 	pub stdin_fd: RawFd,
 	/// File descriptor for stdout (usually 1).
 	pub stdout_fd: RawFd,
-	/// Shared RX ring buffer — I/O thread writes, Python reads on guest RXDATA.
+	/// Shared RX ring buffer — I/O thread writes, Python reads on 受调试程序 RXDATA.
 	pub rx_buf: *mut u8,
 	/// Capacity of ``rx_buf`` in bytes (power of two).
 	pub rx_cap: u32,
@@ -43,7 +43,7 @@ pub struct TermIoHandle {
 	/// 剩余空间 = rx_cap - (rx_wr - rx_rd); 为 0 时线程停止读 stdin,
 	/// 数据留在内核 tty 缓冲 (对照 QEMU fd_chr_read_poll 流控).
 	pub rx_rd: *mut AtomicU32,
-	/// Shared TX ring buffer — CPU hart threads write (guest TXDATA).
+	/// Shared TX ring buffer — CPU hart threads write (受调试程序 TXDATA).
 	/// Layout: entry e occupies bytes [2e] = hart_id, [2e+1] = byte value.
 	pub tx_buf: *mut u8,
 	/// Entry capacity of ``tx_buf`` (= byte capacity / 2, power of two).
@@ -278,8 +278,8 @@ fn esc_seq_len(buf: &[u8]) -> Option<usize> {
 			return Some(2 + idx + 1);
 		}
 	}
-	// 窗口耗尽仍无 final: 若已积累超过 6 字节, 视为无法重组的长序列 —
-	// 透传 ESC 单字节 (不阻塞, 剩余部分按普通字节继续转发, 客机终端自行重组).
+	// 若已积累超过 6 字节, 视为无法重组的长序列 —
+	// 剩余部分按普通字节继续转发, 受调试程序终端自行重组
 	if buf.len() > 6 {
 		return Some(1);
 	}
@@ -515,11 +515,10 @@ fn termio_thread_simple(h: TermIoHandle, old_stdin_fl: libc::c_int) {
 			notify_emu_stop();
 		}
 		let _ = deliver_rx(&h, &mut recv, deliverable);
-		// 本线程只负责 stdin -> RX ring (attach 模式).
-		// stdout 由 CPU 引擎内联 try_write_fd 即时输出 (no_stdout=0), 这里
-		// 不得再调 drain_tx 写 stdout — 否则键盘输入唤醒 poll 时会把整个 TX
-		// ring 积压重放一遍 (重复输出), 且 write_all 在 stdout 阻塞时会拖住
-		// 本线程, 键盘输入不再送达客机 (无输入响应).
+		// 本线程只负责将 stdin 转发到 RX ring.
+		// stdout 由 CPU 引擎内联 try_write_fd 即时输出 (no_stdout=0)
+		// 不得再调 drain_tx 写 stdout — 否则键盘输入唤醒时会
+		// 重复输出 TX ring buf中的内容, 且键盘输入不再送达受调试程序.
 	}
 	let (deliverable, _) = scan_rx(&mut recv);
 	let _ = deliver_rx(&h, &mut recv, deliverable);
@@ -606,8 +605,8 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 	// raw-ish 模式, 始终从 oldtty 副本重新计算 (幂等, 无漂移):
 	// 逐位对照 qemu_chr_set_echo_stdio(echo=false)。
 	let mut raw = oldtty;
-	// QEMU 清除 ICRNL (依赖客机 tty 层做 \r->\n 转换), 但在 pyremu
-	// 客机串口控制台可能未正确初始化 ICRNL (如 dash 作为 PID 1 运行且无
+	// 清除 ICRNL , 但在 pyremu
+	// 受调试程序串口控制台可能未正确初始化 ICRNL (如 dash 作为 PID 1 运行且无
 	// devtmpfs 时), 导致 Enter 键的 \r 不被识别为行终止符 — 用户需按两次
 	// 回车才能触发命令执行。保留 ICRNL 由宿主机内核完成转换, 消除此问题。
 	raw.c_iflag &= !(libc::IGNBRK
@@ -616,10 +615,10 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
         | libc::ISTRIP
         | libc::INLCR
         | libc::IGNCR
-        // ICRNL 保留: 宿主机将 \r->\n, 客机收到 \n 即可行终止
+        // ICRNL 保留: 宿主机将 \r->\n, 受调试程序收到 \n 即可行终止
         | libc::IXON);
 	raw.c_oflag |= libc::OPOST; // 保留输出后处理: '\n' ->CRLF
-							 // 关闭 ISIG: Ctrl+C (0x03) 作为普通字节透传给客机.
+							 // 关闭 ISIG: Ctrl+C (0x03) 作为普通字节透传给受调试程序.
 							 // Ctrl+Q (0x11) 在 termio 线程中拦截并直连置位停止标志暂停.
 	raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::IEXTEN | libc::ISIG);
 	raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
@@ -801,8 +800,6 @@ mod tests {
 
 	#[test]
 	fn test_gather_tx_chunk_u32_wraparound() {
-		// 索引跨越 u32 环绕: drain=0xFFFF_FFFE, wr=2 ->4 个条目
-		// ecap 为 2 的幂 ⇒ 0xFFFF_FFFE % 8 = 6, 槽位连续 6,7,0,1
 		let ecap = 8u32;
 		let mut buf = vec![0u8; (ecap as usize) * 2];
 		for (i, ch) in [(6usize, b'p'), (7, b'q'), (0, b'r'), (1, b's')] {
@@ -832,7 +829,7 @@ mod tests {
 		assert_eq!(&chunk[..n2], b"45");
 	}
 
-	/// 回归: Ctrl+Q 单次触发必须直连置位 CPU 停止标志, 而非仅依赖 SIGINT.
+	/// Ctrl+Q 单次触发必须直连置位 CPU 停止标志, 而非仅依赖 SIGINT.
 	///
 	/// 修复前 ``intercept_ctrl_q`` 只发 SIGINT, 依赖 Python 主线程信号处理器
 	/// 间接置位停止标志; 主线程阻塞于 run_parallel 时处理器不执行 -> Ctrl+Q
@@ -849,7 +846,7 @@ mod tests {
 		EMU_STOP_PTR.store(std::ptr::null_mut(), Ordering::Release);
 	}
 
-	/// 回归: 未注入停止标志指针时 ``notify_emu_stop`` 不得崩溃 (空指针保护).
+	/// 未注入停止标志指针时 ``notify_emu_stop`` 不得崩溃 (空指针保护).
 	#[test]
 	fn test_notify_emu_stop_null_ptr_noop() {
 		EMU_STOP_PTR.store(std::ptr::null_mut(), Ordering::Release);
@@ -950,7 +947,7 @@ mod tests {
 	/// attach 线程 (termio_thread_simple): 键盘输入唤醒 poll 时不得把 TX ring
 	/// 积压重放到 stdout. CPU 引擎已内联 try_write_fd 即时输出 stdout
 	/// (no_stdout=0), 线程再 drain_tx 会重复输出 (启动日志重放), 且 write_all
-	/// 在 stdout 阻塞时拖住线程, 键盘输入不再送达客机 (无输入响应). 回归:
+	/// 在 stdout 阻塞时拖住线程, 键盘输入不再送达受调试程序 (无输入响应). 回归:
 	/// emu-linux-sh 停于 zsh init / 反复输出同一段串口日志.
 	#[test]
 	fn test_attach_thread_does_not_reemit_tx_ring_to_stdout() {

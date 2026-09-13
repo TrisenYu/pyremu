@@ -1,6 +1,6 @@
 //! 所有魔数集中定义。
 //!
-//! 平台可调常量由 Makefile 从 config.mk 生成 config_gen.rs 注入（Kbuild 风格）。
+//! 平台可调常量由 Makefile 从 config.mk 生成 configs_gen.rs 注入（Kbuild 风格）。
 //!
 //! 参照：
 //!   ref-emod/emod_manager/config.mk           VA 布局
@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 // ---- 由 Makefile 从 config.mk 生成 ----
-include!("config_gen.rs");
+include!("configs_gen.rs");
 
 // ---------------------------------------------------------------
 //  PTE 标志位
@@ -50,8 +50,16 @@ pub const ENCLAVE_CALL_GET_ID: u64 = 407;
 pub const ENCLAVE_CALL_GET_HARTID: u64 = 408;
 pub const ENCLAVE_CALL_GET_AVAILABLE_MEM: u64 = 409;
 pub const ENCLAVE_CALL_UNMATCHED_ACC_FAULT: u64 = 506;
+/// 取随机字节: a0 = 目标物理地址 (本飞地内存), a1 = 字节数; 返回实际写入的字节数.
+pub const ENCLAVE_CALL_GET_RAND_NUM: u64 = 507;
 pub const ENCLAVE_CALL_REQUEST_SHUTDOWN: u64 = 410;
 pub const ENCLAVE_CALL_QUERY_REQUESTS: u64 = 411;
+
+/// SUSPEND 让出原因: 自愿让出 (引导期交接 / 等待宿主服务), 必须交还宿主.
+pub const ENCLAVE_SUSPEND_VOLUNTARY: u64 = 0;
+/// SUSPEND 让出原因: 时间片耗尽, 由 M 模式调度器决定切换或就地续期.
+/// 数值与 M 模式 enclave_types.h 的 ENCLAVE_SUSPEND_* 一一对应, 修改需两侧同步.
+pub const ENCLAVE_SUSPEND_QUOTA: u64 = 1;
 
 /// QUERY_REQUESTS 返回: host 已申请终止此飞地.
 pub const ENCLAVE_REQ_SHUTDOWN: u64 = 1 << 0;
@@ -80,7 +88,7 @@ pub const LINEAR_MAP_OFFSET: u64 = 0xFFFF_FFC0_0000_0000;
 pub const UMODE_HEAP_START_ALIGNED: u64 = 0x1_0000_0000;
 pub const UMODE_STACK_TOP_VA: u64 = 0x1_4000_0000;
 
-/// mmap 匿名映射起始 VA, 从高地址向下增长, 避开 heap (0x1_0000_0000) 和 stack.
+/// mmap 匿名映射起始 VA, 自此处向高地址增长, 避开 heap (0x1_0000_0000) 和 stack.
 pub const UMODE_MMAP_BASE: u64 = 0x2_0000_0000;
 
 // ---------------------------------------------------------------
@@ -93,6 +101,9 @@ pub const PAGE_SHIFT: u64 = 12;
 /// M-mode 内存分配 / PMP 保护的最小粒度 = 2 MiB。
 pub const CHUNK_2M_SIZE: u64 = 0x20_0000;
 pub const CHUNK_2M_SHIFT: u64 = 21;
+
+/// 一个 2 MiB 块可切分成的 4 KiB 页数。
+pub const CHUNK_2M_PAGES: u64 = CHUNK_2M_SIZE / PAGE_SIZE;
 
 pub const UMODE_STACK_SIZE_TOTAL: u64 = 0x10_0000;
 
@@ -122,7 +133,7 @@ pub const SIG_LEN: usize = ECC_BYTES * 2; // 64
 /// SHA-256 摘要长度。
 pub const SHA256_DIGEST: usize = 32;
 
-// ATTEST_PUB_KEY: [u8; 33] 由 Makefile 从 config.mk 生成注入 config_gen.rs。
+// ATTEST_PUB_KEY: [u8; 33] 由 Makefile 从 config.mk 生成注入 configs_gen.rs。
 
 // ---------------------------------------------------------------
 //  测试（仅 host 端编译时可用）

@@ -6,11 +6,10 @@
 mod alu;
 mod atom_instr;
 mod concurrent;
-pub mod csr;
 mod decode;
 mod diag;
+mod ffi;
 mod fpu;
-pub mod handlers;
 mod hart_sched;
 mod interrupt;
 mod mem;
@@ -19,11 +18,14 @@ mod op_dispatcher;
 mod peripheral;
 mod pmp;
 mod state;
-pub mod translate;
 mod trap;
+pub mod csr;
+pub mod handlers;
+pub mod translate;
 
 pub use alu::*;
 pub use decode::*;
+pub use ffi::*;
 pub use mem::*;
 pub use mmu::*;
 pub use pmp::*;

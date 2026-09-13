@@ -1,0 +1,3 @@
+https://github.com/yannh/kubernetes-json-schema/blob/master/v1.34.2-standalone/
+https://github.com/libinjection/libinjection/blob/main/src/sqlparse_data.json
+

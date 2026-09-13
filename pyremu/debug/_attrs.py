@@ -17,7 +17,7 @@ Pylance 不再报告 "属性未知" 错误.  无需为每个方法单独写存�
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from prompt_toolkit import PromptSession

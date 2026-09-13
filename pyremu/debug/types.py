@@ -59,7 +59,7 @@ class StackFrame:
     fp: int
     sp: int
     ra: int
-    pc: int  # call site = ra - 4 (若 ra ≥ 4)
+    pc: int  # call site = ra - 4 (若 ra >= 4)
     note: str = ""  # 非空表示特殊帧 (如 "U->S trap", "S->M ecall")
     mode: str = ""  # "M" / "S" / "U" — 用于颜色渲染
 

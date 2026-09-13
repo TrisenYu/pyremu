@@ -5,7 +5,12 @@
 ## Timer 定时器配置
 TIMER_INTERVAL ?= 10000      # 10000 for QEMU, 50000 for VisionFive2
 TIMER_FREQ ?= 10000000       # mtime 递增频率 (Hz): 10 MHz for QEMU, 1 MHz for SiFive
-TIME_QUOTA ?= 0              # 飞地时间配额 (timer interrupt 次数), 0=不限. 1000≈1s @10MHz
+# 飞地时间配额 (timer interrupt 次数), 单位≈1ms @10MHz.
+# 非零默认: 每次 timer 中断计数, 消耗达配额即经 SUSPEND 让出 CPU 给 host;
+# host RESUME 后进入新时间片. 防止单个载荷独占 hart / 阻塞 do_enter.
+# 1000≈1s: 足够载荷 boot 到 main, 又能限制无限默认任务每次 ENTER 只跑 ~1s.
+# 0 = 不限 (仅调试).
+TIME_QUOTA ?= 1000
 
 ## UART 配置
 UART_BASE ?= 0x10000000      # MMIO 基地址

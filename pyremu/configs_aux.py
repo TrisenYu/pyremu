@@ -18,8 +18,10 @@ from pathlib import Path
 
 from pyremu import configs_gen
 from pyremu.utils.file_ops import path_join
+from pyremu.utils.wrapper import die_if_err
 
 
+@die_if_err
 def cfg_str(name: str) -> str:
     """读取环境变量 *name*, 未设置时回退到 configs_gen 中的同名默认值."""
     val = os.environ.get(name, "")
@@ -28,6 +30,7 @@ def cfg_str(name: str) -> str:
     return str(getattr(configs_gen, name, ""))
 
 
+@die_if_err
 def cfg_bool(name: str) -> bool:
     """布尔语义: env 为空 / "0" -> False; 其他 -> True.
     未设置时回退到 configs_gen 默认值."""
@@ -36,6 +39,27 @@ def cfg_bool(name: str) -> bool:
         return val != "0"
     default = str(getattr(configs_gen, name, "0"))
     return default != "0"
+
+
+@die_if_err
+def cfg_int(name: str) -> int:
+    """整数配置: env 优先, 否则回退到 configs_gen 同名默认值.
+
+    env 值支持十进制与 ``0x`` 前缀十六进制 (如 ``FAST_LOAD_THRESHOLD=0x200000``).
+    """
+    val = os.environ.get(name, "")
+    if val != "":
+        return int(val, 0)
+    return int(getattr(configs_gen, name, 0))
+
+
+@die_if_err
+def cfg_float(name: str) -> float:
+    """浮点配置: env 优先, 否则回退到 configs_gen 同名默认值."""
+    val = os.environ.get(name, "")
+    if val != "":
+        return float(val)
+    return float(getattr(configs_gen, name, 0.0))
 
 
 def cfg_is_set(name: str) -> bool:

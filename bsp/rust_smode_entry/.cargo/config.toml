@@ -10,6 +10,7 @@
 target = "riscv64imacfd-unknown-none-elf"
 
 [target.riscv64imac-unknown-none-elf]
+# TODO
 linker = "/opt/custom-llvm/bin/ld.lld"
 rustflags = [
     "-C", "link-arg=-Tlink.ld",

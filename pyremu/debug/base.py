@@ -89,7 +89,7 @@ class DebuggerBase(SharedMixinAttrs):
 
         # Stdin daemon thread — 独立于处理器执行循环, 持续将 stdin 转发到
         # UART RX FIFO. 对照 QEMU chardev fd_chr_read_poll 模型:
-        #   stdin -> os.read -> uart.preload() -> _update_plic_irq() -> PLIC 中断
+        #   stdin -> os.read -> uart.preload() -> _publish_state() -> PLIC 中断
         #   -> _wake_event.set() -> 主线程 WFI 睡眠唤醒 -> try_wfi_wakeup()
         # 处理器感知不到 daemon 的存在 — 它只看到 PLIC 中断信号.
         self._stdin_daemon_running: bool = False
@@ -148,7 +148,14 @@ class DebuggerBase(SharedMixinAttrs):
         self._session: PromptSession[str] = PromptSession(
             history=self._history,
             completer=self._completer,
-            style=Style.from_dict({"prompt": "#00aa00 bold", "": "#cccccc"}),
+            style=Style.from_dict(
+                {
+                    "prompt": "#00aa00 bold",
+                    # 提示符前的时间戳 — 独立样式, 不与 rvdbg 提示符争色.
+                    "clock": "#6c6c6c",
+                    "": "#cccccc",
+                }
+            ),
         )
 
     # ----------------------------------------------------------
@@ -203,7 +210,7 @@ class DebuggerBase(SharedMixinAttrs):
         stdin daemon 独立于处理器执行循环持续读取, 与 WFI 零耦合.
         处理器仅看到 PLIC 外部中断信号 -> try_wfi_wakeup() 自然唤醒.
         """
-        # 终端 ISIG 关闭后键盘 Ctrl+C (0x03) 作为普通字节透传给客机, 不经信号
+        # 终端 ISIG 关闭后键盘 Ctrl+C (0x03) 作为普通字节透传给受调试程序, 不经信号
         # 路径; Ctrl+Q 停止由 termio 的 notify_emu_stop 直连置位 stop_flag, 同样
         # 不经信号. 此 SIGINT handler 仅覆盖 stdin 未转发的场景 (终端仍生成 SIGINT).
         signal.signal(signal.SIGINT, self._sigint_run)
@@ -219,12 +226,12 @@ class DebuggerBase(SharedMixinAttrs):
         # 完整 raw 模式 (对照 termio/src/lib.rs raw 设置):
         # - 关 ECHO/ICANON/IEXTEN/ISIG: 所有字符原样透传
         # - CS8: 8-bit 数据, 不丢高位 (对 backspace 0x7F 等关键)
-        # - ICRNL 保留: \r->\n, 行终止兼容客机控制台
+        # - ICRNL 保留: \r->\n, 行终止兼容受调试程序控制台
         # - IXON 关: Ctrl+Q/Ctrl+S 透传
         if os.isatty(self._stdin_fd):
             self._saved_term_attrs = termios.tcgetattr(self._stdin_fd)
             attrs = termios.tcgetattr(self._stdin_fd)
-            # iflag: 清除输入转换; ICRNL 保留 (客机控制台可能未初始化 \r->\n)
+            # iflag: 清除输入转换; ICRNL 保留 (受调试程序控制台可能未初始化 \r->\n)
             attrs[0] = (attrs[0] & ~(
                 termios.IGNBRK | termios.BRKINT | termios.PARMRK
                 | termios.ISTRIP | termios.INLCR | termios.IGNCR

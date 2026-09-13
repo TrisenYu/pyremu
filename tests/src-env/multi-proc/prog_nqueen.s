@@ -1,4 +1,4 @@
-// SPDX-LICENSE-IDENTIFIER: GPL2.0
+// SPDX-LICENSE-IDENTIFIER: MIT
 // (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 // U 模式 n-Queens — 递归位掩码回溯.

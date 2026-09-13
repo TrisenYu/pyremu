@@ -8,7 +8,8 @@ use std::sync::Mutex;
 
 use crate::csr;
 use crate::decode::{decode_compressed, CompressedFields, DecodedFields};
-use crate::state::{exit_reason, riscv_mode, HartState, InstrToBeExec};
+use crate::ffi::InstrToBeExec;
+use crate::state::{exit_reason, riscv_mode, HartState};
 pub(crate) use crate::translate::{
 	lr_check, lr_clear_all, lr_set, ram_read, ram_write, translate_va, TranslateFault,
 	TranslateResult, WalkCtx,
@@ -18,8 +19,8 @@ use crate::trap::{deliver_illegal_instruction, deliver_trap, exc_code, mcause_va
 // Re-export moved items for backward compatibility
 pub use crate::interrupt::clint::ClintCtx;
 pub(crate) use crate::interrupt::clint::{clint_write_msip, try_handle_clint};
-pub use crate::peripheral::{is_device_addr, virtio::try_handle_virtio, DevCtx};
 use crate::peripheral::plic::try_handle_plic_concurrent;
+pub use crate::peripheral::{is_device_addr, virtio::try_handle_virtio, DevCtx};
 pub use crate::pmp::{pmp_ok, PmpCtx};
 
 // Re-export from csr.rs
@@ -170,7 +171,7 @@ impl MemAccess {
 ///
 /// Returns true if *pa* is within an IMSIC register (seteipnum / clreipnum).
 fn try_handle_imsic_serial(pa: u64, val: u64, clint: &ClintCtx) -> bool {
-	if !crate::state::PYREMU_AIA {
+	if !crate::state::CFG_AIA {
 		return false;
 	}
 	let addr = match crate::interrupt::decode_imsic_addr(pa, clint.num_harts as u64) {
@@ -1145,7 +1146,7 @@ fn handle_c0(
 			// C.FLD: fpr[rd'] = mem[rs1' + uimm] (RV64DC)
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = load_mem_compressed(
+			let val = match load_mem_compressed(
 				state,
 				ctx,
 				addr,
@@ -1156,13 +1157,13 @@ fn handle_c0(
 				pmp,
 				dev,
 				clint,
-			);
+			) {
+				Some(v) => v,
+				None => return EXIT_SENTINEL,
+			};
 			if state.mode != prev_mode {
 				return 0;
 			} // trap delivered
-			if val == EXIT_SENTINEL {
-				return EXIT_SENTINEL;
-			}
 			state.fprs[cf.rdp as usize] = val;
 			state.mstatus |= MSTATUS_FS_LS | MSTATUS_SD_LS;
 			2
@@ -1171,7 +1172,7 @@ fn handle_c0(
 			// C.LW: rd' = mem[rs1' + uimm]
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = load_mem_compressed(
+			let val = match load_mem_compressed(
 				state,
 				ctx,
 				addr,
@@ -1182,13 +1183,13 @@ fn handle_c0(
 				pmp,
 				dev,
 				clint,
-			);
+			) {
+				Some(v) => v,
+				None => return EXIT_SENTINEL,
+			};
 			if state.mode != prev_mode {
 				return 0;
 			} // trap delivered
-			if val == EXIT_SENTINEL {
-				return EXIT_SENTINEL;
-			}
 			let final_val = sext32(val);
 			write_gpr(state, cf.rd, final_val);
 			2
@@ -1197,7 +1198,7 @@ fn handle_c0(
 			// C.LD: rd' = mem[rs1' + uimm]
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = load_mem_compressed(
+			let val = match load_mem_compressed(
 				state,
 				ctx,
 				addr,
@@ -1208,13 +1209,13 @@ fn handle_c0(
 				pmp,
 				dev,
 				clint,
-			);
+			) {
+				Some(v) => v,
+				None => return EXIT_SENTINEL,
+			};
 			if state.mode != prev_mode {
 				return 0;
 			} // trap delivered
-			if val == EXIT_SENTINEL {
-				return EXIT_SENTINEL;
-			}
 			write_gpr(state, cf.rd, val);
 			2
 		}
@@ -1390,7 +1391,7 @@ fn handle_c2(
 			}
 			let addr = state.gprs[2].wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = load_mem_compressed(
+			let val = match load_mem_compressed(
 				state,
 				ctx,
 				addr,
@@ -1401,15 +1402,13 @@ fn handle_c2(
 				pmp,
 				dev,
 				clint,
-			);
+			) {
+				Some(v) => v,
+				None => return EXIT_SENTINEL,
+			};
 			if state.mode != prev_mode {
 				return 0;
 			} // trap delivered
-			if val == EXIT_SENTINEL {
-				// load_mem_compressed returns EXIT_SENTINEL only for device
-				// MMIO — not possible for a stack load, but guard anyway.
-				return EXIT_SENTINEL;
-			}
 			state.fprs[cf.rd as usize] = val;
 			state.mstatus |= MSTATUS_FS_LS | MSTATUS_SD_LS;
 			2
@@ -1422,7 +1421,7 @@ fn handle_c2(
 			}
 			let addr = state.gprs[2].wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = load_mem_compressed(
+			let val = match load_mem_compressed(
 				state,
 				ctx,
 				addr,
@@ -1433,13 +1432,13 @@ fn handle_c2(
 				pmp,
 				dev,
 				clint,
-			);
+			) {
+				Some(v) => v,
+				None => return EXIT_SENTINEL,
+			};
 			if state.mode != prev_mode {
 				return 0;
 			} // trap delivered
-			if val == EXIT_SENTINEL {
-				return EXIT_SENTINEL;
-			}
 			let final_val = sext32(val);
 			write_gpr(state, cf.rd, final_val);
 			2
@@ -1452,7 +1451,7 @@ fn handle_c2(
 			}
 			let addr = state.gprs[2].wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = load_mem_compressed(
+			let val = match load_mem_compressed(
 				state,
 				ctx,
 				addr,
@@ -1463,13 +1462,13 @@ fn handle_c2(
 				pmp,
 				dev,
 				clint,
-			);
+			) {
+				Some(v) => v,
+				None => return EXIT_SENTINEL,
+			};
 			if state.mode != prev_mode {
 				return 0;
 			} // trap delivered
-			if val == EXIT_SENTINEL {
-				return EXIT_SENTINEL;
-			}
 			write_gpr(state, cf.rd, val);
 			2
 		}
@@ -1507,9 +1506,17 @@ fn handle_c2(
 			}
 			let addr = state.gprs[2].wrapping_add(cf.imm2);
 			let fpr_val = state.fprs[cf.rs2 as usize];
-			let mut dummy = unsafe { std::mem::zeroed() };
 			let ret = store_mem_compressed(
-				state, ctx, addr, fpr_val, 8, instr_word, &mut dummy, pmp, dev, clint,
+				state,
+				ctx,
+				addr,
+				fpr_val,
+				8,
+				instr_word,
+				instr_group,
+				pmp,
+				dev,
+				clint,
 			);
 			if ret == EXIT_SENTINEL {
 				return EXIT_SENTINEL;
@@ -1521,9 +1528,17 @@ fn handle_c2(
 			// C.SWSP: mem[sp + uimm] = rs2
 			let addr = state.gprs[2].wrapping_add(cf.imm2);
 			let val = read_gpr(state, cf.rs2) & 0xFFFF_FFFF;
-			let mut dummy = unsafe { std::mem::zeroed() };
 			let ret = store_mem_compressed(
-				state, ctx, addr, val, 4, instr_word, &mut dummy, pmp, dev, clint,
+				state,
+				ctx,
+				addr,
+				val,
+				4,
+				instr_word,
+				instr_group,
+				pmp,
+				dev,
+				clint,
 			);
 			if ret == EXIT_SENTINEL {
 				return EXIT_SENTINEL;
@@ -1534,9 +1549,17 @@ fn handle_c2(
 			// C.SDSP: mem[sp + uimm] = rs2
 			let addr = state.gprs[2].wrapping_add(cf.imm2);
 			let val = read_gpr(state, cf.rs2);
-			let mut dummy = unsafe { std::mem::zeroed() };
 			let ret = store_mem_compressed(
-				state, ctx, addr, val, 8, instr_word, &mut dummy, pmp, dev, clint,
+				state,
+				ctx,
+				addr,
+				val,
+				8,
+				instr_word,
+				instr_group,
+				pmp,
+				dev,
+				clint,
 			);
 			if ret == EXIT_SENTINEL {
 				return EXIT_SENTINEL;
@@ -1554,6 +1577,11 @@ fn handle_c2(
 //  Compressed load/store helpers
 // ============================================================
 
+/// 压缩指令的访存读取。
+///
+/// 返回 ``None`` 表示设备访问、需退出单轮加速执行 (退出原因已写入
+/// ``instr_group``); ``Some`` 为读到的数据。数据本身可以是任意 64 位值,
+/// 故不能用 ``EXIT_SENTINEL`` 之类的带内哨兵表示退出。
 #[inline]
 fn load_mem_compressed(
 	state: &mut HartState,
@@ -1566,51 +1594,51 @@ fn load_mem_compressed(
 	pmp: &PmpCtx,
 	dev: &DevCtx,
 	clint: &ClintCtx,
-) -> u64 {
+) -> Option<u64> {
 	let tr = match translate_va(state, ctx, va, false, false) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
-			return 0; // trap delivered inline; caller must check state.mode
+			return Some(0); // trap delivered inline; caller must check state.mode
 		}
 		Err(_) => {
 			deliver_trap(state, mcause_val(exc_code::LD_ACCESS_FAULT, false), va);
-			return 0; // trap delivered inline; caller must check state.mode
+			return Some(0); // trap delivered inline; caller must check state.mode
 		}
 	};
 
 	if !pmp_ok(state, tr.pa, size as u32, false, false, pmp) {
 		deliver_trap(state, mcause_val(exc_code::LD_ACCESS_FAULT, false), va);
-		return 0; // trap delivered inline; caller must check state.mode
+		return Some(0); // trap delivered inline; caller must check state.mode
 	}
 
 	if let Some(data) = try_handle_clint(&MemAccess::read(tr.pa, size), state, clint) {
-		return data;
+		return Some(data);
 	}
 
 	// IMSIC inline reads — all IMSIC MMIO reads return 0 (seteipnum/clreipnum
 	// are write-only).  Must come before is_device_addr so compressed loads
 	// from IMSIC don't exit to Python.
 	if try_handle_imsic_serial(tr.pa, 0, clint) {
-		return 0;
+		return Some(0);
 	}
 
 	if let Some(data) = try_handle_virtio(tr.pa, false, 0, size, dev) {
-		return data;
+		return Some(data);
 	}
 
 	// PLIC inline (压缩指令直映射访问) — 与 handle_load_concurrent 同源.
 	if let Some(data) = try_handle_plic_concurrent(tr.pa, false, 0, size, state, dev.plic) {
-		return data;
+		return Some(data);
 	}
 
 	if is_device_addr(tr.pa, dev) {
 		instr_group.exit_reason = exit_reason::MMIO;
 		instr_group.exit_instr = instr_word;
-		return EXIT_SENTINEL;
+		return None;
 	}
 
-	ram_read(ctx, tr.pa, size)
+	Some(ram_read(ctx, tr.pa, size))
 }
 
 #[inline]
@@ -2157,5 +2185,172 @@ mod tests {
 
 		let result = try_semihosting(&mut state, &ctx, ebr_addr);
 		assert_eq!(result, None, "plain ebreak should NOT be semihosting");
+	}
+
+	fn make_dev_ctx(bases: &[u64], ends: &[u64]) -> DevCtx {
+		DevCtx {
+			bases: if bases.is_empty() {
+				std::ptr::null()
+			} else {
+				bases.as_ptr()
+			},
+			ends: if ends.is_empty() {
+				std::ptr::null()
+			} else {
+				ends.as_ptr()
+			},
+			num: bases.len() as u8,
+			virtio_base: 0,
+			virtio_raw: std::ptr::null_mut(),
+			plic: std::ptr::null_mut(),
+		}
+	}
+
+	/// 覆盖整个物理地址空间的 TOR 条目 (R|W|X), 供访存测试放行.
+	fn make_dev_test_pmp(cfg: &mut [u8], addr: &mut [u64]) -> PmpCtx {
+		cfg[0] = 0x0F;
+		addr[0] = u64::MAX;
+		PmpCtx {
+			cfg: cfg.as_mut_ptr(),
+			addr: addr.as_mut_ptr(),
+			num: 1,
+		}
+	}
+
+	fn make_test_clint(mtime: &mut u64, mtimecmp: &mut [u64], msip: &mut [u8]) -> ClintCtx {
+		ClintCtx {
+			base: 0x200_0000,
+			mtime: mtime as *mut u64,
+			mtimecmp: mtimecmp.as_mut_ptr(),
+			msip: msip.as_mut_ptr(),
+			states: std::ptr::null_mut(),
+			num_harts: 1,
+			timebase_hz: 0,
+			yield_for_ipi: Cell::new(false),
+			ipi_sender_hart: Cell::new(0),
+			ipi_sender_rounds: Cell::new(0),
+			msip_pending: Cell::new(std::ptr::null()),
+			hart_threads: Cell::new(std::ptr::null()),
+			hart_states: Cell::new(std::ptr::null()),
+		}
+	}
+
+	/// 内存中的全 1 数据是合法内容 (内核的 ``~0UL`` / ``-1``, 全 1 的浮点
+	/// NaN 载荷等), 不得与 ``EXIT_SENTINEL`` 混淆而中断加速执行.
+	#[test]
+	fn compressed_load_all_ones_from_ram_is_not_exit() {
+		let mut ram: Vec<u8> = vec![0u8; 0x400];
+		let ram_base: u64 = 0x8000_0000;
+		ram[0x100..0x108].copy_from_slice(&u64::MAX.to_le_bytes());
+
+		let mut state: HartState = unsafe { mem::zeroed() };
+		state.mode = crate::state::riscv_mode::M;
+		state.gprs[2] = ram_base + 0x100; // sp
+		state.gprs[9] = ram_base + 0x100; // s1
+
+		let ctx = WalkCtx {
+			ram: ram.as_mut_ptr(),
+			ram_size: ram.len() as u64,
+			ram_base,
+			shadow_base: 0,
+			shadow_size: 0,
+			tlb_gen: std::ptr::null(),
+			itlb_hand: Cell::new(0),
+			dtlb_hand: Cell::new(0),
+			lr_reserved: std::ptr::null_mut(),
+			num_harts: 1,
+		};
+		let mut cfg = [0u8; 64];
+		let mut addr = [0u64; 64];
+		let pmp = make_dev_test_pmp(&mut cfg, &mut addr);
+		let dev = make_dev_ctx(&[], &[]);
+		let mut mtime: u64 = 0;
+		let mut mtimecmp = [u64::MAX; 1];
+		let mut msip = [0u8; 1];
+		let clint = make_test_clint(&mut mtime, &mut mtimecmp, &mut msip);
+
+		// C.LDSP x5, 0(sp)
+		let mut group: InstrToBeExec = unsafe { mem::zeroed() };
+		let advance = handle_compressed(
+			&mut state, 0x6282, 0x6282, &mut group, &ctx, &pmp, &dev, &clint,
+		);
+		assert_eq!(advance, 2, "读到全 1 的普通内存不得被判为设备退出");
+		assert_eq!(state.gprs[5], u64::MAX, "寄存器应拿到内存里真实的全 1 数据");
+		assert_eq!(group.exit_reason, exit_reason::NORMAL);
+
+		// C.LD x10, 0(s1)
+		let mut group2: InstrToBeExec = unsafe { mem::zeroed() };
+		let advance2 = handle_compressed(
+			&mut state,
+			0x6088,
+			0x6088,
+			&mut group2,
+			&ctx,
+			&pmp,
+			&dev,
+			&clint,
+		);
+		assert_eq!(advance2, 2, "C.LD 同样不得误判为设备退出");
+		assert_eq!(state.gprs[10], u64::MAX);
+	}
+
+	/// 设备访问必须退出到 Python, 且退出原因标记为 MMIO.
+	#[test]
+	fn compressed_device_access_exits_with_mmio_reason() {
+		let mut ram: Vec<u8> = vec![0u8; 0x400];
+		let ram_base: u64 = 0x8000_0000;
+		let dev_base: u64 = 0x1000_0000;
+		let dev_end: u64 = 0x1000_1000;
+
+		let mut state: HartState = unsafe { mem::zeroed() };
+		state.mode = crate::state::riscv_mode::M;
+		state.gprs[2] = dev_base; // sp 指向设备
+		state.gprs[5] = 0xDEAD_BEEF;
+
+		let ctx = WalkCtx {
+			ram: ram.as_mut_ptr(),
+			ram_size: ram.len() as u64,
+			ram_base,
+			shadow_base: 0,
+			shadow_size: 0,
+			tlb_gen: std::ptr::null(),
+			itlb_hand: Cell::new(0),
+			dtlb_hand: Cell::new(0),
+			lr_reserved: std::ptr::null_mut(),
+			num_harts: 1,
+		};
+		let mut cfg = [0u8; 64];
+		let mut addr = [0u64; 64];
+		let pmp = make_dev_test_pmp(&mut cfg, &mut addr);
+		let bases = [dev_base];
+		let ends = [dev_end];
+		let dev = make_dev_ctx(&bases, &ends);
+		let mut mtime: u64 = 0;
+		let mut mtimecmp = [u64::MAX; 1];
+		let mut msip = [0u8; 1];
+		let clint = make_test_clint(&mut mtime, &mut mtimecmp, &mut msip);
+
+		// C.SDSP x5, 0(sp)
+		let mut group: InstrToBeExec = unsafe { mem::zeroed() };
+		let advance = handle_compressed(
+			&mut state, 0xE016, 0xE016, &mut group, &ctx, &pmp, &dev, &clint,
+		);
+		assert_eq!(advance, EXIT_SENTINEL, "设备存储必须退出到 Python");
+		assert_eq!(group.exit_reason, exit_reason::MMIO, "退出原因必须为 MMIO");
+
+		// C.LDSP x5, 0(sp)
+		let mut group2: InstrToBeExec = unsafe { mem::zeroed() };
+		let advance2 = handle_compressed(
+			&mut state,
+			0x6282,
+			0x6282,
+			&mut group2,
+			&ctx,
+			&pmp,
+			&dev,
+			&clint,
+		);
+		assert_eq!(advance2, EXIT_SENTINEL, "设备读取必须退出到 Python");
+		assert_eq!(group2.exit_reason, exit_reason::MMIO, "退出原因必须为 MMIO");
 	}
 }

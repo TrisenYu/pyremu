@@ -4,6 +4,7 @@
 use core::arch::asm;
 
 use crate::constants::*;
+use crate::context;
 
 // ---------------------------------------------------------------
 //  Low-level ecall primitives
@@ -105,7 +106,7 @@ pub fn enclave_call_exit(code: u64) -> ! {
 	unsafe {
 		ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_SHUTDOWN, code, 0, 0);
 	}
-	crate::hang::hang()
+	crate::hang::fault_halt("enclave_call_exit: ecall returned\n")
 }
 
 /// Query M-mode for pending host requests.
@@ -122,6 +123,16 @@ pub fn enclave_call_query_requests() -> u64 {
 		);
 	}
 	ret
+}
+
+/// 请求 M-mode 向 *buf* 写入随机字节, 返回实际写入的字节数.
+///
+/// 缓冲区地址以物理地址形式交给 M-mode (与 DBCN 同理), 因此只可用于运行时
+/// 自身的内存; 载荷的缓冲区是 U 模式虚拟地址, 须先分块拷入本地缓冲.
+#[inline]
+pub fn enclave_call_get_rand_num(buf: &mut [u8]) -> u64 {
+	let pa = va_to_pa(buf.as_ptr() as u64);
+	unsafe { ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_GET_RAND_NUM, pa, buf.len() as u64, 0) }.0
 }
 
 /// Forward an unmatched access fault to M-mode for diagnosis.
@@ -157,6 +168,26 @@ pub fn sbi_putchar(c: u8) {
 	}
 }
 
+/// 把运行时的虚拟地址折算为物理地址, 供 SBI DBCN 这类地址按物理地址解释的
+/// ecall 使用. 缓冲区是栈上局部量, MMU 使能后其地址落入高 VA 空间
+/// (ENCLAVE_MAN_VA_START 区域), 直接传给 M-mode 会被当作 PA 而找不到域内存区域,
+/// 导致整条诊断输出被静默丢弃. 低地址 (MMU 未使能时的恒等 PA) 原样返回.
+#[inline]
+fn va_to_pa(va: u64) -> u64 {
+	if va >= ENCLAVE_MAN_VA_START {
+		// 运行时自身代码/数据/栈: VA = PA + (ENCLAVE_MAN_VA_START - manager_pa_start).
+		// 仅 MMU 使能后才可能落入此区间, 此刻 context 已初始化.
+		let va_ofs = ENCLAVE_MAN_VA_START.wrapping_sub(context::ctx().manager_pa_start);
+		va.wrapping_sub(va_ofs)
+	} else if va >= LINEAR_MAP_OFFSET {
+		// 载荷/argv 的线性映射别名: VA = PA + LINEAR_MAP_OFFSET.
+		va.wrapping_sub(LINEAR_MAP_OFFSET)
+	} else {
+		// MMU 未使能时的恒等映射 (VA == PA), 无需折算.
+		va
+	}
+}
+
 /// Output a byte buffer via the SBI DBCN Console Write extension.
 /// The entire buffer is written atomically under M-mode's `console_out_lock`,
 /// preventing per-character interleaving with concurrent output from other harts.
@@ -164,7 +195,7 @@ pub fn sbi_putchar(c: u8) {
 /// Falls back to legacy `sbi_putchar` per byte if DBCN is not available.
 #[inline]
 pub fn sbi_console_write(buf: &[u8]) {
-	let pa = buf.as_ptr() as u64;
+	let pa = va_to_pa(buf.as_ptr() as u64);
 	let len = buf.len() as u64;
 	let ret: u64;
 	unsafe {
@@ -189,6 +220,8 @@ pub fn sbi_console_write(buf: &[u8]) {
 
 /// Schedule a timer interrupt at `stime_value` (absolute time in ticks).
 #[inline]
+#[allow(dead_code)]
+#[allow(unused)]
 pub fn sbi_set_timer(stime_value: u64) {
 	unsafe {
 		ecall_3(SBI_TIMER_EXT, SBI_SET_TIMER_FUNC, stime_value, 0, 0);

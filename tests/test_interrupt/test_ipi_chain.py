@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 
-"""IPI delivery chain tests: cross-hart seteipnum → SEIP → stopi → claim → clear.
+"""IPI delivery chain tests: cross-hart seteipnum -> SEIP -> stopi -> claim -> clear.
 
 Verifies the complete IMSIC IPI path at the Python level (no native batch),
 then at the Emulator integration level.  Native batch is disabled by default
@@ -44,10 +44,10 @@ _CSR_STOPI = 0xDB0
 
 
 class TestIpiLifecycle:
-    """Single-hart IPI lifecycle: set → peek → claim → clear."""
+    """Single-hart IPI lifecycle: set -> peek -> claim -> clear."""
 
     def test_ipi_set_peek_claim_clear(self):
-        """S-file seteipnum(1) → peek sees IID=1 → claim clears eip."""
+        """S-file seteipnum(1) -> peek sees IID=1 -> claim clears eip."""
         imsic = IMSIC(num_harts=2, m_base_addr=_IMSIC_M_BASE)
         s_base = 2 * _PAGE_STRIDE  # N=2, S-files after M-files
         imsic.write(s_base + _EIPNUM_SET_OFF, (1).to_bytes(4, "little"))
@@ -85,7 +85,7 @@ class TestIpiLifecycle:
         assert imsic.get_pending_mip(0) & (1 << 9), "SEIP should be set"
 
     def test_mfile_ipi_stays_in_mfile(self):
-        """M-file seteipnum + IID=1 → stays in M-file (no cross-file routing)."""
+        """M-file seteipnum + IID=1 -> stays in M-file (no cross-file routing)."""
         imsic = IMSIC(num_harts=2, m_base_addr=_IMSIC_M_BASE)
         imsic.write(0 * _PAGE_STRIDE, (1).to_bytes(4, "little"))  # M-file, IID=1
 
@@ -124,7 +124,7 @@ class TestCrossHartIpi:
     """Cross-hart IPI delivery via IMSIC seteipnum."""
 
     def test_hart0_sends_ipi_to_hart1_sfile(self):
-        """Write to hart 1's S-file seteipnum → hart 1 sees IPI, hart 0 does not."""
+        """Write to hart 1's S-file seteipnum -> hart 1 sees IPI, hart 0 does not."""
         imsic = IMSIC(num_harts=2, m_base_addr=_IMSIC_M_BASE)
         s_base = 2 * _PAGE_STRIDE
         target = s_base + 1 * _PAGE_STRIDE + _EIPNUM_SET_OFF
@@ -162,7 +162,7 @@ class TestCrossHartIpi:
 class TestIpiCsrLevel:
     """Integration: hart CSR path for stopi / stopei / mtopi / mtopei.
 
-    Native batch disabled by conftest.py → CSR ops stay in Python.
+    Native batch disabled by conftest.py -> CSR ops stay in Python.
     """
 
     @staticmethod
@@ -174,7 +174,7 @@ class TestIpiCsrLevel:
     # ---- stopi (0xDB0, S-mode combined view) ----
 
     def test_stopi_read_after_ipi(self):
-        """stopi (0xDB0) read → IID=9 (SEI); write stopi to claim → next read returns 0."""
+        """stopi (0xDB0) read -> IID=9 (SEI); write stopi to claim -> next read returns 0."""
         emu = self._make_aia_emu(num_harts=2)
         imsic = emu.imsic
         h1 = emu.harts[1]
@@ -194,7 +194,7 @@ class TestIpiCsrLevel:
         assert val2 == 0, f"stopi after claim: expected 0, got {val2}"
 
     def test_stopi_ipi_major_identity_is_sei_regression(self):
-        """Regression: S-file IPI (minor 1) → stopi returns major identity 9 (SEI).
+        """Regression: S-file IPI (minor 1) -> stopi returns major identity 9 (SEI).
 
         Linux 的 riscv_intc_aia_irq() 将 stopi>>16 分发给 intc domain。
         若 stopi 对 S-file IPI 返回 1 (SSI) 而非 9 (SEI)，IMSIC 模式下
@@ -297,10 +297,10 @@ class TestIpiCsrLevel:
         v2 = h.read_csr(_CSR_MTOPEI)
         assert v2 == 0, "mtopei auto-claim: second read should be 0"
 
-    # ---- Integration: IPI → trap ----
+    # ---- Integration: IPI -> trap ----
 
     def test_ipi_raises_seip_trap(self):
-        """set_ip_number → check_pending_interrupts fires for target hart."""
+        """set_ip_number -> check_pending_interrupts fires for target hart."""
 
         emu = self._make_aia_emu(num_harts=2)
         imsic = emu.imsic
@@ -332,7 +332,7 @@ class TestCsrStateConsistency:
     """IMSIC register readback through CSR indirect access."""
 
     def test_eidelivery_roundtrip(self):
-        """miselect=0x70 → mireg write 1 → mireg read 1."""
+        """miselect=0x70 -> mireg write 1 -> mireg read 1."""
         imsic = IMSIC(num_harts=1, m_base_addr=_IMSIC_M_BASE)
         imsic.csr_write(0, 'M', 0x70, 1)
         assert imsic.csr_read(0, 'M', 0x70) == 1
@@ -341,13 +341,13 @@ class TestCsrStateConsistency:
         assert imsic.csr_read(0, 'S', 0x70) == 1
 
     def test_eie_roundtrip_through_csr(self):
-        """miselect=0xC0 → mireg write → mireg read."""
+        """miselect=0xC0 -> mireg write -> mireg read."""
         imsic = IMSIC(num_harts=1, m_base_addr=_IMSIC_M_BASE)
         imsic.csr_write(0, 'M', 0xC0, 0xDEAD)
         assert imsic.csr_read(0, 'M', 0xC0) == 0xDEAD
 
     def test_eip_visible_through_csr_after_seteipnum(self):
-        """seteipnum → eip visible via mireg read."""
+        """seteipnum -> eip visible via mireg read."""
         imsic = IMSIC(num_harts=1, m_base_addr=_IMSIC_M_BASE)
         imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
         imsic.set_ip_number(0, 'M', 3)
@@ -361,7 +361,7 @@ class TestCsrStateConsistency:
         imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
         imsic.set_ip_number(0, 'M', 10)   # external IID=10
 
-        # eie[0] bit 10 is clear → peek_topei should return 0
+        # eie[0] bit 10 is clear -> peek_topei should return 0
         assert imsic.peek_topei(0, 'M') == 0, "external IID blocked without eie"
 
         # Set eie for bit 10
@@ -378,19 +378,19 @@ class TestImsicAddressing:
     """IMSIC MMIO 地址解码: DTB reg 与 decode_imsic_addr 一致."""
 
     def test_mfile_offset_maps_to_correct_hart(self):
-        """M-file offset = hart_id * 0x1000 → correct (hart_id, M-file)."""
+        """M-file offset = hart_id * 0x1000 -> correct (hart_id, M-file)."""
         imsic = IMSIC(num_harts=4, m_base_addr=_IMSIC_M_BASE)
-        # _resolve maps MMIO offset → (hart_id, file, file_off)
+        # _resolve maps MMIO offset -> (hart_id, file, file_off)
         for h in range(4):
             off = h * _PAGE_STRIDE
             resolved = imsic._resolve(off)
             assert resolved is not None
             hart_id, file, file_off = resolved
-            assert hart_id == h, f"offset {off:#x} → hart {hart_id}, expected {h}"
-            assert file_off == 0, f"offset {off:#x} → file_off {file_off}, expected 0"
+            assert hart_id == h, f"offset {off:#x} -> hart {hart_id}, expected {h}"
+            assert file_off == 0, f"offset {off:#x} -> file_off {file_off}, expected 0"
 
     def test_sfile_offset_maps_to_correct_hart(self):
-        """S-file offset = N*0x1000 + hart_id * 0x1000 → correct (hart_id, S-file)."""
+        """S-file offset = N*0x1000 + hart_id * 0x1000 -> correct (hart_id, S-file)."""
         N = 4
         imsic = IMSIC(num_harts=N, m_base_addr=_IMSIC_M_BASE)
         for h in range(N):
@@ -398,5 +398,5 @@ class TestImsicAddressing:
             resolved = imsic._resolve(off)
             assert resolved is not None
             hart_id, file, file_off = resolved
-            assert hart_id == h, f"S-file offset {off:#x} → hart {hart_id}, expected {h}"
+            assert hart_id == h, f"S-file offset {off:#x} -> hart {hart_id}, expected {h}"
             assert file_off == 0

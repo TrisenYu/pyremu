@@ -71,10 +71,21 @@ pub struct EnclaveContext {
 	/// 下一个飞地模块的加载 VA。
 	#[allow(dead_code)]
 	pub enclave_module_load_va: u64,
-	/// U-mode 堆顶。
+	/// U-mode 堆顶 (brk 返回值, 字节粒度)。
 	pub umode_heap_top: u64,
-	/// mmap 匿名映射当前 VA 上限 (从 UMODE_MMAP_BASE 向上增长)。
-	pub umode_mmap_base: u64,
+	/// U-mode 堆已映射到的 VA 上界, 恒为 2 MiB 对齐。
+	pub umode_heap_mapped_end: u64,
+	/// mmap 匿名映射已交付的 4 KiB 页计数 (自 UMODE_MMAP_BASE 起)。
+	/// 右移 CHUNK_2M_SHIFT 位是已彻底写满的 2 MiB 块数, 也就是游标当前所在块的
+	/// 序号; 与块内页数掩码按位与是游标当下所在块内已交付的页数。
+	/// 例: 511 表示 0 块写满、当前块已用 511 页, 下一页仍在本块内; 512 表示 1 块
+	/// 写满、当前块自 0 起用。映射 VA 与块边界都由该计数导出
+	pub umode_mmap_pages_used: u64,
+	/// 当前 2 MiB 块的物理基址, 仅当该块按 4 KiB 页切分时有效;
+	/// 0 表示没有正在切分的块 (游标所在块由 2 MiB 超页覆盖, 或尚无映射)。
+	/// 每块的后备物理内存是独立一次分配 (页池或 M-mode 分区), 块间不保证连续,
+	/// 无法由页计数导出; 已交付页的物理地址另有页表记录, 故只保留当前块。
+	pub umode_curr_mmap_pa: u64,
 	pub umode_pool: PoolDesc,
 	pub smode_pool: PoolDesc,
 	#[allow(dead_code)]
@@ -170,11 +181,15 @@ pub fn ctx() -> &'static EnclaveContext {
 	CTX.get()
 }
 
-/// 返回页表根的物理地址 (始终 4 KiB 对齐).
+/// 返回页表根的**当前映射地址** (始终 4 KiB 对齐).
 ///
-/// `PAGE_TABLE_ROOT` 作为独立 `#[repr(align(4096))]` static,
-/// 不依赖 BSS 内 `EnclaveContext` 的布局, 确保 MMU 使能后
-/// satp.PPN 指向正确的物理页.
+/// 运行时按 PIE 链接, 代码以 PC 相对方式引用 `PAGE_TABLE_ROOT`:
+/// 物理恒等主流程 (MMU 关闭阶段与 MMU 开启后的 after_mmu) 取到 PA,
+/// 虚拟映射的陷态处理 (stvec = VA) 取到 VA, 两者指向同一物理页且
+/// 均已被映射, 可直接解引用 (见 paging::root_table)。
+///
+/// 需要真正物理地址的调用方 (如 `init_satp` 计算 PPN) 只能在物理恒等
+/// 主流程调用, 此刻返回的即为 PA。
 #[inline]
 pub fn root_pa() -> u64 {
 	&raw const PAGE_TABLE_ROOT as u64

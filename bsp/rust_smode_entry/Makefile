@@ -1,10 +1,10 @@
-# SPDX-LICENSE-IDENTIFIER: GPL-2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # Author: <kisfg@hotmail.com> 2026
 #
 # Rust S-mode Runtime
 # Uses custom LLVM toolchain at /opt/custom-llvm/bin/
 #
-# 配置: 编辑 config.mk 或者通过命令行传递定义, e.g.
+# configuration: edit config.mk or pass arguments via command line, e.g.
 #   make TIMER_INTERVAL=50000 UART_BASE=0x10011000
 
 CUSTOM_LLVM := /opt/custom-llvm/bin
@@ -17,7 +17,7 @@ OUTPUT     := rust_smode_entry.bin
 
 include config.mk
 
-# 诊断输出: DIAGNOSTIC 非 0 时向 cargo 传递 --features diagnostic.
+# DIAGNOSTIC -- diagnostic features.
 CARGO_FLAGS ?=
 ifneq ($(filter-out 0 false,$(DIAGNOSTIC)),)
 CARGO_FLAGS += --features diagnostic
@@ -27,15 +27,13 @@ phony = all
 
 all: build
 
-# 由 link.ld.S 和 config.mk 经 C 预处理器生成链接脚本.
 link.ld: link.ld.S config.mk Makefile
 	$(CLANG) -E -P -x c -DLINK_BASE=$(LINK_BASE) $< -o $@
 
 phony += link.ld
 
-# 由config.mk生成常量定义代码 (Kbuild-style).
-# 如果config.mk 或者 Makefile 本身有所改变，就自动尝试生成常量
-src/config_gen.rs: config.mk Makefile
+# When there is any change in config.mk or Makefile, regenerate constant here.
+src/configs_gen.rs: config.mk Makefile
 	@echo '// generated from config.mk by Makefile — do not edit' > $@
 	@echo 'pub const TIMER_INTERVAL: u64 = $(TIMER_INTERVAL);' >> $@
 	@echo 'pub const TIMER_FREQ: u64 = $(TIMER_FREQ);' >> $@
@@ -49,10 +47,10 @@ src/config_gen.rs: config.mk Makefile
 	@echo 'pub const LINK_BASE: u64 = $(LINK_BASE);' >> $@
 	@echo 'pub const ATTEST_ENABLE: bool = $(ATTEST_ENABLE);' >> $@
 	@echo 'pub const ATTEST_PUB_KEY: [u8; 33] = [$(ATTEST_PUB_KEY)];' >> $@
-phony += src/config_gen.rs
+phony += src/configs_gen.rs
 
 
-gen-config: src/config_gen.rs
+gen-config: src/configs_gen.rs
 phony += gen-config
 
 
@@ -68,7 +66,7 @@ phony += build
 
 clean:
 	cargo clean
-	rm -f $(OUTPUT) src/config_gen.rs link.ld
+	rm -f $(OUTPUT) src/configs_gen.rs link.ld
 phony += clean
 
 

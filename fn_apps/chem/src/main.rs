@@ -366,8 +366,7 @@ fn main() {
     // 自检 2: H2 分子在 R=1.4 Bohr 的 HF 总能量
     let r_ref = 1.4;
     let (e_h2, e_orb) = run_scf(r_ref);
-    println!();
-    println!("[hf_scf] H2 STO-3G HF energy at R={:.1} Bohr = {:.6} Ha", r_ref, e_h2);
+    println!("\n[hf_scf] H2 STO-3G HF energy at R={:.1} Bohr = {:.6} Ha", r_ref, e_h2);
     println!("[hf_scf] reference (Szabo & Ostlund) = -1.1167 Ha");
     println!("[hf_scf] occupied orbital energy = {:.6} Ha", e_orb);
     println!(
@@ -376,8 +375,7 @@ fn main() {
     );
 
     // 自检 3: 势能面扫描, 定位平衡键长与结合能
-    println!();
-    println!("[hf_scf] potential energy scan (R in Bohr, E in Hartree):");
+    println!("\n[hf_scf] potential energy scan (R in Bohr, E in Hartree):");
     let mut e_min = f64::INFINITY;
     let mut r_min = 0.0;
     for i in 10..=24 {
@@ -406,7 +404,5 @@ fn main() {
             "FAIL"
         }
     );
-
-    println!();
-    println!("=== hf_scf: done ===");
+    println!("\n=== hf_scf: done ===");
 }

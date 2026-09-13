@@ -4,23 +4,24 @@
 #![no_main]
 
 mod attest;
+mod concurrency;
 mod constants;
 mod context;
 mod csr;
+mod diag;
 mod ecall_aux;
 mod elf;
 mod hang;
-mod memory;
+mod mem;
 mod paging;
 mod println;
-mod sched;
 mod string;
 mod syscall;
 mod trap;
-mod uart;
 
 use core::panic::PanicInfo;
 
+use crate::concurrency::thread;
 use crate::constants::*;
 
 unsafe extern "C" {
@@ -68,16 +69,22 @@ pub unsafe extern "C" fn rust_main_before_mmu(
 	context::init_context(man_pa_start, ENCLAVE_MODULE_LOAD_VA_INIT);
 
 	let pool_offset = end_pa - man_pa_start;
-	let pool_size = memory::page_down(memory::chunk_2m_up(end_pa) - end_pa);
-	memory::init_smode_pool(pool_offset, pool_size);
-	memory::map_smode_page_pool(pool_offset, pool_size);
-	memory::map_sections();
-	paging::setup_linear_map();
-	paging::identity_map_trampoline(man_pa_start);
+	let pool_size = mem::page_down(mem::chunk_2m_up(end_pa) - end_pa);
+	mem::init_smode_pool(pool_offset, pool_size);
+	mem::map_smode_page_pool(pool_offset, pool_size);
+	mem::map_sections();
+	if !paging::setup_linear_map() {
+		hang::fault_halt("setup_linear_map: page table\n");
+	}
+	if let Err(e) = paging::identity_map_trampoline(man_pa_start) {
+		hang::fault_halt(e.name());
+	}
 
 	let root_pa = context::root_pa();
 	let satp_val = paging::init_satp(root_pa);
-	let smode_sp = unsafe { memory::alloc_smode_stack() };
+	let smode_sp = unsafe { mem::alloc_smode_stack() };
+	// 记录主线程（thread 0）内核栈顶, 供 MMU 使能后 init_main_thread 使用.
+	thread::note_boot_kstack_top(smode_sp);
 	let va_offset = ENCLAVE_MAN_VA_START.wrapping_sub(man_pa_start);
 
 	unsafe {
@@ -95,53 +102,113 @@ pub unsafe extern "C" fn rust_main_before_mmu(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_main_after_mmu() {
-	let (payload_pa, payload_size, argc) = ecall_aux::enclave_call_suspend(0);
+	#[cfg(feature = "diagnostic")]
+	println!("[enclave] after_mmu: enter\n");
+	// 引导期交接: 必须交还宿主, 由宿主在 ENTER 返回路径上传入载荷信息.
+	let (payload_pa, payload_size, argc) =
+		ecall_aux::enclave_call_suspend(ENCLAVE_SUSPEND_VOLUNTARY);
+	#[cfg(feature = "diagnostic")]
+	println!(
+		"[enclave] after_mmu: payload pa=0x{payload_pa:x} size=0x{payload_size:x} argc={argc}\n"
+	);
 
 	// 完整性证明: 执行载荷前先验证其尾部 ECDSA 签名。
 	// 载荷布局 [ bare | 64 字节签名 ]; 对 bare 做 SHA-256 后验签。
 	// ATTEST_ENABLE=false 时跳过 (签名流水线未就绪, 保持启动畅通)。
 	if ATTEST_ENABLE {
 		if !attest::attest_payload(payload_pa, payload_size) {
-			hang::hang_with_msg("[enclave] attestation failed — refusing to run payload");
+			hang::fault_halt("[enclave] attestation failed, refusing to run payload\n");
 		}
 		#[cfg(feature = "diagnostic")]
 		println!("[enclave] attestation passed\n");
 	}
 
-	let argv_pa = payload_pa + memory::page_up(payload_size) + PAGE_SIZE;
-	let pool_start = memory::chunk_2m_down(argv_pa);
+	// argv 块基址必须与 M-mode enter_enclave_handler 的落点一致:
+	// ext_ecall.c 中 payload_argv_paddr = ROUNDUP(payload_base_pa + payload_size, PAGE_SIZE),
+	// 即载荷末页之后第一个页. 多偏移一页会指向 argv 块之外, 使 map_user_argv
+	// 读到空白页 (argv 内容在其前一页).
+	let argv_pa = payload_pa + mem::page_up(payload_size);
+	let pool_start = mem::chunk_2m_down(argv_pa);
 	context::ctx_mut().umode_pool_pa_aligned = pool_start;
-	memory::init_umode_pool(
-		memory::page_up(argv_pa) - pool_start,
-		memory::page_down(
-			memory::chunk_2m_up(argv_pa + PAGE_SIZE) + CHUNK_2M_SIZE - (argv_pa + PAGE_SIZE),
+	mem::init_umode_pool(
+		mem::page_up(argv_pa) - pool_start,
+		mem::page_down(
+			mem::chunk_2m_up(argv_pa + PAGE_SIZE) + CHUNK_2M_SIZE - (argv_pa + PAGE_SIZE),
 		),
 	);
 
-	let umode_sp = memory::alloc_map_umode_stack();
-	memory::map_user_argv(argv_pa, argc);
+	// M-mode 移交的载荷/argv 物理区 (载荷后紧跟 argv) 落在池的低物理地址,
+	// 不在 setup_linear_map 的 [5 GiB, 18 GiB) 全局线性窗口内, 故在读取前
+	// 先把 [payload_pa, argv_pa + PAGE_SIZE) 补建到 LINEAR_MAP_OFFSET 别名,
+	// 供 elf::load_elf / map_user_argv / setup_musl_stack 经 PA+OFFSET 读取.
+	if !paging::map_linear_range(payload_pa, argv_pa + PAGE_SIZE) {
+		hang::fault_halt("map_linear_range: page table\n");
+	}
+
+	// 建立飞地文件系统根目录 (ramfs + fd 表), 供载荷的 open/read/close 等系统调用
+	// 使用。文件内容经 syscall::vfs_inject_file 在载荷运行前注入。
+	syscall::vfs_init();
+	// 从载荷镜像末尾解析宿主预置的文件清单 (compound payload trailer), 逐条注入
+	// 文件系统。chibicc 等需 fopen 的载荷由此获得自检源文件; 无清单的载荷返回 0。
+	syscall::inject_manifest(payload_pa, payload_size);
+
+	let umode_sp = mem::alloc_map_umode_stack();
+	mem::map_user_argv(argv_pa, argc);
 	let entry = elf::load_elf(payload_pa, payload_size);
 
 	// musl _start 要求 sp -> argc 的栈布局 (argc/argv/envp/auxv)
-	let umode_sp = setup_musl_stack(umode_sp, argc);
+	let umode_sp = setup_musl_stack(umode_sp, argv_pa, argc);
 
-	context::ctx_mut().umode_heap_top = UMODE_HEAP_START_ALIGNED - memory::umode_pool_avail();
+	// 堆从 UMODE_HEAP_START_ALIGNED 向上增长, 与 mmap 区 (UMODE_MMAP_BASE)
+	// 及栈区 (UMODE_STACK_TOP_VA 下方 1 MiB) 各自独立, 互不重叠。
+	// 已映射上界从同一起点开始, 由 brk 按 2 MiB 块推进。
+	context::ctx_mut().umode_heap_top = UMODE_HEAP_START_ALIGNED;
+	context::ctx_mut().umode_heap_mapped_end = UMODE_HEAP_START_ALIGNED;
 
 	let mut sstatus = csr::read_sstatus();
+	// 首次 sret 进入 U-mode 时, 硬件以 sstatus.SPIE 恢复 SIE. 这里必须把
+	// SPIE 置位, 否则载荷全程运行在全局中断关闭状态, S 定时器 (配额抢占)
+	// 与 host 经 IPI 注入的软件中断 (终止请求) 都被屏蔽: 未自行退出的长
+	// 任务会永久独占当前 hart, 宿主 Linux 表现为 RCU stall 且 NMI 无响应
+	// (与 hang.rs fault_halt 注释描述的是同一问题).
+	sstatus |= csr::SSTATUS_SPIE;
 	sstatus |= csr::SSTATUS_SUM;
 	sstatus &= !csr::SSTATUS_SPP;
+	// 关键: 关闭全局中断使能 (SIE). 待进入 U 模式的现场 (sepc / sstatus /
+	// sscratch) 必须在本函数末尾写入后直达 sret, 中间不可被 S 级中断打断.
+	// 此前首次 arm 定时器 (now+TIMER_INTERVAL) 在 ELF 加载前就已写入, 到本函数
+	// 末尾 deadline 早已过期, STIP 已挂起; 若 sstatus.SIE 仍为 1, 一旦末尾
+	// csrw sie 打开 STIE, 该定时器中断立即在之后的指令处被取走. 陷态入口的
+	// 硬件行为: sepc <- 被中断的物理 PC (运行时自身地址 0x8300445a), SPP <- 1;
+	// 而 handler 的 sret 返回后按 xRET 规则把 SPP 清 0. 于是首次 sret 便以
+	// U 模式在运行时自身的物理地址取指, 恒等映射页无 U 权限, 立即触发取指页
+	// 错误 (scause=0xc, sepc=stval=物理地址), 载荷一条指令未执行即自毁为
+	// EXITED_ERR (退出码 139). 清 SIE 后现场写入与 sret 之间不可被 S 级中断
+	// 打断, 且 SIE 将经 sret 由 SPIE=1 恢复, 载荷运行时的中断不受影响.
+	sstatus &= !csr::SSTATUS_SIE;
+	let now: u64;
+	unsafe { core::arch::asm!("csrr {0}, time", out(reg) now) };
+	// 与 trap.rs 定时器中断路径一致: 直接改写 stimecmp (Sstc) 而非经 SBI TIME
+	// ecall. 后者由 M 模式代写, 在未识别 Sstc 时改设 mtimecmp 而 stimecmp 保持
+	// 旧值, 使首次中断即陷入定时器风暴.
+	csr::write_stimecmp(now + TIMER_INTERVAL);
 
+	#[cfg(feature = "diagnostic")]
+	println!(
+		"[enclave] entry=0x{entry:x} sp=0x{umode_sp:x} argv_pa=0x{argv_pa:x} argc={argc} -> sret\n"
+	);
+
+	// 登记主线程并建立调度状态. 用户现场经参数传入 (见 thread::init_main_thread
+	// 的说明), 不依赖 CSR 的写入时机.
+	thread::init_main_thread(entry, sstatus);
+
+	// 末尾写入 U 模式现场. 此时 sstatus.SIE 已清 0 (见上), 因此从 csrw sstatus
+	// 到 sret 之间不会再有 S 级中断取走, sepc / sscratch / SPP 得以原样送达 sret.
+	// csrw sie 仅设置中断使能掩码, 在 SIE=0 时不触发任何中断.
 	csr::write_sstatus(sstatus);
 	csr::write_sepc(entry);
 	csr::write_sscratch(umode_sp);
 	csr::write_sie(csr::STI | csr::SSI);
-
-	let now: u64;
-	unsafe { core::arch::asm!("csrr {0}, time", out(reg) now) };
-	ecall_aux::sbi_set_timer(now + TIMER_INTERVAL);
-
-	#[cfg(feature = "diagnostic")]
-	println!("[enclave] entry=0x{entry:x} -> sret\n");
 }
 
 // ---------------------------------------------------------------
@@ -153,15 +220,22 @@ const AT_PAGESZ: u64 = 6;
 const AT_UID: u64 = 11;
 const AT_GID: u64 = 13;
 
+unsafe fn push_u64(sp: &mut u64, val: u64) {
+	*sp = sp.wrapping_sub(8);
+	unsafe { core::ptr::write_volatile(*sp as *mut u64, val); }
+}
+
 /// 向 U-mode 栈写入 musl _start 期望的 argc/argv/envp/auxv 布局。
-/// 返回新的 sp (指向 argc)。
-fn setup_musl_stack(sp_top: u64, _argc: u64) -> u64 {
+/// argv[i] 取 map_user_argv 改写后的 U-mode VA (线性映射视图), 与 M-mode
+/// 拷贝的字符串一一对应。返回新的 sp (指向 argc)。
+fn setup_musl_stack(sp_top: u64, argv_pa: u64, argc: u64) -> u64 {
 	let mut sp = sp_top;
 
-	unsafe fn push_u64(sp: &mut u64, val: u64) {
-		*sp = sp.wrapping_sub(8);
-		unsafe { core::ptr::write_volatile(*sp as *mut u64, val) };
-	}
+	// argv 终止 NULL 先于 argv 数组压入 (位于 argv[argc-1] 更高地址);
+	// argv[argc-1] .. argv[0] 逆序压入使 argc 最终落在最低地址.
+	// 此处 sstatus.SUM 尚未置位, 不能经 U-mode VA 读 argv 页; 改从 argv_pa 的
+	// S-mode 线性映射别名读取 map_user_argv 已改写为 U-mode VA 的指针.
+	let argv_arr = argv_pa.wrapping_add(LINEAR_MAP_OFFSET) as *const u64;
 
 	// auxv (先写入, 位于栈底)
 	unsafe {
@@ -177,13 +251,17 @@ fn setup_musl_stack(sp_top: u64, _argc: u64) -> u64 {
 		// envp (空)
 		push_u64(&mut sp, 0); // envp[0] = NULL
 
-		// argv (空, argc=0)
-		push_u64(&mut sp, 0); // argv[0] = NULL
+		// argv 终止 NULL
+		push_u64(&mut sp, 0);
+		// argv[argc-1] .. argv[0]
+		for i in (0..argc as usize).rev() {
+			let arg_ptr = argv_arr.add(i).read_volatile();
+			push_u64(&mut sp, arg_ptr);
+		}
 
 		// argc
-		push_u64(&mut sp, 0); // argc = 0
+		push_u64(&mut sp, argc);
 	}
-
 	sp
 }
 
@@ -195,13 +273,15 @@ fn setup_musl_stack(sp_top: u64, _argc: u64) -> u64 {
 fn panic_handler(info: &PanicInfo) -> ! {
 	if let Some(loc) = info.location() {
 		println!(
-			"[panic] {}:{} — {}\n",
+			"panic at {}:{}, {}\n",
 			loc.file(),
 			loc.line(),
 			info.message()
 		);
 	} else {
-		println!("[panic] {}\n", info.message());
+		println!("panic: {}\n", info.message());
 	}
-	hang::hang()
+	// 可恢复式冻结: 重新打开全局中断并保留 SSIP/STIP, 使 host 的终止请求
+	// 仍能唤醒本 hart 并清理飞地, 避免运行期 panic 导致该 hart 永久失联.
+	hang::fault_halt("[enclave] S-mode runtime panic, waiting for host shutdown")
 }

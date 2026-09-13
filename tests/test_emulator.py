@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """多核模拟器集成测试: 多 hart 执行, IPI, AMO 跨 hart 竞争."""
@@ -1236,7 +1236,7 @@ class TestUartFlush:
         emu.bus.write(0x80000000, code)
 
         emu.step()  # LUI
-        emu.step()  # SB → TXDATA → _tx_callback('A')
+        emu.step()  # SB -> TXDATA -> _tx_callback('A')
 
         assert len(captured) >= 1, f"TXDATA 写入应立即回调, 实际: {captured}"
 
@@ -1532,7 +1532,7 @@ class TestWfiIdleSleep:
 
         修复前 drain_rx 仅置 _ext_irq.pending, 不写 FFI 持久数组 (源挂起)。
         batch 运行期间 Rust 内联 plic_recompute_mip 用 batch 起始的旧数组
-        (源挂起=0) 覆盖 SEIP -> UART 中断永远投递不出去, 客机在 nohz 空闲
+        (源挂起=0) 覆盖 SEIP -> UART 中断永远投递不出去, 受调试程序在 nohz 空闲
         路径自旋冻结 (make emu-linux-sh 间歇性卡死)。修复后 drain 经
         on_irq (= raise_device_irq) -> plic.set_irq 内联写穿 _ffi_pending/
         _ffi_level, 使 batch 内 Rust 仲裁立即看到 UART 源挂起。
@@ -1540,7 +1540,7 @@ class TestWfiIdleSleep:
         emu = Emulator(num_harts=1)
         uart = emu.uart
         assert uart is not None and uart._irq == UART_IRQ
-        # 模拟客机已使能 RX 水位中断 (IE bit1 = rxwm)
+        # 模拟受调试程序已使能 RX 水位中断 (IE bit1 = rxwm)
         uart._ie = 1 << 1
         ev = threading.Event()
         termio = TerminalIO(
@@ -1563,7 +1563,7 @@ class TestWfiIdleSleep:
         assert emu.plic._pending[UART_IRQ] is True
         assert ev.is_set()
 
-        # 反向: 客机关闭 RX 中断 (IE=0) 后 drain 不得强制拉高挂起位 —
+        # 反向: 受调试程序关闭 RX 中断 (IE=0) 后 drain 不得强制拉高挂起位 —
         # 电平语义, raise_device_irq 收到真实电平 False -> 持久数组清零.
         uart._ie = 0
         uart.clear_rx()
@@ -1580,7 +1580,7 @@ class TestWfiIdleSleep:
     def test_uart_read_empty_deasserts_ffi_level(self):
         """回归: guest 读空 RX FIFO 必须写穿 FFI level=0, 防 Rust complete 重挂起风暴.
 
-        修复前 UART._update_plic_irq 仅更新 Python PLIC 对象, 不写 FFI 持久数组。
+        修复前 UART._publish_state 仅更新 Python PLIC 对象, 不写 FFI 持久数组。
         batch 运行期间 guest 读空 FIFO 后, Rust 内联 plic_do_complete 读到陈旧
         level=1 -> 重挂起 pending -> SEIP 再次置位 -> spurious 中断无限循环
         (batch 永不结束, 等价冻结)。修复后 set_irq 内联写穿 _ffi_pending/
@@ -1602,6 +1602,50 @@ class TestWfiIdleSleep:
         assert emu.plic._ffi_level[UART_IRQ] == 0, "读空后陈旧电平不得残留"
         assert emu.plic._level[UART_IRQ] is False
         assert emu.plic._pending[UART_IRQ] is False
+
+    @pytest.mark.usefixtures("legacy_plic")
+    def test_uart_ffi_regs_track_device_state_live(self):
+        """回归: 寄存器字段随设备状态变化同步到持久 FFI 上下文.
+
+        修复前 _native_marshal_uart 每轮重建 FfiUartCtx 快照, 设备侧 (RX
+        daemon 线程) 在 batch 运行期间填入的新字节对 Rust 不可见 -> guest 中断
+        服务程序读 IP 内联应答 rxwm=0 -> 判定无接收数据而不读 RXDATA -> PLIC
+        RX 电平永不清除 -> 中断风暴 (CPU 空转, 输入无响应)。
+        """
+        emu = Emulator(num_harts=1)
+        uart = emu.uart
+        assert uart is not None
+        ev = threading.Event()
+        emu._termio = TerminalIO(
+            uart,
+            ev,
+            ext_irq=emu._native_ext_irq,
+            on_irq=emu.raise_device_irq,
+        )
+        emu._init_for_speedup_lib()
+        ctx = emu._native_uart_ffi
+        assert ctx is not None and ctx is uart._ffi_ctx
+
+        # 数据到达 -> 无需重新 marshal 即可被 native 侧看到
+        uart._ie = 1 << 1
+        uart.preload(b"AB")
+        assert ctx.rx_fifo_len == 2
+        assert ctx.ie == 1 << 1
+        # guest 逐个读走 RXDATA 后水位同步下降
+        uart.read(0x04, 1)
+        assert ctx.rx_fifo_len == 1
+        uart.clear_rx()
+        assert ctx.rx_fifo_len == 0
+        # marshal 复用同一持久对象, 不重建快照
+        assert emu._native_marshal_uart().ffi is ctx
+        # 第二轮防线: 绕过 _publish_state 直接改状态 (模拟未来新增的遗漏路径),
+        # 每轮 marshal 必须重新同步 — 遗漏至多影响一轮, 不会永久失配.
+        uart._ie = 0
+        uart._rx_fifo.append(0x5A)
+        assert ctx.ie == 1 << 1
+        assert emu._native_marshal_uart().ffi is ctx
+        assert ctx.ie == 0
+        assert ctx.rx_fifo_len == 1
 
 
 class TestL2SizeZero:
@@ -1726,7 +1770,7 @@ class TestBusErrorOnUnmappedAccess:
 
     模拟 Linux 内核启动中探访未映射 MMIO 地址时发生的 Bus error 场景.
     与 ``test_trap.py::TestMemoryAccessFaults`` 的区别: 本测试经过
-    fetch → decode → execute → translate → PMP → PMA 完整路径,
+    fetch -> decode -> execute -> translate -> PMP -> PMA 完整路径,
     而非直接调用 ``mem_read`` / ``mem_write``.
     """
 
@@ -1804,7 +1848,7 @@ class TestBusErrorOnUnmappedAccess:
         """跨 RAM 边界的 load -> LdAccessFault (部分字节在空洞中)."""
         h = emu.harts[0]
         h.pc = self.RAM_BASE
-        # 定位到 RAM 最后 4 字节, ld 8 字节 → 高 4 字节溢出到空洞
+        # 定位到 RAM 最后 4 字节, ld 8 字节 -> 高 4 字节溢出到空洞
         ram_end = self.RAM_BASE + emu.bus.ram_size
         h.gprs[10] = ram_end - 4
 
@@ -1826,14 +1870,14 @@ class TestNativeBatchLayout:
 
     Rust 侧将 TLB 存储为 ``[TlbEntry; 32]`` (array-of-structs).
     若 Python 侧错误地使用分离数组 (如 itlb_vpn, itlb_ppn, ...)
-    会造成内存布局不匹配 → SIGBUS (Bus error).
+    会造成内存布局不匹配 -> SIGBUS (Bus error).
     这些用例在每次构建后锁死布局合约.
     """
     def test_tlb_entry_size_40(self) -> None:
         """TlbEntry 必须恰好 40 字节.
 
         mdid 从 u8 加宽为 u64 后 TlbEntry 由 32B 涨到 40B (mdid 对齐到偏移 24).
-        与 Rust ``state::TlbEntry`` 逐字节一致, 否则 Rust 在错误偏移读字段 → SIGBUS.
+        与 Rust ``state::TlbEntry`` 逐字节一致, 否则 Rust 在错误偏移读字段 -> SIGBUS.
         """
         assert ctypes.sizeof(TlbEntry) == 40, (
             f"TlbEntry 应为 40 字节, 实际 {ctypes.sizeof(TlbEntry)}B"
@@ -1858,7 +1902,7 @@ class TestNativeBatchLayout:
     def test_itlb_is_array_of_structs(self) -> None:
         """itlb 确保 array-of-structs 而非 struct-of-arrays.
 
-        struct-of-arrays 会导致 Rust 在 offsetof(itlb[i].ppn) 读到垃圾 → SIGBUS.
+        struct-of-arrays 会导致 Rust 在 offsetof(itlb[i].ppn) 读到垃圾 -> SIGBUS.
         """
         hs = HartState()
         assert len(hs.itlb) % 32 == 0
@@ -1910,7 +1954,7 @@ class TestPlicNativeInline:
         assert info.enable[1 * nw + 0] & (1 << 7) != 0, "context 1 source 7"
 
     def test_unmarshal_plic_roundtrip(self):
-        """marshal → (模拟 Rust 内联改 state) → unmarshal 往返保真."""
+        """marshal -> (模拟 Rust 内联改 state) -> unmarshal 往返保真."""
         emu = Emulator(num_harts=2)
         plic = emu.plic
         plic._priority[10] = 5
@@ -2030,7 +2074,7 @@ class TestClockDecoupling:
 
         回归: 工作树曾把 Rust ``advance_clock_source`` 改为实时/混合模型,
         legacy 模式 PLIC 相位后 HZ=250 的 4ms tick 指令预算不足 (~8-12K 条),
-        低于 kernel post-PLIC timer handler 路径 → mret 后立即再 trap 的活锁,
+        低于 kernel post-PLIC timer handler 路径 -> mret 后立即再 trap 的活锁,
         kernel_init 被饿死, 串口停在 plic 设备树节点输出. 修复为纯指令源
         (20ns/instr) 后, native 路径 mtime 推进率必须与 Python 路径一致:
         5 条指令 = 1 tick, 流逝时间完全不参与.
@@ -2047,10 +2091,10 @@ class TestClockDecoupling:
             f"应恰好执行 2000 条 NOP, 实际 {emu._total_instrs}"
         )
         mtime = emu.clint.get_mtime()
-        # 5 条指令 = 1 tick (10 MHz × 20ns/instr / 1e9). 边界滞后 ≤1 条
+        # 5 条指令 = 1 tick (10 MHz × 20ns/instr / 1e9). 边界滞后 <=1 条
         # (advance_clock_source 在每条指令执行前的循环顶推进), 故期望落在
         # [total//5 - 1, total//5]. 实时/混合模型在此刻会推进
-        # elapsed*timebase ≈ 10^3~10^4+ tick, 远越上界 → 复现修复前行为.
+        # elapsed*timebase ≈ 10^3~10^4+ tick, 远越上界 -> 复现修复前行为.
         lo = emu._total_instrs // 5 - 1
         hi = emu._total_instrs // 5
         assert lo <= mtime <= hi, (
@@ -2080,7 +2124,7 @@ class TestClockDecoupling:
 
 
 class TestMarshalUnmarshalRoundtrip:
-    """marshal_hart → unmarshal_hart 双向数据完整性验证.
+    """marshal_hart -> unmarshal_hart 双向数据完整性验证.
 
     batch 边界 marshal/unmarshal 是 Python HartWithRegs ↔ Rust HartState
     的唯一数据通道.  若任一字段在往返过程中丢失或损坏, batch 内部的 Rust
@@ -2097,7 +2141,7 @@ class TestMarshalUnmarshalRoundtrip:
 
     @staticmethod
     def _roundtrip(hart: Hart) -> Hart:
-        """marshal → unmarshal 到新 hart, 返回新 hart."""
+        """marshal -> unmarshal 到新 hart, 返回新 hart."""
         state = HartState()
         marshal_hart(hart, state)
         out = Hart(id=hart.id + 1)
@@ -2132,7 +2176,7 @@ class TestMarshalUnmarshalRoundtrip:
         """s4 (x20) = -1 (0xFFFF_FFFF_FFFF_FFFF) 在往返后必须保持.
 
         ld-linux 用 s4=-1 作为循环退出哨兵.  若 unmarshal 在某处将其清零
-        或截断, BNE s2,s4 将永不退出 — 继续迭代到 DT_RELA=7 → LoadPageFault.
+        或截断, BNE s2,s4 将永不退出 — 继续迭代到 DT_RELA=7 -> LoadPageFault.
         """
         hart = self._fresh_hart()
         hart.gprs[20] = 0xFFFF_FFFF_FFFF_FFFF  # s4 = -1
@@ -2251,8 +2295,8 @@ class TestMarshalUnmarshalRoundtrip:
         mdid 超过 255 时 marshal 往返必须保持完整 64-bit 值.
 
         回归: HartState.mdid / TlbEntry.mdid 曾声明为 c_uint8 (Rust 侧 u8),
-        与 csr.rs ``val as u8`` 截断共同构成 batch-4 (2000 并发, id ≥ 256)
-        挂死根因 — 300→44, 256→0 (别名回 host, SUSPEND handler 误判而挂死).
+        与 csr.rs ``val as u8`` 截断共同构成 batch-4 (2000 并发, id >= 256)
+        挂死根因 — 300->44, 256->0 (别名回 host, SUSPEND handler 误判而挂死).
         c_uint8 字段赋值 300 会直接抛 ValueError, 本用例在旧布局下无法通过.
         """
         hart = self._fresh_hart()
@@ -2260,7 +2304,7 @@ class TestMarshalUnmarshalRoundtrip:
         out = self._roundtrip(hart)
         assert out.mdid_val == 300
 
-        # 256 ≡ 0 (mod 256) 是最危险别名 (→ host), 必须保留原值
+        # 256 ≡ 0 (mod 256) 是最危险别名 (-> host), 必须保留原值
         hart2 = self._fresh_hart()
         hart2._mdid_val = 256
         out2 = self._roundtrip(hart2)
@@ -2312,7 +2356,7 @@ class TestLdLinuxAddrChain:
     ld-linux 偏移 0x3aba-0x3ace:
       slli s1,a5,2; add s1,s1,a5; slli s1,s1,5
       addi s1,s1,-0xa0; auipc a5,0x1e; addi a5,a5,0x542; add s1,s1,a5
-    若任一指令结果错误则 s1 指向错误元素 → ld a5,0(s1) 读到 DT_RELA=7.
+    若任一指令结果错误则 s1 指向错误元素 -> ld a5,0(s1) 读到 DT_RELA=7.
     """
 
     SLLI_S1_A5_2 = 0x00279493    # 4B: slli s1, a5, 2
@@ -2382,12 +2426,12 @@ class TestBranchEdgeCases:
         hart.mode = RiscvMode.M
         return hart
 
-    # ---- BLTZ (s2 < 0 → branch) ----
+    # ---- BLTZ (s2 < 0 -> branch) ----
     @pytest.mark.parametrize("s2_val,taken", [
-        (-1, True),    # s2=-1 < 0 → branch to skip loop
-        (0, False),    # s2=0 >= 0 → fall through (enter loop)
-        (1, False),    # s2=1 >= 0 → fall through
-        (-2, True),    # s2=-2 < 0 → branch
+        (-1, True),    # s2=-1 < 0 -> branch to skip loop
+        (0, False),    # s2=0 >= 0 -> fall through (enter loop)
+        (1, False),    # s2=1 >= 0 -> fall through
+        (-2, True),    # s2=-2 < 0 -> branch
     ])
     def test_bltz_edge(self, s2_val: int, taken: bool) -> None:
         """BLTZ at 0x3ab6: branch taken iff s2 < 0."""
@@ -2405,12 +2449,12 @@ class TestBranchEdgeCases:
             # Fall-through: pc += advance (4 for non-taken 32-bit branch)
             assert hart.pc == 0x3ABA, f"s2={s2_val}: should fall through to 0x3aba"
 
-    # ---- BNE (s2 != s4 → branch back) ----
+    # ---- BNE (s2 != s4 -> branch back) ----
     @pytest.mark.parametrize("s2_val,s4_val,taken", [
-        (-1, -1, False),  # s2 == s4 → exit loop
-        (0, -1, True),    # s2 != s4 → continue loop
+        (-1, -1, False),  # s2 == s4 -> exit loop
+        (0, -1, True),    # s2 != s4 -> continue loop
         (1, -1, True),    # continue
-        (-2, -1, True),   # s2=-2 != -1 → continue
+        (-2, -1, True),   # s2=-2 != -1 -> continue
     ])
     def test_bne_exit_edge(self, s2_val: int, s4_val: int, taken: bool) -> None:
         """BNE at 0x3b06: branch NOT taken when s2 == s4."""
@@ -2530,7 +2574,7 @@ class TestNativeXonlyFetch:
             f"pc=0x{h.pc:x} mode={h.mode} mcause=0x{h.csrs['mcause'].val:x}"
         )
         assert h.pc == self.TRAP_VEC_VA + 4, (
-            f"trap_vector 首条指令应被取指+执行 (X-only 页取指成功)"
+            "trap_vector 首条指令应被取指+执行 (X-only 页取指成功)"
         )
         assert h.mode == RiscvMode.S, (
             f"不应陷入 M 模式 trap loop, 实际 mode={h.mode}"

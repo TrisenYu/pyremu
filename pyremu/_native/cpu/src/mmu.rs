@@ -106,7 +106,7 @@ pub extern "C" fn pte_parse(raw: u64) -> PteFields {
 ///
 /// For 4 KiB pages:  PA = (ppn << 12) | (va & 0xFFF)
 /// For 2 MiB superpages:  PA = ((ppn[43:21] concatenated with va[20:0]) masked to 64 bits)
-///   which is: the PPN's upper bits (≥bit 9) combined with va[20:12] as the low 9 bits,
+///   which is: the PPN's upper bits (>=bit 9) combined with va[20:12] as the low 9 bits,
 ///   then << 12 and OR with va[11:0].
 #[no_mangle]
 pub extern "C" fn pte_assemble_pa(ppn: u64, va: u64, level: u8) -> u64 {

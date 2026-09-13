@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """RISC-V PLIC (Platform-Level Interrupt Controller) 设备测试.
@@ -171,7 +171,7 @@ class TestThreshold:
         assert _read_u32(plic, _context_threshold_offset(0)) == 4
 
     def test_threshold_blocks_lower_priority(self, plic):
-        """阈值 3 -> 优先级 ≤ 3 的中断不应触发."""
+        """阈值 3 -> 优先级 <= 3 的中断不应触发."""
         _write_u32(plic, _context_threshold_offset(0), 3)
         _write_u32(plic, _priority_offset(10), 2)  # 低于阈值
         _write_u32(plic, _enable_offset(0, 0), 1 << 10)

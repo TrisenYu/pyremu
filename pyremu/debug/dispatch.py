@@ -4,14 +4,15 @@
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """DispatchMixin — REPL 命令分发、帮助信息、hart 切换."""
-from typing import Any
 import signal
+from typing import Any
 
 from rich.panel import Panel
 from rich.table import Table
 
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.utils import fmt_size
+from pyremu.utils.tick import fmt_now_ms
 
 
 class DispatchMixin(SharedMixinAttrs):
@@ -213,7 +214,12 @@ class DispatchMixin(SharedMixinAttrs):
         while True:
             try:
                 raw = self._session.prompt(
-                    [("class:prompt", f"\nrvdbg[{self._hart_id}] ")]
+                    [
+                        ("class:prompt", "\n"),
+                        # 每次渲染提示符时现取系统时间, 插在 rvdbg 之前.
+                        ("class:clock", f"{fmt_now_ms()} "),
+                        ("class:prompt", f"rvdbg[{self._hart_id}] "),
+                    ]
                 ).strip()
             except KeyboardInterrupt:
                 self._console.print()
@@ -284,6 +290,8 @@ class DispatchMixin(SharedMixinAttrs):
                  "在指定指令类型设置断点"),
                 ("b/bp opcode <hex>",
                  "在指定 opcode 设置断点 (如 0x73)"),
+                ("b/bp if reg/csr <name> [op] <val>",
+                 "条件断点 (比较符可缺省, 如 csr mepc 0x... 视为相等)"),
                 ("b/bp", "列出所有断点"),
                 ("bp delete <n>", "删除编号为 n 的断点"),
                 ("bp clear", "清除全部断点"),

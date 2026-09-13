@@ -1,9 +1,9 @@
 //! `#[repr(C)]` state structures that cross the Python FFI boundary.
 
 use core::fmt;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
-include!("config_gen.rs");
+include!("configs_gen.rs");
 
 // ============================================================
 //  TLB entry
@@ -20,7 +20,7 @@ pub struct TlbEntry {
 	pub level: u8,
 	pub valid: u8,
 	/// Memory domain ID — full 64-bit.  Must NOT be narrowed to u8:
-	/// enclave IDs ≥ 256 would alias to 0 (= host) and break both
+	/// enclave IDs >= 256 would alias to 0 (= host) and break both
 	/// `mfence.did` domain isolation and PMP enclave-mode checks.
 	pub mdid: u64,
 	pub tlb_epoch: u32,
@@ -74,7 +74,11 @@ pub struct ImsicFile {
 	pub eithreshold: u8,
 	pub select: u32,
 	pub present: u8,
-	pub eip_ext_any: u8,
+	/// 外部中断位的存在性缓存, 供 ``imsic_topei_peek`` 快速排除无外部中断的
+	/// 情形 (见该函数注释). 由属主 hart 在 eip 变更后重算, 另由跨 hart 的
+	/// ``imsic_eip_set`` 置位 — 该调用可能来自另一个 hart 的加速执行线程, 故
+	/// 必须为原子类型. 类型与 u8 同布局 (1 字节, 对齐 1), FFI 布局不变.
+	pub eip_ext_any: AtomicU8,
 }
 
 // Manual Clone: AtomicU32 is intentionally !Clone / !Copy:
@@ -91,7 +95,7 @@ impl Clone for ImsicFile {
 		out.eithreshold = self.eithreshold;
 		out.select = self.select;
 		out.present = self.present;
-		out.eip_ext_any = self.eip_ext_any;
+		out.eip_ext_any = AtomicU8::new(self.eip_ext_any.load(Ordering::Relaxed));
 		out
 	}
 }
@@ -104,7 +108,7 @@ impl ImsicFile {
 			eithreshold: 0,
 			select: 0,
 			present: 1,
-			eip_ext_any: 0,
+			eip_ext_any: AtomicU8::new(0),
 		}
 	}
 }
@@ -205,10 +209,10 @@ pub struct HartState {
 	// 的指令计数空间: 写入 future 值时, deadline = 写入时刻的 total_instrs +
 	// ceil(剩余 tick / (timebase × NS_PER_INSTR / 1e9)) (见 timer_deadline_own)。
 	// ``sync_mtip`` 对 ACTIVE hart 仅在 total_instrs >= deadline 时置位
-	// (永不清除 — 清除仅发生在 timecmp/stimecmp 写入: 未来值→清位, 0→禁用),
+	// (永不清除 — 清除仅发生在 timecmp/stimecmp 写入: 未来值->清位, 0->禁用),
 	// 从而与其他活跃 hart 的共享 mtime 膨胀解耦。这是与"每指令持续比较
 	// cur_mtime >= cmp"模型的关键差异: 共享 mtime 由所有活跃 hart 以 fetch_max
-	// 推进, 快 hart 会过早触发慢 hart 刚重设 deadline 的定时器 → mret 后立即再 trap
+	// 推进, 快 hart 会过早触发慢 hart 刚重设 deadline 的定时器 -> mret 后立即再 trap
 	// 的活锁。0 = 未设定 deadline (写入即到期/禁用时置 0)。
 	pub stip_deadline: u64,
 	pub mtip_deadline: u64,
@@ -287,209 +291,6 @@ impl HartDiag {
 	}
 }
 
-#[repr(C)]
-pub struct InstrToBeExec {
-	pub total_instrs: u64,
-	pub exit_reason: u8,
-	pub exit_hart_id: u8,
-	pub exit_pc: u64,
-	pub exit_instr: u32,
-	pub trap_cause: u32,
-	pub trap_tval: u64,
-	pub trap_is_interrupt: u8,
-	pub trap_delegated: u8,
-	pub _pad: [u8; 6],
-}
-
-// ============================================================
-//  FFI context structs — group related parameters
-// ============================================================
-
-/// Memory context: RAM + shadow region.
-#[repr(C)]
-pub struct MemCtx {
-	pub ram: *mut u8,
-	pub ram_size: u64,
-	pub ram_base: u64,
-	pub shadow_base: u64,
-	pub shadow_size: u64,
-}
-
-/// PMP configuration (crosses FFI boundary).  Pointers are mutable
-/// so that Rust can write PMP CSR values back inline.
-#[repr(C)]
-pub struct FfiPmpCtx {
-	pub cfg: *mut u8,
-	pub addr: *mut u64,
-	pub num: u8,
-	pub pmpsplit: u8,
-}
-
-/// CLINT state (crosses FFI boundary).  Pointers inside are mutable
-/// so that Rust can update MSIP / MTIMECMP / MTIME inline.
-#[repr(C)]
-pub struct FfiClintCtx {
-	pub mtime: *mut u64,
-	pub mtimecmp: *mut u64,
-	pub msip: *mut u8,
-	pub base: u64,
-	/// mtime 时钟源频率 (Hz, 与 DTB timebase-frequency 同源).
-	/// 用于acceleration内按 clock-source 推进 mtime (QEMU QEMU_CLOCK_VIRTUAL 等价):
-	/// target = time_base_val + elapsed_ns * timebase_hz / 1e9.  0 = 禁用.
-	pub timebase_hz: u64,
-}
-
-/// Device MMIO ranges (crosses FFI boundary).
-#[repr(C)]
-pub struct FfiDevCtx {
-	pub bases: *const u64,
-	pub ends: *const u64,
-	pub num: u8,
-}
-
-/// PLIC state (crosses FFI boundary).  Pointers are mutable so Rust can
-/// update priority / pending / level / enable / threshold / claimed inline
-/// (claim/complete 语义), 避免 kernel 直映射访问 PLIC 时的 batch 退出.
-///
-/// Python 持有底层 ctypes 数组, 并在每次加速执行边界 marshal/unmarshal;
-/// 设备侧 ``raise_device_irq`` 也会直接写入本数组 (write-through), 保证 batch
-/// 内新到达的设备中断对 Rust 可见.
-#[repr(C)]
-pub struct FfiPlicCtx {
-	/// PLIC MMIO base address (0 = no PLIC device present).
-	pub base: u64,
-	/// Number of interrupt sources (source 0 reserved, sources 1..=num_sources).
-	pub num_sources: u32,
-	/// Number of contexts (2 per hart typically: M + S).
-	pub num_contexts: u32,
-	/// Per-source priority (u8, bits [2:0] valid).  Index 0..=num_sources.
-	pub priority: *mut u8,
-	/// Per-source pending flag (0/1).  Shared with Python device set_irq.
-	pub pending: *mut u8,
-	/// Per-source level flag (0/1) — gateway 语义: complete 时电平仍高则重挂 pending.
-	pub level: *mut u8,
-	/// Per-context enable 位图: enable[ctx * num_words + word], 每 u32 一个 word,
-	/// bit i = source (word*32 + i); source 0 保留恒为 0 (与 Python plic.py 一致).
-	/// num_words = (num_sources + 31) / 32.
-	pub enable: *mut u32,
-	/// Per-context threshold (u8, bits [2:0] valid).
-	pub threshold: *mut u8,
-	/// Per-context claimed source (0 = none).
-	pub claimed: *mut u32,
-}
-
-/// Host-side execution watchdog (crosses FFI boundary).
-///
-/// 与 FfiDevCtx / FfiUartCtx / FfiVirtIoCtx 同属设备上下文组 (由 FfiPeriphCtx
-/// 携带), 但不镜像任何 guest 可见 MMIO: 仅携带一次加速执行的时钟源超时时间
-/// ``timeout_ns`` (0 = 禁用).  看门狗线程 ``watchdog_loop`` 以 ``module.st_time_val``
-/// 为基准, 越过该时间后经通用停止接口 (``request_stop`` + ``unpark_all_harts``)
-/// 以 ``exit_reason::TIMEOUT`` 退出.
-#[repr(C)]
-pub struct FfiWatchdogCtx {
-	pub timeout_ns: u64,
-}
-
-/// UART context (crosses FFI boundary).  Rust writes TX characters
-/// directly into ``tx_buf`` so that ``sbi_printf`` does NOT cause a
-/// acceleration exit.  Python reads the buffer after the acceleration completes.
-#[repr(C)]
-pub struct FfiUartCtx {
-	/// UART MMIO base address (e.g. 0x10000000).
-	pub base: u64,
-	/// Ring buffer for TX characters (1-byte entries, ``tx_cap`` slots).
-	pub tx_buf: *mut u8,
-	/// Capacity of ``tx_buf`` (must be power of two, ≤ 256 MiB).
-	pub tx_cap: u32,
-	/// Write-index into ``tx_buf`` (monotonic, wraps at ``tx_cap``).
-	/// Updated atomically by Rust; Python reads after acceleration.
-	pub tx_wr: *mut u32,
-	/// Shadow copy of UART IE register (offset 0x10), written by Python
-	/// during marshal so Rust can handle IE/IP reads inline.
-	pub ie: u32,
-	/// Shadow copy of UART TXCTRL register (offset 0x08).
-	pub txctrl: u32,
-	/// Shadow copy of UART RXCTRL register (offset 0x0C).
-	pub rxctrl: u32,
-	/// Approximate RX FIFO fill level (Python sets during marshal).
-	pub rx_fifo_len: u32,
-	/// Pipe write-end for TX notification: Rust writes 1 byte per TXDATA
-	/// write; Python TX thread select()s the read-end and drains to stdout.
-	/// -1 = disabled.
-	pub tx_notify_fd: i32,
-	/// When 1, Rust writes to ring buffer only (no libc::write).
-	/// Python _tx_callback handles all stdout output.
-	pub no_stdout: u8,
-	/// RX notification — set to 1 by TermIO daemon when new stdin data
-	/// arrives in the ring buffer.  ``hart_worker`` polls this flag and
-	/// wakes WFI / triggers SEIP inline.
-	pub rx_notify: *mut u8,
-}
-
-// Safety: Python holds the backing ctypes arrays alive for the FFI call.
-unsafe impl Send for FfiUartCtx {}
-unsafe impl Sync for FfiUartCtx {}
-
-/// virtio-blk MMIO inline context (crosses FFI boundary).
-///
-/// Rust handles all MMIO register reads/writes inline inside the acceleration,
-/// avoiding expensive exits to Python during the device probe sequence.
-/// Only ``QueueNotify`` (offset 0x050) triggers an exit to Python
-/// then processes the virtqueue descriptors (disk I/O).
-///
-/// Fields are laid out to match the Python ``VirtIOBlock`` MMIO state
-/// 1:1; Python initialises them before the acceleration and reads back changed
-/// fields after the acceleration.
-#[repr(C)]
-pub struct FfiVirtIoCtx {
-	/// virtio MMIO base address (0 = no virtio device present).
-	pub base: u64,
-	/// Disk capacity in 512-byte sectors (for Config reads at offset 0x100).
-	pub capacity: u64,
-	/// Maximum queue entries (read-only, set by Python at init).
-	pub queue_num_max: u32,
-
-	// ---- Feature negotiation ----
-	/// Device features page selector (written at offset 0x014).
-	pub device_features_sel: u32,
-	/// Driver features page selector (written at offset 0x024).
-	pub driver_features_sel: u32,
-	/// Driver features accepted by the guest (written at offset 0x020, 64-bit).
-	pub driver_features: u64,
-
-	// ---- Queue setup ----
-	/// Currently selected queue index (written at offset 0x030).
-	pub queue_sel: u32,
-	/// Chosen queue size (written at offset 0x038).
-	pub queue_num: u32,
-	/// Queue is ready / activated (written at offset 0x044).
-	pub queue_ready: u8,
-
-	// ---- Queue addresses (split 64-bit, written at offsets 0x080-0x0A4) ----
-	pub queue_desc: u64,
-	pub queue_driver: u64,
-	pub queue_device: u64,
-
-	// ---- Device status + interrupts ----
-	/// Device status register (offset 0x070).  Writing 0 resets the device.
-	pub status: u32,
-	/// Interrupt status (offset 0x060).  Bit 0 = used buffer notification.
-	pub interrupt_status: u32,
-
-	// ---- QueueNotify pending flag ----
-	/// Set to 1 by Rust when the driver writes to QueueNotify (offset 0x050).
-	/// Python reads and clears this after processing the virtqueue.
-	pub notify_pending: u8,
-	/// Set to 1 by Rust when InterruptACK clears all interrupt bits and the
-	/// PLIC IRQ should be lowered (``_lower_irq_if_idle``).
-	pub irq_maybe_lower: u8,
-	pub _pad: [u8; 6],
-}
-
-// Safety: Python holds the backing ctypes arrays alive for the FFI call.
-unsafe impl Send for FfiVirtIoCtx {}
-unsafe impl Sync for FfiVirtIoCtx {}
-
 // ============================================================
 //  Constants
 // ============================================================
@@ -505,6 +306,9 @@ pub mod exit_reason {
 	pub const ERROR: u8 = 6;
 	pub const BREAKPOINT: u8 = 7;
 	pub const TIMEOUT: u8 = 8;
+	/// TermIO RX 通知 — 引擎为让 Python 搬运 stdin 字节而主动退出本轮,
+	/// 不是调试器可见的停止事件 (见 hart_sched.rs 的 hart_worker)。
+	pub const RX_WAIT: u8 = 9;
 }
 
 #[allow(dead_code)]
@@ -523,11 +327,12 @@ pub mod riscv_mode {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::ffi::InstrToBeExec;
 	use std::mem::{align_of, size_of};
 
 	#[test]
 	fn tlb_entry_size() {
-		// mdid 加宽 u8→u64 后 TlbEntry 由 32B 涨到 40B (mdid 对齐到偏移 24).
+		// mdid 加宽 u8->u64 后 TlbEntry 由 32B 涨到 40B (mdid 对齐到偏移 24).
 		assert_eq!(size_of::<TlbEntry>(), 40);
 		assert_eq!(align_of::<TlbEntry>(), 8);
 	}
@@ -535,6 +340,21 @@ mod tests {
 	#[test]
 	fn hart_state_alignment() {
 		assert_eq!(align_of::<HartState>(), 8);
+	}
+
+	/// ImsicFile 的字段偏移锁定 — 必须与 Python 侧 ``ImsicFileC``
+	/// (hart.py) 的 ctypes 字段顺序逐一对应, 否则 marshal 时 Python 写入
+	/// 会落到错误的字节 (eip_ext_any 改为 AtomicU8 时布局不变, 由本测试守住).
+	#[test]
+	fn imsic_file_offsets_match_python_layout() {
+		use core::mem::offset_of;
+		// eip[64] + eie[64] 各 256 字节.
+		assert_eq!(offset_of!(ImsicFile, eidelivery), 512);
+		assert_eq!(offset_of!(ImsicFile, eithreshold), 513);
+		assert_eq!(offset_of!(ImsicFile, select), 516);
+		assert_eq!(offset_of!(ImsicFile, present), 520);
+		assert_eq!(offset_of!(ImsicFile, eip_ext_any), 521);
+		assert_eq!(size_of::<ImsicFile>(), 524);
 	}
 
 	#[test]
@@ -601,7 +421,7 @@ mod tests {
 		};
 		// Enable IMSIC state tracking when AIA is active so that
 		// sync_imsic() and imsic_topei_peek() see eip/eie state.
-		if crate::PYREMU_AIA {
+		if crate::CFG_AIA {
 			hs.imsic_m.present = 1;
 			hs.imsic_s.present = 1;
 		};

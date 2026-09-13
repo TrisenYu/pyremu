@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 # Created at 2026/07/09 星期四 17:57:40
 # Last modified at 2026/07/09 星期四 22:25:08
@@ -8,7 +8,7 @@ set -euo pipefail
 
 SUITE="trixie"
 ROOTFS_DIR="./tmp-rootfs" # relative path to this shell script
-MIRROR="https://mirrors.tuna.tsinghua.edu.cn/debian"
+MIRROR="https://mirrors.aliyun.com/debian"
 EXT4_IMG_SIZE_MB=4096
 EXT4_IMG_FILE="./riscv-sd.ext4"
 CPIO_OUT="./debian-riscv-initrd.cpio.gz"
@@ -20,8 +20,17 @@ GREEN='\033[32m'
 YELLOW='\033[33m'
 NC='\033[0m' # No Color
 
+GCC_CROSS="riscv64-linux-gnu-gcc"
+
+QEMU_BIN="/usr/bin/qemu-riscv64-static"
+
 TOY_SRC="$(cd "$(dirname "$0")/../../../tests/src-rv8" && pwd)"
 TOY_DEST="${ROOTFS_DIR}/eval/toy-progs"
+FNAPP_SRC="$(cd "$(dirname "$0")/../../../fn_apps" && pwd)"
+TEE_DEST="${ROOTFS_DIR}/eval/cache-probe-exploit"
+FNAPP_DEST="${TEE_DEST}/fn_apps"
+STRESS_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_aux_tools/stress-test" && pwd)"
+STRESS_DEST="${ROOTFS_DIR}/eval/stress-test"
 
 cleanup_mount() {
     mountpoint -q "${ROOTFS_DIR}/tmp" && umount -l "${ROOTFS_DIR}/tmp"
@@ -61,7 +70,6 @@ fi
 mkdir -p "${ROOTFS_DIR}"
 
 # compile by standard interpreter and fetch essential dependecies
-QEMU_BIN="/usr/bin/qemu-riscv64-static"
 if [ ! -f "${QEMU_BIN}" ]; then
     QEMU_BIN="$(which qemu-riscv64-static 2>/dev/null || true)"
 fi
@@ -202,29 +210,24 @@ ls -la "${TOY_DEST}"
 
 # 8. TEE enclave driver + userspace test programs
 echo ">> Building TEE enclave driver & test programs ..."
-TEE_DRV_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_enclave_drv" && pwd)"
-TEE_TEST_SRC="$(cd "$(dirname "$0")/../../../tests/src-sidecache" && pwd)"
-TEE_DEST="${ROOTFS_DIR}/eval/cache-probe-exploit"
+TEE_DRV_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_aux_tools/linux-driver" && pwd)"
+TEE_TEST_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_aux_tools/cache-probe-exploit" && pwd)"
 mkdir -p "${TEE_DEST}"
 
-# Build kernel module (requires linux tree at ../../linux)
+# Build kernel module (requires linux tree at ../../linux).
 KDIR="$(cd "$(dirname "$0")/../../../bsp/linux" && pwd)"
-CLANG_CC="/opt/custom-llvm/bin/clang"
-if [ -x "${CLANG_CC}" ] && [ -d "${KDIR}" ]; then
+if command -v "${GCC_CROSS}" >/dev/null 2>&1 && [ -d "${KDIR}" ]; then
     make -C "${KDIR}" M="${TEE_DRV_SRC}" ARCH=riscv \
-        CC="${CLANG_CC}" LD="${CLANG_CC/clang/ld.lld}" \
-        STRIP="${CLANG_CC/clang/llvm-strip}" modules 2>&1 | tail -3
+        CROSS_COMPILE="${GCC_CROSS/gcc/}" modules 2>&1 | tail -3
     cp -v "${TEE_DRV_SRC}/tee_enclave_drv.ko" "${ROOTFS_DIR}/eval/"
 else
-    echo ">> SKIP driver build: clang=${CLANG_CC} kdir=${KDIR}"
+    echo ">> SKIP driver build: gcc=${GCC_CROSS} kdir=${KDIR}"
 fi
 
 # Build via Makefile (single source of truth for program list),
 # then copy all resulting binaries + payloads at once.
-# 需要同时构建 musl 飞地载荷 (hello_payload / victim_cache / attacker_cache):
-# cross_enclave_cache 探测与 benign/concurrent 生命周期均依赖它们, 只跑 all
-# 会导致 /eval 下缺失载荷, probe 无法执行.
-GCC_CROSS="riscv64-linux-gnu-gcc"
+# require to build musl payload (hello_payload / victim_cache / attacker_cache):
+# Otherwise, Makefile under /eval will execute as expected.
 if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
     make -C "${TEE_TEST_SRC}" -j"$(nproc)" CROSS_CC="${GCC_CROSS}" all musl
     install -m755 "${TEE_TEST_SRC}"/bin/* "${TEE_DEST}/" 2>/dev/null || true
@@ -234,12 +237,63 @@ else
     echo ">> SKIP test programs: ${GCC_CROSS} not found"
 fi
 
+# 8b. fn_apps enclave payloads (all 7), loaded at runtime by tee_ecall_regress.
+# depends on cargo + riscv64gc-unknown-linux-musl + vendor/musl submodule.
+# Kept in a dedicated fn_apps/ subdir: tee_ecall_regress scans the whole dir as
+# payloads, so it must be isolated from the host programs (cross_enclave_cache /
+# tee_test / ...) and musl probe payloads (hello_payload / victim_*).
+#
+# ensure root can compile rust code when lacking of rust environment
+CARGO_BIN="$(command -v cargo 2>/dev/null || true)"
+INVOKER_HOME=""
+if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+    INVOKER_HOME="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
+fi
+if [ -z "${CARGO_BIN}" ] && [ -n "${INVOKER_HOME}" ] && [ -x "${INVOKER_HOME}/.cargo/bin/cargo" ]; then
+    CARGO_BIN="${INVOKER_HOME}/.cargo/bin/cargo"
+fi
+
+if [ -n "${CARGO_BIN}" ]; then
+    echo ">> Building fn_apps enclave payloads (cargo=${CARGO_BIN}) ..."
+    CARGO_ENV=()
+    if [ -n "${INVOKER_HOME}" ]; then
+        CARGO_ENV=(env HOME="${INVOKER_HOME}" RUSTUP_HOME="${INVOKER_HOME}/.rustup" \
+            CARGO_HOME="${INVOKER_HOME}/.cargo")
+    fi
+    if "${CARGO_ENV[@]}" make -C "${FNAPP_SRC}" CARGO="${CARGO_BIN}" all 2>&1 | tail -8; then
+        mkdir -p "${FNAPP_DEST}"
+        install -m755 "${FNAPP_SRC}"/bin/* "${FNAPP_DEST}/" 2>/dev/null || true
+        # dir for testcases
+		mkdir -p "${FNAPP_DEST}/test"
+        install -m644 "${FNAPP_SRC}"/chibicc/test/inp_src.c "${FNAPP_DEST}/test/inp_src.c" 2>/dev/null || true
+        echo ">> fn_apps payloads installed"
+    else
+        echo ">> WARN: fn_apps build failed; skipping enclave payloads"
+    fi
+else
+    echo ">> SKIP fn_apps: cargo not found"
+fi
+
+# 8c. Headless regression entry — the headless test boots with init=/eval/regress.sh
+# to auto-run the ecall regression (insmod driver + tee_ecall_regress); its
+# [regress] ... markers are asserted from UART.
+cat > "${ROOTFS_DIR}/eval/regress.sh" <<'REGRESS'
+#!/bin/sh
+echo "Regress init starting"
+/sbin/insmod /eval/tee_enclave_drv.ko 2>&1
+cd /eval/cache-probe-exploit || exit 1
+./tee_ecall_regress /eval/cache-probe-exploit/fn_apps
+rc=$?
+echo "Regress rc=$rc"
+exit $rc
+REGRESS
+chmod +x "${ROOTFS_DIR}/eval/regress.sh"
+
 echo ">> TEE components:"
 ls -la "${TEE_DEST}"
 
 # TEE enclave stress test programs
-STRESS_SRC="$(cd "$(dirname "$0")/../../../tests/src-stress" && pwd)"
-STRESS_DEST="${ROOTFS_DIR}/eval/stress-test"
+
 mkdir -p "${STRESS_DEST}"
 
 if command -v "${GCC_CROSS}" >/dev/null 2>&1; then

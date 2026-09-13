@@ -13,7 +13,7 @@ CLINT_BASE = 0x02000000
 
 
 class TestWFIMsipWakeup:
-    """H0 写 MSIP ->H1 从 WFI 唤醒."""
+    """H0 写 MSIP -> H1 从 WFI 唤醒."""
 
     @pytest.fixture
     def emu_two_harts(self):

@@ -109,7 +109,7 @@ VIRTIO_STATUS_FAILED = 0x80
 VIRTIO_F_VERSION_1 = 1 << 32
 VIRTIO_F_RING_INDIRECT_DESC = 1 << 28
 # VIRTIO_F_RING_EVENT_IDX (bit 29) — 刻意不声明.
-# 若声明此 feature, 客机驱动走 event-index 通知抑制路径:
+# 若声明此 feature, 受调试程序驱动走 event-index 通知抑制路径:
 #   needs_kick = vring_need_event(avail_event, new, old)
 # 但 device 侧从未更新 used ring 的 avail_event 字段 (始终为 0),
 # 导致第二个及之后的 buffer 不再写 QueueNotify ->内核永远等不到 I/O 完成.
@@ -122,10 +122,10 @@ VIRTIO_BLK_F_BLK_SIZE = 1 << 6
 
 # 本设备支持的 feature (64-bit)
 # VIRTIO_F_RING_INDIRECT_DESC (bit 28) —
-# 若声明, 客机驱动可用 indirect 描述符 (一层跳转), 但 _process_descriptor_chain
+# 若声明, 受调试程序驱动可用 indirect 描述符 (一层跳转), 但 _process_descriptor_chain
 # 未实现 indirect 表遍历, 遇到 INDIRECT flag 的 desc 会因缺失 NEXT flag 而 return
 # False — 内核拿不到 ext4 superblock ->VFS panic.
-# 与 VIRTIO_F_RING_EVENT_IDX 同模式: 声明 feature 但未实现 ->误引导客机 ->移除以退避.
+# 与 VIRTIO_F_RING_EVENT_IDX 同模式: 声明 feature 但未实现 ->误引导受调试程序 ->移除以退避.
 _DEVICE_FEATURES = (
     VIRTIO_F_VERSION_1
 )

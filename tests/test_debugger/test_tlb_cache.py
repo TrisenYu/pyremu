@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# SPDX-LICENSE-IDENTIFIER: GPL2.0
+# SPDX-LICENSE-IDENTIFIER: MIT
 
 """测试 pyremu.debug.tlb_cache — TLB/Cache 显示."""
 
@@ -117,7 +117,7 @@ class TestCmdTlb:
 
     def test_bad_range_reversed(self):
         dbg = _make_tlbdbg()
-        dbg.cmd_tlb("20-10")  # end ≤ start
+        dbg.cmd_tlb("20-10")  # end <= start
 
 
 class TestCmdTlbflush:

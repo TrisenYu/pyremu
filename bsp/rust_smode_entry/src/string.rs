@@ -2,7 +2,7 @@
 //! `calc_mem_leap` 模式：优先 8 字节搬移，余数按 {4, 2, 1} 字节递减处理。
 //! ref-emod string.c 的 memcpy 仍是逐字节循环，此处一并修正。
 
-/// mem_leap 辅助结构 — 将长度分解为 8 字节块数 + 余数 bitmask。
+/// MemLeapCnt 辅助结构 — 将长度分解为 8 字节块数 + 余数 bitmask。
 struct MemLeapCnt {
 	times8: u64,
 	mod8: u8,

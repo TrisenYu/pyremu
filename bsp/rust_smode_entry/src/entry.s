@@ -94,9 +94,9 @@ _start:
     mv   s2, a2                 # s2 = payload_size
 
     # ---- 设置临时栈 ----
-.L0_tmp_stack:
+_setup_tmp_stk:
     auipc sp, %pcrel_hi(tmp_stack_top)
-    addi  sp, sp, %pcrel_lo(.L0_tmp_stack)
+    addi  sp, sp, %pcrel_lo(_setup_tmp_stk)
     # ---- 为 BootInfo 分配栈空间 (3 × u64 = 24 字节, 对齐到 32) ----
     addi sp, sp, -32
 
@@ -132,12 +132,12 @@ _start:
 .L0_bss_e:
     auipc t1, %pcrel_hi(_bss_end)
     addi  t1, t1, %pcrel_lo(.L0_bss_e)
-    beq   t0, t1, .L_bss_done
+    beq   t0, t1, _bss_reset_done
 .L_bss_loop:
     sd    zero, 0(t0)
     addi  t0, t0, 8
     bltu  t0, t1, .L_bss_loop
-.L_bss_done:
+_bss_reset_done:
 
     # ---- 设置 rust_main_before_mmu 参数 ----
     # fn(out: *mut BootInfo, enclave_id: u64, base_pa: u64, payload_size: u64)
@@ -146,9 +146,9 @@ _start:
     mv   a2, s1                 # a2 = base_pa
     mv   a3, s2                 # a3 = payload_size
     # ---- 注册早期陷态处理 (PC 相对) ----
-.L0_early:
+setup_early_stvec:
     auipc t0, %pcrel_hi(early_trap)
-    addi  t0, t0, %pcrel_lo(.L0_early)
+    addi  t0, t0, %pcrel_lo(setup_early_stvec)
     csrw stvec, t0
     # Bare 模式调用阶段一 (PC 相对 call)
     call rust_main_before_mmu
@@ -201,12 +201,12 @@ early_trap:
 trap_vector:
     # sscratch 交换：sp ↔ sscratch
     csrrw sp, sscratch, sp
-    bnez  sp, .L_user_trap      # sp != 0 -> 用户态陷态
+    bnez  sp, save_user_ctx      # sp != 0 -> 用户态陷态
 
     # ---- 内核陷态：sscratch == 0 ----
     csrr  sp, sstatus
     andi  sp, sp, 0x100         # SPP bit
-    bnez  sp, .L_kernel_trap    # SPP=1 -> 内核陷态
+    bnez  sp, save_kern_ctx    # SPP=1 -> 内核陷态
 
     # ---- 新线程首次陷态：SPP=0，需分配内核栈 ----
     csrrw sp, sscratch, sp      # 恢复 sp
@@ -215,14 +215,14 @@ trap_vector:
     csrw  sscratch, a0
     RESTORE_CONTEXT
     csrrw sp, sscratch, sp
-    j     .L_user_trap
+    j     save_user_ctx
 
-.L_kernel_trap:
+save_kern_ctx:
     # 内核陷态：清零 sscratch
     mv    sp, zero
     csrrw sp, sscratch, sp
 
-.L_user_trap:
+save_user_ctx:
     # 保存全部寄存器
     SAVE_CONTEXT
     # 取出用户 sp 并保存
@@ -236,6 +236,12 @@ trap_vector:
     csrr  a3, stval
     call  trap_dispatch
 
+    # a0 = trap_dispatch 返回: 0 表示不切换; 非 0 为目标线程陷阱帧基址.
+    # 切换即 mv sp, a0 (sp 由当前帧换到目标帧), 随后统一走恢复路径.
+    beqz  a0, not_alter_thread
+    mv    sp, a0
+not_alter_thread:
+
     # 恢复用户 sp
     ld   t1, 256(sp)
     csrw  sscratch, t1
@@ -243,9 +249,9 @@ trap_vector:
 
     # 恢复 sp
     csrrw sp, sscratch, sp
-    bnez  sp, .L_trap_sret
+    bnez  sp, ret_to_user
     csrrw sp, sscratch, sp
-.L_trap_sret:
+ret_to_user:
     sret
 
 # ================================================================

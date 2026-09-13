@@ -16,7 +16,11 @@ TLB 缓存最近使用的虚拟页号 (VPN) -> 物理页号 (PPN) 映射,
 
 from dataclasses import dataclass
 
+from pyremu.configs_aux import cfg_bool
 from pyremu.memory.cache_base import CacheBase, CacheLineBase, ReplacementPolicy
+
+# PYREMU_NO_TLB 停用 TLB: 查询与插入一并跳过 (与 Bus 中 PYREMU_NO_L2 对 L2
+# 缓存的整体旁路一致), 每次地址翻译都完整遍历 Sv39 页表.
 
 
 @dataclass
@@ -86,7 +90,12 @@ class TLB(CacheBase):
 
         ASID 非零时仅匹配相同 ASID 的条目 — 不同的地址空间不共享映射,
         进程切换换 ASID 后无需 SFENCE.VMA (ASID-tagged TLB 语义).
+
+        设置 PYREMU_NO_TLB 时恒返回未命中, 调用方转而完整遍历页表.
         """
+        if cfg_bool("PYREMU_NO_TLB"):
+            return False, 0, 0
+
         entry = self._find_by_tag(vpn)
         if entry is not None:
             e: TLBLine = entry  # type: ignore
@@ -104,7 +113,13 @@ class TLB(CacheBase):
         mdid: int = 0,
         asid: int = 0,
     ) -> None:
-        """将一条映射插入 TLB.  若 vpn 已存在则原地更新."""
+        """将一条映射插入 TLB.  若 vpn 已存在则原地更新.
+
+        设置 PYREMU_NO_TLB 时不写入任何条目.
+        """
+        if cfg_bool("PYREMU_NO_TLB"):
+            return
+
         self._clock += 1
 
         existing_idx = self._tag_to_idx.get(vpn)
@@ -156,6 +171,25 @@ class TLB(CacheBase):
                 e.ppn = 0
                 e.perm = 0
                 e.level = 0
+
+    def flush_all(self) -> None:
+        """刷新全部条目 (基类实现扫描全部槽位).
+
+        PYREMU_NO_TLB 下条目恒为空, 直接返回, 省去每次 csrw satp 与
+        SFENCE.VMA 引发的整表扫描.
+        """
+        if cfg_bool("PYREMU_NO_TLB"):
+            return
+        super().flush_all()
+
+    def flush_by_mdid(self, mdid: int) -> int:
+        """按内存域 ID 刷新条目 (基类实现扫描全部槽位).
+
+        PYREMU_NO_TLB 下条目恒为空, 无条目可刷, 返回 0.
+        """
+        if cfg_bool("PYREMU_NO_TLB"):
+            return 0
+        return super().flush_by_mdid(mdid)
 
     # ----------------------------------------------------------
     #  条目访问

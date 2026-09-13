@@ -19,16 +19,10 @@
 运行:
     uv run python examples/demo_s_to_u.py
 """
-
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+from pyremu.configs_aux import elf_dir, path_join
 from pyremu.debugger import Debugger
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
-from pyremu.configs_aux import elf_dir, path_join
 from pyremu.utils.parse_bin import parse_firmware
 
 

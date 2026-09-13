@@ -818,7 +818,7 @@ class TestMsipClearBothPaths:
 
         真实 RISC-V 硬件要求 M-mode handler 在 MRET 之前写 0 到 CLINT MSIP
         以撤销电平触发的中断线。bare mret 不满足此要求 —— CLINT MSIP 保持 1,
-        每次指令边界 sync_msip 重新断言 mip.MSIP → 无限重入风暴。
+        每次指令边界 sync_msip 重新断言 mip.MSIP -> 无限重入风暴。
         """
         h = emu.harts[0]
         # Handler @ 0x80000000:

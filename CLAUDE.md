@@ -267,7 +267,7 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 ### 测试汇编与算法
 
 - [tests/src-env/](tests/src-env/) — 汇编测试源码 (M->S 移交, Sv39 页表设置, ZSBL 启动, UART 输入)
-  - 所有目标通过 [makefile](tests/src-env/makefile) 构建, 使用 `/opt/custom-llvm/bin/` 下的自定义 LLVM 工具链
+  - 所有目标通过 [makefile](tests/src-env/makefile) 构建, 使用标准 `llvm-mc` / `ld.lld` 工具链
   - `make build-m2s` 编译 M->S 测试固件 (`s_mode_hello.elf`)
   - `make build-s2u` 编译 M->S->U 测试固件 (`u_mode_run_fib.elf`, 含 Sv39 + UART 输入 + fib)
   - `make build-multi` 编译多程序内核 (`kernel.elf`: kernel.s + prog_fib.s + prog_nqueen.s)
@@ -346,7 +346,7 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 ### FFI struct 布局锁定: Python ctypes ↔ Rust `#[repr(C)]` 同步
 
 `HartState`, `TlbEntry`, `BatchResult` 通过 ctypes 跨越 FFI 边界传递.
-**两侧布局必须逐字节一致**, 否则 Rust 在错误偏移处读取字段 → SIGBUS.
+**两侧布局必须逐字节一致**, 否则 Rust 在错误偏移处读取字段 -> SIGBUS.
 
 核心约束:
 - **array-of-structs, 非 struct-of-arrays**. `[TlbEntry; 32]` 在两侧必须是
@@ -364,7 +364,7 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
   itlb/dtlb 确保 `.vpn` / `.ppn` / `.valid` 属性存在 (即 struct 非分离数组).
 
 **教训**: 初次实现 Phase B 时, Rust 侧新增 `itlb: [TlbEntry; 32]` 但 Python 侧误用
-分离数组布局. 旧测试因 `PYREMU_NATIVE_BATCH=0` 从未触发 native batch → 静默通过.
+分离数组布局. 旧测试因 `PYREMU_NATIVE_BATCH=0` 从未触发 native batch -> 静默通过.
 首次固件启动才暴露 SIGBUS. 参见 [CHANGELOG.md](CHANGELOG.md) 2026-07-05 条目.
 
 ### GPR 值的 64-bit 规范化与 Python 位运算陷阱
@@ -374,7 +374,7 @@ Python 的任意精度整数在位运算 (`|`, `&`, `^`) 中表现不同于有�
 后的正 int (如 `0xFFFFFFFFD0000000`) 仅保留低 64 位, 两者 `==` 不相等—
 即使它们代表同一硬件 bit pattern.
 
-**当前策略**: `_sext(val, bits)` 对 `bits≤64` 归一化返回值为 `[0, 2^64)` 范围内的
+**当前策略**: `_sext(val, bits)` 对 `bits<=64` 归一化返回值为 `[0, 2^64)` 范围内的
 无符号 Python int. 所有 RISC-V 立即数和 32-bit 操作的结果写入 GPR 前均经过此规范化.
 使用 `_sint64()` / `_uint64()` ctypes 包装器进行有符号/无符号比较时传入规范化值同样正确.
 
@@ -501,7 +501,7 @@ csrw medeleg, t0
 
 ### 注释编写规范
 不准使用计算机领域内人员无法理解的表述与使IDE意外高亮的字符。
-如"重武装"、"→"、"双元素"，本例下应当使用"重新设置"、"->"与"两个成员变量"。如无必要，注释不准中英文混杂，应当一致使用中文。
+如"重武装"、"->"、"双元素"，本例下应当使用"重新设置"、"->"与"两个成员变量"。如无必要，注释不准中英文混杂，应当一致使用中文。
 
 ## Changelog
 
@@ -511,6 +511,9 @@ csrw medeleg, t0
 - `csrw satp` 绕过 `_mmu_mode` 更新
 - TLB 不可迭代 (缺少 `__iter__`)
 - C.JALR / CSRRW 等 rd==rs1 读写竞争
+
+**归档格式**: `docs/CHANGELOG.md` 仅作索引, 条目按月存放于 [docs/changelogs/](docs/changelogs/)
+(`YYYY-MM.md`, 最新在前)。新增修复记录写入当月文件顶部, 当月文件不存在时新建并在索引表登记。
 
 ## Stub modules (no implementation yet)
 
@@ -649,9 +652,10 @@ if data is None: ...
 
 ## Custom LLVM toolchain
 
-项目使用位于 `/opt/custom-llvm/bin/` 的自定义 LLVM 工具链 (基于 LLVM 22.0.0git,
-作者自行修改扩展). 构建脚本 [tests/src-env/makefile](tests/src-env/makefile) 顶部通过
-`custom_bin_dir=/opt/custom-llvm/bin` 引用全部工具. 各工具及常用选项:
+厂商自定义指令集 (`ztee` / `zknh`) 组件使用位于 `/opt/custom-llvm/bin/` 的自定义
+LLVM 工具链 (基于 LLVM 22.0.0git, 作者自行修改扩展), 见 `bsp/custom-opensbi`、
+`bsp/rust_smode_entry`、`tests/src-alg`。其余组件 (内核、驱动、tests 汇编、fn_apps)
+改用标准 `clang` / `llvm-mc` / `ld.lld` 工具链。各工具及常用选项:
 
 | 工具 | 用途 | 常用参数 |
 |------|------|---------|

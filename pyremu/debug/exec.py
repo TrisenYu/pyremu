@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 
 from pyremu._native import decode_fields
+from pyremu.configs_aux import cfg_float
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend
@@ -36,8 +37,6 @@ from pyremu.emulator import Emulator, RunStopReason, TimeoutError
 from pyremu.env_inject import Preloader
 from pyremu.utils.mask import mask64
 from pyremu.utils.parse_bin import FirmwareImage
-
-_DEFAULT_TIMEOUT = 3600.0
 
 
 class ExecutionMixin(SharedMixinAttrs):
@@ -217,13 +216,14 @@ class ExecutionMixin(SharedMixinAttrs):
         - 时钟源超时 (TimeoutError).
 
         Args:
-            timeout: 时钟源超时秒数, 默认 3600 (1 小时). 设为 0 禁用.
+            timeout: 时钟源超时秒数
+            默认取 emu-configs.mk 的 DEFAULT_TIMEOUT 设为 0 禁用.
         """
         self._running = True
         self._terminated = False
         self._bp_hit_this_run.clear()
         self._enter_run_mode()
-        timeout = _DEFAULT_TIMEOUT if timeout is None else timeout
+        timeout = cfg_float("DEFAULT_TIMEOUT") if timeout is None else timeout
 
         # Push addr breakpoints to the emulator so Rust checks them inline.
         # For kernel symbols resolved to physical addresses, also include the
@@ -338,6 +338,22 @@ class ExecutionMixin(SharedMixinAttrs):
                 return
         self.cmd_pc()
 
+    def __reset_inner_state(self) -> None:
+        self._snapshot = None
+        self._mem_changes = []
+        self._instr_count = 0
+        self._trap_displayed_mcause = None
+        self._disasm_next_addr = None
+        self._disasm_ref_pc = None
+        self._disasm_base_step = 0
+        self._disasm_past_terminator = False
+        self._stack_frames = []
+        self._current_frame_idx = 0
+        self._last_command = None
+        self._hart_paused.clear()
+        self._bp_hit_this_run.clear()
+        self._prev_instr_csr_addr = -1
+
     def cmd_restart(self) -> None:
         """重新运行当前加载的程序."""
         emu = self._emu
@@ -402,21 +418,7 @@ class ExecutionMixin(SharedMixinAttrs):
             for h in emu.harts:
                 h.pc = preload_entry
 
-        self._snapshot = None
-        self._mem_changes = []
-        self._instr_count = 0
-        self._trap_displayed_mcause = None
-        self._disasm_next_addr = None
-        self._disasm_ref_pc = None
-        self._disasm_base_step = 0
-        self._disasm_past_terminator = False
-        self._stack_frames = []
-        self._current_frame_idx = 0
-        self._last_command = None
-        self._hart_paused.clear()
-        self._bp_hit_this_run.clear()
-        self._prev_instr_csr_addr = -1
-
+        self.__reset_inner_state()
         self._console.print(
             f"[dim]已重启 — {cfg.num_harts} hart(s), "
             f"PC = [yellow]{emu.harts[0].pc:#018x}[/][/]"

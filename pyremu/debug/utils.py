@@ -11,8 +11,8 @@
 from pathlib import Path
 
 from pyremu.core.trap_def import trap_cause_name as _trap_cause_name_impl
-from pyremu.utils.mask import mask64
 from pyremu.utils.disassem import Opc
+from pyremu.utils.mask import mask64
 
 # ============================================================
 #  节流常量

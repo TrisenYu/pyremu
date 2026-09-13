@@ -92,9 +92,6 @@ macro_rules! clear_csr {
 }
 
 pub(crate) use clear_csr;
-// pub(crate) use read_csr;
-// pub(crate) use set_csr;
-// pub(crate) use write_csr;
 
 // ---------------------------------------------------------------
 //  Named convenience wrappers
@@ -163,4 +160,16 @@ pub fn read_sscratch() -> u64 {
 #[inline]
 pub fn write_sscratch(v: u64) {
 	write_csr!(sscratch, v)
+}
+/// 设定 S 模式定时器比较值 (Sstc, CSR 0x14D)。
+///
+/// 硬件语义: mtime >= stimecmp > 0 时置位 mip.STIP。
+#[inline]
+pub fn write_stimecmp(v: u64) {
+	write_csr!(stimecmp, v)
+}
+/// 读取 S 模式定时器比较值 (Sstc, CSR 0x14D)。
+#[inline]
+pub fn read_stimecmp() -> u64 {
+	read_csr!(stimecmp)
 }

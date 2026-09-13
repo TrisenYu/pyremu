@@ -8,7 +8,6 @@
 通过 mixin 多重继承组合为完整的 Debugger 类, 与 pyremu.debugger 等价.
 """
 from pyremu.core.trap_def import trap_cause_name
-
 from pyremu.debug.base import DebuggerBase
 from pyremu.debug.breakpoint import BreakpointMixin
 from pyremu.debug.dispatch import DispatchMixin

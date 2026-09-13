@@ -1,4 +1,4 @@
-// SPDX-LICENSE-IDENTIFIER: GPL2.0
+// SPDX-LICENSE-IDENTIFIER: MIT
 // (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 // M+S 模式内核: 进程调度 + trap 处理 + UART 驱动.
@@ -471,7 +471,7 @@ timer_set_next:
 // ============================================================
 //  schedule_next — 调度下一个 READY 进程
 //
-//   若 current_pid ≥ 0: 保存当前进程 sepc/sp 到 PCB
+//   若 current_pid >= 0: 保存当前进程 sepc/sp 到 PCB
 //   查找下一个 READY 进程, 恢复其 sepc/sp
 //   设置 mtimecmp, SRET 到 U 模式
 //

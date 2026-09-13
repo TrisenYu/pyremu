@@ -24,7 +24,7 @@ from loguru import logger
 
 from pyremu._native import (
     native_available,
-    pmp_check as _native_pmp_check,
+    pmp_check,
 )
 from pyremu.configs_aux import cfg_bool
 from pyremu.utils.mask import mask64
@@ -229,7 +229,7 @@ class Pmp:
         if self._use_native:
             if self._cache_dirty:
                 self._rebuild_cache()
-            return _native_pmp_check(
+            return pmp_check(
                 bytes(self._flat_cfg),
                 self._flat_addr,
                 self._num_entries,
