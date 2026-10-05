@@ -70,7 +70,7 @@ _MODE_S = RiscvMode.S.value
 _MODE_U = RiscvMode.U.value
 
 
-def _update_hw_mip(hart: HartWithRegs, hw_mip_bits: int) -> None:
+def update_hw_mip(hart: HartWithRegs, hw_mip_bits: int) -> None:
     """用当前硬件状态替换 mip CSR 中的硬件源位.
 
     与简单的 `current_mip | hw_mip_bits` 不同, 此函数**清除**已不再被
@@ -304,15 +304,15 @@ def trap_ecall(
     deliver_trap(hart, cause, tval=hart.pc, is_interrupt=False)
 
 
-# ---- RISC-V semihosting 序列 (ARM/QEMU 约定) ----
-# 调用序列: ``slli x0,x0,0x1f; ebreak; srai x0,x0,7`` (操作码在 a0, 参数块指针在 a1).
-# marker 指令编码与 Rust 引擎 handlers.rs 的 SEMIHOSTING_PRE/POST 保持一致.
-# native 引擎 (try_semihosting) 对带 marker 的 ebreak 一律内联服务 (SYS_WRITE /
-# SYS_WRITEC / SYS_OPEN / SYS_ISTTY …), 仅 SYS_EXIT 触发 run() 停机; 纯 Python
-# 引擎此前只识别 SYS_EXIT, 其余操作被当作普通断点 trap 投递. 当固件在 M 模式
-# 控制台打印路径 (sbi_nputs 已持有 console_out_lock) 内执行 semihosting 写时,
-# 该 trap 使控制台锁在嵌套的 M 处理中无法释放, 造成自旋锁死锁. 故此处补齐与
-# native 对齐的通用 semihosting 服务.
+# ---- RISC-V semihosting 序列, 沿用 ARM 与 QEMU 的约定 ----
+# 调用序列为 ``slli x0,x0,0x1f; ebreak; srai x0,x0,7``, 其中 a0 存放操作码, a1 存放
+# 参数块指针; marker 指令编码与 Rust 加速执行引擎 handlers.rs 的 SEMIHOSTING_PRE/POST
+# 保持一致.
+# 加速执行引擎对带 marker 的 ebreak 一律内联服务 (SYS_WRITE / SYS_WRITEC / SYS_OPEN /
+# SYS_ISTTY …), 仅 SYS_EXIT 触发 run() 停机; 纯 Python 引擎此前只识别 SYS_EXIT, 其余
+# 操作被当作普通断点 trap 投递. 固件在持有锁 console_out_lock 的 M 模式控制台
+# sbi_nputs 的输出路径上执行 semihosting 写时, 该 trap 使该锁在嵌套的 M 模式处理中
+# 无法释放, 引发死锁. 故此处补齐通用的 semihosting 服务.
 _SEMIHOSTING_SYS_OPEN: int = 0x01
 _SEMIHOSTING_SYS_WRITEC: int = 0x03
 _SEMIHOSTING_SYS_WRITE: int = 0x05
@@ -320,15 +320,15 @@ _SEMIHOSTING_SYS_ISTTY: int = 0x09
 _SEMIHOSTING_SYS_EXIT: int = 0x18
 _SEMIHOSTING_PRE: int = 0x01F01013  # slli x0, x0, 0x1f
 _SEMIHOSTING_POST: int = 0x40705013  # srai x0, x0, 7
-# native semihosting_dispatch 对不可识别的操作码 / 非法参数一律返回 -1.
-_SEMIHOSTING_ERR: int = 0xFFFF_FFFF_FFFF_FFFF  # -1 (64-bit 规范化)
+# 加速执行引擎的 semihosting_dispatch 对不可识别的操作码与非法参数一律返回 -1.
+_SEMIHOSTING_ERR: int = 0xFFFF_FFFF_FFFF_FFFF  # -1 的 64 位表示
 
 
 def _semihosting_write_stderr(data: bytes) -> None:
-    """semihosting 输出写到 stderr (fd 2), 与 native 策略一致.
+    """semihosting 输出写到 stderr (fd 2), 与加速执行引擎的处理一致.
 
-    避免污染 stdout 上的调试器 TUI 与 UART 转发行; os.write 绕过 Python
-    stdio 缓冲, 与 Rust 侧 write(2, ...) 等价.
+    写到 stderr 可避免污染 stdout 上的调试器界面与 UART 转发行; os.write 绕过
+    Python 的 stdio 缓冲, 与 Rust 侧 write(2, ...) 等价.
     """
     try:
         os.write(2, data)
@@ -341,10 +341,10 @@ def _sh_read_ram(
     pa: int,
     size: int,
 ) -> bytes:
-    """读物理 RAM *size* 字节; 越界返回全零 — 对齐 native read_ram_u64/u8.
+    """读物理 RAM *size* 字节; 越界返回全零, 与加速执行引擎的 read_ram_u64/u8 一致.
 
-    native 仅在 ``[ram_base, ram_base + ram_size)`` 内读, 越界视为 0;
-    设备 MMIO 地址同样不在此范围, 一并视为越界.
+    加速执行引擎仅在 ``[ram_base, ram_base + ram_size)`` 内读, 越界视为 0;
+    设备 MMIO 地址不在此范围内, 一并视为越界.
     """
     bus = hart._bus
     if bus is None or size < 1:
@@ -378,11 +378,11 @@ def _semihosting_markers_match(
 def _semihosting_service(
     hart: HartWithRegs,
 ) -> None:
-    """服务带 marker 的 ebreak — 与 native try_semihosting 语义对齐.
+    """服务带 marker 的 ebreak, 与加速执行引擎的 try_semihosting 语义一致.
 
-    按 a0 操作码分发, 结果写回 a0, 并将 pc 前进 8 (越过 ebreak + 退出 marker),
-    使序列余下的 ``sext.w/bltz`` 等指令自然处理返回值. SYS_EXIT 除外: 置停机
-    标记供 run() 返回 (与既有 python 语义一致), 不投递断点 trap.
+    按 a0 操作码分发, 结果写回 a0, 并将 pc 前进 8 越过 ebreak 与退出 marker, 使序列
+    余下的 ``sext.w/bltz`` 等指令自然处理返回值. SYS_EXIT 除外: 置停机标记供 run()
+    返回, 与纯 Python 引擎原有的处理相同, 不投递断点 trap.
     """
     op = hart.gprs[10]
     param = hart.gprs[11]
@@ -411,7 +411,7 @@ def _semihosting_service(
             _semihosting_write_stderr(_sh_read_ram(hart, buf_addr, length))
             hart.gprs[10] = 0
     elif op == _SEMIHOSTING_SYS_OPEN:
-        # 返回合法 fd, 令固件的探测认为有宿主 (与 native 一致)
+        # 返回合法的 fd, 使固件探测时认为存在宿主, 与加速执行引擎一致
         hart.gprs[10] = 1
     elif op == _SEMIHOSTING_SYS_ISTTY:
         fd = int.from_bytes(_sh_read_ram(hart, param, 8), "little")
@@ -425,8 +425,8 @@ def trap_ebreak(
     hart: HartWithRegs,
 ) -> None:
     """EBREAK: 断点异常."""
-    # semihosting marker 序列 — 不投递断点 trap, 由 _semihosting_service 内联
-    # 服务 (SYS_EXIT 置停机标记供 run() 返回). native 引擎行为一致, 详见上.
+    # semihosting marker 序列不投递断点 trap, 由 _semihosting_service 内联服务,
+    # SYS_EXIT 置停机标记供 run() 返回. 加速执行引擎的处理与此一致, 详见上方注释.
     if _semihosting_markers_match(hart):
         _semihosting_service(hart)
         return
@@ -526,7 +526,7 @@ def handle_wfi(
 
     注意: 等待期间不检查 mstatus.MIE, 仅 mip & mie 非零即可唤醒.
     """
-    # TW (Timeout Wait) 检查: 非 M 模式下 mstatus.TW=1 -> 非法指令异常
+    # 超时等待位 TW 检查: 非 M 模式下 mstatus.TW=1 则触发非法指令异常
     if hart.mode != RiscvMode.M and hart.mstatus_val & MSTATUS_TW:
         deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
         return
@@ -543,7 +543,7 @@ def handle_wfi(
     if hart.mip_val & hart.mie_val:
         return  # 正常返回, 调用方会将 PC+4
 
-    # 无可处理中断 -> 进入等待状态, 重置唤醒标记
+    # 无可处理中断则进入等待状态, 重置唤醒标记
     hart._waiting = True
     hart._wfi_woken = False
 
@@ -626,7 +626,7 @@ def try_wfi_wakeup(
         ext_mip = hart._plic.get_pending_mip(hart.id)
     mip_bits = mip_bits | ext_mip
 
-    _update_hw_mip(hart, mip_bits)
+    update_hw_mip(hart, mip_bits)
 
     if not has_pending and not msip_raw and ext_mip == 0:
         return False
@@ -710,17 +710,17 @@ def check_pending_interrupts(hart: HartWithRegs) -> bool:
 
     # 更新 mip CSR: 用当前硬件状态替换硬件源位, 保留软件写入位.
     # 必须在 early return 之前执行 — 即使无 pending 中断, 也要清除已撤除的
-    # 硬件源位 (如 MSIP 清零后 mip.MSIP 需同步为 0), 否则旧位残留
-    # 导致下次 mip & mie 仍命中 -> MSIP 风暴.
-    _update_hw_mip(hart, mip_bits)
+    # 硬件源位, 如 MSIP 清零后 mip.MSIP 需同步为 0, 否则旧位残留
+    # 导致下次 mip & mie 仍命中, 随后出现 MSIP 风暴.
+    update_hw_mip(hart, mip_bits)
 
     if not has_pending and ext_mip == 0:
-        # 无中断挂起 -> 更新缓存供后续快速路径使用
+        # 无中断挂起则更新缓存供后续快速路径使用
         hart._int_cache_version = hart._int_state_version
         hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)
         return False
 
-    # M 模式 + MIE=0 -> 全局关中断
+    # M 模式且 MIE=0 则关闭全局中断
     if hart.mode == RiscvMode.M and not hart.mie:
         return False
 
@@ -737,6 +737,7 @@ def check_pending_interrupts(hart: HartWithRegs) -> bool:
         hart.mode == RiscvMode.S and hart.sie
     )
 
+    ret = False
     # 按优先级找最高优先级的使能中断.
     # 使用模块级预计算常量, 避免每条指令分配 list + 6 tuple.
     for mask, trap_type in _INT_PRIORITY:
@@ -746,9 +747,9 @@ def check_pending_interrupts(hart: HartWithRegs) -> bool:
         if (mideleg & mask) and not s_mode_global:
             continue
         deliver_trap(hart, trap_type, tval=0, is_interrupt=True)
-        return True
-
-    return False
+        ret = True
+        break
+    return ret
 
 
 # ============================================================
@@ -838,10 +839,10 @@ def check_pending_interrupts_nested_enabled(
     mip_bits = mip_bits | ext_mip
 
     # 更新 mip CSR: 用当前硬件状态替换硬件源位, 保留软件写入位.
-    _update_hw_mip(hart, mip_bits)
+    update_hw_mip(hart, mip_bits)
 
     if not has_pending and ext_mip == 0:
-        # 无中断挂起 -> 更新缓存
+        # 无中断挂起则更新缓存
         hart._int_cache_version = hart._int_state_version
         hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)
         return False
@@ -849,8 +850,7 @@ def check_pending_interrupts_nested_enabled(
     if hart.mode == RiscvMode.M and not hart.mie:
         return False
 
-    mie = hart.mie_val
-    masked = hart.mip_val & mie
+    masked = hart.mip_val & hart.mie_val
     if masked == 0:
         return False
 
@@ -860,6 +860,7 @@ def check_pending_interrupts_nested_enabled(
     )
 
     # 使用模块级预计算常量, 避免每条指令分配 list + 6 tuple.
+    ret = False
     for mask, trap_type in _INT_PRIORITY:
         if not (masked & mask) or ((mideleg & mask) and not s_mode_global):
             continue
@@ -869,6 +870,6 @@ def check_pending_interrupts_nested_enabled(
             tval=0,
             is_interrupt=True,
         )
-        return True
-
-    return False
+        ret = True
+        break
+    return ret

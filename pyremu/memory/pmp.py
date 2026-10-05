@@ -15,7 +15,7 @@ RV64 编码: pmpcfgN 覆盖 8 个条目, 仅偶数编号的 pmpcfg 可用.
 
 from __future__ import annotations
 
-from array import array as _array
+from array import array
 from collections.abc import MutableMapping
 from dataclasses import dataclass
 from typing import Any
@@ -40,8 +40,8 @@ PMP_A_NA4 = 0b0001_0000  # Naturally Aligned 4-byte
 PMP_A_NAPOT = 0b0001_1000  # Naturally Aligned Power-of-Two
 PMP_L = 0b1000_0000  # 锁定位
 
-# RiscvMode 值 -> PMP 检查时的特权级逻辑:
-# M=3 且 MPRV=0 -> 跳过 PMP; 否则按 MPP 特权级检查
+# RiscvMode 值到 PMP 检查特权级逻辑的映射:
+# M=3 且 MPRV=0 则跳过 PMP; 否则按 MPP 特权级检查
 _MODE_M = 3
 
 
@@ -151,7 +151,7 @@ class Pmp:
 
         # Rust 加速: 扁平化 PMP 条目缓存 (64 u8 cfg + 64 u64 addr)
         self._flat_cfg: bytearray = bytearray(64)
-        self._flat_addr: _array = _array("Q", [0] * 64)
+        self._flat_addr: array = array("Q", [0] * 64)
         self._cache_dirty: bool = True
         self._use_native: bool = native_available()
 
@@ -266,6 +266,7 @@ class Pmp:
         if self._num_entries == 0:
             return False
 
+        # TODO: 0更换为HOST_DID
         enclave_mode = mdid != 0
 
         # 按优先级遍历 PMP 条目 (低编号优先)

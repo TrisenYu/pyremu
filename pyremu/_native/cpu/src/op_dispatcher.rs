@@ -174,7 +174,7 @@ pub fn handle_fp_op(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64
 	4
 }
 
-/// FMA (opcode 0x43/0x47/0x4B/0x4F): 融合乘加的四种变体。
+/// FMA (opcode 0x43/0x47/0x4B/0x4F): 合并乘加的四种变体。
 pub fn handle_fp_fma(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
 	if fp_disabled(state) {
 		deliver_illegal_instruction(state, instr as u64);

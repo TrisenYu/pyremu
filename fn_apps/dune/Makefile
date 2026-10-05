@@ -29,13 +29,13 @@ CXXFLAGS := $(ARCH) -std=c++20 -O2 -Wall \
   -isystem $(MUSL_SRC)/arch/generic \
   -isystem $(MUSL_SRC)/obj/include
 
-# DUNE 静态库 (依赖序: uggrid -> grid -> geometry -> common)。
+# DUNE 静态库, 依赖序为 uggrid、grid、geometry、common。
 DUNE_LIBS := -lduneuggrid -ldunegrid -ldunegeometry -ldunecommon
 
 all: $(OUT)
 
-# -nodefaultlibs 屏蔽 clang 隐式追加 -lgcc_eh; 显式列 DUNE 库与 C++ 运行库,
-# 顺序须为 DUNE -> libc++ -> libunwind -> libc -> libgcc (libc++ 引用后三者符号)。
+# -nodefaultlibs 屏蔽 clang 隐式追加 -lgcc_eh; 显式列 DUNE 库与 C++ 运行库。
+# 链接顺序须为 DUNE 库、libc++、libunwind、libc、libgcc, 因为 libc++ 引用后三者符号。
 $(OUT): $(SRC)
 	@mkdir -p $(@D)
 	$(CLANGXX) --target=$(TARGET) $(CXXFLAGS) $< $(LDFLAGS) -nodefaultlibs \

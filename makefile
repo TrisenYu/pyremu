@@ -1,13 +1,16 @@
 phony =
 
-# 主要入口: make emu-linux-sh — 自动构建固件 -> 更新 kei.sav -> 启动调试器
+# 主要入口: make emu-linux-sh — 自动构建固件、更新 kei.sav、启动调试器
 #
 # 构建依赖链:
-#   rust_smode_entry.bin -> opensbi (distclean + 全量编译)
-#       -> 拷贝 fw_*.elf 到 tests/ -> kei.sav 符号更新 -> 启动调试器
+#   sittim.bin
+#       -> opensbi (distclean + 全量编译)
+#       -> 拷贝 fw_*.elf 到 tests/
+#       -> kei.sav 符号更新
+#       -> 启动调试器
 #
 # make build-native — 编译 Rust cdylib 加速库 (pyremu/_native/libdecode.so)
-# make clean-native  — 删除编译产物
+# make clean-native — 删除编译产物
 #
 
 # 全部变量定义集中在 configs.mk (路径/固件 flags/DISK/INITRD/ram 等)。
@@ -38,16 +41,10 @@ endif
 phony += __pyenv-check
 
 
-# CARGO_FLAGS 变化时强制重建 native .so (需求: PYREMU_TRACE_SRET / PYREMU_DIAG_LOG
-# 设为非零/非空值时启用 --features diagnostic, 否则不启用).
-# 若仅依赖加速库项目更新的时间戳, 修改环境变量后 make 不会重建 -> 旧的
-# (不含 diagnostic) .so 被继续使用 -> 诊断日志静默缺失.
+# CARGO_FLAGS 变化时强制重建 native .so
 CONFIG_GEN_RS = $(NATIVE_DIR)/cpu/src/configs_gen.rs
 
-# 由 configs.mk 生成 Rust 常量定义 — 照搬 rust_smode_entry/Makefile 模式.
-# 开关类配置的命名: 工程根目录的 PYREMU_XXX -> Rust 侧 CFG_XXX
-# (去掉 PYREMU_ 前缀, 保持 SCREAMING_SNAKE_CASE 常量命名惯例),
-# 使同一份配置在两处都以各自语言的惯用形式出现.
+# 由 configs.mk 生成 Rust 常量定义
 $(CONFIG_GEN_RS): FORCE
 	@rm -f $@.tmp
 	@echo '// generated from configs.mk by Makefile — do not edit' >> $@.tmp
@@ -80,11 +77,11 @@ phony += FORCE
 
 
 # ---- Rust S-mode Runtime ----
-# 编译 rust_smode_entry.bin, 供 opensbi 嵌入 .coffer_enclave_man 段
-$(RUST_SMODE_BIN): $(wildcard $(RUST_SMODE_DIR)/src/*.rs) $(wildcard $(RUST_SMODE_DIR)/src/**/*.rs)
-	$(MAKE) -C $(RUST_SMODE_DIR) build
+# 编译 sittim.bin, 供 opensbi 嵌入 .sittim 段
+$(SITTIM_BIN): $(wildcard $(SITTIM_DIR)/src/*.rs) $(wildcard $(SITTIM_DIR)/src/**/*.rs)
+	$(MAKE) -C $(SITTIM_DIR) build
 
-build-rust: $(RUST_SMODE_BIN)
+build-rust: $(SITTIM_BIN)
 phony += build-rust
 
 # 对bsp/opensbi的编译配置
@@ -108,12 +105,12 @@ fi
 endef
 __dbg_mem_sync := $(shell $(dbg_mem_sync_sh))
 
-$(FW_BUILD_DIR)/fw_payload.elf: $(RUST_SMODE_BIN) $(FW_SRC_DEPS)
+$(FW_BUILD_DIR)/fw_payload.elf: $(SITTIM_BIN) $(FW_SRC_DEPS)
 	$(MAKE) -C $(FW_SRC_DIR) distclean
 	$(MAKE) -C $(FW_SRC_DIR) $(FW_MAKE_FLAGS) -j$$(nproc)
 
-# fw_jump 同样内嵌 rust_smode_entry.bin (firmware/objects.mk _ENCLAVE_DEFAULT),
-$(FW_BUILD_DIR)/fw_jump.elf: $(RUST_SMODE_BIN) $(FW_SRC_DEPS)
+# fw_jump 同样内嵌 sittim.bin (firmware/objects.mk _ENCLAVE_DEFAULT),
+$(FW_BUILD_DIR)/fw_jump.elf: $(SITTIM_BIN) $(FW_SRC_DEPS)
 	$(MAKE) -C $(FW_SRC_DIR) distclean
 	$(MAKE) -C $(FW_SRC_DIR) $(FW_JUMP_FLAGS) -j$$(nproc)
 
@@ -141,18 +138,11 @@ $(fw_jump): $(FW_BUILD_DIR)/fw_jump.elf
 	@echo "固件已拷贝: $(fw_jump)"
 
 # ---- kei.sav 构建 ----
-# 依赖固件产物, 保证启动模拟器前固件已就位 (kei.sav 本身已不再从固件 ELF 提取符号)
-${kei-sav}: $(fw_payload)
+# 依赖固件产物, 保证启动模拟器前固件已构建完成; kei.sav 本身已不再从固件 ELF 提取符号
+kei-sav: $(fw_payload)
 	$(MAKE) -C bsp/kei-boot kei-sav
 
-# ---- 主入口: 启动模拟器 ----
-# 完整依赖链: Rust -> 固件编译 -> 拷贝 -> kei.sav -> 模拟器
-emu: ${kei-sav} __pyenv-check
-	PYREMU_TRACE_TRAPS=1 PYREMU_TRACE_PMP=1 \
-	python -m pyremu.debugger --hart-logs=output/ $(pyargs)
-phony += emu
-
-$(fw_payload_linux): $(RUST_SMODE_BIN) $(FW_SRC_DEPS)
+$(fw_payload_linux): $(SITTIM_BIN) $(FW_SRC_DEPS)
 	@echo "构建 opensbi + Linux 内核 payload..."
 	$(MAKE) -C $(FW_SRC_DIR) distclean $(FW_MAKE_FLAGS) \
 		FW_PAYLOAD_PATH=$(realpath $(LINUX_IMG))
@@ -166,26 +156,7 @@ $(fw_payload_linux): $(RUST_SMODE_BIN) $(FW_SRC_DEPS)
 build-fw-linux: $(fw_payload_linux)
 phony += build-fw-linux
 
-# fw_payload 模式 (Linux 内嵌 OpenSBI payload) — 备用; 主用 emu-linux (fw_jump)。
-# 嵌入的是vmlinux，会缺乏调试符号
-emu-linux-payload: ${kei-sav} $(fw_payload_linux) __pyenv-check
-	@$(MAKE) -C pyremu
-	python -m pyremu.debugger \
-		--hart-logs=output/ --ram-base=0x80000000 --ram 512M --preload=${kei-sav} \
-		--harts=$(hart_num) $(fw_payload_linux)
-phony += emu-linux-payload
-
-# 最小 init 验证内核能否走到执行 init 阶段
-emu-linux-sh: ${kei-sav} $(fw_jump_elf) build-native __pyenv-check
-	@$(MAKE) -C pyremu
-	PYTHON_GIL=0 python -m pyremu.debugger \
-		--hart-logs=output/ --ram-base=0x80000000 --ram $(ram) --preload=${kei-sav} \
-		--kernel=$(LINUX_IMG) --sym=$(LINUX_VMLINUX) --fdt -1 \
-		$(disk_args) $(initrd_args) $(bootargs_arg) \
-		--harts=$(hart_num) $(fw_jump_elf)
-phony += emu-linux-sh
-
-# ---- initramfs 打包 (debootstrap 目录 -> newc cpio + gzip) ----
+# ---- initramfs 打包 debootstrap 目录下生成cpio与gzip ----
 # 用 fakeroot (若可用) 保留属主与 /dev 节点。
 $(INITRAMFS):
 	@test -d $(ROOTFS_DIR) || { echo "缺少 rootfs 目录: $(ROOTFS_DIR) (先运行 debootstrap)"; exit 1; }
@@ -200,30 +171,79 @@ phony += build-initramfs
 
 
 # ---- 设备树: 生成 DTB 并还原 DTS ----
-# 用 tools/dump_dtb.py 构造平台预设 -> build_dtb() 落盘 build/emu.dtb,
+# 用 tools/dump_dtb.py 构造平台预设dtb二进制文件，
 # 再用 dtc 还原为人类可读的 build/emu.dts。
-dtb: __pyenv-check
+gen-dtb: __pyenv-check
 	@mkdir -p $(bins_dir)
 	PYTHONPATH=$(CURDIR) uv run python tools/dump_dtb.py $(bins_dir)/emu.dtb
 	dtc -I dtb -O dts $(bins_dir)/emu.dtb -o $(bins_dir)/emu.dts
 	@echo "  -> $(bins_dir)/emu.dtb + $(bins_dir)/emu.dts"
-phony += dtb
+phony += gen-dtb
+
+# 项目打包
+pkg-up: __pyenv-check
+	python3 -m build --sdist --sdist-extract-dir pyremu
+
+
+# ---- 主入口: 启动模拟器 ----
+# 完整依赖链: Rust 编译、固件编译、拷贝、kei.sav、模拟器
+emu: kei-sav __pyenv-check
+	PYREMU_TRACE_TRAPS=1 PYREMU_TRACE_PMP=1 \
+	python -m pyremu.debugger --hart-logs=output/ $(pyargs)
+phony += emu
+
+# fw_payload 模式 (Linux 内嵌 OpenSBI payload)
+# 注意，嵌入的是vmlinux，会缺乏调试符号
+emu-linux-payload: kei-sav $(fw_payload_linux) __pyenv-check
+	@$(MAKE) -C pyremu
+	python -m pyremu.debugger \
+		--hart-logs=output/ --ram-base=0x80000000 --ram 512M --preload=${kei-sav} \
+		--harts=$(hart_num) $(fw_payload_linux)
+phony += emu-linux-payload
+
+# 启动linux并调试整个调试系统与试验环境
+emu-linux-sh: kei-sav $(fw_jump_elf) build-native __pyenv-check
+# 调试输出地址
+# 内存基地址
+# 模拟内存大小
+# 零阶段启动器
+# 内核镜像
+# 内核符号文件
+# 设备树生成
+# ext4参数
+# 启动参数
+# hart数量
+# 调试对象
+	@$(MAKE) -C pyremu
+	PYTHON_GIL=0 python -m pyremu.debugger \
+		--hart-logs=output/ \
+		--ram-base=0x80000000 \
+		--ram $(ram) \
+		--preload=${kei-sav} \
+		--kernel=$(LINUX_IMG) \
+		--sym=$(LINUX_VMLINUX) \
+		--fdt -1 \
+		$(disk_args) \
+		$(initrd_args) \
+		$(bootargs_arg) \
+		--harts=$(hart_num) \
+		$(fw_jump_elf)
+phony += emu-linux-sh
 
 
 # ---- 测试 ----
 # 限制: 4 GiB 虚拟内存, --ignore 排除 ordering-dependent 失败.
-# 详见 memory/test-constraints.md 与 memory/ordering-dependent-native-batch-failures.md.
 # ---- 测试 ----
 test-build:
 	$(MAKE) -C tests all
 phony += test-build
 
 test: __pyenv-check test-build
+	$(MAKE) -C bsp/sittim test
 	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 uv run pytest -v -x \
 		--ignore=tests/test_multihart_diff.py
 phony += test
 
-# timeout 600
 cov-test: __pyenv-check test-build
 	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 uv run pytest -v -x \
 		--cov=pyremu --cov-report=term --ignore=tests/test_multihart_diff.py --full-trace

@@ -118,7 +118,7 @@ class TestRType:
 
     def test_unknown_rtype(self):
         instr = _r_type(funct7=0x7F, rs2=0, rs1=0, funct3=7, rd=0, opcode=OP)
-        assert disasm(instr, 0) == "<unknown opcode>"
+        assert disasm(instr, 0) == "<unk-op>"
 
 
 # ============================================================
@@ -493,7 +493,7 @@ class TestEdgeCases:
 
     def test_unknown_opcode(self):
         # opcode 0b1100111 实际上是 JALR... 用个不存在的 opcode
-        assert disasm(0xFFFFFFFF, 0) == "<unknown opcode>"
+        assert disasm(0xFFFFFFFF, 0) == "<unk-op>"
 
 
 class TestCompressedLargeOffset:

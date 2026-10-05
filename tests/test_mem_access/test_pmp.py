@@ -16,7 +16,7 @@ from pyremu.core.mem_check_aux import (
     mem_write,
     MemoryAccessFault,
 )
-from pyremu.core.registers import _MmodeCSR
+from pyremu.core.registers import CSR, CsrAccess
 from pyremu.emulator import Emulator
 from pyremu.memory.bus import Bus
 from pyremu.memory.pmp import (
@@ -35,7 +35,7 @@ from pyremu.memory.pmp import (
 
 
 class TestNapotDecode:
-    """验证 NAPOT 格式的 pmpaddr -> (base, size) 解码."""
+    """验证 NAPOT 格式的 pmpaddr 解码得到 base 与 size."""
 
     # es: expected_size
     # eb: expected_base
@@ -106,7 +106,7 @@ class TestPmpCheck:
     def test_m_mode_mprv_uses_mpp(self, pmp):
         """M 模式 + MPRV=1: 按 MPP 特权级检查."""
         # MPRV=1, MPP=0 (U) — 应作为 U 模式检查
-        # 0 条目 -> U 模式拒绝
+        # 0 条目时 U 模式拒绝
         mstatus = (1 << 17) | (0 << 11)  # MPRV=1, MPP=U
         assert not pmp.check(PmpAccessInfo(0x1000, 4, mode_val=3, mstatus_val=mstatus))
 
@@ -175,7 +175,7 @@ class TestPmpCheck:
                 (0b11_000 | 0b0111, val),
             ],
         )
-        # 从 0xFFC 读 8 字节 -> 超出区域
+        # 从 0xFFC 读 8 字节则超出区域
         assert not pmp.check(PmpAccessInfo(0x8000_0FFC, 8, mode_val=0, mstatus_val=0))
 
     # ---- 权限 ----
@@ -208,13 +208,13 @@ class TestPmpCheck:
     # ---- 无条目 ----
 
     def test_no_entries_s_mode_rejected(self, pmp):
-        """0 条目 -> S 模式拒绝."""
+        """0 条目时 S 模式拒绝."""
         assert not pmp.check(PmpAccessInfo(0x1000, 4, mode_val=1, mstatus_val=0))
 
     # ---- S-mode by default rejected with no match ----
 
     def test_s_mode_no_match_rejected(self, pmp):
-        """S 模式无匹配 PMP 条目 -> 拒绝."""
+        """S 模式无匹配 PMP 条目时拒绝."""
         # 每条目都 OFF, 无匹配
         pmp._num_entries = 4
         assert not pmp.check(PmpAccessInfo(0x1000, 4, mode_val=1, mstatus_val=0))
@@ -333,7 +333,7 @@ class TestPmpInHart:
         assert hart.mcause_val == 0
 
     def test_umode_store_pmp_rw_ok(self, hart):
-        """U 模式, PMP 允许 RW -> store 成功."""
+        """U 模式, PMP 允许 RW 时 store 成功."""
         self._setup_napot_rw(hart, 0x8000_1000, 12, r=True, w=True)
         hart.mode = RiscvMode.U
         mem_write(hart, 0x8000_1000, b"\x11\x22")
@@ -398,7 +398,7 @@ class TestInstrFetchPmp:
         hart.csrs["pmpcfg0"].val = cfg
 
     def test_bare_fetch_x_ok(self, hart):
-        """Bare 模式, PMP X=1 -> 取指通过."""
+        """Bare 模式, PMP X=1 时取指通过."""
         self._setup_napot(hart, 0x8000_1000, 12, r=True, w=False, x=True)
         hart.mode = RiscvMode.S
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
@@ -417,7 +417,7 @@ class TestInstrFetchPmp:
 
     def test_bare_fetch_no_match_s_mode(self, hart):
         """S 模式无匹配 PMP 条目 -> InstrAccessFault."""
-        # 所有条目 OFF -> S 模式取指被拒
+        # 所有条目 OFF 时 S 模式取指被拒
         hart.mode = RiscvMode.S
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
         assert not ok
@@ -427,7 +427,7 @@ class TestInstrFetchPmp:
         """M 模式取指 (MPRV=0) 不受 PMP 限制."""
         self._setup_napot(hart, 0x8000_1000, 12, r=True, w=True, x=False)
         hart.mode = RiscvMode.M
-        # M 模式 MPRV=0 -> PMP 自动放行
+        # M 模式 MPRV=0 时不受 PMP 限制
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
         assert ok
         assert pa == 0x8000_1000
@@ -511,7 +511,7 @@ class TestNativeBatchPmpFetch:
         hart._pmp.invalidate_cache()
 
     def test_native_batch_smode_fetch_allowed(self, emu: Emulator):
-        """S 模式取指 — PMP 覆盖该区域 (RWX) -> 正常执行, 无 trap."""
+        """S 模式取指 — PMP 覆盖该区域且权限为 RWX 时正常执行, 无 trap."""
         hart = emu.harts[0]
 
         # 配置 PMP 条目 0: NAPOT 覆盖 [0x8000_0000, 0x8200_0000) 32 MiB RWX
@@ -559,7 +559,7 @@ class TestNativeBatchPmpFetch:
         )
 
     def test_native_batch_smode_no_match_denied(self, emu: Emulator):
-        """S 模式取指 — 所有 PMP 条目 OFF -> 拒绝."""
+        """S 模式取指 — 所有 PMP 条目 OFF 时拒绝."""
         hart = emu.harts[0]
 
         addi_instr = (42 << 20) | (5 << 7) | 0b0010011
@@ -571,7 +571,7 @@ class TestNativeBatchPmpFetch:
 
         emu.step()
 
-        # 无 PMP 条目匹配 -> S 模式拒绝
+        # 无 PMP 条目匹配时 S 模式拒绝
         assert hart.mcause_val == 1, (
             f"应为 InstrAccessFault, 实际 mcause={hart.mcause_val}"
         )
@@ -606,11 +606,11 @@ class TestSyncFromFlat:
         # Create pmpcfg registers (even-numbered, RV64: 8 entries each)
         for reg_idx in range(0, (num_entries + 7) // 8 * 2, 2):
             name = f"pmpcfg{reg_idx}"
-            csrs[name] = _MmodeCSR(name=name)
+            csrs[name] = CSR(name=name, access=CsrAccess.m_rw)
         # Create pmpaddr registers
         for i in range(num_entries):
             name = f"pmpaddr{i}"
-            csrs[name] = _MmodeCSR(name=name)
+            csrs[name] = CSR(name=name, access=CsrAccess.m_rw)
         return Pmp(csrs, num_entries)
 
     def test_sync_cfg_to_entries(self):

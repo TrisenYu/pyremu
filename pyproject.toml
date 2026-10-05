@@ -43,6 +43,11 @@ default = true
 [tool.ruff]
 indent-width = 4
 line-length = 95
+extend-exclude = [
+    "vendor",
+    "bsp",
+    "fn_apps",
+]
 
 [tool.ruff.lint]
 select = [

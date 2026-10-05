@@ -20,6 +20,7 @@
 		    fault and traps to mtvec)
 		[ ] uart channel (MMIO base taken from the device tree and passed in
 		    via -D, not implemented yet)
+		[ ] load firmware/dtb from hard-disk via basic driver and check the integrity
 		[ ] cache / watchdog / RTC / I2C / SPI / USB / GPU POST (not implemented yet)
 
 	A failed POST will later light the matching indicator LED through a GPIO
@@ -193,7 +194,7 @@ AL1S_POST_DONE:
 	csrrs	a0, mhartid, x0      // read the current hart ID into a0
 	lla		a1, _start + 0x10000 // set the FDT address, placed at _start + 64 KiB by default
 	li		t0, RAM_BASE         // the firmware _start is placed at RAM_BASE; loading is skipped here
-	jr		t0                   // Alice, startup!
+	jr		t0                   // Startup AL-1S
 
 
 /**

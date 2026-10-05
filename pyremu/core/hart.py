@@ -143,7 +143,7 @@ MSTATUS_TW = 1 << 21  # 陷入 WFI
 MSTATUS_TSR = 1 << 22  # 陷入 SRET
 MSTATUS_SD = 1 << 63  # 状态脏位 (FS 或 XS 为脏时置 1)
 
-# SPP / MPP 编码 -> RiscvMode 的映射
+# SPP / MPP 编码到 RiscvMode 的映射
 _SPP_TO_MODE = {0: RiscvMode.U, 1: RiscvMode.S}
 _MPP_TO_MODE = {0: RiscvMode.U, 1: RiscvMode.S, 2: RiscvMode.H, 3: RiscvMode.M}
 _MODE_TO_MPP = {RiscvMode.U: 0, RiscvMode.S: 1, RiscvMode.H: 2, RiscvMode.M: 3}
@@ -368,7 +368,7 @@ class HartWithRegs:
         elif csr_name == "pmpsplit":
             self.pmpsplit_val = val
         elif csr_name.startswith(("pmpcfg", "pmpaddr")):
-            # PMP CSR 写入 -> 使 Rust 扁平缓存失效, 并同步到所有 hart
+            # PMP CSR 写入导致 Rust 扁平缓存失效, 并同步到所有 hart
             self._csr_write_raw(csr_name, val)
             self._pmp.invalidate_cache()
             # 同步 PMP 到其他 hart — OpenSBI 冷启动 hart 可能不是 hart 0,
@@ -654,23 +654,23 @@ class HartWithRegs:
     def satp_val(self, v: int) -> None:
         """写入 satp 时同步更新缓存的 MMU 模式.
 
-        ASID 字段 (bits[59:44]) 按 WARL 硬连线为 0: 本实现的 TLB (Python 与
-        加速执行用动态链接库两侧) 查找均不带 ASID 标签。若允许 ASID 读回非零,
+        ASID 字段即 bits[59:44], 按 WARL 硬连线为 0: 本实现的 TLB 在 Python 与
+        加速执行用动态链接库两侧的查找均不带 ASID 标签。若允许 ASID 读回非零,
         Linux 探测到 ASID 支持后会启用 ASID 分配器, 上下文切换时仅改写
         satp.ASID 而不执行 sfence.vma — 前一地址空间的 TLB 表项残留命中,
-        用户进程读到脏数据随机 SIGSEGV (ld.so 崩溃)。读回 0 则内核走
+        用户进程读到脏数据随机 SIGSEGV, 表现为 ld.so 崩溃。读回 0 则内核走
         no-ASID 路径, 每次 mm 切换显式 local_flush_tlb_all().
 
         每次 satp 写入均刷新 TLB — 不仅限 MODE 字段变化.
-        约束: 飞地上下文切换 (alter_hart_ctx_for_enclave) 恢复 host
-        satp 时, host 与飞地均为 Sv39 -> MODE 相同 -> 旧逻辑跳过 flush ->
-        飞地的 TLB 残留 (VPN2=0x180, 与内核 VA 重叠) 毒化内核地址空间 ->
-        缺页异常 + 栈溢出.
+        约束: 飞地上下文切换经 alter_hart_ctx_for_enclave 恢复 host
+        satp 时, host 与飞地均为 Sv39 使 MODE 相同, 若按 MODE 字段是否变化
+        判断则跳过刷新, 飞地的 TLB 残留随后毒化内核地址空间, 导致缺页异常 +
+        栈溢出; 该残留的 VPN2=0x180 与内核 VA 重叠.
         """
         v &= ~(0xFFFF << 44)
         self.csrs["satp"].val = mask64(v)
         # 必须无条件刷新: 两个不同 Sv39 页表之间切换时 MODE 不变,
-        # 但 TLB 中的旧映射 (VPN->PPN) 已失效.
+        # 但 TLB 中 VPN 到 PPN 的旧映射已失效.
         self.itlb.flush_all()
         self.dtlb.flush_all()
         self._mmu_mode = (v >> 60) & 0xF
@@ -766,15 +766,15 @@ class HartWithRegs:
     #
     #  SSIP / MSIP use mip_val because they are either edge-driven
     #  (auto-cleared at trap entry) or level-driven via CLINT MSIP,
-    #  which check_pending_interrupts keeps fresh via _update_hw_mip.
+    #  which check_pending_interrupts keeps fresh via update_hw_mip.
 
     def _eval_stip(self, stimecmp_val: int) -> None:
         """Immediately re-evaluate mip.STIP after stimecmp write.
 
-        Python 步骤路径: 单线程执行无并发 mtime 膨胀, 共享 mtime 比较即等价于
-        QEMU riscv_timer_write_timecmp (过去->置位, 未来->清除). Rust native 路径
-        由 csr.rs 的 write_stimecmp 承担同一语义并按 own 指令计数设定 deadline.
-        This is critical for the kernel's stopi loop to exit.
+        Python 步骤路径: 单线程执行期间 mtime 不会被并发推进, 共享 mtime 比较即等价于
+        QEMU riscv_timer_write_timecmp: 比较值已过去则置位, 比较值在未来则清除.
+        Rust native 路径由 csr.rs 的 write_stimecmp 承担同一语义并按自身的指令计数
+        设定 deadline. 该行为决定内核的 stopi 循环能否退出.
         """
         # Python 侧重算时使 Rust deadline 失效 (0 = 未设定): 之后若进入 native
         # batch, 该 hart 定时器退化为共享比较. Python 写入只发生在单线程步骤/
@@ -1308,9 +1308,9 @@ def _unmarshal_imsic(hart: HartWithRegs, state: HartState) -> None:
         hart._imsic_select_s = state.imsic_s.select
         return
     # 持锁: 写回 eip/eie 与 RX daemon 的 set_pending RMW 互斥.
-    # 不持锁则 daemon 在 marshal->unmarshal 窗口注入的 eip 位可能被
-    # Rust 写回的旧值覆盖 (lost injection), 或在 daemon_m 计算时
-    # 读到 torn 状态.
+    # 不持锁则 daemon 在 marshal 到 unmarshal 之间注入的 eip 位可能被
+    # Rust 写回的旧值覆盖, 即该次注入丢失, 或在 daemon_m 计算时
+    # 读到只写入一半的状态.
     with imsic._lock:
         mf, sf = imsic._files[hart.id]
         # Compute daemon-added bits: bits set in Python between marshal

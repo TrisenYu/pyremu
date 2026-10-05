@@ -1,6 +1,5 @@
 """WFI 被跨核 MSIP 唤醒的正确性测试 — 最小多核场景."""
 
-import os
 import struct
 
 import pytest
@@ -13,16 +12,10 @@ CLINT_BASE = 0x02000000
 
 
 class TestWFIMsipWakeup:
-    """H0 写 MSIP -> H1 从 WFI 唤醒."""
+    """H0 写 MSIP 使 H1 从 WFI 唤醒."""
 
     @pytest.fixture
     def emu_two_harts(self):
-        cfg = PlatformConfig(num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024)
-        emu = Emulator(cfg, bootargs="")
-        return emu
-
-    @pytest.fixture
-    def emu_two_harts_native(self):
         cfg = PlatformConfig(num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024)
         emu = Emulator(cfg, bootargs="")
         return emu
@@ -97,19 +90,3 @@ class TestWFIMsipWakeup:
         assert h1._waiting, \
             f"H1 should still be in WFI (no MSIP sent), got waiting={h1._waiting}"
         assert h1.pc == 0x80000104, f"H1 PC should advance past WFI, got {h1.pc:#010x}"
-
-    @pytest.mark.skip(
-        reason="diagnostic 计数器需 Rust 编译时启用 --features diagnostic"
-    )
-    def test_msip_sets_counter(self, emu_two_harts_native):
-        """验证 diag_clint_msip_set 计数器正确递增 (native batch 路径)."""
-        emu = emu_two_harts_native
-        self._setup_harts(emu)
-        # 直接从 Python 写 CLINT MSIP[1]
-        emu.bus.write(CLINT_BASE + 4, struct.pack("<I", 1))
-        emu.step()
-        # 从 native state 读取计数器
-        ns = emu._native_states
-        assert ns[1].diag.clint_msip_set >= 1, (
-            f"H1 diag_clint_msip_set should be >= 1, got {ns[1].diag.clint_msip_set}"
-        )

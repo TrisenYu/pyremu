@@ -35,7 +35,7 @@ class IntSource(Enum):
     STI = 5  # Supervisor Timer Interrupt
 
 
-# 中断源 -> mip/sip 位掩码映射
+# 中断源到 mip/sip 位掩码的映射
 INT_SOURCE_MIP_MASK: dict[IntSource, int] = {
     IntSource.MEI: 1 << 11, # MEIP
     IntSource.MSI: 1 << 3,  # MSIP

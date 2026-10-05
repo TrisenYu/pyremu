@@ -10,7 +10,7 @@
 
 from pathlib import Path
 
-from pyremu.core.trap_def import trap_cause_name as _trap_cause_name_impl
+from pyremu.core import trap_def
 from pyremu.utils.disassem import Opc
 from pyremu.utils.mask import mask64
 
@@ -69,7 +69,7 @@ def fmt_instr_count(n: int) -> str:
 
 def trap_cause_name(mcause_val: int) -> str:
     """将 mcause 寄存器值翻译为可读的 trap 类型名称."""
-    return _trap_cause_name_impl(mcause_val)
+    return trap_def.trap_cause_name(mcause_val)
 
 
 # ============================================================
@@ -136,7 +136,7 @@ IRQ_NAMES: dict[int, str] = {
 #  断点常量
 # ============================================================
 
-_INSTR_BP_NAMES: dict[str, int] = {
+INSTR_BP_NAMES: dict[str, int] = {
     "ecall": 0x000,
     "ebreak": 0x001,
     "mret": 0x302,
@@ -144,9 +144,9 @@ _INSTR_BP_NAMES: dict[str, int] = {
     "wfi": 0x105,
 }
 
-_KNOWN_OPCODES: frozenset[int] = frozenset(o.value for o in Opc)
+KNOWN_OPCODES: frozenset[int] = frozenset(o.value for o in Opc)
 
-_RAM_MUL: dict[str, int] = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+RAM_MUL: dict[str, int] = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
 
 # ============================================================
 #  历史文件修剪

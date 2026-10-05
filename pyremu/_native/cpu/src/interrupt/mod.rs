@@ -31,20 +31,19 @@ pub(crate) fn check_pending_interrupts(state: &HartState) -> Option<(u64, bool)>
 		return None;
 	}
 
-	// Priority order: MEI, MSI, MTI, SEI, SSI, STI.
+	// 优先级顺序: MEI、MSI、MTI、SEI、SSI、STI。
 	//
-	// 委派完全遵循 mideleg (与 Python check_pending_interrupts 一致):
-	// 任一中断只要 mideleg 对应位置位, 就按 S 级中断处理 —
-	//    S/U 模式 + S 级全局使能 -> 投递到 S 模式
-	//    M 模式 -> 保持挂起 (委派中断永不投递到 M 模式, 等 hart 降到 S/U)
-	// mideleg 位清零的中断 (如 OpenSBI 复位默认 0) 一律投递到 M 模式.
+	// 委派完全按 mideleg 判定, 与 Python 侧 check_pending_interrupts 一致:
+	// 任一中断只要 mideleg 的对应位置位, 就按 S 级中断处理, S 或 U 模式且有 S 级
+	// 全局使能时投递到 S 模式; mideleg 对应位为 0 的中断一律投递到 M 模式。
+	// 委派中断在 M 模式保持挂起, 等 hart 降到 S 或 U 模式再投递, 故这类中断永不
+	// 投递到 M 模式。OpenSBI 复位后 mideleg 的值为 0。
 	//
-	// 早期实现将 MEI/MSI/MTI 硬编码为不可委派 ("M-mode first" 模型,
-	// 给 OpenSBI 的 M 模式定时器处理 + 软件注入 STI 用). 但这不符合
-	// RISC-V 规范 §3.1.9 — mideleg[7] 置位时 MTI 必须能直接委派为 STI
-	// 投递到 S 模式. 硬编码导致裸核内核 (设 mideleg=0x80 期待 MTI->STI)
-	// 在 native 模式下 MTI 永远进 M 模式: m_trap_handler skip+4 -> mret ->
-	// MTIP 仍悬置 -> 死循环. 改为按 mideleg 动态判定.
+	// 按 RISC-V 规范 §3.1.9, 置位 mideleg 的 bit 7 后, CLINT 的 MTI 必须能委派
+	// 到 S 模式并以 STI 投递。若把 MEI、MSI 与 MTI 固定为不可委派, 裸核内核置
+	// mideleg=0x80 时期待 MTI 委派到 S 模式并投递为 STI, 而加速执行引擎下 MTI
+	// 仍进入 M 模式, M 模式处理函数跳过该指令并 mret 后 mip.MTIP 仍置位, 于是
+	// 立即再次陷入 MTI, 反复执行同一段代码。
 	let checks: [(u64, u64); 6] = [
 		(MIE_MEIE, 11),
 		(MIE_MSIE, 3),
@@ -166,15 +165,19 @@ pub(crate) fn compute_stopi(state: &mut HartState, mtime: u64) -> (u64, u8) {
 		state.mip.fetch_and(!(1 << 1), Ordering::AcqRel);
 		return (val, 0);
 	}
-	// 3. STIP -> IID=5 (IRQ_S_TIMER)
+	// 3. STIP 映射到 IID=5 (IRQ_S_TIMER)
 	//
-	// 与 sync_mtip 活跃分支一致的判定: 已设定 deadline (write_stimecmp 写入
-	// 未来值) 时按本 hart 指令计数空间判定, 与共享 mtime 跨 batch 膨胀解耦 —
-	// 否则其他活跃 hart 的进度会把刚 claim 后 bump 到 mtime+4 的 stimecmp
-	// 重新推成"已到期", stopi 立即再次报告 STI -> 活锁。
-	// 未设定 deadline (deadline==0, Python 步骤路径/写入即到期) 时退化为
-	// 共享比较 (旧行为)。claim 路径 (csrw stopi IID=5) bump stimecmp 后经
-	// write_stimecmp 设定 deadline, 故 stopi 在 claim 后的重读回到 0。
+	// 判定方式与 sync_mtip 的活跃分支一致: 已设定截止时刻时, 即 write_stimecmp
+	// 收到的是未来的 mtime 值, 按本 hart 的指令计数是否越过该截止时刻判定, 不
+	// 比较共享的 mtime。共享 mtime 由全部活跃 hart 共同推进, 若仍按它比较, 其他
+	// hart 的进度越过刚写入的 stimecmp 后 mip.STIP 重新置位, 内核返回后立刻再次
+	// 陷入同一中断。
+	// 未设定截止时刻时, 即 stip_deadline 为 0, 写入 0、写入已到期的值, 以及纯
+	// Python 路径直接推进时钟这三种情况都会使它为 0, 此时按共享的 mtime 比较
+	// 判定。
+	// 内核读出 stopi 得到中断号后把同一中断号写回, 收到 IID=5 的写回时处理函数
+	// 清除 mip.STIP, 并在 stimecmp 不晚于当前 mtime 时把它上调为当前 mtime 加 4,
+	// 再经 write_stimecmp 设定截止时刻, 故此后重读 stopi 返回 0。
 	let sti_pending = if state.stip_deadline != 0 {
 		state.total_instrs >= state.stip_deadline
 	} else {
@@ -230,11 +233,25 @@ pub(crate) fn check_and_deliver_interrupt_concurrent(
 /// Drain the shared external-interrupt latch (``ext_irq.pending``) into the
 /// hart's ``mip.MEIP``/``mip.SEIP`` bits.
 ///
-/// Only lines NOT owned by an IMSIC interrupt file (``eidelivery == 1``) are
-/// driven here — when eidelivery=1 the IMSIC file owns that external line and
-/// ``sync_imsic`` (or the boundary marshal) drives it from eip & eie.  Setting
-/// it here too would create a fetch_or / topei_peek / fetch_and ping-pong
-/// across step_interrupts (~22× instruction-throughput regression in AIA mode).
+/// 线路归属分两种情形, 本函数据此采取不同动作:
+///
+/// * **未被 IMSIC 文件占用** (``eidelivery == 0``, legacy PLIC 模式): 直接置位
+///   对应 mip 位, 由 legacy PLIC 负责在设备撤除电平时清除.
+/// * **被 IMSIC 文件占用** (``eidelivery != 0``, AIA 模式): MEIP/SEIP 必须由该
+///   文件的 eip 派生, 不能无条件置位 — 无条件置位会让受调试程序在 ``stopi`` 上取到
+///   空的中断身份, 触发 SEI -> handler -> sret -> SEI 空转 (AIA 模式下曾造成
+///   ~22× 指令吞吐回归). 故此处按 live eip 走 ``sync_imsic_one``, 与
+///   ``sync_imsic`` 的 eidelivery != 0 分支同语义: 有身份则置位, 无身份则清位.
+///
+/// eip 的新增位由 Python 侧 ``IMSIC._publish_eip`` 在注入时写穿到本结构
+/// (与 PLIC 的 ``_ffi_pending`` 写穿同一模式), 故引擎在单轮加速执行内即可看到
+/// 设备线程新注入的中断 — 这是 AIA 模式下输入延迟与 legacy 模式持平的依据.
+/// 缺了写穿这一步, 引擎读到的只是 marshal 时刻的快照, 外部中断须等到轮边界
+/// (Python 侧 ``_native_sync_plic_mip``) 才能投递, 输入回显延迟以百毫秒计.
+///
+/// ``eip_ext_any`` 门控只用于省掉无外部中断时的原子读改写: eip 全部为 0 时
+/// ``imsic_topei_peek`` 必然返回 0, 置位与清位都是空操作, 而 mip 位的清除另有
+/// ``step_interrupts`` 的 eidelivery != 0 分支完成.
 ///
 /// Returns ``true`` when ``ext_irq.pending`` was asserted (callers may use it
 /// as a wake condition).
@@ -245,10 +262,18 @@ pub(crate) fn sync_ext_irq_mip(state: &mut HartState, ext_irq: *mut FfiExtIrqCtx
 	}
 	let mfile_owns = state.imsic_m.present != 0 && state.imsic_m.eidelivery != 0;
 	let sfile_owns = state.imsic_s.present != 0 && state.imsic_s.eidelivery != 0;
-	if !sfile_owns {
+	if sfile_owns {
+		if state.imsic_s.eip_ext_any.load(Ordering::Relaxed) != 0 {
+			sync_imsic_one(state, false);
+		}
+	} else {
 		state.mip.fetch_or(1 << 9, Ordering::AcqRel); // SEIP
 	}
-	if !mfile_owns {
+	if mfile_owns {
+		if state.imsic_m.eip_ext_any.load(Ordering::Relaxed) != 0 {
+			sync_imsic_one(state, true);
+		}
+	} else {
 		state.mip.fetch_or(1 << 11, Ordering::AcqRel); // MEIP
 	}
 	true
@@ -491,4 +516,95 @@ use crate::ffi::FfiExtIrqCtx;
 		);
 	}
 
+	/// 回归: IMSIC 独占外部中断线路 (eidelivery != 0) 时, 设备线程在单轮加速
+	/// 执行中注入的 eip 必须在本轮内联投递, 不得推迟到轮边界.
+	///
+	/// 修复前该分支对独占线路直接跳过置位, 而引擎读到的 eip 只是 marshal 时刻
+	/// 的快照, 于是即便设备线程已注入 eip 也无人置 SEIP: hart 从 WFI 醒来后
+	/// 取不到中断身份, 又回到空闲循环, 输入回显要等到全部 hart 重新停驻、轮边界
+	/// 执行 _native_sync_plic_mip 才发生 (AIA 实测单字符回显中位 398ms,
+	/// legacy PLIC 为毫秒级).
+	///
+	/// 修复后 eip 由 Python 侧 IMSIC._publish_eip 写穿共享数组, 引擎按 live eip
+	/// 走 sync_imsic_one: 有身份则置位 (本测试前半), 身份被 claim 掉后由
+	/// step_interrupts 的 eidelivery != 0 分支清位 (本测试后半), 故不会产生
+	/// SEI -> stopi(0) -> sret -> SEI 的空转风暴.
+	#[test]
+	fn ext_irq_drain_delivers_live_imsic_eip_inline() {
+		const EXT_IID: u32 = 10;
+		let mut ext = FfiExtIrqCtx {
+			pending: 1,
+			sources: 0,
+			max_priority: 0,
+			_pad: [0; 2],
+		};
+		let ext_ptr: *mut FfiExtIrqCtx = &mut ext;
+
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.imsic_s.present = 1;
+		state.imsic_s.eidelivery = 1;
+		state.mip.store(0, Ordering::Release);
+
+		// 设备线程刚注入的外部 MSI: eip 位与 eie 位同时置起, eie 由受调试程序此前配置.
+		state.imsic_s.eip[0].store(1 << EXT_IID, Ordering::Release);
+		state.imsic_s.eie[0].store(1 << EXT_IID, Ordering::Release);
+		state.imsic_s.eip_ext_any.store(1, Ordering::Release);
+
+		assert!(
+			sync_ext_irq_mip(&mut state, ext_ptr),
+			"AIA 模式 ext_irq 应被消费"
+		);
+		assert_ne!(
+			state.mip.load(Ordering::Acquire) & (1 << 9),
+			0,
+			"IMSIC 独占线路时, live eip 有身份必须内联置位 SEIP — \
+			 否则外部中断要等到轮边界才投递, 输入回显延迟以百毫秒计"
+		);
+
+		// 受调试程序经 stopei 认领该身份后, IMSIC 已无待处理身份.
+		imsic_topei_claim_iid(&mut state.imsic_s, EXT_IID);
+		assert_eq!(
+			state.imsic_s.eip_ext_any.load(Ordering::Acquire),
+			0,
+			"claim 之后 eip_ext_any 缓存必须归零"
+		);
+
+		// 引擎的每指令清理 (step_interrupts 的 eidelivery != 0 分支) 据此清 SEIP.
+		sync_imsic(&mut state);
+		assert_eq!(
+			state.mip.load(Ordering::Acquire) & (1 << 9),
+			0,
+			"身份被 claim 后 SEIP 必须清除, 否则退化为 SEI 空转风暴"
+		);
+	}
+
+	/// 回归: eip 全部为 0 时, eidelivery != 0 的独占线路不得被 ext_irq 无条件置位.
+	///
+	/// 这是 eip_ext_any 门控的直接后果: 门控为 0 时跳过 sync_imsic_one, mip 位
+	/// 保持不变. 若有人把门控去掉改为无条件 sync_imsic_one, 本测试仍会通过
+	/// (peek 返回 0 -> 清位), 故这里同时锁定"置位"与"不清位"两个方向:
+	/// 清除方向由 step_interrupts 负责, ext_irq 排空不得越权.
+	#[test]
+	fn ext_irq_drain_leaves_mip_alone_when_imsic_eip_empty() {
+		let mut ext = FfiExtIrqCtx {
+			pending: 1,
+			sources: 0,
+			max_priority: 0,
+			_pad: [0; 2],
+		};
+		let ext_ptr: *mut FfiExtIrqCtx = &mut ext;
+
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.imsic_s.present = 1;
+		state.imsic_s.eidelivery = 1;
+		// 模拟受调试程序尚未认领的挂起中断已由别处置位, 例如 WFI 唤醒路径.
+		state.mip.store(1 << 9, Ordering::Release);
+
+		assert!(sync_ext_irq_mip(&mut state, ext_ptr));
+		assert_ne!(
+			state.mip.load(Ordering::Acquire) & (1 << 9),
+			0,
+			"eip 为空时 ext_irq 排空不得清除 SEIP (清除由 step_interrupts 负责)"
+		);
+	}
 }

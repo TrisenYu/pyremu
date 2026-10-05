@@ -5,7 +5,7 @@
 #   json_cpp_payload   nlohmann/json (C++, MIT, 见 nlohmann/LICENSE.MIT)
 #
 # cJSON 的 Parse/Print/Delete 各自大量调用 libc 分配器, 以 input/ 下每份真实第三方
-# 配置 (sqlparse_data.json、npm-cli-pkg-lock.json 等) 为输入构成「分配 + 回收」压力.
+# 配置 (sqlparse_data.json、npm-cli-pkg-lock.json 等) 为输入构成分配与回收的压力.
 # 每个文件先经 scripts/minify_json.py 压成单行, 再由 scripts/embed_json.py 把两种形态
 # (pretty 原版 + minified 单行) 一并编码为 json_inputs[] 数组写进 json_config.inc,
 # 载体内无文件系统依赖.
@@ -46,8 +46,8 @@ CPP_OUT := $(BUILD)/json_cpp_payload
 
 all: $(OUT) $(CPP_OUT)
 
-# 输入集: input/ 下所有 .json 文件 (按文件名排序, 顺序稳定). 每个文件保留两种物理
-# 形态 —— 原版 pretty 与 minify 压成的单行 (浏览器/API 实际接收形态, 无缩进与换行);
+# 输入集为 input/ 下所有 .json 文件, 按文件名排序, 顺序稳定. 每个文件保留两种形态 ——
+# 原版 pretty 与 minify 压成的单行, 后一种无缩进与换行, 即浏览器与 API 实际接收的形态;
 # 由 scripts/embed_json.py 一并编码为 json_inputs[] 数组写进 json_config.inc, 供
 # main.c 遍历压测. 新增输入只须把文件放进 input/, 无需改动本 Makefile 与 main.c.
 JSON_SRC := $(sort $(wildcard input/*.json))
@@ -83,8 +83,8 @@ run: $(OUT)
 	$(QEMU) $(OUT)
 
 # C++ 载荷: nlohmann/json 单头 (nlohmann/json.hpp) + libc++。
-# -nodefaultlibs 屏蔽 clang 隐式追加 -lgcc_eh; 显式列 C++ 运行库, 顺序须为
-# libc++ -> libunwind -> libc -> libgcc (libc++ 引用后三者符号)。
+# -nodefaultlibs 屏蔽 clang 隐式追加 -lgcc_eh; 显式列 C++ 运行库。
+# 链接顺序须为 libc++、libunwind、libc、libgcc, 因为 libc++ 引用后三者符号。
 $(CPP_OUT): src/main_cpp.cpp $(BUILD)/json_config.inc $(NLOHMANN_DIR)/json.hpp
 	@mkdir -p $(@D)
 	$(CLANGXX) --target=$(TARGET) $(CXXFLAGS) $< $(LDFLAGS) -nodefaultlibs \

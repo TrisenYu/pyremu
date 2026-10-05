@@ -4,15 +4,19 @@
 
 """IMSIC (Incoming MSI Controller) 单元测试 — Phase 1 AIA 实现."""
 
+import threading
+
 import pytest
 
-from pyremu.core.hart import RiscvMode
-from pyremu.core.registers import PYREMU_AIA
+from pyremu._native import native_available
+import pyremu.configs_gen
+from pyremu.core.hart import HartState, RiscvMode
+from pyremu.core.registers import AIA_CSR_ADDRS, csr_bank, sync_aia_csr_gate
 from pyremu.core.trap_def import trap_cause_code, TrapType
 from pyremu.core.trap_handler import check_pending_interrupts
-import pyremu.configs_gen
 from pyremu.emulator import Emulator
 from pyremu.interrupt.imsic import IMSIC
+from pyremu.peripheral.termio import TerminalIO
 from pyremu.platform import InterruptMode, PlatformConfig
 
 
@@ -23,6 +27,23 @@ def _disable_aia_compile_override(monkeypatch):
     Tests use explicit configs: qemu_virt() for legacy, qemu_virt_aia() for AIA.
     """
     monkeypatch.setattr(pyremu.configs_gen, "PYREMU_AIA", False)
+
+
+@pytest.fixture
+def aia_csr_gate():
+    """打开 AIA CSR 门控, 供只在 AIA 模式下有意义的用例.
+
+    门控是 registers 模块的全局状态, 用例结束后按进入前的取值逐项复原.
+    按实际状态快照而非按编译期开关复原, 是因为上面的 autouse fixture 已把
+    configs_gen 中的开关改写为假值, 据此复原会关掉编译期本就打开的门控.
+    """
+    saved = {addr: csr_bank[addr].implemented for addr in AIA_CSR_ADDRS}
+    sync_aia_csr_gate(True)
+    try:
+        yield
+    finally:
+        for addr, implemented in saved.items():
+            csr_bank[addr].implemented = implemented
 
 
 # ============================================================
@@ -50,7 +71,7 @@ class TestImsicMMIO:
     """IMSIC MMIO (seteipnum / clreipnum) 寄存器."""
 
     def test_seteipnum_sets_pending_and_meip(self):
-        """seteipnum 写 -> eip 置位 -> get_pending_mip 返回 MEIP (eidelivery=1, eie 已使能)."""
+        """seteipnum 写后 eip 置位, get_pending_mip 返回 MEIP, eidelivery=1 且 eie 已使能."""
         imsic = _make_imsic()
         imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
         imsic.csr_write(0, 'M', 0xC0, 1 << 10)  # eie: enable identity 10
@@ -301,35 +322,35 @@ class TestImsicTopei:
 class TestMtopi:
     """mtopi (0xFB0) AIA 模式下动态报告最高优先级 M 模式中断."""
 
-    def test_mtopi_readable_in_aia_mode(self):
+    def test_mtopi_readable_in_aia_mode(self, aia_csr_gate):
         """AIA 模式下 mtopi 可读且无中断时返回 0."""
 
         emu = _make_aia_emu()
         h = emu.harts[0]
         h.pc = 0x40000000
 
-        if not PYREMU_AIA:
-            # Legacy 模式: mtopi 返回 IllInstr
+        val = h.read_csr(0xFB0)
+        assert val == 0, f"mtopi should return 0 when no interrupt pending, got {val:#x}"
 
-            instr = (0xFB0 << 20) | (5 << 7) | 0x73  # csrr t0, mtopi
-            h.exec_instr(instr)
-            assert h.mcause_val == trap_cause_code(TrapType.IllInstr), (
-                f"mtopi should trap IllInstr in legacy mode, got mcause={h.mcause_val}"
-            )
-        else:
-            # AIA 模式: mtopi 可读, 无中断时返回 0
-            val = h.read_csr(0xFB0)
-            assert val == 0, f"mtopi should return 0 when no interrupt pending, got {val:#x}"
+    def test_mtopi_traps_ill_instr_when_gate_closed(self):
+        """门控关闭时 mtopi 不可达 — 与上一用例成对锁定门控的两个方向."""
 
-    def test_mtopi_reports_msip_as_iid_3(self):
+        emu = _make_aia_emu()
+        h = emu.harts[0]
+        h.pc = 0x40000000
+
+        instr = (0xFB0 << 20) | (5 << 7) | 0x73  # csrr t0, mtopi
+        h.exec_instr(instr)
+        assert h.mcause_val == trap_cause_code(TrapType.IllInstr), (
+            f"mtopi should trap IllInstr when AIA gate is closed, got mcause={h.mcause_val}"
+        )
+
+    def test_mtopi_reports_msip_as_iid_3(self, aia_csr_gate):
         """MSIP 待处理时 mtopi 返回 (IRQ_M_SOFT<<16)|1 = (3<<16)|1.
 
         OpenSBI 的 sbi_trap_aia_irq() 将 mtopi>>16 与 IRQ_M_SOFT(=3) 比较
         来决定是否调用 sbi_ipi_process(). 此测试锁死该行为.
         """
-        if not PYREMU_AIA:
-            pytest.skip("mtopi is readable only when PYREMU_AIA=1")
-
         emu = _make_aia_emu(num_harts=2)
         h = emu.harts[0]
         h.pc = 0x40000000
@@ -352,7 +373,7 @@ class TestMtopi:
         )
         assert mtopi & 0xFFFF, f"mtopi priority should be non-zero, got {mtopi:#x}"
 
-    def test_mtopi_reports_imsic_ipi_as_iid_11(self):
+    def test_mtopi_reports_imsic_ipi_as_iid_11(self, aia_csr_gate):
         """IMSIC M-file eip 有 IPI (minor identity 1) 时 mtopi 返回 major identity 11 (MEI).
 
         All IMSIC interrupts (IPI minor identity 1 and external IID>=6)
@@ -362,9 +383,6 @@ class TestMtopi:
         mtopei.  OpenSBI's ``sbi_trap_aia_irq`` sees mtopi>>16 == 11, then reads
         mtopei>>16 == 1 to dispatch ``sbi_ipi_process``.
         """
-
-        if not PYREMU_AIA:
-            pytest.skip("mtopi is readable only when PYREMU_AIA=1")
 
         emu = _make_aia_emu(num_harts=2)
         h = emu.harts[0]
@@ -416,34 +434,35 @@ class TestMtopi:
 class TestStopi:
     """stopi (0xDB0) AIA 模式下动态报告最高优先级 S 模式中断."""
 
-    def test_stopi_readable_in_aia_mode(self):
+    def test_stopi_readable_in_aia_mode(self, aia_csr_gate):
         """AIA 模式下 stopi 可读且无中断时返回 0."""
 
         emu = _make_aia_emu()
         h = emu.harts[0]
         h.pc = 0x40000000
 
-        if not PYREMU_AIA:
-            # Legacy 模式: stopi 返回 IllInstr
-            instr = (0xDB0 << 20) | (5 << 7) | 0x73  # csrr t0, stopi
-            h.exec_instr(instr)
-            assert h.mcause_val == trap_cause_code(TrapType.IllInstr), (
-                f"stopi should trap IllInstr in legacy mode, got mcause={h.mcause_val}"
-            )
-        else:
-            # AIA 模式: stopi 可读, 无中断时返回 0
-            val = h.read_csr(0xDB0)
-            assert val == 0, f"stopi should return 0 when no interrupt pending, got {val:#x}"
+        val = h.read_csr(0xDB0)
+        assert val == 0, f"stopi should return 0 when no interrupt pending, got {val:#x}"
 
-    def test_stopi_reports_ssip_as_iid_1(self):
+    def test_stopi_traps_ill_instr_when_gate_closed(self):
+        """门控关闭时 stopi 不可达 — 与上一用例成对锁定门控的两个方向."""
+
+        emu = _make_aia_emu()
+        h = emu.harts[0]
+        h.pc = 0x40000000
+
+        instr = (0xDB0 << 20) | (5 << 7) | 0x73  # csrr t0, stopi
+        h.exec_instr(instr)
+        assert h.mcause_val == trap_cause_code(TrapType.IllInstr), (
+            f"stopi should trap IllInstr when AIA gate is closed, got mcause={h.mcause_val}"
+        )
+
+    def test_stopi_reports_ssip_as_iid_1(self, aia_csr_gate):
         """SSIP 待处理时 stopi 返回 (IRQ_S_SOFT<<16)|1 = (1<<16)|1.
 
         Linux 内核的 riscv_intc_aia_irq() 将 stopi>>16 与 IID 比较
         来决定调用哪个中断 handler. 此测试锁死该行为.
         """
-
-        if not PYREMU_AIA:
-            pytest.skip("stopi is readable only when PYREMU_AIA=1")
 
         emu = _make_aia_emu(num_harts=2)
         h = emu.harts[0]
@@ -466,16 +485,13 @@ class TestStopi:
         )
         assert stopi & 0xFFFF, f"stopi priority should be non-zero, got {stopi:#x}"
 
-    def test_stopi_reports_imsic_ext_as_iid_9(self):
+    def test_stopi_reports_imsic_ext_as_iid_9(self, aia_csr_gate):
         """IMSIC S-file eip 有待处理中断时 stopi 返回 (IRQ_S_EXT << 16) | prio.
 
         所有外部中断在 stopi 中映射到 major identity IRQ_S_EXT (9),
         内核随后通过 STOPEI CSR 读取 minor identity (具体设备 IID).
         这是 AIA 规范 §5.3 的要求: stopi 返回 MAJOR identity, stopei 返回 MINOR.
         """
-
-        if not PYREMU_AIA:
-            pytest.skip("stopi is readable only when PYREMU_AIA=1")
 
         emu = _make_aia_emu(num_harts=2)
         h = emu.harts[0]
@@ -517,7 +533,7 @@ class TestStopi:
             f"STOPEI>>16 should be minor IID 21, got {minor_iid} (stopei={stopei:#x})"
         )
 
-    def test_stopi_reports_stip_as_iid_5(self):
+    def test_stopi_reports_stip_as_iid_5(self, aia_csr_gate):
         """STIP pending -> stopi reports IID=5 (IRQ_S_TIMER).
 
         STIP is computed from LIVE mtime & stimecmp (not cached mip_val),
@@ -526,9 +542,6 @@ class TestStopi:
         after the kernel writes a new stimecmp, causing stopi to never
         return 0 (infinite loop in riscv_intc_aia_irq).
         """
-        if not PYREMU_AIA:
-            pytest.skip("stopi is readable only when PYREMU_AIA=1")
-
         emu = _make_aia_emu(num_harts=2)
         h = emu.harts[0]
         h.pc = 0x40000000
@@ -549,7 +562,7 @@ class TestStopi:
         )
         assert stopi & 0xFFFF, f"stopi priority should be non-zero, got {stopi:#x}"
 
-    def test_stopi_clears_after_stimecmp_written(self):
+    def test_stopi_clears_after_stimecmp_written(self, aia_csr_gate):
         """stopi returns 0 after stimecmp is advanced into the future.
 
         The kernel's timer ISR writes a new stimecmp (future value) and
@@ -558,9 +571,6 @@ class TestStopi:
         mip_val.STIP=1 (set by check_pending_interrupts during the
         initial trap) and never returned 0 -> infinite loop.
         """
-        if not PYREMU_AIA:
-            pytest.skip("stopi is readable only when PYREMU_AIA=1")
-
         emu = _make_aia_emu(num_harts=2)
         h = emu.harts[0]
         h.pc = 0x40000000
@@ -581,7 +591,7 @@ class TestStopi:
             f"stopi must return 0 after stimecmp is advanced, got {stopi:#x}"
         )
 
-    def test_stopi_ignores_mtip(self):
+    def test_stopi_ignores_mtip(self, aia_csr_gate):
         """MTIP (bit 7) alone must NOT be reported by stopi.
 
         mtimecmp is frozen during native batch execution; if stopi
@@ -589,9 +599,6 @@ class TestStopi:
         Only STIP (bit 5, from state.stimecmp) is authoritative for
         S-mode timer interrupts.
         """
-        if not PYREMU_AIA:
-            pytest.skip("stopi is readable only when PYREMU_AIA=1")
-
         emu = _make_aia_emu(num_harts=2)
         h = emu.harts[0]
         h.pc = 0x40000000
@@ -714,6 +721,86 @@ class TestImsicHartIntegration:
 
 
 # ============================================================
+#  eip 写穿到加速引擎共享数组
+# ============================================================
+
+
+class TestImsicFfiWriteThrough:
+    """设备线程注入的 eip 必须即时写穿加速引擎正在读的共享数组.
+
+    引擎在单轮加速执行内按该数组中的 eip 驱动 SEIP/MEIP (Rust
+    ``sync_ext_irq_mip`` -> ``sync_imsic_one``). 若注入只落在 Python 对象上,
+    引擎读到的仍是 marshal 时刻的快照, 外部中断须等到轮边界
+    ``_native_sync_plic_mip`` 才可见 — AIA 实测单字符回显延迟中位 398ms,
+    而 legacy PLIC 经 ext_irq 内联置位为毫秒级.
+    """
+
+    def test_set_ip_number_publishes_to_bound_state(self):
+        """set_ip_number 后共享数组的 eip 位与 eip_ext_any 与 Python 侧一致."""
+        imsic = _make_imsic()
+        states = (HartState * 2)()
+        imsic.bind_ffi_states(states)
+        imsic.csr_write(0, 'S', 0x70, 1)        # eidelivery = 1
+        imsic.csr_write(0, 'S', 0xC0, 1 << 10)  # eie: 使能 identity 10
+
+        imsic.set_ip_number(0, 'S', 10)
+
+        assert states[0].imsic_s.eip[0] == 1 << 10, "注入的 eip 位必须写穿"
+        assert states[0].imsic_s.eip_ext_any == 1, "外部中断存在性缓存必须同步置位"
+        assert states[1].imsic_s.eip[0] == 0, "其它 hart 的数组不得被污染"
+
+    def test_clear_ip_number_republishes(self):
+        """clear_ip_number 后写穿的位随之清除, 缓存归零."""
+        imsic = _make_imsic()
+        states = (HartState * 2)()
+        imsic.bind_ffi_states(states)
+        imsic.set_ip_number(0, 'S', 10)
+        assert states[0].imsic_s.eip[0] == 1 << 10
+
+        imsic.clear_ip_number(0, 'S', 10)
+
+        assert states[0].imsic_s.eip[0] == 0, "撤除的 eip 位必须同步清除"
+        assert states[0].imsic_s.eip_ext_any == 0
+
+    def test_publish_skipped_without_binding(self):
+        """未绑定共享数组 (纯 Python 路径) 时注入照常工作, 不得抛异常."""
+        imsic = _make_imsic()
+        imsic.csr_write(0, 'S', 0x70, 1)
+        imsic.csr_write(0, 'S', 0xC0, 1 << 10)
+
+        imsic.set_ip_number(0, 'S', 10)
+        assert imsic.get_pending_mip(0) & (1 << 9), "未绑定时仍应投递 SEIP"
+
+        imsic.clear_ip_number(0, 'S', 10)
+        assert imsic.get_pending_mip(0) == 0
+
+    def test_speedup_lib_binds_imsic_states(self):
+        """装配级: 加速基础设施就绪后 IMSIC 持有同一份 hart 状态数组."""
+        if not native_available():
+            pytest.skip("native 加速库不可用, 跳过写穿绑定测试")
+        cfg = PlatformConfig.qemu_virt_aia()
+        cfg.num_harts = 2
+        emu = Emulator(cfg)
+        ev = threading.Event()
+        emu._termio = TerminalIO(
+            emu.uart, ev, ext_irq=emu._native_ext_irq, on_irq=emu.raise_device_irq
+        )
+        emu._init_for_speedup_lib()
+
+        assert emu.imsic is not None
+        assert emu._speedup_hart_states is not None, "回归测试必须走 native 路径"
+        assert emu.imsic._ffi_states is emu._speedup_hart_states, (
+            "IMSIC 必须绑定引擎实际读写的同一份 hart 状态数组"
+        )
+
+        # 经 APLIC 注入的外部中断在共享数组上立即可见 (无需等轮边界).
+        emu.imsic.csr_write(0, 'S', 0x70, 1)
+        emu.imsic.csr_write(0, 'S', 0xC0, 1 << 10)
+        emu.imsic.set_ip_number(0, 'S', 10)
+        assert emu._speedup_hart_states[0].imsic_s.eip[0] == 1 << 10
+
+
+# ============================================================
 #  Config 层
 # ============================================================
 
@@ -727,7 +814,7 @@ class TestImsicConfig:
         assert cfg.interrupt_mode == InterruptMode.AIA
         assert cfg.periph.imsic_m_base == 0x2400_0000
         assert cfg.periph.imsic_s_base == 0x2800_0000
-        assert cfg.periph.aplic_base == 0x0C00_0000
+        assert cfg.periph.aplic_s_base == 0x0C00_0000
 
     def test_default_config_no_imsic(self):
         """默认 qemu_virt 配置 imsic_base=0 — 不创建 IMSIC."""
@@ -738,7 +825,7 @@ class TestImsicConfig:
 
 
 # ============================================================
-#  IPI 投递: M-file -> MEIP, S-file -> SEIP (无跨文件路由)
+#  IPI 投递: M-file 得到 MEIP, S-file 得到 SEIP, 无跨文件路由
 # ============================================================
 
 
@@ -784,7 +871,7 @@ class TestImsicIpi:
         )
 
     def test_ext_interrupt_sets_meip(self):
-        """M-file 外部中断 (>=6) -> get_pending_mip 返回 MEIP."""
+        """M-file 外部中断 IID>=6 时 get_pending_mip 返回 MEIP."""
         imsic = _make_imsic()
         imsic.csr_write(0, 'M', 0x70, 1)
         imsic.csr_write(0, 'M', 0xC0, 1 << 10)  # eie bit 10
@@ -793,7 +880,7 @@ class TestImsicIpi:
         assert mip & (1 << 11), f"MEIP should be set for ext int, got mip={mip:#x}"
 
     def test_mixed_ipi_and_ext(self):
-        """IPI (IID=1) + 外部中断 (IID=10) 同时写 M-file -> MEIP 置位, SEIP 不置位.
+        """IPI IID=1 与外部中断 IID=10 同时写 M-file 时 MEIP 置位, SEIP 不置位.
 
         Both a software IPI minor identity (1) and an external interrupt (10)
         written to the M-file stay in the M-file (no cross-file routing) and
@@ -805,7 +892,9 @@ class TestImsicIpi:
         imsic.write(0x000, (1).to_bytes(4, 'little'))   # M-file IID=1 -> stays in M-file
         imsic.write(0x000, (10).to_bytes(4, 'little'))  # M-file IID=10 -> stays in M-file
         mip = imsic.get_pending_mip(0)
-        assert mip & (1 << 11), f"MEIP should be set (from IID=1,10 in M-file), got mip={mip:#x}"
+        assert mip & (1 << 11), (
+            f"MEIP should be set (from IID=1,10 in M-file), got mip={mip:#x}"
+        )
         assert not (mip & (1 << 9)), (
             f"SEIP must NOT be set (no cross-file routing), got mip={mip:#x}"
         )

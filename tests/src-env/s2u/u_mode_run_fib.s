@@ -7,17 +7,24 @@
 //  架构概述
 // ═══════════════════════════════════════════════════════════════
 //
-//  M 模式: PMP / medeleg / mstatus -> MRET -> S
-//  S 模式: stvec / sscratch / sstatus -> Sv39 页表 -> SRET -> U
-//  U 模式: 读 UART -> 约束 n -> fib(n) -> ECALL 报告
+//  M 模式: 配置 PMP / medeleg / mstatus, 随后 MRET 进入 S 模式
+//  S 模式: 配置 stvec / sscratch / sstatus 与 Sv39 页表, 随后 SRET 进入 U 模式
+//  U 模式: 读取 UART, 约束 n, 计算 fib(n), 随后以 ECALL 报告
 //
 //  Sv39 identity 映射 (4 KiB 页):
-//    VA 0x8000_0000–0x8000_FFFF -> PA 同 (16 页, R+W+X+U, 代码/数据/BSS)
-//    VA 0x1000_0000–0x1000_0FFF -> PA 同 ( 1 页, R+W+U,    UART MMIO)
-//    VA 0x8010_0000–0x8010_0FFF -> PA 同 ( 1 页, R+W+U,    U 模式栈)
+//    VA 0x8000_0000–0x8000_FFFF -> PA 同 (16 页, R+W+X,   S 模式代码/数据/页表/栈)
+//    VA 0x8001_0000–0x8001_1FFF -> PA 同 ( 2 页, R+W+X+U, U 模式代码/数据)
+//    VA 0x1000_0000–0x1000_0FFF -> PA 同 ( 1 页, R+W+U,   UART MMIO)
+//    VA 0x8010_0000–0x8010_0FFF -> PA 同 ( 1 页, R+W+U,   U 模式栈)
 //    VA 0x800F_F000–0x800F_FFFF   (保护页, 未映射 -> StorePageFault 15)
 //
-//  U 栈顶 = 0x8010_1000.  栈向下增长触及 0x800F_FFFF -> trap -> S 终止进程.
+//  S 模式代码与 U 模式代码分处不同的页, 因为 S 模式取指永不许可落在 U=1 的
+//  页上 (RISC-V §4.3.2 基础规则, 与 sstatus.SUM 无关), 两者共用一页会使 S 模式
+//  在启用 Sv39 之后无法取指. 汇编层面由 .stext 与 .utext 两段区分, 链接脚本
+//  把 .utext 放在 0x8001_0000; 两侧各自持有一份 UART 输出例程, 因为例程本身
+//  也是代码, 不能跨页调用.
+//
+//  U 栈顶 = 0x8010_1000.  栈向下增长触及 0x800F_FFFF 则 trap, 由 S 模式终止进程.
 //
 //  sscratch 交换: S 模式进入前将 sscratch 指向 S 栈顶;
 //  trap handler 第一条指令用 csrrw sp, sscratch, sp 交换,
@@ -29,7 +36,10 @@
 //
 //   uart_poll -> ring buffer (64B) -> uart_getc -> readline -> parse_int_simple
 
-.section .text
+// S 模式代码段: 与 U 模式代码分处不同页, 见文件头的映射说明.
+// 段名非 .text 一类内建名, 故须显式给出标志位, 否则汇编器不置 SHF_ALLOC,
+// 链接器会把该段放在地址 0, 指向它的 PC 相对重定位随即超出范围.
+.section .stext, "ax"
 .globl _start
 .globl u_mode_bad
 
@@ -77,7 +87,7 @@ _start:
     la   t0, m_trap_handler
     csrw mtvec, t0
 
-    // 委派: ECALL + page faults 从 U/S 模式 -> S 模式处理
+    // 委派到 S 模式处理: 来自 U/S 模式的 ECALL + page faults
     //   bits: 8 (ECALL-U) + 12 (InstrPF) + 13 (LdPF) + 15 (StPF)
     li   t0, 0xA100
     csrw medeleg, t0
@@ -139,7 +149,7 @@ s_mode_boot:
     csrw sepc, t0
 
     la   a0, str_sboot
-    call uart_puts
+    call s_uart_puts
 
     sret
 
@@ -155,46 +165,63 @@ s_mode_boot:
 //    L3_uart @ page_tables + 0x4000  (UART)
 //
 //  映射:
-//    16 页 @ 0x80000–0x8000F  R+W+X+U  (代码/数据/BSS/栈)
+//    16 页 @ 0x80000–0x8000F  R+W+X    (S 模式代码/数据/页表/栈)
+//     2 页 @ 0x80010–0x80011  R+W+X+U  (U 模式代码/数据)
 //     1 页 @ 0x10000           R+W+U    (UART)
 //     1 页 @ 0x80100           R+W+U    (U 模式栈)
 //     1 页 @ 0x800FF           未映射    (保护页)
 // ============================================================
 setup_sv39:
-    addi sp, sp, -32
+    addi sp, sp, -40
     sd   ra,  0(sp)
     sd   s0,  8(sp)
     sd   s1, 16(sp)
     sd   s2, 24(sp)
+    sd   s3, 32(sp)
 
     // 页表在 BSS 中, RAM 初始化为零, 无需显式清零.
     // 仅需覆写用到的条目, 其余 V=0 即未映射.
-    la   s0, page_tables       // s0 = L1
+    la   s0, page_tables       // s0 = 页表第一级 L1 (4 KiB 对齐)
+    // 指向下一级页表的 PTE 形如 (PPN << 10) | V. PPN 由页表第一级 L1 的实际地址算出,
+    // 不写字面常量: 页表各页的位置一旦随段布局移动, 硬编码的页号不再指向
+    // 对应的页表页, 遍历在第一级就取到零条目, 表现为启用 Sv39 之后 S 模式
+    // 的每条访存都缺页.
+    srli s3, s0, PAGE_SHIFT    // s3 = 页表第一级 L1 的物理页号
 
     // -- L1[2] -> L2_hi (VPN[2]=2, VA 0x8000_0000–0xBFFF_FFFF) --
-    li   t0, 0x0000000020001001  // V=1, PPN=0x80004 (page_tables+0x1000)
-    sd   t0, 16(s0)            // L1[2] = L1 + 16
+    addi t0, s3, 1             // 页表第二级 L2_hi = L1 + 1 页
+    slli t0, t0, 10
+    ori  t0, t0, PTE_V
+    sd   t0, 16(s0)            // L1[2] = L1 + 2×8
 
     // -- L1[0] -> L2_lo (VPN[2]=0, VA 0x0000_0000–0x3FFF_FFFF) --
-    li   t0, 0x0000000020001401  // V=1, PPN=0x80005 (page_tables+0x2000)
+    addi t0, s3, 2             // 页表第二级 L2_lo = L1 + 2 页
+    slli t0, t0, 10
+    ori  t0, t0, PTE_V
     sd   t0, 0(s0)             // L1[0] = L1 + 0
 
     // -- L2_hi[0] -> L3_main --
     li   t0, 0x1000
-    add  s1, s0, t0            // s1 = L2_hi (+1 page)
-    li   t0, 0x0000000020001801  // V=1, PPN=0x80006 (page_tables+0x3000)
+    add  s1, s0, t0            // s1 = L2_hi (+1 页)
+    addi t0, s3, 3             // 页表第三级 L3_main = L1 + 3 页
+    slli t0, t0, 10
+    ori  t0, t0, PTE_V
     sd   t0, 0(s1)
 
     // -- L2_lo[128] -> L3_uart (VPN[1]=128, VA 0x1000_0000) --
     li   t0, 0x2000
-    add  s2, s0, t0            // s2 = L2_lo (+2 pages)
-    li   t0, 0x0000000020001c01  // V=1, PPN=0x80007 (page_tables+0x4000)
+    add  s2, s0, t0            // s2 = L2_lo (+2 页)
+    addi t0, s3, 4             // 页表第三级 L3_uart = L1 + 4 页
+    slli t0, t0, 10
+    ori  t0, t0, PTE_V
     sd   t0, 1024(s2)          // L2_lo[128] = L2_lo + 128×8
 
-    // -- L3_main: 16 页 identity 映射 (循环) --
+    // -- L3_main[0..15]: 16 页 identity 映射, R+W+X 不含 U 位 --
+    //    这 16 页承载 S 模式代码与数据. S 模式取指永不许可落在 U=1 的页上
+    //    (RISC-V §4.3.2), 故此处不能带 U 位.
     li   t0, 0x3000
     add  s1, s0, t0            // s1 = L3_main (+3 pages)
-    li   t0, 0x000000002000001f  // 第 0 页 PTE (R+W+X+U, PPN=0x80000)
+    li   t0, 0x000000002000000f  // 第 0 页 PTE (R+W+X, PPN=0x80000)
     li   t1, 16                // 16 页
 1:
     sd   t0, 0(s1)
@@ -203,6 +230,20 @@ setup_sv39:
     add  t0, t0, t2
     addi t1, t1, -1
     bnez t1, 1b
+
+    // -- L3_main[16..17]: 2 页 U 模式代码/数据, R+W+X+U --
+    //    首轮循环结束时 s1 已指向 L3_main[16], t0 的权限位由 R+W+X 改为
+    //    R+W+X+U 即得该页 PTE. 链接脚本把 .utext 放在 0x8001_0000, 并断言
+    //    U 模式区不超过这两页.
+    li   t0, 0x000000002000401f  // 第 16 页 PTE (R+W+X+U, PPN=0x80010)
+    li   t1, 2
+2:
+    sd   t0, 0(s1)
+    addi s1, s1, 8
+    li   t2, (1 << 10)
+    add  t0, t0, t2
+    addi t1, t1, -1
+    bnez t1, 2b
 
     // -- L3_main[256] U 模式栈 (PPN=0x80100, R+W+U) --
     li   t0, 0x3000
@@ -221,8 +262,7 @@ setup_sv39:
     // 启用 Sv39
     li   t0, 8                 // MODE = Sv39
     slli t0, t0, 60            // t0 = (8 << 60)
-    li   t1, 0x80003           // PPN of L1 (= page_tables PA >> 12)
-    or   t0, t0, t1            // satp = (Sv39 << 60) | root_ppn
+    or   t0, t0, s3            // satp = (Sv39 << 60) | root_ppn (页表第一级 L1 的页号)
     csrw satp, t0
     sfence.vma zero, zero
 
@@ -230,7 +270,8 @@ setup_sv39:
     ld   s0,  8(sp)
     ld   s1, 16(sp)
     ld   s2, 24(sp)
-    addi sp, sp, 32
+    ld   s3, 32(sp)
+    addi sp, sp, 40
     ret
 
 
@@ -278,19 +319,19 @@ s_trap_default:
     ld   s4, 72(sp)            // 故障时的 U sp (之前保存的 sscratch)
 
     la   a0, str_fault
-    call uart_puts
+    call s_uart_puts
     mv   a0, s2
-    call uart_putdec
+    call s_uart_putdec
     la   a0, str_at
-    call uart_puts
+    call s_uart_puts
     mv   a0, s3
-    call uart_puthex
+    call s_uart_puthex
     la   a0, str_sp
-    call uart_puts
+    call s_uart_puts
     mv   a0, s4
-    call uart_puthex
+    call s_uart_puthex
     li   a0, '\n'
-    call uart_putc
+    call s_uart_putc
 
     mv   a0, s2
     j    terminate_proc
@@ -300,15 +341,15 @@ report_fib:
     mv   s3, a1                 // n
 
     la   a0, str_fib
-    call uart_puts
+    call s_uart_puts
     mv   a0, s3
-    call uart_putdec
+    call s_uart_putdec
     la   a0, str_eq
-    call uart_puts
+    call s_uart_puts
     mv   a0, s2
-    call uart_putdec
+    call s_uart_putdec
     li   a0, '\n'
-    call uart_putc
+    call s_uart_putc
 
     la   t0, fib_result
     sd   s2, 0(t0)
@@ -323,11 +364,11 @@ terminate_proc:
     mv   s2, a0
 
     la   a0, str_exit
-    call uart_puts
+    call s_uart_puts
     mv   a0, s2
-    call uart_putdec
+    call s_uart_putdec
     li   a0, '\n'
-    call uart_putc
+    call s_uart_putc
 
     // 重新导向到 S 空闲循环
     la   t0, s_mode_idle
@@ -362,7 +403,117 @@ s_mode_idle:
 
 
 // ============================================================
-//  U 模式入口 (well-behaved) — 约束输入 -> fib -> 报告
+//  S 模式 UART 输出例程
+//
+//  S 模式取指永不许可落在 U=1 的页上, 故不能调用 .utext 段中的同名例程,
+//  此处另置一份. S 模式只发送不接收, 故只需发送方向的四个例程.
+// ============================================================
+
+s_uart_putc:
+    li   t0, UART_BASE + UART_TX
+    li   t2, 0x80000000
+1:
+    lw   t1, UART_TXCTRL(t0)
+    and  t1, t1, t2
+    bnez t1, 1b
+    sb   a0, 0(t0)
+    ret
+
+
+s_uart_puts:
+    addi sp, sp, -16
+    sd   ra, 0(sp)
+    sd   s0, 8(sp)
+    mv   s0, a0
+1:
+    lbu  a0, 0(s0)
+    beqz a0, 2f
+    call s_uart_putc
+    addi s0, s0, 1
+    j    1b
+2:
+    ld   ra, 0(sp)
+    ld   s0, 8(sp)
+    addi sp, sp, 16
+    ret
+
+
+s_uart_putdec:
+    addi sp, sp, -48
+    sd   ra,  0(sp)
+    sd   s0,  8(sp)
+    sd   s1, 16(sp)
+    mv   s0, a0
+    addi s1, sp, 40
+    sb   zero, 0(s1)
+    addi s1, s1, -1
+    bnez s0, s_putdec_loop
+    li   t0, '0'
+    sb   t0, 0(s1)
+    addi s1, s1, -1
+    j    s_putdec_out
+s_putdec_loop:
+    li   t0, 10
+    divu t1, s0, t0
+    remu t2, s0, t0
+    addi t2, t2, '0'
+    sb   t2, 0(s1)
+    addi s1, s1, -1
+    mv   s0, t1
+    bnez s0, s_putdec_loop
+s_putdec_out:
+    addi a0, s1, 1
+    call s_uart_puts
+    ld   ra,  0(sp)
+    ld   s0,  8(sp)
+    ld   s1, 16(sp)
+    addi sp, sp, 48
+    ret
+
+
+s_uart_puthex:
+    addi sp, sp, -32
+    sd   ra,  0(sp)
+    sd   s0,  8(sp)
+    sd   s1, 16(sp)
+    sd   s2, 24(sp)
+    mv   s0, a0
+    li   a0, '0'
+    call s_uart_putc
+    li   a0, 'x'
+    call s_uart_putc
+    li   s1, 60
+1:
+    srl  s2, s0, s1
+    andi s2, s2, 0xF
+    addi s2, s2, '0'
+    li   t0, '9'
+    ble  s2, t0, 2f
+    addi s2, s2, 'a' - '0' - 10
+2:
+    mv   a0, s2
+    call s_uart_putc
+    addi s1, s1, -4
+    bgez s1, 1b
+    ld   ra,  0(sp)
+    ld   s0,  8(sp)
+    ld   s1, 16(sp)
+    ld   s2, 24(sp)
+    addi sp, sp, 32
+    ret
+
+
+// ============================================================
+//  U 模式代码段
+//
+//  以下全部内容 (U 模式入口, 递归例程, UART 收发例程) 由 U 模式取指执行,
+//  故必须落在 U=1 的页上, 见文件头的映射说明. S 模式需要的那几个输出例程
+//  另有一份, 位于本文件前面的 S 模式代码段.
+// ============================================================
+.section .utext, "ax"
+
+// ============================================================
+//  U 模式入口 (well-behaved) — 约束输入, 计算 fib, 报告结果
 // ============================================================
 u_mode_main:
     li   sp, STACK_TOP_U
@@ -408,7 +559,7 @@ u_exit:
 
 
 // ============================================================
-//  U 模式入口 (pathological) — 不约束, 输入 0 -> stack_bomb
+//  U 模式入口 (pathological) — 不约束, 输入 0 则进入 stack_bomb
 // ============================================================
 u_mode_bad:
     li   sp, STACK_TOP_U
@@ -430,7 +581,7 @@ u_mode_bad:
 
     mv   s4, a0
 
-    // 输入 0 -> 栈溢出演示
+    // 输入 0 则演示栈溢出
     beqz s4, stack_bomb
 
     call uart_putdec
@@ -458,8 +609,8 @@ u_bad_exit:
 //  stack_bomb — 分配超大栈帧, 立即触及保护页
 //
 //  U 栈仅 1 页 (0x8010_0000–0x8010_0FFF), sp 初值 0x8010_1000.
-//  减去 0x2000 -> sp=0x800F_F000 (保护页).
-//  随后 sd -> StorePageFault (scause=15) -> S 终止进程.
+//  减去 0x2000 后 sp=0x800F_F000 (保护页).
+//  随后 sd 触发 StorePageFault (scause=15), 由 S 模式终止进程.
 // ============================================================
 stack_bomb:
     addi sp, sp, -16
@@ -803,20 +954,19 @@ uart_puthex:
 
 
 // ============================================================
-//  数据段
+//  S 模式数据段
+//
+//  这些地址只由 S 模式访问, 故随 S 模式代码一同放在 U=0 的页上.
 // ============================================================
-.section .data
+.section .sdata, "aw"
 .align 3
 fib_result:
     .dword 0
 
-.section .rodata
+.section .srodata, "a"
 .align 2
 str_sboot:
     .asciz "S-mode boot (Sv39 guard page enabled)\n"
-
-str_prompt:
-    .asciz "Enter n (1-16): "
 
 str_fib:
     .asciz "fib("
@@ -836,6 +986,18 @@ str_at:
 str_sp:
     .asciz " sp="
 
+
+// ============================================================
+//  U 模式数据段
+//
+//  U 模式只能访问 U=1 的页, 故 U 模式读写的字符串与缓冲区必须随 U 模式
+//  代码一同放在 0x8001_0000 起的页上.
+// ============================================================
+.section .urodata, "a"
+.align 2
+str_prompt:
+    .asciz "Enter n (1-16): "
+
 str_bad_boot:
     .asciz "S-mode: UNTRUSTED U-mode proc (no bounds check, guard page active)\n"
 
@@ -844,14 +1006,26 @@ str_bomb:
 
 
 // ============================================================
-//  BSS — 页表 + ring buffer + input buffer + M/S 栈
+//  BSS — 页表 + M/S 栈 (S 模式), ring buffer + input buffer (U 模式)
+//
+//  段名非 .bss 一类内建名, 故须显式给出 @nobits, 否则该段按 PROGBITS 落盘,
+//  零填充内容白白占用 ELF 文件体积.
 // ============================================================
-.section .bss
+.section .sbss, "aw", @nobits
 
 // Sv39 页表 (5 × 4 KiB, 页对齐)
 .align 12
 page_tables:
     .skip 5 * 4096
+
+// M / S 模式栈 (U 栈独立于 0x8010_1000)
+.align 4
+    .skip 4096
+stack_top_m:
+    .skip 4096
+stack_top_s:
+
+.section .ubss, "aw", @nobits
 
 // Ring buffer
 .align 4
@@ -867,10 +1041,3 @@ rbuf_count:
 // Line buffer
 input_buf:
     .skip LINE_MAX
-
-// M / S 模式栈 (U 栈独立于 0x8010_1000)
-.align 4
-    .skip 4096
-stack_top_m:
-    .skip 4096
-stack_top_s:

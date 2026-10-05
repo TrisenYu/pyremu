@@ -39,9 +39,11 @@ vendor/*
 !vendor/riscv-tests
 !vendor/keystone
 !vendor/musl
+!vendor/gmp
+!vendor/busybox
 
 bsp/*
-!bsp/rust_smode_entry/
+!bsp/sittim/
 !bsp/tee_aux_tools/
 !bsp/kei-boot/
 !bsp/setup-rootfs/local-build.sh

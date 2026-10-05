@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """GPR / CSR 名称查找 — 独立于 core.registers 以避免循环导入.
 
-由 ``core.registers`` 的工厂函数在模块初始化后调用 ``_init_gpr_map`` /
-``_init_csr_map`` 注入名称映射。 ``utils.disassem`` 仅依赖本模块,
+由 ``core.registers`` 的工厂函数在模块初始化后调用 ``init_gpr_map`` /
+``init_csr_map`` 注入名称映射。 ``utils.disassem`` 仅依赖本模块,
 不依赖 ``core.*``, 从而断开 core.decoder ↔ utils.disassem 循环导入链。
 """
 
 from __future__ import annotations
 
-# 默认占位: 模块加载时 register 数据尚未注入, 回退到裸编号.
+# 默认占位: 模块加载时名称数据尚未注入, 查询回退为 ?x<编号> 形式.
 _gpr_names: list[str] = []
 _gpr_aliases: list[str] = []
 _csr_names: dict[int, str] = {}

@@ -26,7 +26,7 @@ def _make_ram(size=64 * 1024):
 
 
 class TestL2CacheBasic:
-    """L2 基本读写."""
+    """L2 缓存基本读写."""
 
     @pytest.fixture
     def l2(self) -> L2Cache:
@@ -103,7 +103,7 @@ class TestMESIState:
         return l2
 
     def test_read_miss_goes_to_exclusive(self, l2):
-        """读未命中 -> E 状态."""
+        """读未命中变为 E 状态."""
         l2.read(0x1000, 4)
         # 找到该行检查状态
         for e in l2._entries:
@@ -131,7 +131,7 @@ class TestMESIState:
 
 
 class TestL2Properties:
-    """L2 属性."""
+    """L2 缓存属性."""
 
     def test_line_size(self):
         l2 = L2Cache(size=16 * 1024, line_size=64, ways=4)
@@ -152,7 +152,7 @@ class TestL2Properties:
 
 
 class TestL2BusInterface:
-    """L2 bus_read / bus_write 总线接口."""
+    """L2 缓存 bus_read / bus_write 总线接口."""
 
     def test_bus_read_is_alias_for_read(self):
         """bus_read 应与 read 返回相同数据."""
@@ -173,7 +173,7 @@ class TestL2BusInterface:
 
 
 class TestL2Invalidate:
-    """L2 invalidate 边界用例."""
+    """L2 缓存 invalidate 边界用例."""
 
     @pytest.fixture
     def l2(self) -> L2Cache:
@@ -222,7 +222,7 @@ class TestL2Invalidate:
 
 
 class TestL2HitRate:
-    """L2 命中率统计."""
+    """L2 缓存命中率统计."""
 
     def test_hit_rate_initial_zero(self):
         ram, rf, wf = _make_ram()
@@ -253,7 +253,7 @@ class TestL2HitRate:
 
 
 class TestL2Iter:
-    """L2 __iter__ 迭代器."""
+    """L2 缓存 __iter__ 迭代器."""
 
     def test_iter_yields_valid_entries(self):
         ram, rf, wf = _make_ram()
@@ -294,7 +294,7 @@ class TestL2SingleWay:
 
 
 class TestL2FlushAll:
-    """L2 flush_all / invalidate_all 批量缓存一致性操作."""
+    """L2 缓存 flush_all / invalidate_all 批量缓存一致性操作."""
 
     @pytest.fixture
     def l2(self) -> L2Cache:
@@ -372,7 +372,7 @@ class TestL2FlushAll:
         """
         l2.read(0x1000, 8)
         l2.write(0x1000, b"\xc0\xff\xee\x00\x00\x00\x00\x00")
-        # flush_all: 写回脏行 M->E; invalidate_all: 丢弃 E 行 (无回写)
+        # flush_all: 写回脏行, 状态由 M 变为 E; invalidate_all: 丢弃 E 行 (无回写)
         assert l2.flush_all() == 1
         l2.invalidate_all()
 

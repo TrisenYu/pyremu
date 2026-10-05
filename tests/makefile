@@ -12,7 +12,7 @@ ASFLAGS  = --arch=riscv64 --triple=riscv64 --mattr=+m,+a
 
 # ---- 编译全部测试固件 ----
 phony = all
-all: build-multi build-lottery
+all: build-multi build-lottery build-s2u
 
 # ---- 多程序内核 (kernel + fib + nqueen + A/B counter) ----
 build-multi:
@@ -28,9 +28,15 @@ build-lottery:
 	-rm -f lottery_boot.tmp
 phony += build-lottery
 
+# ---- M -> S -> U 移交固件 (Sv39 栈保护页 + UART 输入 + fib) ----
+build-s2u:
+	$(MAKE) -C src-env/s2u elf_dir=../../build/elf
+phony += build-s2u
+
 clean:
 	-rm -f $(elf_dir)/kernel.elf $(elf_dir)/kernel_ab.elf $(elf_dir)/lottery_boot.elf
 	$(MAKE) -C src-env/multi-proc clean
+	$(MAKE) -C src-env/s2u clean
 phony += clean
 
 .PHONY: $(phony)

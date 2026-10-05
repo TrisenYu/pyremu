@@ -29,8 +29,7 @@ RAM_BASE = 0x8000_0000
 RAM_SIZE = 2 * 1024**3
 FW_JUMP_ADDR = 0x8020_0000
 
-
-def main() -> None:
+if __name__ == "__main__":
     root = Path(__file__).resolve().parent.parent
     fw_path = root / "build" / "elf" / "custom_opensbi_fw_jump.elf"
     bin_path = root / "examples" / "easy_kern" / "easy_kern.bin"
@@ -69,7 +68,3 @@ def main() -> None:
         print("... 超时 (300 s)", flush=True)
     print("stop_reason:", getattr(emu, "_run_stop_reason", None), flush=True)
     print("=== 运行结束 ===", flush=True)
-
-
-if __name__ == "__main__":
-    main()

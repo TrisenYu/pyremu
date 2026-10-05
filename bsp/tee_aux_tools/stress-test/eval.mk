@@ -6,22 +6,25 @@
 #   make help           Show this help
 #   make install        Load the TEE driver (insmod)
 #   make stress         Run batch enclave stress test (2/20/200/2000/20000)
+#   make concurrent-enter  Same enclave must not be entered by two harts at once
 #   make uninstall      Unload the TEE driver
 #
 # See also: /eval/cache-probe-exploit/ for side-channel probe & exploit tests.
 
 DRV      = ../tee_enclave_drv.ko
 STRESS   = tee_stress
+CONCUR   = tee_concurrent_enter
 PAYLOAD  = stress_payload
 
 TEE_BIN_DIR := /eval/stress-test
 
-.PHONY: help install stress uninstall
+.PHONY: help install stress concurrent-enter uninstall
 
 help:
 	@echo "=== /eval TEE Stress Test Suite ==="
 	@echo ""
 	@echo "  make stress          Batch enclave lifecycle stress (2/20/200/2000/20000)"
+	@echo "  make concurrent-enter  Concurrent ENTER on one enclave (single-owner check)"
 	@echo ""
 	@echo "  make install         Load driver (insmod)"
 	@echo "  make uninstall       Unload driver (rmmod)"
@@ -39,6 +42,12 @@ stress: install
 	@echo "  batches: 2 -> 20 -> 200 -> 2000 -> 20000"
 	@echo ""
 	"$(TEE_BIN_DIR)/$(STRESS)" "$(TEE_BIN_DIR)/$(PAYLOAD)"
+
+concurrent-enter: install
+	@echo "=== Enclave Concurrent ENTER Test ==="
+	@echo "  one enclave must never be entered by two harts at once"
+	@echo ""
+	"$(TEE_BIN_DIR)/$(CONCUR)" "$(TEE_BIN_DIR)/$(PAYLOAD)" 5
 
 uninstall:
 	@/sbin/rmmod tee_enclave_drv 2>/dev/null && echo "[eval] driver unloaded" || true

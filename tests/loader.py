@@ -9,13 +9,17 @@
 num_processes. 本模块通过 FirmwareImage 符号表解析这些地址,
 在固件加载后填充 PCB, 使内核调度器可以启动多个用户进程.
 
-PCB 布局 (每进程 40 字节, 与 kernel.s 中 PCB_*_OFF 常量一致):
-    offset 0:  state        (4B, uint32) — 0=EMPTY, 1=READY, 2=RUNNING
-    offset 4:  entry_pc     (8B, uint64)
-    offset 12: stack_top    (8B, uint64)
-    offset 20: saved_sepc   (8B, uint64)
-    offset 28: saved_sp     (8B, uint64)
-    offset 36: exit_code    (4B, uint32)
+PCB 布局 (每进程 296 字节, 与 kernel.s 中 PCB_*_OFF 常量一致):
+    offset 0:   state        (4B, uint32) — 0=EMPTY, 1=READY, 2=RUNNING
+    offset 4:   填充         (4B, 使 entry_pc 8 字节对齐)
+    offset 8:   entry_pc     (8B, uint64)
+    offset 16:  stack_top    (8B, uint64)
+    offset 24:  saved_sepc   (8B, uint64)
+    offset 32:  saved_sp     (8B, uint64)
+    offset 40:  exit_code    (4B, uint32)
+    offset 44:  填充         (4B, 使 GPR 保存区 8 字节对齐)
+    offset 48:  GPR 保存区   (248B, x1 至 x31, 每项 8B)
+                寄存器 x(i) 位于 PCB_GPR_OFF + (i - 1) * 8
 
 用法:
     from pyremu.emulator import Emulator
@@ -61,6 +65,10 @@ PS_RUNNING = 2
 STACK_PAGES = 2  # 1 栈页 + 1 保护页
 PAGE_SIZE = 4096
 STACK_BASE_U = 0x80100000
+
+# run() 的时钟源上界 (秒). 内核调度器不会因进程不终止而自行停机, 不设上界会使
+# 不终止的程序无限阻塞调用方. 正常用例在该上界内完成并停机.
+RUN_TIMEOUT_S = 120.0
 
 
 class MultiProgramLoader:
@@ -133,16 +141,20 @@ class MultiProgramLoader:
     def run(
         self,
         uart_input: bytes | None = None,
+        timeout: float = RUN_TIMEOUT_S,
     ) -> str:
         """运行模拟直至内核停机 (semihosting SYS_EXIT / 全部 hart halted),
         返回 UART 输出.
 
         若提供 *uart_input*, 预加载到 UART RX buffer.
+
+        *timeout* 为时钟源上界 (秒). 内核调度器不会因进程不终止而自行停机,
+        不设上界会使不终止的程序无限阻塞调用方, 故以超时失败取代无限等待.
         """
         if uart_input:
             self._uart.preload(uart_input)
 
-        self._emu.run(timeout=0)
+        self._emu.run(timeout=timeout)
 
         return self._uart.tx_data().decode("latin-1", errors="replace")
 

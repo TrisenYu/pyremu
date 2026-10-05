@@ -134,8 +134,8 @@ class HartWatchdog(Device):
     def _do_recover(self) -> None:
         """恢复操作: 对全体 WFI hart 注入 MSIP.
 
-        利用现有的 CLINT MSIP -> WFI 唤醒 -> M-mode trap -> sbi_ipi_process
-        路径, 让空闲 hart 重新处理可能排队的 IPI 事件.
+        沿用现有路径, 即 CLINT MSIP 触发 WFI 唤醒, 随后进入 M-mode trap, 最终由
+        sbi_ipi_process 处理, 让空闲 hart 重新处理可能排队的 IPI 事件.
         同时通知状态变化, 使中断缓存失效并触发 try_wfi_wakeup.
         """
         clint = self._emu.clint

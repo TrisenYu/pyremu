@@ -44,6 +44,7 @@ from pyremu.core.trap_handler import (
 from pyremu.emulator import Emulator
 from pyremu.interrupt.clint import CLINT
 from pyremu.memory.bus import Bus
+from pyremu.memory.mmu import sv39_vpn
 from pyremu.platform import PeripheralConfig, PlatformConfig
 from pyremu.utils.disassem import Opc
 from pyremu.utils.parse_bin import parse_firmware
@@ -1330,10 +1331,7 @@ class TestPageFault:
         """
         if target_pa is None:
             target_pa = self.DATA_PA
-        # 内联 _sv39_vpn, 避免导入私有符号
-        vpn0 = (va >> 12) & 0x1FF
-        vpn1 = (va >> 21) & 0x1FF
-        vpn2 = (va >> 30) & 0x1FF
+        vpn2, vpn1, vpn0 = sv39_vpn(va)
         target_ppn = target_pa >> self.PAGE_SHIFT
 
         # L1 (根) -> L2
@@ -3544,37 +3542,9 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
     覆盖: LD / SD / C.LD / C.SD / AMO LR.W
     """
 
-    # 从 TestPageFault 继承的测试直接调用 mem_read/mem_write,
-    # 现因抛出 MemoryAccessFault 而失败。暂时跳过, 待逐个改写为
-    # 经 exec_instr 或显式捕获 MemoryAccessFault 的版本。
-
-    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
-    def test_ld_page_fault_root_pte_invalid(self):
-        pass
-
-    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
-    def test_ld_page_fault_l2_pte_invalid(self):
-        pass
-
-    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
-    def test_ld_page_fault_l3_pte_invalid(self):
-        pass
-
-    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
-    def test_ld_page_fault_unsupported_mode(self):
-        pass
-
-    @pytest.mark.skip(reason="直接调用 mem_write 依赖旧返回值行为, 需改写")
-    def test_st_page_fault_invalid_pte(self):
-        pass
-
-    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
-    def test_page_fault_before_pma(self):
-        pass
-
-    @pytest.mark.skip(reason="直接调用 mem_read 依赖旧返回值行为, 需改写")
-    def test_tlb_caches_and_page_fault_on_miss(self):
-        pass
+    # 以下七项不再覆写 TestPageFault 的同名用例: 覆写版本是空函数体且被标记跳过,
+    # 既未断言任何内容, 又遮蔽了父类中可直接通过的真实实现。父类实现现已与
+    # mem_read/mem_write 抛出 MemoryAccessFault 的行为一致, 故直接继承。
 
     def _setup_sv39_for(
         self, hart, ram: bytearray, valid_va: int, valid_pa: int,

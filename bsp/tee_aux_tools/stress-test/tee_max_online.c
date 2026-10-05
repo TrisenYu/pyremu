@@ -61,6 +61,17 @@ static uint8_t *read_file(const char *path, size_t *out_sz) {
 	return buf;
 }
 
+/* TEE_IOC_SHUTDOWN 为 _IOW, 驱动 copy_from_user 读取 struct tee_enclave_token_args
+ * (目标飞地编号 + 管理令牌). 本文件的飞地均由 TEE_IOC_CREATE 创建, 其登记的管理
+ * 令牌恒为 0. */
+static int do_shutdown(int fd, uint64_t enclave_id) {
+	struct tee_enclave_token_args args = {
+		.enclave_id = enclave_id,
+		.token		= 0,
+	};
+	return ioctl(fd, TEE_IOC_SHUTDOWN, &args);
+}
+
 /* ---- main ---- */
 
 int main(int argc, char **argv) {
@@ -117,12 +128,12 @@ int main(int argc, char **argv) {
 		}
 
 		/* 进入飞地, 执行 stress_payload (完成后保持在线) */
-		struct tee_enter_args args = {
+		struct tee_enclave_args args = {
 			.enclave_id   = enclave_id,
-			.payload_ptr  = (uint64_t)payload,
-			.payload_size = payload_sz,
-			.argc         = 0,
-			.argv_ptr     = 0,
+			.enter.payload_ptr  = (uint64_t)payload,
+			.enter.payload_size = payload_sz,
+			.enter.argc         = 0,
+			.enter.argv_ptr     = 0,
 		};
 		rc = ioctl(fd, TEE_IOC_ENTER, &args);
 		if (rc < 0) {
@@ -131,7 +142,7 @@ int main(int argc, char **argv) {
 				count + 1, errno, strerror(errno),
 				consecutive_failures, MAX_CONSECUTIVE_FAILURES);
 			/* 回退: 关停该飞地 */
-			ioctl(fd, TEE_IOC_SHUTDOWN, &enclave_id);
+			do_shutdown(fd, enclave_id);
 			continue;
 		}
 
@@ -173,7 +184,7 @@ int main(int argc, char **argv) {
 	/* 清理: 关停所有在线飞地 */
 	puts("\n=== Cleanup ===");
 	for (int i = 0; i < count; i++) {
-		ioctl(fd, TEE_IOC_SHUTDOWN, &online_ids[i]);
+		do_shutdown(fd, online_ids[i]);
 	}
 	printf("cleanup: %d enclaves shut down.\n", count);
 

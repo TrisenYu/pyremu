@@ -15,7 +15,7 @@ use super::DevCtx;
 /// are deliberately NOT advertised: the Python-side virtqueue processor
 /// (_process_descriptor_chain) does not implement avail_event writes or
 /// indirect-descriptor-table traversal.  Advertising either feature causes
-/// the 受调试程序 driver to take code paths that break on our device.
+/// the guest driver to take code paths that break on our device.
 /// Without them the driver falls back to flags-based notification
 /// (VRING_USED_F_NO_NOTIFY) and direct descriptor chains — both of which
 /// work correctly.
@@ -62,7 +62,7 @@ fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::ffi::FfiVirtIoCtx
 			(*raw).device_features_sel = write_data as u32;
 			Some(0)
 		},
-		// DriverFeatures (0x020) — 受调试程序 features for selected page
+		// DriverFeatures (0x020) — 受调试程序写入的 feature 选择, 按 driver_features_sel 分页
 		0x020 => unsafe {
 			let sel = (*raw).driver_features_sel;
 			let mask = (write_data as u64 & 0xFFFF_FFFF) << (sel * 32);
@@ -107,9 +107,9 @@ fn virtio_write(offset: u64, write_data: u64, raw: *mut crate::ffi::FfiVirtIoCtx
 			Some(0)
 		},
 		// InterruptACK (0x064) — 清空中断位.
-		// 若 ACK 后 ISR 归零 (old 非零且被全清), 必须同步拉低 PLIC IRQ 电平,
-		// 否则 受调试程序 紧随其后的 PLIC complete 内联执行时看到陈旧高电平 ->
-		// 重挂 pending -> 虚假中断 (kernel "irq N: nobody cared"). 故返回 None
+		// ACK 后 ISR 归零且 ACK 前非零时, 必须同步拉低 PLIC IRQ 电平, 否则受调试
+		// 程序紧随其后在 PLIC complete 的内联执行中看到陈旧的高电平, 该电平使
+		// pending 重挂而产生虚假中断, 内核打印 "irq N: nobody cared". 故返回 None
 		// 强制 MMIO 退出, 由 Python _mmio_write 在 complete 之前调用
 		// _lower_irq_if_idle 拉低电平.  仅清除部分中断位时无需拉低电平, 内联处理.
 		0x064 => {

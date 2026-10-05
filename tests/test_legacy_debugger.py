@@ -1139,10 +1139,10 @@ class TestCmdSymbols:
     def test_find_segment_gap_between_segments_returns_none(self):
         """段间空隙中的地址返回 None — 不做最近前驱猜测.
 
-        模拟真实固件布局: .text 在 VA 0x0, .coffer_enclave_man 在 VA 0x180000.
+        模拟真实固件布局: .text 在 VA 0x0, .sittim 在 VA 0x180000.
         内核 Image 加载在 VA 0x200000 (fw_jump 模式), 无对应固件段.
-        VA 0x201048 在 .coffer_enclave_man 之后 0x72e23 字节 — 距离足够近
-        (在旧实现的 1 MiB 阈值内) 会触发错误猜测, 返回 .coffer_enclave_man.
+        VA 0x201048 在 .sittim 之后 0x72e23 字节 — 距离足够近
+        (在旧实现的 1 MiB 阈值内) 会触发错误猜测, 返回 .sittim.
         修复后应返回 None.
         """
         image = FirmwareImage(
@@ -1152,7 +1152,7 @@ class TestCmdSymbols:
                 FirmwareSegment(vaddr=0x0, data=b"", memsz=0x3F260, name=".text"),
                 FirmwareSegment(
                     vaddr=0x180000, data=b"",
-                    memsz=0xE225, name=".coffer_enclave_man"
+                    memsz=0xE225, name=".sittim"
                 ),
             ],
             symbols={},

@@ -246,7 +246,7 @@ class TestCompressedC1:
         assert h.gprs[2] == 0x80248E30  # -0x70, 不是 -0x140
 
     def test_c_addi16sp_rejects_zero(self):
-        """C.ADDI16SP: nzuimm=0 为非法指令 -> IllInstr 陷态."""
+        """C.ADDI16SP: nzuimm=0 为非法指令, 触发 IllInstr 陷态."""
         h = Hart(id=0)
         h.csrs["mtvec"].val = 0x80000000
         # 构造 nzuimm=0 的 C.ADDI16SP (所有立即数位全 0, rd=2)
@@ -273,7 +273,7 @@ class TestCompressedC1:
         assert h.gprs[rd] == expected
 
     def test_c_lui_rejects_zero(self):
-        """C.LUI: nzuimm=0 为非法指令 -> IllInstr 陷态."""
+        """C.LUI: nzuimm=0 为非法指令, 触发 IllInstr 陷态."""
         h = Hart(id=0)
         h.csrs["mtvec"].val = 0x80000000
         # 构造 nzuimm=0 的 C.LUI (rd=10, 所有立即数位全 0)
@@ -703,10 +703,10 @@ class TestCompressedC2:
 #  背景: rv64imafdc 在此函数中卡死, rv64g 正常.
 #  寄存器差异: callee-saved 分配不同 (s1 vs s3 缓存 FDT),
 #  但函数参数 (a0/a1/a2) 语义一致. 需验证:
-#    1. C.ADDI16SP 栈帧分配 -> 保存/恢复 callee-saved
-#    2. C.JALR 间接调用 (strnlen / memcmp) -> 参数无损
-#    3. while-loop 终止条件 -> 各边界情况
-#    4. strnlen / memcmp 逐字节结果 -> 与 march 无关
+#    1. C.ADDI16SP 栈帧分配, 随后保存与恢复 callee-saved
+#    2. C.JALR 间接调用 (strnlen / memcmp), 参数无损
+#    3. while-loop 终止条件, 各边界情况
+#    4. strnlen / memcmp 逐字节结果, 与 march 无关
 # ============================================================
 
 
@@ -720,7 +720,7 @@ class TestFdtProbeScenario:
     # -- 栈帧完整性 -------------------------------------------------------
 
     def test_c_addi16sp_prologue_save_restore_ra(self):
-        """C.ADDI16SP 分配栈帧 -> sd ra -> ld ra -> sp 复原."""
+        """C.ADDI16SP 分配栈帧, 随后 sd ra, 随后 ld ra, 最后 sp 复原."""
         ram, read_fn, write_fn = _make_ram()
         h = Hart(id=0)
         inject_memory_backend(h, read_fn, write_fn)
@@ -797,7 +797,7 @@ class TestFdtProbeScenario:
         assert h.gprs[12] == 0x80042EE0, "a2 被破坏"
 
     def test_c_mv_then_c_jalr_call_chain(self):
-        """C.MV 设置参数 -> C.JALR: 模拟 strnlen(compat_str, prop_len)."""
+        """C.MV 设置参数后 C.JALR: 模拟 strnlen(compat_str, prop_len)."""
         h = Hart(id=0)
         h.gprs[19] = 0x87FF0000  # s3 = compat_str
         h.gprs[21] = 14          # s5 = prop_len
@@ -882,7 +882,7 @@ class TestFdtWhileLoop:
         return it
 
     def test_single_string_exact_prop_len(self):
-        """prop_len 恰好等于数据长度 (str + NUL) -> 1 次迭代后退出."""
+        """prop_len 恰好等于数据长度 (str + NUL), 1 次迭代后退出."""
         # "pyremu,riscv64" = 14 chars + NUL = 15 bytes
         assert self._run_while(b"pyremu,riscv64\x00", 15) == 1
 
@@ -894,9 +894,9 @@ class TestFdtWhileLoop:
         assert self._run_while(b"ns16550\x00snps\x00", 13) == 2
 
     def test_prop_len_too_short_no_null(self):
-        """prop_len 小于首字符串长度且无 NUL -> strnlen 返回 maxlen -> 退出."""
+        """prop_len 小于首字符串长度且无 NUL, strnlen 返回 maxlen, 随后退出."""
         # "pyremu,riscv64" = 14 chars, prop_len=8 不包含 NUL
-        # strnlen 返回 8, compat_len=9 > 8 -> 退出 (0 次迭代)
+        # strnlen 返回 8, compat_len=9 > 8, 则退出 (0 次迭代)
         assert self._run_while(b"pyremu,riscv64\x00", 8) == 0
 
     def test_boundary_compat_len_equals_prop_len(self):

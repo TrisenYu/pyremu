@@ -49,10 +49,10 @@ class TestPreemptInterleave:
 class TestPreemptPurePython:
     """回归: 关闭 native 加速后, 纯 Python 路径下抢占交错仍成立.
 
-    ``_make_emu`` 构造 Emulator 时调用 ``_init_for_speedup_lib``, 其以公开的
-    ``native_available()`` 为门控 (emulator.py 构造期读该全局). patch 该公开
-    函数返回 False, 使 ``_speedup_hart_states`` 保持 None -> ``run()`` 走纯
-    Python ``step()`` 路径 — 无需触及私有库加载状态.
+    ``_make_emu`` 构造 Emulator 时调用 ``_init_for_speedup_lib``, 后者调用公开的
+    ``native_available()`` 判断加速执行是否可用, 该函数在 emulator.py 构造期读取
+    全局标志. patch ``native_available()`` 返回 False, 使 ``_speedup_hart_states``
+    保持 None, 故 ``run()`` 走纯 Python ``step()`` 路径 — 无需触及私有库加载状态.
     """
 
     def test_interleaved_pure_python(self):

@@ -96,7 +96,7 @@ pub struct FfiPlicCtx {
 /// Host-side execution watchdog (crosses FFI boundary).
 ///
 /// 与 DevMMIOAddrInfo / FfiUartCtx / FfiVirtIoCtx 同属设备上下文组 (由 FfiDevicesCtx
-/// 携带), 但不镜像任何 受调试程序 可见 MMIO: 仅携带一次加速执行的时钟源超时时间
+/// 携带), 但其中不含任何设备寄存器: 仅携带一次加速执行的时钟源超时时间
 /// ``timeout_ns`` (0 = 禁用).  看门狗线程 ``watchdog_loop`` 以 ``module.st_time_val``
 /// 为基准, 越过该时间后经通用停止接口 (``request_stop`` + ``unpark_all_harts``)
 /// 以 ``exit_reason::TIMEOUT`` 退出.
@@ -252,7 +252,7 @@ pub struct FfiVirtIoCtx {
 	pub device_features_sel: u32,
 	/// Driver features page selector (written at offset 0x024).
 	pub driver_features_sel: u32,
-	/// Driver features accepted by the 受调试程序 (written at offset 0x020, 64-bit).
+	/// Driver features accepted by the guest (written at offset 0x020, 64-bit).
 	pub driver_features: u64,
 
 	// ---- Queue setup ----

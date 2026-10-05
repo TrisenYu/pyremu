@@ -43,7 +43,7 @@ MUSL_LDLIBS = $(MUSL_DIR)/lib/crt1.o \
               $(LIBGCC)
 
 OUT_DIR    = bin
-PROGRAMS   = tee_stress tee_max_online
+PROGRAMS   = tee_stress tee_max_online tee_concurrent_enter
 PAYLOADS   = stress_payload
 
 BINS       = $(addprefix $(OUT_DIR)/, $(PROGRAMS))

@@ -185,7 +185,7 @@ int main(argc, argv)
    unsigned *p;
    double d;
 
-   progName = *argv;
+   progName = (argc > 0 && argv && argv[0]) ? argv[0] : "cfrac";
 
    while ((ch = getopt(argc, argv, "a:k:i:dv")) != EOF) switch (ch) {
    case 'a':
@@ -209,10 +209,14 @@ usage: fprintf(stderr,
          progName);
       return 1;
    }
+
    argc -= optind;
    argv += optind;
 
-   if (argc == 0) {
+   /* 无参数启动时分解内置的合数. 此时 argc 为 0 且 argv 为 NULL,
+      而 getopt 把 optind 留在 1, 故相减后的剩余操作数为 -1, 判据须含负值;
+      上游写作 argc == 0, 该情形下取不到内置数, 反而落入 usage 分支. */
+   if (argc <= 0) {
      argc = 1;
      static char* argvx[2] = { "17545186520507317056371138836327483792736", NULL };
      argv = argvx;

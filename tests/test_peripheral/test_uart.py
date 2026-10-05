@@ -6,11 +6,11 @@
 """UART 多 hart 行缓冲 + 每 hart 日志文件 + 控制台回显所有权测试.
 
 锁定:
-- native 并发引擎多核并发写 UART 时, 输出需按 hart 归入各自行缓冲
-  (消除交错乱码), 并可定向到 <log_dir>/hart<N>.log。
-- 单一输出 owner (QEMU chardev 模型): Rust termio 线程运行期间
-  (console_echo=False) Python 行缓冲不重复回显控制台, 仅归档日志。
-- TX 环形缓冲的日志消费者 (tx_log_rd) 与 termio 线程排空索引 (tx_drain)
+- 加速执行引擎多核并发写 UART 时, 输出需按 hart 归入各自行缓冲以消除交错乱码,
+  并可定向到 <log_dir>/hart<N>.log。
+- 控制台输出的唯一所有者与 QEMU chardev 模型一致: Rust termio 线程运行期间
+  console_echo 取 False, 此时 Python 行缓冲不重复回显控制台, 仅归档日志。
+- TX 环形缓冲的日志消费者 tx_log_rd 与 termio 线程的读出索引 tx_drain
   相互独立, Python 不写 tx_drain。
 """
 
@@ -25,7 +25,7 @@ import pytest
 from pyremu._native import FfiUartCtx, native_available
 from pyremu.emulator import Emulator
 from pyremu.interrupt.plic import PLIC
-from pyremu.peripheral.uart import IP_RXWM, IP_TXWM, UART
+from pyremu.peripheral.uart import IP_RXWM, IP_TXWM, REG_RXDATA, RX_FIFO_SIZE, UART
 from pyremu.platform import PeripheralConfig, PlatformConfig
 
 TXDATA = 0x00
@@ -245,11 +245,11 @@ class TestNativeUartPairRouting:
         emu._native_flush_uart()
         # 日志读索引追上写索引 — 所有条目已归档
         assert termio.tx_log_rd == termio.tx_wr.value
-        # tx_drain 不被 Python 写入 (termio 线程未运行 ->保持 0)
+        # tx_drain 不被 Python 写入, termio 线程未运行时保持 0
         assert termio.tx_drain.value == 0
 
     def test_log_drain_handles_u32_wraparound(self, tmp_path):
-        """索引跨 u32 环绕: rd=0xFFFF_FFFE, wr=2 ->4 个条目正确归档.
+        """索引跨 u32 环绕: rd=0xFFFF_FFFE, wr=2, 则 4 个条目正确归档.
 
         修复前 range(drain, min(tx_wr, tx_cap)) 在此场景下为空区间, 条目全丢。
         """
@@ -328,16 +328,16 @@ class TestNativeUartPairRouting:
 
 
 class TestTxArchiveDaemonPollFallback:
-    """TX 归档 daemon 的 0.2s 轮询兜底 — 回归 (make emu-linux-sh hart 日志近乎为空).
+    """TX 归档守护线程在 0.2s 轮询超时后仍归档 TX 条目.
 
-    回归背景: 修复前 ``_tx_archive_loop`` 在 select 超时 (0.2s) 后无条件落入
-    阻塞 ``os.read(notify_r, 256)``。而通知管道只有 Rust 引擎写 ``tx_notify_fd``
-    才可读, 实际恒为空 (state.rs 中该字段恒为 -1, Rust 从不写) -> daemon 永久
-    阻塞在空管道读, ring buffer 永不归档; 仅剩 ``stop_tx_archive_thread`` 最终
-    排空的一小段, hart 日志与启动输出严重不符。
+    修复前 ``_tx_archive_loop`` 在 select 超时 0.2s 后无条件落入阻塞的
+    ``os.read(notify_r, 256)``。而通知管道只有 Rust 引擎写 ``tx_notify_fd`` 后
+    才可读, 该字段在 state.rs 中恒为 -1, Rust 从不写, 故管道实际恒为空, 守护线程
+    永久阻塞在空管道读, 环形缓冲区永不归档; 仅剩 ``stop_tx_archive_thread``
+    终止前读出的一小段, hart 日志与启动输出严重不符。
 
-    本测试验证: 通知管道为空 (无 Rust 通知) 时, daemon 仍靠 0.2s 轮询在
-    ``stop`` 之前把新 TX 条目归档到 hart 日志文件 — 修复前日志为空。
+    本测试验证: 通知管道为空而 Rust 不写通知时, 守护线程仍靠 0.2s 轮询在
+    ``stop`` 之前把新 TX 条目归档到 hart 日志文件, 修复前该日志为空。
     """
 
     def _make_emu(self, tmp_path) -> Emulator:
@@ -404,7 +404,7 @@ class TestTxArchiveDaemonPollFallback:
                     f"log_exists={log_path.exists()} log_content={content!r} "
                     f"open_fds={nfds} notify_r_fd={termio._tx_notify_r}]"
                 )
-            # 日志读索引已追平写索引 (stop 的最终排空前已消费)
+            # 日志读索引已追平写索引, 全部条目在 stop 的最终读出之前已被消费
             assert termio.tx_log_rd == termio.tx_wr.value
         finally:
             termio.stop_tx_archive_thread()
@@ -496,13 +496,13 @@ class TestTxArchiveDaemonPollFallback:
             assert getattr(termio, name) == -1
 
     def test_start_after_stop_recreates_pipes(self, tmp_path):
-        """回归: 调试器 REPL↔运行模式往返 (stop -> start) 必须重建管道.
+        """调试器 REPL 与运行模式往返时, stop 之后 start 必须重建管道.
 
-        用户报告 rvdbg ``continue`` 时 ``_tx_archive_loop`` / ``_rx_daemon_loop``
-        双双崩溃: ``ValueError: file descriptor cannot be a negative integer (-1)``。
-        根因: ``_enter_repl_mode`` 调 ``termio.stop()`` 关闭全部管道 (fd 置 -1),
-        随后 ``continue`` 的 ``_enter_run_mode`` 调 ``termio.start()``, 而 start()
-        不重建管道, daemon 线程捕获 fd=-1 后在 ``poll.register(-1)`` 崩溃。
+        调试器执行 ``continue`` 时 ``_tx_archive_loop`` 与 ``_rx_daemon_loop``
+        均崩溃: ``ValueError: file descriptor cannot be a negative integer (-1)``。
+        根因: ``_enter_repl_mode`` 调 ``termio.stop()`` 关闭全部管道并把读端 fd
+        置为 -1, 随后 ``continue`` 的 ``_enter_run_mode`` 调 ``termio.start()``,
+        而 start() 不重建管道, 守护线程捕获 fd=-1 后在 ``poll.register(-1)`` 崩溃。
         修复后 start() 先重建管道, 全部读端 fd 恢复有效。
         """
         emu = self._make_emu(tmp_path)
@@ -514,7 +514,7 @@ class TestTxArchiveDaemonPollFallback:
             assert getattr(termio, name) == -1, "stop() 后读端 fd 应置 -1"
 
         try:
-            # 修复前: start() 不重建管道 -> 以下两行在 stop() 清理后即见
+            # 修复前: start() 不重建管道, 则以下两行在 stop() 清理后即见
             # daemon 线程 (Thread-1/Thread-2) 崩溃; 修复后 fd 全部恢复有效.
             termio.start()
             assert termio._tx_notify_r >= 0
@@ -557,10 +557,10 @@ class TestTxArchiveDaemonPollFallback:
         termio._rx_daemon_loop()
 
     def test_emulator_close_releases_termio_fds(self, tmp_path):
-        """Emulator 生命周期结束 (close) 释放 termio 管道 fd — 回归.
+        """Emulator 生命周期结束 (close) 释放 termio 管道 fd.
 
         使用 Emulator 的调用方 (调试器退出 / 测试 teardown) 只需调一次
-        ``emu.close()`` 即释放 6 个管道 fd; 未显式 close 的实例由 __del__ 兜底.
+        ``emu.close()`` 即释放 6 个管道 fd; 未显式 close 的实例由 __del__ 释放.
         """
         emu = self._make_emu(tmp_path)
         termio = emu._termio
@@ -582,17 +582,8 @@ class TestTxArchiveDaemonPollFallback:
         emu.close()
 
 
-class TestRxDaemonLostNotifyFallback:
-    """RX daemon 通知丢失兜底 — 回归 (快速输入回显卡死).
-
-    回归背景: 修复前 ``_rx_daemon_loop`` 在 poll 超时后 ``if not ready: continue``
-    跳过排空。而 Rust termio 线程写 ring buffer 后向通知管道写 1 字节, 写端
-    非阻塞 — 突发输入时管道满 EAGAIN, 通知字节丢失; daemon 空等 0.5s 仍不排空,
-    输入滞留 ring buffer 直到主线程碰巧排空, 快速输入下表现为回显卡死。
-
-    本测试验证: 通知管道为空 (通知字节丢失), 但 ring buffer 已有数据时,
-    ``_rx_daemon_tick`` 走 poll 超时路径仍排空到 UART FIFO — 修复前数据滞留。
-    """
+class _RxRingHarness:
+    """接收环形缓冲区测试夹具: 构建 Emulator, 并直接写入接收环形缓冲区."""
 
     def _make_emu(self, tmp_path) -> Emulator:
         cfg = PlatformConfig(
@@ -611,7 +602,7 @@ class TestRxDaemonLostNotifyFallback:
         return emu
 
     def _push_rx_ring(self, emu: Emulator, data: bytes) -> None:
-        """直接写入 RX ring buffer, 绕过 Rust termio 线程 (不写通知管道)."""
+        """直接写入接收环形缓冲区, 绕过 Rust termio 线程, 不写通知管道."""
         termio = emu._termio
         if termio is None:
             pytest.skip("TerminalIO not available")
@@ -620,20 +611,33 @@ class TestRxDaemonLostNotifyFallback:
             termio._rx_buf[idx % termio.RX_CAP] = b
             termio._rx_wr.value = (idx + 1) & 0xFFFF_FFFF
 
+
+class TestRxDaemonLostNotifyFallback(_RxRingHarness):
+    """通知字节丢失时仍读出接收环形缓冲区 — 快速输入下回显停滞的回归测试.
+
+    Rust termio 线程写入接收环形缓冲区后, 再向通知管道写入 1 个字节以唤醒
+    守护线程. 该管道的写端为非阻塞, 突发输入时管道已满, 这次写入因 EAGAIN
+    失败, 通知字节丢失. 此时守护线程若在 poll 超时后跳过读出, 已到达的字节
+    就要等主线程碰巧读出才进入 UART FIFO, 表现为快速输入下的回显停滞.
+
+    本测试令通知管道为空而接收环形缓冲区已有数据, 验证 ``_rx_daemon_tick``
+    走 poll 超时路径仍把字节写入 UART FIFO.
+    """
+
     def test_rx_daemon_drains_on_timeout_without_notify(self, tmp_path):
-        """通知字节丢失时, 超时兜底仍排空 ring buffer — 修复前 continue 跳过."""
+        """通知字节丢失时, 超时路径仍读出接收环形缓冲区; 修复前该路径跳过读出."""
         emu = self._make_emu(tmp_path)
         termio = emu._termio
         assert termio is not None
         uart = emu.uart
         assert uart is not None
         try:
-            # ring buffer 已有数据, 但通知管道为空 (模拟通知字节丢失).
+            # 接收环形缓冲区已有数据, 但通知管道为空, 即通知字节丢失.
             self._push_rx_ring(emu, b"hi")
             assert termio._rx_wr.value != termio._rx_rd.value
             poll = select.poll()
             poll.register(termio._rx_notify_r, select.POLLIN)
-            # 空管道 -> poll 走 1ms 超时路径; 修复前该分支 continue, 数据滞留.
+            # 管道为空, poll 走 1ms 超时路径; 修复前该分支跳过读出, 数据留在缓冲区.
             assert termio._rx_daemon_tick(termio._rx_notify_r, poll, timeout_ms=1)
             assert bytes(uart._rx_fifo) == b"hi"
             assert termio._rx_wr.value == termio._rx_rd.value
@@ -642,20 +646,91 @@ class TestRxDaemonLostNotifyFallback:
             termio.stop()
 
 
+class TestRxRoomRefill(_RxRingHarness):
+    """FIFO 被填满后引起输入停顿的回归测试.
+
+    FIFO 满时 ``drain_rx`` 每次写入的字节数不超过 FIFO 的空位数, 其余字节留在
+    接收环形缓冲区. 受调试程序从 RXDATA 读出一个字节后, FIFO 空出一个槽位,
+    此时接收环形缓冲区有数据而 FIFO 有空位; 修复前这一状态没有任何唤醒源,
+    只能等守护线程的下一次超时轮询, 故 FIFO 被填满过一次之后, 剩余的字节要等
+    下一次超时轮询才进入 FIFO.
+
+    修复后 ``UART._accept_input()`` 在读出字节时经回调调用 ``drain_rx``, 同一次
+    操作内即完成续写.
+    """
+
+    def test_read_rxdata_notifies_slot_freed(self):
+        """从 RXDATA 读出一个字节后必须执行回调函数, 修复前该回调是空函数."""
+        calls: list[int] = []
+        uart = _make_uart([])
+        uart.set_rx_room_notifier(lambda: calls.append(1))
+        uart.preload(b"a")
+        assert uart.read(REG_RXDATA, 1) == b"a"
+        assert calls == [1]
+
+    def test_read_rxdata_on_empty_fifo_keeps_quiet(self):
+        """FIFO 已空时读 RXDATA 不会空出槽位, 不得触发回调."""
+        calls: list[int] = []
+        uart = _make_uart([])
+        uart.set_rx_room_notifier(lambda: calls.append(1))
+        # 空 FIFO 返回 UART_RXFIFO_EMPTY (bit31=1), 低字节为 0
+        assert uart.read(REG_RXDATA, 1) == b"\x00"
+        assert calls == []
+
+    def test_ring_residue_enters_fifo_on_rxdata_read(self, tmp_path):
+        """FIFO 满时留在接收环形缓冲区的字节, 必须在读出字节的同一次操作内写入.
+
+        修复前读出字节只空出一个槽位, 剩余的数据要等守护线程的下一次超时轮询;
+        修复后读操作内即经回调完成续写.
+        """
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        uart = emu.uart
+        assert termio and uart
+        try:
+            uart.set_rx_room_notifier(termio.drain_rx)
+            uart.preload(b"f" * RX_FIFO_SIZE)  # FIFO 填满
+            self._push_rx_ring(emu, b"tail")  # 4 字节留在接收环形缓冲区, 不写通知管道
+            assert len(uart._rx_fifo) == RX_FIFO_SIZE
+            assert uart.read(REG_RXDATA, 1) == b"f"
+            # 读出 1 个字节后立即由接收环形缓冲区续写 1 个字节, FIFO 内的字节数不变
+            assert len(uart._rx_fifo) == RX_FIFO_SIZE
+            assert bytes(uart._rx_fifo[-1:]) == b"t"
+            assert termio._rx_wr.value - termio._rx_rd.value == 3
+        finally:
+            uart.set_rx_room_notifier(None)
+            uart.close_logs()
+            termio.stop()
+
+    def test_termio_start_binds_notifier_and_stop_unbinds(self, tmp_path):
+        """start() 期间绑定槽位回调, stop() 后解绑."""
+        emu = self._make_emu(tmp_path)
+        termio = emu._termio
+        uart = emu.uart
+        assert termio and uart
+        try:
+            termio.start()
+            assert uart._on_rx_room is not None
+        finally:
+            termio.stop()
+        assert uart._on_rx_room is None
+
+
 # ============================================================
 #  TX watermark 电平中断 — 回归
 # ============================================================
 
 
 class TestTxWatermarkInterrupt:
-    """TX watermark 电平中断: txcnt>0 时 IP.txwm 恒置位 (FIFO 即时排空模型).
+    """TX watermark 电平中断: txcnt>0 时 IP.txwm 恒置位.
 
-    回归背景: 旧实现 IP.txwm 依赖 Python TXDATA 写路径锁存, 而 Linux 启动后
-    TXDATA 写由 Rust 批量引擎 inline 处理 (不经 Python `_write_reg`) ->
-    IP.txwm 恒为 0; sifive 驱动 start_tx 使能 IE.txwm 后永远等不到中断,
-    用户态 tty 输出 (shell 提示符 / 输入回显) 全部滞留内核 TX 环形缓冲,
-    仅内核 printk (轮询 console 路径) 可见。且旧 `_update_plic_rx` 只按
-    RX 状态拉 PLIC 线, IE.txwm 使能从不触发中断。
+    该位在读取时按 FIFO 当前占用与比较阈值算出, 不在 TXDATA 写入时置位.
+    旧实现 IP.txwm 依赖 Python TXDATA 写路径锁存, 而 Linux 启动后 TXDATA 写由
+    Rust 批量引擎直接处理, 不经 Python `_write_reg`, 故 IP.txwm 恒为 0;
+    sifive 驱动 start_tx 使能 IE.txwm 后永远等不到中断, 用户态 tty 输出的
+    shell 提示符与输入回显全部留在内核 TX 环形缓冲, 仅内核 printk 经轮询
+    console 路径可见。且旧 `_update_plic_rx` 只按 RX 状态拉 PLIC 线,
+    IE.txwm 使能从不触发中断。
     """
 
     REG_TXCTRL = 0x08
@@ -668,7 +743,7 @@ class TestTxWatermarkInterrupt:
     def test_ip_txwm_set_by_txcnt_without_any_txdata_write(self):
         """txcnt=1 时 IP.txwm 立即可读为 1 — 无需任何 TXDATA 写经过 Python.
 
-        旧行为 (锁存式) 下本测试失败: 未写过 TXDATA ->IP 读 0。
+        旧行为下本测试失败: 未写过 TXDATA 时 IP 读出 0。
         """
         uart = _make_uart([])
         # Linux sifive 驱动 probe: txctrl = TXEN | (1 << TXCNT_SHIFT)
@@ -676,13 +751,13 @@ class TestTxWatermarkInterrupt:
         assert self._read_ip(uart) & IP_TXWM
 
     def test_ip_txwm_clear_when_txcnt_zero(self):
-        """txcnt=0 ->水位条件永不成立, IP.txwm 读 0."""
+        """txcnt=0 时比较条件永不成立, IP.txwm 读 0."""
         uart = _make_uart([])
         uart.write(self.REG_TXCTRL, (0x1).to_bytes(4, "little"))  # 仅 TXEN
         assert not (self._read_ip(uart) & IP_TXWM)
 
     def test_ie_txwm_raises_plic_line(self):
-        """IE.txwm 使能且水位满足 ->PLIC 中断线拉高 (旧行为: 从不拉高)."""
+        """IE.txwm 使能且比较条件成立时, PLIC 中断线拉高; 旧行为是从不拉高."""
 
         plic = PLIC(base_addr=0x0C00_0000, num_sources=4, num_contexts=2)
         uart = UART(base=0x1000_0000, plic=plic, irq=1)
@@ -699,10 +774,10 @@ class TestTxWatermarkInterrupt:
         uart = _make_uart([])
         uart.write(self.REG_TXCTRL, (0x1 | (1 << 16)).to_bytes(4, "little"))
         uart.write(self.REG_IP, (0xFFFF_FFFF).to_bytes(4, "little"))
-        assert self._read_ip(uart) & IP_TXWM, "IP 写入不得清除水位状态"
+        assert self._read_ip(uart) & IP_TXWM, "IP 写入不得改变 txwm 的电平"
 
     def test_ip_combines_tx_and_rx(self):
-        """TX 水位与 RX 非空同时成立 ->IP 两位均置位."""
+        """TX 比较条件成立且 RX 非空时, IP 两位均置位."""
         uart = _make_uart([])
         uart.write(self.REG_TXCTRL, (0x1 | (1 << 16)).to_bytes(4, "little"))
         uart.preload(b"x")
@@ -711,14 +786,14 @@ class TestTxWatermarkInterrupt:
 
 
 class TestRxWatermarkInterrupt:
-    """RX 触发阈值 rxcnt 位于 rxctrl bits[18:16] (SiFive spec, 与 txcnt 同偏移).
+    """RX 触发阈值 rxcnt 位于 rxctrl bits[18:16], 与 txcnt 同偏移, 见 SiFive spec.
 
-    回归背景: 旧实现误从 bits[2:0] 取 rxcnt — Linux sifive 驱动 probe 写
-    rxctrl = RXEN|(0<<16) = 0x1, 旧代码读到 rxcnt=1 (rxen 位), 单字节输入
-    (FIFO 占用 1, 不满足 1>1) 永不触发 RX 中断。交互终端中逐字符输入产生
-    单字节滞留: 尾字节 (如命令后的 \\n) 永远不被受调试程序读取, 表现为输入冻结
-    (zsh 下 UP ARROW 召回命令后回车无响应)。对照 QEMU sifive_uart:
-    SIFIVE_UART_GET_RXCNT(rxctrl) = ((rxctrl) >> 16) & 0x7。
+    旧实现误从 bits[2:0] 取 rxcnt, 而 Linux sifive 驱动 probe 写
+    rxctrl = RXEN|(0<<16) = 0x1, 旧代码读到 rxcnt=1 即 rxen 位, 单字节输入使
+    FIFO 占用为 1, 不满足 1>1, 故永不触发 RX 中断。交互终端中逐字符输入时
+    单字节留在接收缓冲区: 命令后的 \\n 等剩余的字节永远不被受调试程序读取,
+    表现为输入冻结, 即 zsh 下 UP ARROW 召回命令后回车无响应。对照 QEMU
+    sifive_uart: SIFIVE_UART_GET_RXCNT(rxctrl) = ((rxctrl) >> 16) & 0x7。
     """
 
     REG_RXCTRL = 0x0C
@@ -732,7 +807,7 @@ class TestRxWatermarkInterrupt:
     def test_rxwm_single_byte_after_driver_probe_write(self):
         """驱动 probe 写 rxctrl=RXEN (rxcnt=0) 后, 单字节即置位 IP.rxwm.
 
-        旧行为: rxcnt 误读 bits[2:0]=1 (rxen 位), 单字节不置位 ->本测试失败。
+        旧行为: rxcnt 误读 bits[2:0]=1 即 rxen 位, 单字节不置位, 故本测试失败。
         """
         uart = _make_uart([])
         uart.write(self.REG_RXCTRL, self.RXEN.to_bytes(4, "little"))
@@ -742,7 +817,7 @@ class TestRxWatermarkInterrupt:
     def test_rxwm_single_byte_raises_plic_line(self):
         """rxctrl=RXEN + IE.rxwm 使能时, 单字节 preload 必须拉高 PLIC 线.
 
-        锁定冻结场景: 尾字节滞留 FIFO 且 PLIC 不挂起 ->受调试程序永不读取。
+        锁定冻结场景: 最后一个字节留在 FIFO 且 PLIC 不挂起, 受调试程序永不读取.
         """
         plic = PLIC(base_addr=0x0C00_0000, num_sources=4, num_contexts=2)
         uart = UART(base=0x1000_0000, plic=plic, irq=1)
@@ -761,9 +836,9 @@ class TestRxWatermarkInterrupt:
         assert self._read_ip(uart) & IP_RXWM
 
     def test_rxctrl_write_reevaluates_plic_line(self):
-        """降低 rxcnt 使既有 FIFO 内容满足触发条件 ->写 RXCTRL 立即拉高 PLIC.
+        """降低 rxcnt 使既有 FIFO 内容满足触发条件后, 写 RXCTRL 立即拉高 PLIC.
 
-        旧实现 RXCTRL 写路径不调用 _publish_state ->中断线状态滞后。
+        旧实现 RXCTRL 写路径不调用 _publish_state, 中断线状态滞后。
         """
         plic = PLIC(base_addr=0x0C00_0000, num_sources=4, num_contexts=2)
         uart = UART(base=0x1000_0000, plic=plic, irq=1)
@@ -771,17 +846,17 @@ class TestRxWatermarkInterrupt:
         uart.write(self.REG_IE, (0x2).to_bytes(4, "little"))
         uart.preload(b"a")  # 占用 1, rxcnt=1 ->不满足
         assert not plic._pending[1]
-        # 驱动重写 rxcnt=0 ->既有字节立即满足触发条件
+        # 驱动重写 rxcnt=0, 既有字节立即满足触发条件
         uart.write(self.REG_RXCTRL, self.RXEN.to_bytes(4, "little"))
         assert plic._pending[1], "rxcnt 降低后既有 FIFO 数据必须立即触发中断"
 
 
 class TestUartNativeRegsPublish:
-    """UART 寄存器字段与 native 侧持久上下文的同步.
+    """UART 寄存器字段与加速执行侧持久上下文的同步.
 
-    加速执行期间 Rust 内联应答 guest 的 IP/IE 读, 数据源是持久上下文而非
+    加速执行期间 Rust 内联应答受调试程序的 IP/IE 读, 数据源是持久上下文而非
     每轮 marshal 的快照; 设备侧状态变化必须即时同步, 否则 batch 内新到的
-    RX 数据对 guest 不可见 (中断服务程序读 IP 得 rxwm=0 而不读 RXDATA)。
+    RX 数据对受调试程序不可见, 其中断服务程序读 IP 得 rxwm=0 而不读 RXDATA。
     """
 
     def test_register_fields_follow_device_state(self):
@@ -793,7 +868,7 @@ class TestUartNativeRegsPublish:
         uart.preload(b"AB")
         assert ctx.rx_fifo_len == 2
         assert ctx.ie == 1 << 1
-        # guest 读走一个字节 (RXDATA 偏移 0x04) 后水位同步下降
+        # 受调试程序从 RXDATA 读出一个字节后, 该字段同步减一
         uart.read(0x04, 1)
         assert ctx.rx_fifo_len == 1
         uart.clear_rx()

@@ -23,8 +23,8 @@ kei-sav:
 		-o kei.sav.elf
 	$(OBJCOPY) kei.sav.elf \
 		-O binary          \
-		$(firmbin_dir)/kei.sav.bin
-	@echo "kei.sav.elf is stripped. Stored under $(firmbin_dir)/kei.sav.bin"
+		$(firmbin_dir)/kei.sav
+	@echo "kei.sav.elf is stripped. Stored under $(firmbin_dir)/kei.sav"
 
 clean:
 	-rm -f kei.sav.elf

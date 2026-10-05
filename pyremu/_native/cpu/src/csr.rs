@@ -416,7 +416,7 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
             // timer (SSTC) / external interrupt controller.  Preserve them;
             // only allow writes to software-writable bits (SSIP, USIP).
             // STIP/SEIP mirror hardware state and must never be clobbered by
-            // a 受调试程序 ``csrw mip`` — the SSTC timer and the external interrupt
+            // a guest ``csrw mip`` — the SSTC timer and the external interrupt
             // controller are the sole owners of these bits.
             let ro_mask: u64 = (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 11);
             ctx.state.mip.store((ctx.state.mip.load(Ordering::Acquire) & ro_mask) | (val & !ro_mask), Ordering::Release);
@@ -438,10 +438,10 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
         SIP => {
             // sip 是 mip 的只读视图, 唯一可写位是 SSIP (bit 1). 与 sie 不同,
             // sip 并非对所有 mideleg 委派位都可写: STIP (bit 5) 由 SSTC 定时器
-            // 硬件驱动, SEIP (bit 9) 由 PLIC 硬件驱动, 均不得被 受调试程序 ``csrw sip``
-            // 覆写. 飞地上下文切换 (restore_csr_for_enclave 的 csr_write(CSR_SIP,
-            // saved)) 写回陈旧 sip, 若把 SEIP/STIP 一并覆写会丢失挂起的外设/定时器
-            // 中断 (飞地回归测试后输入冻结).
+            // 硬件驱动, SEIP (bit 9) 由 PLIC 硬件驱动, 均不得被受调试程序的 ``csrw sip``
+            // 覆写. 飞地上下文切换以 csr_write(CSR_SIP, saved) 写回陈旧 sip, 若把
+            // SEIP/STIP 一并覆写会丢失挂起的外设与定时器中断, 表现为飞地回归测试
+            // 之后输入冻结.
             let wr_mask: u64 = 1 << 1; // SSIP 是唯一软件可写位
             ctx.state.mip.store((ctx.state.mip.load(Ordering::Acquire) & !wr_mask) | (val & wr_mask), Ordering::Release);
             CSR_OK
@@ -1128,7 +1128,7 @@ mod tests {
 		);
 	}
 
-	/// mip (0x344) 的只读位 (STIP/SEIP) 不得被 受调试程序 ``csrw mip`` 覆写.
+	/// mip (0x344) 的只读位 STIP/SEIP 不得被受调试程序的 ``csrw mip`` 覆写.
 	/// 修复前 ro_mask 缺 STIP(5)/SEIP(9), 一条 ``csrw mip, 0`` 会清掉
 	/// SSTC 定时器/外部中断的 pending 位, 破坏定时器状态.
 	#[test]

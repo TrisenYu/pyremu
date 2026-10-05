@@ -117,7 +117,7 @@ class TestUartLineBuffering:
         """
         assert len(lottery_lines_4h) > 0, "应有输出"
         all_text = "".join(lottery_lines_4h)
-        # 仅冷启动 hart 输出 "cold boot" -> 不交错 -> 应完整
+        # 仅冷启动 hart 输出 "cold boot", 不交错则输出完整
         assert "cold boot" in all_text
         # warm boot 和 running 可能交错, 但每个 hart 的日志文件应完整
 
@@ -187,8 +187,8 @@ class TestUartLineBuffering:
 class TestLotteryBoot:
     """OpenSBI 风格彩票启动 — 一个冷启动, 其余热启动.
 
-    多 hart 无锁并发写 UART -> 控制台字节交错, 正确性验证通过每 hart
-    日志文件 (set_hart_log_dir) 实现 — 与 QEMU -nographic 行为一致.
+    多 hart 无锁并发写 UART 时控制台字节交错, 正确性验证通过每 hart
+    日志文件实现, 该目录由 set_hart_log_dir 指定 — 与 QEMU -nographic 行为一致.
     """
 
     def _hart_logs(self, tmp_path) -> dict[int, str]:
@@ -259,10 +259,10 @@ class TestLotteryBoot:
         assert "running" in cold_log
 
     def test_lock_prevents_duplicate_cold(self):
-        """多次运行均只有 1 个 cold boot (锁机制正确).
+        """多次运行中均只有 1 个 cold boot, 由此验证锁机制正确.
 
-        TXDATA 字节级输出 -> 控制台必然交错, 但 "cold boot" 仅一个 hart
-        输出 -> 在合并文本中应恰好出现一次.
+        TXDATA 字节级输出时控制台必然交错, 但 "cold boot" 仅一个 hart
+        输出, 在合并文本中应恰好出现一次.
         """
         for _ in range(3):
             emu = _make_emu(4)

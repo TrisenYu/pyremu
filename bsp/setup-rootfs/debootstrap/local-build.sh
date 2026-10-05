@@ -31,6 +31,14 @@ TEE_DEST="${ROOTFS_DIR}/eval/cache-probe-exploit"
 FNAPP_DEST="${TEE_DEST}/fn_apps"
 STRESS_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_aux_tools/stress-test" && pwd)"
 STRESS_DEST="${ROOTFS_DIR}/eval/stress-test"
+# Enclave modules: images and their manifest modules.list share /modules, read by
+# both regress.sh and the module loader.
+MODULE_SRC="$(cd "$(dirname "$0")/../../../bsp/sittim/modules" && pwd)"
+MODULE_DEST="${ROOTFS_DIR}/modules"
+# Module loader: a host program, deployed as /eval/ext-mod-loader together with its
+# eval.mk (installed as that directory's Makefile).
+EXT_MOD_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_aux_tools/ext-mod-loader" && pwd)"
+EXT_MOD_DEST="${ROOTFS_DIR}/eval/ext-mod-loader"
 
 cleanup_mount() {
     mountpoint -q "${ROOTFS_DIR}/tmp" && umount -l "${ROOTFS_DIR}/tmp"
@@ -230,7 +238,7 @@ fi
 # Otherwise, Makefile under /eval will execute as expected.
 if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
     make -C "${TEE_TEST_SRC}" -j"$(nproc)" CROSS_CC="${GCC_CROSS}" all musl
-    install -m755 "${TEE_TEST_SRC}"/bin/* "${TEE_DEST}/" 2>/dev/null || true
+    install -m755 "${TEE_TEST_SRC}"/bin/* "${TEE_DEST}/"
     cp -v "${TEE_TEST_SRC}/tee_enclave.h" "${TEE_DEST}/"
     cp -v "${TEE_TEST_SRC}/eval.mk" "${TEE_DEST}/Makefile"
 else
@@ -253,19 +261,22 @@ if [ -z "${CARGO_BIN}" ] && [ -n "${INVOKER_HOME}" ] && [ -x "${INVOKER_HOME}/.c
     CARGO_BIN="${INVOKER_HOME}/.cargo/bin/cargo"
 fi
 
+# Run cargo with the invoker's HOME: root's HOME holds no rustup toolchain.
+# Shared by fn_apps, the enclave modules and the module signer.
+CARGO_ENV=()
+if [ -n "${INVOKER_HOME}" ]; then
+    CARGO_ENV=(env HOME="${INVOKER_HOME}" RUSTUP_HOME="${INVOKER_HOME}/.rustup" \
+        CARGO_HOME="${INVOKER_HOME}/.cargo")
+fi
+
 if [ -n "${CARGO_BIN}" ]; then
     echo ">> Building fn_apps enclave payloads (cargo=${CARGO_BIN}) ..."
-    CARGO_ENV=()
-    if [ -n "${INVOKER_HOME}" ]; then
-        CARGO_ENV=(env HOME="${INVOKER_HOME}" RUSTUP_HOME="${INVOKER_HOME}/.rustup" \
-            CARGO_HOME="${INVOKER_HOME}/.cargo")
-    fi
     if "${CARGO_ENV[@]}" make -C "${FNAPP_SRC}" CARGO="${CARGO_BIN}" all 2>&1 | tail -8; then
         mkdir -p "${FNAPP_DEST}"
-        install -m755 "${FNAPP_SRC}"/bin/* "${FNAPP_DEST}/" 2>/dev/null || true
+        install -m755 "${FNAPP_SRC}"/bin/* "${FNAPP_DEST}/"
         # dir for testcases
 		mkdir -p "${FNAPP_DEST}/test"
-        install -m644 "${FNAPP_SRC}"/chibicc/test/inp_src.c "${FNAPP_DEST}/test/inp_src.c" 2>/dev/null || true
+        install -m644 "${FNAPP_SRC}"/chibicc/test/inp_src.c "${FNAPP_DEST}/test/inp_src.c"
         echo ">> fn_apps payloads installed"
     else
         echo ">> WARN: fn_apps build failed; skipping enclave payloads"
@@ -274,18 +285,116 @@ else
     echo ">> SKIP fn_apps: cargo not found"
 fi
 
-# 8c. Headless regression entry — the headless test boots with init=/eval/regress.sh
-# to auto-run the ecall regression (insmod driver + tee_ecall_regress); its
-# [regress] ... markers are asserted from UART.
+LANGLANDS_SYSROOT="${FNAPP_SRC}/Langlands/build/sysroot/lib/libflint.a"
+if [ -f "${LANGLANDS_SYSROOT}" ]; then
+    echo ">> Building Langlands payloads ..."
+    if make -C "${FNAPP_SRC}" langlands 2>&1 | tail -4; then
+        mkdir -p "${FNAPP_DEST}"
+        # make can succeed without producing either payload; regress.sh scans the
+        # payload directory, so a missing one silently leaves the summary incomplete.
+        for f in Lfunc modular_form; do
+            if [ ! -f "${FNAPP_SRC}/bin/${f}" ]; then
+                echo ">> ERROR: Langlands build produced no ${FNAPP_SRC}/bin/${f}" >&2
+                exit 1
+            fi
+        done
+        install -m755 "${FNAPP_SRC}/bin/Lfunc" "${FNAPP_SRC}/bin/modular_form" \
+            "${FNAPP_DEST}/"
+        echo ">> Langlands payloads installed"
+    else
+        echo ">> WARN: Langlands build failed; skipping"
+    fi
+else
+    echo ">> SKIP Langlands: run fn_apps/Langlands/build-deps.sh first"
+fi
+
+# 8c. Enclave module images (bsp/sittim/modules). The host hands a module to the
+# enclave while it runs, so images are installed apart from the payloads: every
+# image sits in /modules next to the manifest modules.list, which names the files
+# relative to that directory. The make target `dist` writes that flattened copy.
+if [ -n "${CARGO_BIN}" ]; then
+    echo ">> Building enclave modules (cargo=${CARGO_BIN}) ..."
+    "${CARGO_ENV[@]}" make -C "${MODULE_SRC}" CARGO="${CARGO_BIN}" dist
+    mkdir -p "${MODULE_DEST}"
+    install -m644 "${MODULE_SRC}"/dist/* "${MODULE_DEST}/"
+    echo ">> Enclave modules installed:"
+    ls -la "${MODULE_DEST}"
+else
+    echo ">> SKIP enclave modules: cargo not found"
+fi
+
+# 8d. Module loader: the smallest host program that drives the load path on its own.
+if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
+    make -C "${EXT_MOD_SRC}" CROSS_CC="${GCC_CROSS}" all
+    mkdir -p "${EXT_MOD_DEST}"
+    install -m755 "${EXT_MOD_SRC}/bin/ext_mod_loader" "${EXT_MOD_DEST}/"
+    cp -v "${EXT_MOD_SRC}/eval.mk" "${EXT_MOD_DEST}/Makefile"
+else
+    echo ">> SKIP module loader: ${GCC_CROSS} not found"
+fi
+
+# 8e. Headless regression entry — the headless test boots with init=/eval/regress.sh
+# to auto-run the ecall regression (insmod driver + tee_ecall_regress + tee_concurrent);
+# its [regress] ... markers are asserted from UART.
 cat > "${ROOTFS_DIR}/eval/regress.sh" <<'REGRESS'
 #!/bin/sh
 echo "Regress init starting"
+# This script is the kernel init, so nothing mounts /etc/fstab on its behalf;
+# without this /proc and /dev stay empty, and both counting the online harts and
+# creating the /dev/tee_enclave node fail.
+mount -a
 /sbin/insmod /eval/tee_enclave_drv.ko 2>&1
 cd /eval/cache-probe-exploit || exit 1
-./tee_ecall_regress /eval/cache-probe-exploit/fn_apps
-rc=$?
-echo "Regress rc=$rc"
-exit $rc
+
+# Stage 1: one hart loads every payload under fn_apps, one enclave at a time.
+# The second argument is the module directory: payloads that request a module are
+# served from it while the regression keeps resuming the enclave. It is omitted
+# when the build installed no modules, because the regression rejects a directory
+# it cannot read the manifest from.
+if [ -d /modules ]; then
+	set -- /modules
+else
+	set --
+fi
+./tee_ecall_regress /eval/cache-probe-exploit/fn_apps "$@"
+rc_seq=$?
+echo "Regress sequential rc=$rc_seq"
+
+# Stage 2: several harts enter their own enclaves concurrently and run the same
+# payload.  orbit is chosen because it exits by itself with argc = 0 (ENTER from
+# tee_concurrent passes no arguments) and stays within the regression's time
+# budget.
+CONC_PAYLOAD=/eval/cache-probe-exploit/fn_apps/orbit
+
+# One child per online hart, capped at 4.
+harts=$(grep -c ^processor /proc/cpuinfo 2>/dev/null)
+case "$harts" in
+'' | *[!0-9]*) harts=1 ;;
+esac
+if [ "$harts" -gt 4 ]; then
+	harts=4
+fi
+
+rc_conc=0
+if [ ! -f "$CONC_PAYLOAD" ]; then
+	echo "Regress concurrent skipped: $CONC_PAYLOAD not found"
+elif [ "$harts" -lt 2 ]; then
+	# Two harts at least are required for the requests to overlap; on one hart
+	# they can only run serially, which concurrent-two-harts rejects by design.
+	echo "Regress concurrent skipped: $harts online hart(s)"
+else
+	echo "Regress concurrent starting (procs=$harts)"
+	./tee_concurrent "$CONC_PAYLOAD" "$harts"
+	rc_conc=$?
+	echo "Regress concurrent rc=$rc_conc"
+fi
+
+if [ "$rc_seq" -eq 0 ] && [ "$rc_conc" -eq 0 ]; then
+	echo "Regress summary: ALL PASS"
+	exit 0
+fi
+echo "Regress summary: FAILED"
+exit 1
 REGRESS
 chmod +x "${ROOTFS_DIR}/eval/regress.sh"
 
@@ -298,7 +407,7 @@ mkdir -p "${STRESS_DEST}"
 
 if command -v "${GCC_CROSS}" >/dev/null 2>&1; then
     make -C "${STRESS_SRC}" -j"$(nproc)" CROSS_CC="${GCC_CROSS}" all
-    install -m755 "${STRESS_SRC}"/bin/* "${STRESS_DEST}/" 2>/dev/null || true
+    install -m755 "${STRESS_SRC}"/bin/* "${STRESS_DEST}/"
     cp -v "${STRESS_SRC}/tee_enclave.h" "${STRESS_DEST}/"
     cp -v "${STRESS_SRC}/eval.mk" "${STRESS_DEST}/Makefile"
 else
@@ -315,22 +424,28 @@ cat > "${ROOTFS_DIR}/eval/Makefile" <<'EVALMK'
 #   make help                  Show this help
 #   make probe                 Side-channel probe & exploit tests
 #   make stress                Batch enclave lifecycle stress tests
+#   make modules               Load an enclave module through the standalone loader
 
-.PHONY: help probe stress
+.PHONY: help probe stress modules
 
 help:
 	@echo "=== /eval TEE Test Suite ==="
 	@echo "  make probe    cache-probe-exploit (全部缓存侧信道: Flush+Reload + 生命周期 + 并发 + TLB/integrity)"
 	@echo "  make stress   stress-test (batch enclave lifecycle 2/20/200/2000/20000)"
+	@echo "  make modules  ext-mod-loader (one payload, one module from /modules)"
 	@echo ""
 	@echo "  cd cache-probe-exploit && make help   for attack details (含阻塞式 DoS: malice-avail)"
 	@echo "  cd stress-test && make help           for stress test details"
+	@echo "  cd ext-mod-loader && make help        for loader details"
 
 probe:
 	$(MAKE) -C cache-probe-exploit probe
 
 stress:
 	$(MAKE) -C stress-test stress
+
+modules:
+	$(MAKE) -C ext-mod-loader load
 EVALMK
 
 echo ">> /eval/Makefile created"

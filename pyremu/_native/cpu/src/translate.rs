@@ -16,7 +16,6 @@
 //!   readable by load instructions.  Does not affect stores or instruction
 //!   fetches.
 
-use core::cell::Cell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::mmu::{pte_parse, sv39_decompose_va};
@@ -37,10 +36,6 @@ pub struct WalkCtx {
 	/// boundary; on mismatch, it marks its own TLB entries dirty (not flush),
 	/// forcing re-walk on next access.
 	pub tlb_gen: *const AtomicU64,
-	/// Clock algorithm: eviction hand for itlb / dtlb.
-	/// Cell provides interior mutability; handlers take ``&WalkCtx``.
-	pub itlb_hand: Cell<u8>,
-	pub dtlb_hand: Cell<u8>,
 	/// Per-hart LR reservation slots (indexed by hart_id).
 	/// LR sets `lr_reserved[hid] = pa`; any store clears all slots.
 	/// Allocated in ``ModuleState``, pointer passed through FFI.
@@ -540,50 +535,75 @@ pub fn sv39_walk(
 //  TLB operations
 // ============================================================
 
+// 条目总数由 emu-configs.mk 的 TLB_ENTRIES 给出, 经 makefile 生成 configs_gen.rs,
+// 与 Python 侧 configs_gen.py 取自同一处配置, 两侧容量因此始终一致.
 #[inline]
 const fn tlb_sz() -> usize {
 	TLB_ENTRIES
 }
 
 // ============================================================
-//  Clock algorithm (second-chance LRU approximation)
+//  Set-associative organization
 // ============================================================
 
-/// Find a victim for eviction using the clock algorithm.
-/// Prefers invalid entries; otherwise scans for accessed==0.
+/// 组相联的路数.  条目数组按组划分: 第 s 组的第 w 路位于 s + w * TLB_SETS.
+const TLB_WAYS: usize = 4;
+
+/// 组数.  组号由页号的乘法散列高位给出, 故必须为 2 的整数次幂.
+const TLB_SETS: usize = TLB_ENTRIES / TLB_WAYS;
+
+// 改动 emu-configs.mk 的 TLB_ENTRIES 时须同时满足: 为 2 的整数次幂, 且不小于
+// 路数.  两条约束在此于编译期检查, 不满足则编译失败, 不会退化为错误的分组.
+const _: () = assert!(TLB_WAYS.is_power_of_two());
+const _: () = assert!(TLB_ENTRIES.is_power_of_two());
+const _: () = assert!(TLB_ENTRIES >= TLB_WAYS);
+
 #[inline]
-fn clock_victim(tlb: &mut [TlbEntry], hand: &mut u8) -> usize {
-	let sz = tlb_sz();
-	// First pass: prefer invalid entries
-	for _ in 0..sz {
-		let idx = *hand as usize;
-		if tlb[idx].valid == 0 {
-			*hand = ((idx + 1) % sz) as u8;
-			return idx;
-		}
-		*hand = ((idx + 1) % sz) as u8;
-	}
-	// Second pass: clock algorithm — find unaccessed entry
-	for _ in 0..sz {
-		let idx = *hand as usize;
-		if tlb[idx].accessed == 0 {
-			*hand = ((idx + 1) % sz) as u8;
-			return idx;
-		}
-		// Give a second chance: clear accessed, advance hand
-		let e = unsafe { &mut *tlb.as_mut_ptr().add(idx) };
-		e.accessed = 0;
-		*hand = ((idx + 1) % sz) as u8;
-	}
-	// All entries accessed — evict current hand position
-	let idx = *hand as usize;
-	*hand = ((idx + 1) % sz) as u8;
-	idx
+const fn tlb_set_bits() -> u32 {
+	TLB_SETS.trailing_zeros()
 }
 
-// ============================================================
-//  TLB operations
-// ============================================================
+/// 由页号算出所属的组号.
+///
+/// 取乘法散列的高位而非页号的低位: 相邻 2 MiB 大页的页号相差 512, 低位会被
+/// 512 的因子整除, 若直接取低位则内核线性映射的连续大页全部落进同一组,
+/// 组相联退化为直接映射.  乘法散列把页号的高低位混合, 消除该规律性.
+#[inline]
+fn tlb_set(vpn: u64) -> usize {
+	const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+	(vpn.wrapping_mul(GOLDEN) >> (64 - tlb_set_bits())) as usize
+}
+
+/// 第 s 组第 w 路的条目下标.
+#[inline]
+const fn tlb_slot(set: usize, way: usize) -> usize {
+	set + way * TLB_SETS
+}
+
+/// 在某组内取一个可逐出的条目: 优先空槽位, 其次未被访问的槽位,
+/// 全部被访问过时清除访问位后取第 0 路.
+///
+/// 只查看该组的 TLB_WAYS 个槽位, 与组数无关.
+#[inline]
+fn set_victim(tlb: &mut [TlbEntry], set: usize) -> usize {
+	for w in 0..TLB_WAYS {
+		let idx = tlb_slot(set, w);
+		if tlb[idx].valid == 0 {
+			return idx;
+		}
+	}
+	for w in 0..TLB_WAYS {
+		let idx = tlb_slot(set, w);
+		if tlb[idx].accessed == 0 {
+			return idx;
+		}
+	}
+	for w in 0..TLB_WAYS {
+		let idx = tlb_slot(set, w);
+		tlb[idx].accessed = 0;
+	}
+	tlb_slot(set, 0)
+}
 
 /// Result of a TLB lookup.
 pub enum TlbResult {
@@ -601,9 +621,13 @@ pub enum TlbResult {
 /// - ``DirtyReuse(idx)`` for a stale match — caller must re-walk and insert
 ///   at this index to avoid leaking the slot.
 /// - ``Miss`` if no entry matches.
+///
+/// 只查看页号所映射的那一组内的 TLB_WAYS 个条目, 比较次数不随条目总数增长.
 #[inline]
 pub fn tlb_lookup(tlb: &mut [TlbEntry], vpn: u64, asid: u16) -> TlbResult {
-	for i in 0..tlb_sz() {
+	let set = tlb_set(vpn);
+	for w in 0..TLB_WAYS {
+		let i = tlb_slot(set, w);
 		if tlb[i].valid != 0 && tlb[i].vpn == vpn {
 			// ASID-tagged: different address space -> miss.
 			// asid=0 (Bare mode) matches any entry (no tag).
@@ -620,12 +644,29 @@ pub fn tlb_lookup(tlb: &mut [TlbEntry], vpn: u64, asid: u16) -> TlbResult {
 	TlbResult::Miss
 }
 
-/// Insert or update a translation at *prefer_idx* (if valid) or via clock
-/// eviction.  ``prefer_idx`` should be the index from a prior ``DirtyReuse``.
+/// 在某组内取一个条目下标, 供插入使用.
+///
+/// 页号已在该组内时返回其下标, 使重复插入就地更新而不额外占用槽位;
+/// 否则返回该组内可逐出的条目.
+#[inline]
+fn tlb_slot_for_insert(tlb: &mut [TlbEntry], set: usize, vpn: u64) -> usize {
+	for w in 0..TLB_WAYS {
+		let idx = tlb_slot(set, w);
+		if tlb[idx].valid != 0 && tlb[idx].vpn == vpn {
+			return idx;
+		}
+	}
+	set_victim(tlb, set)
+}
+
+/// Insert or update the translation of *vpn* into its set.
+///
+/// ``prefer_idx`` should be the index from a prior ``DirtyReuse``; it is used
+/// only when it lies in the set that *vpn* maps to.  An index outside that set
+/// cannot hold this translation, so the set's own victim is taken instead.
 #[inline]
 pub fn tlb_insert(
 	tlb: &mut [TlbEntry],
-	hand: &mut u8,
 	prefer_idx: Option<usize>,
 	vpn: u64,
 	ppn: u64,
@@ -634,9 +675,12 @@ pub fn tlb_insert(
 	mdid: u64,
 	asid: u16,
 ) {
+	let set = tlb_set(vpn);
+	// 槽位 i 属于第 i % TLB_SETS 组, 故该判据即"该槽位位于本页号所映射的组内".
+	// 组号由页号唯一决定, 落在别组的槽位无法被后续查询命中, 不能用于存放本条翻译.
 	let idx = match prefer_idx {
-		Some(i) if i < tlb_sz() => i,
-		_ => clock_victim(tlb, hand),
+		Some(i) if i < tlb_sz() && i % TLB_SETS == set => i,
+		_ => tlb_slot_for_insert(tlb, set, vpn),
 	};
 	tlb[idx].vpn = vpn;
 	tlb[idx].ppn = ppn;
@@ -872,10 +916,10 @@ pub fn translate_va(
 	};
 
 	let vpn = va >> 12;
-	let (tlb, hand) = if is_execute {
-		(&mut state.itlb, &ctx.itlb_hand)
+	let tlb = if is_execute {
+		&mut state.itlb
 	} else {
-		(&mut state.dtlb, &ctx.dtlb_hand)
+		&mut state.dtlb
 	};
 
 	// ---- TLB lookup ----
@@ -947,10 +991,8 @@ pub fn translate_va(
 		} else {
 			&mut state.dtlb
 		};
-		let mut h = hand.get();
 		tlb_insert(
 			tlb_mut,
-			&mut h,
 			reuse_idx,
 			vpn,
 			result.ppn_for_tlb(vpn),
@@ -959,7 +1001,6 @@ pub fn translate_va(
 			state.mdid,
 			asid,
 		);
-		hand.set(h);
 	}
 
 	Ok(result)
@@ -1010,17 +1051,40 @@ mod tests {
 		satp
 	}
 
+	fn empty_tlb() -> [TlbEntry; TLB_ENTRIES] {
+		[TlbEntry::empty(); TLB_ENTRIES]
+	}
+
+	/// 取第 *n* 个落在组 *set* 内的页号.
+	///
+	/// 扫描上界确保组号函数退化时本条以断言失败收场, 而不是无限循环.
+	fn vpn_in_set(set: usize, n: u64) -> u64 {
+		let mut seen = 0u64;
+		for vpn in 0u64..(1 << 24) {
+			if tlb_set(vpn) == set {
+				if seen == n {
+					return vpn;
+				}
+				seen += 1;
+			}
+		}
+		panic!("set {set} holds fewer than {} page numbers", n + 1)
+	}
+
+	fn insert(tlb: &mut [TlbEntry], prefer: Option<usize>, vpn: u64, ppn: u64) {
+		tlb_insert(tlb, prefer, vpn, ppn, 0xF, 0, 0, 0);
+	}
+
 	#[test]
 	fn tlb_lookup_miss() {
-		let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
+		let mut tlb = empty_tlb();
 		assert!(matches!(tlb_lookup(&mut tlb, 0x100, 0), TlbResult::Miss));
 	}
 
 	#[test]
 	fn tlb_insert_and_lookup() {
-		let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
-		let mut hand: u8 = 0;
-		tlb_insert(&mut tlb, &mut hand, None, 0x1000, 0x80000, 0xF, 0, 0, 0);
+		let mut tlb = empty_tlb();
+		insert(&mut tlb, None, 0x1000, 0x80000);
 		let idx = match tlb_lookup(&mut tlb, 0x1000, 0) {
 			TlbResult::Hit(i) => i,
 			_ => panic!("expected clean hit"),
@@ -1046,100 +1110,137 @@ mod tests {
 		};
 		assert_eq!(reuse, idx);
 		// Re-insert at the dirty slot
-		tlb_insert(
-			&mut tlb,
-			&mut hand,
-			Some(reuse),
-			0x1000,
-			0x90000,
-			0xF,
-			0,
-			0,
-			0,
-		);
+		insert(&mut tlb, Some(reuse), 0x1000, 0x90000);
 		assert!(matches!(tlb_lookup(&mut tlb, 0x1000, 0), TlbResult::Hit(_)));
 		assert_eq!(tlb[reuse].ppn, 0x90000);
 	}
 
 	#[test]
 	fn test_tlb_flush_all() {
-		let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
-		let mut hand: u8 = 0;
-		tlb_insert(&mut tlb, &mut hand, None, 0x1000, 0x80000, 0xF, 0, 0, 0);
+		let mut tlb = empty_tlb();
+		insert(&mut tlb, None, 0x1000, 0x80000);
 		crate::translate::tlb_flush_all(&mut tlb);
 		assert!(matches!(tlb_lookup(&mut tlb, 0x1000, 0), TlbResult::Miss));
 	}
 
 	#[test]
 	fn test_tlb_flush_vpn() {
-		let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
-		let mut hand: u8 = 0;
-		tlb_insert(&mut tlb, &mut hand, None, 0x1000, 0x80000, 0xF, 0, 0, 0);
-		tlb_insert(&mut tlb, &mut hand, None, 0x2000, 0x90000, 0xF, 0, 0, 0);
+		let mut tlb = empty_tlb();
+		insert(&mut tlb, None, 0x1000, 0x80000);
+		insert(&mut tlb, None, 0x2000, 0x90000);
 		crate::translate::tlb_flush_vpn(&mut tlb, 0x1000);
 		assert!(matches!(tlb_lookup(&mut tlb, 0x1000, 0), TlbResult::Miss));
 		assert!(matches!(tlb_lookup(&mut tlb, 0x2000, 0), TlbResult::Hit(_)));
 	}
 
+	/// 命中项的槽位号必须落在该页号所映射的组内.
+	///
+	/// 查询只查看这一组的 TLB_WAYS 个槽位, 故该不变量成立即比较次数与条目总数无关.
+	/// 逐组填充, 使插入次序与组号互不相关: 若槽位改回按插入次序线性分配, 命中槽位
+	/// 与组号不再一致, 本条失败.
 	#[test]
-	fn tlb_clock_evicts() {
-		let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
-		let mut hand: u8 = 0;
-		for i in 0..TLB_ENTRIES {
-			tlb_insert(
-				&mut tlb,
-				&mut hand,
-				None,
-				i as u64,
-				i as u64 * 0x1000,
-				0xF,
-				0,
-				0,
-				0,
+	fn tlb_hit_always_lies_in_own_set() {
+		let mut tlb = empty_tlb();
+		for set in 0..TLB_SETS {
+			for way in 0..TLB_WAYS {
+				let vpn = vpn_in_set(set, way as u64);
+				insert(&mut tlb, None, vpn, vpn * 0x1000);
+			}
+		}
+		for set in 0..TLB_SETS {
+			for way in 0..TLB_WAYS {
+				let vpn = vpn_in_set(set, way as u64);
+				let idx = match tlb_lookup(&mut tlb, vpn, 0) {
+					TlbResult::Hit(i) => i,
+					_ => panic!("expected a hit in set {set} way {way}"),
+				};
+				assert_eq!(idx % TLB_SETS, set, "slot {idx} is not in set {set}");
+			}
+		}
+	}
+
+	/// 逐出只在目标组内发生, 且组内有效条目数不超过路数.
+	#[test]
+	fn tlb_evicts_within_own_set_only() {
+		let mut tlb = empty_tlb();
+		let target = 0usize;
+		let other = 1usize;
+		// 在另一组放一个条目, 逐出不得触及它.
+		let keeper = vpn_in_set(other, 0);
+		insert(&mut tlb, None, keeper, 0xABCDE);
+
+		// 填满目标组.
+		for way in 0..TLB_WAYS {
+			let vpn = vpn_in_set(target, way as u64);
+			insert(&mut tlb, None, vpn, vpn * 0x1000);
+		}
+		// 再插入 TLB_WAYS 个同组的新页号, 全部应落在目标组内.
+		for n in TLB_WAYS..(2 * TLB_WAYS) {
+			let vpn = vpn_in_set(target, n as u64);
+			insert(&mut tlb, None, vpn, vpn * 0x1000);
+			assert!(
+				matches!(tlb_lookup(&mut tlb, vpn, 0), TlbResult::Hit(_)),
+				"freshly inserted vpn {vpn:#x} is not resident"
 			);
 		}
-		assert!(matches!(tlb_lookup(&mut tlb, 0, 0), TlbResult::Hit(_)));
-		tlb_insert(
-			&mut tlb,
-			&mut hand,
-			None,
-			TLB_ENTRIES as u64,
-			0xA000,
-			0xF,
-			0,
-			0,
-			0,
-		);
-		let valid_count = tlb.iter().filter(|e| e.valid != 0).count();
-		assert_eq!(valid_count, TLB_ENTRIES);
+
+		let in_target = (0..TLB_WAYS)
+			.filter(|w| tlb[tlb_slot(target, *w)].valid != 0)
+			.count();
+		assert_eq!(in_target, TLB_WAYS, "set {target} should hold {TLB_WAYS}");
+		assert!(matches!(tlb_lookup(&mut tlb, keeper, 0), TlbResult::Hit(_)));
 	}
 
 	#[test]
 	fn tlb_dirty_reuse() {
-		let mut tlb: [TlbEntry; TLB_ENTRIES] = [TlbEntry::empty(); TLB_ENTRIES];
-		let mut hand: u8 = 0;
-		// Fill all entries clean
-		for i in 0..TLB_ENTRIES {
-			tlb_insert(
-				&mut tlb,
-				&mut hand,
-				None,
-				i as u64,
-				i as u64 * 0x1000,
-				0xF,
-				0,
-				0,
-				0,
-			);
+		let mut tlb = empty_tlb();
+		let set = 7usize;
+		// 填满该组, 使后续插入必然触发逐出.
+		for way in 0..TLB_WAYS {
+			let vpn = vpn_in_set(set, way as u64);
+			insert(&mut tlb, None, vpn, vpn * 0x1000);
 		}
-		// Mark entry 5 dirty
-		tlb[5].dirty = 1;
-		// Re-insert at dirty slot — should reuse slot 5, not evict another
-		tlb_insert(&mut tlb, &mut hand, Some(5), 0x1000, 0x90000, 0xF, 0, 0, 0);
-		assert_eq!(tlb[5].ppn, 0x90000);
-		assert_eq!(tlb[5].dirty, 0);
-		let valid_count = tlb.iter().filter(|e| e.valid != 0).count();
-		assert_eq!(valid_count, TLB_ENTRIES); // no extra entry leaked
+		let target = vpn_in_set(set, 0);
+		let idx = match tlb_lookup(&mut tlb, target, 0) {
+			TlbResult::Hit(i) => i,
+			_ => panic!("expected a hit before marking dirty"),
+		};
+		tlb[idx].dirty = 1;
+		let reuse = match tlb_lookup(&mut tlb, target, 0) {
+			TlbResult::DirtyReuse(i) => i,
+			_ => panic!("expected DirtyReuse"),
+		};
+		assert_eq!(reuse, idx);
+		// 在脏槽位就地重填: 该组有效条目数不变, 不额外占用槽位.
+		insert(&mut tlb, Some(reuse), target, 0x90000);
+		assert_eq!(tlb[reuse].ppn, 0x90000);
+		assert_eq!(tlb[reuse].dirty, 0);
+		let in_set = (0..TLB_WAYS)
+			.filter(|w| tlb[tlb_slot(set, *w)].valid != 0)
+			.count();
+		assert_eq!(in_set, TLB_WAYS, "refill must not add a valid entry");
+	}
+
+	/// 相邻 2 MiB 大页的页号相差 512, 组号不得仅由页号低位决定.
+	///
+	/// 若组号取页号低位, 内核线性映射的连续大页全部落进同一组, 组相联退化为直接
+	/// 映射, 可用容量从 TLB_ENTRIES 降到 TLB_WAYS. 本条以低位方案必然失败.
+	#[test]
+	fn tlb_set_spreads_consecutive_megapages() {
+		let mut seen = [false; TLB_SETS];
+		let mut distinct = 0usize;
+		for k in 0..TLB_SETS as u64 {
+			let vpn = 0x40000 + k * 512;
+			let set = tlb_set(vpn);
+			if !seen[set] {
+				seen[set] = true;
+				distinct += 1;
+			}
+		}
+		assert!(
+			distinct > TLB_WAYS,
+			"consecutive megapages land in only {distinct} sets"
+		);
 	}
 
 	#[test]
@@ -1153,8 +1254,6 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 			tlb_gen: std::ptr::null(),
-			itlb_hand: Cell::new(0),
-			dtlb_hand: Cell::new(0),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1177,8 +1276,6 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 			tlb_gen: std::ptr::null(),
-			itlb_hand: Cell::new(0),
-			dtlb_hand: Cell::new(0),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1205,8 +1302,6 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 			tlb_gen: std::ptr::null(),
-			itlb_hand: Cell::new(0),
-			dtlb_hand: Cell::new(0),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1237,8 +1332,6 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 			tlb_gen: std::ptr::null(),
-			itlb_hand: Cell::new(0),
-			dtlb_hand: Cell::new(0),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1247,23 +1340,26 @@ mod tests {
 		let fetch = sv39_walk(&ctx, satp, va, false, true);
 		assert!(
 			fetch.is_some(),
-			"X-only leaf 取指必须成功 (修复前返回 None)"
+			"fetch from an X-only leaf must succeed (returned None before the fix)"
 		);
 		assert_eq!(
 			fetch.unwrap().pa,
 			pa,
-			"X-only leaf 取指应翻译到正确物理地址"
+			"fetch from an X-only leaf must translate to the mapped PA"
 		);
 
 		// 数据读 (is_execute=false, is_write=false): R=0 页不可读, 仍应失败.
 		let load = sv39_walk(&ctx, satp, va, false, false);
-		assert!(load.is_none(), "X-only leaf 数据读仍应被拒绝 (需要 PTE_R)");
+		assert!(
+			load.is_none(),
+			"data load from an X-only leaf must stay denied (PTE_R required)"
+		);
 
 		// 写 (is_write=true): R&W 均缺, 仍应失败.
 		let store = sv39_walk(&ctx, satp, va, true, false);
 		assert!(
 			store.is_none(),
-			"X-only leaf 写仍应被拒绝 (需要 PTE_R|PTE_W)"
+			"store to an X-only leaf must stay denied (PTE_R|PTE_W required)"
 		);
 	}
 
@@ -1286,8 +1382,6 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 			tlb_gen: std::ptr::null(),
-			itlb_hand: Cell::new(0),
-			dtlb_hand: Cell::new(0),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1318,8 +1412,6 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 			tlb_gen: std::ptr::null(),
-			itlb_hand: Cell::new(0),
-			dtlb_hand: Cell::new(0),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1349,8 +1441,6 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 			tlb_gen: std::ptr::null(),
-			itlb_hand: Cell::new(0),
-			dtlb_hand: Cell::new(0),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1380,8 +1470,6 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 			tlb_gen: std::ptr::null(),
-			itlb_hand: Cell::new(0),
-			dtlb_hand: Cell::new(0),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1405,17 +1493,17 @@ mod tests {
 		let perm = (PTE_U | PTE_X) as u8;
 		assert!(
 			!check_pte_perm(perm, riscv_mode::S, 1 << 18, false, true),
-			"S 模式取指 U 页必须 fault, 与 SUM=1 无关"
+			"S-mode fetch of a U page must fault regardless of SUM"
 		);
 		// SUM=0 时同样 fault.
 		assert!(
 			!check_pte_perm(perm, riscv_mode::S, 0, false, true),
-			"S 模式取指 U 页在 SUM=0 时必须 fault"
+			"S-mode fetch of a U page must fault when SUM=0"
 		);
 		// 对照: 同一 U|X 页在 U 模式取指合法 (不会走到 U-check 拒绝).
 		assert!(
 			check_pte_perm(perm, riscv_mode::U, 0, false, true),
-			"U 模式从 U|X 页取指应合法"
+			"U-mode fetch of a U|X page must be allowed"
 		);
 	}
 
@@ -1427,17 +1515,17 @@ mod tests {
 		let perm = (PTE_U | PTE_R) as u8;
 		assert!(
 			check_pte_perm(perm, riscv_mode::S, 1 << 18, false, false),
-			"S 模式数据读 U 页在 SUM=1 时应放行"
+			"S-mode data load of a U page must be allowed when SUM=1"
 		);
 		// SUM=0: S 模式数据读 U 页拒绝.
 		assert!(
 			!check_pte_perm(perm, riscv_mode::S, 0, false, false),
-			"S 模式数据读 U 页在 SUM=0 时应拒绝"
+			"S-mode data load of a U page must be denied when SUM=0"
 		);
 		// 取指 (即使读到可读页) 仍拒绝 — 取指只看 X 位.
 		assert!(
 			!check_pte_perm(perm, riscv_mode::S, 1 << 18, false, true),
-			"S 模式从仅可读 U 页取指必须 fault (无 X 位)"
+			"S-mode fetch of a read-only U page must fault (no X bit)"
 		);
 	}
 }

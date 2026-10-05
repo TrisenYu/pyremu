@@ -81,7 +81,7 @@ class TestTLBFIFO:
     def test_fifo_wraps_around(self):
         """FIFO 指针应循环."""
         tlb = TLB(size=2)
-        # 插入 4 次, 验证 FIFO 指针正确回绕
+        # 插入 4 次, 验证 FIFO 指针以 TLB 容量作为取模对象正确递增
         for i in range(4):
             tlb.insert(vpn=0x100 + i, ppn=0x200 + i, perm=0xF)
 

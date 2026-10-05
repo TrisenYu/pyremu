@@ -22,13 +22,15 @@ import libfdt
 
 from pyremu.configs_gen import PYREMU_AIA
 from pyremu.peripheral.virtio_blk import VIRTIO_BLK_IRQ
+from pyremu.peripheral.virtio_net import VIRTIO_NET_S_IRQ
 from pyremu.platform import InterruptMode, PlatformConfig
+from pyremu.utils.mask import mask32
 
 if TYPE_CHECKING:
     from pyremu.interrupt.aplic import APLIC
     from pyremu.interrupt.imsic import IMSIC
     from pyremu.interrupt.plic import PLIC
-    from pyremu.peripheral import CRNG, GPIO, I2C, SPI, UART, VirtIOBlock
+    from pyremu.peripheral import CRNG, GPIO, I2C, SPI, UART, VirtIOBlock, VirtIONet
     from pyremu.peripheral.watchdog import HartWatchdog
 
 # APLIC 有线中断触发类型 (interrupts 第二 cell). 与 QEMU virt.c 对齐:
@@ -51,7 +53,7 @@ class Initrd:
 
 
 # ============================================================
-#  ISA 字符串 -> 扩展名列表 (用于 riscv,isa-extensions)
+#  ISA 字符串到扩展名列表的映射, 用于生成 riscv,isa-extensions 属性
 # ============================================================
 
 
@@ -66,7 +68,7 @@ def _isa_to_extensions(
         "rv64imafdc_zicsr_zifencei" -> ["i", "m", "a", "f", "d", "c", "zicsr", "zifencei"]
 
     用于生成 DTB ``riscv,isa-extensions`` 属性
-    (Linux 6.x+ 优先使用, 旧式 ``riscv,isa`` 字符串已废弃).
+    (Linux 6.x+ 优先使用; ``riscv,isa`` 字符串自该版本起被弃用).
     """
     s = isa
     # 去掉 rv32/rv64 前缀
@@ -106,7 +108,13 @@ def _encode_reg_4mib(
     size: int,
 ) -> bytes:
     """将 64-bit 地址/大小编码为 4 个大端 u32 (addr_hi, addr_lo, size_hi, size_lo)."""
-    return struct.pack(">IIII", 0, addr, 0, size)
+    return struct.pack(
+        ">IIII",
+        addr >> 32,
+        mask32(addr),
+        size >> 32,
+        mask32(size),
+    )
 
 
 # ============================================================
@@ -193,7 +201,7 @@ def _dtb_cpus(
         sw.property_string("device_type", "cpu")
         sw.property_u32("reg", i)
         sw.property_string("compatible", "riscv")
-        # 保留旧式 riscv,isa 向后兼容旧内核 (Linux <6.x)
+        # 保留 riscv,isa, 供不识别 riscv,isa-extensions 的旧版本内核使用
         sw.property_string("riscv,isa", isa_str)
         # 新式 riscv,isa-extensions — 消除 "Falling back to deprecated" 警告
         sw.property("riscv,isa-extensions", isa_ext_bytes)
@@ -218,10 +226,10 @@ def _dtb_reserved_memory(
     sw: libfdt.FdtSw,
     ranges: list[tuple[int, int]],
 ) -> None:
-    """/reserved-memory — 从 Linux 中移除物理区域 (no-map).
+    """/reserved-memory — 以 no-map 属性从 Linux 中移除物理区域.
 
     用于 enclave 内存池等需要从内核线性映射中完全移除的区域,
-    与 PMP 隔离策略保持一致: 内核无法访问这些物理地址 -> 不会分配其中页面.
+    与 PMP 隔离策略保持一致: 内核无法访问这些物理地址, 因此不会分配其中页面.
     """
     if not ranges:
         return
@@ -305,17 +313,17 @@ def _dtb_plic(
 # ============================================================
 #  IMSIC 节点 — 拆分为 M/S 两个独立节点以匹配 QEMU virt DT 布局.
 #
-#  QEMU 针对每个 privilege level 各创建一个 IMSIC 节点, 且
-#  interrupts-extended 仅含该 level 对应的中断号码 (M=11, S=9)。
+#  QEMU 针对每个特权级各创建一个 IMSIC 节点, 且
+#  interrupts-extended 仅含该特权级对应的中断号码, M 为 11, S 为 9。
 #
 #  为什么必须拆分:
-#  Linux 内核的 imsic_get_parent_hartid() 在 S 模式 (RV_IRQ_EXT=9) 下
-#  遍历 interrupts-extended 计数 — 首条非 SEIP(9) 条目即返回 -EINVAL,
+#  Linux 内核的 imsic_get_parent_hartid() 在 S 模式下遍历 interrupts-extended
+#  计数, 该模式下 RV_IRQ_EXT 为 9 — 首条非 SEIP 条目即返回 -EINVAL,
 #  导致 nr_parent_irqs=0 并终止驱动初始化。 合并在单一节点的
-#  <MEIP, SEIP, MEIP, SEIP> 使循环在 index=0 遇到 MEIP(11) 后立即停止。
+#  <MEIP, SEIP, MEIP, SEIP> 使循环在 index=0 遇到 MEIP 后立即停止。
 #  拆分为两个节点后:
-#    - M 节点 (<MEIP,...>) -> S 核计数 0 -> 失败 -> imsic 释放
-#    - S 节点 (<SEIP,...>) -> S 核计数 N -> 成功 -> eidelivery 正常置 1
+#    - M 节点, 即 <MEIP,...>, 使 S 核计数为 0, 初始化失败并释放 imsic
+#    - S 节点, 即 <SEIP,...>, 使 S 核计数为 N, 初始化成功, eidelivery 正常置 1
 # ============================================================
 
 # M/S 模式对应的 CPU intc 中断号.
@@ -349,10 +357,10 @@ def _dtb_imsic_file(
     sw.property_u32("riscv,num-ids", 255)  # must satisfy (num_ids & 63) == 63
     sw.property_u32("riscv,guest-index-bits", 0)
     # 不设 hart-index-bits — QEMU virt DT 同样省略此属性.
-    # 内核默认 stride = PAGE_SIZE << 受调试程序_index_bits = 0x1000,
-    # 必须与 decode_imsic_addr 的实际布局一致 (连续排列, 每个 hart 一页).
-    # hart-index-bits != 0 会使内核算出更大的 stride (0x2000/0x4000...),
-    # 导致写 seteipnum 偏移到错误的 hart -> IPI 丢失 -> SMP 死锁.
+    # 内核默认 stride = PAGE_SIZE << guest_index_bits = 0x1000,
+    # 必须与 decode_imsic_addr 的实际布局一致, 即连续排列, 每个 hart 一页.
+    # hart-index-bits != 0 会使内核算出更大的 stride, 如 0x2000、0x4000 等,
+    # 导致写 seteipnum 偏移到错误的 hart, 进而 IPI 丢失与 SMP 死锁.
     sw.property("reg", _encode_reg_4mib(base_addr, size))
     # 该 privilege level 对应的中断 — 每种各一个 per hart.
     ie: list[int] = []
@@ -368,30 +376,35 @@ def _dtb_imsic_file(
 def _dtb_aplic(
     sw: libfdt.FdtSw,
     cfg: PlatformConfig,
-    aplic: APLIC | None,
+    aplic_s: APLIC | None,
     aplic_phandle: int | None,
     imsic_phandle: int | None,
 ) -> None:
-    """aplic@ — 有线->MSI 桥, 经 msi-parent=<&imsic> 投递.
+    """aplic@ — 把有线中断转换为 MSI 消息, 经 msi-parent=<&imsic> 投递.
 
     APLIC does NOT have interrupts-extended because all interrupts are
     delivered as MSIs through the IMSIC identified by msi-parent.
     This matches QEMU's virt machine DT and the RISC-V AIA specification.
+
+    本函数只建 S 域这一个节点。固件的 APLIC 驱动对树中每个 riscv,aplic 节点执行
+    aplic_init, 该函数把 DOMAINCFG 清零, 并把全部 sourcecfg 与 target 复位; 树中
+    再出现一个 msi-parent 指向 IMSIC M 节点的 aplic 节点, 会令模拟器预置的 M 域
+    源配置被复位, 该域的源退回 inactive 而丢弃全部中断。
     """
-    if aplic is None:
+    if aplic_s is None:
         return
     p = cfg.periph
-    aplic_base = p.aplic_base
-    sw.begin_node(f"aplic@{aplic_base:x}")
+    aplic_s_base = p.aplic_s_base
+    sw.begin_node(f"aplic@{aplic_s_base:x}")
     sw.property_u32("phandle", aplic_phandle)
     sw.property_string("compatible", "riscv,aplic")
     sw.property_u32("#interrupt-cells", 2)
     sw.property("interrupt-controller", b"")
     sw.property_u32("riscv,num-sources", 128)
-    sw.property("reg", _encode_reg_4mib(aplic_base, aplic.size))
+    sw.property("reg", _encode_reg_4mib(aplic_s_base, aplic_s.size))
     # msi-parent: route through IMSIC
     sw.property_u32("msi-parent", imsic_phandle)
-    sw.end_node()  # aplic
+    sw.end_node()  # aplic_s
 
 
 def _dtb_uart(
@@ -437,6 +450,26 @@ def _dtb_uart(
     sw.end_node()  # serial
 
 
+def _dtb_virtio_node(
+    sw: libfdt.FdtSw,
+    base: int,
+    irq: int,
+) -> None:
+    """一个 virtio-mmio 节点, 中断由 /soc 的 interrupt-parent 转达.
+
+    中断单元数随中断模式变化: AIA 下 APLIC 取 ``<中断源编号 flags>`` 两格,
+    legacy 下 PLIC 取 ``<中断源编号>`` 一格.
+    """
+    sw.begin_node(f"virtio@{base:x}")
+    sw.property_string("compatible", "virtio,mmio")
+    sw.property("reg", _encode_reg_4mib(base, 0x200))
+    if PYREMU_AIA:
+        sw.property("interrupts", struct.pack(">II", irq, _IRQ_TYPE_LEVEL_HIGH))
+    else:
+        sw.property_u32("interrupts", irq)
+    sw.end_node()  # virtio
+
+
 def _dtb_simple_devices(
     sw: libfdt.FdtSw,
     cfg: PlatformConfig,
@@ -444,8 +477,12 @@ def _dtb_simple_devices(
     i2c_gen: I2C | None,
     gpio: GPIO | None,
     virtio_blk: VirtIOBlock | None,
+    virtio_net_s: VirtIONet | None,
 ) -> None:
-    """spi/i2c/gpio/virtio — 无中断的简单 MMIO 节点."""
+    """spi/i2c/gpio 三个无中断的 MMIO 节点, 另加 virtio 设备节点.
+
+    virtio 节点带 interrupts 属性, 形制由 _dtb_virtio_node 给出.
+    """
     p = cfg.periph
     if spi is not None:
         sw.begin_node(f"spi@{p.spi_base:x}")
@@ -463,16 +500,11 @@ def _dtb_simple_devices(
         sw.property("reg", _encode_reg_4mib(p.gpio_base, 0x1000))
         sw.end_node()  # gpio
     if virtio_blk is not None:
-        sw.begin_node(f"virtio@{p.virtio_blk_base:x}")
-        sw.property_string("compatible", "virtio,mmio")
-        sw.property("reg", _encode_reg_4mib(p.virtio_blk_base, 0x200))
-        if PYREMU_AIA:
-            # APLIC #interrupt-cells=2: <source flags>
-            sw.property("interrupts", struct.pack(">II", VIRTIO_BLK_IRQ, _IRQ_TYPE_LEVEL_HIGH))
-        else:
-            # PLIC #interrupt-cells=1: <irq>
-            sw.property_u32("interrupts", VIRTIO_BLK_IRQ)
-        sw.end_node()  # virtio
+        _dtb_virtio_node(sw, p.virtio_blk_base, VIRTIO_BLK_IRQ)
+    # M 模式一侧的网卡实例不进设备树: 内核会为树中出现的中断源在自己的 S context
+    # 上使能它, 该中断源一置位即产生 SEIP, 而 SEIP 由宿主 S 模式支配.
+    if virtio_net_s is not None:
+        _dtb_virtio_node(sw, p.virtio_net_s_base, VIRTIO_NET_S_IRQ)
 
 
 def _dtb_watchdog(
@@ -516,11 +548,12 @@ def build_dtb(
     i2c_gen: I2C | None = None,
     gpio: GPIO | None = None,
     virtio_blk: VirtIOBlock | None = None,
+    virtio_net_s: VirtIONet | None = None,
     watchdog: HartWatchdog | None = None,
     crng: CRNG | None = None,
     plic: PLIC | None = None,
     imsic: IMSIC | None = None,
-    aplic: APLIC | None = None,
+    aplic_s: APLIC | None = None,
     bootargs: str | None = None,
     initrd: Initrd | None = None,
     reserved_ranges: list[tuple[int, int]] | None = None,
@@ -534,11 +567,14 @@ def build_dtb(
         i2c_gen: I2C 外设实例.
         gpio: GPIO 外设实例.
         virtio_blk: virtio-blk 外设实例.
+        virtio_net_s: S 模式一侧的 virtio-net 实例 (None 则跳过该节点).
+        watchdog: 多 hart 停滞检测实例.
         crng: 模拟随机数生成器实例 (None 则跳过 crng 节点).
         plic: PLIC 中断控制器实例 (legacy 模式).
         imsic: IMSIC 中断控制器实例 (AIA 模式).
-        aplic: APLIC 有线->MSI 桥实例 (AIA 模式).
+        aplic_s: APLIC 实例 (AIA 模式), 把有线中断转成 MSI.
         bootargs: 内核命令行参数, 写入 /chosen/bootargs.
+        initrd: 初始内存盘 (None 则 /chosen 不写 initrd 相关属性).
         reserved_ranges: (base, size) 列表, 生成 /reserved-memory no-map 子节点.
 
     Returns:
@@ -564,7 +600,7 @@ def build_dtb(
 
     # ---- soc simple-bus — 挂载所有 MMIO 外设 ----
     # phandle 分配: CPU intc 占 [1..num_harts].
-    # 随后: AIA -> IMSIC_M, IMSIC_S, APLIC 各一; legacy -> PLIC.
+    # 随后 AIA 模式下 IMSIC_M、IMSIC_S、APLIC 各分配一个; legacy 模式下分配 PLIC.
     page_stride = _PAGE_STRIDE_DTB
     next_phandle = len(cpu_phandles) + 1
     imsic_m_phandle: int | None = None
@@ -577,7 +613,7 @@ def build_dtb(
             next_phandle += 1
             imsic_s_phandle = next_phandle
             next_phandle += 1
-        if aplic is not None:
+        if aplic_s is not None:
             aplic_phandle = next_phandle
             next_phandle += 1
             ext_irq_handle_prop = aplic_phandle
@@ -599,9 +635,9 @@ def build_dtb(
         # OpenSBI imsic_data_check 要求 reg size 对齐到
         # 2^hart_index_bits * PAGE_SIZE.  hart_index_bits =
         # ceil(log2(num_harts)), 即 (num_harts-1).bit_length().
-        # 非 2 的幂 hart 数 (如 3, 5, 6, 7) 若不补齐,
-        # OpenSBI imsic_cold_irqchip_init 失败 -> 无 irqchip ->
-        # sbi_irqchip_process 返回 SBI_ENODEV (-1000).
+        # 非 2 的幂 hart 数, 如 3、5、6、7, 若不补齐,
+        # 则 OpenSBI imsic_cold_irqchip_init 失败, irqchip 未注册,
+        # 此后 sbi_irqchip_process 返回 SBI_ENODEV, 即 -1000.
         if cfg.num_harts > 1:
             hart_index_bits = (cfg.num_harts - 1).bit_length()
         else:
@@ -616,11 +652,11 @@ def build_dtb(
                         cpu_intc_irq=_IMSIC_IRQ_S,
                         base_addr=m_base + padded_count * page_stride,
                         size=m_size)
-        _dtb_aplic(sw, cfg, aplic, aplic_phandle, imsic_s_phandle)
+        _dtb_aplic(sw, cfg, aplic_s, aplic_phandle, imsic_s_phandle)
     else:
         _dtb_plic(sw, cfg, plic, ext_irq_handle_prop, cpu_phandles)
     _dtb_uart(sw, cfg, uart, ext_irq_handle_prop, next_phandle)
-    _dtb_simple_devices(sw, cfg, spi, i2c_gen, gpio, virtio_blk)
+    _dtb_simple_devices(sw, cfg, spi, i2c_gen, gpio, virtio_blk, virtio_net_s)
     _dtb_watchdog(sw, cfg)
     _dtb_crng(sw, cfg, crng)
 

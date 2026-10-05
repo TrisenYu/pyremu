@@ -53,9 +53,9 @@ def seize_val_err(
 ) -> Callable:
     """装饰器: 捕获被装饰函数中的 ValueError 并以统一方式报告.
 
-    适用于因用户输入无效整数而触发 ValueError 的命令方法 (如调试器 REPL).
-    若被装饰函数的第一个参数 (self) 具有 _err 方法 (如 Debugger),
-    则通过 _err -> Rich Console 输出; 否则降级为 print.
+    适用于因用户输入无效整数而触发 ValueError 的命令方法, 如调试器 REPL.
+    若被装饰函数的第一个参数, 即 self, 具有 _err 方法, 例如 Debugger,
+    则经 _err 输出到 Rich Console; 否则降级为 print.
 
     Args:
         err_msg: 固定的错误描述字符串, ValueError 发生时输出.
@@ -81,7 +81,7 @@ def seize_val_err(
 def silent_on_err(fn):
     """装饰器: 静默忽略被装饰函数中的所有异常, 失败时返回 None.
 
-    适用于 best-effort 操作 (如回滚时的内存写入、调试信息读取),
+    适用于尽力而为的操作, 如回滚时的内存写入、调试信息读取,
     失败不应中断主流程.
     """
 

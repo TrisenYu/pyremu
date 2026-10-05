@@ -3,24 +3,24 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""多 hart PMP 隔离回归测试 (native 并发引擎).
+"""多 hart PMP 隔离回归测试, 由加速执行引擎并发执行.
 
-锁定修复: native 并发引擎必须为每个 hart 使用独立的 PMP 缓冲切片
-(cfg/addr 按 hart_id 偏移 hid*64), 而非所有 hart 共享 hart0 的 PMP。
+锁定修复: 加速执行引擎必须为每个 hart 使用独立的 PMP 缓冲切片,
+cfg 与 addr 按 hart_id 偏移 hid*64, 而非所有 hart 共享 hart0 的 PMP。
 
 修复前的错误行为:
 - ``_step_native`` 只 marshal ``active[0]._pmp``, 并在批次后把 hart0 的 PMP
   镜像到所有其它 hart。
 - ``run_parallel`` 将同一 ``SharedPmpCtx`` 交给每个 hart 线程。
-- 多 hart SMP 启动时各 hart 的 OpenSBI warm-boot 并发重写共享 PMP ->
-  数据竞争 + 瞬时执行权限丢失 -> 内核取指访问故障 (cause=1)。
+- 多 hart SMP 启动时各 hart 的 OpenSBI warm-boot 并发重写共享 PMP,
+  造成数据竞争与执行权限的暂时性丢失, 于是内核取指时触发访问故障, 即 cause=1。
 
-这些用例在修复前必失败 (两 hart 的 PMP 被压成同一值), 修复后通过。
+这些用例在修复前必失败, 因为两 hart 的 PMP 被镜像为同一值, 修复后通过。
 
-run() 无指令配额, 对纯 WFI 无停机固件按设计持续阻塞 (等待 stdin/定时器/看门狗
-唤醒), 永不返回。固件需以 ARM semihosting SYS_EXIT 序列 (a0=0x18; slli/ebreak/
-srai) 使 run() 经 EXIT_EBREAK 返回; 仅"批次内并发写"用例保留 WFI 作全 hart
-屏障, 经设备暂停事件 (notify_processor) 终止 — 见 ``_run_wfi_firmware``。
+run() 无指令配额, 对纯 WFI 无停机固件按设计持续阻塞, 即等待 stdin、定时器
+或看门狗唤醒, 永不返回。固件需以 ARM semihosting SYS_EXIT 序列使 run() 经
+EXIT_EBREAK 返回, 该序列为 a0=0x18, slli/ebreak/srai; 仅"批次内并发写"用例
+保留 WFI 作全 hart 同步屏障, 经设备暂停事件 notify_processor 终止 — 见 ``_run_wfi_firmware``。
 """
 
 import ctypes
@@ -55,8 +55,8 @@ def _run_wfi_firmware(emu: Emulator) -> None:
     """运行 WFI 固件批次, 经设备暂停事件使 run() 返回.
 
     run() 对全部 hart WFI 等待的情形按设计持续阻塞. 测试只需观测单批次执行
-    后的 PMP 状态: 批次完成 (全部 hart 的 csrw 落地 + 进入 WFI) 后, 由外部
-    设备暂停请求 (notify_processor — 打断连续执行的唯一通道) 终止 run().
+    后的 PMP 状态: 批次在全部 hart 的 csrw 写入完成并进入 WFI 后结束, 由外部
+    设备暂停请求 notify_processor 终止 run(), 该请求是打断连续执行的唯一通道.
     """
     timer = threading.Timer(0.05, emu.notify_processor)
     timer.start()
@@ -108,11 +108,11 @@ def test_per_hart_pmp_roundtrip_not_mirrored():
 def test_per_hart_pmp_concurrent_write_isolated():
     """一个 hart 在批次内写 pmpaddr, 只落到自己的切片, 不污染其它 hart."""
     emu = _make_emu(2)
-    # 程序: csrw pmpaddr1, x5; 然后 WFI 作全 hart 屏障。
+    # 程序: csrw pmpaddr1, x5; 然后 WFI 作全 hart 同步屏障。
     # 不用 SYS_EXIT 停机: 首个 hart 的 SYS_EXIT 会立即停止整个批次,
-    # 抢跑其它 hart 尚未执行的 csrw (已知竞态). WFI 则要求所有 hart 都
-    # 进入等待才退出批次, 保证每个 hart 的 csrw 均已落地 — 经设备暂停
-    # 事件 (_run_wfi_firmware) 终止 run()。
+    # 使其它 hart 尚未执行的 csrw 无法执行, 这是已知竞态. WFI 则要求所有 hart 都
+    # 进入等待才退出批次, 保证每个 hart 的 csrw 均已写入完成 — 经设备暂停
+    # 事件 _run_wfi_firmware 终止 run()。
     prog = struct.pack("<II", CSRW_PMPADDR1_X5, WFI)
     emu.load_code(RAM_BASE, prog)
     for h in emu.harts:
@@ -141,7 +141,7 @@ def test_four_hart_pmp_all_distinct():
 
     emu.run()
 
-    # 修复前: 仅 hart0 的 PMP 被 marshal 并镜像到全部 hart -> 全部压成 0x1000。
+    # 修复前: 仅 hart0 的 PMP 被 marshal 并镜像到全部 hart, 所有 hart 的 PMP 均为 0x1000。
     for i, h in enumerate(emu.harts):
         assert h.csrs["pmpaddr1"].val == vals[i], (
             f"hart{i} pmpaddr1=0x{h.csrs['pmpaddr1'].val:x} 期望 0x{vals[i]:x}"
@@ -152,8 +152,8 @@ def test_four_hart_pmp_all_distinct():
 #  PmpInfo.num u8 溢出回归 (per-hart 计数 vs 扁平缓冲总长)
 # ------------------------------------------------------------------
 # 修复前 PmpInfo.num = min(len(cfg), len(addr)) = 每 hart 64 项 * hart 数。
-# 4 hart 时 = 256, 写入 FfiPmpCtx.num (c_uint8) 溢出为 0 -> PMP 被静默禁用:
-# OpenSBI PMP 探测全为 0 ("Boot HART PMP Count : 0"), pmp_ok(num==0) 放行一切,
+# 4 hart 时 = 256, 写入 FfiPmpCtx.num c_uint8 时溢出为 0, 于是 PMP 被静默禁用:
+# OpenSBI PMP 探测全为 0 ("Boot HART PMP Count : 0"), pmp_ok(num==0) 使全部访问通过,
 # 内核在 4 hart 下 PMP 形同虚设。1~3 hart 因 <=192 未溢出而未暴露。
 
 
@@ -176,5 +176,5 @@ def test_pmpinfo_num_survives_u8_ffi_at_four_harts():
     info = PmpInfo(cfg=cfg, addr=addr, hart_num=4)
     ffi = FfiPmpCtx()
     ffi.num = info.num
-    # 修复前 info.num=256, 写入 u8 后读回 0 -> PMP 被禁用。
+    # 修复前 info.num=256, 写入 u8 后读回 0, 于是 PMP 被禁用。
     assert ffi.num == 64, f"FfiPmpCtx.num={ffi.num} 期望 64 (u8 未溢出)"

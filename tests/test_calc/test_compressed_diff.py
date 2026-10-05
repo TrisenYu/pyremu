@@ -23,7 +23,7 @@ def _r_type(opcode: int, rd: int, funct3: int, rs1: int, rs2: int, funct7: int) 
     return (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
 
 
-def _i_type(opcode: int, rd: int, funct3: int, rs1: int, imm12: int) -> int:
+def i_type(opcode: int, rd: int, funct3: int, rs1: int, imm12: int) -> int:
     return ((imm12 & 0xFFF) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
 
 
@@ -43,7 +43,7 @@ def _s_type(opcode: int, funct3: int, rs1: int, rs2: int, imm12: int) -> int:
     )
 
 
-def _b_type(opcode: int, funct3: int, rs1: int, rs2: int, offset: int) -> int:
+def b_type(opcode: int, funct3: int, rs1: int, rs2: int, offset: int) -> int:
     return (
         ((offset & 0x1000) << 19)  # imm[12] -> bit[31]
         | ((offset & 0x7E0) << 20)  # imm[10:5] -> bits[30:25]
@@ -56,11 +56,11 @@ def _b_type(opcode: int, funct3: int, rs1: int, rs2: int, offset: int) -> int:
     )
 
 
-def _u_type(opcode: int, rd: int, imm20: int) -> int:
+def u_type(opcode: int, rd: int, imm20: int) -> int:
     return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | opcode
 
 
-def _j_type(opcode: int, rd: int, offset: int) -> int:
+def j_type(opcode: int, rd: int, offset: int) -> int:
     return (
         ((offset & 0x100000) << 11)  # imm[20]   -> bit[31]
         | ((offset & 0x7FE) << 20)   # imm[10:1] -> bits[30:21]
@@ -100,7 +100,7 @@ def _c0(funct3: int, rd_creg: int, scatter_bits_12_to_2: int) -> int:
 #  C1 格式: funct3[15:13] | scatter[12:2] | rd/rs1[11:7] | 01
 # ============================================================
 
-def _c1(funct3: int, rd_5bit: int, scatter_bits_12_to_2: int) -> int:
+def c1(funct3: int, rd_5bit: int, scatter_bits_12_to_2: int) -> int:
     return (
         ((funct3 & 0x7) << 13)
         | (scatter_bits_12_to_2 & 0x1FFF)
@@ -128,7 +128,7 @@ def _c2(funct3: int, rd_5bit: int, scatter_bits_12_to_2: int) -> int:
 #  测试基础设施
 # ============================================================
 
-def _make_ram():
+def make_ram():
     """构造模拟物理内存."""
     ram = bytearray(2 * 1024 * 1024)
 
@@ -176,12 +176,12 @@ class TestCompressedDifferential:
         (15, 0xFFFF_FFFF_FFFF_FFFE, 1),  # overflow wrap
     ])
     def test_c_addi_vs_addi(self, rd, init_val, imm):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         imm6 = imm & 0x3F
         # C.ADDI: bit[12]=imm[5], bits[6:2]=imm[4:0]
-        c_instr = _c1(0b000, rd, ((imm6 & 0x20) << 7) | ((imm6 & 0x1F) << 2))
+        c_instr = c1(0b000, rd, ((imm6 & 0x20) << 7) | ((imm6 & 0x1F) << 2))
         imm12 = sext(imm, 6) & 0xFFF
-        nc_instr = _i_type(Opc.opImm.value, rd, 0b000, rd, imm12)
+        nc_instr = i_type(Opc.opImm.value, rd, 0b000, rd, imm12)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -206,11 +206,11 @@ class TestCompressedDifferential:
         (9, 100, -32),
     ])
     def test_c_addiw_vs_addiw(self, rd, init_val, imm):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         imm6 = imm & 0x3F
-        c_instr = _c1(0b001, rd, ((imm6 & 0x20) << 7) | ((imm6 & 0x1F) << 2))
+        c_instr = c1(0b001, rd, ((imm6 & 0x20) << 7) | ((imm6 & 0x1F) << 2))
         imm12 = sext(imm, 6) & 0xFFF
-        nc_instr = _i_type(Opc.opImm32.value, rd, 0b000, rd, imm12)
+        nc_instr = i_type(Opc.opImm32.value, rd, 0b000, rd, imm12)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -232,11 +232,11 @@ class TestCompressedDifferential:
         (5, 0), (7, -1), (12, 31), (8, -32), (15, 1),
     ])
     def test_c_li_vs_addi_x0(self, rd, imm):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         imm6 = imm & 0x3F
-        c_instr = _c1(0b010, rd, ((imm6 & 0x20) << 7) | ((imm6 & 0x1F) << 2))
+        c_instr = c1(0b010, rd, ((imm6 & 0x20) << 7) | ((imm6 & 0x1F) << 2))
         imm12 = sext(imm, 6) & 0xFFF
-        nc_instr = _i_type(Opc.opImm.value, rd, 0b000, 0, imm12)
+        nc_instr = i_type(Opc.opImm.value, rd, 0b000, 0, imm12)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -255,11 +255,11 @@ class TestCompressedDifferential:
         (5, 1), (8, -1), (12, 31), (3, 16), (15, -32),
     ])
     def test_c_lui_vs_lui(self, rd, imm6):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         val6 = imm6 & 0x3F
-        c_instr = _c1(0b011, rd, ((val6 & 0x20) << 7) | ((val6 & 0x1F) << 2))
+        c_instr = c1(0b011, rd, ((val6 & 0x20) << 7) | ((val6 & 0x1F) << 2))
         imm20 = sext(imm6, 6) & 0xFFFFF
-        nc_instr = _u_type(Opc.lui.value, rd, imm20)
+        nc_instr = u_type(Opc.lui.value, rd, imm20)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -280,18 +280,18 @@ class TestCompressedDifferential:
         (0xFFFF_FFFF_FFFF_FF00, 256),
     ])
     def test_c_addi16sp_vs_addi_sp(self, init_sp, nzimm10):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         nz = nzimm10 >> 4  # 6-bit: nzimm[9:4]
         if nz == 0:
             pytest.skip("C.ADDI16SP: nzuimm==0 is illegal")
-        c_instr = _c1(0b011, 2, (
+        c_instr = c1(0b011, 2, (
             ((nz & 0x01) << 6)    # nzimm[4]  ← instr[6]
             | ((nz & 0x02) << 1)   # nzimm[5]  ← instr[2]
             | ((nz & 0x04) << 3)   # nzimm[6]  ← instr[5]
             | (nz & 0x18)          # nzimm[8:7]← instr[4:3]
             | ((nz & 0x20) << 7)   # nzimm[9]  ← instr[12]
         ))
-        nc_instr = _i_type(Opc.opImm.value, 2, 0b000, 2, nzimm10 & 0xFFF)
+        nc_instr = i_type(Opc.opImm.value, 2, 0b000, 2, nzimm10 & 0xFFF)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -317,7 +317,7 @@ class TestCompressedDifferential:
         (0, 0xFFFF_FFFF_FFFF_FFF0, 16),
     ])
     def test_c_addi4spn_vs_addi_sp(self, rd_creg, init_sp, nzuimm):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rd = _c_reg(rd_creg)
         # C.ADDI4SPN: nzuimm[5:4]->instr[12:11], nzuimm[9:6]->instr[10:7],
         #   nzuimm[2]->instr[6], nzuimm[3]->instr[5]
@@ -328,7 +328,7 @@ class TestCompressedDifferential:
             | ((nzuimm >> 5) & 0x1) << 12  # nzuimm[5] -> instr[12]
             | ((nzuimm >> 6) & 0xF) << 7   # nzuimm[9:6] -> instr[10:7]
         ))
-        nc_instr = _i_type(Opc.opImm.value, rd, 0b000, 2, nzuimm & 0xFFF)
+        nc_instr = i_type(Opc.opImm.value, rd, 0b000, 2, nzuimm & 0xFFF)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -357,15 +357,15 @@ class TestCompressedDifferential:
         (5, 0xFFFF_FFFF_FFFF_FFFF, 63),   # max shamt, shamt[5]=1
     ])
     def test_c_srli_vs_srli(self, rd_creg, init_val, shamt):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rd = _c_reg(rd_creg)
         # C.SRLI: funct3=100, sf=00, shamt = {bit12, bits[6:2]}
-        c_instr = _c1(0b100, rd_creg,
+        c_instr = c1(0b100, rd_creg,
             (0b00 << 10)                       # sf=00 = SRLI
             | ((shamt >> 5) << 12)             # bit12 = shamt[5]
             | ((shamt & 0x1F) << 2)            # bits[6:2] = shamt[4:0]
         )
-        nc_instr = _i_type(Opc.opImm.value, rd, 0b101, rd, shamt & 0x3F)
+        nc_instr = i_type(Opc.opImm.value, rd, 0b101, rd, shamt & 0x3F)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -396,15 +396,15 @@ class TestCompressedDifferential:
         (4, 0, 32),                       # minimum bit12=1
     ])
     def test_c_srai_vs_srai(self, rd_creg, init_val, shamt):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rd = _c_reg(rd_creg)
         # C.SRAI: funct3=100, sf=01, shamt = {bit12, bits[6:2]}
-        c_instr = _c1(0b100, rd_creg,
+        c_instr = c1(0b100, rd_creg,
             (0b01 << 10)                   # sf=01 = SRAI
             | ((shamt >> 5) << 12)         # bit12 = shamt[5]
             | ((shamt & 0x1F) << 2)        # bits[6:2] = shamt[4:0]
         )
-        nc_instr = _i_type(Opc.opImm.value, rd, 0b101, rd, 0x400 | (shamt & 0x3F))
+        nc_instr = i_type(Opc.opImm.value, rd, 0b101, rd, 0x400 | (shamt & 0x3F))
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -429,16 +429,16 @@ class TestCompressedDifferential:
         (7, 0xFFFF_FFFF_FFFF_FFFF, 0),    # clear
     ])
     def test_c_andi_vs_andi(self, rd_creg, init_val, imm6):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rd = _c_reg(rd_creg)
         val6 = imm6 & 0x3F
-        c_instr = _c1(0b100, rd_creg,
+        c_instr = c1(0b100, rd_creg,
             (0b10 << 10)                    # sf=10 = C.ANDI
             | ((val6 & 0x20) << 7)          # imm[5] -> bit12
             | ((val6 & 0x1F) << 2)          # imm[4:0] -> bits[6:2]
         )
         imm12 = sext(imm6, 6) & 0xFFF
-        nc_instr = _i_type(Opc.opImm.value, rd, 0b111, rd, imm12)
+        nc_instr = i_type(Opc.opImm.value, rd, 0b111, rd, imm12)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -465,11 +465,11 @@ class TestCompressedDifferential:
         (2, 4, 5, 10, 0b00),                # SUB: negative result
     ])
     def test_c_alu_vs_alu(self, rd_creg, rs2_creg, v1, v2, op_bits):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rd = _c_reg(rd_creg)
         rs2 = _c_reg(rs2_creg)
         # LLVM encoding: sf=11, bit12=0 for C.SUB/C.XOR/C.OR/C.AND
-        c_instr = _c1(0b100, rd_creg,
+        c_instr = c1(0b100, rd_creg,
             (0b11 << 10)                      # sf=11
             | (0 << 12)                       # bit12=0
             | (op_bits << 5)                  # op -> bits[6:5]
@@ -506,11 +506,11 @@ class TestCompressedDifferential:
         (3, 5, 0x1_0000_0001, 1, 1),        # ADDW: 32-bit wrap to 2 -> sext32
     ])
     def test_c_subw_addw_vs_32bit(self, rd_creg, rs2_creg, v1, v2, op_bit5):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rd = _c_reg(rd_creg)
         rs2 = _c_reg(rs2_creg)
         # LLVM encoding: sf=11, bit12=1 for C.SUBW/C.ADDW
-        c_instr = _c1(0b100, rd_creg,
+        c_instr = c1(0b100, rd_creg,
             (0b11 << 10)                      # sf=11
             | (1 << 12)                       # bit12=1 (RV64C)
             | (op_bit5 << 5)                  # 0=SUBW, 1=ADDW -> bit[5]
@@ -550,7 +550,7 @@ class TestCompressedDifferential:
         (3, 2, 0x2000, 0x7C, 0xCAFE_BABE),   # max offset: uimm[6]=1, uimm[5:3]=7, uimm[2]=0
     ])
     def test_c_lw_vs_lw(self, rd_creg, rs1_creg, init_rs1, uimm, mem_val):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rd = _c_reg(rd_creg)
         rs1 = _c_reg(rs1_creg)
         addr = init_rs1 + uimm
@@ -587,7 +587,7 @@ class TestCompressedDifferential:
         (5, 3, 0x3000, 0xDEAD_BEEF, 0x7C),   # max offset
     ])
     def test_c_sw_vs_sw(self, rs2_creg, rs1_creg, init_rs1, init_rs2, uimm):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rs2 = _c_reg(rs2_creg)
         rs1 = _c_reg(rs1_creg)
 
@@ -600,14 +600,14 @@ class TestCompressedDifferential:
         ))
         nc_instr = _s_type(Opc.st.value, 0b010, rs1, rs2, uimm & 0xFFF)
 
-        ram_c, rf_c, wf_c = _make_ram()
+        ram_c, rf_c, wf_c = make_ram()
         hc = Hart(id=0)
         inject_memory_backend(hc, rf_c, wf_c)
         hc.gprs[rs1] = init_rs1
         hc.gprs[rs2] = init_rs2
         hc.exec_instr(c_instr)
 
-        ram_n, rf_n, wf_n = _make_ram()
+        ram_n, rf_n, wf_n = make_ram()
         hn = Hart(id=0)
         inject_memory_backend(hn, rf_n, wf_n)
         hn.gprs[rs1] = init_rs1
@@ -631,7 +631,7 @@ class TestCompressedDifferential:
         (2, 1, 0x2000, 0xF8, 0xAAAA_BBBB_CCCC_DDDD),  # max offset
     ])
     def test_c_ld_vs_ld(self, rd_creg, rs1_creg, init_rs1, uimm, mem_val):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rd = _c_reg(rd_creg)
         rs1 = _c_reg(rs1_creg)
         addr = init_rs1 + uimm
@@ -667,7 +667,7 @@ class TestCompressedDifferential:
         (4, 2, 0x3000, 0xBBBB_AAAA_DDDD_CCCC, 0xF8),  # max offset
     ])
     def test_c_sd_vs_sd(self, rs2_creg, rs1_creg, init_rs1, init_rs2, uimm):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rs2 = _c_reg(rs2_creg)
         rs1 = _c_reg(rs1_creg)
 
@@ -679,14 +679,14 @@ class TestCompressedDifferential:
         ))
         nc_instr = _s_type(Opc.st.value, 0b011, rs1, rs2, uimm & 0xFFF)
 
-        ram_c, rf_c, wf_c = _make_ram()
+        ram_c, rf_c, wf_c = make_ram()
         hc = Hart(id=0)
         inject_memory_backend(hc, rf_c, wf_c)
         hc.gprs[rs1] = init_rs1
         hc.gprs[rs2] = init_rs2
         hc.exec_instr(c_instr)
 
-        ram_n, rf_n, wf_n = _make_ram()
+        ram_n, rf_n, wf_n = make_ram()
         hn = Hart(id=0)
         inject_memory_backend(hn, rf_n, wf_n)
         hn.gprs[rs1] = init_rs1
@@ -709,12 +709,12 @@ class TestCompressedDifferential:
         (12, 0xFFFF_FFFF_FFFF_FFFF, 63),
     ])
     def test_c_slli_vs_slli(self, rd, init_val, shamt):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         c_instr = _c2(0b000, rd,
             ((shamt & 0x20) << 7)               # shamt[5] -> bit12
             | ((shamt & 0x1F) << 2)             # shamt[4:0] -> bits[6:2]
         )
-        nc_instr = _i_type(Opc.opImm.value, rd, 0b001, rd, shamt & 0x3F)
+        nc_instr = i_type(Opc.opImm.value, rd, 0b001, rd, shamt & 0x3F)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -736,7 +736,7 @@ class TestCompressedDifferential:
         (5, 8, 100), (7, 12, 0), (15, 3, -1), (10, 10, 0xDEAD),
     ])
     def test_c_mv_vs_add_x0(self, rd, rs2, init_rs2):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         c_instr = _c2(0b100, rd,
             (0 << 12)                           # bit12=0 -> C.MV
             | (rs2 << 2)                        # rs2 -> bits[6:2]
@@ -764,11 +764,11 @@ class TestCompressedDifferential:
         (5, 0x100), (8, 0), (12, 0xFFFF_FFFF_FFFF_FFFE),  # PC & ~1 clears LSB
     ])
     def test_c_jr_vs_jalr_x0(self, rs1, target):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         c_instr = _c2(0b100, rs1,
             (0 << 12) | (0 << 2)                # bit12=0, rs2=0 -> C.JR
         )
-        nc_instr = _i_type(Opc.jalr.value, 0, 0b000, rs1, 0)
+        nc_instr = i_type(Opc.jalr.value, 0, 0b000, rs1, 0)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -795,11 +795,11 @@ class TestCompressedDifferential:
         (5, 0x200), (8, 0),
     ])
     def test_c_jalr_vs_jalr_ra(self, rs1, target):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         c_instr = _c2(0b100, rs1,
             (1 << 12) | (0 << 2)                # bit12=1 -> C.JALR, rs2=0
         )
-        nc_instr = _i_type(Opc.jalr.value, 1, 0b000, rs1, 0)
+        nc_instr = i_type(Opc.jalr.value, 1, 0b000, rs1, 0)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -835,7 +835,7 @@ class TestCompressedDifferential:
         (3, 0x2000, 0xFC, 0x1234_5678),        # large offset
     ])
     def test_c_lwsp_vs_lw_sp(self, rd, init_sp, uimm, mem_val):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         addr = init_sp + uimm
         ram[addr:addr+4] = mem_val.to_bytes(4, 'little')
 
@@ -870,7 +870,7 @@ class TestCompressedDifferential:
         (3, 0x2000, 0x1F8, 0xAAAA_BBBB_CCCC_DDDD),  # large offset
     ])
     def test_c_ldsp_vs_ld_sp(self, rd, init_sp, uimm, mem_val):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         addr = init_sp + uimm
         ram[addr:addr+8] = mem_val.to_bytes(8, 'little')
 
@@ -906,7 +906,7 @@ class TestCompressedDifferential:
         (3, 0x3000, 0xDEAD_BEEF, 0xFC),        # large offset
     ])
     def test_c_swsp_vs_sw_sp(self, rs2, init_sp, init_rs2, uimm):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
 
         # C.SWSP: uimm[7:6]=instr[8:7], uimm[5:2]=instr[12:9], rs2=instr[6:2]
         c_instr = (
@@ -918,14 +918,14 @@ class TestCompressedDifferential:
         )
         nc_instr = _s_type(Opc.st.value, 0b010, 2, rs2, uimm & 0xFFF)
 
-        ram_c, rf_c, wf_c = _make_ram()
+        ram_c, rf_c, wf_c = make_ram()
         hc = Hart(id=0)
         inject_memory_backend(hc, rf_c, wf_c)
         hc.gprs[2] = init_sp
         hc.gprs[rs2] = init_rs2
         hc.exec_instr(c_instr)
 
-        ram_n, rf_n, wf_n = _make_ram()
+        ram_n, rf_n, wf_n = make_ram()
         hn = Hart(id=0)
         inject_memory_backend(hn, rf_n, wf_n)
         hn.gprs[2] = init_sp
@@ -951,7 +951,7 @@ class TestCompressedDifferential:
         (3, 0x3000, 0xBBBB_AAAA_DDDD_CCCC, 0x1F8),  # large offset
     ])
     def test_c_sdsp_vs_sd_sp(self, rs2, init_sp, init_rs2, uimm):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
 
         # C.SDSP: uimm[8:6]=instr[9:7], uimm[5:3]=instr[12:10], rs2=instr[6:2]
         c_instr = (
@@ -963,14 +963,14 @@ class TestCompressedDifferential:
         )
         nc_instr = _s_type(Opc.st.value, 0b011, 2, rs2, uimm & 0xFFF)
 
-        ram_c, rf_c, wf_c = _make_ram()
+        ram_c, rf_c, wf_c = make_ram()
         hc = Hart(id=0)
         inject_memory_backend(hc, rf_c, wf_c)
         hc.gprs[2] = init_sp
         hc.gprs[rs2] = init_rs2
         hc.exec_instr(c_instr)
 
-        ram_n, rf_n, wf_n = _make_ram()
+        ram_n, rf_n, wf_n = make_ram()
         hn = Hart(id=0)
         inject_memory_backend(hn, rf_n, wf_n)
         hn.gprs[2] = init_sp
@@ -995,11 +995,11 @@ class TestCompressedDifferential:
         (0x8000_0000, -2048),
     ])
     def test_c_j_vs_jal_x0(self, init_pc, offset):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         # Spec encoding: offset[11]=bit12, offset[10]=bit8,
         #   offset[9:8]=bits[10:9], offset[7]=bit6, offset[6]=bit7,
         #   offset[5]=bit2, offset[4]=bit11, offset[3:1]=bits[5:3]
-        c_instr = _c1(0b101, 0, (
+        c_instr = c1(0b101, 0, (
             ((offset >> 11) & 0x1) << 12         # offset[11] -> bit[12]
             | ((offset >> 4) & 0x1) << 11        # offset[4] -> bit[11]
             | ((offset >> 8) & 0x3) << 9         # offset[9:8] -> bits[10:9]
@@ -1009,7 +1009,7 @@ class TestCompressedDifferential:
             | ((offset >> 1) & 0x7) << 3         # offset[3:1] -> bits[5:3]
             | ((offset >> 5) & 0x1) << 2         # offset[5] -> bit[2]
         ))
-        nc_instr = _j_type(Opc.jal.value, 0, offset)
+        nc_instr = j_type(Opc.jal.value, 0, offset)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -1037,17 +1037,17 @@ class TestCompressedDifferential:
         (0, 0xFFFF_FFFF_FFFF_FFFF, 0x8000_0000, 128),  # not taken, rs1≠0
     ])
     def test_c_beqz_vs_beq_x0(self, rs1_creg, init_rs1, init_pc, offset):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rs1 = _c_reg(rs1_creg)
         # C.BEQZ encoding per spec:
-        c_instr = _c1(0b110, rs1_creg, (          # rd field = rs1' for BEQZ
+        c_instr = c1(0b110, rs1_creg, (          # rd field = rs1' for BEQZ
             ((offset >> 8) & 0x1) << 12            # offset[8] -> bit[12]
             | ((offset >> 3) & 0x3) << 10          # offset[4:3] -> bits[11:10]
             | ((offset >> 6) & 0x3) << 5           # offset[7:6] -> bits[6:5]
             | ((offset >> 1) & 0x3) << 3           # offset[2:1] -> bits[4:3]
             | ((offset >> 5) & 0x1) << 2           # offset[5] -> bit[2]
         ))
-        nc_instr = _b_type(Opc.br.value, 0b000, rs1, 0, offset)
+        nc_instr = b_type(Opc.br.value, 0b000, rs1, 0, offset)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)
@@ -1074,17 +1074,17 @@ class TestCompressedDifferential:
         (7, -1, 0x8000_0000, -32),    # taken, negative offset
     ])
     def test_c_bnez_vs_bne_x0(self, rs1_creg, init_rs1, init_pc, offset):
-        ram, rf, wf = _make_ram()
+        ram, rf, wf = make_ram()
         rs1 = _c_reg(rs1_creg)
         # C.BNEZ: same encoding as C.BEQZ, just funct3=111
-        c_instr = _c1(0b111, rs1_creg, (
+        c_instr = c1(0b111, rs1_creg, (
             ((offset >> 8) & 0x1) << 12
             | ((offset >> 3) & 0x3) << 10
             | ((offset >> 6) & 0x3) << 5
             | ((offset >> 1) & 0x3) << 3
             | ((offset >> 5) & 0x1) << 2
         ))
-        nc_instr = _b_type(Opc.br.value, 0b001, rs1, 0, offset)
+        nc_instr = b_type(Opc.br.value, 0b001, rs1, 0, offset)
 
         hc = Hart(id=0)
         inject_memory_backend(hc, rf, wf)

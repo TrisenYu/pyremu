@@ -63,7 +63,7 @@ class MemoryMixin(SharedMixinAttrs):
     # ----------------------------------------------------------
 
     def _try_read_va(self, va: int, size: int) -> bytes | None:
-        """从虚拟地址读取内存 (自动 VA->PA 翻译)."""
+        """从虚拟地址读取内存, 自动完成 VA 到 PA 的翻译."""
         if size <= 0 or size > 4096:
             return None
         hart = self.hart
@@ -147,7 +147,7 @@ class MemoryMixin(SharedMixinAttrs):
     def _fetch_and_disasm(self, pc: int) -> tuple[str, str] | None:
         """从 pc 取指并反汇编一条指令, 返回 (hex_str, asm_str).
 
-        MMU 启用时 PC 为虚拟地址, 需经 VA->PA 翻译后读取.
+        MMU 启用时 PC 为虚拟地址, 需先做 VA 到 PA 的翻译再读取.
         """
         raw = self._try_read_va(pc, 4)
         if raw is None:
@@ -165,7 +165,7 @@ class MemoryMixin(SharedMixinAttrs):
         parts = asm_text.split(maxsplit=1)
         mnemonic = parts[0]
         rest = parts[1] if len(parts) > 1 else ""
-        # 立即数着色: 十六进制 / 纯数字 -> 品红
+        # 十六进制与纯数字立即数显示为品红
         if rest:
             rest = re.sub(
                 r'\b(0x[0-9a-fA-F]+|\d+)\b',
@@ -641,7 +641,7 @@ class MemoryMixin(SharedMixinAttrs):
     # ----------------------------------------------------------
 
     def _show_va_mapping_header(self, va: int, size: int) -> None:
-        """显示 VA->PA 翻译及各页的 PTE 权限位."""
+        """显示 VA 到 PA 的翻译及各页的 PTE 权限位."""
         h = self.hart
         page_cnt = ((va & 0xFFF) + size + 0xFFF) >> 12
         lines: list[str] = []

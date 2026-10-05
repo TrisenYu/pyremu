@@ -9,9 +9,9 @@
 共享总线 (Bus) — 统一的物理内存访问层。
 
 Bus 管理:
-- 物理 RAM (bytearray), 默认基址 0x8000_0000 (RISC-V 标准内存映射)
-- L2 共享缓存 (可选, 继承 CacheBase)
-- 内存映射设备 (CLINT, 未来的 IMSIC/APLIC/UART 等)
+- 物理 RAM, 以 bytearray 存储, 默认基址 0x8000_0000, 采用 RISC-V 标准内存映射
+- 共享 L2 缓存, 可选, 继承 CacheBase
+- 内存映射设备, 例如 CLINT, 未来的 IMSIC/APLIC/UART 等
 
 PMA (Physical Memory Attributes):
   地址空间按硬件属性分为三类区域:
@@ -87,11 +87,11 @@ class Bus:
     """共享物理总线.
 
     所有 hart 通过 Bus.read() / Bus.write() 访问物理资源。
-    地址路由顺序: 设备 MMIO -> L2 缓存 -> RAM 直读。
+    地址路由顺序: 设备 MMIO 优先, 其次是 L2 缓存, 最后通过访问 RAM 得到。
 
     设备地址的读写保证:
-    - 不经过 L2 缓存 (直通设备)
-    - 由调用方 (Hart._translate_full) 负责不在 TLB 中缓存这些地址
+    - 不经过 L2 缓存, 直接访问设备
+    - 由调用方 mem_check_aux.translate_addr 保证这些地址不插入 TLB
     - 通过 is_device_addr() 供外部判断
     """
 
@@ -132,7 +132,7 @@ class Bus:
         # add_device 后置 None, 首次 _find_device 时重建.
         self._device_cache: list[tuple[int, int, Device]] | None = None
 
-        # 若 L2 缓存存在, 注入 RAM 后端回调 (L2 只缓存 RAM, 不缓存设备)
+        # 若 L2 缓存存在, 注入 RAM 后端回调. L2 缓存只缓存 RAM, 不缓存设备.
         if self._l2 is not None:
             self._l2.set_ram_backend(
                 read_fn=self._ram_read_direct,
@@ -201,7 +201,7 @@ class Bus:
     def is_device_addr(self, addr: int) -> bool:
         """判断物理地址是否属于 MMIO 设备区域 (不可缓存).
 
-        Hart 在 TLB 插入前调用此方法, 对设备地址跳过缓存。
+        Hart 在 TLB 插入前调用此方法, 设备地址不插入 TLB。
         O(log n) 二分查找, 复用 _find_device 的排序缓存。
         """
         dev, _ = self._find_device(addr)
@@ -230,7 +230,7 @@ class Bus:
         return self._devices
 
     # ----------------------------------------------------------
-    #  RAM 直接访问 (绕过 L2, 供 L2 回退和调试使用)
+    #  RAM 直接访问, 绕过 L2 缓存, 供 L2 回退和调试使用
     # ----------------------------------------------------------
 
     @staticmethod
@@ -313,7 +313,7 @@ class Bus:
         能看到 Python 侧通过 bus.write() 写入的全部数据.
 
         Returns:
-            回写的缓存行数; 无 L2 时返回 0.
+            回写的缓存行数; 无 L2 缓存时返回 0.
         """
         if self._l2 is not None:
             return self._l2.flush_all()
@@ -322,11 +322,11 @@ class Bus:
     def invalidate_l2(self) -> int:
         """使 L2 缓存全部行失效 (脏行先回写).
 
-        调用动态链接库加速执行后调用, 确保 Python 侧后续通过 L2 读取时
+        调用动态链接库加速执行后调用, 确保 Python 侧后续通过 L2 缓存读取时
         不会命中 Rust 直接修改 bytearray 前的过时缓存行.
 
         Returns:
-            失效的缓存行数; 无 L2 时返回 0.
+            失效的缓存行数; 无 L2 缓存时返回 0.
         """
         if self._l2 is not None:
             return self._l2.invalidate_all()
@@ -337,7 +337,7 @@ class Bus:
     # ----------------------------------------------------------
 
     def read(self, addr: int, size: int) -> bytes:
-        """总线读: 设备 (直通) -> L2 缓存 -> RAM."""
+        """总线读: 设备 MMIO 直通优先, 其次是 L2 缓存, 最后通过访问 RAM 得到."""
         dev, offset = self._find_device(addr)
         if dev is not None:
             return dev.read(offset, size)
@@ -351,19 +351,19 @@ class Bus:
         return self._ram_read_direct(addr, size)
 
     # 最大 CPU store 大小 (RISC-V: sd = 8 bytes).
-    # 超过此阈值的写入必定是 DMA/批量传输, 应绕过 L2 直写 bytearray,
+    # 超过此阈值的写入必定是 DMA/批量传输, 应绕过 L2 缓存直写 bytearray,
     # 避免缓存行逐出覆盖加速用动态链接库的直接写入.
     _MAX_CPU_STORE = 8
 
     def _ram_bypass_l2(self, addr: int, data_len: int) -> bool:
         """RAM 地址是否应绕过 L2 缓存, 直写 bytearray.
 
-        调用动态链接库加速时，直接修改 bytearray, 不经过 L2。若 Python 侧 L2 缓存行
-        覆盖同一 PA 的字节 (写命中合并旧数据 -> flush 回写), 会污染 Rust
+        调用动态链接库加速时，直接修改 bytearray, 不经过 L2 缓存。若 Python 侧 L2 缓存行
+        覆盖同一 PA 的字节, 写命中时合并旧数据并回写, 会污染 Rust
         的修改, 表现为页表 PTE 或栈数据被覆写为旧值。
 
         绕过条件:
-          - PYREMUNO_L2=1: 排查专用, 全旁路 L2 以隔离问题。
+          - PYREMU_NO_L2=1: 排查专用, RAM 访问全部绕过 L2 缓存以隔离问题。
           - data_len > 8: DMA/批量传输不经过 CPU 缓存。
         """
         if not self.is_ram_addr(addr):
@@ -371,7 +371,7 @@ class Bus:
         return NO_L2 or data_len > self._MAX_CPU_STORE
 
     def write(self, addr: int, data: bytes) -> None:
-        """总线写: 设备 (直通) -> L2 缓存 -> RAM."""
+        """总线写: 设备 MMIO 直通优先, 其次是 L2 缓存, 最后通过访问 RAM 写入."""
         dev, offset = self._find_device(addr)
         if dev is not None:
             dev.write(offset, data)
@@ -394,8 +394,8 @@ class Bus:
     def try_read(self, addr: int, size: int) -> bytes | None:
         """安全读取物理内存 — 失败返回 None 而非抛异常.
 
-        与 read() 的区别: 将设备/L2 的异常转换为 None 返回值,
-        调用方无需 try/except. 适用于调试器、内存 dump 等 best-effort 场景.
+        与 read() 的区别: 将设备/L2 缓存的异常转换为 None 返回值,
+        调用方无需 try/except. 适用于调试器、内存 dump 等尽力而为的场景.
 
         Args:
             addr: 物理地址.
@@ -421,8 +421,8 @@ class Bus:
     def try_write(self, addr: int, data: bytes) -> bool:
         """安全写入物理内存 — 返回 bool 表示成功与否.
 
-        与 write() 的区别: 将设备/L2 的异常转换为 False 返回值,
-        调用方无需 try/except. 适用于回滚、内存补丁等 best-effort 场景.
+        与 write() 的区别: 将设备/L2 缓存的异常转换为 False 返回值,
+        调用方无需 try/except. 适用于回滚、内存补丁等尽力而为的场景.
 
         Args:
             addr: 物理地址.

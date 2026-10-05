@@ -5,7 +5,7 @@ SECTIONS {
     . = 0x0;
     .text : { *(.text) }
 
-    /* BSS 按 8 字节对齐 */
+    /* BSS is 8 bytes aligned */
     . = ALIGN(8);
     _bss_start = .;
     .bss : { *(.sbss) *(.bss) *(COMMON) }

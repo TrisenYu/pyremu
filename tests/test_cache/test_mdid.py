@@ -129,7 +129,7 @@ class TestMfenceDid:
             f"非法 funct12 应 IllInstr(2), 实际 mcause={h.mcause_val}"
         )
 
-    # -- TLB flush 隔离性 --
+    # -- TLB 刷新的隔离性 --
 
     def test_flushes_only_matching_mdid(self):
         emu = _make_emu()
@@ -170,7 +170,7 @@ class TestMfenceDid:
         assert len(h.dtlb) == 0, "dtlb 应被清空"
 
     def test_nonzero_mdid_flushes_nothing_when_no_match(self):
-        """mdid=3 但没有任何条目带此标记 -> flush 为空操作."""
+        """mdid=3 但没有任何条目带此标记, 则刷新为空操作."""
         emu = _make_emu()
         h = emu.harts[0]
 
@@ -197,7 +197,7 @@ class TestMfenceDid:
         _ = emu.bus.read(addr_a, 4)  # 触发 L2 分配
         _ = emu.bus.read(addr_b, 4)
 
-        # 手动标记 L2 条目: 第一个 mdid=1, 第二个 mdid=0
+        # 手动标记 L2 缓存条目: 第一个 mdid=1, 第二个 mdid=0
         l2 = emu.bus._l2
         assert l2 is not None
         entries = [e for e in l2.entries if e.valid]
@@ -219,7 +219,7 @@ class TestMfenceDid:
     # -- 广播: 多 hart --
 
     def test_broadcasts_to_all_harts(self):
-        """hart 0 执行 mfence.did -> 全部 hart 的 TLB 均被刷新."""
+        """hart 0 执行 mfence.did, 全部 hart 的 TLB 均被刷新."""
         emu = _make_emu(num_harts=4)
         for h in emu.harts:
             h.dtlb.insert(vpn=0x42, ppn=0x42, perm=7, mdid=1)
@@ -234,7 +234,7 @@ class TestMfenceDid:
             assert len(h.itlb) == 0, f"Hart {i} itlb 应被清空 (广播)"
 
     def test_broadcast_only_flushes_matching_harts(self):
-        """不同 hart 的 TLB 带有不同 mdid -> 仅匹配的被刷."""
+        """不同 hart 的 TLB 带有不同 mdid, 仅匹配的被刷."""
         emu = _make_emu(num_harts=2)
         h0, h1 = emu.harts
 
@@ -333,7 +333,7 @@ class TestTLBAutoMdid:
         h.mode = RiscvMode.S  # MMU 翻译仅在 S/U 模式生效
         h.satp_val = (8 << 60) | (L1_BASE >> PAGE_SHIFT)  # Sv39
 
-        # 触发地址翻译 -> TLB 插入
+        # 触发地址翻译, TLB 插入
         try:
             mem_read(h, 0x0, 4)
         except MemoryAccessFault:
@@ -345,7 +345,7 @@ class TestTLBAutoMdid:
             for e in dtlb_entries:
                 assert e.mdid == 7, f"TLB 条目 mdid 应为 7, 实际 {e.mdid}"
 
-        # 切换飞地: mdid=7 -> mdid=9, 用 mdid=9 执行 mfence.did
+        # 切换飞地: mdid 由 7 变为 9, 用 mdid=9 执行 mfence.did
         # — 不应刷掉 mdid=7 的条目 (飞地隔离)
         h.mdid_val = 9
         h.pc = 0x80000000
@@ -463,13 +463,13 @@ class TestL2AutoMdid:
     """L2 缓存分配时自动打上 current_mdid (由 emulator.step 逐 hart 设置)."""
 
     def test_l2_read_hit_updates_mdid(self):
-        """读命中时 L2 条目 mdid 更新为当前 hart 的 mdid."""
+        """读命中时 L2 缓存条目 mdid 更新为当前 hart 的 mdid."""
         emu = _make_emu()
         l2 = emu.bus._l2
         assert l2 is not None
         addr = 0x80001000
 
-        # hart mdid=1 写数据 -> L2 分配, mdid=1
+        # hart mdid=1 写数据, L2 缓存分配, mdid=1
         l2.current_mdid = 1
         emu.bus.write(addr, b"X" * 64)
         _ = emu.bus.read(addr, 4)
@@ -478,25 +478,25 @@ class TestL2AutoMdid:
         assert len(entries) == 1, "应有一条 L2 条目"
         assert entries[0].mdid == 1, f"新分配条目 mdid 应为 1, 实际 {entries[0].mdid}"
 
-        # 切换 hart mdid=2, 再次读取同一地址 -> 命中, mdid 应刷新为 2
+        # 切换 hart mdid=2, 再次读取同一地址, 命中, mdid 应刷新为 2
         l2.current_mdid = 2
         _ = emu.bus.read(addr, 4)
         entries = [e for e in l2.entries if e.valid and e.tag == (addr >> l2._line_shift)]
         assert entries[0].mdid == 2, f"命中后 mdid 应刷新为 2, 实际 {entries[0].mdid}"
 
     def test_l2_write_hit_updates_mdid(self):
-        """CPU store (<=8B) 命中 L2 时更新 mdid.
+        """CPU store (<=8B) 命中 L2 缓存时更新 mdid.
 
-        DMA (>8B, RAM 地址) 直写 bytearray 绕过 L2, 匹配硬件语义:
-        设备 DMA 不经过 CPU cache, 只有 CPU 访存才填充缓存行.
-        因此用 8-byte store 测试 L2 mdid 行为.
+        DMA (>8B, RAM 地址) 直写 bytearray 绕过 L2 缓存, 匹配硬件语义:
+        设备 DMA 不经过 CPU 缓存, 只有 CPU 访存才填充缓存行.
+        因此用 8-byte store 测试 L2 缓存 mdid 行为.
         """
         emu = _make_emu()
         l2 = emu.bus._l2
         assert l2 is not None
         addr = 0x80001000
 
-        # 先触发一次读以将缓存行加载到 L2
+        # 先触发一次读以将缓存行加载到 L2 缓存
         _ = emu.bus.read(addr, 8)
         entries = [e for e in l2.entries if e.valid and e.tag == (addr >> l2._line_shift)]
         assert len(entries) > 0, "读取应填充 L2"
@@ -514,7 +514,7 @@ class TestL2AutoMdid:
         assert entries[0].mdid == 3, f"写命中后 mdid 应刷新为 3, 实际 {entries[0].mdid}"
 
     def test_l2_auto_tag_then_selective_flush(self):
-        """不同 mdid 的 hart 访问不同地址 -> mfence.did 仅刷匹配的."""
+        """不同 mdid 的 hart 访问不同地址, 则 mfence.did 仅刷匹配的."""
         emu = _make_emu()
         h = emu.harts[0]
         l2 = emu.bus._l2
@@ -549,7 +549,7 @@ class TestL2AutoMdid:
         assert 0xB in remaining_mdids, "mdid=0xB 的 L2 条目应保留"
 
     def test_emulator_step_sets_current_mdid(self):
-        """emulator.step() 自动将 hart.mdid 同步到 L2.current_mdid."""
+        """emulator.step() 自动将 hart.mdid 同步到 L2 缓存的 current_mdid."""
         emu = _make_emu()
         h = emu.harts[0]
         l2 = emu.bus._l2
@@ -564,7 +564,7 @@ class TestL2AutoMdid:
         emu.step()
 
         # step() 内设置了 l2.current_mdid = hart.mdid_val
-        # 取指 (bus.read) 会经过 L2 -> 新行标记 mdid=0x77
+        # 取指 (bus.read) 会经过 L2 缓存, 新行标记 mdid=0x77
         assert l2._current_mdid == 0x77, (
             f"step 后 current_mdid 应为 0x77, 实际 {l2._current_mdid}"
         )
@@ -716,7 +716,7 @@ class TestPmpsplitPmpIsolation:
 
 
 # ============================================================
-#  多飞地 mdid 隔离 — TLB / L2
+#  多飞地 mdid 隔离 — TLB / L2 缓存
 # ============================================================
 
 
@@ -754,7 +754,7 @@ class TestMultiEnclaveMdid:
         assert h.dtlb.lookup(0x300)[0], "mdid=3 的仍应保留"
 
     def test_multi_enclave_l2_isolation(self):
-        """4 个伪飞地访问不同地址, 各自 L2 条目标不同 mdid, 按域刷新互不干扰."""
+        """4 个伪飞地访问不同地址, 各自 L2 缓存条目标不同 mdid, 按域刷新互不干扰."""
         emu = _make_emu()
         l2 = emu.bus._l2
         assert l2 is not None
@@ -787,12 +787,12 @@ class TestMultiEnclaveMdid:
         assert 40 in remaining, "mdid=40 应保留"
 
     def test_same_vpn_different_mdid_overwrites(self):
-        """同 VPN 插入不同 mdid -> 原地更新 (TLB 以 tag 为键, mdid 仅用于 flush)."""
+        """同 VPN 插入不同 mdid, 原地更新, 因为 TLB 以 tag 为键, mdid 仅用于刷新."""
         tlb = TLB(size=8)
         tlb.insert(vpn=0x42, ppn=0x100, perm=7, mdid=1)
         tlb.insert(vpn=0x42, ppn=0x200, perm=7, mdid=2)
 
-        # 同 VPN -> 同 tag -> 原地更新, 只有一条有效条目
+        # 同 VPN 对应同 tag, 原地更新, 只有一条有效条目
         entries = [e for e in tlb.entries if e.valid and e.tag == 0x42]
         assert len(entries) == 1, f"同 VPN 应原地更新, 实际 {len(entries)}"
         assert entries[0].mdid == 2, f"更新后 mdid 应为 2, 实际 {entries[0].mdid}"
@@ -823,7 +823,7 @@ class TestMultiEnclaveMdid:
 
 
 class TestPmpsplitMdidIntegration:
-    """pmpsplit 划分 PMP 条目 + mdid 标记飞地 -> 硬件级别的飞地间隔离."""
+    """pmpsplit 划分 PMP 条目 + mdid 标记飞地, 得到硬件级别的飞地间隔离."""
 
     def test_enclave_a_cannot_see_enclave_b_pmp_entries(self):
         """设置两个飞地各自的 PMP 区域后, 飞地 A 不能访问飞地 B 的物理内存."""
@@ -854,13 +854,13 @@ class TestPmpsplitMdidIntegration:
         pmp._csrs["pmpcfg2"] = FakeCSR(cfg_val)
 
         # 飞地 A (mdid=1, pmpsplit=6): 只能看到条目 6-15
-        # 访问自己的内存 (条目 8) -> OK
+        # 访问自己的内存, 即条目 8, 允许
         info_a_own = PmpAccessInfo(
             pa=0x8000_0000, size=4, mode_val=0, mstatus_val=0, pmpsplit=6, mdid=1,
         )
         assert pmp.check(info_a_own), "飞地 A 应能访问自己的内存"
 
-        # 访问飞地 B 的内存 (条目 10) -> 也 OK (条目 10 在飞地区间内)
+        # 访问飞地 B 的内存, 即条目 10, 同样允许, 因为条目 10 在飞地区间内
         # 注意: 虽然 PMP 不阻止, 但 pmpsplit 只控制可见条目范围.
         # 飞地间的进一步隔离由 mfence.did + TLB 管理实现.
         info_a_other = PmpAccessInfo(
@@ -868,7 +868,7 @@ class TestPmpsplitMdidIntegration:
         )
         assert pmp.check(info_a_other), "条目 10 在飞地区间内, PMP 不阻止"
 
-        # 访问 host 区域 (条目 0) -> DENY (条目 0 < pmpsplit, 对飞地不可见)
+        # host 侧条目的编号小于 pmpsplit, 对 mdid 非零的飞地不可见
         info_a_host = PmpAccessInfo(
             pa=0x0000, size=4, mode_val=0, mstatus_val=0, pmpsplit=6, mdid=1,
         )
@@ -895,7 +895,7 @@ class TestPmpsplitMdidIntegration:
             assert h.pmpsplit_val == pmpsplit, f"Hart {hart_idx} pmpsplit"
 
     def test_pmpsplit_pmp_fault_on_enclave_access_host_region(self):
-        """通过 hart 执行 store -> trap 验证 pmpsplit 阻止飞地访问 host 内存."""
+        """通过 hart 执行 store 触发 trap, 验证 pmpsplit 阻止飞地访问 host 内存."""
         hart = Hart(id=0, pmp_entries=8)
         bus = Bus(ram_size=1024 * 1024, ram_base=0x8000_0000)
         inject_memory_backend(hart, bus.read, bus.write)
@@ -916,16 +916,16 @@ class TestPmpsplitMdidIntegration:
         cfg |= (0b11000 | 0b0011) << (4 * 8)
         hart.csrs["pmpcfg0"].val = cfg
 
-        # 配置飞地: mdid=1, pmpsplit=4 (条目 0-3=host, 4-7=enclave)
+        # 配置飞地: mdid=1, pmpsplit=4; 条目 0 至 3 属 host, 条目 4 至 7 属飞地
         hart.mdid_val = 1
         hart.pmpsplit_val = 4
         hart.mode = RiscvMode.S
 
-        # 飞地写入自己的区域 (条目 4) -> OK
+        # 飞地写入自己的区域, 即条目 4 覆盖的区间
         mem_write(hart, 0x8000_2000, b"\xaa\xbb")
         assert hart.mcause_val == 0, f"飞地写自己的区域应成功: mcause={hart.mcause_val}"
 
-        # 飞地写 host 区域 (条目 0, 对飞地不可见) -> StAccessFault
+        # 飞地写 host 区域, 落入 StAccessFault
         try:
             mem_write(hart, 0x8000_1000, b"\xcc\xdd")
         except AccessFault:

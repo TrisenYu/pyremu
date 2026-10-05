@@ -61,12 +61,12 @@ class FirmwareImage:
 
     Attributes:
         entry_point: 程序入口虚拟地址。
-        segments: 需要加载到内存的各段 (至少包含 .text 代码段)。
+        segments: 需要加载到内存的各段, 至少包含 .text 代码段。
         format: 原始文件格式 ("elf", "pe", "raw")。
-        symbols: 符号名 -> 地址映射。ELF 从 .symtab 提取已定义的非零符号;
-            PE 从导出表提取; raw binary 为空字典。
+        symbols: 符号名到地址的映射。ELF 从 .symtab 提取已定义的非零符号;
+            PE 从导出表提取; 原始二进制为空字典。
         symbol_ranges: 符号地址范围列表, 按起始地址升序排列.
-            (start, end, name) — 供二分查找做 PC->名称 解析.
+            (start, end, name) — 供二分查找做 PC 到名称的解析.
     """
 
     entry_point: int
@@ -150,7 +150,7 @@ def _parse_symtab_raw(
 
     Returns:
         (symbols, ranges) 二元组:
-        - symbols: 符号名 -> VA 映射
+        - symbols: 符号名到 VA 的映射
         - ranges:  (start, end, name) 列表, 按 start 升序排列
     """
     count = symtab_size // _ELF64_SYM_SIZE
@@ -242,8 +242,8 @@ def _parse_elf(
                 )
             )
 
-    # 提取已定义的具名符号 (函数/变量名 -> 地址)
-    # 优先用原始解析绕过 LIEF 的 1M 符号上限 (Linux vmlinux 有 1.8M+ 符号)
+    # 提取已定义的符号, 即函数名与变量名到地址的映射
+    # 优先用原始解析绕过 LIEF 的 1M 符号上限, Linux vmlinux 有 1.8M+ 符号
     symbols: dict[str, int] = {}
     symbol_ranges: list[tuple[int, int, str]] = []
 
@@ -323,7 +323,7 @@ def _parse_pe(
             ),
         ))
 
-    # 提取导出符号 (函数/变量名 -> 地址)
+    # 提取导出符号, 即函数名与变量名到地址的映射
     symbols: dict[str, int] = {}
 
     exported = binary.get_export()
@@ -383,13 +383,13 @@ def parse_firmware(
     """跨平台固件解析入口 — 自动识别格式并提取机器码。
 
     格式识别:
-        ELF (\\x7fELF 魔数) -> 提取 LOAD 段 + entrypoint
-        PE  (MZ 魔数)       -> 提取节内容 + entrypoint (RVA + ImageBase)
-        其他                -> 作为 raw binary, 全部字节映射到 base_addr
+        ELF, 即 \\x7fELF 魔数, 提取 LOAD 段与 entrypoint
+        PE, 即 MZ 魔数, 提取节内容与 entrypoint, 入口地址由 RVA 加 ImageBase 得到
+        其他格式按原始二进制处理, 全部字节映射到 base_addr
 
     Args:
         path: 固件文件路径。
-        base_addr: raw binary 时的加载基址 (ELF/PE 时忽略)。
+        base_addr: 原始二进制格式的加载基址, ELF 与 PE 格式下忽略。
 
     Returns:
         FirmwareImage 包含入口地址、内存段列表和格式标记; 解析失败返回 None。

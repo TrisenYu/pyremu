@@ -1540,7 +1540,7 @@ class TestWfiIdleSleep:
         emu = Emulator(num_harts=1)
         uart = emu.uart
         assert uart is not None and uart._irq == UART_IRQ
-        # 模拟受调试程序已使能 RX 水位中断 (IE bit1 = rxwm)
+        # 模拟受调试程序已使能 rxwm 中断, 即 IE 的 bit1
         uart._ie = 1 << 1
         ev = threading.Event()
         termio = TerminalIO(
@@ -1578,10 +1578,10 @@ class TestWfiIdleSleep:
 
     @pytest.mark.usefixtures("legacy_plic")
     def test_uart_read_empty_deasserts_ffi_level(self):
-        """回归: guest 读空 RX FIFO 必须写穿 FFI level=0, 防 Rust complete 重挂起风暴.
+        """回归: 受调试程序读空 RX FIFO 必须写穿 FFI level=0, 防 Rust complete 重挂起风暴.
 
         修复前 UART._publish_state 仅更新 Python PLIC 对象, 不写 FFI 持久数组。
-        batch 运行期间 guest 读空 FIFO 后, Rust 内联 plic_do_complete 读到陈旧
+        batch 运行期间受调试程序读空 FIFO 后, Rust 内联 plic_do_complete 读到陈旧
         level=1 -> 重挂起 pending -> SEIP 再次置位 -> spurious 中断无限循环
         (batch 永不结束, 等价冻结)。修复后 set_irq 内联写穿 _ffi_pending/
         _ffi_level, complete 读到 level=0 不再重挂。
@@ -1589,12 +1589,12 @@ class TestWfiIdleSleep:
         emu = Emulator(num_harts=1)
         uart = emu.uart
         assert uart is not None and uart._irq == UART_IRQ
-        uart._ie = 1 << 1  # RX 水位中断使能 (IE bit1 = rxwm)
+        uart._ie = 1 << 1  # 使能 rxwm 中断, 即 IE 的 bit1
         # 数据入队 -> set_irq 写穿: FFI 数组与 Python 对象同步置位
         uart.preload(b"AB")
         assert emu.plic._ffi_pending[UART_IRQ] == 1
         assert emu.plic._ffi_level[UART_IRQ] == 1
-        # 模拟 guest ISR 逐个读走 FIFO (RXDATA 偏移 0x04); 读空后电平写穿为 0
+        # 模拟受调试程序的中断服务程序逐个读出 FIFO 中的字节; 读空后电平写穿为 0
         uart.read(0x04, 1)
         assert emu.plic._ffi_pending[UART_IRQ] == 1, "还有数据时不得 deassert"
         uart.read(0x04, 1)
@@ -1607,10 +1607,10 @@ class TestWfiIdleSleep:
     def test_uart_ffi_regs_track_device_state_live(self):
         """回归: 寄存器字段随设备状态变化同步到持久 FFI 上下文.
 
-        修复前 _native_marshal_uart 每轮重建 FfiUartCtx 快照, 设备侧 (RX
-        daemon 线程) 在 batch 运行期间填入的新字节对 Rust 不可见 -> guest 中断
-        服务程序读 IP 内联应答 rxwm=0 -> 判定无接收数据而不读 RXDATA -> PLIC
-        RX 电平永不清除 -> 中断风暴 (CPU 空转, 输入无响应)。
+        修复前 _native_marshal_uart 每轮重建 FfiUartCtx 快照, 设备侧的 RX
+        daemon 线程在 batch 运行期间填入的新字节对 Rust 不可见, 于是受调试程序
+        的中断服务程序读 IP 时得到内联应答 rxwm=0, 判定无接收数据而不读 RXDATA,
+        PLIC RX 电平永不清除而引发中断风暴, 表现为 CPU 空转与输入无响应。
         """
         emu = Emulator(num_harts=1)
         uart = emu.uart
@@ -1631,7 +1631,7 @@ class TestWfiIdleSleep:
         uart.preload(b"AB")
         assert ctx.rx_fifo_len == 2
         assert ctx.ie == 1 << 1
-        # guest 逐个读走 RXDATA 后水位同步下降
+        # 受调试程序逐个从 RXDATA 读出字节后, rx_fifo_len 同步减一
         uart.read(0x04, 1)
         assert ctx.rx_fifo_len == 1
         uart.clear_rx()

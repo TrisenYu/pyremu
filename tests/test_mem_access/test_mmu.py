@@ -11,7 +11,6 @@ from pyremu.core.hart import HartWithRegs, RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend, translate_addr
 from pyremu.memory.bus import Bus
 from pyremu.memory.mmu import (
-    _sv39_vpn,
     MemAccessMode,
     PAGE_SHIFT,
     PTE,
@@ -23,6 +22,8 @@ from pyremu.memory.mmu import (
     PTE_X,
     SATP_MODE_BARE,
     SATP_MODE_SV39,
+    sv39_decompose_va,
+    sv39_vpn,
     translate_va,
 )
 
@@ -254,7 +255,7 @@ class TestVpnDecomposition:
     """虚拟地址 VPN 分解."""
 
     def test_sv39_zero_va(self):
-        vpn2, vpn1, vpn0 = _sv39_vpn(0)
+        vpn2, vpn1, vpn0 = sv39_vpn(0)
         assert vpn2 == 0 and vpn1 == 0 and vpn0 == 0
 
 
@@ -262,26 +263,47 @@ class TestVpnDecomposition:
         """VA[20:12] -> vpn0, 测试边界."""
         # 设置 VA[20:12] = 0x1FF
         va = 0x1FF << 12
-        _, _, vpn0 = _sv39_vpn(va)
+        _, _, vpn0 = sv39_vpn(va)
         assert vpn0 == 0x1FF
 
     def test_sv39_vpn1_field(self):
         """VA[29:21] -> vpn1."""
         va = 0x1FF << 21
-        _, vpn1, _ = _sv39_vpn(va)
+        _, vpn1, _ = sv39_vpn(va)
         assert vpn1 == 0x1FF
 
     def test_sv39_vpn2_field(self):
         """VA[38:30] -> vpn2."""
         va = 0x1FF << 30
-        vpn2, _, _ = _sv39_vpn(va)
+        vpn2, _, _ = sv39_vpn(va)
         assert vpn2 == 0x1FF
 
     def test_sv39_offset_not_in_vpn(self):
         """VA[11:0] 的页内偏移不应影响 VPN."""
         va = 0xFFF  # 全部 offset 位置 1
-        vpn2, vpn1, vpn0 = _sv39_vpn(va)
+        vpn2, vpn1, vpn0 = sv39_vpn(va)
         assert vpn2 == 0 and vpn1 == 0 and vpn0 == 0
+
+    def test_own_decomposer_unshadowed_by_native_one(self):
+        """本模块与加速执行库的同名分解函数并存, 两者互不遮蔽.
+
+        本模块的 ``sv39_decompose_va`` 返回四元组, 供调试器页表展示使用;
+        加速执行库的同名函数返回带 vpn2/vpn1/vpn0 字段的结构体, 由
+        ``sv39_vpn`` 调用. 二者同名, 导入时必须另取短名, 否则本模块的定义会
+        遮蔽导入, ``sv39_vpn`` 取不到 vpn2 字段并抛出 AttributeError.
+        """
+        # 按 (vpn2 << 30) | (vpn1 << 21) | (vpn0 << 12) | offset 构造,
+        # 四个字段取值互不相同, 任一字段串位都会被断言发现
+        va = (0x48 << 30) | (0x1A2 << 21) | (0x34 << 12) | 0x678
+        assert va == 0x1234434678
+        vpn2, vpn1, vpn0 = sv39_vpn(va)
+        own2, own1, own0, offset = sv39_decompose_va(va)
+
+        # 两条路径在共有的三个字段上必须一致
+        assert (vpn2, vpn1, vpn0) == (0x48, 0x1A2, 0x34)
+        assert (own2, own1, own0) == (vpn2, vpn1, vpn0)
+        # 页内偏移只由本模块的版本返回, 加速执行库的版本不返回它
+        assert offset == 0x678
 
 
 # ============================================================
@@ -310,16 +332,16 @@ class TestSv39Walk:
         root_ppn = 1
         l1_pte = PTE()
         l1_pte.v = True
-        l1_pte.ppn = 2  # -> L2 表在 PPN=2
+        l1_pte.ppn = 2  # 二级页表在 PPN=2
         self._write_pte(ram, write_fn, (1 << PAGE_SHIFT), l1_pte)
 
-        # L2 表在 PPN=2 (物理地址 0x2000)
+        # 二级页表在 PPN=2, 物理地址 0x2000
         l2_pte = PTE()
         l2_pte.v = True
-        l2_pte.ppn = 3  # -> L3 表在 PPN=3
+        l2_pte.ppn = 3  # 三级页表在 PPN=3
         self._write_pte(ram, write_fn, (2 << PAGE_SHIFT), l2_pte)
 
-        # L3 叶 PTE: 映射 VPN(0,0,0) -> PPN=0x40
+        # 三级页表叶 PTE: 映射 VPN(0,0,0) 到 PPN=0x40
         l3_pte = PTE()
         l3_pte.v = True
         l3_pte.r = True
@@ -345,7 +367,7 @@ class TestSv39Walk:
         l1_pte.ppn = 2
         self._write_pte(ram, write_fn, (1 << PAGE_SHIFT), l1_pte)
 
-        # L2: 2 MiB 大页, PPN[43:9] 部分 = 0x20 (即 PA 基址 0x2000000)
+        # 二级页表: 2 MiB 大页, PPN[43:9] 部分 = 0x20, 即 PA 基址 0x2000000
         l2_pte = PTE()
         l2_pte.v = True
         l2_pte.r = True
@@ -390,7 +412,7 @@ class TestSv39Walk:
         va = (0xAB << 12) | 0xCDE
         ok, pa, _perm = translate_va(va, satp, read_fn)
         assert ok, "大页翻译应成功"
-        # PPN: 高位保留, PPN[8:0] -> vpn[0], offset 不变
+        # PPN: 高位保留, PPN[8:0] 映射到 vpn[0], offset 不变
         expected_pa = ((mega_ppn & 0xFFFFFFFFFFFE00) | 0xAB) << 12 | 0xCDE
         assert pa == expected_pa, f"PA=0x{pa:x}, expected=0x{expected_pa:x}"
 
@@ -482,8 +504,8 @@ class TestMemAccessMode:
 class TestHartMMUIntegration:
     """验证 hart 设置 satp 后 translate_addr 和 mem_read 的正确性.
 
-    此套用例覆盖从 VA->PA 的完整链路:
-      TLB 查找 -> sv39_walk -> PTE 读取 -> 物理内存访问.
+    此套用例覆盖从 VA 到 PA 的完整链路:
+      TLB 查找、sv39_walk、PTE 读取、物理内存访问.
     """
 
     RAM_BASE = 0x80000000
@@ -522,7 +544,7 @@ class TestHartMMUIntegration:
 
     @staticmethod
     def _make_2mib_megapage_pte(flags: int, ppn: int) -> int:
-        """构造 2 MiB 大页 PTE (R 或 X 置位 -> 叶节点)."""
+        """构造 2 MiB 大页 PTE, 其中 R 或 X 置位则为叶节点."""
         return flags | PTE_V | PTE_A | PTE_D | TestHartMMUIntegration._encode_ppn(ppn)
 
     def _write_pte(self, hart: HartWithRegs, pa: int, value: int) -> None:
@@ -530,7 +552,7 @@ class TestHartMMUIntegration:
         assert hart._mem_write_phy is not None
         hart._mem_write_phy(pa, value.to_bytes(8, "little"))
 
-    # ---- 4 KiB 普通页: patp -> L2 -> L3 三级遍历 ----
+    # ---- 4 KiB 普通页: patp 经二级页表到三级页表的遍历 ----
 
     def test_identity_4kib_read_after_satp(self, hart):
         """satp 使能后, 4 KiB identity 映射 VA 能读到预期数据."""
@@ -541,11 +563,11 @@ class TestHartMMUIntegration:
         l2_ppn = l2_pa >> 12
         l3_ppn = l3_pa >> 12
 
-        # VA=0x80000000 -> vpn[2]=2, 在 root[2] 指向 L2
+        # VA=0x80000000 得到 vpn[2]=2, 在 root[2] 指向二级页表
         self._write_pte(hart, root_pa + 2 * 8, self._make_pointer_pte(l2_ppn))
-        # VPN[1]=0 -> L2[0] 指向 L3
+        # VPN[1]=0 时二级页表[0] 指向三级页表
         self._write_pte(hart, l2_pa + 0 * 8, self._make_pointer_pte(l3_ppn))
-        # VPN[0]=0 -> L3[0] 叶, identity: VA=0x80000000 -> PA=0x80000000
+        # VPN[0]=0 时三级页表[0] 为叶, identity: VA=0x80000000 映射到 PA=0x80000000
         ram_ppn = self.RAM_BASE >> 12
         self._write_pte(
             hart, l3_pa + 0 * 8,
@@ -599,13 +621,13 @@ class TestHartMMUIntegration:
     # ---- 2 MiB 大页: 二级命中 ----
 
     def test_identity_2mib_megapage_translate(self, hart):
-        """2 MiB 大页 identity 映射: root[2] -> L2[0] mega page."""
+        """2 MiB 大页 identity 映射: root[2] 指向二级页表[0] 的大页."""
         root_pa = self.RAM_BASE + 0x1000
         l2_pa = self.RAM_BASE + 0x2000
         root_ppn = root_pa >> 12
         l2_ppn = l2_pa >> 12
 
-        # root[2] -> L2 (VA=0x80000000 -> vpn[2]=2)
+        # root[2] 指向二级页表, VA=0x80000000 得到 vpn[2]=2
         self._write_pte(hart, root_pa + 2 * 8, self._make_pointer_pte(l2_ppn))
         # L2[0] mega page: identity VA=0x80000000 -> PA=0x80000000
         # PPN 的高位部分: 0x80000000 >> 12 = 0x80000
@@ -628,9 +650,9 @@ class TestHartMMUIntegration:
         l2_pa = root_pa + 0x1000
         l2_ppn = l2_pa >> 12
 
-        # root[0] -> L2 (VA 低 1 GiB)
+        # root[0] 指向二级页表, 覆盖 VA 低 1 GiB
         self._write_pte(hart, root_pa + 0 * 8, self._make_pointer_pte(l2_ppn))
-        # L2 mega page 映射 VA[0, 2MiB) -> PA[0x10000, 0x30000)
+        # 二级页表大页把 VA[0, 2MiB) 映射到 PA[0x10000, 0x30000)
         self._write_pte(
             hart, l2_pa + 0 * 8,
             self._make_2mib_megapage_pte(PTE_R | PTE_W, 0x10),
@@ -646,7 +668,7 @@ class TestHartMMUIntegration:
     # ---- TLB 行为 ----
 
     def test_tlb_miss_then_hit(self, hart):
-        """首次翻译 TLB miss -> sv39_walk -> 插入 TLB; 再次命中."""
+        """首次翻译 TLB miss 时执行 sv39_walk 并插入 TLB; 再次命中."""
         root_pa = self.RAM_BASE
         root_ppn = root_pa >> 12
         l2_pa = root_pa + 0x1000
@@ -745,9 +767,9 @@ class TestHartMMUIntegration:
         l2_pa = root_pa + 0x1000
         l2_ppn = l2_pa >> 12
 
-        # root[0] -> L2 (有效指针)
+        # root[0] 指向二级页表, 有效指针
         self._write_pte(hart, root_pa + 0 * 8, self._make_pointer_pte(l2_ppn))
-        # L2[0] = 0 -> 中途断裂
+        # 二级页表[0] = 0, 页表遍历中途断裂
         self._write_pte(hart, l2_pa + 0 * 8, 0)
 
         hart.satp_val = (SATP_MODE_SV39 << 60) | root_ppn
@@ -758,7 +780,7 @@ class TestHartMMUIntegration:
     # ---- 非零 ASID 不影响翻译 ----
 
     def test_asid_ignored_in_sv39_walk(self, hart):
-        """ASID 非零不影响地址翻译 (ASID 仅用于 TLB 标记匹配)."""
+        """ASID 非零不影响地址翻译, ASID 仅用于 TLB 标记匹配."""
         root_pa = self.RAM_BASE
         root_ppn = root_pa >> 12
         l2_pa = root_pa + 0x1000
@@ -786,13 +808,13 @@ class TestHartMMUIntegration:
 
 
 class TestSatpAsidHardwiredZero:
-    """satp.ASID (bits[59:44]) 必须写入即被清零 (WARL 读回 0).
+    """satp.ASID bits[59:44] 必须写入即被清零, 即 WARL 读回 0.
 
-    回归背景: TLB (Python 与 Rust 批量引擎) 查找均不带 ASID 标签。旧行为
-    原样存储 ASID ->Linux 探测到 ASID 支持 ->启用 ASID 分配器 ->上下文
-    切换仅改写 satp.ASID 而不执行 sfence.vma ->前一地址空间的 TLB 表项
-    残留命中 ->用户进程读脏数据 SIGSEGV (实测: ls 崩于 ld.so, 现场
-    satp=0x8000100000082f1b 即 ASID=1 证明分配器已激活)。
+    TLB 在 Python 与 Rust 批量引擎中的查找均不带 ASID 标签。旧行为
+    原样存储 ASID, 于是 Linux 探测到 ASID 支持并启用 ASID 分配器, 上下文
+    切换仅改写 satp.ASID 而不执行 sfence.vma, 前一地址空间的 TLB 表项
+    残留命中, 用户进程读脏数据而 SIGSEGV, 实测 ls 崩于 ld.so, 现场
+    satp=0x8000100000082f1b 即 ASID=1 证明分配器已激活。
     """
 
     # Linux ASID 探测写法: ASID 全 1; PPN 取现场值 0x82f1b

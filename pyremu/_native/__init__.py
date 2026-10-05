@@ -1161,9 +1161,9 @@ class VirtIOInfo:
     accesses inline; only QueueNotify exits to Python.
 
     Carries the full runtime state of the virtio-blk MMIO register file
-    across speedup process.  Without this, dynamic state written by the 受调试程序
+    across speedup process.  Without this, dynamic state written by the guest
     (queue descriptors, feature negotiation, InterruptStatus, etc.) is
-    silently reset to zero, and the 受调试程序 sees a dead device.
+    silently reset to zero, and the guest sees a dead device.
     """
     __slots__ = (
         "base", "capacity", "queue_num_max",

@@ -58,11 +58,15 @@ class PeripheralConfig:
     clint_base: int = 0x0200_0000
     plic_base: int = 0x0C00_0000  # PLIC 基址 (SiFive standard)
     virtio_blk_base: int = 0  # 0 = 禁用
+    virtio_net_s_base: int = 0  # 宿主侧网卡, 中断由 S 模式接受, 0 = 禁用
+    virtio_net_m_base: int = 0  # 飞地侧网卡, 中断由 M 模式接受, 0 = 禁用
     watchdog_base: int = 0x1000_4000
     crng_base: int = 0x1000_6000  # 模拟随机数生成器 (0 = 禁用)
     imsic_m_base: int = 0  # IMSIC M-file MMIO 基址 (0=禁用, AIA 标准 0x2400_0000)
     imsic_s_base: int = 0  # IMSIC S-file MMIO 基址 (0=禁用, AIA 标准 0x2800_0000)
-    aplic_base: int = 0  # APLIC 基址 (0=禁用, AIA 标准 0x0C00_0000)
+    aplic_s_base: int = 0  # APLIC S 域 (0=禁用, AIA 标准 0x0C00_0000)
+    # APLIC M 域 (0=禁用). M 文件的 eidelivery/eie/eithreshold 归 M 模式所有
+    aplic_m_base: int = 0
 
 
 @dataclass
@@ -93,12 +97,14 @@ class PlatformConfig:
     disk_image: str | None = None  # virtio-blk 磁盘镜像路径, None=不挂载
 
     # DTB /reserved-memory no-map 区域列表 (base, size).
-    # 默认值由 configs.mk 生成 pyremu/pan_vars.py 注入, 需与 custom-opensbi
-    # Kconfig POOL_BASE/POOL_SIZE 保持同步. 单边修改会导致内核在保留区内分配
-    # 页面, 与固件访问产生冲突.
+    # 默认值由 emu-configs.mk 生成 pyremu/configs_gen.py 注入. 第一项为固件
+    # 映像保留区 (含内嵌的 .sittim 飞地运行时), 第二项为飞地内存池, 后者需与
+    # custom-opensbi Kconfig POOL_BASE/POOL_SIZE 保持同步. 单边修改会导致内核
+    # 在保留区内分配页面, 与固件访问产生冲突.
     reserved_memory_ranges: list[tuple[int, int]] = field(
         default_factory=lambda: [
-            (configs_gen.RESERVED_MEM_BASE, configs_gen.RESERVED_MEM_SIZE)
+            (configs_gen.FW_RESERVED_MEM_BASE, configs_gen.FW_RESERVED_MEM_SIZE),
+            (configs_gen.RESERVED_MEM_BASE, configs_gen.RESERVED_MEM_SIZE),
         ]
     )
 
@@ -116,7 +122,8 @@ class PlatformConfig:
             self.interrupt_mode = InterruptMode.AIA
             self.periph.imsic_m_base = configs_gen.IMSIC_M_BASE
             self.periph.imsic_s_base = configs_gen.IMSIC_S_BASE
-            self.periph.aplic_base = configs_gen.APLIC_BASE
+            self.periph.aplic_s_base = configs_gen.APLIC_S_BASE
+            self.periph.aplic_m_base = configs_gen.APLIC_M_BASE
 
     @classmethod
     def from_dict(
@@ -228,12 +235,14 @@ class PlatformConfig:
         """QEMU virt AIA 平台 — 使用 IMSIC+APLIC 替代 PLIC.
 
         IMSIC 基址 0x2400_0000, 每 hart stride 0x1000.
-        APLIC 基址 0x0C00_0000 (复用 PLIC 地址空间).
+        APLIC S 域基址 0x0C00_0000 (复用 PLIC 地址空间), M 域紧随其后取 0x0C00_8000
+        (S 域实例的 MMIO 覆盖为 0x6000).
         定时器仍由 CLINT mtimecmp 提供.
         """
         cfg = cls.qemu_virt()
         cfg.interrupt_mode = InterruptMode.AIA
         cfg.periph.imsic_m_base = 0x2400_0000
         cfg.periph.imsic_s_base = 0x2800_0000
-        cfg.periph.aplic_base = 0x0C00_0000
+        cfg.periph.aplic_s_base = 0x0C00_0000
+        cfg.periph.aplic_m_base = 0x0C00_8000
         return cfg

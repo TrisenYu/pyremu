@@ -32,7 +32,7 @@ def cfg_str(name: str) -> str:
 
 @die_if_err
 def cfg_bool(name: str) -> bool:
-    """布尔语义: env 为空 / "0" -> False; 其他 -> True.
+    """布尔语义: env 为空或为 "0" 时得到 False, 其他值得到 True.
     未设置时回退到 configs_gen 默认值."""
     val = os.environ.get(name, "")
     if val != "":

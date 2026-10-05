@@ -18,7 +18,7 @@ from pyremu.core.mem_check_aux import translate_addr
 from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.types import Breakpoint
-from pyremu.debug.utils import _INSTR_BP_NAMES, _KNOWN_OPCODES, check_rv64_addr, hex_addr
+from pyremu.debug.utils import check_rv64_addr, hex_addr, INSTR_BP_NAMES, KNOWN_OPCODES
 from pyremu.utils.wrapper import seize_val_err
 
 
@@ -330,10 +330,10 @@ class BreakpointMixin(SharedMixinAttrs):
 
         # 3) 命名指令
         name = rest.lower()
-        if name not in _INSTR_BP_NAMES:
+        if name not in INSTR_BP_NAMES:
             self._err(f"无法识别的断点参数: {rest}")
             return
-        bp = Breakpoint(kind="instr", value=_INSTR_BP_NAMES[name], desc=name)
+        bp = Breakpoint(kind="instr", value=INSTR_BP_NAMES[name], desc=name)
         self._breakpoints.append(bp)
         self._refresh_bp_cache()
         self._console.print(
@@ -348,7 +348,7 @@ class BreakpointMixin(SharedMixinAttrs):
         if raw < 0 or raw > 0x7F:
             self._err(f"opcode 0x{raw:x} 超出 7-bit 范围 [0, 127]")
             return
-        if val not in _KNOWN_OPCODES:
+        if val not in KNOWN_OPCODES:
             self._err(f"opcode 0x{val:02x} 不是已知的 RV64 opcode, 拒绝设置断点")
             return
         bp = Breakpoint(kind="opcode", value=val, desc=f"opcode 0x{val:02x}")

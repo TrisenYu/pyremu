@@ -15,7 +15,6 @@ qemu-system-riscv64 \
 ## -monitor: QEMU monitor (telnet :5555) 用于查 TLB
 # -s -S \
 #   -monitor tcp:127.0.0.1:5555,server,nowait
-
 # 用 RISC-V GDB 连接
 # /opt/custom-llvm/bin/llvm-gdb \
 #   -ex "target remote :1234" \

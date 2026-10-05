@@ -1,0 +1,20 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 静态库: 由 ../Makefile 以 ../module.ld 链接成模块映像。
+[lib]
+crate-type = ["staticlib"]
+
+# 协议栈取用 smoltcp, 特性集合与运行时的既有取值一致:
+#   - 不含 socket-tcp-cubic, 它使用 f64;
+#   - 不含默认特性, 故不要求内存分配器的实现;
+#   - 不含 proto-ipv4-fragmentation, 分片报文按丢弃处理。
+[dependencies]
+smoltcp = { version = "0.14", default-features = false, features = [
+	"medium-ethernet",
+	"proto-ipv4",
+	"socket-udp",
+] }

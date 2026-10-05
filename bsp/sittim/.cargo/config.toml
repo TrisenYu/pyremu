@@ -1,0 +1,20 @@
+# ================================================================
+# 编译 sittim 的配置
+# ================================================================
+
+[build]
+incremental = true
+target = "riscv64imacfd-unknown-none-elf"
+
+[target.riscv64imac-unknown-none-elf]
+# 必要时再切回扩充厂商私有指令的编译器
+linker = "/usr/bin/ld.lld"
+rustflags = [
+	"-D", "warnings",
+    "-C", "link-arg=-Tlink.ld",
+    "-C", "link-arg=--relax",
+    "-C", "link-arg=--pie",
+    "-C", "relocation-model=pie",
+    "-C", "target-feature=+m,+a,+c",
+    # "-C", "llvm-args=-mattr=+ztee",
+]

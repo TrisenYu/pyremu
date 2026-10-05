@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""中央诊断模块 — sret/mret ->U 模式寄存器状态跟踪.
+"""诊断模块 — sret/mret 返回 U 模式时的寄存器状态跟踪.
 
 与 ``pyremu/_native/cpu/src/diag.rs`` 保持一致的设计:
 所有诊断逻辑集中在本模块, 调用方仅需一行条件导入 + 一行调用,
-且由环境变量控制开关, 无需重编译 (Python 侧) 或 feature gate (Rust 侧).
+且由环境变量控制开关, Python 侧无需重编译, Rust 侧无需启用特性开关.
 
 Usage:
     from pyremu.core.diag import log_sret_to_u, log_mret_to_u, TRACE_SRET_TO_U
@@ -199,7 +199,7 @@ def diag(tag: str, msg: str) -> None:
         print(f"[{tag}] {msg}", file=sys.stderr, flush=True)
 
 # 排查开关: 设置 PYREMU_NO_L2=1 后 Bus.read/write 对 RAM 地址完全绕过 L2 缓存.
-# 动态链接库内直接写 bytearray, L2 写命中合并旧数据后 flush 回写会污染 bytearray.
+# 动态链接库内直接写 bytearray, L2 缓存写命中合并旧数据后回写会污染 bytearray.
 NO_L2 = cfg_bool("PYREMU_NO_L2")
 
 # 诊断开关: PYREMU_DIAG_LOG 已设置时启用 PAGE_POISON (0xFE) 写追踪.
@@ -218,12 +218,12 @@ _TRAP_CAUSE_NAME: dict[int, str] = {
 
 
 def log_sret_to_u(hart: HartWithRegs) -> None:
-    """记录 SRET->U 时的关键寄存器状态."""
+    """记录 SRET 返回 U 模式时的关键寄存器状态."""
     _log_transition(hart, "sret")
 
 
 def log_mret_to_u(hart: HartWithRegs) -> None:
-    """记录 MRET->U 时的关键寄存器状态."""
+    """记录 MRET 返回 U 模式时的关键寄存器状态."""
     _log_transition(hart, "mret")
 
 
@@ -258,7 +258,7 @@ def log_ld_trap(hart: HartWithRegs, code: int, tval: int) -> None:
 
 
 def _log_transition(hart: HartWithRegs, kind: str) -> None:
-    """通用陷阱返回->U 模式日志."""
+    """通用陷阱返回 U 模式时的日志."""
     try:
         offset = hart.pc - _LD_BASE
     except Exception:

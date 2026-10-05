@@ -16,7 +16,7 @@ from enum import Enum
 from pyremu.utils.mask import mask64, sext, sext12
 from pyremu.utils.regname import check_csr, gpr_name
 
-_UNKNOWN = "<unknown opcode>"
+_UNKNOWN = "<unk-op>"
 
 
 # ============================================================
@@ -39,10 +39,10 @@ class Opc(Enum):
     st = 0b01000_11  # 写入
     stfp = 0b01001_11  # 浮点存储 (FSW/FSD) — STORE-FP
     amo = 0b01011_11  # 原子
-    fmadd = 0b10000_11  # 融合乘加 FMADD
-    fmsub = 0b10001_11  # 融合乘减 FMSUB
-    fnmsub = 0b10010_11  # 负融合乘减 FNMSUB
-    fnmadd = 0b10011_11  # 负融合乘加 FNMADD
+    fmadd = 0b10000_11  # 合并乘加 FMADD
+    fmsub = 0b10001_11  # 合并乘减 FMSUB
+    fnmsub = 0b10010_11  # 负合并乘减 FNMSUB
+    fnmadd = 0b10011_11  # 负合并乘加 FNMADD
     opFp = 0b10100_11  # 浮点算术/转换/比较 OP-FP
     op = 0b01100_11  # ALU (R-type)
     lui = 0b01101_11  # 立即数载入
@@ -530,7 +530,7 @@ _CSR_MNEMONIC: dict[int, str] = {
 
 
 def _csr_name(addr: int) -> str:
-    """CSR 地址 -> 名称, 未找到则返回地址 hex."""
+    """由 CSR 地址得到名称, 未找到则返回地址的十六进制形式."""
     ok, name = check_csr(addr)
     return name if ok else f"0x{addr:03x}"
 
@@ -615,7 +615,7 @@ def _dis_amo(instr: int) -> str:
 
 
 def _c_x8(idx3: int) -> str:
-    """3-bit 压缩寄存器索引 -> ABI 名 (x8-x15)."""
+    """由 3-bit 压缩寄存器索引得到 ABI 名, 即 x8 到 x15."""
     return gpr_name(8 + (idx3 & 0b111))
 
 
@@ -986,7 +986,7 @@ def disasm(
 
     Returns:
         反汇编字符串 ("mnemonic     operands").
-        未知指令返回 "<unknown opcode>".
+        未知指令返回 "<unk-op>".
         16-bit 压缩指令返回解码后的汇编字符串.
     """
     if parse_compressed(instr):

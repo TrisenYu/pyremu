@@ -6,7 +6,7 @@
 """SymbolMixin — 符号解析、内核符号加载、段查找."""
 
 import bisect
-from pathlib import Path as _Path
+from pathlib import Path
 
 from rich.table import Table
 
@@ -16,8 +16,8 @@ from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.utils import group_order
 from pyremu.memory.mmu import sv39_canonical_va
-from pyremu.utils.parse_bin import FirmwareSegment, parse_firmware
 from pyremu.utils.mask import MASK64, mask64
+from pyremu.utils.parse_bin import FirmwareSegment, parse_firmware
 
 
 class SymbolMixin(SharedMixinAttrs):
@@ -57,8 +57,8 @@ class SymbolMixin(SharedMixinAttrs):
     ) -> str | None:
         """在符号表中查找包含 *addr* 的函数符号.
 
-        优先使用地址范围做精确包含匹配 (start <= addr < end);
-        无范围信息时回退到最近前驱符号 (相差 > 64 KiB 视为不匹配).
+        优先使用地址范围做精确包含匹配, 即 start <= addr < end;
+        无范围信息时回退到最近前驱符号, 相差 > 64 KiB 视为不匹配.
         """
         # 1) 范围查找: 二分搜索
         if ranges:
@@ -73,16 +73,16 @@ class SymbolMixin(SharedMixinAttrs):
             if a == addr:
                 return name
 
-        # 3) ranges 存在但未命中: 若地址落在 ranges 覆盖范围内
-        #    (第一个 range 的 start 到最后一个 range 的 end), 则放弃;
-        #    若落在覆盖范围外的空隙 (如 NOTYPE 标签和下一个 FUNC 之间),
+        # 3) ranges 存在但未命中: 若地址落在 ranges 覆盖范围内, 该范围从
+        #    第一个 range 的 start 到最后一个 range 的 end, 则放弃;
+        #    若落在覆盖范围外的空隙, 例如 NOTYPE 标签和下一个 FUNC 之间,
         #    则回退到最近前驱符号, 避免 .text 段入口代码无函数名.
         if ranges:
             first_start = ranges[0][0]
             last_end = ranges[-1][1]
             if first_start <= addr < last_end:
                 return None
-            # 地址在 ranges 覆盖范围外 -> 回退最近前驱
+            # 地址在 ranges 覆盖范围外, 回退到最近前驱符号
 
         # 4) 无 ranges / ranges 覆盖范围外: 最近前驱
         best_name, best_dist = None, MASK64
@@ -95,7 +95,7 @@ class SymbolMixin(SharedMixinAttrs):
 
     def load_kernel_symbols(self, path: str, base_pa: int | None = None) -> bool:
         """从 vmlinux ELF 加载调试符号 (不加载段到 RAM)."""
-        if not _Path(path).exists():
+        if not Path(path).exists():
             self._err(f"符号文件不存在: {path}")
             return False
 
@@ -133,7 +133,7 @@ class SymbolMixin(SharedMixinAttrs):
         self._sym_ranges_pa.sort(key=lambda r: r[0])
 
         self._console.print(
-            f"[bold]sym[/] 已加载 [green]{_Path(path).name}[/]"
+            f"[bold]sym[/] 已加载 [green]{Path(path).name}[/]"
             f" ({len(self._sym_symbols):,} 符号,"
             f" VA 0x{min_vaddr:x} -> PA 0x{base_pa:x},"
             f" load_offset=0x{load_offset:x})"

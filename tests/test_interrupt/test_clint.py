@@ -10,7 +10,7 @@ import pytest
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import MSTATUS_MIE, RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend
-from pyremu.core.trap_handler import _update_hw_mip
+from pyremu.core.trap_handler import update_hw_mip
 from pyremu.interrupt.clint import (
     CLINT,
     CLINT_BASE,
@@ -105,7 +105,7 @@ class TestCLINTBusIntegration:
     """通过 Bus 访问 CLINT."""
 
     def test_bus_write_to_msip(self):
-        """通过总线写 MSIP -> IPI 触发."""
+        """通过总线写 MSIP 触发 IPI."""
         clint = CLINT(num_harts=4)
         bus = Bus(ram_size=1024 * 1024)
         bus.add_device(CLINT_BASE, clint)
@@ -165,7 +165,7 @@ class TestCLINTMmioPath:
         return h, clint, bus
 
     def test_store_to_msip_sets_hardware_bit(self):
-        """Store 指令写入 CLINT MSIP -> _msip[hart_id] 置位."""
+        """Store 指令写入 CLINT MSIP 使 _msip[hart_id] 置位."""
         h, clint, bus = self._make_hart_with_clint()
 
         # 设置 store 目标地址 = CLINT MSIP[hart0]
@@ -188,7 +188,7 @@ class TestCLINTMmioPath:
         assert src is not None and src.name == "MSI", f"中断源应为 MSI, 实际={src}"
 
     def test_store_zero_to_msip_clears_hardware_bit(self):
-        """Store 指令写 0 到 CLINT MSIP -> _msip[hart_id] 清零."""
+        """Store 指令写 0 到 CLINT MSIP 使 _msip[hart_id] 清零."""
         h, clint, bus = self._make_hart_with_clint()
 
         # 先通过 Python API 置位 MSIP (模拟先前的 IPI)
@@ -210,7 +210,7 @@ class TestCLINTMmioPath:
         assert not has_pending, "check_interrupt 应返回 no pending"
 
     def test_store_to_other_hart_msip_sets_correct_bit(self):
-        """Hart 0 store 到 CLINT MSIP[hart1] -> _msip[1] 置位, _msip[0] 不变."""
+        """Hart 0 store 到 CLINT MSIP[hart1] 使 _msip[1] 置位, _msip[0] 不变."""
         h, clint, bus = self._make_hart_with_clint(hart_id=0, num_harts=4)
 
         # 目标: CLINT MSIP[hart3] (offset = MSIP_OFFSET + 3 * 4)
@@ -231,10 +231,10 @@ class TestCLINTMmioPath:
         assert has_pending, "hart 3 应有 pending MSIP"
 
     def test_msip_clear_via_mmio_and_verify_no_pending(self):
-        """MMIO 清零 MSIP 后 mip CSR 通过 _update_hw_mip 反映已清零状态.
+        """MMIO 清零 MSIP 后 mip CSR 通过 update_hw_mip 反映已清零状态.
 
         回归: 若只清零 _msip 但 mip CSR 未同步, check_pending_interrupts
-        仍会看到过时的 MSIP=1 -> 虚假中断投递 -> MSIP 风暴.
+        仍会看到过时的 MSIP=1 导致虚假中断投递与 MSIP 风暴.
         """
         h, clint, bus = self._make_hart_with_clint(hart_id=0, num_harts=2)
 
@@ -248,7 +248,7 @@ class TestCLINTMmioPath:
 
         # Step 2: 同步 mip CSR 从硬件
         has_pending, mip_bits, _ = clint.check_interrupt(0)
-        _update_hw_mip(h, mip_bits)
+        update_hw_mip(h, mip_bits)
         assert h.mip_val & (1 << 3), "mip.MSIP 应置位"
 
         # Step 3: 通过 MMIO store 清零 MSIP[0]
@@ -259,9 +259,9 @@ class TestCLINTMmioPath:
         h.exec_instr(self.SW_INSTR)
         assert clint._msip[0] == 0, "MSIP 应已被 MMIO store 清零"
 
-        # Step 4: 重新同步 mip CSR -> MSIP 必须为 0
+        # Step 4: 重新同步 mip CSR 后 MSIP 必须为 0
         has_pending, mip_bits, _ = clint.check_interrupt(0)
-        _update_hw_mip(h, mip_bits)
+        update_hw_mip(h, mip_bits)
         assert not (h.mip_val & (1 << 3)), (
             f"清零后 mip.MSIP 必须为 0, 实际 mip={h.mip_val:#x}"
         )

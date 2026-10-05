@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path as _Path
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -210,10 +210,10 @@ class ExecutionMixin(SharedMixinAttrs):
         停止事件与接管:
         - Ctrl+Q 设备暂停事件 — 引擎逐指令检查、即时退出, 状态保留
           在 live 数组中; stop_flag 由本函数消费后回到 REPL.
-        - 固件停机序列 (semihosting SYS_EXIT) -> 调试器接管.
-        - addr 断点命中 (Rust 内联比对, EXIT_BREAKPOINT) -> 报告.
+        - 固件停机序列, 即 semihosting SYS_EXIT, 随后由调试器接管.
+        - addr 断点命中, 由 Rust 内联比对并以 EXIT_BREAKPOINT 退出, 随后报告.
         - 全部 hart halted.
-        - 时钟源超时 (TimeoutError).
+        - 时钟源超时, 即 TimeoutError.
 
         Args:
             timeout: 时钟源超时秒数
@@ -403,7 +403,7 @@ class ExecutionMixin(SharedMixinAttrs):
             emu.load_dtb(_dtb_addr)
 
         if self._kernel_path is not None:
-            kernel_data = _Path(self._kernel_path).read_bytes()
+            kernel_data = Path(self._kernel_path).read_bytes()
             emu.bus.write_ram_direct(self._kernel_addr, kernel_data)
 
         if self._preload_path is not None:

@@ -83,7 +83,7 @@ def demo_well_behaved(emu: Emulator, fw) -> None:
 
 
 def demo_pathological(emu: Emulator, fw) -> None:
-    """病态 U 模式: 无输入约束, 触发栈保护页 -> S 终止进程."""
+    """病态 U 模式: 无输入约束, 触发栈保护页后由 S 模式终止进程."""
     h = emu.harts[0]
     uart = emu.bus.devices[0x10000000]
     u_mode_bad_addr = fw.symbols.get("u_mode_bad")

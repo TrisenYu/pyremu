@@ -1,0 +1,15 @@
+# 扩展模块的工作区。
+#
+# 每个模块是一个独立的包, 各自链接成一份模块映像; 源码与构建都在 sittim 树内。
+# 本文件所在的目录是独立的工作区根, 不并入 sittim 自身的包。
+#
+# 工作区根是 cargo 唯一读取 [profile] 的地方, 故编译选项写在这里。
+[workspace]
+resolver = "3"
+members = ["attest", "net", "fs"]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1

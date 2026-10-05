@@ -8,16 +8,16 @@
 SiFive 兼容的 CLINT (Core Local Interruptor) 设备。
 
 CLINT 提供:
-- 核间中断 (IPI): 通过内存映射的 msip 寄存器, hart A 写 hart B 的 msip -> hart B 收到
+- 核间中断 (IPI): 通过内存映射的 msip 寄存器, hart A 写 hart B 的 msip, hart B 随后收到
                     Machine Software Interrupt
 - 定时器中断:     每个 hart 有独立的 mtimecmp, 当 mtime >= mtimecmp 时触发
                    Machine Timer Interrupt
 - 全局计数器:     mtime, 单调递增
 
-寄存器布局 (SiFive 标准, 基址 0x0200_0000):
-    MSIP_BASE     = 0x0000  (每个 hart 4 字节, bit 0 = software interrupt pending)
-    MTIMECMP_BASE = 0x4000  (每个 hart 8 字节)
-    time_base_val    = 0xBFF8  (8 字节, 全局共享)
+寄存器布局, 按 SiFive 标准, 基址为 0x0200_0000:
+    MSIP_BASE     = 0x0000, 每个 hart 4 字节, bit 0 表示 software interrupt pending
+    MTIMECMP_BASE = 0x4000, 每个 hart 8 字节
+    time_base_val    = 0xBFF8, 8 字节, 全局共享
 
 同时实现 InterruptController 和 Device 接口, 以便 Bus 和 Emulator 使用。
 """
@@ -32,9 +32,9 @@ from pyremu.utils.mask import mask64
 CLINT_BASE = 0x0200_0000
 CLINT_SIZE = 0xC000  # 48 KiB
 
-# 中断优先级 -> mip 位掩码 (按优先级从高到低排列).
+# 中断优先级到 mip 位掩码的映射, 按优先级从高到低排列.
 # 预计算为 (mask, IntSource) 元组, 避免每条指令在 check_interrupt 中
-# 遍历 IntSource Enum 并做 dict 查找 (profile 显示 6M Enum.__hash__/s).
+# 遍历 IntSource Enum 并做 dict 查找, profile 显示 Enum.__hash__ 每秒调用 6M 次.
 _INT_PRIORITY: list[tuple[int, IntSource]] = [
     (1 << 11, IntSource.MEI),  # MEIP
     (1 << 3,  IntSource.MSI),  # MSIP

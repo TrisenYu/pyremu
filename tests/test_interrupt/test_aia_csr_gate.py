@@ -21,9 +21,8 @@ from pyremu.configs_gen import PYREMU_AIA
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend
-from pyremu.core.registers import _csr_bank, check_csr_access, CsrAccessError
+from pyremu.core.registers import check_csr_access, csr_bank, CsrAccessError
 from pyremu.memory.bus import Bus
-
 
 # ============================================================
 #  常量
@@ -62,23 +61,23 @@ class TestAiaCsrGateCheckAccess:
 
     def test_implemented_flags_uniform(self) -> None:
         """全部 8 个 AIA CSR 的 implemented 标志必须一致."""
-        states = {addr: _csr_bank[addr].implemented for addr in _AIA_CSRS}
+        states = {addr: csr_bank[addr].implemented for addr in _AIA_CSRS}
         unique = set(states.values())
         assert len(unique) == 1, f"AIA CSR implemented flags must be uniform: {states}"
 
     def test_mmode_access_consistent(self) -> None:
-        """M 模式: implemented=False -> CsrAccessError, True -> 通过.
-        mtopi (0xFB0) / stopi (0xDB0) 为只读 CSR, 写操作应报 readonly."""
+        """M 模式: implemented 为 False 时得到 CsrAccessError, 为 True 时通过.
+        mtopi 0xFB0 / stopi 0xDB0 为只读 CSR, 写操作应报 readonly."""
         M = RiscvMode.M.value
         for addr in _AIA_CSRS:
-            if not _csr_bank[addr].implemented:
+            if not csr_bank[addr].implemented:
                 with pytest.raises(CsrAccessError, match="unknown"):
                     check_csr_access(addr, M, is_write=False)
                 with pytest.raises(CsrAccessError, match="unknown"):
                     check_csr_access(addr, M, is_write=True)
             else:
                 check_csr_access(addr, M, is_write=False)
-                if (_csr_bank[addr].access.value & 1) == 0:
+                if (csr_bank[addr].access.value & 1) == 0:
                     # Read-only CSR (e.g. mtopi, stopi)
                     with pytest.raises(CsrAccessError, match="readonly"):
                         check_csr_access(addr, M, is_write=True)

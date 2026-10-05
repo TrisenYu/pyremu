@@ -99,19 +99,25 @@ static void *worker(void *arg) {
 		return NULL;
 	}
 
-	struct tee_enter_args args = {
+	struct tee_enclave_args args = {
 		.enclave_id	  = enclave_id,
-		.payload_ptr  = (uint64_t)g_payload,
-		.payload_size = g_payload_size,
-		.argc		  = 0,
-		.argv_ptr	  = 0,
+		.enter.payload_ptr  = (uint64_t)g_payload,
+		.enter.payload_size = g_payload_size,
+		.enter.argc		  = 0,
+		.enter.argv_ptr	  = 0,
 	};
 
 	// 请求进入可信应用
 	rc = ioctl(fd, TEE_IOC_ENTER, &args);
 
-	/* 请求停用当前可信应用 — 即使 ENTER 失败也尝试 */
-	ioctl(fd, TEE_IOC_SHUTDOWN, &enclave_id);
+	/* 请求停用当前可信应用 — 即使 ENTER 失败也尝试. TEE_IOC_SHUTDOWN 为 _IOW,
+	 * 驱动 copy_from_user 读取 struct tee_enclave_token_args (目标飞地编号 + 管理
+	 * 令牌); 本线程的飞地由纯 TEE_IOC_CREATE 创建, 其登记的管理令牌为 0. */
+	struct tee_enclave_token_args sd_args = {
+		.enclave_id = enclave_id,
+		.token		= 0,
+	};
+	ioctl(fd, TEE_IOC_SHUTDOWN, &sd_args);
 
 	if (rc < 0) {
 		atomic_fetch_add(&g_failed, 1);

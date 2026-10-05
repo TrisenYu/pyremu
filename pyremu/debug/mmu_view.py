@@ -205,7 +205,7 @@ class MmuViewMixin(SharedMixinAttrs):
             "",
         ]
 
-        # L1 (根表)
+        # L1 页表, 即根页表
         l1_raw = self._emu.bus.try_read(root_pa, 4096)
         if l1_raw is None:
             out.append("[red]根页表不可读[/]")

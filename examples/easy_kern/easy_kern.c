@@ -1,6 +1,6 @@
 // easy_kern.c — 无 Linux 的 S 模式极简 host 示例
 //
-// 用途: 在仿真器上快速验证「飞地载荷真正进入运行时与 main()」,
+// 用途: 在仿真器上快速验证飞地载荷真正进入运行时与 main(),
 // 免去完整 Linux 引导 (约 60 至 130 倍慢于真实时间, 难以迭代).
 //
 // 运行位置与方式:
@@ -8,13 +8,13 @@
 //   以 S 模式 (satp=Bare, 虚拟地址即物理地址, mdid=0 即 host) 从 entry.S
 //   的 _start 开始执行, 随后直接经 SBI ecall 驱动飞地生命周期:
 //
-//     CREATE(id) -> ENTER(cfrac 载荷) -> (时间片让出则反复 RESUME) -> 退出
+//     CREATE(id), 随后 ENTER(cfrac 载荷); 飞地自愿让出时反复 RESUME, 直至载荷自行退出
 //
 // 载荷 (默认 cfrac 静态 ELF) 由 payload_embed.S 以 .incbin 嵌入本二进制,
 // ENTER 时经 a3/a4 把载荷指针与大小传给 M 模式, 由 M 模式拷入飞地内存.
 // 裸机 freestanding, 不引入任何头文件; riscv64 下 long 即 64 位.
 
-// 飞地 SBI 扩展号与函数号 (与 bsp/tee_aux_tools/linux-driver / bsp/rust_smode_entry 一致)
+// 飞地 SBI 扩展号与函数号 (与 bsp/tee_aux_tools/linux-driver / bsp/sittim 一致)
 #define ENCLAVE_EXT_ID     0x20221222UL
 #define ENCLAVE_CREATE     400UL
 #define ENCLAVE_ENTER      401UL
@@ -96,7 +96,7 @@ static u64 enclave_create(u64 mgmt_token) {
 }
 
 // 进入飞地, 提供载荷与 argv. 语义同 enclave_ecall 返回约定:
-// 正数(飞地 ID)为时间片让出, 0 为飞地自毁退出, 负数为 SBI 错误.
+// 正数(飞地 ID)为飞地自愿让出, 0 为飞地自行退出, 负数为 SBI 错误.
 static s64 enclave_enter(u64 id, u64 argc, u64 argv, u64 payload, u64 size) {
 	return (s64)enclave_ecall(ENCLAVE_ENTER, id, argc, argv, payload, size);
 }
@@ -106,7 +106,7 @@ static s64 enclave_resume(u64 id) {
 	return (s64)enclave_ecall(ENCLAVE_RESUME, id, 0, 0, 0, 0);
 }
 
-// 反复进入并在时间片让出后恢复, 直到飞地自毁 (返回 0) 或 SBI 错误 (负值).
+// 反复进入并在飞地自愿让出后恢复, 直到飞地自行退出 (返回 0) 或 SBI 错误 (负值).
 static s64 run_enclave(u64 id, u64 argc, u64 argv, u64 payload, u64 size) {
 	s64 r;
 	for (;;) {
@@ -114,7 +114,7 @@ static s64 run_enclave(u64 id, u64 argc, u64 argv, u64 payload, u64 size) {
 		puts("[easy_kern] enter returned "); putdec((u64)r); putc('\n');
 		if (r <= 0)
 			return r;
-		// 时间片让出: 持续恢复, 直至退出或出错
+		// 飞地自愿让出: 持续恢复, 直至退出或出错
 		do {
 			r = enclave_resume(id);
 			puts("[easy_kern] resume returned "); putdec((u64)r); putc('\n');
@@ -145,7 +145,7 @@ int main(void) {
 		return 1;
 	}
 
-	// 第二步: 进入飞地并运行载荷, 时间片让出时自动恢复, 直至退出
+	// 第二步: 进入飞地并运行载荷, 飞地自愿让出时自动恢复, 直至退出
 	ret = run_enclave(id, 1, (u64)argv_slots, (u64)payload_blob, payload_size);
 	puts("[easy_kern] enclave exited with ret = "); putdec((u64)ret); putc('\n');
 	puts("[easy_kern] demo done, entering wfi\n");

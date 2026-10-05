@@ -18,7 +18,7 @@ from pyremu._native import (
     native_available,
     pte_assemble_pa,
     pte_parse,
-    sv39_decompose_va as native_sv39_decompose_va,
+    sv39_decompose_va as decompose_va,
 )
 from pyremu.utils.mask import mask64
 
@@ -263,10 +263,12 @@ class PTE:
 _NATIVE_MMU = native_available()
 
 
-def _sv39_vpn(va: int) -> tuple:
+def sv39_vpn(va: int) -> tuple:
     """将 39 位虚拟地址分解为 (vpn2, vpn1, vpn0)."""
     if _NATIVE_MMU:
-        v = native_sv39_decompose_va(va)
+        # 加速执行库的实现返回带 vpn2/vpn1/vpn0 字段的结构体, 与本模块第 457 行
+        # 返回四元组的同名函数不同, 故导入时另取短名以示区分。
+        v = decompose_va(va)
         return v.vpn2, v.vpn1, v.vpn0
     return (
         (va >> 30) & 0x1FF,
@@ -308,7 +310,7 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
     Returns:
         (success: bool, ppn: int, perm_flags: int, page_size: int)
     """
-    vpn = _sv39_vpn(va)  # (vpn2, vpn1, vpn0)
+    vpn = sv39_vpn(va)  # (vpn2, vpn1, vpn0)
 
     # 一级页表: 基址 = root_ppn << PAGE_SHIFT, 索引 vpn[2]
     table_addr = mask64(root_ppn << PAGE_SHIFT)
@@ -375,7 +377,7 @@ def _pte_perm_flags(pte: PTE) -> int:
 
 
 def translate_va(va: int, satp_val: int, mem_read_phy: Callable[[int, int], bytes]) -> tuple:
-    """根据 satp 配置进行虚拟地址 -> 物理地址翻译.
+    """根据 satp 配置把虚拟地址翻译为物理地址.
 
     当前仅支持 Bare (直接等同物理地址) 和 Sv39.
 
@@ -409,7 +411,7 @@ def translate_va(va: int, satp_val: int, mem_read_phy: Callable[[int, int], byte
 
 
 # ============================================================
-#  PTE 标志位 -> 可读字符串
+#  PTE 标志位转换为可读字符串
 # ============================================================
 
 # Sv39 PTE 标志位掩码

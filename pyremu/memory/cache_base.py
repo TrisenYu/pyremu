@@ -7,12 +7,12 @@
 """
 缓存抽象基类。
 
-TLB 和各类 Cache (L1 I-Cache, L1 D-Cache, L2 共享缓存) 在结构上相似:
+TLB 和一级指令缓存、一级数据缓存、共享 L2 缓存等在结构上相似:
 - 全相联或组相联组织
 - 按 tag 匹配查找条目
 - 命中返回数据, 未命中则逐出旧条目、插入新条目
 - FIFO / LRU / 随机替换策略
-- 刷新 (单个或全部)
+- 刷新单个条目或全部条目
 
 本模块提供:
 - CacheLineBase:   缓存行基类 (tag, valid, dirty, last_access)
@@ -39,7 +39,7 @@ class ReplacementPolicy(Enum):
 class CacheLineBase:
     """缓存行基类 — TLB 条目和各级缓存行共用.
 
-    子类可添加自己的字段 (如 TLB 的 level/perm, L2 的 mesi/line_data).
+    子类可添加自己的字段, 如 TLB 的 level/perm, L2 缓存的 mesi/line_data.
     """
 
     tag: int = 0
@@ -94,7 +94,7 @@ class CacheBase(ABC):
         """标签匹配规则: entry.tag 是否等于 key."""
 
     def _on_evict(self, entry: CacheLineBase) -> None:
-        """逐出条目时的回调 (子类可选覆写, 如 L2 脏行回写)."""
+        """逐出条目时的回调, 子类可选覆写, 如 L2 缓存脏行回写."""
 
     # ----------------------------------------------------------
     #  查找
@@ -153,12 +153,12 @@ class CacheBase(ABC):
         return idx
 
     def _alloc_entry(self, tag: int, **kwargs) -> CacheLineBase:
-        """分配一个条目: 若 tag 已存在则原地更新; 否则选择 victim 并逐出.
+        """分配一个条目: 若 tag 已存在则原地更新; 否则按替换策略逐出一个条目并复用其槽位.
 
         Returns:
-            分配的 CacheLineBase 条目 (子类应填充自定义字段).
+            分配的 CacheLineBase 条目, 子类应填充自定义字段.
         """
-        # 查重 — 原地更新 (O(1) via _tag_to_idx)
+        # 查重: 命中则原地更新, 经 _tag_to_idx 直接定位
         idx = self._find_index(tag)
         if idx >= 0:
             return self._entries[idx]

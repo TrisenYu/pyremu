@@ -24,9 +24,9 @@ import tempfile
 
 import pytest
 
+from pyremu.emulator import Emulator
 from pyremu.interrupt.plic import PLIC
 from pyremu.peripheral.virtio_blk import (
-    _VRING_DESC_SIZE,
     SECTOR_SIZE,
     VIRTIO_BLK_IRQ,
     VIRTIO_BLK_S_OK,
@@ -67,6 +67,8 @@ from pyremu.peripheral.virtio_blk import (
     VRING_DESC_F_NEXT,
     VRING_DESC_F_WRITE,
 )
+from pyremu.peripheral.virtio_mmio import VirtQueue, VRING_DESC_SIZE
+from pyremu.platform import PeripheralConfig, PlatformConfig
 
 # ============================================================
 #  辅助: Guest RAM 模拟 — 用 bytearray 作为 virtqueue 描述符的存储
@@ -78,12 +80,12 @@ _GUEST_RAM_SIZE = 16 * 1024 * 1024  # 16 MiB
 
 
 def _make_gpa(offset: int) -> int:
-    """将 bytearray 偏移量转为 guest 物理地址."""
+    """将 bytearray 偏移量转为受调试程序的物理地址."""
     return _GUEST_RAM_BASE + offset
 
 
 def _to_offset(gpa: int) -> int:
-    """将 guest 物理地址转回 bytearray 偏移量."""
+    """将受调试程序的物理地址转回 bytearray 偏移量."""
     return gpa - _GUEST_RAM_BASE
 
 
@@ -169,7 +171,7 @@ def _setup_virtqueue(
     """在 guest_ram 中分配并初始化 virtqueue 结构.
 
     Returns:
-        (desc_pa, driver_pa, device_pa) — 三部分在 guest 物理地址空间中的地址.
+        (desc_pa, driver_pa, device_pa) — 三部分在受调试程序物理地址空间中的地址.
     """
     if desc_pa is None:
         desc_pa = _make_gpa(0x1000)
@@ -203,9 +205,9 @@ def _write_descriptor(
     """向描述符表中写入一个描述符."""
     if desc_table_pa is None:
         desc_table_pa = _make_gpa(0x1000)
-    addr = _to_offset(desc_table_pa) + idx * _VRING_DESC_SIZE
+    addr = _to_offset(desc_table_pa) + idx * VRING_DESC_SIZE
     raw = struct.pack("<QIHH", buf_pa, buf_len, flags, next_idx)
-    guest_ram[addr : addr + _VRING_DESC_SIZE] = raw
+    guest_ram[addr : addr + VRING_DESC_SIZE] = raw
 
 
 def _setup_blk_request(
@@ -234,7 +236,7 @@ def _setup_blk_request(
     desc_table_off = _to_offset(desc_table_pa)
 
     # 请求头 (16 bytes) 放在描述符表区域之后
-    hdr_pa = _make_gpa(desc_table_off + 16 * _VRING_DESC_SIZE)
+    hdr_pa = _make_gpa(desc_table_off + 16 * VRING_DESC_SIZE)
 
     # 写入请求头: type (u32) + ioprio (u32) + sector (u64)
     hdr_data = struct.pack("<IIQ", req_type, 0, sector)
@@ -286,11 +288,11 @@ def _submit_avail(
     ring_idx: int = 0,
     avail_idx: int | None = None,
 ) -> None:
-    """提交描述符链并触发队列处理: avail ring 挂链头 -> 更新 idx -> QueueNotify.
+    """提交描述符链并触发队列处理: available ring 挂链头, 更新 idx, 最后写 QueueNotify.
 
-    测试中最常见的三连操作 (写 avail 条目 / 置 avail idx / 敲门铃) 的组合;
-    desc_head 默认为 0 (与 `_setup_blk_request` 的返回值一致 — 链头始终是
-    描述符表第 0 项); avail_idx 默认为 ring_idx + 1 (连续提交场景).
+    该函数组合测试中最常见的三步操作, 即写 avail 条目、置 avail idx、写 QueueNotify;
+    desc_head 默认为 0, 与 `_setup_blk_request` 的返回值一致, 链头始终是描述符表
+    第 0 项; avail_idx 默认为 ring_idx + 1, 即连续提交场景.
     """
     _write_avail_entry(guest_ram, ring_idx, desc_head)
     idx = avail_idx if avail_idx is not None else ring_idx + 1
@@ -780,27 +782,27 @@ class TestPlicInterrupt:
         plic = PLIC(num_sources=128, num_contexts=2)
         vblk = VirtIOBlock(
             image_path=disk_image, mem_read=mem_read, mem_write=mem_write,
-            plic=plic, irq=VIRTIO_BLK_IRQ,
+            on_irq=plic.set_irq, irq=VIRTIO_BLK_IRQ,
         )
         assert plic._pending[VIRTIO_BLK_IRQ] is False
         self._submit_read(vblk, guest_ram)
-        # 处理完成 -> PLIC 源 VIRTIO_BLK_IRQ 被拉高
+        # 处理完成后 PLIC 源 VIRTIO_BLK_IRQ 被拉高
         assert plic._pending[VIRTIO_BLK_IRQ] is True
 
     def test_ack_lowers_plic_irq(self, disk_image, mem_read, mem_write, guest_ram):
         plic = PLIC(num_sources=128, num_contexts=2)
         vblk = VirtIOBlock(
             image_path=disk_image, mem_read=mem_read, mem_write=mem_write,
-            plic=plic, irq=VIRTIO_BLK_IRQ,
+            on_irq=plic.set_irq, irq=VIRTIO_BLK_IRQ,
         )
         self._submit_read(vblk, guest_ram)
         assert plic._pending[VIRTIO_BLK_IRQ] is True
-        # Guest ACK 清 InterruptStatus -> PLIC 源被拉低
+        # 受调试程序 ACK 清 InterruptStatus 后, PLIC 源不再挂起
         _mmio_write(vblk, VIRTIO_MMIO_INTERRUPT_ACK, 1)
         assert plic._pending[VIRTIO_BLK_IRQ] is False
 
     def test_no_plic_no_crash(self, vblk, guest_ram):
-        # 无 PLIC (irq=0) 时完成不应报错, InterruptStatus 仍照常置位
+        # 无中断上报入口 (irq=0) 时完成不应报错, InterruptStatus 仍照常置位
         self._submit_read(vblk, guest_ram)
         assert _mmio_read(vblk, VIRTIO_MMIO_INTERRUPT_STATUS) & 1 == 1
 
@@ -816,7 +818,7 @@ class TestReadOnly:
             image_path=disk_image, mem_read=mem_read, mem_write=mem_write,
             read_only=True,
         )
-        assert vblk._read_only is True
+        assert vblk.read_only is True
 
     def test_fallback_when_no_write_permission(self, disk_image, mem_read, mem_write):
         os.chmod(disk_image, 0o444)  # 去写权限 -> O_RDWR EACCES -> 回退 O_RDONLY
@@ -824,7 +826,7 @@ class TestReadOnly:
             vblk = VirtIOBlock(
                 image_path=disk_image, mem_read=mem_read, mem_write=mem_write,
             )
-            assert vblk._read_only is True
+            assert vblk.read_only is True
         finally:
             os.chmod(disk_image, 0o644)
 
@@ -848,3 +850,184 @@ class TestReadOnly:
         # 写被忽略但返回成功; 文件未增长 (仍为空)
         assert guest_ram[_to_offset(status_pa)] == VIRTIO_BLK_S_OK
         assert os.path.getsize(disk_image) == 0
+
+
+# ============================================================
+#  描述符链遍历的有界性 (virtio-mmio 传输层)
+# ============================================================
+
+
+class TestDescriptorChainBounds:
+    """描述符链遍历的有界性.
+
+    链的走向由受调试程序写入的 next 索引决定, 属不可信输入: 越界的索引与首尾相接的
+    环都会让朴素遍历取出假链或自旋. 本类锁定 VirtQueue.descriptor_chain 对这两类
+    畸形链的拒绝行为。
+    """
+
+    @staticmethod
+    def _new_queue(mem_read, mem_write, num: int = 8) -> VirtQueue:
+        queue = VirtQueue(index=0, num_max=num, mem_read=mem_read, mem_write=mem_write)
+        queue.desc = _make_gpa(0x1000)
+        return queue
+
+    def test_cycle_rejected(self, mem_read, mem_write, guest_ram):
+        """首尾相接的环形链被拒绝, 而不是被长度上界截断成一条假链."""
+        queue = self._new_queue(mem_read, mem_write)
+        # desc[0] -> desc[1] -> desc[0], 两个描述符都带 NEXT 标志
+        _write_descriptor(
+            guest_ram, 0, _make_gpa(0x4000), 16, flags=VRING_DESC_F_NEXT, next_idx=1,
+        )
+        _write_descriptor(
+            guest_ram, 1, _make_gpa(0x4000), 16, flags=VRING_DESC_F_NEXT, next_idx=0,
+        )
+        # max_desc 取队列长度: 若只按长度上界截断, 此处会返回含 8 个描述符的假链
+        assert queue.descriptor_chain(0, 8) is None
+
+    def test_cycle_traversal_is_bounded(self, mem_read, mem_write, guest_ram):
+        """成环链的遍历步数以队列长度为上界, 不自旋."""
+        reads: list[int] = []
+
+        def counting_read(pa: int, size: int) -> bytes:
+            reads.append(pa)
+            return mem_read(pa, size)
+
+        queue = self._new_queue(counting_read, mem_write)
+        _write_descriptor(
+            guest_ram, 0, _make_gpa(0x4000), 16, flags=VRING_DESC_F_NEXT, next_idx=1,
+        )
+        _write_descriptor(
+            guest_ram, 1, _make_gpa(0x4000), 16, flags=VRING_DESC_F_NEXT, next_idx=0,
+        )
+        assert queue.descriptor_chain(0, 8) is None
+        assert len(reads) <= 8
+
+    def test_out_of_range_next_rejected(self, mem_read, mem_write, guest_ram):
+        """next 超出描述符表范围时返回失败, 而不是把表外内存当成描述符."""
+        queue = self._new_queue(mem_read, mem_write)
+        _write_descriptor(
+            guest_ram, 0, _make_gpa(0x4000), 16, flags=VRING_DESC_F_NEXT, next_idx=99,
+        )
+        assert queue.descriptor_chain(0, 8) is None
+
+    def test_out_of_range_head_rejected(self, mem_read, mem_write):
+        """链头索引本身越界时返回失败."""
+        queue = self._new_queue(mem_read, mem_write)
+        assert queue.descriptor_chain(8, 8) is None
+
+    def test_acyclic_chain_truncated_at_max_desc(self, mem_read, mem_write, guest_ram):
+        """无环链在 max_desc 处截断, 与 virtio-blk 的三描述符链一致."""
+        queue = self._new_queue(mem_read, mem_write)
+        for idx in range(3):
+            _write_descriptor(
+                guest_ram, idx, _make_gpa(0x4000), 16,
+                flags=VRING_DESC_F_NEXT, next_idx=idx + 1,
+            )
+        _write_descriptor(guest_ram, 3, _make_gpa(0x4000), 16, flags=0, next_idx=0)
+
+        chain = queue.descriptor_chain(0, 3)
+        assert chain is not None
+        assert len(chain) == 3
+
+
+# ============================================================
+#  设备中断的上报路径 (设备与模拟器的接线)
+# ============================================================
+
+# virtio-blk 在模拟器中的默认基址, 与 pyremu/debug/cli.py 的取值一致.
+_VBLK_EMU_BASE = 0x1000_5000
+
+# 在模拟器 RAM 内布置 virtqueue 各结构所用的偏移
+_Q_DESC_OFF = 0x1000
+_Q_DRIVER_OFF = 0x2000
+_Q_DEVICE_OFF = 0x3000
+_Q_HDR_OFF = 0x4000
+_Q_DATA_OFF = 0x5000
+_Q_STATUS_OFF = 0x6000
+
+
+class TestIrqReportPath:
+    """完成中断必须经 Emulator.raise_device_irq 上报.
+
+    修复前 VirtIOBlock 直接调 plic.set_irq, 略过 raise_device_irq 的两项副作用:
+    置 _native_ext_irq.pending 使加速执行引擎在单轮内看到新中断, 以及 set(_wake_event)
+    唤醒阻塞于 WFI 的 hart。缺前者会在单轮加速执行内丢失中断, 缺后者使空闲的 hart
+    错过唤醒时机。本类锁定该接线: 修改前此类用例失败。
+    """
+
+    @pytest.fixture
+    def emu(self, disk_image: str) -> Emulator:
+        cfg = PlatformConfig(
+            num_harts=1,
+            periph=PeripheralConfig(virtio_blk_base=_VBLK_EMU_BASE),
+            disk_image=disk_image,
+        )
+        return Emulator(cfg, bootargs="")
+
+    @staticmethod
+    def _lay_out_read_request(emu: Emulator) -> int:
+        """在模拟器 RAM 中布置一条 virtio-blk 读请求, 返回描述符表地址."""
+        ram = emu.bus.ram_base
+        desc_pa = ram + _Q_DESC_OFF
+        hdr_pa = ram + _Q_HDR_OFF
+        data_pa = ram + _Q_DATA_OFF
+        status_pa = ram + _Q_STATUS_OFF
+
+        # 请求头: type (u32) + ioprio (u32) + sector (u64)
+        emu.bus.write(hdr_pa, struct.pack("<IIQ", VIRTIO_BLK_T_IN, 0, 0))
+
+        # 描述符链依次为请求头、数据缓冲区与状态字节, 后两项由设备写入
+        chain = [
+            (hdr_pa, 16, VRING_DESC_F_NEXT, 1),
+            (data_pa, SECTOR_SIZE, VRING_DESC_F_WRITE | VRING_DESC_F_NEXT, 2),
+            (status_pa, 1, VRING_DESC_F_WRITE, 0),
+        ]
+        for idx, (addr, length, flags, nxt) in enumerate(chain):
+            emu.bus.write(
+                desc_pa + idx * VRING_DESC_SIZE,
+                struct.pack("<QIHH", addr, length, flags, nxt),
+            )
+
+        # available ring: flags=0, idx=1, ring[0]=0 (链头为描述符 0)
+        emu.bus.write(ram + _Q_DRIVER_OFF, struct.pack("<HH", 0, 1))
+        emu.bus.write(ram + _Q_DRIVER_OFF + 4, struct.pack("<H", 0))
+        # used ring: flags=0, idx=0
+        emu.bus.write(ram + _Q_DEVICE_OFF, struct.pack("<HH", 0, 0))
+        return desc_pa
+
+    def test_completion_reaches_emulator_irq_entry(self, emu: Emulator) -> None:
+        """请求完成时 interrupt_status 与 raise_device_irq 的两项副作用同时出现."""
+        desc_pa = self._lay_out_read_request(emu)
+        emu._native_ext_irq.pending = 0
+        emu._wake_event.clear()
+
+        _configure_queue(
+            emu.virtio_blk, 8, desc_pa,
+            emu.bus.ram_base + _Q_DRIVER_OFF,
+            emu.bus.ram_base + _Q_DEVICE_OFF,
+        )
+        _mmio_write(emu.virtio_blk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+
+        assert _mmio_read(emu.virtio_blk, VIRTIO_MMIO_INTERRUPT_STATUS) == 1
+        assert emu.plic is not None
+        assert emu.plic._pending[VIRTIO_BLK_IRQ] is True
+        # raise_device_irq 的两项副作用: 引擎通知位与 WFI 唤醒
+        assert emu._native_ext_irq.pending == 1
+        assert emu._wake_event.is_set()
+
+    def test_ack_clears_engine_notify_flag(self, emu: Emulator) -> None:
+        """受调试程序确认中断后中断源被拉低, 引擎通知位随电平一同清零."""
+        desc_pa = self._lay_out_read_request(emu)
+        _configure_queue(
+            emu.virtio_blk, 8, desc_pa,
+            emu.bus.ram_base + _Q_DRIVER_OFF,
+            emu.bus.ram_base + _Q_DEVICE_OFF,
+        )
+        _mmio_write(emu.virtio_blk, VIRTIO_MMIO_QUEUE_NOTIFY, 0)
+        assert emu.plic._pending[VIRTIO_BLK_IRQ] is True
+
+        emu._native_ext_irq.pending = 0
+        _mmio_write(emu.virtio_blk, VIRTIO_MMIO_INTERRUPT_ACK, 1)
+
+        assert emu.plic._pending[VIRTIO_BLK_IRQ] is False, "确认后中断源应被拉低"
+        assert emu._native_ext_irq.pending == 1, "拉低同样经 raise_device_irq 通知引擎"

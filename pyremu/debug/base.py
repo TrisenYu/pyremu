@@ -109,7 +109,7 @@ class DebuggerBase(SharedMixinAttrs):
         self._console: Console = Console(highlight=False)
 
         # 覆盖 UART TX 回调: 每次写入后刷新 stdout, 确保不以 \\n 结尾的
-        # 部分行 (如 shell 提示符 "# "、字符回显) 立即显示, 而非滞留在
+        # 部分行, 如 shell 提示符 "# " 与字符回显, 立即显示, 而非留在
         # Python 的行缓冲中直到下一换行或 Ctrl+C。
         if self._emu.uart is not None:
             self._emu.uart._tx_callback = self._uart_tx
@@ -200,15 +200,15 @@ class DebuggerBase(SharedMixinAttrs):
         self._emu._stdin_forward_callback = None
 
     def _enter_run_mode(self) -> None:
-        """切换到运行模式: Ctrl+Q 暂停, cbreak stdin (ISIG 关, Ctrl+C 透传).
+        """切换到运行模式: Ctrl+Q 暂停, cbreak stdin 下 ISIG 关闭, Ctrl+C 透传.
 
         ── TX: QEMU fd_chr_write 模型, 与单轮加速执行零耦合 ──
-        固件写 TXDATA -> Rust inline handler -> libc::write(1, &byte, 1).
+        固件写 TXDATA, 随后经 Rust inline handler 调用 libc::write(1, &byte, 1).
         每字节即时输出, _console_echo=False 抑制 Python 双重输出.
 
-        ── RX: daemon 线程 select(stdin) -> uart.preload() -> PLIC 中断 ──
+        ── RX: daemon 线程 select(stdin), 随后 uart.preload(), 随后 PLIC 中断 ──
         stdin daemon 独立于处理器执行循环持续读取, 与 WFI 零耦合.
-        处理器仅看到 PLIC 外部中断信号 -> try_wfi_wakeup() 自然唤醒.
+        处理器仅看到 PLIC 外部中断信号, 由 try_wfi_wakeup() 自然唤醒.
         """
         # 终端 ISIG 关闭后键盘 Ctrl+C (0x03) 作为普通字节透传给受调试程序, 不经信号
         # 路径; Ctrl+Q 停止由 termio 的 notify_emu_stop 直连置位 stop_flag, 同样
@@ -223,11 +223,11 @@ class DebuggerBase(SharedMixinAttrs):
 
         self._emu._stdin_forward_callback = self._idle_poll
 
-        # 完整 raw 模式 (对照 termio/src/lib.rs raw 设置):
-        # - 关 ECHO/ICANON/IEXTEN/ISIG: 所有字符原样透传
-        # - CS8: 8-bit 数据, 不丢高位 (对 backspace 0x7F 等关键)
-        # - ICRNL 保留: \r->\n, 行终止兼容受调试程序控制台
-        # - IXON 关: Ctrl+Q/Ctrl+S 透传
+        # 完整 raw 模式, 对照 termio/src/lib.rs 的 raw 设置:
+        # - 关闭 ECHO/ICANON/IEXTEN/ISIG, 字符原样转发
+        # - CS8: 8-bit 数据不丢高位, 对 backspace 0x7F 等关键
+        # - ICRNL 保留: 把 \r 映射到 \n, 行终止兼容受调试程序控制台
+        # - 关闭 IXON: Ctrl+Q/Ctrl+S 原样转发
         if os.isatty(self._stdin_fd):
             self._saved_term_attrs = termios.tcgetattr(self._stdin_fd)
             attrs = termios.tcgetattr(self._stdin_fd)
@@ -354,11 +354,11 @@ class DebuggerBase(SharedMixinAttrs):
         daemon 线程已在后台 select(stdin)->os.read->uart.preload,
         此处仍保留原有 select+os.read 路径 — daemon 作为加速补充而非替代.
         """
-        # daemon 活跃时也走到这里: 原有 select+os.read 路径不受影响
-        # (daemon 读走后 select 返回空即 no-op)
+        # 守护线程活跃时也走到这里: 原有 select+os.read 路径不受影响
+        # 守护线程读出后 select 返回空, 此时不进行任何操作
 
         if self._emu._termio is not None and self._emu._termio.native_active:
-            # 排空 RX ring -> UART FIFO, 内部处理 _rx_notify 的 TOCTOU 清零.
+            # 从 RX 环形缓冲区读出并写入 UART FIFO, 内部处理 _rx_notify 的 TOCTOU 清零.
             had_input = self._emu._termio.drain_rx_feed_uart()
             self._flush_uart_if_present()
             return had_input
@@ -433,20 +433,20 @@ class DebuggerBase(SharedMixinAttrs):
         return had_input
 
     def _idle_poll_termio(self) -> bool:
-        """WFI 空闲轮询回调 (Rust termio 线程模式).
+        """WFI 空闲轮询回调, 用于 Rust termio 线程模式.
 
-        termio 线程已接管 stdin 读取和 TX->stdout 排空; 此处排空 RX 环形
-        缓冲到 UART 模型, 并刷新行缓冲确保部分行及时进入 hart 日志文件。
+        termio 线程已接管 stdin 读取和 TX 到 stdout 的写入; 此处把 RX 环形
+        缓冲区的字节读出并写入 UART 模型, 并刷新行缓冲确保部分行及时进入 hart 日志文件。
 
         Returns:
-            True 仅当有 stdin 数据被 preload (中断 WFI 睡眠, 立即同步
-            PLIC 并重新使用动态链接库加速)。恒返回 True 会使 WFI 轮询循环每次立即
-            退出 ->热自旋 100% CPU。
+            返回 True 仅当有 stdin 数据被 preload, 此时中断 WFI 睡眠, 立即同步
+            PLIC 并重新使用动态链接库加速。恒返回 True 会使 WFI 轮询循环每次立即
+            退出, 导致热自旋 100% CPU。
         """
         had_input = False
         if self._emu._termio is not None:
             had_input = self._emu._termio.drain_rx()
-            # _rx_notify 由 idle poll 在确认 ring buffer 排空后清零
+            # _rx_notify 由 idle poll 在确认环形缓冲区已全部读出后清零
             termio = self._emu._termio
             if termio._rx_wr.value == termio._rx_rd.value:
                 termio._rx_notify.value = 0
@@ -497,12 +497,12 @@ class DebuggerBase(SharedMixinAttrs):
     # ----------------------------------------------------------
 
     def _show_trap_context(self, h) -> None:
-        """hart 进入不可恢复陷态时的上下文摘要."""
+        """hart trap后的上下文摘要."""
         cause = h.mcause_val
         name = trap_cause_name(cause)
         is_int = (cause >> 63) & 1
         tag = "中断" if is_int else "异常"
-        self._warn(f"Hart {h.id} 进入不可恢复陷态, 已暂停")
+        self._warn(f"Hart {h.id} 已暂停")
         self._console.print(
             f"  [red bold]{tag}[/] {name}  "
             f"mcause=0x{cause:x}  mepc={hex_addr(h.mepc_val)}  "

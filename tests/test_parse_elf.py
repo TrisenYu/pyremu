@@ -163,7 +163,7 @@ class TestParseElf:
         for p in elf_paths:
             img = parse_firmware(p)
             assert img is not None
-            # 可重定位对象 (.o) 没有 program headers -> segments 可为空
+            # 可重定位对象 .o 没有 program headers, 故 segments 可为空
             for seg in img.segments:
                 assert isinstance(seg, FirmwareSegment)
                 assert seg.vaddr >= 0

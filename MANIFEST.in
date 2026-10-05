@@ -1,0 +1,2 @@
+# every Python test files under tests (include sub-dir) will be recorded in sdist
+recursive-include tests *.py

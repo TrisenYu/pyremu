@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import IO
+from typing import Callable, IO
 
 from pyremu.memory.bus import Device
 
@@ -64,7 +64,7 @@ class UART(Device):
     - RX FIFO 固定 8 字节 (``SIFIVE_UART_RX_FIFO_SIZE``)
     - preload() 受 ``can_rx()`` 控制: FIFO 满时拒绝新数据
     - RXDATA 读取后调用 ``_accept_input()`` 通知 termio 可继续接收
-    - IP 按 FIFO 实际占用 vs 水位 (rxcnt) 计算, 非简单非空判断
+    - IP 按 FIFO 占用量与比较阈值 rxcnt 的大小关系计算, 非简单非空判断
 
     TXDATA 写入即自动输出 (无 hart 耦合): 每字节经 _tx_callback (若设置)
     即时输出, 不依赖外部 set_writer / flush_all.
@@ -101,20 +101,24 @@ class UART(Device):
         # 写 UART MMIO 地址时自动标记, 仅用于 hart 日志文件分流归档.
         self._current_writer: int | None = None
 
-        # Terminal I/O 反向引用 — 由 Emulator._init_for_speedup_lib 注入,
-        # 用于调试器/模拟器直连路径管理终端所有权。
+        # 终端 I/O 反向引用 — 由 Emulator._init_for_speedup_lib 注入,
+        # 用于调试器与模拟器直连路径管理终端所有权.
         self.termio: object | None = None
 
-        # native 侧寄存器上下文 (FfiUartCtx, 由 Emulator 注入): 加速执行期间
-        # 受调试程序 读 IP (0x14) 由 Rust 内联应答, 数据源即本对象, 状态变化时需同步。
+        # 加速执行的寄存器上下文 FfiUartCtx, 由 Emulator 注入. 加速执行期间
+        # 受调试程序经偏移 0x14 读 IP 寄存器时由 Rust 内联应答, 数据源即本对象,
+        # 故设备状态变化时须同步到此上下文.
         self._ffi_ctx: object | None = None
 
-        # 控制台回显开关 — 单一输出 owner 原则 (QEMU chardev 模型):
-        # native termio 线程运行期间为 False (Rust 已直写 stdout),
-        # 其余时刻为 True (_tx_callback 负责回显)。
+        # 控制台回显开关 — 控制台输出只有一个写入者, 与 QEMU 的 chardev 模型一致:
+        # Rust 的终端 I/O 线程运行期间为 False, 由该线程直写 stdout;
+        # 其余时刻为 True, 由 _tx_callback 负责回显.
         self._console_echo: bool = True
 
-        # 每 hart 日志文件 (可选): set_hart_log_dir 后各 hart 输出另存 hart<N>.log
+        # 环形缓冲区空出槽位时的通知回调 — 由 TermIO 搬运期间绑定.
+        self._on_rx_room: Callable[[], None] | None = None
+
+        # 每 hart 日志文件, 可选: 调用 set_hart_log_dir 后各 hart 的输出另存为 hart<N>.log
         self._hart_log_dir: str | None = None
         self._hart_log_files: dict[int, IO] = {}
 
@@ -162,34 +166,43 @@ class UART(Device):
     # ---- QEMU 风格容量控制接口 (对照 sifive_uart_can_rx / sifive_uart_rx) ----
 
     def can_rx(self) -> bool:
-        """RX FIFO 是否有空闲槽位 (对照 QEMU ``sifive_uart_can_rx``).
+        """RX FIFO 是否有空闲槽位, 对照 QEMU ``sifive_uart_can_rx``.
 
         termio 的 ``drain_rx()`` 在 preload 前调用此方法; FIFO 满时不读
-        stdin, 数据滞留内核 tty 缓冲 (对照 QEMU ``fd_chr_read_poll`` 流控).
+        stdin, 数据留在内核 tty 缓冲, 对照 QEMU ``fd_chr_read_poll`` 的流量控制.
         """
         with self._rx_lock:
             return len(self._rx_fifo) < RX_FIFO_SIZE
 
-    def _accept_input(self) -> None:
-        """RXDATA 读取后调用 — 通知 termio 可继续接收数据.
+    def set_rx_room_notifier(self, notifier: Callable[[], None] | None) -> None:
+        """绑定 FIFO 空出槽位时的回调, None 解绑.
 
-        对照 QEMU ``sifive_uart_read`` 中的 ``qemu_chr_fe_accept_input()``:
-        读走一个字节后 FIFO 多出一个空位, 上层可继续 preload.
-        当前实现: 读取动作本身释放槽位, 无需额外操作;
-        此钩子保留供未来 termio 唤醒优化 (如读后立即触发一次 stdin poll).
+        由 TermIO 绑定 ``drain_rx``: 从 RXDATA 读出一个字节后 FIFO 出现空位,
+        接收环形缓冲区中剩余的字节可以继续写入.
         """
+        self._on_rx_room = notifier
+
+    def _accept_input(self) -> None:
+        """RXDATA 读取后调用: 通知上层 FIFO 已空出一个槽位, 可继续写入数据.
+
+        对照 QEMU ``sifive_uart_read`` 中的 ``qemu_chr_fe_accept_input()``,
+        与 ``can_rx()`` 构成反压协议的两半: 后者在 FIFO 满时暂停投递, 此处
+        在空位出现后恢复投递. 未绑定回调时为空操作.
+        """
+        if self._on_rx_room is not None:
+            self._on_rx_room()
 
 
     def _ip_value(self) -> int:
-        """动态计算 IP 寄存器值 (对照 QEMU ``sifive_uart_ip``).
+        """动态计算 IP 寄存器值, 与 QEMU 的 ``sifive_uart_ip`` 一致.
 
-        - **txwm**: TX FIFO 占用 < txctrl.txcnt (bits[18:16])。本模型 TX 即时
-          排空 (FIFO 恒空, 占用=0), 故 txcnt>0 时条件恒成立。
-        - **rxwm**: RX FIFO 占用 > rxctrl.rxcnt (bits[18:16], 与 txcnt 同偏移)。
-          默认 rxcnt=0, 故 FIFO 非空时置位。
+        - **txwm**: TX FIFO 占用 < txctrl.txcnt, txcnt 位于 bits[18:16]. 本模型
+          写入 TXDATA 后立即输出, TX FIFO 恒为空, 故 txcnt>0 时条件恒成立.
+        - **rxwm**: RX FIFO 占用 > rxctrl.rxcnt, rxcnt 与 txcnt 同在 bits[18:16].
+          默认 rxcnt=0, 故 FIFO 非空时置位.
 
-        TXDATA 写入可能由加速执行动态链接库于内部处理 (绕过 _write_reg),
-        故 IP 不能依赖写入路径锁存, 必须在读取时按状态计算。
+        TXDATA 写入可能由加速执行引擎在内部处理而绕过 _write_reg, 故 IP 必须在
+        读取时按 FIFO 当前占用与比较阈值算出, 不在写入时置位.
         """
         ip = 0
         if ((self._txctrl >> 16) & 0x7) > 0:
@@ -201,16 +214,15 @@ class UART(Device):
         return ip
 
     def irq_asserted(self) -> bool:
-        """返回当前 UART 中断线电平 (IP & IE != 0).
+        """返回 UART 中断线当前电平, 由 IP 与 IE 的按位与结果决定.
 
-        供外部 (termio RX 排空路径) 在注入数据后查询真实电平, 用于
-        按电平语义同步 PLIC 挂起位 — 而非无条件拉高, 避免 IE 关闭时
-        产生虚假挂起。
+        供 TermIO 的 RX 读出路径在注入数据后查询真实电平, 用于按电平语义
+        同步 PLIC 挂起位, 而不是无条件拉高, 以免 IE 关闭时产生虚假挂起.
         """
         return bool(self._ip_value() & self._ie)
 
     def _publish_native_regs(self) -> None:
-        """把寄存器当前值同步到 native 侧上下文 (未启用加速库时为空操作)."""
+        """把寄存器当前值同步到加速执行的上下文 FfiUartCtx, 未启用加速执行引擎时为空操作."""
         ctx = self._ffi_ctx
         if ctx is None:
             return
@@ -222,11 +234,12 @@ class UART(Device):
         ctx.rx_fifo_len = fifo_len
 
     def _publish_state(self) -> None:
-        """单一状态变化入口: 同步 native 侧寄存器值, 并更新 PLIC 中断线电平.
+        """单一状态变化入口: 同步加速执行的寄存器值, 并更新 PLIC 中断线电平.
 
-        PLIC 为电平语义, pending = (IP & IE) != 0 — TX 与 RX 任一满足即拉高;
-        RXDATA 读空 / IE 关闭 / txcnt 清零时拉低。PLIC claim 后重新拉高由各读写
-        路径调用本方法恢复 (level-triggered)。
+        PLIC 为电平触发, 挂起条件为
+            pending = (IP & IE) != 0
+        TX 与 RX 任一满足即拉高; RXDATA 读空、IE 关闭、txcnt 清零时拉低. PLIC 的
+        claim 操作之后重新拉高, 由各读写路径调用本方法恢复.
         """
         self._publish_native_regs()
         if self._plic is None or self._irq <= 0:
@@ -272,13 +285,12 @@ class UART(Device):
         self._tx_buf.clear()
 
     def record_tx_byte(self, byte: int) -> None:
-        """记录 TX 字节到行缓冲 (native Rust 直写 stdout 路径的归档回填).
+        """把 TX 字节记入行缓冲, 供 TermIO 在加速执行引擎直写 stdout 时保持行缓冲完整.
 
-        与 ``_write_reg`` 的 TXDATA 路径不同, 此方法仅追加到 ``_tx_buf``,
-        不触发 ``_tx_callback`` / ``os.write`` — native 模式下 Rust 引擎已
-        即时输出到 stdout, 再输出即双重写控制台. 供 termio 在排空 TX ring
-        buffer 时同步回填, 使 ``tx_data()`` 在 native 与纯 Python 两条路径
-        下返回一致的完整输出.
+        与 ``_write_reg`` 的 TXDATA 路径不同, 此方法仅追加到 ``_tx_buf``, 不触发
+        ``_tx_callback`` 与 ``os.write``: 加速执行期间该字节已由 Rust 引擎写到
+        stdout, 再输出一遍会使控制台上出现重复字符. 供 TermIO 在读出 TX 环形缓冲区
+        时调用, 使 ``tx_data()`` 在加速执行与纯 Python 两条路径下返回一致的完整输出.
         """
         self._tx_buf.append(byte)
 
@@ -311,7 +323,7 @@ class UART(Device):
             self._publish_state()
             return b
         if offset == REG_TXDATA:
-            return 0  # TXDATA 只写; full 位 (bit31) 恒 0 — FIFO 即时排空
+            return 0  # TXDATA 只写; full 位即 bit31, 恒 0 — 写入即输出, TX FIFO 恒为空
         if offset == REG_TXCTRL:
             return self._txctrl
         if offset == REG_RXCTRL:
@@ -319,8 +331,7 @@ class UART(Device):
         if offset == REG_IE:
             return self._ie
         if offset == REG_IP:
-            # 电平语义: 按 FIFO 水位状态动态计算, 不依赖写入路径锁存
-            # (TXDATA 写可能被 Rust 引擎 inline 处理, 绕过 Python).
+            # IP 在读取时计算, 不在写入时置位 — 见 ``_ip_value()``.
             return self._ip_value()
         if offset == REG_DIV:
             return self._div
@@ -345,9 +356,9 @@ class UART(Device):
             return
         if offset == REG_TXCTRL:
             self._txctrl = val
-            # txcnt (bits[18:16]) 变化影响 txwm 水位条件 — 若 IE.txwm 已使能,
-            # 此处需立即拉高/拉低 PLIC (驱动 probe 先写 txcnt 后开中断,
-            # 但顺序不可假设).
+            # txcnt (bits[18:16]) 是 txwm 的比较阈值, 其变化可直接改变中断触发
+            # 条件 — 若 IE.txwm 已使能, 此处需立即拉高或拉低 PLIC 中断线,
+            # 因为驱动 probe 先写 txcnt 后开中断的顺序不可假设.
             self._publish_state()
             return
         if offset == REG_RXCTRL:
@@ -361,7 +372,7 @@ class UART(Device):
             self._publish_state()
             return
         if offset == REG_IP:
-            # SiFive spec: IP 只读 (水位条件电平语义), 写入忽略.
+            # SiFive spec: IP 为只读的电平状态寄存器, 写入忽略.
             return
         if offset == REG_DIV:
             self._div = val & 0xFFFF

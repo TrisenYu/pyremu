@@ -1,8 +1,8 @@
 """验证跨核 TLB shootdown 同步 — tlb_sync 递增/递减原子模式.
 
-模拟 OpenSBI tlb_update ->tlb_sync ->tlb_entry_process 链:
-  - Hart 1 (发起者): amoadd 递增共享计数器 ->MSIP ->自旋直到计数器归零
-  - Hart 0 (接收者): WFI 唤醒 ->amoadd 递减同一计数器 ->回 WFI
+模拟 OpenSBI tlb_update、tlb_sync、tlb_entry_process 的调用链:
+  - Hart 1 (发起者): amoadd 递增共享计数器, 随后写 MSIP, 随后自旋直到计数器归零
+  - Hart 0 (接收者): 被 WFI 唤醒, 随后 amoadd 递减同一计数器, 随后重新进入 WFI
   - 验证 Hart 1 最终看到计数器=0 且不会死锁
 
 这是 SMP boot 死锁 (ticket spinlock in sbi_fifo.qlock) 的简化版复现.
@@ -112,11 +112,11 @@ class TestTlbSyncCounter:
         )
 
     # ================================================================
-    #  Test 2: WFI 唤醒后执行 AMO — 完整 MSIP->wake->AMO 链
+    #  Test 2: WFI 唤醒后执行 AMO — 完整的 MSIP 唤醒与 AMO 执行流程
     # ================================================================
 
     def test_wfi_wake_then_amo(self):
-        """Hart 0 WFI ->Hart 1 写 MSIP ->Hart 0 醒来执行 AMO ->验证结果."""
+        """Hart 0 进入 WFI, Hart 1 写 MSIP, Hart 0 醒来执行 AMO, 随后验证结果."""
         cfg = PlatformConfig(num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024)
         emu = Emulator(cfg, bootargs="")
         h0, h1 = emu.harts
@@ -180,8 +180,8 @@ class TestTlbSyncCounter:
         流程:
           1. H0 执行 WFI ->waiting
           2. H1 通过 Bus.write 设置 MSIP[0] (模拟 sbi_ipi_send_many)
-          3. emu.step() ->H0 醒来 ->陷阱 ->mret ->执行 amoadd ->递减共享变量
-          4. H1 读共享变量 ->应为 0 (被 H0 递减后)
+          3. emu.step() 使 H0 醒来, 进入陷阱, mret 后执行 amoadd, 递减共享变量
+          4. H1 读共享变量, 应为 0, 因为该变量已被 H0 递减
 
         """
         cfg = PlatformConfig(
@@ -219,8 +219,8 @@ class TestTlbSyncCounter:
 
         # --- 阶段 2: H1 发送 MSIP[0] (模拟 sbi_ipi_send_many) ---
         emu.bus.write(CLINT_BASE, struct.pack("<I", 1))
-        # 并发模型: H0 的 WFI 被 MSIP 唤醒 ->陷阱到 mtvec ->
-        # mret ->回到 amoadd (+4) ->执行 amoadd ->下一个 wfi (+8)
+        # 并发模型: H0 的 WFI 被 MSIP 唤醒, 随后进入陷阱到 mtvec,
+        # 随后 mret 回到 amoadd (+4), 执行 amoadd, 随后到下一个 wfi (+8)
         # MSIP 此时必须清除, 否则第二个 wfi 会立即再次唤醒
         for _ in range(10):
             emu.step()
@@ -259,7 +259,7 @@ class TestTlbSyncCounter:
     # ================================================================
 
     def test_multiple_wake_amo_sequence(self):
-        """连续两次 MSIP->wake->AMO, 每次计数器正确递减."""
+        """连续两次 MSIP 唤醒并执行 AMO, 每次计数器正确递减."""
         cfg = PlatformConfig(
             num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024
         )

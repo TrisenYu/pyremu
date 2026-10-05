@@ -28,11 +28,11 @@ TrapType = Enum("TrapType", (
     "InstrPageFault",  # 12: 指令页错误
     "LdPageFault",  # 13: 载入页错误
     "StPageFault",  # 15: 存储页错误
-    # H-extension 受调试程序-page faults (RISC-V privileged spec §8.6.2)
-    "InstrGuestPageFault",  # 20: 指令 受调试程序-physical 页错误
-    "LdGuestPageFault",  # 21: 载入 受调试程序-physical 页错误
+    # H-extension guest-page faults (RISC-V privileged spec §8.6.2)
+    "InstrGuestPageFault",  # 20: 指令 guest-physical 地址页错误
+    "LdGuestPageFault",  # 21: 载入 guest-physical 地址页错误
     "VirtualInstruction",  # 22: 虚拟指令 (HLVID emulation)
-    "StGuestPageFault",  # 23: 存储 受调试程序-physical 页错误
+    "StGuestPageFault",  # 23: 存储 guest-physical 地址页错误
     # === 中断 (Interrupt) — mcause bit 63 置 1 ===
     "SoftInterrupt",  # 软件中断 (通用)
     "UmodeSoftInterrupt",  # 0: U 模式软件中断
@@ -76,7 +76,7 @@ _TRAP_CAUSE_CODE: dict[TrapType, int] = {
     TrapType.InstrPageFault: 12,
     TrapType.LdPageFault: 13,
     TrapType.StPageFault: 15,
-    # H-extension 受调试程序-page faults
+    # H-extension guest-page faults
     TrapType.InstrGuestPageFault: 20,
     TrapType.LdGuestPageFault: 21,
     TrapType.VirtualInstruction: 22,
@@ -112,7 +112,7 @@ def trap_is_interrupt(trap: TrapType) -> bool:
     return (code >> 63) & 1 == 1
 
 
-# mcause/scause 编码 -> TrapType 名称逆向映射 (惰性构建)
+# mcause/scause 编码到 TrapType 名称的逆向映射, 惰性构建
 _CAUSE_CODE_NAME: dict[int, str] = {code: trap.name for trap, code in _TRAP_CAUSE_CODE.items()}
 
 

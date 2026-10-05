@@ -3,7 +3,7 @@ use crate::ffi::FfiExtIrqCtx;
 use crate::concurrent::{
 	ConcurrentClintCtx, ModuleState, StopInfo, WATCHDOG_POLL_US,
 };
-use crate::interrupt::{clint::sync_msip, clint::sync_mtip, sync_imsic};
+use crate::interrupt::{clint::sync_msip, clint::sync_mtip, imsic_topei_peek, sync_imsic};
 use crate::state::{exit_reason, riscv_mode, HartState};
 use std::sync::atomic::Ordering;
 
@@ -55,7 +55,7 @@ pub(crate) fn wfi_sync_and_check(
 	// OpenSBI's PLIC irqchip has no process_hwirqs and never sets MEIE;
 	// a force-enabled MEIP would fire an M-mode external trap into an
 	// unprocessable irqchip (sbi_irqchip_process -> SBI_ENODEV) and hang
-	// the boot.  The 受调试程序's mie is authoritative there.
+	// the boot.  The guest's mie is authoritative there.
 	if state.imsic_m.present != 0
 		&& (state.mip.load(Ordering::Acquire) & (1 << 11)) != 0
 		&& (state.mie & (1 << 11)) == 0
@@ -72,17 +72,38 @@ pub(crate) fn wfi_sync_and_check(
 	let rx_ready = !uart_rx_notify.is_null() && unsafe { *uart_rx_notify != 0 };
 	let msip_pending = (state.mip.load(Ordering::Acquire) & (1 << 3)) != 0;
 
+	// AIA 下 MEIP 是 sync_imsic 依据 IMSIC M 文件的待处理状态派生出的位, 且
+	// eidelivery=0 时该分支只置位不清位, 因为 legacy PLIC 可能独立驱动 MEIP.
+	// 但 present!=0 即 CFG_AIA, 该配置下 Emulator 不创建 PLIC, 无人清除该位:
+	// 受调试程序经 mtopei 认领 eip 之后 MEIP 仍为 1, 而上面的强制使能又把 MEIE
+	// 置位, 于是 mip 与 mie 的交集恒非零, WFI 每次都立即醒来, 永不进入停驻.
+	// 全部 hart 停驻这一前提因此永不成立, Python 侧唯一的墙钟补偿
+	// _wfi_sleep_if_idle 永不执行, 而受调试程序时钟是纯指令计数, 于是该时钟
+	// 相对墙钟塌陷, 且每个 hart 在 WFI 自旋中占满一个宿主核心.
+	//
+	// 故此处与 trap 分发路径 compute_mtopi 一致, 不采信 mip.MEIP, 改为直接查询
+	// IMSIC 是否仍有待处理的身份.
+	let mfile_pending =
+		state.imsic_m.present != 0 && imsic_topei_peek(&state.imsic_m).0 != 0;
+	let mut wake_mask = state.mie;
+	if state.imsic_m.present != 0 {
+		wake_mask &= !(1 << 11); // MEIP 排除, 改由上面的 IMSIC 直查承担
+	}
+
 	// In M-mode, exclude delegated (S-level) interrupts from the wake
 	// check.  Delegated interrupts (SEI, SSI, STI) are invisible to
 	// mtopi and cannot be handled by the M-mode trap handler, so waking
 	// for them creates an infinite WFI->wake->skip->WFI loop.  They will
 	// be delivered when the hart drops to S-mode.
 	// Non-delegatable M-level interrupts (MEI, MSI, MTI) always wake.
-	let other_pending = if state.mode == riscv_mode::M {
-		(state.mip.load(Ordering::Acquire) & state.mie & !state.mideleg) != 0
+	let level_pending = if state.mode == riscv_mode::M {
+		(state.mip.load(Ordering::Acquire) & wake_mask & !state.mideleg) != 0
 	} else {
-		(state.mip.load(Ordering::Acquire) & state.mie) != 0
+		(state.mip.load(Ordering::Acquire) & wake_mask) != 0
 	};
+	// MEIE 已由上面的强制使能置位, 故按 mie 判定与旧行为等价.
+	let imsic_pending = mfile_pending && (state.mie & (1 << 11)) != 0;
+	let other_pending = level_pending || imsic_pending;
 	let woke = other_pending || msip_pending || rx_ready || ext_irq_pending;
 	(woke, msip_pending)
 }
@@ -238,6 +259,7 @@ pub(crate) fn wfi_spin(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::interrupt::{imsic_topei_claim_iid, IID_M_IPI};
 	use std::cell::Cell;
 	use std::sync::atomic::{AtomicU64, AtomicU8};
 	use std::sync::mpsc;
@@ -350,5 +372,81 @@ mod tests {
 			Ok(v) => panic!("stop_flag 置位后 WFI hart 应返回 false (exit), 实际 {v:?}"),
 			Err(_) => panic!("stop_flag 置位后 WFI hart 未在有界时间内退出 (旧行为: 无限 park)"),
 		}
+	}
+
+	/// 构造一个 "IMSIC 存在但 M-file eidelivery=0" 的 hart 状态, 用于
+	/// 验证 WFI 唤醒判定的 MEIP 生命周期.
+	fn make_state_aia_no_mfile_delivery() -> (HartState, ConcurrentClintCtx) {
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mhartid = 0;
+		state.mode = riscv_mode::M;
+		state.pc = 0x1000;
+		state.mip.store(0, Ordering::Release);
+		state.mie = 0;
+		state.imsic_m.present = 1;
+		state.imsic_m.eidelivery = 0;
+		state.imsic_s.present = 1;
+		state.imsic_s.eidelivery = 0;
+		(state, make_clint_ctx())
+	}
+
+	/// 构造一个全零的 CLINT 上下文 (mtime=mtimecmp=0, MSIP 无挂起).
+	fn make_clint_ctx() -> ConcurrentClintCtx {
+		// SAFETY: 三个计数器的后备存储必须比 ctx 活得久, 故用 leak 固化.
+		let mtime: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+		let mtimecmp: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+		let msip: &'static AtomicU8 = Box::leak(Box::new(AtomicU8::new(0)));
+		ConcurrentClintCtx {
+			base: 0x2000000,
+			mtime: mtime as *const AtomicU64,
+			mtimecmp: mtimecmp as *const AtomicU64,
+			msip: msip as *const AtomicU8,
+			timebase_hz: 0,
+			num_harts: 1,
+			msip_pending: Cell::new(std::ptr::null()),
+			hart_threads: Cell::new(std::ptr::null()),
+			hart_states: Cell::new(std::ptr::null()),
+		}
+	}
+
+	/// 回归: M 文件 eidelivery=0 时, 一个已被认领的软件中断不得让 MEIP 残留,
+	/// 否则 WFI 永远判定为有中断待处理而无法停驻.
+	///
+	/// 修复前行为: ``sync_imsic`` 在 eidelivery=0 分支里对挂起的 M 文件 IPI 置
+	/// MEIP, 且注释声明该位不在此处清除, 理由是 legacy PLIC 可能同时在驱动 MEIP.
+	/// 但 AIA 模式下 ``self.plic`` 为 None, 没有任何 PLIC, 无人清除该位: 受调试
+	/// 程序经 mtopei 认领 eip 之后 MEIP 仍为 1, 而 ``wfi_sync_and_check`` 又把
+	/// MEIE 强制使能, 于是 ``mip & mie`` 恒非零, ``woke`` 恒为 true, hart 每次
+	/// 执行 WFI 都立即醒来, 永不进入停驻.
+	///
+	/// 后果: 全部 hart 停驻这一前提永不成立, Python 侧唯一的墙钟补偿
+	/// ``Emulator._wfi_sleep_if_idle`` 永不执行, 而受调试程序时钟是纯指令计数,
+	/// 即 ``NS_PER_INSTR``, 于是该时钟相对墙钟塌陷, AIA 实测约 0.21 倍, legacy
+	/// PLIC 约 0.9 倍, 且每个 hart 在 WFI 自旋中占满一个宿主核心.
+	#[test]
+	fn wfi_meip_not_stale_after_mfile_ipi_claim_without_eidelivery() {
+		let (mut state, clint) = make_state_aia_no_mfile_delivery();
+		// M-file 有一个挂起的软件中断 (IID=3)
+		state.imsic_m.eip[0].store(1 << IID_M_IPI, Ordering::Relaxed);
+
+		let (woke_before, _) =
+			wfi_sync_and_check(&mut state, &clint, std::ptr::null(), std::ptr::null_mut());
+		assert!(
+			woke_before,
+			"挂起 IPI 期间 WFI 必须醒来处理该 IPI, 唤醒判定不可过弱"
+		);
+
+		// 受调试程序读取 mtopei 认领该中断, IMSIC eip 对应位随之清除
+		imsic_topei_claim_iid(&mut state.imsic_m, IID_M_IPI);
+
+		// claim 之后 IMSIC 已无任何挂起, WFI 应当能够停驻
+		let (woke_after, _) =
+			wfi_sync_and_check(&mut state, &clint, std::ptr::null(), std::ptr::null_mut());
+		assert!(
+			!woke_after,
+			"mtopei claim 之后 MEIP 残留 (mip=0x{:x} mie=0x{:x}) -> WFI 永远无法停驻",
+			state.mip.load(Ordering::Acquire),
+			state.mie
+		);
 	}
 }

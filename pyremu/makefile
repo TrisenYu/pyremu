@@ -9,6 +9,8 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo '# mem layout' >> $@.tmp
 	@echo 'RESERVED_MEM_BASE = $(RESERVED_MEM_BASE)' >> $@.tmp
 	@echo 'RESERVED_MEM_SIZE = $(RESERVED_MEM_SIZE)' >> $@.tmp
+	@echo 'FW_RESERVED_MEM_BASE = $(FW_RESERVED_MEM_BASE)' >> $@.tmp
+	@echo 'FW_RESERVED_MEM_SIZE = $(FW_RESERVED_MEM_SIZE)' >> $@.tmp
 	@echo '' >> $@.tmp
 	@echo '# arguments for emulator' >> $@.tmp
 	@echo 'TLB_ENTRIES = $(TLB_ENTRIES)' >> $@.tmp
@@ -21,7 +23,6 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo 'NS_PER_INSTR = $(NS_PER_INSTR)' >> $@.tmp
 	@echo '' >> $@.tmp
 # 诊断用相关定义
-	@echo 'PYREMU_NATIVE_SPEEDUP = $(PYREMU_NATIVE_SPEEDUP)' >> $@.tmp
 	@echo 'PYREMU_DIAG_LOG = "$(PYREMU_DIAG_LOG)"' >> $@.tmp
 	@echo 'PYREMU_DIAG_VERBOSE = $(PYREMU_DIAG_VERBOSE)' >> $@.tmp
 	@echo 'PYREMU_TRACE_SRET = $(PYREMU_TRACE_SRET)' >> $@.tmp
@@ -33,7 +34,8 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo 'PYREMU_AIA = $(PYREMU_AIA)' >> $@.tmp
 	@echo 'IMSIC_M_BASE = $(IMSIC_M_BASE)' >> $@.tmp
 	@echo 'IMSIC_S_BASE = $(IMSIC_S_BASE)' >> $@.tmp
-	@echo 'APLIC_BASE = $(APLIC_BASE)' >> $@.tmp
+	@echo 'APLIC_S_BASE = $(APLIC_S_BASE)' >> $@.tmp
+	@echo 'APLIC_M_BASE = $(APLIC_M_BASE)' >> $@.tmp
 	@echo 'WFI_WATCHDOG_MS = $(WFI_WATCHDOG_MS)' >> $@.tmp
 	@echo 'PYREMU_H_EXT = $(PYREMU_H_EXT)' >> $@.tmp
 	@echo 'PYREMU_NO_L2 = $(PYREMU_NO_L2)' >> $@.tmp

@@ -14,6 +14,8 @@
 - SPI   : 主模式 SPI 控制器
 - I2C   : 主模式 I2C 控制器
 - GPIO  : 双向通用 I/O 控制器
+- VirtIOBlock : virtio-blk 块设备
+- VirtIONet   : virtio-net 网络设备
 """
 
 from pyremu.peripheral.crng import CRNG
@@ -23,5 +25,6 @@ from pyremu.peripheral.spi import SPI
 from pyremu.peripheral.termio import TerminalIO
 from pyremu.peripheral.uart import UART
 from pyremu.peripheral.virtio_blk import VirtIOBlock
+from pyremu.peripheral.virtio_net import VirtIONet
 
-__all__ = ["TerminalIO", "UART", "SPI", "I2C", "GPIO", "VirtIOBlock", "CRNG"]
+__all__ = ["TerminalIO", "UART", "SPI", "I2C", "GPIO", "VirtIOBlock", "VirtIONet", "CRNG"]

@@ -311,6 +311,23 @@ pub(crate) fn priv_ecall_concurrent(
 	_module: &ModuleState,
 	dev: &dyn FfiDevCtx,
 ) -> u64 {
+	// SBI 是 S 模式到 M 模式的接口, 只有 S 模式发起的 ecall 才可能命中下面的
+	// 快速路径. U 模式发起的 ecall 按 RISC-V 约定一律以 ECALL_UMODE 投递给
+	// S 模式内核, 不得被按 SBI 约定匹配的快速路径认领.
+	//
+	// 缺少此判据时, 用户程序的退出序列 (li a0,0 / li a7,1 / ecall) 与 SBI 传统
+	// putchar 的扩展号 0x01 和功能号 0 完全一致; 其 a7 = 1、a6 = 0 恒成立
+	// (装载器只初始化 sp, 程序自身不写 x16), 于是该 ecall 被串口快速路径认领,
+	// a0 被当作字符写出且不投递任何陷态, 程序越过退出 ecall 继续执行.
+	if state.mode != riscv_mode::S {
+		let ecall_cause = match state.mode {
+			riscv_mode::U => mcause_val(exc_code::ECALL_UMODE, false),
+			_ => mcause_val(exc_code::ECALL_MMODE, false),
+		};
+		deliver_trap(state, ecall_cause, 0);
+		return 0;
+	}
+
 	let a7 = read_gpr(state, 17);
 	let a6 = read_gpr(state, 16);
 
@@ -358,12 +375,8 @@ pub(crate) fn priv_ecall_concurrent(
 	// MSIP store and processes the IPI, all within one acceleration.
 
 	// Generic ECALL — deliver trap inline (stay in acceleration).
-	let ecall_cause = match state.mode {
-		riscv_mode::U => mcause_val(exc_code::ECALL_UMODE, false),
-		riscv_mode::S => mcause_val(exc_code::ECALL_SMODE, false),
-		_ => mcause_val(exc_code::ECALL_MMODE, false),
-	};
-	deliver_trap(state, ecall_cause, 0);
+	// 至此 state.mode 必为 S: 非 S 模式已在函数开头投递陷态并返回.
+	deliver_trap(state, mcause_val(exc_code::ECALL_SMODE, false), 0);
 	// deliver_trap sets PC -> mtvec/stvec and mode -> M/S.
 	// Return 0 so the dispatch loop continues execution from the
 	// trap handler entry point, all within the same acceleration.
@@ -455,6 +468,43 @@ mod tests {
 		s.stvec = 0x80004000;
 		s.pc = 0x1000;
 		s
+	}
+
+	/// 构造单 hart 的计时器上下文, 供 ecall 用例使用.
+	fn single_hart_clint(
+		mtime: &AtomicU64,
+		mtimecmp: &AtomicU64,
+		msip: &AtomicU8,
+	) -> ConcurrentClintCtx {
+		ConcurrentClintCtx {
+			base: 0x2000000,
+			mtime: mtime as *const AtomicU64,
+			mtimecmp: mtimecmp as *const AtomicU64,
+			msip: msip as *const AtomicU8,
+			num_harts: 1,
+			msip_pending: Cell::new(std::ptr::null()),
+			hart_threads: Cell::new(std::ptr::null()),
+			hart_states: Cell::new(std::ptr::null()),
+			timebase_hz: 10_000_000,
+		}
+	}
+
+	/// 构造一个发送缓冲区可用的串口上下文.
+	/// ``tx_wr`` 指向调用方的局部变量, 供调用后读取写指针.
+	fn uart_ctx_with_tx_buffer(tx_buf: *mut u8, tx_wr: *mut u32) -> FfiUartCtx {
+		FfiUartCtx {
+			base: 0x1000_0000,
+			tx_buf,
+			tx_cap: 8,
+			tx_wr,
+			ie: 0,
+			txctrl: 0,
+			rxctrl: 0,
+			rx_fifo_len: 0,
+			tx_notify_fd: -1,
+			no_stdout: 1,
+			rx_notify: std::ptr::null_mut(),
+		}
 	}
 
 	// ---- delegation tests ----
@@ -713,6 +763,9 @@ mod tests {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mhartid = 0;
 		state.total_instrs = 1000;
+		// SBI 只在 S 模式下可用; 零初始化的 mode 为 U, 必须显式置为 S,
+		// 否则该调用不会进入快速路径.
+		state.mode = riscv_mode::S;
 		// a0 = 目标绝对时间 (未来值), a6 = 0, a7 = SBI_TIME (0x54494D45).
 		state.gprs[10] = 11000;
 		state.gprs[16] = 0;
@@ -754,5 +807,76 @@ mod tests {
 			0,
 			"未来定时器不应立即置位 MTIP"
 		);
+	}
+
+	// ---- ecall 特权级判据用例 ----
+	//
+	// ``dev.try_ecall`` 与 SBI set_timer 两处快速路径原先位于特权级判据之前.
+	// 用户程序的退出序列 (li a0,0 / li a7,1 / ecall) 的 a7 = 1 与 SBI 传统
+	// putchar 的扩展号 0x01 相同, a6 = 0 与功能号相同, 于是该 ecall 被串口
+	// 快速路径认领: a0 被当作字符写出且不投递陷态, 程序越过退出 ecall 继续
+	// 执行. 下面两条用例分别锁定该边界的两侧.
+
+	#[test]
+	fn umode_ecall_with_sbi_putchar_encoding_never_takes_fast_path() {
+		let mut state = default_state();
+		state.mode = riscv_mode::U;
+		state.medeleg = 1 << exc_code::ECALL_UMODE;
+		// 用户程序的退出序列: a0 = 0, a7 = 1 (= SBI putchar 扩展号), a6 = 0.
+		state.gprs[10] = 0;
+		state.gprs[16] = 0;
+		state.gprs[17] = 1;
+
+		let mtime = AtomicU64::new(0);
+		let mtimecmp = AtomicU64::new(0);
+		let msip = AtomicU8::new(0);
+		let clint = single_hart_clint(&mtime, &mtimecmp, &msip);
+		let module = ModuleState::new(1, 1, 0, 0, vec![0].into_boxed_slice());
+
+		let mut tx_buf = [0u8; 8];
+		let mut tx_wr: u32 = 0;
+		let uart = uart_ctx_with_tx_buffer(tx_buf.as_mut_ptr(), &mut tx_wr as *mut u32);
+
+		priv_ecall_concurrent(&mut state, 0, &clint, &module, &uart);
+
+		assert_eq!(
+			tx_wr, 0,
+			"U 模式 ecall 不得被串口快速路径认领而写出字符"
+		);
+		assert_eq!(
+			state.scause,
+			mcause_val(exc_code::ECALL_UMODE, false),
+			"U 模式 ecall 必须以 ECALL_UMODE 投递给 S 模式内核"
+		);
+		assert_eq!(state.sepc, 0x1000, "sepc 应保存发起 ecall 的 PC");
+		assert_eq!(state.pc, 0x80004000, "应跳转到 stvec");
+	}
+
+	#[test]
+	fn smode_ecall_with_sbi_putchar_encoding_takes_fast_path() {
+		let mut state = default_state();
+		state.mode = riscv_mode::S;
+		// S 模式发出同样的编码: a7 = 1, a6 = 0, a0 = 'A'.
+		state.gprs[10] = 0x41;
+		state.gprs[16] = 0;
+		state.gprs[17] = 1;
+
+		let mtime = AtomicU64::new(0);
+		let mtimecmp = AtomicU64::new(0);
+		let msip = AtomicU8::new(0);
+		let clint = single_hart_clint(&mtime, &mtimecmp, &msip);
+		let module = ModuleState::new(1, 1, 0, 0, vec![0].into_boxed_slice());
+
+		let mut tx_buf = [0u8; 8];
+		let mut tx_wr: u32 = 0;
+		let uart = uart_ctx_with_tx_buffer(tx_buf.as_mut_ptr(), &mut tx_wr as *mut u32);
+
+		let advance = priv_ecall_concurrent(&mut state, 0, &clint, &module, &uart);
+
+		assert_eq!(advance, 4, "S 模式 SBI putchar 应返回 advance=4");
+		assert_eq!(tx_wr, 1, "应写出一个字符");
+		assert_eq!(tx_buf[0], 0x41, "写出的字符应为 a0 的低字节");
+		assert_eq!(state.gprs[10], 0, "a0 应置为 SBI 成功返回值 0");
+		assert_eq!(state.pc, 0x1000, "快速路径不投递陷态, PC 由调用方推进");
 	}
 }

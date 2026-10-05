@@ -5,12 +5,12 @@
 # Created at 2026/06/09 星期二
 
 """
-L2 共享缓存 — 多 hart 之间的统一二级缓存。
+共享 L2 缓存 — 多 hart 之间的统一二级缓存。
 
 继承 CacheBase, 使用 MESI 一致性协议:
 - M (Modified):  脏数据, 仅此缓存拥有, 逐出时需回写 RAM
 - E (Exclusive): 干净数据, 仅此缓存拥有, 与 RAM 一致
-- S (Shared):    干净数据, 可能多个缓存拥有 (模拟器中仅 L2 自己)
+- S (Shared):    干净数据, 可能多个缓存拥有, 模拟器中仅 L2 缓存持有该行
 - I (Invalid):   无效条目
 
 组相联组织, 默认 4 路组相联 + LRU 替换。
@@ -115,7 +115,7 @@ class L2Cache(CacheBase):
         """M 状态脏行逐出时回写 RAM."""
         l2e: L2CacheLine = entry  # type: ignore
         if l2e.mesi == MESIState.MODIFIED and self._ram_write:
-            # 计算物理地址: tag << line_shift -> 对齐到缓存行
+            # 计算物理地址: 由 tag << line_shift 得到缓存行基址
             pa = l2e.tag << self._line_shift
             self._ram_write(pa, bytes(l2e.data))
 
@@ -221,8 +221,8 @@ class L2Cache(CacheBase):
         tag: int,
         offset: int,
     ) -> bytes:
-        """未命中时: 选择 victim -> 逐出 -> 从 RAM 加载整行 -> 返回数据."""
-        # 选择 victim (同组内的 LRU)
+        """未命中时: 选择被逐出的条目并将其逐出, 从 RAM 加载整行, 返回数据."""
+        # 选择被逐出的条目, 同组内按 LRU 选取
         # 全部有效但不应发生; 回退到第一个
 
         victim_idx = max(0, self._pick_victim_in_set(way_entries))
@@ -358,7 +358,7 @@ class L2Cache(CacheBase):
         victim.mesi = MESIState.MODIFIED
 
     def _pick_victim_in_set(self, way_entries: list[L2CacheLine]) -> int:
-        """在一组内选择要逐出的路 (优先无效 -> LRU)."""
+        """在一组内选择要逐出的路: 先取无效条目, 全部有效时按 LRU 取最久未使用的."""
         # 优先选无效的
         for i, e in enumerate(way_entries):
             if not e.valid:
@@ -405,7 +405,7 @@ class L2Cache(CacheBase):
         """将全部脏行 (MODIFIED) 回写到 RAM, 保持有效 (降级为 EXCLUSIVE).
 
         调用动态链接库加速执行前: 确保 Rust 从 bytearray 读取时
-        能看到 Python 侧通过 L2 写入的全部数据。
+        能看到 Python 侧通过 L2 缓存写入的全部数据。
 
         Returns:
             回写的缓存行数.
@@ -423,12 +423,12 @@ class L2Cache(CacheBase):
         return count
 
     def invalidate_all(self) -> int:
-        """使全部缓存行失效 (不写回).
+        """使全部缓存行失效, 不做回写.
 
         调用动态链接库加速执行后: Rust 已直接修改 bytearray,
-        L2 中的旧缓存行 (包括脏行) 全部过时, 必须无条件丢弃。
+        L2 缓存中的旧缓存行全部过时, 无论是否为脏行, 必须无条件丢弃。
         脏行数据已回写, 此处再写回会覆盖动态链接库在一轮加速过程中对同一物理地址的修改，
-        避免页表/栈数据污染。
+        并污染页表/栈数据。
 
         Returns:
             失效的缓存行数.

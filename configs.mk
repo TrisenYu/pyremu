@@ -15,21 +15,24 @@ linux_dir   = $(bsp_dir)/linux
 NATIVE_DIR     = pyremu/_native
 NATIVE_SO      = $(NATIVE_DIR)/libdecode.so
 TERMIO_SO      = $(NATIVE_DIR)/libtermio.so
-# 额外 cargo flags。
-# PYREMU_DIAG_LOG / PYREMU_TRACE_SRET 已指定时自动启用 diagnostic feature。
 CARGO_FLAGS    ?=
-ifneq ($(or $(PYREMU_DIAG_LOG),$(PYREMU_TRACE_SRET)),)
-  CARGO_FLAGS += --features diagnostic
-endif
 NATIVE_SRC = $(shell find $(NATIVE_DIR)/cpu $(NATIVE_DIR)/termio -type f -name '*.rs') \
              $(NATIVE_DIR)/Cargo.toml $(NATIVE_DIR)/cpu/Cargo.toml $(NATIVE_DIR)/termio/Cargo.toml
 
 # ---- 模拟器硬件特性 (隔离到 emu-configs.mk) ----
 include emu-configs.mk
 
+# 任一诊断布尔开关置 1 即启用 _native 的 diagnostic feature.
+# 必须放在 include emu-configs.mk 之后: ?= 默认值到那时才可见 (旧实现于
+# include 之前判定, 导致 DIAG_* 变量永远不影响构建). PYREMU_DIAG_LOG 只作
+# 日志路径, 不参与本判定 (它默认非空, 纳入会退化为始终开启).
+ifneq ($(filter 1,$(PYREMU_TRACE_SRET) $(PYREMU_TRACE_TRAPS) $(PYREMU_TRACE_PMP)),)
+  CARGO_FLAGS += --features diagnostic
+endif
+
 # ---- 路径配置 ----
 hart_num = 3
-kei-sav = $(firm_dir)/kei.sav.bin
+kei-sav = $(firm_dir)/kei.sav
 
 fw_payload     = $(elf_dir)/custom_opensbi_fw_payload.elf
 fw_jump        = $(elf_dir)/custom_opensbi_fw_jump.elf
@@ -38,20 +41,20 @@ fw_dynamic     = $(elf_dir)/custom_opensbi_fw_dynamic.elf
 # opensbi
 # Rust S-mode 可信管理程序 (相应的段将嵌入到固件)
 FW_SRC_DIR     = $(bsp_dir)/custom-opensbi
-RUST_SMODE_DIR = $(bsp_dir)/rust_smode_entry
+SITTIM_DIR = $(bsp_dir)/sittim
 FW_BUILD_DIR   = $(FW_SRC_DIR)/build/platform/generic/firmware
-RUST_SMODE_BIN = $(RUST_SMODE_DIR)/rust_smode_entry.bin
+SITTIM_BIN = $(SITTIM_DIR)/sittim.bin
 
 # 调试器参数
 pyargs = --ram-base=0x80000000 \
-	--preload=$(kei_sav) \
+	--preload=${kei-sav} \
 	--hart=$(hart_num) \
 	$(fw_payload)
 
 # ---- 固件构建 ----
 # 全量编译 opensbi (generic 平台, 跳过 BSS 清零).
 # 依赖:
-#   - Rust S-mode runtime (嵌入 .coffer_enclave_man 段)
+#   - Rust S-mode runtime (嵌入 .sittim 段)
 #   - opensbi 自身全部源码 (firmware/lib/include/platform/Kconfig/scripts)
 # 当任一依赖更新或产物缺失时自动触发 distclean + 全量重编译.
 FW_SRC_DEPS := $(FW_SRC_DIR)/Makefile
@@ -89,8 +92,8 @@ FW_JUMP_FLAGS += FW_JUMP=y
 FW_JUMP_FLAGS += FW_JUMP_ADDR=0x80200000
 
 # ---- Linux 内核启动 ----
-# fw_payload 模式: Linux Image 嵌入 OpenSBI, 经 M->S 移交直接启动 (ZSBL 设 coldboot_done=1)。
-# fw_jump 模式: OpenSBI mret -> 0x80200000, 内核 Image 预载该地址, vmlinux 供调试符号。
+# fw_payload 模式: Linux Image 嵌入 OpenSBI, 经 M 模式向 S 模式移交后直接启动 (ZSBL 设 coldboot_done=1)。
+# fw_jump 模式: OpenSBI 经 mret 跳至 0x80200000, 内核 Image 预载该地址, vmlinux 供调试符号。
 LINUX_IMG        = $(linux_dir)/arch/riscv/boot/Image
 LINUX_VMLINUX    = $(linux_dir)/vmlinux
 fw_payload_linux = $(elf_dir)/custom_opensbi_fw_payload_linux.elf
@@ -109,7 +112,9 @@ INITRD     ?=
 #   自动只读打开。覆盖: make emu-linux DISK=/path/to/other.ext4
 DISK       ?= $(bsp_dir)/setup-rootfs/debootstrap/riscv-sd.ext4
 # ram / rdinit 可覆盖; 挂载 initramfs 时建议加大 RAM (全量驻留内存)。
-ram        ?= 2G
+# 6G: 飞地内存池 (RESERVED_MEM_SIZE, 见 emu-configs.mk) 自 0x83000000 起占用
+# 2.25 GiB, 尾部到 ~4.30 GiB, 其余留给内核、根文件系统与 initramfs.
+ram        ?= 6G
 rdinit     ?= /bin/bash
 
 

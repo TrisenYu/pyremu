@@ -8,10 +8,10 @@
 """
 翻译后备缓冲器 (Translation Lookaside Buffer, TLB).
 
-TLB 缓存最近使用的虚拟页号 (VPN) -> 物理页号 (PPN) 映射,
-加速从虚拟地址到物理地址的转换, 避免每次内存访问都遍历页表。
+TLB 缓存最近使用的虚拟页号 (VPN) 与物理页号 (PPN) 的对应关系,
+加速虚拟地址到物理地址的转换, 避免每次内存访问都遍历页表。
 
-重构为继承 CacheBase 抽象基类, 统一缓存管理框架。
+继承 CacheBase 抽象基类, 复用统一的缓存管理框架。
 """
 
 from dataclasses import dataclass
@@ -19,8 +19,8 @@ from dataclasses import dataclass
 from pyremu.configs_aux import cfg_bool
 from pyremu.memory.cache_base import CacheBase, CacheLineBase, ReplacementPolicy
 
-# PYREMU_NO_TLB 停用 TLB: 查询与插入一并跳过 (与 Bus 中 PYREMU_NO_L2 对 L2
-# 缓存的整体旁路一致), 每次地址翻译都完整遍历 Sv39 页表.
+# PYREMU_NO_TLB 关闭 TLB: 查询与插入一并跳过, 与 Bus 中 PYREMU_NO_L2 对 L2 缓存的
+# 整体旁路一致, 每次地址翻译都完整遍历 Sv39 页表.
 
 
 @dataclass
@@ -44,10 +44,10 @@ class TLBLine(CacheLineBase):
 
 
 class TLB(CacheBase):
-    """全相联 TLB, 继承 CacheBase 提供 VPN->PPN 映射缓存.
+    """全相联 TLB, 继承 CacheBase 提供 VPN 到 PPN 的映射缓存.
 
     默认 FIFO 替换策略, 支持按 VPN 查找/插入/刷新。
-    保持与旧版兼容的 lookup/insert/flush 接口。
+    对外提供 lookup/insert/flush 接口。
 
     Usage:
         tlb = TLB(size=256)
@@ -78,7 +78,7 @@ class TLB(CacheBase):
         return entry.tag == key
 
     def _on_evict(self, entry: CacheLineBase) -> None:
-        """TLB 逐出无额外操作 (无需回写)."""
+        """TLB 逐出时无需回写, 无额外操作."""
         pass
 
     # ----------------------------------------------------------
@@ -89,7 +89,7 @@ class TLB(CacheBase):
         """在 TLB 中查找 vpn.
 
         ASID 非零时仅匹配相同 ASID 的条目 — 不同的地址空间不共享映射,
-        进程切换换 ASID 后无需 SFENCE.VMA (ASID-tagged TLB 语义).
+        进程切换 ASID 后无需 SFENCE.VMA, 即带 ASID 标记的 TLB 语义.
 
         设置 PYREMU_NO_TLB 时恒返回未命中, 调用方转而完整遍历页表.
         """
@@ -152,11 +152,11 @@ class TLB(CacheBase):
         self._tag_to_idx[vpn] = idx
 
     def flush(self, vpn: int = 0, asid: int = 0) -> None:
-        """刷新 TLB.  单 VPN 刷新为 O(1) via _tag_to_idx.
+        """刷新 TLB.  单 VPN 刷新为 O(1), 经 _tag_to_idx 直接定位.
 
         Args:
             vpn: 若为 0 则刷新全部; 否则仅刷新匹配该 VPN 的条目.
-            asid: 暂未使用 (预留, 配合 ASID 做按地址空间刷新).
+            asid: 暂未使用, 预留给按地址空间刷新.
         """
         if vpn == 0:
             self.flush_all()
@@ -173,7 +173,7 @@ class TLB(CacheBase):
                 e.level = 0
 
     def flush_all(self) -> None:
-        """刷新全部条目 (基类实现扫描全部槽位).
+        """刷新全部条目; 基类实现扫描全部槽位.
 
         PYREMU_NO_TLB 下条目恒为空, 直接返回, 省去每次 csrw satp 与
         SFENCE.VMA 引发的整表扫描.
@@ -183,7 +183,7 @@ class TLB(CacheBase):
         super().flush_all()
 
     def flush_by_mdid(self, mdid: int) -> int:
-        """按内存域 ID 刷新条目 (基类实现扫描全部槽位).
+        """按内存域 ID 刷新条目; 基类实现扫描全部槽位.
 
         PYREMU_NO_TLB 下条目恒为空, 无条目可刷, 返回 0.
         """
@@ -206,11 +206,11 @@ class TLB(CacheBase):
 
     @property
     def size(self) -> int:
-        """返回 TLB 容量 (总槽位数)."""
+        """返回 TLB 容量."""
         return self._num_entries
 
 def decode_tlb_perm(perm: int) -> str:
-    """TLB 权限位 -> 可读字符串: 0b1111 -> 'RWXU'."""
+    """把 TLB 权限位转换为可读字符串, 如 0b1111 得到 'RWXU'."""
     r = "R" if perm & 1 else "-"
     w = "W" if perm & 2 else "-"
     x = "X" if perm & 4 else "-"

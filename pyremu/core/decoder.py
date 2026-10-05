@@ -22,14 +22,14 @@ ecall/ebreak:    func12   rs1 func3 rd opcode
 import ctypes
 
 from pyremu._native import (
-    decode_compressed as _native_decode_compressed,
-    decode_fields as _native_decode_fields,
-    exec_alu_op as _native_alu_op,
-    exec_op32 as _native_op32,
-    exec_op_imm as _native_op_imm,
-    exec_op_imm32 as _native_op_imm32,
-    fp_exec_fma as _native_fp_fma,
-    fp_exec_op as _native_fp_op,
+    decode_compressed,
+    decode_fields,
+    exec_alu_op,
+    exec_op32,
+    exec_op_imm,
+    exec_op_imm32,
+    fp_exec_fma,
+    fp_exec_op,
     native_available,
 )
 from pyremu.core.hart import HartWithRegs
@@ -317,7 +317,7 @@ def _flush_tlbs(origin, vpn: int | None, all_harts: list | None) -> None:
 
 
 class Hart(HartWithRegs):
-    # 32-bit 指令分发表: opcode (int 0..127) -> handler 方法名 (O(1) dispatch)
+    # 32-bit 指令分发表: opcode 映射到处理方法名, 索引取值为整数 0 到 127, 分发复杂度为 O(1)
     _DISPATCH: dict[int, str] = {
         0b01100_11: "handle_alu",       # Opc.op
         0b00100_11: "handle_op_imm",    # Opc.opImm
@@ -346,16 +346,17 @@ class Hart(HartWithRegs):
     #  R-type ALU (opcode = Opc.op)
     # ----------------------------------------------------------
     def handle_alu(self, instr: int) -> int:
-        """Execute an R-type ALU instruction on this hart."""
+        """执行 R 型 ALU 指令."""
         f = self._f
         v1, v2 = self.gprs[f.rs1], self.gprs[f.rs2]
 
         if native_available():
-            r = _native_alu_op(f.func3, f.func7, v1, v2)
+            r = exec_alu_op(f.func3, f.func7, v1, v2)
             if not r.trap:
                 self.gprs[f.rd] = r.value
                 return 4
-            # Zbb (funct7 in {0x05, 0x20, 0x30}): fallback to Python
+            # funct7 属于 Zbb 扩展的 {0x05, 0x20, 0x30}: 加速执行引擎的 alu 辅助
+            # 函数对这些编码返回无效编码, 故在此交由 _zbb_alu 计算
             if f.func7 in (0x05, 0x20, 0x30):
                 result = _zbb_alu(f.func3, f.func7, v1, v2)
                 if f.rd != 0:
@@ -365,7 +366,7 @@ class Hart(HartWithRegs):
                 f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
             )
 
-        # -- 纯 Python fallback (.so 缺失或调试时使用) --
+        # -- 纯 Python 路径, 加速执行引擎动态库缺失或调试时使用 --
         part1, part2 = f.func3, f.func7
         if part1 == 0b000:
             if part2 == 0:
@@ -447,16 +448,17 @@ class Hart(HartWithRegs):
     #  I-type ALU (opcode = Opc.opImm)
     # ----------------------------------------------------------
     def handle_op_imm(self, instr: int) -> int:
-        """Execute an I-type immediate ALU instruction."""
+        """执行 I 型立即数 ALU 指令."""
         f = self._f
         v1 = self.gprs[f.rs1]
 
         if native_available():
-            r = _native_op_imm(f.func3, f.func7, v1, f.imm12_se)
+            r = exec_op_imm(f.func3, f.func7, v1, f.imm12_se)
             if not r.trap:
                 self.gprs[f.rd] = r.value
                 return 4
-            # Zbb (funct7=0x30): native 未实现, fallback 到 Python
+            # funct7 属于 Zbb 扩展的 0x30: 加速执行引擎的 alu 辅助函数对该编码
+            # 返回无效编码, 故在此交由 _zbb_imm 计算
             if f.func7 != 0x30:
                 raise ValueError(
                     f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
@@ -466,7 +468,7 @@ class Hart(HartWithRegs):
                 self.gprs[f.rd] = result
             return 4
 
-        # -- 纯 Python fallback --
+        # -- 纯 Python 路径 --
         part1 = f.func3
         part6 = f.func7 >> 1
         imm = f.imm12_se
@@ -516,16 +518,17 @@ class Hart(HartWithRegs):
     #  RV64 32-bit word operations (opcode = Opc.op32)
     # ----------------------------------------------------------
     def handle_op32(self, instr: int):
-        """Execute an RV64 32-bit word operation (e.g. ADDW, SUBW, SLLW, etc.)."""
+        """执行 RV64 的 32 位字运算指令, 如 ADDW、SUBW、SLLW 等."""
         f = self._f
         v1, v2 = self.gprs[f.rs1], self.gprs[f.rs2]
 
         if native_available():
-            r = _native_op32(f.func3, f.func7, v1, v2)
+            r = exec_op32(f.func3, f.func7, v1, v2)
             if not r.trap:
                 self.gprs[f.rd] = r.value
                 return 4
-            # Zbb (funct7=0x30, funct3 ∈ {001, 101}): fallback
+            # funct7 属于 Zbb 扩展的 0x30 且 funct3 为 001 或 101: 加速执行引擎的
+            # alu 辅助函数对这些编码返回无效编码, 故在此交由 _zbb_alu32 计算
             if f.func7 == 0x30 and f.func3 in (0b001, 0b101):
                 result = _zbb_alu32(f.func3, f.func7, v1, v2)
                 if f.rd != 0:
@@ -535,7 +538,7 @@ class Hart(HartWithRegs):
                 f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
             )
 
-        # -- 纯 Python fallback --
+        # -- 纯 Python 路径 --
         part1, part2 = f.func3, f.func7
         v1 = mask32(v1)
         v2 = mask32(v2)
@@ -634,26 +637,27 @@ class Hart(HartWithRegs):
     #  I-type immediate word operations (opcode = Opc.opImm32)
     # ----------------------------------------------------------
     def handle_op_imm32(self, instr: int):
-        """Execute an I-type 32-bit word immediate ALU instruction (ADDIW, SLLIW, etc.)."""
+        """执行 I 型 32 位字立即数 ALU 指令, 如 ADDIW、SLLIW 等."""
         f = self._f
         v1 = self.gprs[f.rs1]
 
         if native_available():
-            r = _native_op_imm32(f.func3, f.func7, v1, f.imm12_se)
-            if r.trap:
-                # Zbb (funct7=0x30): fallback to Python
-                if f.func7 != 0x30:
-                    raise ValueError(
-                        f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
-                    )
-                result = _zbb_imm32(f.func3, v1, f.imm12_se & 0x1F)
-                if f.rd != 0:
-                    self.gprs[f.rd] = result
+            r = exec_op_imm32(f.func3, f.func7, v1, f.imm12_se)
+            if not r.trap:
+                self.gprs[f.rd] = r.value
                 return 4
-            self.gprs[f.rd] = r.value
+            # funct7 属于 Zbb 扩展的 0x30: 加速执行引擎的 alu 辅助函数对该编码
+            # 返回无效编码, 故在此交由 _zbb_imm32 计算
+            if f.func7 != 0x30:
+                raise ValueError(
+                    f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
+                )
+            result = _zbb_imm32(f.func3, v1, f.imm12_se & 0x1F)
+            if f.rd != 0:
+                self.gprs[f.rd] = result
             return 4
 
-        # -- 纯 Python fallback --
+        # -- 纯 Python 路径 --
         part1, part7 = f.func3, f.func7
         imm = f.imm12_se
         shamt = f.imm12_se & 0x1F
@@ -824,10 +828,11 @@ class Hart(HartWithRegs):
         return 4
 
     # ----------------------------------------------------------
-    #  F/D floating point (opcode = opfp/stfp/opFp/fmadd…)
+    #  F/D 浮点指令 (opcode = opfp/stfp/opFp/fmadd…)
     #
-    #  计算委托给 native softfloat (fp_exec_op/fp_exec_fma);
-    #  Python 侧仅负责寄存器/内存路由与 NaN-boxing。无纯 Python FPU。
+    #  计算委托给加速执行引擎的 softfloat, 入口为 fp_exec_op 与 fp_exec_fma,
+    #  单精度结果的高 32 位由该引擎填为全 1 以设置为 NaN; Python 侧仅负责寄存器与内存的路由,
+    #  并在 FLW 载入 32 位浮点数时做同样的填充.
     # ----------------------------------------------------------
 
     _NANBOX_S = 0xFFFF_FFFF_0000_0000
@@ -898,7 +903,7 @@ class Hart(HartWithRegs):
         return 4
 
     def handle_fp_op(self, instr: int) -> int:
-        """OP-FP — 算术/转换/比较/符号/分类/移动 (native 计算)。"""
+        """OP-FP — 算术、转换、比较、符号、分类、移动指令, 计算委托给加速执行引擎."""
         if not self._fp_enabled():
             raise ValueError("FP disabled (mstatus.FS=Off)")
         f = self._f
@@ -909,7 +914,7 @@ class Hart(HartWithRegs):
         else:
             rs1_bits = self._fpr_bits[f.rs1]
         rs2_bits = self._fpr_bits[f.rs2]
-        out = _native_fp_op(f.func7, f.func3, f.rs2, rs1_bits, rs2_bits, self._fp_frm())
+        out = fp_exec_op(f.func7, f.func3, f.rs2, rs1_bits, rs2_bits, self._fp_frm())
         if out.trap:
             raise ValueError(f"invalid OP-FP funct7={f.func7:#x} funct3={f.func3:#x}")
         if out.to_gpr:
@@ -922,11 +927,11 @@ class Hart(HartWithRegs):
         return 4
 
     def handle_fp_fma(self, instr: int) -> int:
-        """FMADD/FMSUB/FNMSUB/FNMADD — 融合乘加 (native 计算)。"""
+        """FMADD/FMSUB/FNMSUB/FNMADD — 合并乘加指令, 计算委托给加速执行引擎."""
         if not self._fp_enabled():
             raise ValueError("FP disabled (mstatus.FS=Off)")
         f = self._f
-        out = _native_fp_fma(
+        out = fp_exec_fma(
             f.opcode, f.func3, f.fmt,
             self._fpr_bits[f.rs1], self._fpr_bits[f.rs2], self._fpr_bits[f.rs3],
             self._fp_frm(),
@@ -978,7 +983,7 @@ class Hart(HartWithRegs):
                 return 0
             val = int.from_bytes(data_bytes, "little", signed=False) & mask
             if rd != 0:
-                # LR.D: 64-bit 值不需要符号扩展; LR.W: 32->64 符号扩展
+                # LR.D: 64-bit 值不需要符号扩展; LR.W: 由 32-bit 符号扩展到 64-bit
                 self.gprs[rd] = val if is_64bit else sext32(val)
             self.set_reservation(addr, val)
             return 4
@@ -1216,7 +1221,7 @@ class Hart(HartWithRegs):
 
     @staticmethod
     def _creg(n: int) -> int:
-        """3-bit 压缩寄存器号 -> 完整寄存器号 (x8-x15)."""
+        """把 3-bit 压缩寄存器号转换为完整寄存器号, 结果范围为 x8 到 x15."""
         return (n & 0x7) + 8
 
     # -- C0: Quadrant 0 (低 2 位 = 00) --
@@ -1344,7 +1349,7 @@ class Hart(HartWithRegs):
                     raise ValueError("C.ADDI16SP: nzuimm must be non-zero")
                 self.gprs[2] = mask64((self.gprs[2] + nz))
             else:
-                # C.LUI: nz 已 6-bit 符号扩展 -> 左移 12
+                # C.LUI: nz 已按 6-bit 符号扩展, 随后左移 12 位
                 if nz == 0:
                     raise ValueError("C.LUI: nzuimm must be non-zero")
                 self.gprs[rd_raw] = mask64((nz << 12))
@@ -1575,7 +1580,7 @@ class Hart(HartWithRegs):
             0: PC 已被该指令修改 (跳转/trap 等), 调用方不追加 PC
         """
         # 预解码全部字段 — 避免 C0/C1/C2 处理器中重复的位提取
-        self._cf = _native_decode_compressed(instr)
+        self._cf = decode_compressed(instr)
         op = self._cf.quadrant
         if op == 0:
             return self._handle_compressed_c0(instr)
@@ -1602,7 +1607,7 @@ class Hart(HartWithRegs):
             - 0: PC 已被该指令修改 (分支跳转/JAL/JALR/MRET/SRET/trap)
         """
         # 预解码全部字段 — 一次 FFI 调用替代逐个 parse_* Python 调用
-        f = _native_decode_fields(instr)
+        f = decode_fields(instr)
         self._f = f
 
         # 16-bit 压缩指令 — 非法编码触发 IllInstr 陷态

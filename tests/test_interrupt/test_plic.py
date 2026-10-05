@@ -171,7 +171,7 @@ class TestThreshold:
         assert _read_u32(plic, _context_threshold_offset(0)) == 4
 
     def test_threshold_blocks_lower_priority(self, plic):
-        """阈值 3 -> 优先级 <= 3 的中断不应触发."""
+        """阈值 3 时, 优先级 <= 3 的中断不应触发."""
         _write_u32(plic, _context_threshold_offset(0), 3)
         _write_u32(plic, _priority_offset(10), 2)  # 低于阈值
         _write_u32(plic, _enable_offset(0, 0), 1 << 10)
@@ -179,7 +179,7 @@ class TestThreshold:
         assert _read_u32(plic, _context_claim_offset(0)) == 0  # 不触发
 
     def test_threshold_allows_higher_priority(self, plic):
-        """阈值 3 -> 优先级 > 3 的中断正常触发."""
+        """阈值 3 时, 优先级 > 3 的中断正常触发."""
         _write_u32(plic, _context_threshold_offset(0), 3)
         _write_u32(plic, _priority_offset(10), 5)  # 高于阈值
         _write_u32(plic, _enable_offset(0, 0), 1 << 10)
@@ -220,13 +220,13 @@ class TestArbitration:
     def test_not_enabled_ignored(self, plic):
         _write_u32(plic, _priority_offset(5), 7)
         plic.set_irq(5, True)
-        # 不设置 enable -> 不触发
+        # 不使能则不触发
         assert _read_u32(plic, _context_claim_offset(0)) == 0
 
     def test_not_pending_ignored(self, plic):
         _write_u32(plic, _priority_offset(5), 7)
         _write_u32(plic, _enable_offset(0, 0), 1 << 5)
-        # 不设 pending -> 不触发
+        # 不设置中断挂起则不触发
         assert _read_u32(plic, _context_claim_offset(0)) == 0
 
     def test_zero_priority_ignored(self, plic):
@@ -323,7 +323,7 @@ class TestDualContext:
     """
 
     def test_s_context_returns_seip(self, plic):
-        # 源使能于 hart0 的 S-context (ctx 1) -> SEIP, 而非 MEIP
+        # 源使能于 hart0 的 S-context ctx 1 时得到 SEIP, 而非 MEIP
         _write_u32(plic, _priority_offset(10), 3)
         _write_u32(plic, _enable_offset(1, 0), 1 << 10)
         plic.set_irq(10, True)
@@ -343,7 +343,7 @@ class TestDualContext:
         assert plic.get_pending_mip(0) == ((1 << 11) | (1 << 9))
 
     def test_hart1_s_context_isolated(self, plic):
-        # hart1 的 S-context = ctx 3; hart0 未使能 -> 仅 hart1 得 SEIP
+        # hart1 的 S-context = ctx 3; hart0 未使能则仅 hart1 得 SEIP
         _write_u32(plic, _priority_offset(7), 2)
         _write_u32(plic, _enable_offset(3, 0), 1 << 7)
         plic.set_irq(7, True)
@@ -379,12 +379,12 @@ class TestMultiSource:
 
 
 class TestLevelRetrigger:
-    """complete 时设备电平仍高 ->pending 重新置位 (QEMU sifive_plic gateway 语义).
+    """complete 时设备电平仍高则 pending 重新置位, 与 QEMU sifive_plic gateway 语义一致.
 
-    回归背景: UART TX watermark 为电平中断; sifive 驱动 ISR 每次仅发送
-    FIFO 深度 (8) 个字符, 期间 TXDATA 写由 Rust inline 处理, 不再有任何
-    Python 侧设备访问调用 set_irq。旧行为 claim 清 pending 后无人重新拉线
-    ->complete 后中断永久丢失, 剩余 TX 数据滞留内核环形缓冲。
+    UART TX watermark 为电平中断; sifive 驱动 ISR 每次仅发送
+    FIFO 深度的 8 个字符, 期间 TXDATA 写由 Rust inline 处理, 不再有任何
+    Python 侧设备访问调用 set_irq。旧行为在 claim 清 pending 后不再置位电平,
+    complete 后中断永久丢失, 剩余 TX 数据留在内核环形缓冲。
     """
 
     def test_complete_reraises_when_level_still_high(self, plic):
@@ -420,7 +420,7 @@ class TestLevelRetrigger:
         # 第一轮 claim+complete
         assert _read_u32(plic, _context_claim_offset(0)) == 7
         _write_u32(plic, _context_claim_offset(0), 7)
-        # complete 时电平仍高 ->pending 必须重挂
+        # complete 时电平仍高则 pending 必须重挂
         assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) != 0, (
             "第一轮 complete: 电平仍高但 pending 未重挂 — "
             "TX 中断在第一批 8 字符后永久丢失"
@@ -449,7 +449,7 @@ class TestLevelRetrigger:
 
         # claim -> 验证 pending 清但 level 保留
         assert _read_u32(plic, _context_claim_offset(0)) == 7
-        # 不做任何 set_irq, 直接 complete -> level 仍高 -> pending 重挂
+        # 不做任何 set_irq 调用, 直接执行 complete, 此时电平仍为高, pending 重新挂起
         _write_u32(plic, _context_claim_offset(0), 7)
         assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) != 0
 
@@ -458,5 +458,5 @@ class TestLevelRetrigger:
         # 现在设备拉低电平 (如 UART IE 关闭)
         plic.set_irq(7, False)
         _write_u32(plic, _context_claim_offset(0), 7)  # complete
-        # level 已为低 -> pending 必须保持低
+        # level 已为低则 pending 必须保持低
         assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) == 0

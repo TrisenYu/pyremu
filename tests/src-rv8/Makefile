@@ -68,7 +68,7 @@ clean:
 	rm -f $(O_PROGS) $(D_FILES)
 phony += clean
 
-# ---- 编译 + strip 规则: $(eval) 展开 O3/O2/Os × .c/.cc (1 模板 -> 每个 opt 3 规则) ----
+# ---- 编译 + strip 规则: $(eval) 展开 O3/O2/Os × .c/.cc (1 模板展开为每个 opt 3 规则) ----
 define compile_opt
 $(OUT_DIR)/%_$(1).o: %.c
 	@mkdir -p $$(@D)

@@ -1,0 +1,48 @@
+[package]
+name = "sittim"
+version = "0.2.0"
+edition = "2024"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[features]
+## 特性1: 固件
+# 固件目标 (bin) 的启用开关. bin 含 RISC-V 汇编与 ecall, 只能在目标上编译;
+# 主机上执行 cargo test 时该特性不打开, bin 因此不参与构建, tests/ 下的
+# 纯逻辑测试入口才能单独编译.
+firm = []
+
+## 特性2: 诊断
+# 编译时启用诊断输出.
+# 通过 make DIAGNOSTIC=1 或 cargo --features diagnostic 开启.
+diagnostic = []
+
+
+[[bin]]
+name = "sittim"
+path = "src/main.rs"
+required-features = ["firm"]
+
+[dependencies]
+elf = { version = "0.8.0", default-features = false }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
+sha2 = { version = "0.11.0", default-features = false }
+sm3 = { version = "0.5.0", default-features = false }
+
+# 协议栈取用 smoltcp.
+# 所选特性不含：
+#   - 使用到f64的拥塞控制实现 socket-tcp-cubic
+#   - 默认特性。从而不要求内存分配器的实现
+#   - IPv4报文分片
+smoltcp = { version = "0.14", default-features = false, features = [
+	"medium-ethernet",
+	"proto-ipv4",
+	"socket-udp",
+] }

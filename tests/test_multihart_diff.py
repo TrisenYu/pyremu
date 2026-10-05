@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """多核差分测试: 验证跨 hart CSR 隔离、IPI 投递、TLB 一致性.
 
-每个测试同步验证 Python 和 Rust native batch 两条路径, 差异即 bug.
+每个测试同步验证 Python 和 Rust 加速执行批次两条路径, 差异即 bug.
 设计原则: 每条测试用最少的指令, 直接断言预期行为.
 """
 
@@ -171,13 +171,13 @@ class TestCrossHartMsip:
         assert emu.clint._msip[1] == 1, f"MSIP[1]={emu.clint._msip[1]}"
 
     def test_msip_reset_during_batch_survives_unmarshal(self):
-        """batch 期间新 IPI 的电平必须保留到下一轮, 不得被旧电平反向清除.
+        """batch 期间新 IPI 的电平必须保留到下一轮, 不得被旧电平清除.
 
-        回归: 旧实现用 batch 前的 MSIP 电平 (旧 IPI 已挂起) 反向清除
-        CLINT._msip。若 batch 执行期间旧 IPI 的 handler 写 0 清电平、随后
-        另一 hart 写入新 IPI (电平重新置 1), 而目标 hart 的 sync_msip 尚未
-        消费该电平 (mip.MSIP == 0), 则该新 IPI 被误清零 -> 发送方永远自旋
-        在 OpenSBI tlb_sync 等待确认 -> TLB-shootdown 死锁。
+        旧实现以 batch 前的 MSIP 电平清除 CLINT._msip, 而该电平在 batch 开始前
+        已挂起。若 batch 执行期间旧 IPI 的 handler 写 0 清除电平, 随后另一 hart
+        写入新 IPI 使电平重新置 1, 而目标 hart 的 sync_msip 尚未消费该电平且
+        mip.MSIP 为 0, 则该新 IPI 被一并清除, 发送方永远自旋在 OpenSBI tlb_sync
+        等待确认, 形成 TLB-shootdown 死锁。
         """
         cfg = PlatformConfig(num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024)
         emu = Emulator(cfg, bootargs="")
@@ -188,8 +188,8 @@ class TestCrossHartMsip:
         def _stub_batch(*_args, **_kwargs):
             # 模拟 Rust 加速执行结果:
             # 1) 目标 hart 1 的 handler 写 0 清除旧 MSIP
-            # 2) 随后另一 hart 写入新 IPI -> msip 数组电平位重新置 1
-            # 3) 目标 hart 的 sync_msip 尚未消费该电平 -> mip.MSIP 保持 0
+            # 2) 随后另一 hart 写入新 IPI, msip 数组电平位重新置 1
+            # 3) 目标 hart 的 sync_msip 尚未消费该电平, mip.MSIP 保持 0
             emu._clint_msip_arr[1] = 1
             emu._speedup_hart_states[1].mip &= ~(1 << 3)
             return None
@@ -415,8 +415,8 @@ class TestHardwareMipClear:
     """验证硬件源中断撤除后 mip 对应位被清除, 不产生虚假中断重入.
 
     对应 bug: check_pending_interrupts 仅 OR 累加硬件 mip 位,
-    CLINT MSIP 清零后旧位仍残留 mip CSR -> 无限 MmodeSoftInterrupt 重投递
-    -> 两个 hart 在 M-mode trap handler 之间往返, 无法推进.
+    CLINT MSIP 清零后旧位仍残留 mip CSR, 导致无限 MmodeSoftInterrupt 重投递,
+    两个 hart 在 M-mode trap handler 之间往返, 无法推进.
     """
 
     def test_msip_cleared_after_clint_write_zero(self):
@@ -431,7 +431,7 @@ class TestHardwareMipClear:
         set_mie(h0, 1 << 3)  # MSIE
         h0.csrs["mtvec"].val = 0x80000000
 
-        # Step 1: 设置 MSIP -> mip 应有 MSIP
+        # Step 1: 设置 MSIP 后 mip 应有 MSIP
         set_msip(clint, 0, 1)
         has_pending, mip_bits, _ = clint.check_interrupt(0)
         assert has_pending and (mip_bits & (1 << 3)), "MSIP=1 时应 pending"
@@ -445,7 +445,7 @@ class TestHardwareMipClear:
         clint.clear_ipi(0)
         assert clint._msip[0] == 0, "clear_ipi 后 MSIP 应为 0"
 
-        # Step 3: 模拟 mret -> 恢复 MIE
+        # Step 3: 模拟 mret 后恢复 MIE
         h0._csr_write_raw("mstatus", h0.mstatus_val | MSTATUS_MIE)
         assert h0.mie, "mret 后 MIE 应恢复为 1"
 
@@ -502,7 +502,7 @@ class TestHardwareMipClear:
         )
 
     def test_msip_clear_prevents_spurious_retrap_loop(self):
-        """模拟 MSIP 风暴场景: IPI -> trap -> clear -> mret -> 应安静, 不重入.
+        """模拟 MSIP 风暴场景: 依次执行 IPI、trap、clear 与 mret 后不重入.
 
         这是诊断中观察到的真实故障模式: 两个 hart 在 M-mode 之间无限往返,
         每次 ~5500 traps/10s, 900s 内共投递 214K 次 MSIP 中断.
@@ -540,7 +540,7 @@ class TestHardwareMipClear:
         )
 
     def test_cross_hart_msip_no_storm(self):
-        """跨 hart 完整流程: Hart 0 发 IPI -> Hart 1 收到 -> 清除 -> 不重入."""
+        """跨 hart 完整流程: Hart 0 发 IPI, Hart 1 收到后清除, 不重入."""
         bus = Bus(ram_base=0x80000000, ram_size=128 * 1024 * 1024)
         clint = CLINT(num_harts=2)
         h0 = make_hart(0, bus, clint, make_pmp())
@@ -583,7 +583,7 @@ class TestMsipClearViaMemWritePhy:
     """
 
     def test_msip_clear_via_bus_write(self):
-        """通过 Bus.write 写 CLINT MSIP=0 -> 中断应撤除, 不重投递."""
+        """通过 Bus.write 写 CLINT MSIP=0 后, 再次检查挂起中断不再投递."""
         bus = Bus(ram_base=0x80000000, ram_size=128 * 1024 * 1024)
         clint = CLINT(num_harts=2)
         bus.add_device(0x02000000, clint)
@@ -614,10 +614,10 @@ class TestMsipClearViaMemWritePhy:
         )
 
     def test_msip_clear_via_mem_write_phy(self):
-        """通过 _mem_write_phy 写 CLINT MSIP=0 -> 中断撤除, 不重投递.
+        """通过 _mem_write_phy 写 CLINT MSIP=0 后, 再次检查挂起中断不再投递.
 
         这是 OpenSBI 代码在模拟器中实际走过的路径: _mem_write_phy(PA, data)
-        -> Bus.write -> CLINT.write. 专用于检测 _mem_write_phy/Bus 层路由缺陷.
+        再经 Bus.write 到 CLINT.write. 专用于检测 _mem_write_phy/Bus 层路由缺陷.
         """
         bus = Bus(ram_base=0x80000000, ram_size=128 * 1024 * 1024)
         clint = CLINT(num_harts=2)
@@ -685,7 +685,7 @@ class TestMsipClearViaMemWritePhy:
         )
 
     def test_msip_double_set_clear_via_mem_write_phy(self):
-        """连续两次 MSIP 置位->清零, 每次清零后都不应重入."""
+        """连续两次 MSIP 置位后清零, 每次清零后都不应重入."""
         bus = Bus(ram_base=0x80000000, ram_size=128 * 1024 * 1024)
         clint = CLINT(num_harts=2)
         bus.add_device(0x02000000, clint)
@@ -712,7 +712,7 @@ class TestMsipClearViaMemWritePhy:
             )
 
     def test_msip_clear_must_go_through_bus_not_skip(self):
-        """验证 _mem_write_phy -> Bus.write 路由未被绕过.
+        """验证 _mem_write_phy 到 Bus.write 的路由未被绕过.
 
         如果 _mem_write_phy 没有正确调用 Bus.write, CLINT 不会收到清零,
         这是本次诊断发现的实际缺陷路径.
@@ -752,7 +752,7 @@ class TestCrossHartMemWritePhyIpi:
     """跨 hart IPI 完整流程: 通过 _mem_write_phy 发/清 IPI."""
 
     def test_cross_hart_ipi_via_mem_write_phy(self):
-        """Hart 0 通过 _mem_write_phy 发 IPI -> Hart 1 收到 -> 清除 -> 不重入."""
+        """Hart 0 通过 _mem_write_phy 发 IPI, Hart 1 收到后清除, 不重入."""
         bus = Bus(ram_base=0x80000000, ram_size=128 * 1024 * 1024)
         clint = CLINT(num_harts=2)
         bus.add_device(0x02000000, clint)
@@ -795,8 +795,8 @@ class TestCrossHartMemWritePhyIpi:
 class TestMsipClearBothPaths:
     """验证 MSIP 中断投递后 CLINT MSIP 清零 — Python / Rust 路径一致.
 
-    若 native batch 路径的 ``check_and_deliver_interrupt`` 未在投递 MSIP
-    后清除 CLINT 硬件源, mip.MSIP 将保持为 1 -> mret 后立即重入 -> 风暴.
+    若加速执行批次路径的 ``check_and_deliver_interrupt`` 未在投递 MSIP
+    后清除 CLINT 硬件源, mip.MSIP 将保持为 1, mret 后立即重入, 形成风暴.
     """
 
     @staticmethod
@@ -818,7 +818,7 @@ class TestMsipClearBothPaths:
 
         真实 RISC-V 硬件要求 M-mode handler 在 MRET 之前写 0 到 CLINT MSIP
         以撤销电平触发的中断线。bare mret 不满足此要求 —— CLINT MSIP 保持 1,
-        每次指令边界 sync_msip 重新断言 mip.MSIP -> 无限重入风暴。
+        每次指令边界 sync_msip 重新断言 mip.MSIP, 形成无限重入风暴。
         """
         h = emu.harts[0]
         # Handler @ 0x80000000:
@@ -953,10 +953,10 @@ class TestWfiWakeupMsipBypass:
         )
 
     def test_wfi_wakeup_msip_bypass_delivers_interrupt(self):
-        """MSIE=0 时 MSIP 仍触发 M-mode trap -> handler 清 CLINT -> mret -> WFI 退出.
+        """MSIE=0 时 MSIP 仍触发 M-mode trap, handler 清 CLINT 后 mret, WFI 退出.
 
-        不走 emu.step() (会触发 native batch 死循环).  纯 Python 路径直接
-        模拟 WFI 唤醒 + handler 清 MSIP 行为, 与同文件其他测试一致.
+        不走 emu.step(), 因为会触发加速执行批次死循环.  纯 Python 路径直接
+        模拟 WFI 唤醒与 handler 清 MSIP 行为, 与同文件其他测试一致.
         """
         emu = self._make_emu(False)
         self._setup_msip_handler(emu)

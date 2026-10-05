@@ -3,7 +3,7 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""TlbCacheMixin — TLB/Cache 状态显示和刷新.
+"""TlbCacheMixin — TLB 与 L2 缓存的状态显示和刷新.
 
 依赖 DebuggerBase.
 """
@@ -31,7 +31,7 @@ class TlbCacheMixin(SharedMixinAttrs):
 
     @staticmethod
     def _tlb_page_size(level: int) -> str:
-        """TLB level -> 页大小标签."""
+        """把 TLB 层级转换为页大小标签."""
         return {0: "4K", 1: "2M", 2: "1G"}.get(level, f"Lv{level}")
 
     # ----------------------------------------------------------
@@ -47,7 +47,7 @@ class TlbCacheMixin(SharedMixinAttrs):
     ) -> None:
         """显示单个 TLB 的有效条目及命中率.
 
-        *start_entry* / *end_entry* 限制显示的条目索引范围 (左闭右开);
+        *start_entry* / *end_entry* 限制显示的条目索引范围, 该范围左闭右开;
         *end_entry* 为 None 时显示全部.
         """
         total = tlb._hits + tlb._misses
@@ -178,7 +178,7 @@ class TlbCacheMixin(SharedMixinAttrs):
 
     @seize_val_err("无效 VPN")
     def cmd_tlbflush(self, vpn_str: str | None = None) -> None:
-        """刷新 TLB: tlbflush [vpn] (无参数 = 全部)."""
+        """刷新 TLB: tlbflush [vpn], 无参数时刷新全部."""
         h = self.hart
         if vpn_str is None:
             h.itlb.flush_all()
@@ -199,7 +199,7 @@ class TlbCacheMixin(SharedMixinAttrs):
 
     @staticmethod
     def _hexdump_bytes(data: bytes, indent: str = "") -> str:
-        """字节数据 -> hexdump 多行字符串."""
+        """把字节数据转换为 hexdump 多行字符串."""
         rows = []
         for off in range(0, len(data), 16):
             chunk = data[off : off + 16]

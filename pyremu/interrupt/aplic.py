@@ -29,20 +29,20 @@ vendor/qemu-10.2.0/hw/intc/riscv_aplic.c):
     +0x1fdc            clrienum
     +0x2000            setipnum_le    — 单源置 pending (小端, 供 EOI retrigger)
     +0x3000            genmsi
-    +0x3004 + (i-1)*4  target[i]      — (hart_idx << 18) | (受调试程序_idx << 12) | eiid
+    +0x3004 + (i-1)*4  target[i]      — (hart_idx << 18) | (guest_idx << 12) | eiid
     +0x4000            IDC 结构 (MSI 模式不使用)
 
 关键语义 (与 QEMU 对齐):
 
 - **sourcecfg[i]** 仅编码 SM 触发类型 (``SM_LEVEL_HIGH`` 等), **不含** 目标 hart
   或 EIID — 这些信息在 **target[i]** 寄存器中。
-- **target[i]** = ``(hart_idx << 18) | (受调试程序_idx << 12) | eiid``: 指定该源
+- **target[i]** = ``(hart_idx << 18) | (guest_idx << 12) | eiid``: 指定该源
   触发时向 ``hart_idx`` 的 IMSIC 投递 ``eiid`` 外部中断身份。
 - **MSI 投递**: 当 pending 且 enabled 且 ``domaincfg.IE`` 时, 清除 pending,
-  调用 ``IMSIC.set_ip_number(hart_idx, 'S', eiid)`` 置 S-file eip。本 APLIC 的
-  ``msi-parent`` 为 S-mode IMSIC 节点 (见 dtb.py), 故投递到 S-file。
-- **电平触发**: 外设拉高电平 -> 置 pending -> 投递; 受调试程序 EOI 后写 ``setipnum``
-  retrigger (``aplic_msi_irq_eoi``) 以在电平仍高时重新投递。
+  调用 ``IMSIC.set_ip_number(hart_idx, priv, eiid)`` 置该文件的 eip。``priv`` 由
+  实例的 ``is_mmode`` 决定: 假值取 ``'S'``, 真值取 ``'M'``。
+- **电平触发**: 外设拉高电平则置 pending, 随后投递; 受调试程序的 EOI 写 ``setipnum``
+  retrigger, 即 ``aplic_msi_irq_eoi``, 以在电平仍高时重新投递。
 """
 
 from __future__ import annotations
@@ -104,11 +104,12 @@ _STATE_PENDING = 1 << 0
 
 
 class APLIC(Device):
-    """RISC-V AIA APLIC — 有线 -> MSI 桥 (MSI 投递模式)。
+    """RISC-V AIA APLIC — 把有线中断转换为 MSI 消息, 按 MSI 投递模式工作。
 
     外设调用 ``set_irq(source_num, level)`` 时, 依据 ``sourcecfg`` 的 SM 触发
     类型更新 pending, 并在 pending & enabled & domaincfg.IE 时经 ``target``
-    路由投递 MSI 到目标 hart 的 IMSIC S-file ``eip[eiid]``。
+    路由投递 MSI 到目标 hart 的 IMSIC 文件 ``eip[eiid]``: ``is_mmode`` 取假值时
+    投进 S 文件, 取真值时投进 M 文件。
     """
 
     def __init__(
@@ -116,15 +117,18 @@ class APLIC(Device):
         imsic: IMSIC,
         base_addr: int = 0x0C00_0000,
         num_sources: int = _MAX_SOURCES,
+        is_mmode: bool = False,
     ) -> None:
         self._imsic: IMSIC = imsic
         self.base_addr = base_addr
         self.num_sources = num_sources
         self.size = _REGION_SIZE
+        # 真值把 MSI 投进 IMSIC 的 M 文件, 假值投进 S 文件
+        self.is_mmode = is_mmode
 
         # sourcecfg[i]: SM 触发类型 (bits[9:0]).
         self._sourcecfg: list[int] = [0] * (num_sources + 1)
-        # target[i]: (hart_idx << 18) | (受调试程序_idx << 12) | eiid.
+        # target[i]: (hart_idx << 18) | (guest_idx << 12) | eiid.
         self._target: list[int] = [0] * (num_sources + 1)
         # state[i]: input(bit8) | enabled(bit1) | pending(bit0).
         self._state: list[int] = [0] * (num_sources + 1)
@@ -135,6 +139,11 @@ class APLIC(Device):
         # sourcecfg/target/state — 共享状态访问需互斥. 锁顺序 APLIC -> IMSIC
         # (set_irq -> _deliver_from_source -> imsic.set_ip_number), 不得反向.
         self._lock = threading.Lock()
+
+    @property
+    def priv(self) -> str:
+        """MSI 所投 IMSIC 文件所属的特权域."""
+        return 'M' if self.is_mmode else 'S'
 
     # ================================================================
     #  外设编程接口
@@ -191,6 +200,22 @@ class APLIC(Device):
 
             if update:
                 self._deliver_from_source(source_num)
+
+    def bind_source(self, source_num: int, hart_id: int, eiid: int) -> None:
+        """把一个源配成高电平触发并投递到 *hart_id* 的 *eiid*, 同时打开使能.
+
+        供没有软件写 MMIO 的域预置路由: 源停留在 inactive 时 set_irq 直接丢弃.
+        """
+        with self._lock:
+            if not (0 < source_num <= self.num_sources):
+                return
+            if not (0 <= hart_id <= _TARGET_HART_IDX_MASK):
+                return
+            self._sourcecfg[source_num] = _SM_LEVEL_HIGH
+            self._target[source_num] = (
+                (hart_id << _TARGET_HART_IDX_SHIFT) | (eiid & _TARGET_EIID_MASK)
+            )
+            self._state[source_num] |= _STATE_ENABLED
 
     # ================================================================
     #  Device 接口 (MMIO)
@@ -427,4 +452,4 @@ class APLIC(Device):
         eiid = target & _TARGET_EIID_MASK
         if eiid == 0:
             return
-        self._imsic.set_ip_number(hart_idx, 'S', eiid)
+        self._imsic.set_ip_number(hart_idx, self.priv, eiid)

@@ -29,10 +29,10 @@ fn handle_uart_read(offset: u64, uart: &FfiUartCtx) -> Option<u64> {
 		0x08 => Some(uart.txctrl as u64),
 		0x10 => Some(uart.ie as u64),
 		0x14 => {
-			// TXWM: TX FIFO 恒空 -> 若 txcnt > 0 则水位条件恒满足.
-			// 必须检查 txcnt, 不可硬编码为 1 — 否则受调试程序驱动关 TX 中断
-			// (txcnt=0) 时 Rust 侧仍返回 TXWM=1, 与 Python _ip_value 矛盾,
-			// 否则生成无法清除的虚假 TX 中断而引发 PLIC 中断风暴.
+			// TXWM: TX FIFO 恒空, 占用字节数恒不大于 txcnt, 故 txcnt > 0 时该位恒为 1.
+			// 必须检查 txcnt, 不可硬编码为 1 — 受调试程序的内核关闭 TX 中断后
+			// txcnt 为 0, 此时 Rust 侧仍返回 TXWM=1 与 Python _ip_value 矛盾,
+			// 并生成无法清除的虚假 TX 中断, 引发 PLIC 中断风暴.
 			let txcnt = (uart.txctrl >> 16) & 0x7;
 			let txwm = if txcnt > 0 { 1u32 } else { 0u32 };
 			let rxcnt = (uart.rxctrl >> 16) & 0x7;

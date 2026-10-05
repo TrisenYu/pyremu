@@ -10,7 +10,7 @@ RISC-V 寄存器定义 — 合并 abs_reg + gpr_fpr + csr.
 - Reg / FPR: 通用寄存器基类
 - GPR / FPR 预构建列表及工厂函数 (register_gpr, register_fpr)
 - CSR / CsrAccess: 控制和状态寄存器
-- CSR 地址库 (_csr_bank) 及查询/注册函数 (check_csr, register_csr)
+- CSR 地址库 (csr_bank) 及查询/注册函数 (check_csr, register_csr)
 """
 
 from copy import deepcopy
@@ -198,7 +198,7 @@ _MmodeCSR = partial(CSR, access=CsrAccess.m_rw)
 _DmodeCSR = partial(CSR, access=CsrAccess.d_rw)
 _DMmodeCSR = partial(CSR, access=CsrAccess.dm_rw)
 
-_csr_bank: dict[int, CSR] = {
+csr_bank: dict[int, CSR] = {
     # 000 status
     0x001: _UmodeCSR(name="fflags", xlen=32).strip_w(),
     0x002: _UmodeCSR(name="frm", xlen=32),
@@ -380,20 +380,32 @@ _csr_bank: dict[int, CSR] = {
 # AIA=1 时 AIA CSR 可访问; AIA=0 时全部返回 IllInstr (门控).
 # miselect / mireg / siselect / sireg / mtopei / stopei / mtopi / stopi
 # 必须在 AIA 禁用时统一不可达, 防止内核/固件误判 IMSIC 存在.
-if not PYREMU_AIA:
-    for _aia_addr in (
-        0x150, 0x151,  # siselect, sireg
-        0x15C,         # stopei
-        0x350, 0x351,  # miselect, mireg
-        0x35C,         # mtopei
-        0xDB0,         # stopi
-        0xFB0,         # mtopi
-    ):
-        _csr_bank[_aia_addr].not_implemented()
+AIA_CSR_ADDRS: tuple[int, ...] = (
+    0x150, 0x151,  # siselect, sireg
+    0x15C,         # stopei
+    0x350, 0x351,  # miselect, mireg
+    0x35C,         # mtopei
+    0xDB0,         # stopi
+    0xFB0,         # mtopi
+)
+
+
+def sync_aia_csr_gate(enabled: bool) -> None:
+    """按 AIA 开关设置上述 8 个 AIA CSR 的可达性.
+
+    门控作用于 csr_bank 这一模块级状态, 导入时按编译期开关执行一次. 测试
+    用 force_config 切换开关后再调用本函数, 使门控与新取值一致; 故本函数
+    两个方向都可用, 不只做关闭.
+    """
+    for addr in AIA_CSR_ADDRS:
+        csr_bank[addr].implemented = bool(enabled)
+
+
+sync_aia_csr_gate(PYREMU_AIA)
 
 # H-extension: PYREMU_H_EXT=0 时全部 H-mode CSR 不可访问.
 if not PYREMU_H_EXT:
-    for _addr, _csr in _csr_bank.items():
+    for _csr in csr_bank.values():
         if _csr.access in (CsrAccess.h_ro, CsrAccess.h_rw):
             _csr.not_implemented()
 
@@ -432,39 +444,39 @@ def register_fpr():
 
 # 批量生成编号连续的 CSR
 for i in range(0, 4):
-    _csr_bank[0x10C + i] = _SmodeCSR(name=f"sstateen{i}")
-    _csr_bank[0x30C + i] = _MmodeCSR(name=f"mstateen{i}")
-    _csr_bank[0x31C + i] = _MmodeCSR(name=f"mstateen{i}h", xlen=32)
-    _csr_bank[0x60C + i] = _HmodeCSR(name=f"hstateen{i}")
-    _csr_bank[0x61C + i] = _HmodeCSR(name=f"hstateen{i}h", xlen=32)
+    csr_bank[0x10C + i] = _SmodeCSR(name=f"sstateen{i}")
+    csr_bank[0x30C + i] = _MmodeCSR(name=f"mstateen{i}")
+    csr_bank[0x31C + i] = _MmodeCSR(name=f"mstateen{i}h", xlen=32)
+    csr_bank[0x60C + i] = _HmodeCSR(name=f"hstateen{i}")
+    csr_bank[0x61C + i] = _HmodeCSR(name=f"hstateen{i}h", xlen=32)
 
 for i in range(0, 16):
-    _csr_bank[0x3A0 + i] = _MmodeCSR(name=f"pmpcfg{i}")
+    csr_bank[0x3A0 + i] = _MmodeCSR(name=f"pmpcfg{i}")
 
 for i in range(0, 64):
-    _csr_bank[0x3B0 + i] = _MmodeCSR(name=f"pmpaddr{i}")
+    csr_bank[0x3B0 + i] = _MmodeCSR(name=f"pmpaddr{i}")
 
 for i in range(3, 32):
-    _csr_bank[0x320 + i] = _MmodeCSR(name=f"mhpmevent{i}", xlen=64)
-    _csr_bank[0x720 + i] = _MmodeCSR(name=f"mhpmevent{i}h", xlen=32)
-    _csr_bank[0xB00 + i] = _MmodeCSR(name=f"mhpmcounter{i}", xlen=64)
-    _csr_bank[0xB80 + i] = _MmodeCSR(name=f"mhpmcounter{i}h", xlen=32)
-    _csr_bank[0xC00 + i] = _UmodeCSR(name=f"hpmcounter{i}").strip_w()
-    _csr_bank[0xC80 + i] = _UmodeCSR(name=f"hpmcounter{i}h", xlen=32).strip_w()
+    csr_bank[0x320 + i] = _MmodeCSR(name=f"mhpmevent{i}", xlen=64)
+    csr_bank[0x720 + i] = _MmodeCSR(name=f"mhpmevent{i}h", xlen=32)
+    csr_bank[0xB00 + i] = _MmodeCSR(name=f"mhpmcounter{i}", xlen=64)
+    csr_bank[0xB80 + i] = _MmodeCSR(name=f"mhpmcounter{i}h", xlen=32)
+    csr_bank[0xC00 + i] = _UmodeCSR(name=f"hpmcounter{i}").strip_w()
+    csr_bank[0xC80 + i] = _UmodeCSR(name=f"hpmcounter{i}h", xlen=32).strip_w()
 
 
 def check_csr(csr_id: int) -> tuple[bool, str]:
     """检查 CSR 地址是否有效, 返回 (valid, name)."""
     csr_id &= 0xFFF
-    if csr_id not in _csr_bank:
+    if csr_id not in csr_bank:
         return False, ""
-    return True, _csr_bank[csr_id].name
+    return True, csr_bank[csr_id].name
 
 
 def csr_addr_from_name(name: str) -> int | None:
-    """按小写名称查找 CSR 地址 (例: "mtvec" -> 0x305). 未找到返回 None."""
+    """按小写名称查找 CSR 地址, 例如 "mtvec" 得到 0x305. 未找到返回 None."""
     name = name.lower()
-    for addr, csr in _csr_bank.items():
+    for addr, csr in csr_bank.items():
         if csr.name == name:
             return addr
     return None
@@ -558,10 +570,10 @@ def check_csr_access(
         CsrAccessError: 特权级不足 (privilege)、写入只读 CSR (readonly) 或未知 CSR (unknown).
     """
     csr_id &= 0xFFF
-    if csr_id not in _csr_bank:
+    if csr_id not in csr_bank:
         raise CsrAccessError(csr_id, "unknown")
 
-    csr = _csr_bank[csr_id]
+    csr = csr_bank[csr_id]
     if not csr.implemented:
         raise CsrAccessError(csr_id, "unknown")
 
@@ -578,11 +590,11 @@ def check_csr_access(
 
 
 def register_csr():
-    """返回所有 CSR 的独立副本 (name -> CSR 对象)."""
-    ret = {v.name: v for _, v in _csr_bank.items()}
+    """返回所有 CSR 的独立副本, 以 name 为键映射到 CSR 对象."""
+    ret = {v.name: v for _, v in csr_bank.items()}
     return deepcopy(ret)
 
 
 # 向 regname 注入名称映射 — 断开 core.decoder 与 utils.disassem 的循环导入
 init_gpr_map([r.name for r in _gpr], [r.alias for r in _gpr])
-init_csr_map({addr: csr.name for addr, csr in _csr_bank.items()})
+init_csr_map({addr: csr.name for addr, csr in csr_bank.items()})

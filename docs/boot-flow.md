@@ -182,27 +182,23 @@ OpenSBI 完成初始化, 所有 hart 进入 WFI 等待 SBI ecall 或中断。
 | `fdt_get_address`=0x2200000 | serial init 读错 FDT | DTB 副本 @ 正确地址 |
 | BSS 零填充清除 flag | init_warmboot 死循环等待 | debugger patch blt->j |
 
-## 编译桩文件
+## 预加载映像
 
-桩文件由汇编源码通过 makefile 构建:
+预加载映像由 [bsp/kei-boot/kei.sav.S](../bsp/kei-boot/kei.sav.S) 经 makefile 构建,
+产出 `build/firm-bin/kei.sav`:
 
 ```bash
-make -C tests/src-env zsbl_fsbl_stub
-# -> tests/bins/firm-bin/zsbl_fsbl_stub_asm.bin      (热启动)
-# -> tests/bins/firm-bin/zsbl_fsbl_stub_cold_asm.bin  (冷启动)
+make kei-sav
+# -> build/firm-bin/kei.sav
 ```
+
+`tests/src-env/zsbl/` 存放 ZSBL 与 FSBL 的汇编源码, 当前未接入任何 makefile.
 
 ## 命令行
 
 ```bash
-# 冷启动 (OpenSBI Logo + 串口输出)
 python -m pyremu.debugger --ram-base=0x80000000 \
-    --preload tests/bins/firm-bin/zsbl_fsbl_stub_cold_asm.bin \
-    tests/bins/elf/custom_opensbi_fw_jump.elf
-
-# 热启动 (无输出, 更快)
-python -m pyremu.debugger --ram-base=0x80000000 \
-    --preload tests/bins/firm-bin/zsbl_fsbl_stub_asm.bin \
-    tests/bins/elf/custom_opensbi_fw_jump.elf
-# 使用 --hart=2 启用两个hart
+    --preload build/firm-bin/kei.sav \
+    build/elf/custom_opensbi_fw_jump.elf
+# 使用 --harts=2 启用两个 hart
 ```

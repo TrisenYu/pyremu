@@ -48,7 +48,7 @@ class TestQemuVirtAiaPreset:
         cfg = PlatformConfig.qemu_virt_aia()
         assert cfg.interrupt_mode == InterruptMode.AIA
         assert cfg.periph.imsic_m_base == 0x2400_0000
-        assert cfg.periph.aplic_base == 0x0C00_0000
+        assert cfg.periph.aplic_s_base == 0x0C00_0000
 
     def test_emulator_creates_imsic(self):
         emu = Emulator(PlatformConfig.qemu_virt_aia())
@@ -75,7 +75,7 @@ class TestConfigSerialization:
                 "periph": {
                     "imsic_m_base": cfg.periph.imsic_m_base,
                     "imsic_s_base": cfg.periph.imsic_s_base,
-                    "aplic_base": cfg.periph.aplic_base,
+                    "aplic_s_base": cfg.periph.aplic_s_base,
                     "plic_base": cfg.periph.plic_base,
                 },
             }, f)
@@ -95,7 +95,7 @@ class TestConfigSerialization:
                 "periph": {
                     "imsic_m_base": cfg.periph.imsic_m_base,
                     "imsic_s_base": cfg.periph.imsic_s_base,
-                    "aplic_base": cfg.periph.aplic_base,
+                    "aplic_s_base": cfg.periph.aplic_s_base,
                     "plic_base": cfg.periph.plic_base,
                 },
             }, f)
@@ -113,7 +113,7 @@ class TestPeripheralConfigDefault:
     def test_default_imsic_base_zero(self):
         p = PeripheralConfig()
         assert p.imsic_m_base == 0
-        assert p.aplic_base == 0
+        assert p.aplic_s_base == 0
 
     def test_minimal_preset_no_imsic(self):
         cfg = PlatformConfig.minimal()

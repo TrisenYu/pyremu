@@ -7,17 +7,17 @@
 
 
 def fmt_addr(addr: int) -> str:
-    """64 位地址 -> 0x 前缀固定 16 位 hex 字符串."""
+    """64 位地址转换为固定 16 位、带 0x 前缀的十六进制字符串."""
     return f"0x{addr:016x}"
 
 
 def fmt_hexdump(data: bytes, addr: int = 0, *, columns: int = 16) -> str:
-    """字节序列 -> 经典 hexdump 文本 (地址 | hex | ASCII).
+    """把字节序列转换为经典 hexdump 文本, 依次为地址列、十六进制列与 ASCII 列.
 
     Args:
         data: 原始字节.
-        addr: 起始地址 (用于地址列显示).
-        columns: 每行字节数 (默认 16).
+        addr: 起始地址, 用于地址列显示.
+        columns: 每行字节数, 默认为 16.
     """
     lines: list[str] = []
     for offset in range(0, len(data), columns):

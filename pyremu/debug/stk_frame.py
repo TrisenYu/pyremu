@@ -59,10 +59,10 @@ class StackWalkMixin(SharedMixinAttrs):
         """快速拒绝明显无效的返回地址.
 
         返回 False 的值:
-          - 0 (空指针)
-          - 0xFFFFFFFFFFFFFFFF (未初始化/哨兵/函数破坏 x1)
-          - < 4 (无法安全 ra-4)
-          - 地址落在 64-bit 空间最高 64 KiB 内 (> 0xFFFF_FFFF_FFFF_0000).
+          - 0, 即空指针
+          - 0xFFFFFFFFFFFFFFFF, 表示未初始化或函数覆盖了 x1
+          - < 4, 无法安全地取 ra-4
+          - 地址落在 64-bit 空间最高 64 KiB 内, 即 > 0xFFFF_FFFF_FFFF_0000.
             内核/用户代码的实际映射地址都远低于此边界.
         """
         if ra == 0 or ra == 0xFFFF_FFFF_FFFF_FFFF:
@@ -362,22 +362,21 @@ class StackWalkMixin(SharedMixinAttrs):
             prev_mode = h.spp
             if prev_mode == RiscvMode.U and trapped_pc >= (1 << 63):
                 prev_mode = RiscvMode.S
-            # 检测残留 sepc: M->S mret 后 SPP=U 且 sepc 为过时 RAM 地址,
-            # 或 Sv39 启用时 sepc 落在 RAM PA 范围 (非规范 VA).
-            # 仅当 MMU 开启或 trapped_pc 高于 RAM 窗口时才认为无效 —
-            # Bare 翻译下 U-mode PA 即 RAM 地址, 属合法 trap 现场.
+            # 检测残留 sepc: 从 M 模式经 mret 进入 S 模式后 SPP=U 且 sepc 为残留 RAM 地址,
+            # 或 Sv39 启用时 sepc 落在 RAM 物理地址范围, 即非规范虚拟地址.
+            # 仅当 Sv39 启用或 trapped_pc 高于 RAM 窗口时才认为无效,
+            # Bare 翻译下 U 模式的虚拟地址即 RAM 物理地址, 属合法 trap 现场.
             # 直接从 satp CSR 读 MODE 字段, 避免依赖缓存 _mmu_mode.
             satp_mode = (h.satp_val >> 60) & 0xF
             if self._emu.bus.is_ram_addr(trapped_pc):
                 if satp_mode != 0:
-                    # Sv39 启用 -> 内核/sepc 应为规范高 VA, 残留值
+                    # Sv39 启用则内核与 sepc 应为规范高虚拟地址, 该地址为残留值
                     return
                 if prev_mode == RiscvMode.U:
-                    # Bare 翻译下 U-mode trap: RAM 地址合法, 不跳过
+                    # Bare 翻译下 U 模式 trap 的地址合法, 不跳过
                     pass
                 else:
-                    # Bare 翻译下非 U 模式 (SPP=S): sepc 落在 RAM
-                    # 但 S 模式代码预期在高区 ->残留值
+                    # Bare 翻译下 SPP=S 而 sepc 落在 RAM 窗口: 按残留值处理, 跳过
                     return
             s_trapped_pc = 0
             s_prev_mode = RiscvMode.U
@@ -658,7 +657,7 @@ class StackWalkMixin(SharedMixinAttrs):
                 "无有效栈指针 (sp=0), 跳过栈内存显示[/]"
             )
             return
-        # 使用 VA->PA 翻译读取栈内存 (Sv39 等 MMU 模式下 VA 非物理地址)
+        # 经 VA 到 PA 的翻译读取栈内存
         stack_data = self._try_read_va(cur.sp, 64)
         if stack_data is None:
             self._console.print(

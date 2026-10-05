@@ -33,7 +33,7 @@ pub struct TermIoHandle {
 	pub stdin_fd: RawFd,
 	/// File descriptor for stdout (usually 1).
 	pub stdout_fd: RawFd,
-	/// Shared RX ring buffer — I/O thread writes, Python reads on 受调试程序 RXDATA.
+	/// Shared RX ring buffer — I/O thread writes, Python reads when the guest reads RXDATA.
 	pub rx_buf: *mut u8,
 	/// Capacity of ``rx_buf`` in bytes (power of two).
 	pub rx_cap: u32,
@@ -43,7 +43,7 @@ pub struct TermIoHandle {
 	/// 剩余空间 = rx_cap - (rx_wr - rx_rd); 为 0 时线程停止读 stdin,
 	/// 数据留在内核 tty 缓冲 (对照 QEMU fd_chr_read_poll 流控).
 	pub rx_rd: *mut AtomicU32,
-	/// Shared TX ring buffer — CPU hart threads write (受调试程序 TXDATA).
+	/// Shared TX ring buffer — CPU hart threads write (guest TXDATA).
 	/// Layout: entry e occupies bytes [2e] = hart_id, [2e+1] = byte value.
 	pub tx_buf: *mut u8,
 	/// Entry capacity of ``tx_buf`` (= byte capacity / 2, power of two).
@@ -453,8 +453,8 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
 		let _ = deliver_rx(&h, &mut recv, deliverable);
 		drain_tx(&h, &mut chunk);
 	}
-	// 退出前 best-effort 投递剩余可转发字节 (ring 有空间时; 满 ring / 不完整
-	// ESC 尾场景下数据随线程退出丢弃, 与 QEMU chardev 拆除行为一致).
+	// 当环形缓冲区仍存在空间时, 退出函数前尽力而为转发输入字符至其中; 当接收区存在
+	// 待译码的 ESC 多字节序列时, 则保留于接收缓冲区内而不做转发.
 	let (deliverable, _) = scan_rx(&mut recv);
 	let _ = deliver_rx(&h, &mut recv, deliverable);
 	drain_tx(&h, &mut chunk);
@@ -515,10 +515,10 @@ fn termio_thread_simple(h: TermIoHandle, old_stdin_fl: libc::c_int) {
 			notify_emu_stop();
 		}
 		let _ = deliver_rx(&h, &mut recv, deliverable);
-		// 本线程只负责将 stdin 转发到 RX ring.
+		// 本线程只负责把 stdin 转发到接收环形缓冲区.
 		// stdout 由 CPU 引擎内联 try_write_fd 即时输出 (no_stdout=0)
 		// 不得再调 drain_tx 写 stdout — 否则键盘输入唤醒时会
-		// 重复输出 TX ring buf中的内容, 且键盘输入不再送达受调试程序.
+		// 重复输出发送环形缓冲区中的内容, 且键盘输入不再投递给受调试程序.
 	}
 	let (deliverable, _) = scan_rx(&mut recv);
 	let _ = deliver_rx(&h, &mut recv, deliverable);
@@ -615,7 +615,7 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
         | libc::ISTRIP
         | libc::INLCR
         | libc::IGNCR
-        // ICRNL 保留: 宿主机将 \r->\n, 受调试程序收到 \n 即可行终止
+        // ICRNL 保留: 宿主终端把 \r 转换为 \n, 受调试程序收到 \n 即可结束一行
         | libc::IXON);
 	raw.c_oflag |= libc::OPOST; // 保留输出后处理: '\n' ->CRLF
 							 // 关闭 ISIG: Ctrl+C (0x03) 作为普通字节透传给受调试程序.
@@ -944,10 +944,10 @@ mod tests {
 		assert_eq!(rx_notify.load(Ordering::Acquire), 1, "写入后置 rx_notify");
 	}
 
-	/// attach 线程 (termio_thread_simple): 键盘输入唤醒 poll 时不得把 TX ring
-	/// 积压重放到 stdout. CPU 引擎已内联 try_write_fd 即时输出 stdout
-	/// (no_stdout=0), 线程再 drain_tx 会重复输出 (启动日志重放), 且 write_all
-	/// 在 stdout 阻塞时拖住线程, 键盘输入不再送达受调试程序 (无输入响应). 回归:
+	/// attach 线程 (termio_thread_simple): 键盘输入唤醒 poll 时不得把发送环形缓冲区
+	/// 的积压重放到 stdout. no_stdout=0 时 CPU 引擎已内联 try_write_fd 即时输出
+	/// stdout, 线程再调 drain_tx 会重复输出启动日志, 且 write_all 在 stdout 阻塞时
+	/// 拖住线程, 键盘输入不再投递给受调试程序而表现为无输入响应. 回归:
 	/// emu-linux-sh 停于 zsh init / 反复输出同一段串口日志.
 	#[test]
 	fn test_attach_thread_does_not_reemit_tx_ring_to_stdout() {

@@ -6,6 +6,7 @@
 mod alu;
 mod atom_instr;
 mod concurrent;
+mod consts;
 mod decode;
 mod diag;
 mod ffi;
@@ -24,6 +25,7 @@ pub mod handlers;
 pub mod translate;
 
 pub use alu::*;
+pub use consts::*;
 pub use decode::*;
 pub use ffi::*;
 pub use mem::*;

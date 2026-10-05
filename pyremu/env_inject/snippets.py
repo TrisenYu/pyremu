@@ -233,11 +233,14 @@ def set_mtvec(vector_base: int, mode: int = 0) -> list[AsmSnippet]:
     """设置 mtvec CSR 为 vector_base | mode.
 
     Args:
-        vector_base: trap 向量基址 (必须 4 字节对齐).
-        mode: 0 = 直接模式 (所有 trap -> base), 1 = 向量模式 (base + 4×cause).
+        vector_base: trap 向量基址, 必须 4 字节对齐.
+        mode: 0 为直接模式, 所有 trap 均跳转到 vector_base; 1 为向量模式,
+            第 n 号 trap 跳转到 vector_base + 4n.
 
     Returns:
-        两段片段: [load mtvec 值到 t0, 写入 mtvec CSR].
+        由两段片段构成的列表, 其中:
+        第一段把 mtvec 的值写入 t0,
+        第二段把 t0 的值写入 mtvec CSR.
     """
     mtvec_val = (vector_base & ~0x3) | (mode & 0x3)
     return [
@@ -379,7 +382,7 @@ def zsbl_stub(
     """
     snippets: list[AsmSnippet] = []
 
-    # 所有 hart 放行: DTB -> a1 (PC 相对: DTB @ preload_addr + 0x10000)
+    # 所有 hart 放行: DTB 写入 a1, 取 PC 相对寻址, DTB 位于 preload_addr + 0x10000
     # 先跳转再算偏移太复杂, 直接用已知的 PC 相对偏移
     zsbl_pc = 10 * 4  # ZSBL 内 auipc 的 PC 偏移 (word 10)
     dtb_from_zsbl = 0x10000 - zsbl_pc  # DTB @ preload+64K
@@ -500,9 +503,9 @@ def fsbl_stub(
         )
     )
 
-    # 可选: patch sbi_init -> 无条件冷启动 (next_mode 保持 S-mode)
+    # 可选: patch sbi_init, 使冷启动无条件发生, next_mode 保持 S-mode
     if cold_boot:
-        # sbi_init @ opensbi+0xe0d0: beq a0,a1,warm -> j cold_boot
+        # sbi_init @ opensbi+0xe0d0: 把 beq a0,a1,warm 改写为 j cold_boot
         # 不改 fw_next_mode, 不影响 Domain0 Next Mode
         sb_addr = opensbi_addr + 0xE0D0
         j_imm = (0xE0D8 - 0xE0D0) >> 1  # =4
@@ -521,7 +524,7 @@ def fsbl_stub(
                 desc="sw  j-cold-boot @ sbi_init+0xe0d0",
             )
         )
-    # (BSS 循环和 fw_next_mode 已由 debugger bus.write 处理)
+    # BSS 循环和 fw_next_mode 已由 debugger bus.write 处理
 
     # unimp -> trap -> mtvec -> OpenSBI
     snippets.append(
@@ -535,7 +538,7 @@ def fsbl_stub(
 
 
 # ============================================================
-#  OpenSBI 冷启动桩 — 绕过 init_warmboot 同步栅栏
+#  OpenSBI 冷启动桩 — 绕过 init_warmboot 的同步屏障
 # ============================================================
 
 
@@ -545,15 +548,18 @@ def opensbi_coldboot_stub(
 ) -> list[AsmSnippet]:
     """为 OpenSBI FW_PAYLOAD / FW_JUMP 生成最小 FSBL 桩代码.
 
-    FW_PAYLOAD/FW_JUMP 在 sbi_init -> init_warmboot 轮询等待
-    ``*(flag_addr)`` 变为非零 (表示冷启动完成). 没有 FSBL 时该标志
+    FW_PAYLOAD/FW_JUMP 在 sbi_init 进入 init_warmboot 后轮询等待
+    ``*(flag_addr)`` 变为非零, 该标志表示冷启动完成. 没有 FSBL 时该标志
     永不为 1, 导致死循环.
 
-    此桩执行:  *(flag_addr) = 1;  jalr zero, 0(t0) -> entry_addr.
+    返回的片段依次为: 把 flag_addr 装入 t0, 把 1 装入 t1, 把 t1 存入 0(t0),
+    执行 fence w,w, 把 entry_addr 装入 t0, 执行 jalr zero, 0(t0).
 
     Args:
-        entry_addr: OpenSBI 入口 (PIE 搬迁后地址, 通常 = ram_base).
-        flag_addr: 冷启动完成标志的绝对地址 (可从调试器获得: x11-868).
+        entry_addr: OpenSBI 入口地址, 取重定位之后的地址, 通常等于 ram_base.
+        flag_addr: 冷启动完成标志的绝对地址, 由 sbi_hsm 模块管理. 反汇编中该标志
+            经 ``-868(x11)`` 取出, 该轮询循环内 x11 不变, 故调试器按 x11 减 868
+            得到的地址恒定.
     """
     snippets: list[AsmSnippet] = []
     snippets.append(imm64(_T0, flag_addr))

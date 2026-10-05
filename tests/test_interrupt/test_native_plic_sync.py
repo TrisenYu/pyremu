@@ -3,14 +3,14 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""native 引擎 PLIC -> mip 同步回归测试.
+"""加速执行引擎把 PLIC 状态同步到 mip 的回归测试.
 
-锁定修复: native 批次引擎内部只同步 CLINT (MSIP/MTIP), 不感知 PLIC。
+锁定修复: 加速执行引擎内部只同步 CLINT 的 MSIP 与 MTIP, 不感知 PLIC。
 `_step_native` 在 marshal 前必须调用 `_native_sync_plic_mip`, 把 PLIC 的
-外部中断挂起 (MEIP bit11 / SEIP bit9) 合并进各 hart 的 mip —— 否则 virtio
-等外设的完成中断永远到不了 hart (S 模式 Linux 收不到 SEIP)。
+MEIP bit11 与 SEIP bit9 外部中断挂起合并进各 hart 的 mip —— 否则 virtio
+等外设的完成中断永远到不了 hart, 即 S 模式 Linux 收不到 SEIP。
 
-修复前 (无此同步): 走 native 路径时 hart.mip 的 SEIP/MEIP 恒为 0。
+修复前无此同步时, 在加速执行场景下 hart.mip 的 SEIP/MEIP 恒为 0。
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def _plic_program(plic, context: int, source: int) -> None:
 
 
 def test_native_sync_sets_seip_from_s_context():
-    """源在 hart0 S-context(ctx1) 使能且挂起 -> 同步后 mip 含 SEIP."""
+    """源在 hart0 的 S-context ctx1 使能且挂起时, 同步后 mip 含 SEIP."""
     emu = _make_emu(1)
     _plic_program(emu.plic, context=1, source=_SRC)  # ctx1 = hart0 S
     assert emu.plic
@@ -77,7 +77,7 @@ def test_native_sync_sets_seip_from_s_context():
 
 
 def test_native_sync_sets_meip_from_m_context():
-    """源在 hart0 M-context(ctx0) 使能 -> 同步后 mip 含 MEIP."""
+    """源在 hart0 的 M-context ctx0 使能时, 同步后 mip 含 MEIP."""
     emu = _make_emu(1)
     _plic_program(emu.plic, context=0, source=_SRC)  # ctx0 = hart0 M
     assert emu.plic
@@ -103,7 +103,7 @@ def test_native_sync_clears_when_not_pending():
 
 
 def test_native_sync_per_hart_isolated():
-    """多 hart: 源仅在 hart1 S-context 使能 -> 只有 hart1 得 SEIP."""
+    """多 hart: 源仅在 hart1 S-context 使能时, 只有 hart1 得 SEIP."""
     emu = _make_emu(2)
     # hart1 的 S-context = 2*1+1 = 3
     _plic_program(emu.plic, context=3, source=_SRC)

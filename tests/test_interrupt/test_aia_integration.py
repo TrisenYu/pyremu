@@ -10,7 +10,8 @@ import pyremu.configs_gen
 from pyremu.core.trap_handler import check_pending_interrupts, try_wfi_wakeup
 from pyremu.emulator import Emulator
 from pyremu.interrupt.aplic import APLIC
-from pyremu.interrupt.imsic import IMSIC
+from pyremu.interrupt.imsic import IID_EXT_MIN
+from pyremu.peripheral.virtio_net import VIRTIO_NET_M_IRQ, VIRTIO_NET_S_IRQ
 from pyremu.platform import InterruptMode, PlatformConfig
 
 
@@ -82,8 +83,8 @@ class TestAiaEmulator:
     def test_aplic_mmio_on_bus(self):
         """APLIC MMIO 区域在总线上."""
         emu = _make_aia_emu()
-        aplic_base = emu._cfg.periph.aplic_base
-        dev = emu.bus.devices.get(aplic_base)
+        aplic_s_base = emu._cfg.periph.aplic_s_base
+        dev = emu.bus.devices.get(aplic_s_base)
         assert dev is emu.aplic
 
 
@@ -96,7 +97,7 @@ class TestAiaInterruptDelivery:
     """端到端中断投递: 外设 -> APLIC -> IMSIC -> hart mip."""
 
     def test_uart_irq_raises_seip(self):
-        """UART 写 -> APLIC set_irq -> IMSIC S-file -> get_pending_mip 返回 SEIP.
+        """UART 写触发 APLIC set_irq, 中断进入 IMSIC S-file, get_pending_mip 返回 SEIP.
 
         Device interrupts route to S-mode (delegate=True) so the kernel's
         IMSIC driver handles them directly without M-mode forwarding.
@@ -106,9 +107,9 @@ class TestAiaInterruptDelivery:
         # 使能 IMSIC S-file eie for IID=20 (UART via APLIC)
         emu.imsic.csr_write(0, 'S', 0x70, 1)  # eidelivery=1
         emu.imsic.csr_write(0, 'S', 0xC0, 1 << 20)  # eie: enable identity 20
-        # 配置 APLIC source 10 -> hart 0 S-file IID 20 (经 MMIO, 模拟内核流程)
+        # 配置 APLIC source 10 映射到 hart 0 S-file IID 20, 该配置经 MMIO 写入以模拟内核流程
         emu.aplic.write(0x3004 + (10 - 1) * 4, (20).to_bytes(4, "little"))  # target[10]
-        emu.aplic.write(0x0004 + (10 - 1) * 4, (0x6).to_bytes(4, "little"))  # sourcecfg[10] LEVEL_HIGH
+        emu.aplic.write(0x0004 + (10 - 1) * 4, (0x6).to_bytes(4, "little"))
         emu.aplic.write(0x1EDC, (10).to_bytes(4, "little"))  # setienum source 10
 
         # 触发 UART 中断: 经 APLIC source 10 -> S-file IID=20
@@ -284,4 +285,114 @@ class TestInterruptModeConfig:
         cfg = PlatformConfig.qemu_virt_aia()
         assert cfg.interrupt_mode == InterruptMode.AIA
         assert cfg.periph.imsic_m_base != 0
-        assert cfg.periph.aplic_base != 0
+        assert cfg.periph.aplic_s_base != 0
+
+
+# ============================================================
+#  飞地侧网卡: APLIC M 域投递到 IMSIC M 文件
+# ============================================================
+
+# 两个网卡实例的 MMIO 基址 — 与 pyremu/debug/cli.py 的取值一致
+_NET_S_BASE = 0x1000_7000
+_NET_M_BASE = 0x1000_8000
+
+_MEIP = 1 << 11
+_SEIP = 1 << 9
+
+
+def _make_aia_emu_with_nics() -> Emulator:
+    """构造两个网卡实例都启用的 AIA 平台."""
+    cfg = PlatformConfig.qemu_virt_aia()
+    cfg.num_harts = 1
+    cfg.ram_base = 0x4000_0000
+    cfg.prog_cnt = 0x4000_0000
+    cfg.periph.virtio_net_s_base = _NET_S_BASE
+    cfg.periph.virtio_net_m_base = _NET_M_BASE
+    return Emulator(cfg)
+
+
+class TestEnclaveNetRouting:
+    """飞地侧网卡的中断经 APLIC M 域投进 IMSIC 的 M 文件.
+
+    M 文件的 eidelivery 与 eie 由 M 模式自身写入 (OpenSBI 冷初始化打开
+    eidelivery, 登记该设备中断的 M 模式代码打开对应的 eie 位), 故用例按软件
+    的写法显式打开二者, 而不依赖模拟器代劳.
+    """
+
+    def test_enclave_nic_bound_to_mmode_aplic(self):
+        """飞地侧实例的中断源登记在 M 域 APLIC 上."""
+        emu = _make_aia_emu_with_nics()
+        ctrl = emu.irq_route.get(VIRTIO_NET_M_IRQ)
+        assert isinstance(ctrl, APLIC)
+        assert ctrl.is_mmode, "飞地侧实例应接 M 域 APLIC"
+
+    def test_msi_lands_in_m_file_not_s_file(self):
+        """使能 M 文件后网卡中断只产出 MEIP, S 文件不被置位."""
+        emu = _make_aia_emu_with_nics()
+        imsic = emu.imsic
+        assert imsic is not None
+        imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
+        imsic.csr_write(0, 'M', 0xC0, 1 << IID_EXT_MIN)  # eie: 使能该 identity
+
+        emu.raise_device_irq(VIRTIO_NET_M_IRQ, True)
+
+        mip = imsic.get_pending_mip(0)
+        assert mip & _MEIP, f"MEIP expected, got mip={mip:#x}"
+        assert not mip & _SEIP, "S 文件不得被置位"
+        assert imsic.peek_topei(0, 'S') == 0
+
+    def test_mtopei_reports_the_eiid(self):
+        """MTOPI 读到的 identity 是外部中断 identity, 认领后 pending 清除."""
+        emu = _make_aia_emu_with_nics()
+        imsic = emu.imsic
+        assert imsic is not None
+        imsic.csr_write(0, 'M', 0x70, 1)
+        imsic.csr_write(0, 'M', 0xC0, 1 << IID_EXT_MIN)
+        emu.raise_device_irq(VIRTIO_NET_M_IRQ, True)
+
+        assert (imsic.peek_topei(0, 'M') >> 16) == IID_EXT_MIN
+        assert (imsic.read_topei(0, 'M') >> 16) == IID_EXT_MIN
+        assert imsic.get_pending_mip(0) == 0, "认领后 pending 应清除"
+
+    def test_unenabled_nic_irq_produces_no_meip(self):
+        """未打开 eidelivery 与 eie 时网卡中断不产出 MEIP.
+
+        回归: 投递 identity 取中断源编号本身 (3) 时, 该位与 M 文件上的软件中断
+        identity 相同, IPI 快路径不经使能位即产生 MEIP —— 网卡中断被当作 IPI
+        认领. 改动前本用例失败.
+        """
+        emu = _make_aia_emu_with_nics()
+        imsic = emu.imsic
+        assert imsic is not None
+
+        emu.raise_device_irq(VIRTIO_NET_M_IRQ, True)
+
+        assert imsic.get_pending_mip(0) == 0, "未使能时不得产出 MEIP"
+        assert imsic.peek_topei(0, 'M') == 0, "不得被当作软件中断"
+
+    def test_two_nics_do_not_cross(self):
+        """两张网卡各投各的域: S 侧进 S 文件, M 侧进 M 文件."""
+        emu = _make_aia_emu_with_nics()
+        imsic = emu.imsic
+        aplic_s = emu.aplic
+        assert imsic is not None and aplic_s is not None
+        imsic.csr_write(0, 'S', 0x70, 1)
+        imsic.csr_write(0, 'S', 0xC0, 1 << 20)
+        imsic.csr_write(0, 'M', 0x70, 1)
+        imsic.csr_write(0, 'M', 0xC0, 1 << IID_EXT_MIN)
+        # 受调试程序的内核写 S 域 APLIC 的 sourcecfg 与 target 得到同一结果
+        aplic_s.bind_source(VIRTIO_NET_S_IRQ, 0, 20)
+
+        emu.raise_device_irq(VIRTIO_NET_S_IRQ, True)
+
+        mip = imsic.get_pending_mip(0)
+        assert mip & _SEIP, "宿主侧实例应产出 SEIP"
+        assert not mip & _MEIP, "宿主侧实例不得产出 MEIP"
+        assert imsic.peek_topei(0, 'M') == 0
+
+        imsic.read_topei(0, 'S')  # 认领 SEIP, 避免与下一次断言混淆
+        emu.raise_device_irq(VIRTIO_NET_M_IRQ, True)
+
+        mip = imsic.get_pending_mip(0)
+        assert mip & _MEIP, "飞地侧实例应产出 MEIP"
+        assert not mip & _SEIP, "飞地侧实例不得产出 SEIP"

@@ -1,0 +1,9 @@
+[package]
+name = "attest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 静态库: 由 ../Makefile 以 ../module.ld 链接成模块映像。
+[lib]
+crate-type = ["staticlib"]

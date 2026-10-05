@@ -1,6 +1,6 @@
 # 调试记录: custom_opensbi_fw_payload.elf 启动流程
 
-> 固件: `tests/bins/elf/custom_opensbi_fw_payload.elf`
+> 固件: `build/elf/custom_opensbi_fw_payload.elf`
 > 构建: OpenSBI PLATFORM=generic, FW_PAYLOAD, PIE, 无嵌入式 DTB
 > 日期: 2026-06-20
 
@@ -95,12 +95,14 @@ IllInstr (0x00000000 非法指令)。
 
 ### 结论
 
-该固件不适合在 pyremu 中完整运行——`FW_PAYLOAD` 模式依赖 FSBL 完成冷启动。
-如需调试 OpenSBI, 建议使用 `FW_JUMP` 或 `FW_DYNAMIC` 构建。
+上述三个缺陷修复后, 该固件可在 pyremu 中启动至 `_start_hang` (WFI 空闲)。
+`FW_PAYLOAD` 模式仍依赖前一级完成冷启动, 该角色由预加载映像
+`build/firm-bin/kei.sav` 承担, 见 [boot-flow.md](boot-flow.md)。
+不加载该映像而直接运行固件, 仍会停在 `init_warmboot` 的同步栅栏。
 
 ## 相关测试
 
 | 文件 | 新增测例 |
 |------|---------|
-| `tests/test_emulator.py` | `TestRegValueCanonicalization` (4 条) |
-| `tests/test_compressed.py` | C.ADD (2 条), C.SUB (1 条), C.OR (1 条) |
+| [tests/test_emulator.py](../tests/test_emulator.py) | `TestRegValueCanonicalization` (4 条) |
+| [tests/test_calc/test_compressed.py](../tests/test_calc/test_compressed.py) | C.ADD (2 条), C.SUB (1 条), C.OR (1 条) |

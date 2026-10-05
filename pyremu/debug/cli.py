@@ -12,7 +12,7 @@ import sys
 from loguru import logger
 
 from pyremu.debug import Debugger
-from pyremu.debug.utils import _RAM_MUL, fmt_size
+from pyremu.debug.utils import fmt_size, RAM_MUL
 from pyremu.emulator import Emulator
 from pyremu.env_inject import Preloader
 from pyremu.platform import PeripheralConfig, PlatformConfig
@@ -20,6 +20,11 @@ from pyremu.utils.parse_bin import FirmwareImage, parse_firmware
 
 # virtio-blk MMIO 基址 — 置于默认外设 (UART/SPI/I2C/GPIO/watchdog) 之后的空闲槽。
 _VIRTIO_BLK_BASE = 0x1000_5000
+
+# 两个 virtio-net 实例的 MMIO 基址 — 紧接 virtio-blk 之后的空闲槽。
+# 中断源编号取 2 与 3.
+_VIRTIO_NET_S_BASE = 0x1000_7000
+_VIRTIO_NET_M_BASE = 0x1000_8000
 
 # ============================================================
 #  Argument parser
@@ -151,10 +156,10 @@ def _setup_logger(level: str) -> None:
 
 
 def _parse_ram_size(ram_str: str) -> int:
-    """解析 RAM 大小字符串 (支持 K/KB/M/MB/G/GB 后缀) -> 字节数."""
+    """解析 RAM 大小字符串, 支持 K/KB/M/MB/G/GB 后缀, 返回字节数."""
     s = ram_str.upper().rstrip("B")
-    if s and s[-1] in _RAM_MUL:
-        return int(s[:-1]) * _RAM_MUL[s[-1]]
+    if s and s[-1] in RAM_MUL:
+        return int(s[:-1]) * RAM_MUL[s[-1]]
     return int(s)
 
 
@@ -335,16 +340,20 @@ def debugger(args: list[str] | None = None) -> None:
     # --disk: 启用 virtio-blk (base 置于 watchdog 之后的空闲 MMIO 槽)。
     # 未显式给 --bootargs 时提供默认根挂载参数 (只读, ext4 root 所有)。
     periph = PeripheralConfig()
+    # 两个 virtio-net 实例恒启用: S 模式一侧实例供受调试程序的协议栈驱动,
+    # M 模式一侧实例供飞地直通, 二者取不同的 MMIO 基址与中断源编号.
+    periph.virtio_net_s_base = _VIRTIO_NET_S_BASE
+    periph.virtio_net_m_base = _VIRTIO_NET_M_BASE
     bootargs = ns.bootargs
     if ns.disk is not None:
         periph.virtio_blk_base = _VIRTIO_BLK_BASE
         if bootargs is None:
-            # debootstrap --variant=minbase 不创建 /sbin/init -> systemd 的
-            # 符号链接; 内核按序查找 init 会一路落到 /bin/sh 并阻塞在无输入
-            # 的 stdin read 上 (表现为指令计数器攀升但无输出)。
+            # debootstrap --variant=minbase 不创建 /sbin/init, 而它是指向
+            # systemd 的符号链接; 内核按序查找 init 会一路落到 /bin/sh 并阻塞在无输入
+            # 的 stdin read 上, 表现为指令计数器攀升但无输出。
             # 显式指定 systemd 路径绕过此问题。
             # systemd.log_level=debug + console 目标: 若 systemd 静默失败,
-            # 至少能看到它输出了什么 (journald 转发到串口)。
+            # 至少能看到它输出了什么, journald 会转发到串口。
             bootargs = (
                 "earlycon=sbi console=ttySIF0 "
                 "root=/dev/vda ro "

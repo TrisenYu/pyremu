@@ -6,7 +6,7 @@
 """AIA (Advanced Interrupt Architecture) — IMSIC + APLIC 模块.
 
 IMSIC (Incoming MSI Controller): 每 hart MSI 中断控制器, 处理外部 + 软件中断.
-APLIC (Advanced PLIC): 有线 -> MSI 桥 (Phase 2).
+APLIC (Advanced PLIC): 把有线中断转换为 MSI 消息, 属计划中的 Phase 2.
 
 用法:
     from pyremu.interrupt.aia import IMSIC

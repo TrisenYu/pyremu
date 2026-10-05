@@ -1,0 +1,12 @@
+# 扩展模块清单: 每行为 "<模块编号> <映像文件名>", 以 # 开头的行与空行忽略.
+#
+# 映像文件名相对部署目录给出: make dist 把各映像扁平放入 dist/, 清单随之复制到该目录,
+# 故此处只写文件名, 不写 build/ 前缀.
+#
+# 模块编号须与该模块源码中声明的编号一致 (见各模块的 MODULE_ID), 不一致时飞地的取入
+# 以编号不符失败 (ext_mod::LoadError::IdMismatch). 清单由宿主的装载器与回归工具读取,
+# 见 bsp/tee_aux_tools/ext-mod-svc/tee_ext_mod_svc.h.
+
+7 attest.signed.bin
+4 net.signed.bin
+3 fs.signed.bin

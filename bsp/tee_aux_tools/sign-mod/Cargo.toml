@@ -1,0 +1,10 @@
+[package]
+name = "sign-mod"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# 依赖版本与 sittim 的 Cargo.toml 一致: 两侧由同一版本的库计算摘要与签名。
+[dependencies]
+p256 = { version = "0.14.0", features = ["ecdsa", "pem"] }
+sha2 = "0.11.0"

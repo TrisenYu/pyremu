@@ -1,14 +1,21 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{ AtomicU32, AtomicU64, Ordering };
 
-use crate::concurrent::{ModuleState, StopInfo};
+use crate::concurrent::{ ModuleState, StopInfo };
 use crate::handlers::{
-	lr_check, lr_clear_all, lr_set, pmp_ok, try_handle_virtio, DevCtx, PmpCtx, EXIT_SENTINEL,
+	lr_check,
+	lr_clear_all,
+	lr_set,
+	pmp_ok,
+	try_handle_virtio,
+	DevCtx,
+	PmpCtx,
+	EXIT_SENTINEL,
 };
-use crate::hart_sched::{ram_offset, read_gpr};
+use crate::hart_sched::{ ram_offset, read_gpr };
 use crate::peripheral::is_device_addr;
-use crate::state::{exit_reason, HartState};
-use crate::translate::{translate_va, TranslateFault, WalkCtx};
-use crate::trap::{deliver_illegal_instruction, deliver_trap, exc_code, mcause_val};
+use crate::state::{ exit_reason, HartState };
+use crate::translate::{ translate_va, TranslateFault, WalkCtx };
+use crate::trap::{ deliver_illegal_instruction, deliver_trap, exc_code, mcause_val };
 
 pub(crate) fn atomic_minmax_u32(atomic: &AtomicU32, funct5: u8, rs2: u32) -> u64 {
 	loop {
@@ -16,13 +23,19 @@ pub(crate) fn atomic_minmax_u32(atomic: &AtomicU32, funct5: u8, rs2: u32) -> u64
 		let next = match funct5 {
 			0b10000 => (cur as i32).min(rs2 as i32) as u32, // AMOMIN
 			0b10100 => (cur as i32).max(rs2 as i32) as u32, // AMOMAX
-			0b11000 => cur.min(rs2),                        // AMOMINU
-			0b11100 => cur.max(rs2),                        // AMOMAXU
-			_ => return 0,
+			0b11000 => cur.min(rs2), // AMOMINU
+			0b11100 => cur.max(rs2), // AMOMAXU
+			_ => {
+				return 0;
+			}
 		};
 		match atomic.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
-			Ok(v) => return v as u64,
-			Err(_) => continue,
+			Ok(v) => {
+				return v as u64;
+			}
+			Err(_) => {
+				continue;
+			}
 		}
 	}
 }
@@ -33,13 +46,19 @@ pub(crate) fn atomic_minmax_u64(atomic: &AtomicU64, funct5: u8, rs2: u64) -> u64
 		let next = match funct5 {
 			0b10000 => (cur as i64).min(rs2 as i64) as u64, // AMOMIN
 			0b10100 => (cur as i64).max(rs2 as i64) as u64, // AMOMAX
-			0b11000 => cur.min(rs2),                        // AMOMINU
-			0b11100 => cur.max(rs2),                        // AMOMAXU
-			_ => return 0,
+			0b11000 => cur.min(rs2), // AMOMINU
+			0b11100 => cur.max(rs2), // AMOMAXU
+			_ => {
+				return 0;
+			}
 		};
 		match atomic.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
-			Ok(v) => return v,
-			Err(_) => continue,
+			Ok(v) => {
+				return v;
+			}
+			Err(_) => {
+				continue;
+			}
 		}
 	}
 }
@@ -53,16 +72,18 @@ pub(crate) fn handle_amo_concurrent(
 	pa: u64,
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
-	dev: &DevCtx,
+	dev: &DevCtx
 ) -> u64 {
 	let width: u8 = match funct3 {
 		0b010 => 4,
 		0b011 => 8,
-		_ => return 0, // illegal — caller handles
+		_ => {
+			return 0;
+		} // illegal — caller handles
 	};
 
 	// Alignment check (RISC-V AMO requires natural alignment)
-	if pa & (width as u64 - 1) != 0 {
+	if (pa & ((width as u64) - 1)) != 0 {
 		return 0; // caller delivers misaligned trap
 	}
 
@@ -76,16 +97,13 @@ pub(crate) fn handle_amo_concurrent(
 		return EXIT_SENTINEL; // exit to Python for MMIO handling
 	}
 
-	let off = match ram_offset(
-		pa,
-		width as u32,
-		ctx.ram_base,
-		ctx.ram_size,
-		ctx.shadow_base,
-		ctx.shadow_size,
-	) {
+	let off = match
+		ram_offset(pa, width as u32, ctx.ram_base, ctx.ram_size, ctx.shadow_base, ctx.shadow_size)
+	{
 		Some(o) => o as usize,
-		None => return 0,
+		None => {
+			return 0;
+		}
 	};
 
 	match funct5 {
@@ -96,7 +114,7 @@ pub(crate) fn handle_amo_concurrent(
 			let loaded: u64 = if width == 4 {
 				let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
 				let raw = atomic.load(Ordering::Acquire);
-				((raw as i32) as i64) as u64
+				raw as i32 as i64 as u64
 			} else {
 				let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU64) };
 				atomic.load(Ordering::Acquire)
@@ -131,18 +149,13 @@ pub(crate) fn handle_amo_concurrent(
 						state.reservation_value as u32,
 						rs2_val as u32,
 						Ordering::Release,
-						Ordering::Relaxed,
+						Ordering::Relaxed
 					)
 					.is_ok()
 			} else {
 				let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU64) };
 				atomic
-					.compare_exchange(
-						state.reservation_value,
-						rs2_val,
-						Ordering::Release,
-						Ordering::Relaxed,
-					)
+					.compare_exchange(state.reservation_value, rs2_val, Ordering::Release, Ordering::Relaxed)
 					.is_ok()
 			};
 			state.reservation_valid = 0;
@@ -195,7 +208,7 @@ pub(crate) fn handle_amo_concurrent_dispatch(
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	module: &ModuleState,
+	module: &ModuleState
 ) -> u64 {
 	let funct5 = f.func7 >> 2;
 	let width: u8 = match f.func3 {
@@ -210,7 +223,7 @@ pub(crate) fn handle_amo_concurrent_dispatch(
 	let base = read_gpr(state, f.rs1);
 	let va = base;
 
-	if va & (width as u64 - 1) != 0 {
+	if (va & ((width as u64) - 1)) != 0 {
 		deliver_trap(state, mcause_val(exc_code::LD_MISALIGNED, false), va);
 		return 0;
 	}
@@ -251,8 +264,7 @@ pub(crate) fn handle_amo_concurrent_dispatch(
 		return EXIT_SENTINEL;
 	}
 
-	let advance =
-		handle_amo_concurrent(state, funct5, f.func3, rs2_val, f.rd, tr.pa, ctx, pmp, dev);
+	let advance = handle_amo_concurrent(state, funct5, f.func3, rs2_val, f.rd, tr.pa, ctx, pmp, dev);
 
 	if advance == EXIT_SENTINEL {
 		let info = StopInfo {

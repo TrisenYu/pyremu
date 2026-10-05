@@ -74,9 +74,12 @@ _EIP_WORDS = 64  # 2048 bits / 32 bits per word
 # ``IMSIC_IPI_ID = 1`` 是 OpenSBI 的约定: IPI 即向目标 hart 的 M-file 写
 # ``seteipnum = 1`` 的普通 MSI, 作为外部中断 (MEIP) 投递, 经 MTOPEI 发现。
 # IID=3 仅为对称保留, OpenSBI 实际不使用 (始终用 minor identity 1)。
-_IID_S_IPI = 1  # OpenSBI IPI minor identity (M-file)
-_IID_M_IPI = 3  # legacy M-file IPI minor identity
-_IID_EXT_MIN = 6  # 外部中断起始 identity
+IID_S_IPI = 1  # OpenSBI IPI minor identity (M-file)
+IID_M_IPI = 3  # legacy M-file IPI minor identity
+# 外部中断起始 identity. 1 与 3 是软件中断 identity, 设备 MSI 的 eiid 取本值
+# 及以上: 取 1 或 3 会被 _bit_is_set / peek_topei 的软件中断快路径当作 IPI,
+# 与 M 文件上真实的 IPI 混为一路.
+IID_EXT_MIN = 6
 
 
 class _ImsicFile:
@@ -132,7 +135,7 @@ class _ImsicFile:
             return False
         word = eip_num >> 5
         bit = eip_num & 31
-        is_sw = eip_num in (_IID_M_IPI, _IID_S_IPI)
+        is_sw = eip_num in (IID_M_IPI, IID_S_IPI)
         if is_sw:
             return (self.eip[word] & (1 << bit)) != 0
         return (self.eip[word] & self.eie[word] & (1 << bit)) != 0
@@ -148,7 +151,7 @@ class _ImsicFile:
         for i in range(_EIP_WORDS):
             pending = self.eip[i] & self.eie[i]
             if i == 0:
-                pending &= ~((1 << _IID_M_IPI) | (1 << _IID_S_IPI))
+                pending &= ~((1 << IID_M_IPI) | (1 << IID_S_IPI))
             if pending:
                 return True
         return False
@@ -161,7 +164,7 @@ class _ImsicFile:
         """
         if not self.eidelivery:
             return False
-        sw_mask = (1 << _IID_M_IPI) | (1 << _IID_S_IPI)
+        sw_mask = (1 << IID_M_IPI) | (1 << IID_S_IPI)
         ext_mask = ~sw_mask & 0xFFFFFFFF
         for i in range(_EIP_WORDS):
             if i == 0:
@@ -186,7 +189,7 @@ class _ImsicFile:
         # eidelivery only gates external interrupts (IID >= 6).
         # Checking IPIs first ensures pending IPIs are visible even before
         # the kernel sets eidelivery, matching the Rust imsic_topei_peek.
-        sw_mask = (1 << _IID_M_IPI) | (1 << _IID_S_IPI)
+        sw_mask = (1 << IID_M_IPI) | (1 << IID_S_IPI)
         ipi_pending = (self.eip[0] & sw_mask) != 0
         if ipi_pending:
             bit = (self.eip[0] & sw_mask).bit_length() - 1
@@ -224,7 +227,7 @@ class _ImsicFile:
         # IPI fast-path: software interrupts (IID=1,3) are always "enabled"
         # when pending — they do NOT require eie NOR eidelivery (matching
         # both peek_topei above and Rust's imsic_topei_peek).
-        sw_mask = (1 << _IID_M_IPI) | (1 << _IID_S_IPI)
+        sw_mask = (1 << IID_M_IPI) | (1 << IID_S_IPI)
         ipi_pending = (self.eip[0] & sw_mask) != 0
         if ipi_pending:
             bit = (self.eip[0] & sw_mask).bit_length() - 1
@@ -373,6 +376,10 @@ class IMSIC(Device):
         # set_ip_number), 不得反向.
         self._lock = threading.Lock()
 
+        # 加速引擎持有的 hart 状态 ctypes 数组 (Emulator 注入, 无 native 时为 None).
+        # 见 bind_ffi_states / _publish_eip.
+        self._ffi_states = None
+
     # ----------------------------------------------------------
     #  内部辅助
     # ----------------------------------------------------------
@@ -509,6 +516,39 @@ class IMSIC(Device):
     #  MSI 注入 (供 Phase 2 APLIC 使用)
     # ----------------------------------------------------------
 
+    def bind_ffi_states(self, states) -> None:
+        """绑定加速引擎使用的 hart 状态 ctypes 数组 (无 native 时为 None).
+
+        绑定后 set_ip_number / clear_ip_number 会把 eip 即时写穿到共享数组,
+        使加速引擎在单轮加速执行内即可依据 live eip 投递外部中断 (见
+        _publish_eip 与 Rust sync_ext_irq_mip).
+        """
+        with self._lock:
+            self._ffi_states = states
+
+    def _publish_eip(self, hart_id: int, priv: str) -> None:
+        """把指定 interrupt file 的 eip 写穿到加速引擎的共享 ctypes 结构.
+
+        仅在 eip 变化处调用 (调用方已持有 self._lock). 未绑定数组时为 no-op,
+        故纯 Python 路径不受影响.
+
+        轮边界由 _marshal_imsic 全量重拷贝, 此处的实时写穿只覆盖单轮加速执行
+        期间由设备线程注入的位 — 那一窗口内主线程正阻塞在引擎里, 不可能靠
+        轮边界同步.
+        """
+        states = self._ffi_states
+        if states is None or not (0 <= hart_id < self.num_harts):
+            return
+        file = self._file_for(hart_id, priv)
+        if file is None:
+            return
+        mirror = states[hart_id].imsic_m if priv == 'M' else states[hart_id].imsic_s
+        for i in range(_EIP_WORDS):
+            mirror.eip[i] = file.eip[i]
+        # 仅外部中断门控位; 软件中断 (IID 1/3) 由 Rust 侧 IPI 快路径覆盖,
+        # 不看该标志. 取"任一位非零"这一保守上界即可, 宁多扫不得漏判.
+        mirror.eip_ext_any = 1 if file._any_ext else 0
+
     def set_ip_number(self, hart_id: int, priv: str, eip_num: int) -> None:
         """向指定 hart 的指定 privilege IMSIC file 注入 MSI.
 
@@ -520,18 +560,20 @@ class IMSIC(Device):
             file = self._file_for(hart_id, priv)
             if file is not None:
                 file.set_pending(eip_num)
+                self._publish_eip(hart_id, priv)
 
     def clear_ip_number(self, hart_id: int, priv: str, eip_num: int) -> None:
         """清除指定 hart 的指定 privilege IMSIC file 的 pending 位.
 
         供 APLIC set_irq(source, False) 在设备撤除 level-triggered
-        中断时调用, 将 IMSIC eip 同步清除 (受调试程序 已通过 stopei claim,
+        中断时调用, 将 IMSIC eip 同步清除 (受调试程序已通过 stopei claim,
         但设备端仍需通知 IMSIC 中断已不存在).
         """
         with self._lock:
             file = self._file_for(hart_id, priv)
             if file is not None:
                 file.clear_pending(eip_num)
+                self._publish_eip(hart_id, priv)
 
     def clear_ipi_on_trap(self, hart_id: int, exc_code: int) -> None:
         """清除软件中断 trap 入口对应的 IMSIC eip 位 (legacy 路径).

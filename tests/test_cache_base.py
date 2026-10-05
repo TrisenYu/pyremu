@@ -3,7 +3,7 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""缓存抽象基类 (CacheBase) 测试: 通过 TLB 验证 CacheBase 基础功能."""
+"""缓存抽象基类 CacheBase 的测试: 通过 TLB 验证 CacheBase 基础功能."""
 
 from pyremu.memory.cache_base import CacheBase, CacheLineBase, ReplacementPolicy
 from pyremu.memory.tlb import TLB, TLBLine

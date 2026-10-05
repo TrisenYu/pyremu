@@ -128,7 +128,7 @@ class TestCRNGConfig:
 
         历史 bug: 两者默认同为 0x1000_5000, ``bus.add_device`` 后注册的
         CRNG 覆盖 virtio, 使 virtio 的 ACK 写被 CRNG 空 ``write()`` 吞掉,
-        PLIC 电平无法拉低 -> guest "irq N: nobody cared" 停摆.
+        PLIC 电平无法拉低, 受调试程序打印 "irq N: nobody cared" 后停摆.
         """
         # virtio-blk 基址来自 cli.py --disk 的硬编码 _VIRTIO_BLK_BASE (0x200 字节).
         virtio_base = 0x1000_5000

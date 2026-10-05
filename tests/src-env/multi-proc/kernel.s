@@ -8,7 +8,7 @@
 //   - 最多 MAX_PROCS 个 U 模式进程
 //   - 每进程独立栈 + 保护页 (Sv39)
 //   - ECALL 系统调用分发 (report/exit/uart_putc/uart_puts/uart_getc/report_nq)
-//   - 页错误 -> 终止进程, 调度下一个
+//   - 页错误则终止进程, 调度下一个
 //
 // 链接: 与 prog_fib.o + prog_nqueen.o 共同链接.
 // 符号: process_table, num_processes, current_pid 供 Python Loader 访问.
@@ -52,7 +52,7 @@
 
 .equ TIMESLICE,     100       // 每次调度分片 (mtime ticks; 模拟器 1 tick ≈ 100 指令)
                               // 原 2000 tick ≈ 20 万指令, 远超 prog_a/prog_b 的
-                              // ~6 万指令体量, MTI 永不触发 -> test_interleaved 无交错.
+                              // ~6 万指令体量, MTI 永不触发, 因此 test_interleaved 无交错.
                               // 100 tick ≈ 1 万指令, 每进程被抢占多次, 抢占机制可测.
 
 .equ RBUF_SIZE,     64
@@ -97,10 +97,10 @@ _start:
     la   t0, m_trap_handler
     csrw mtvec, t0
 
-    // 委派异常: ECALL + page faults -> S
+    // 委派到 S 模式的异常: ECALL + page faults
     li   t0, 0xB100           // bits 8,12,13,15
     csrw medeleg, t0
-    // 委派中断: MTI -> S
+    // 委派到 S 模式的中断: MTI
     li   t0, (1 << 7)
     csrw mideleg, t0
     // 使能 MTIE
@@ -167,7 +167,7 @@ s_mode_boot:
     la   a0, str_boot
     call uart_puts
 
-    // 首次调度 -> U 模式
+    // 首次调度进入 U 模式
     call schedule_next
     // schedule_next 已设置 sepc 和 sscratch (进程的 U sp)
     csrrw sp, sscratch, sp     // sp = U 栈, sscratch = S 栈 (schedule_next 的栈帧)
@@ -404,7 +404,7 @@ setup_sv39:
     // 栈 PTE 基: PPN = STACK_BASE_U >> 12 = 0x80100, 每进程 +2
     li   t0, 0x0000000020040017  // PPN=0x80100, R+W+U
     li   t4, 0x100             // 第一个 L3 索引 (VA 0x80100000 的 VPN[0])
-    slli t4, t4, 3             // 索引 -> 字节偏移 (×8)
+    slli t4, t4, 3             // 索引映射到字节偏移 (×8)
     add  s1, s1, t4            // s1 = &L3_main[0x100]
 
 2:
@@ -544,7 +544,7 @@ sched_no_wrap:
     li   t0, MAX_PROCS
     blt  t5, t0, sched_scan    // 未扫满一轮, 继续
 
-    // 无 READY 进程 -> 停机
+    // 无 READY 进程则停机
     // (stop_machine 在文件末尾定义)
     j    stop_machine
 
@@ -559,7 +559,7 @@ sched_found:
 
     // 恢复 sepc ← PCB[t2].saved_sepc (若首次则为 entry_pc)
     ld   t5, PCB_SEPC_OFF(t3)
-    beqz t5, 1f                // sepc==0 -> 首次, 用 entry_pc
+    beqz t5, 1f                // sepc==0 表示首次, 用 entry_pc
     csrw sepc, t5
     j    2f
 1:
@@ -567,10 +567,10 @@ sched_found:
     csrw sepc, t5
 2:
 
-    // 恢复 U sp -> sscratch (s_trap_done 会交换回 sp)
+    // 恢复 U sp 到 sscratch (s_trap_done 会交换回 sp)
     ld   t5, PCB_SP_OFF(t3)
-    bnez t5, 3f                // sp 有值 -> 恢复
-    ld   t5, PCB_STACK_OFF(t3) // 首次 -> 用 stack_top
+    bnez t5, 3f                // sp 有值则恢复
+    ld   t5, PCB_STACK_OFF(t3) // 首次则用 stack_top
 3:
     // 写入 sscratch, 供 s_trap_done 的 csrrw 交换
     csrw sscratch, t5
@@ -590,7 +590,7 @@ sched_found:
 terminate_current:
     la   t0, current_pid
     lw   t1, 0(t0)
-    bltz t1, sched_find_next   // 无当前进程 -> 直接调度
+    bltz t1, sched_find_next   // 无当前进程则直接调度
 
     la   t2, process_table
     li   t3, PCB_SIZE
@@ -614,7 +614,7 @@ terminate_current:
     sw   t3, 0(t0)
 
     // 设置 ra = s_trap_done_switch: schedule_next 的 ret 将直接跳转到
-    // 切换路径 (恢复新进程寄存器 -> sret), 而非 sys_exit (会落入
+    // 切换路径 (恢复新进程寄存器后 sret), 而非 sys_exit (会落入
     // s_trap_fault). 用 _switch 变体: 已切换进程, 内核帧属旧进程不可恢复.
     la   ra, s_trap_done_switch
     j    schedule_next
@@ -640,7 +640,7 @@ s_trap_handler:
     // 保存全部用户 GPR 到帧
     call save_gprs_to_frame
 
-    // 帧 GPR -> PCB (若有当前进程)
+    // 帧 GPR 写入 PCB (若有当前进程)
     la   t2, current_pid
     lw   t1, 0(t2)
     bltz t1, 1f
@@ -653,7 +653,7 @@ s_trap_handler:
 
     csrr t0, scause
 
-    // 中断? (bit 63 置位 -> 负数)
+    // 中断? (bit 63 置位则值为负数)
     bltz t0, s_trap_interrupt
 
     // ---- 异常 ----
@@ -765,7 +765,7 @@ s_trap_interrupt:
     // 保存当前进程的 sepc/sp
     la   t0, current_pid
     lw   t1, 0(t0)
-    bltz t1, 2f               // 无当前进程 -> 直接调度
+    bltz t1, 2f               // 无当前进程则直接调度
 
     la   t2, process_table
     li   t3, PCB_SIZE
@@ -1140,7 +1140,7 @@ stop_machine:
     slli x0, x0, 0x1f
     ebreak
     srai x0, x0, 7
-    // 兜底: 纯 Python 路径无 semihosting, WFI 自旋
+    // 纯 Python 路径无 semihosting, 停在此处以 WFI 自旋等待
 stop_machine_idle:
     wfi
     j    stop_machine_idle

@@ -4,6 +4,7 @@
 //! Handles M-mode bypass (MPRV-aware), enclave pmpsplit partitioning, and
 //! the standard priority-based matching rules.
 
+use crate::consts::HOST_MDID;
 use crate::state::{riscv_mode, HartState};
 
 /// PMP (Physical Memory Protection) configuration.
@@ -193,8 +194,8 @@ pub extern "C" fn pmp_check(
 		return 0;
 	}
 
-	// ---- Enclave mode (mdid != 0): entries in [0, pmpsplit) are OFF ----
-	let enclave_mode = mdid != 0;
+	// ---- Enclave mode (mdid != HOST_MDID): entries in [0, pmpsplit) are OFF ----
+	let enclave_mode = mdid != HOST_MDID;
 	if enclave_mode && pmpsplit > 0 && pmpsplit >= num_entries {
 		return 0;
 	}

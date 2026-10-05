@@ -21,7 +21,7 @@ import pytest
 from pyremu.core.hart import RiscvMode
 from pyremu.core.trap_handler import check_pending_interrupts
 from pyremu.emulator import Emulator
-from pyremu.interrupt.imsic import _IID_M_IPI, _IID_S_IPI, IMSIC
+from pyremu.interrupt.imsic import IID_M_IPI, IID_S_IPI, IMSIC
 from pyremu.platform import PlatformConfig
 
 # ============================================================
@@ -54,11 +54,11 @@ class TestIpiLifecycle:
 
         sf = imsic._file_for(0, 'S')
         assert sf is not None
-        assert sf.eip[0] & (1 << _IID_S_IPI), "S-file eip[0] bit 1 should be set"
+        assert sf.eip[0] & (1 << IID_S_IPI), "S-file eip[0] bit 1 should be set"
 
         peek = imsic.peek_topei(0, 'S')
         assert peek != 0, f"peek_topei non-zero, got {peek}"
-        assert ((peek >> 16) & 0x7FF) == _IID_S_IPI
+        assert ((peek >> 16) & 0x7FF) == IID_S_IPI
 
         # Claim via read_topei — clears eip
         claim = imsic.read_topei(0, 'S')
@@ -91,7 +91,7 @@ class TestIpiLifecycle:
 
         mf = imsic._file_for(0, 'M')
         assert mf is not None
-        assert mf.eip[0] & (1 << _IID_S_IPI), "M-file eip[0] bit 1 should be set"
+        assert mf.eip[0] & (1 << IID_S_IPI), "M-file eip[0] bit 1 should be set"
         assert imsic.peek_topei(0, 'M') != 0, "M-file should have pending IPI"
         assert imsic.peek_topei(0, 'S') == 0, "S-file should have no pending IPI"
 
@@ -142,13 +142,13 @@ class TestCrossHartIpi:
 
         mf_h1 = imsic._file_for(1, 'M')
         assert mf_h1 is not None
-        assert mf_h1.eip[0] & (1 << _IID_S_IPI)
+        assert mf_h1.eip[0] & (1 << IID_S_IPI)
         assert imsic.get_pending_mip(1) & (1 << 11), "hart 1 MEIP should be set"
 
     def test_set_ip_number_all_harts_independent(self):
         """set_ip_number to hart 2 leaves harts 0,1,3 unaffected."""
         imsic = IMSIC(num_harts=4, m_base_addr=_IMSIC_M_BASE)
-        imsic.set_ip_number(2, 'S', _IID_S_IPI)
+        imsic.set_ip_number(2, 'S', IID_S_IPI)
         assert imsic.peek_topei(2, 'S') != 0
         for h in (0, 1, 3):
             assert imsic.peek_topei(h, 'S') == 0, f"Hart {h} unaffected"
@@ -181,7 +181,7 @@ class TestIpiCsrLevel:
         h1.mode = RiscvMode.S
         assert imsic
         imsic.csr_write(1, 'S', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(1, 'S', _IID_S_IPI)
+        imsic.set_ip_number(1, 'S', IID_S_IPI)
 
         val = h1.read_csr(_CSR_STOPI)
         assert val != 0, f"stopi after IPI: expected non-zero, got {val}"
@@ -207,7 +207,7 @@ class TestIpiCsrLevel:
         h1.mode = RiscvMode.S
         assert imsic
         imsic.csr_write(1, 'S', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(1, 'S', _IID_S_IPI)
+        imsic.set_ip_number(1, 'S', IID_S_IPI)
 
         # stopi must report the MAJOR identity (SEI=9), not the minor (1).
         stopi = h1.read_csr(_CSR_STOPI)
@@ -217,7 +217,7 @@ class TestIpiCsrLevel:
 
         # stopei must still reveal the MINOR identity (1 = IPI).
         stopei = h1.read_csr(_CSR_STOPEI)
-        assert ((stopei >> 16) & 0x7FF) == _IID_S_IPI, (
+        assert ((stopei >> 16) & 0x7FF) == IID_S_IPI, (
             f"stopei>>16 must be the minor IPI identity (1), got {(stopei >> 16) & 0x7FF}"
         )
 
@@ -229,7 +229,7 @@ class TestIpiCsrLevel:
         h.mode = RiscvMode.S
         assert imsic
         imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.set_ip_number(0, 'S', _IID_S_IPI)
+        imsic.set_ip_number(0, 'S', IID_S_IPI)
 
         v1 = h.read_csr(_CSR_STOPI)
         v2 = h.read_csr(_CSR_STOPI)
@@ -257,7 +257,7 @@ class TestIpiCsrLevel:
         h.mode = RiscvMode.S
         assert imsic
         imsic.csr_write(0, 'S', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(0, 'S', _IID_S_IPI)
+        imsic.set_ip_number(0, 'S', IID_S_IPI)
 
         v1 = h.read_csr(_CSR_STOPEI)
         assert v1 != 0, f"first stopei: expected non-zero, got {v1}"
@@ -274,7 +274,7 @@ class TestIpiCsrLevel:
         h.mode = RiscvMode.M
         assert imsic
         imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(0, 'M', _IID_M_IPI)
+        imsic.set_ip_number(0, 'M', IID_M_IPI)
 
         val = h.read_csr(_CSR_MTOPI)
         iid = (val >> 16) & 0x7FF
@@ -291,7 +291,7 @@ class TestIpiCsrLevel:
 
         assert imsic
         imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.set_ip_number(0, 'M', _IID_M_IPI)
+        imsic.set_ip_number(0, 'M', IID_M_IPI)
         v1 = h.read_csr(_CSR_MTOPEI)
         assert v1 != 0
         v2 = h.read_csr(_CSR_MTOPEI)
@@ -311,7 +311,7 @@ class TestIpiCsrLevel:
         h1.csrs["mie"].val = 1 << 9  # SEIE
         assert h1.mie_val & (1 << 9), "SEIE should be set in mie CSR"
         assert imsic
-        imsic.set_ip_number(1, 'S', _IID_S_IPI)
+        imsic.set_ip_number(1, 'S', IID_S_IPI)
 
         # check_pending_interrupts returns True if a trap was delivered
         result = check_pending_interrupts(h1)

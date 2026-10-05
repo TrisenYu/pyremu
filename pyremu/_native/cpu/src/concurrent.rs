@@ -153,6 +153,19 @@ impl ConcurrentClintCtx {
 			hart_states: Cell::new(std::ptr::null()),
 		}
 	}
+
+	/// 取 ``hart_id`` 的 MSIP 待处理槽位地址 — 未初始化时返回空指针.
+	///
+	/// 槽位地址为 ``msip_pending`` 数组首地址加 ``hart_id * MSIP_PENDING_STRIDE``,
+	/// 与 ``ModuleState::new`` 的分配跨步一致.
+	#[inline]
+	pub(crate) fn msip_pending_slot(&self, hart_id: usize) -> *const AtomicU64 {
+		let base = self.msip_pending.get();
+		if base.is_null() {
+			return std::ptr::null();
+		}
+		unsafe { base.add(hart_id * MSIP_PENDING_STRIDE) }
+	}
 }
 
 // ============================================================
@@ -186,6 +199,12 @@ impl StopInfo {
 		}
 	}
 }
+
+/// 每 hart 的 MSIP 待处理槽位占用的元素个数 — hart 索引乘本值即该 hart 的槽位下标,
+/// 相邻 hart 的槽位相距 64 字节.
+///
+/// 槽位由向其发送 IPI 的 hart 置位, 由本 hart 的 ``sync_msip`` 读取并写入 0.
+pub const MSIP_PENDING_STRIDE: usize = 8;
 
 /// Global coordination state shared across all hart threads.
 ///
@@ -236,15 +255,15 @@ pub struct ModuleState {
 	/// marshal 时的 mtime 基准值. 指令推进的基准:
 	/// target = time_base_val + instr_delta * timebase_hz * NS_PER_INSTR / 1e9.
 	pub time_base_val: u64,
-	/// 每 hart 本轮加速执行起始时的指令计数 (marshal 时快照).
+	/// 每 hart 本轮加速执行起始时的指令计数, marshal 时快照.
 	/// ``advance_clock_source`` 用 ``state.total_instrs - instr_ref_num[hid]``
-	/// 计算本轮已执行的指令增量并换算 mtime tick — 受调试程序 时钟随已执行指令推进,
-	/// 与主机单调时钟无关. 低速模拟 (2.5~6 MIPS) 下若 mtime 跟随真实流逝, 内核
-	/// HZ=250 的定时器 tick (每 4ms 受调试程序时间) 只隔 ~1e4 条指令, tick 处理路径
-	/// (实测 <=5e4 条) 超长即陷入 mret 后立即再 trap 的活锁; 按指令推进
-	/// (每指令 20ns, tick 间隔 2e5 条指令 = 4× 余量, 永不风暴) 消除该活锁,
-	/// 同时 rdtime 预算循环 (如内核 unaligned-access 测速, 8ms = 80000 ticks =
-	/// 4e6 条指令) 仍可完成.
+	/// 计算本轮已执行的指令增量并换算 mtime tick, 故受调试程序时钟随已执行指令
+	/// 推进, 与主机单调时钟无关. 模拟速度为 2.5 至 6 MIPS 时, 若 mtime 跟随真实
+	/// 流逝, 内核 HZ=250 的定时器 tick 相隔 4 ms 的受调试程序时间, 仅对应约 1e4
+	/// 条指令, 而 tick 处理路径实测可长达 5e4 条指令, 每处理完一次 tick 即已再
+	/// 次到期, 陷入 mret 后立即再 trap 的活锁. 改为按指令推进后每指令 20 纳秒,
+	/// tick 间隔 2e5 条指令, 留有 4 倍余量; rdtime 预算循环仍可完成, 如内核
+	/// unaligned-access 测速的 8 ms 折合 4e6 条指令.
 	pub instr_ref_num: Box<[u64]>,
 }
 
@@ -259,11 +278,13 @@ impl ModuleState {
 		let mut v = Vec::with_capacity(num_harts as usize);
 		let mut gv = Vec::with_capacity(num_harts as usize);
 		let mut rv = Vec::with_capacity(num_harts as usize);
-		let mut mv = Vec::with_capacity(num_harts as usize);
+		let mut mv = Vec::with_capacity(num_harts as usize * MSIP_PENDING_STRIDE);
 		for _ in 0..num_harts {
 			v.push(AtomicU8::new(0));
 			gv.push(AtomicU64::new(0));
 			rv.push(AtomicU64::new(0));
+		}
+		for _ in 0..num_harts as usize * MSIP_PENDING_STRIDE {
 			mv.push(AtomicU64::new(0));
 		}
 		ModuleState {
@@ -553,9 +574,9 @@ unsafe fn writeback_mtime(clint_raw: &FfiClintCtx, cc_clint: &ConcurrentClintCtx
 /// 纳秒/秒 — Duration 换算为时钟 tick 的定义性常数.
 const NS_PER_SEC: u64 = 1_000_000_000;
 
-/// 指令计数推进的换算比率 — 每指令多少纳秒 受调试程序 时间.
+/// 指令计数推进的换算比率 — 每条指令对应多少纳秒的受调试程序时间.
 ///
-/// 取值 20ns/instr:
+/// 取值为 20, 即每条指令 20 纳秒:
 pub const NS_PER_INSTR: u64 = 20;
 
 /// 按指令计数推进 mtime (纯指令源, 无实时分量).
@@ -584,7 +605,12 @@ pub(crate) fn advance_clock_source(
 		.saturating_mul(NS_PER_INSTR)
 		/ NS_PER_SEC;
 	let target = module.time_base_val.wrapping_add(ticks);
-	unsafe { &*clint.mtime }.fetch_max(target, Ordering::Relaxed);
+	// mtime 只增不减, 取最大值的目标不超过当前值时该操作不改变任何值.
+	// 本 hart 的指令增量在 tick 周期内重复时目标值不变, 以一次普通读取代替
+	// 取最大值, 避免每条指令都对共享行执行一次加锁的读改写.
+	if unsafe { &*clint.mtime }.load(Ordering::Relaxed) < target {
+		unsafe { &*clint.mtime }.fetch_max(target, Ordering::Relaxed);
+	}
 }
 
 /// QEMU 一次性定时器语义的指令计数换算: 计算 future ``timecmp`` 在
@@ -1007,13 +1033,12 @@ mod tests {
         );
 	}
 
-	/// 构造「受调试程序 在无限循环中执行, 且 termio 已置位 RX 通知」的单 hart 加速
-	/// 执行场景, 返回 (退出原因, 本轮指令数)。``imsic_owns`` 决定 IMSIC 是否存在
-	/// 且已开启投递 (eidelivery 非 0)。
+	/// 构造一组确定性的加速执行场景并运行一轮: 受调试程序是 M 模式下的原地无限循环
+	/// ``jal x0, 0``, 中断使能位与挂起位均为 0, termio 的 RX 通知位已置位。
+	/// 返回 (退出原因, 本轮执行的指令数)。
 	///
-	/// 看门狗超时 300 ms 用于界定「引擎忽略 RX 通知」的行为: 受调试程序 的无限
-	/// 循环使本轮永不自然结束, 忽略通知时只能由看门狗以 TIMEOUT 收场, 测试因此
-	/// 以断言失败而非挂起的形式暴露回归。
+	/// 无限循环不会自行结束, 故本轮的出口只有两个: 引擎因 RX 通知退出, 或看门狗在
+	/// 300 ms 后以超时结束本轮。后者使回归测试表现为断言失败而不是挂起。
 	unsafe fn run_rx_notify_case(imsic_owns: bool) -> (u8, u64) {
 		let mut ram = vec![0u8; 256];
 		write_u32_le(&mut ram, 0, 0x0000_006F); // jal x0, 0: 原地无限循环
@@ -1117,11 +1142,10 @@ mod tests {
 	/// Regression: termio 写入 stdin 字节并置位 RX 通知时, 若 IMSIC 独占外部中断
 	/// 线路 (eidelivery 非 0), 引擎必须在执行任何指令之前退出本轮加速执行。
 	///
-	/// 字节到达受调试程序 需经 Python 侧两步搬运: RX 线程把 ring buffer 的字节
-	/// 搬进 UART FIFO, APLIC 再把中断注入 IMSIC 的 eip。这两步在单轮加速执行内
-	/// 都不可见, 且 ``sync_ext_irq_mip`` 在 IMSIC 独占线路时不置 SEIP, 引擎读到的
-	/// eip 又是 marshal 时刻的快照, 故本轮无法投递中断, 必须退出让 Python 搬运;
-	/// 下一轮 ``_native_sync_plic_mip`` 依据新的 eip 置 SEIP, 受调试程序 随即取走数据。
+	/// 字节进入 UART FIFO 需经 Python 侧的搬运 (RX 线程把 ring buffer 的字节搬进
+	/// FIFO), 该步骤在单轮加速执行内不可见, 故必须退出让 Python 尽快搬运。
+	/// 中断投递本身不再依赖此退出: eip 的新增位由 Python 经 ``IMSIC._publish_eip``
+	/// 写穿到共享数组, ``sync_ext_irq_mip`` 在轮内即可依据 live eip 置 SEIP。
 	///
 	/// 修复前 (e904ba4 删除了 ``hart_worker`` 的 RX 通知退出) 该通知被完全忽略,
 	/// 输入要等到本轮加速执行自然结束才被处理 — 交互式控制台下单轮长达数秒,
@@ -1139,9 +1163,9 @@ mod tests {
 	}
 
 	/// 互补用例: IMSIC 未占用外部中断线路 (legacy PLIC 模式) 时, RX 通知不得
-	/// 触发退出 — ``sync_ext_irq_mip`` 已在本轮内联置位 SEIP, 受调试程序 在轮内
-	/// 即可取走字节; 退出会砍掉 legacy 模式的输入吞吐。此处受调试程序 无限循环,
-	/// 唯一的结束方式是看门狗超时, 故以 TIMEOUT 锁定「未退出」这一行为。
+	/// 触发退出 — ``sync_ext_irq_mip`` 已在本轮内联置位 SEIP, 受调试程序在轮内
+	/// 即可取走字节; 退出会降低 legacy 模式的输入吞吐. 此处受调试程序为无限循环,
+	/// 唯一的结束方式是看门狗超时, 故以 TIMEOUT 锁定未退出这一行为.
 	#[test]
 	fn rx_notify_does_not_exit_batch_without_imsic() {
 		let (reason, _) = unsafe { run_rx_notify_case(false) };
