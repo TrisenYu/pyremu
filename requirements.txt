@@ -26,4 +26,4 @@ ruff==0.16.6
 setuptools==84.0.0
 typing-extensions==4.16.0
 typing-inspection==0.4.4
-wcwidth==0.8.3
+wcwidth==0.9.1
