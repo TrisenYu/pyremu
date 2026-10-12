@@ -11,7 +11,7 @@ use super::consts::{
 use super::mount;
 use super::super::fdtable::FDS;
 use super::super::{
-	EBADF, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOSYS, ENOTDIR, ERANGE,
+	EBADF, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOTDIR, ERANGE,
 };
 use super::{fd_node, vfs_errno};
 
@@ -77,8 +77,11 @@ pub fn mkdirat_handler(dirfd: u64, pathname: u64, mode: u64) -> u64 {
 		}
 	};
 	let path = &path_buf[..plen];
-	let Some((_, ops, sub)) = mount::resolve(path) else {
-		return ENOSYS;
+	let (_, ops, sub) = match mount::resolve(path) {
+		Ok(found) => found,
+		Err(e) => {
+			return e;
+		}
 	};
 	vfs_errno(unsafe { (ops.mkdir)(sub.as_ptr(), sub.len() as u64, (mode & 0o777) as u32) })
 }
@@ -98,8 +101,11 @@ pub fn unlinkat_handler(dirfd: u64, pathname: u64, flags: u64) -> u64 {
 		}
 	};
 	let path = &path_buf[..plen];
-	let Some((_, ops, sub)) = mount::resolve(path) else {
-		return ENOSYS;
+	let (_, ops, sub) = match mount::resolve(path) {
+		Ok(found) => found,
+		Err(e) => {
+			return e;
+		}
 	};
 	vfs_errno(unsafe { (ops.unlink)(sub.as_ptr(), sub.len() as u64, flags as u32) })
 }
@@ -109,7 +115,8 @@ pub fn unlinkat_handler(dirfd: u64, pathname: u64, flags: u64) -> u64 {
 /// *mode* 只接受 [`ACCESS_MODE_BITS`] 覆盖的位, *flags* 只接受 [`ACCESS_FLAG_BITS`]
 /// 覆盖的位, 出现其余位返回 EINVAL。*flags* 含 [`AT_EMPTY_PATH`] 而路径取空时, 目标取
 /// *dirfd* 自身绑定的节点, 见 [empty_path_exists]; *dirfd* 无效或绑定的不是文件系统节点时
-/// 返回 EBADF。路径经 [mount] 分派给它所属的文件系统; 该文件系统尚未交付时返回 ENOSYS。
+/// 返回 EBADF。路径经 [mount] 分派给它所属的文件系统; 该文件系统尚未交付时返回取入失败
+/// 给出的错误码, 见 [mount::resolve]。
 pub fn faccessat_handler(dirfd: u64, pathname: u64, mode: u64, flags: u64) -> u64 {
 	if mode & !ACCESS_MODE_BITS != 0 || flags & !ACCESS_FLAG_BITS != 0 {
 		return EINVAL;
@@ -125,14 +132,17 @@ pub fn faccessat_handler(dirfd: u64, pathname: u64, mode: u64, flags: u64) -> u6
 		return empty_path_exists(dirfd);
 	}
 	let path = &path_buf[..plen];
-	let Some((_, ops, sub)) = mount::resolve(path) else {
-		return ENOSYS;
+	let (_, ops, sub) = match mount::resolve(path) {
+		Ok(found) => found,
+		Err(e) => {
+			return e;
+		}
 	};
 	vfs_errno(unsafe { (ops.access)(sub.as_ptr(), sub.len() as u64) })
 }
 
 /// 检查描述符 *dirfd* 绑定的节点是否存在。描述符无效或绑定的不是文件系统节点时返回
-/// EBADF, 该节点所属的文件系统尚未交付时返回 ENOSYS。
+/// EBADF, 该节点所属的文件系统尚未交付时返回取入失败给出的错误码, 见 [mount::ops_of]。
 fn empty_path_exists(dirfd: u64) -> u64 {
 	let (fs, node) = {
 		let tables = FDS.lock();
@@ -141,8 +151,11 @@ fn empty_path_exists(dirfd: u64) -> u64 {
 		};
 		found
 	};
-	let Some(ops) = mount::ops_of(fs) else {
-		return ENOSYS;
+	let ops = match mount::ops_of(fs) {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	// 按节点的存在性判定: 操作表没有按下标检查的入口, stat 是按下标探测的入口
 	let mut vstat = VfsStat::zero();

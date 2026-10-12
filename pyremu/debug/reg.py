@@ -14,8 +14,8 @@ from pyremu.core.registers import gpr_alias, gpr_name
 from pyremu.core.trap_def import trap_cause_name
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.utils import hex_addr
-from pyremu.utils.wrapper import seize_val_err
 from pyremu.utils.mask import mask64
+from pyremu.utils.wrapper import seize_val_err
 
 
 class RegisterMixin(SharedMixinAttrs):

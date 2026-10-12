@@ -4,6 +4,7 @@
 
 """工具函数: 文件操作, 错误处理, 固件解析, 反汇编, 格式化."""
 
+from pyremu.utils.disassem import disasm
 from pyremu.utils.file_ops import (
     get_abs_filename_arr_from_dir,
     is_file,
@@ -11,9 +12,9 @@ from pyremu.utils.file_ops import (
     reloc_path,
 )
 from pyremu.utils.parse_bin import (
+    detect_format,
     FirmwareImage,
     FirmwareSegment,
-    detect_format,
     parse_firmware,
 )
 from pyremu.utils.str_aux import fmt_addr, fmt_hexdump
@@ -24,7 +25,6 @@ from pyremu.utils.wrapper import (
     seize_val_err,
     silent_on_err,
 )
-from pyremu.utils.disassem import disasm
 
 __all__ = [
     "FirmwareImage",

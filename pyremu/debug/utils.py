@@ -9,10 +9,17 @@
 """
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pyremu.core import trap_def
+from pyremu.core.hart import RiscvMode
+from pyremu.core.mem_check_aux import translate_addr
 from pyremu.utils.disassem import Opc
 from pyremu.utils.mask import mask64
+
+if TYPE_CHECKING:
+    from pyremu.core.hart import HartWithRegs
+    from pyremu.memory.bus import Bus
 
 # ============================================================
 #  节流常量
@@ -57,19 +64,88 @@ def fmt_size(n: int) -> str:
 
 
 def fmt_instr_count(n: int) -> str:
-    """将指令数格式化为 human-readable: B(十亿) / M(百万) / K(千)."""
     if n < 1000:
         return str(n)
-    if n < 1_000_000:
-        return f"{n / 1000:.3f}K"
-    if n < 1_000_000_000:
-        return f"{n / 1_000_000:.6f}M"
-    return f"{n / 1_000_000_000:.7f}B"
+    nn = float(n / 1000.0)
+    if nn < 1000:
+        return f"{nn:.3f}K"
+    nn /= 1000
+    if nn < 1000:
+        return f"{nn:.3f}M"
+    nn /= 1000
+    if nn < 1000:
+        return f"{nn:.3f}B"
+    nn /= 1000
+    return f"{nn:.3f}T"
 
 
 def trap_cause_name(mcause_val: int) -> str:
     """将 mcause 寄存器值翻译为可读的 trap 类型名称."""
     return trap_def.trap_cause_name(mcause_val)
+
+
+# ============================================================
+#  虚拟地址读取
+# ============================================================
+
+
+def read_va_bytes(
+    bus: Bus,
+    hart: HartWithRegs,
+    va: int,
+    size: int,
+    *,
+    is_execute: bool = False,
+) -> bytes | None:
+    """按指定的访问类型从虚拟地址读取内存, 跨越页边界时逐页翻译.
+
+    取指语义只判定页面的可执行位; 数据读语义还要求 R=1, 只在 mstatus.MXR
+    置位时才由 X=1 顶替. 两者都不施加 PMP 与 PMA 判定.
+
+    Returns:
+        读到的字节; 翻译失败或读取失败时返回 None.
+    """
+    if size <= 0 or size > 4096:
+        return None
+    if hart.mmu_mode == 0 or hart.mode == RiscvMode.M:
+        return bus.try_read(va, size)
+    result = bytearray()
+    remain = size
+    cur = va
+    while remain > 0:
+        page_off = cur & 0xFFF
+        chunk = min(remain, 0x1000 - page_off)
+        ok, pa = translate_addr(hart, cur, is_execute=is_execute)
+        if not ok:
+            return None
+        data = bus.try_read(pa, chunk)
+        if data is None:
+            return None
+        result.extend(data)
+        remain -= chunk
+        cur += chunk
+    return bytes(result)
+
+
+def read_code_bytes(
+    bus: Bus,
+    hart: HartWithRegs,
+    va: int,
+    size: int,
+) -> bytes | None:
+    """按取指语义读取指令字节, 取指语义被拒时退回数据读语义.
+
+    取指只判定页面的可执行位, 数据读语义还要求 R=1. 只可执行的页面须用取指
+    语义读出; 取指语义被拒时退回数据读语义, 使 S 模式仍能读出 U 模式页面上
+    的指令字节.
+
+    Returns:
+        读到的字节; 两种语义都读不到时返回 None.
+    """
+    data = read_va_bytes(bus, hart, va, size, is_execute=True)
+    if data is not None:
+        return data
+    return read_va_bytes(bus, hart, va, size, is_execute=False)
 
 
 # ============================================================

@@ -18,7 +18,12 @@ from pyremu.core.mem_check_aux import translate_addr
 from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
 from pyremu.core.trap_def import trap_cause_name
 from pyremu.debug._attrs import SharedMixinAttrs
-from pyremu.debug.utils import check_rv64_addr, hex_addr, MAX_INSTR_COUNT
+from pyremu.debug.utils import (
+    check_rv64_addr,
+    hex_addr,
+    MAX_INSTR_COUNT,
+    read_code_bytes,
+)
 from pyremu.memory.mmu import sv39_walk
 from pyremu.utils.disassem import disasm
 from pyremu.utils.mask import mask64
@@ -86,6 +91,15 @@ class MemoryMixin(SharedMixinAttrs):
             cur += chunk
         return bytes(result)
 
+    def _try_read_code_va(self, va: int, size: int) -> bytes | None:
+        """按取指语义读取指令字节.
+
+        取指只判定页面的可执行位; 数据读语义还要求 R=1, 只在 mstatus.MXR
+        置位时才由 X=1 顶替. 管理器把自身 .text 映射为只可执行, 故 pc 与栈
+        回溯读取指令字节时不能用数据读语义.
+        """
+        return read_code_bytes(self._emu.bus, self.hart, va, size)
+
     def _try_read_pa(self, pa: int, size: int) -> bytes | None:
         """从物理地址读取内存."""
         if size <= 0 or size > 4096:
@@ -124,6 +138,7 @@ class MemoryMixin(SharedMixinAttrs):
         v = self._read_csr_by_name(arg)
         if v != 0 or csr_addr_from_name(arg) is not None:
             return v
+
         if self._image and self._image.symbols:
             sym_va = self._image.symbols.get(arg)
             if sym_va is not None:
@@ -148,8 +163,10 @@ class MemoryMixin(SharedMixinAttrs):
         """从 pc 取指并反汇编一条指令, 返回 (hex_str, asm_str).
 
         MMU 启用时 PC 为虚拟地址, 需先做 VA 到 PA 的翻译再读取.
+        读取用取指语义 (只判定页面的可执行位), 只可执行的页面在数据读语义下
+        必定被拒, pc 将显示为不可读取.
         """
-        raw = self._try_read_va(pc, 4)
+        raw = self._try_read_code_va(pc, 4)
         if raw is None:
             return None
         instr = int.from_bytes(raw.ljust(4, b"\x00"), "little", signed=False)

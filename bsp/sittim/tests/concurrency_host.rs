@@ -4,9 +4,9 @@
 //! 调用。二者在飞地内分处 `src/syscall/concurrency/` 的两个文件, 用例一并取入, 覆盖的是
 //! 两者真实相遇的那一层。
 //!
-//! 本层对平台的依赖集中在四处, 由本文件给出替身: 时钟源与陷阱帧 [`csr`]、[`trap`], 内核栈
-//! 分配 [`mem`], 以及让出宿主与终止飞地两条 ecall [`ecall_aux`]。四处替身只记录调用与给出
-//! 可设置的返回值, 不改变本层的判定。
+//! 本层对平台的依赖集中在三处, 由本文件给出替身: 时钟源 [`csr`]、内核栈分配 [`mem`], 以及
+//! 让出宿主与终止飞地两条 ecall [`ecall_aux`]。三处替身只记录调用与给出可设置的返回值,
+//! 不改变本层的判定。陷态栈帧取入真实源文件 [`trap_frame`], 与 [`thread`] 相同。
 //!
 //! 不在覆盖范围内的一项: 飞地内 [`thread::block_current`] 在没有其它可运行线程时经
 //! [`ecall_aux::enclave_call_suspend`] 让出宿主, 该让出在主机侧没有对应行为, 替身只记录
@@ -32,6 +32,9 @@ pub mod timer;
 
 #[path = "../src/syscall/concurrency/thread.rs"]
 pub mod thread;
+
+#[path = "../src/trap_frame.rs"]
+mod trap_frame;
 
 /// 时钟源与 S 模式 CSR 的替身。本层只用到时钟源与 sepc/sstatus 四项, 前者可被用例设定,
 /// 后者只作记录。
@@ -99,27 +102,6 @@ mod csr {
 	}
 }
 
-/// 陷阱帧的替身: 布局与飞地内一致 (32 个通用寄存器后接用户 sp), 内容由先进入的线程写入,
-/// 本层只要求该写入落在可写内存内。
-mod trap {
-	/// x10 即 a0 的编号。
-	pub const A0: usize = 10;
-	/// x4 即 tp 的编号。
-	pub const TP: usize = 4;
-
-	#[repr(C)]
-	pub struct TrapGprs {
-		pub regs: [u64; 32],
-		pub usp: u64,
-	}
-
-	impl TrapGprs {
-		pub fn tp(&self) -> u64 {
-			self.regs[TP]
-		}
-	}
-}
-
 /// 内核栈分配的替身: 自一张进程内的静态数组切分, 使线程运行时的帧写入落在真实内存内。
 mod mem {
 	use core::sync::atomic::{AtomicUsize, Ordering};
@@ -136,7 +118,7 @@ mod mem {
 	/// 已切分的内核栈数。
 	static TAKEN: AtomicUsize = AtomicUsize::new(0);
 
-	/// 把切分游标复位, 使下一个用例从第一张内核栈开始。
+	/// 把已切分的内核栈数复位, 使下一个用例从第一张内核栈开始。
 	pub fn reset_kstacks() {
 		TAKEN.store(0, Ordering::SeqCst);
 	}
@@ -196,7 +178,7 @@ pub mod syscall {
 
 		/// 进程层替身。本入口不覆盖进程式 clone 与进程退出, 故只给出最小判定与空实现。
 		pub mod proc {
-			use crate::trap::TrapGprs;
+			use crate::trap_frame::TrapGprs;
 
 			/// 进程式 clone 的标志位: 未请求共享地址空间。
 			const CLONE_VM: u64 = 0x0000_0100;
@@ -251,7 +233,7 @@ mod tests {
 
 	/// 在当前线程之外登记一个可运行线程, 使本线程的阻塞按「登记切换目标并返回」结束。
 	fn spawn_peer() {
-		let gprs = trap::TrapGprs { regs: [0; 32], usp: 0 };
+		let gprs = trap_frame::TrapGprs { regs: [0; 32], sp_before_trap: 0 };
 		thread::clone_thread(
 			&gprs,
 			CLONE_VM | CLONE_THREAD,

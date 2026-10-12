@@ -7,7 +7,8 @@
 //! UDP_SOCKETS 个套接字并记下各自的句柄, 关闭只是解绑并释放下标, 不增删集合成员,
 //! 故下标、句柄与缓冲区三者的对应关系在栈的生命周期内不变。
 
-use core::ptr::addr_of_mut;
+use core::mem::MaybeUninit;
+use core::ptr::{addr_of, addr_of_mut};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::udp;
@@ -70,11 +71,21 @@ struct Storage {
 }
 
 impl Storage {
-	const fn new() -> Self {
-		Self {
-			buf_sets: [const { BufferSet::new() }; UDP_SOCKETS],
-			socket_storage: [SocketStorage::EMPTY; UDP_SOCKETS],
+	/// 就地写入全部字段, 返回本静态存储的引用。
+	///
+	/// 本结构体的大小约 103 KiB, 而模块代码运行在管理程序的内核栈上。整值一次写入时
+	/// 调用方需在栈上取出同样大小的临时值, 故此处逐个元素写入, 栈上的临时值不超过一个
+	/// 元素的大小。`dst` 必须指向一块可以按 [`Storage`] 写入的存储。
+	unsafe fn write_into(dst: *mut Self) -> &'static mut Self {
+		let buf_sets = unsafe { addr_of_mut!((*dst).buf_sets).cast::<BufferSet>() };
+		let socket_storage = unsafe {
+			addr_of_mut!((*dst).socket_storage).cast::<SocketStorage<'static>>()
+		};
+		for i in 0..UDP_SOCKETS {
+			unsafe { buf_sets.add(i).write(BufferSet::new()) };
+			unsafe { socket_storage.add(i).write(SocketStorage::EMPTY) };
 		}
+		unsafe { &mut *dst }
 	}
 }
 
@@ -90,11 +101,23 @@ struct Stack {
 	next_ephemeral_port: u16,
 }
 
-static mut STORAGE: Storage = Storage::new();
-static mut STACK: Option<Stack> = None;
+/// 协议栈的静态存储。
+///
+/// 模块的可写静态数据只允许以全零的字节作初值: 映像中初值非零的部分落在可执行部分之内,
+/// 装入后只有读与执行权限。[`Storage`] 的字节不全为零, 其中的 `Option` 取 `None` 时判别
+/// 标记非零, 故本静态的初值由 [`init`] 经 [`Storage::write_into`] 就地写入。
+static mut STORAGE: MaybeUninit<Storage> = MaybeUninit::uninit();
+/// 接口、套接字集合与各下标的取用状态, 同样由 [`init`] 写入; 是否已写入由
+/// [`IS_STACK_READY`] 判定。
+static mut STACK: MaybeUninit<Stack> = MaybeUninit::uninit();
+/// 协议栈是否已写入 [`STACK`]。
+static mut IS_STACK_READY: bool = false;
 
 fn stack() -> Option<&'static mut Stack> {
-	unsafe { (*addr_of_mut!(STACK)).as_mut() }
+	if !unsafe { addr_of!(IS_STACK_READY).read() } {
+		return None;
+	}
+	Some(unsafe { (*addr_of_mut!(STACK)).assume_init_mut() })
 }
 
 /// 协议栈是否已建立。
@@ -137,7 +160,10 @@ pub fn init() -> bool {
 		let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(LOCAL_IP), LOCAL_PREFIX_LEN));
 	});
 
-	let storage: &'static mut Storage = unsafe { &mut *addr_of_mut!(STORAGE) };
+	let storage: &'static mut Storage = unsafe {
+		let dst = (*addr_of_mut!(STORAGE)).as_mut_ptr();
+		Storage::write_into(dst)
+	};
 	let Storage { buf_sets, socket_storage } = storage;
 	let mut sockets = SocketSet::new(&mut socket_storage[..]);
 	let mut handles = [SocketHandle::default(); UDP_SOCKETS];
@@ -157,7 +183,10 @@ pub fn init() -> bool {
 		peer: [None; UDP_SOCKETS],
 		next_ephemeral_port: EPHEMERAL_PORT_BASE,
 	};
-	unsafe { *addr_of_mut!(STACK) = Some(st) };
+	unsafe {
+		(*addr_of_mut!(STACK)).write(st);
+		addr_of_mut!(IS_STACK_READY).write(true);
+	}
 	true
 }
 

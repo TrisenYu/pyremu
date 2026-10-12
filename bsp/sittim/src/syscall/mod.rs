@@ -26,8 +26,8 @@ mod types;
 use crate::constants::LINEAR_MAP_OFFSET;
 use crate::mem;
 #[cfg(feature = "diagnostic")]
-use crate::println;
-use crate::trap::TrapGprs;
+use crate::diag;
+use crate::trap_frame::TrapGprs;
 
 use types::*;
 
@@ -136,7 +136,7 @@ pub const SYSNUM_GETRANDOM: u64 = 278;
 
 /// 系统调用分发。返回的值写入 gprs.a0。
 ///
-/// 陷阱帧以可变引用传入: rt_sigreturn 需要在调用内改写整个帧以恢复信号投递前的
+/// 陷态栈帧以可变引用传入: rt_sigreturn 需要在调用内改写整个帧以恢复信号投递前的
 /// 寄存器现场, 其余调用只经 a0 传出返回值。
 pub fn syscall_handler(gprs: &mut TrapGprs) -> u64 {
     let num = gprs.a7();
@@ -262,10 +262,11 @@ pub fn syscall_handler(gprs: &mut TrapGprs) -> u64 {
         // ---- 未知 ----
         _ => {
             #[cfg(feature = "diagnostic")]
-            println!("syscall: unknown {}\n", num);
+            diag::log(format_args!("syscall: unknown {}\n", num));
             ENOSYS
         }
     };
+
     ret
 }
 

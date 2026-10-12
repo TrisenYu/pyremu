@@ -66,14 +66,16 @@ struct RamfsNode {
 }
 
 impl RamfsNode {
-	const fn empty() -> Self {
+	/// 全零的节点。链接字段的全零取值指向节点 0, 不是空值, 故取得节点后须由调用方把
+	/// parent、first_child 与 next_sibling 置为 [`NIL`]。
+	const fn zeroed() -> Self {
 		Self {
 			name: [0; NAME_MAX],
 			name_len: 0,
-			kind: VFS_KIND_FILE,
-			parent: NIL,
-			first_child: NIL,
-			next_sibling: NIL,
+			kind: VFS_KIND_DIR,
+			parent: 0,
+			first_child: 0,
+			next_sibling: 0,
 			data_off: 0,
 			size: 0,
 			mode: 0,
@@ -96,9 +98,9 @@ struct VfsState {
 }
 
 impl VfsState {
-	const fn empty() -> Self {
+	const fn zeroed() -> Self {
 		Self {
-			nodes: [RamfsNode::empty(); MAX_NODES],
+			nodes: [RamfsNode::zeroed(); MAX_NODES],
 			data: [0; DATA_ARENA],
 			data_used: 0,
 			next_node: 0,
@@ -109,7 +111,7 @@ impl VfsState {
 /// 全局目录树状态。飞地 S 模式运行在单 hart 上, 且系统调用不可重入: 中断只登记抢占, 待
 /// 系统调用返回后才切换线程。加自旋锁只为与共享资源的访问约定保持一致; 锁的持有区间不含
 /// 任何 ecall 与让出, 也就不会再次取用本锁。
-static VFS: SpinLock<VfsState> = SpinLock::new(VfsState::empty());
+static VFS: SpinLock<VfsState> = SpinLock::new(VfsState::zeroed());
 
 // ---------------------------------------------------------------
 //  工具
@@ -301,7 +303,7 @@ fn alloc_node(fs: &mut VfsState, kind: u8, mode: u32) -> i16 {
 	}
 	fs.next_node += 1;
 	let node = &mut fs.nodes[idx];
-	*node = RamfsNode::empty();
+	*node = RamfsNode::zeroed();
 	node.kind = kind;
 	node.mode = mode;
 	node.parent = NIL;
@@ -466,6 +468,10 @@ pub fn init() -> bool {
 		root.mode = 0o755;
 		root.name[0] = b'/';
 		root.name_len = 1;
+		// 全零的链接字段指向节点 0, 即根目录自身
+		root.parent = NIL;
+		root.first_child = NIL;
+		root.next_sibling = NIL;
 	}
 	true
 }
@@ -856,7 +862,7 @@ pub(crate) mod tests {
 		let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		{
 			let mut fs = VFS.lock();
-			*fs = VfsState::empty();
+			*fs = VfsState::zeroed();
 		}
 		assert!(init(), "根目录建立失败");
 		guard

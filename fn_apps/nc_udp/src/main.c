@@ -1,8 +1,4 @@
 /* nc_udp — 飞地内 UDP 自收自发的套接字通路载荷
- *
- * 协议收发由 busybox 的 nc applet 完成, 本载荷用的是 vendor/busybox 的源码, 上游文件
- * 未作改动。本文件是它的启动外壳, 只做两件 busybox 自身做不到的事:
- *
  *   1. 把标准输入换成 ramfs 上的一个文件。nc 的发送方向读自标准输入, 而飞地的标准输入
  *      接在控制台上, 飞地又没有字符输入源, 读到的恒为文件结束, nc 因此不会发出任何
  *      字节。自检标记即写入该文件。
@@ -25,13 +21,9 @@
 #include <stdio.h>
 #include <unistd.h>
 
-/* busybox 的入口, 构建时由 busybox 的 main 改名而来 (见同目录 Makefile)。 */
 extern int bb_main(int argc, char **argv);
 
-/* 承载自检标记的文件, 标准输入在其上重新打开。 */
 #define MARKER_PATH "udp_msg"
-
-/* 自检标记。本文件不把它写入描述符 1, 它只能经 nc 的接收方向到达控制台。 */
 #define MARKER_TEXT "nc_udp: udp round trip ok\n"
 
 #define DEFAULT_ADDR "10.0.0.2"
@@ -41,13 +33,12 @@ extern int bb_main(int argc, char **argv);
 #define NC_ARGC 8
 
 /* *text* 为点分四段十进制地址时返回 1, 其余输入返回 0。 */
-static int is_dotted_quad(const char *text)
-{
+static int is_dotted_quad(const char *text) {
 	int parts = 0;
 
 	for (;;) {
 		int digits = 0;
-		int value = 0;
+		int value  = 0;
 
 		while (*text >= '0' && *text <= '9') {
 			value = value * 10 + (*text - '0');
@@ -67,10 +58,9 @@ static int is_dotted_quad(const char *text)
 }
 
 /* *text* 为 1 至 65535 的十进制数时返回 1, 其余输入返回 0。 */
-static int is_port(const char *text)
-{
+static int is_port(const char *text) {
 	int digits = 0;
-	int value = 0;
+	int value  = 0;
 
 	while (*text >= '0' && *text <= '9') {
 		value = value * 10 + (*text - '0');
@@ -81,8 +71,7 @@ static int is_port(const char *text)
 }
 
 /* 把 *text* 写入描述符 *fd*。 */
-static void say(int fd, const char *text)
-{
+static void say(int fd, const char *text) {
 	const char *end = text;
 
 	while (*end) {
@@ -92,8 +81,7 @@ static void say(int fd, const char *text)
 }
 
 /* 报告返回编号 *value* 的调用, 供失败路径使用。 */
-static void report_call(const char *call, int value)
-{
+static void report_call(const char *call, int value) {
 	char line[96];
 	int len = snprintf(line, sizeof(line), "nc_udp: %s returned %d\n", call, value);
 
@@ -102,8 +90,7 @@ static void report_call(const char *call, int value)
 	}
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
 	const char *addr = DEFAULT_ADDR;
 	const char *port = DEFAULT_PORT;
 	char line[96], *bb_argv[NC_ARGC + 2];
@@ -123,7 +110,8 @@ int main(int argc, char **argv)
 		report_call("open " MARKER_PATH, fd);
 		return 1;
 	}
-	if (write(0, MARKER_TEXT, sizeof(MARKER_TEXT) - 1) != (ssize_t)(sizeof(MARKER_TEXT) - 1)) {
+	if (write(0, MARKER_TEXT, sizeof(MARKER_TEXT) - 1)
+		!= (ssize_t)(sizeof(MARKER_TEXT) - 1)) {
 		say(2, "nc_udp: write " MARKER_PATH " failed\n");
 		return 1;
 	}
@@ -131,8 +119,13 @@ int main(int argc, char **argv)
 		say(2, "nc_udp: lseek " MARKER_PATH " failed\n");
 		return 1;
 	}
-
-	len = snprintf(line, sizeof(line), "nc_udp: stdin=%s peer=%s:%s\n", MARKER_PATH, addr, port);
+	// clang-format off
+	len = snprintf(
+		line, sizeof(line),
+        "nc_udp: stdin=%s peer=%s:%s\n",
+        MARKER_PATH, addr, port
+    );
+	// clang-format on
 	if (len > 0) {
 		write(1, line, (size_t)len);
 	}
@@ -148,11 +141,15 @@ int main(int argc, char **argv)
 	bb_argv[8] = (char *)port;
 	bb_argv[9] = NULL;
 
-	/* nc 可能自行退出而不返回, 此时不打印这一行。 */
 	rc = bb_main(NC_ARGC + 1, bb_argv);
 
-	len = snprintf(line, sizeof(line), "nc_udp: nc exit=%d\n", rc);
-	if (len > 0) {
+    // clang-format off
+	len = snprintf(
+        line, sizeof(line),
+        "nc_udp: nc exit=%d\n", rc
+    );
+    // clang-format on
+    if (len > 0) {
 		write(1, line, (size_t)len);
 	}
 	return rc;

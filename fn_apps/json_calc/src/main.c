@@ -279,7 +279,7 @@ static void print_summary(const struct node_stats *stats) {
 	size_t nodes = 0;
 	size_t bytes = 0;
 
-	printf("\njson_calc: AST summary (per node kind, last iteration over %zu inputs)\n",
+	printf("\nAST summary (per node kind, last iteration over %zu inputs)\n",
 		   (size_t)JSON_INPUT_COUNT);
 	printf("  %-8s %10s  %12s\n", "kind", "nodes", "bytes");
 	for (int k = 0; k < KIND_COUNT; k++) {
@@ -288,7 +288,7 @@ static void print_summary(const struct node_stats *stats) {
 		bytes += stats->bytes[k];
 	}
 	printf("  %-8s %10zu  %12zu\n", "total", nodes, bytes);
-	printf("json_calc: heap bytes (counted by the cJSON hooks): peak=%zu live_at_end=%zu\n",
+	printf("heap bytes (counted by the cJSON hooks): peak=%zu live_at_end=%zu\n",
 		   peak_bytes, live_bytes);
 }
 
@@ -305,9 +305,6 @@ int main(void) {
 			n_malformed++;
 		}
 	}
-	printf("json_calc: %zu inputs (%zu valid + %zu malformed) x %d iters = %zu checks\n",
-		   (size_t)JSON_INPUT_COUNT, (size_t)JSON_INPUT_COUNT - n_malformed, n_malformed,
-		   JSON_ITERS, (size_t)JSON_INPUT_COUNT * JSON_ITERS);
 
 	/* 每轮开始时清零节点统计, 故汇总反映的是最后一轮遍历全部输入的结果. */
 	for (int iter = 0; iter < JSON_ITERS; iter++) {
@@ -334,7 +331,7 @@ int main(void) {
 	}
 
 	if (n_failed != 0) {
-		printf("\njson_calc: %zu failed checks\n", n_failed);
+		printf("\n%zu failed checks\n", n_failed);
 		printf("  marks: . valid-passed  ~ malformed-rejected  ! valid-failed  "
 			   "# malformed-accepted\n");
 		for (size_t i = 0; i < JSON_INPUT_COUNT; i++) {
@@ -347,17 +344,17 @@ int main(void) {
 	print_summary(&stats);
 
 	if (live_bytes != 0) {
-		printf("json_calc: FAIL %zu bytes still allocated after every input was "
+		printf("FAIL %zu bytes still allocated after every input was "
 			   "released\n",
 			   live_bytes);
 		return 1;
 	}
 	if (n_failed != 0) {
-		printf("json_calc: FAIL %zu of %zu checks\n", n_failed,
+		printf("FAIL %zu of %zu checks\n", n_failed,
 			   (size_t)JSON_INPUT_COUNT * JSON_ITERS);
 		return 1;
 	}
-	printf("json_calc: %zu inputs (%zu valid + %zu malformed) x %d parse: ALL OK\n",
+	printf("%zu inputs (%zu valid + %zu malformed) x %d parse: ALL OK\n",
 		   (size_t)JSON_INPUT_COUNT, (size_t)JSON_INPUT_COUNT - n_malformed, n_malformed,
 		   JSON_ITERS);
 	return 0;

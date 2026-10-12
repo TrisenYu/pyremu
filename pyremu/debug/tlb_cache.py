@@ -312,6 +312,8 @@ class TlbCacheMixin(SharedMixinAttrs):
             limit = None
 
         lines: list[str] = []
+        # 判定用 None 比较: *limit* 为 None 表示不限制行数.
+        checker = lambda: limit is not None and len(lines) >= limit
         for set_idx in set_range:
             for way_idx in range(ways):
                 if target_way is not None and way_idx != target_way:
@@ -322,18 +324,15 @@ class TlbCacheMixin(SharedMixinAttrs):
                 lines.append(
                     self._fmt_cache_line(e, set_idx, way_idx, full_dump)
                 )
-                if limit is not None and len(lines) >= limit:
+                if checker():
                     break
-            if limit is not None and len(lines) >= limit:
+            if checker():
                 break
 
-        if limit is not None and len(lines) >= limit and valid_count > len(lines):
+        if checker() and valid_count > len(lines):
             lines.append(
                 f"[dim]... 还有 {valid_count - len(lines)} 条 valid 行, "
                 f"用 'cache <start>-<end>' 查看范围[/]"
             )
-
-        if lines:
-            self._console.print(header + "\n" + "\n".join(lines))
-        else:
-            self._console.print(header + "\n[dim](无 valid 行)[/]")
+        header += "\n" + "\n".join(lines) if lines else "\n[dim](无 valid 行)[/]"
+        self._console.print(header)

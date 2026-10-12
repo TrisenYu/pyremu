@@ -937,9 +937,10 @@ pub fn translate_va(
 	};
 
 	let reuse_idx = if CFG_NO_TLB {
-		// 启用后完全停用 TLB: 既不查询也不填充, 每次地址翻译都完整遍历 Sv39
-		// 页表, 用于隔离地址翻译相关的性能问题. 该常量由 emu-configs.mk 经
-		// Makefile 生成到 configs_gen.rs, 与 Python 侧的 CFG_NO_TLB 同源.
+		// CFG_NO_TLB 为真时 TLB 查询与插入一并跳过, 每次地址翻译都完整遍历
+		// Sv39 页表, 用于隔离地址翻译相关的性能问题. 该常量由 emu-configs.mk
+		// 经 Makefile 生成到 configs_gen.rs, 与 Python 侧读取的 PYREMU_NO_TLB
+		// 取同一值.
 		None
 	} else {
 		match tlb_probe(
@@ -1057,7 +1058,7 @@ mod tests {
 
 	/// 取第 *n* 个落在组 *set* 内的页号.
 	///
-	/// 扫描上界确保组号函数退化时本条以断言失败收场, 而不是无限循环.
+	/// 扫描上界确保组号函数退化时本条以断言失败终止, 而不是无限循环.
 	fn vpn_in_set(set: usize, n: u64) -> u64 {
 		let mut seen = 0u64;
 		for vpn in 0u64..(1 << 24) {

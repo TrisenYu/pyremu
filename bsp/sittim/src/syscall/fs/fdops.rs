@@ -43,14 +43,15 @@ use super::super::fdtable::{
 	take_fd_slot,
 	take_fd_slot_from,
 };
-use super::super::{ EBADF, EINVAL, EMFILE, ENOSYS };
+use super::super::{ EBADF, EINVAL, EMFILE };
 use super::{ read_path, vfs_errno };
 
 /// openat(56): dirfd + pathname + flags + mode, 返回新 fd。
 ///
 /// 打开标志原样转交文件系统判定; 建立的描述只取其中的状态标志位, 执行时关闭位记在该描述
 /// 符自身的表项上, 见 [`OPEN_ONLY_FLAGS`] 与 [`FD_FLAG_MASK`]。路径经 [super::mount] 分派
-/// 给它所属的文件系统; 该文件系统尚未交付时返回 ENOSYS。
+/// 给它所属的文件系统; 该文件系统尚未交付时返回取入失败给出的错误码, 见
+/// [super::mount::resolve]。
 pub fn openat_handler(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> u64 {
 	let mut path_buf = [0u8; PATH_MAX];
 	let plen = match unsafe { read_path(pathname as *const u8, dirfd, &mut path_buf) } {
@@ -60,8 +61,11 @@ pub fn openat_handler(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> u64 {
 		}
 	};
 	let path = &path_buf[..plen];
-	let Some((fs, ops, sub)) = mount::resolve(path) else {
-		return ENOSYS;
+	let (fs, ops, sub) = match mount::resolve(path) {
+		Ok(found) => found,
+		Err(e) => {
+			return e;
+		}
 	};
 	let mut node: i16 = NIL;
 	let status = unsafe {

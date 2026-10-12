@@ -23,6 +23,5 @@ Usage:
 """
 
 from pyremu.env_inject.preload import Preloader
-from pyremu.env_inject.snippets import AsmSnippet, hosted_bootstrap
 
-__all__ = ["AsmSnippet", "Preloader", "hosted_bootstrap"]
+__all__ = ["Preloader"]

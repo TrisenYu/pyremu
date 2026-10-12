@@ -65,7 +65,8 @@ class BreakpointMixin(SharedMixinAttrs):
     def _refresh_bp_cache(self) -> None:
         """更新断点性能缓存标志; 所有修改 _breakpoints 的路径均需调用."""
         self._has_non_addr_bps = any(
-            bp.kind != "addr" or bp.cond_type  # cond breakpoint on addr still needs Python eval
+            # cond breakpoint on addr still needs Python eval
+            bp.kind != "addr" or bp.cond_type
             for bp in self._breakpoints
         )
 
@@ -80,23 +81,20 @@ class BreakpointMixin(SharedMixinAttrs):
         - CSR 条件: opcode=0x73 且 CSR 地址匹配, 或上一条指令写了目标 CSR
         - GPR 条件: 仅 rd 字段匹配目标寄存器且 rd≠x0 时返回 True
         """
-        if bp.cond_type == "csr":
-            target = csr_addr_from_name(bp.cond_reg)
-            if target is None:
-                return True
-            f = decode_fields(instr)
-            if f.opcode == 0x73 and f.func12 == target:
-                return True
-            if self._prev_instr_csr_addr == target:
-                return True
-            return False
+        if bp.cond_type not in {"csr", "reg"}:
+            return True
         elif bp.cond_type == "reg":
             rd = decode_fields(instr).rd
             if rd == 0:
                 return False
             target = gpr_idx_from_name(bp.cond_reg)
+            # 判定用 None 比较: 未识别的寄存器名返回 None, 而 x0 的索引是 0.
             return target is not None and rd == target
-        return True
+        target = csr_addr_from_name(bp.cond_reg)
+        if target is None:
+            return True
+        f = decode_fields(instr)
+        return f.opcode == 0x73 and f.func12 == target or self._prev_instr_csr_addr == target
 
     # ----------------------------------------------------------
     #  条件评估
@@ -182,11 +180,7 @@ class BreakpointMixin(SharedMixinAttrs):
                 hit = self._bp_match_pc(hart, pc, bp.value)
             elif bp.kind == "instr":
                 f = decode_fields(instr)
-                hit = (
-                    f.opcode == 0x73
-                    and f.func3 == 0
-                    and f.func12 == bp.value
-                )
+                hit = f.opcode == 0x73 and f.func3 == 0 and f.func12 == bp.value
             elif bp.kind == "opcode":
                 f = decode_fields(instr)
                 if f.is_compressed:
@@ -229,8 +223,10 @@ class BreakpointMixin(SharedMixinAttrs):
     def _try_set_symbol_bp(self, name: str) -> bool:
         """尝试按符号名设置地址断点.  成功返回 True, 未匹配返回 False."""
         # 1) 固件符号 (OpenSBI / 测试固件)
-        if self._image is not None and self._image.symbols:
+        if self._image and self._image.symbols:
             sym_addr = self._image.symbols.get(name)
+            # 判定用 None 比较: 链接在地址 0 的符号 (入口点 0x0 的固件) 取值为 0,
+            # 用真值判定会把该符号当作未找到.
             if sym_addr is not None:
                 addr = sym_addr + self._load_offset
                 if not check_rv64_addr(addr):
@@ -239,12 +235,13 @@ class BreakpointMixin(SharedMixinAttrs):
                 return True
 
         # 2) 外部调试符号 (Linux vmlinux 等)
-        if self._sym_symbols is None or not self._sym_symbols:
+        if (
+            self._sym_symbols is None
+            or not self._sym_symbols
+            or self._sym_symbols.get(name) is None
+        ):
             return False
-        sym_va = self._sym_symbols.get(name)
-        if sym_va is None:
-            return False
-        runtime_addr = self._resolve_sym_addr(sym_va)
+        runtime_addr = self._resolve_sym_addr(self._sym_symbols.get(name))
         if runtime_addr is None:
             self._err(f"无法解析符号运行时地址: {name}")
             return True
@@ -270,8 +267,7 @@ class BreakpointMixin(SharedMixinAttrs):
             parsed = _parse_bp_condition(parts[2])
             if parsed is None:
                 self._err(
-                    f"无法解析条件: '{parts[2]}'"
-                    " (用法: reg/csr <name> [==|!=|<|>|<=|>=] <值>)"
+                    f"无法解析条件: '{parts[2]}' (用法: reg/csr <name> [==|!=|<|>|<=|>=] <值>)"
                 )
                 return
             cond_type, cond_reg, cond_op, cond_val = parsed
@@ -285,16 +281,16 @@ class BreakpointMixin(SharedMixinAttrs):
             self._breakpoints[-1].cond_reg = cond_reg
             self._breakpoints[-1].cond_op = cond_op
             self._breakpoints[-1].cond_val = cond_val
-            self._breakpoints[-1].desc += (
-                f" if {cond_type} {cond_reg} {cond_op} 0x{cond_val:x}"
-            )
-            self._console.print(
-                f"    条件: {cond_type} {cond_reg} {cond_op} 0x{cond_val:x}"
-            )
+            self._breakpoints[
+                -1
+            ].desc += f" if {cond_type} {cond_reg} {cond_op} 0x{cond_val:x}"
+            self._console.print(f"    条件: {cond_type} {cond_reg} {cond_op} 0x{cond_val:x}")
             return
 
         # 2) 地址 (pc / 寄存器名 / 十六进制)
         addr = self._resolve_addr(rest)
+        # 判定用 None 比较: 地址 0 是合法入参 (入口点为 0x0 的固件, 或取值为 0 的
+        # 寄存器), 用真值判定会把这一取值当作解析失败.
         if addr is not None:
             if not check_rv64_addr(addr):
                 return
@@ -305,7 +301,8 @@ class BreakpointMixin(SharedMixinAttrs):
                 label = "条件断点"
             bp = Breakpoint(
                 kind="addr",
-                value=addr, desc=desc,
+                value=addr,
+                desc=desc,
                 cond_type=cond_type,
                 cond_reg=cond_reg,
                 cond_op=cond_op,
@@ -336,9 +333,7 @@ class BreakpointMixin(SharedMixinAttrs):
         bp = Breakpoint(kind="instr", value=INSTR_BP_NAMES[name], desc=name)
         self._breakpoints.append(bp)
         self._refresh_bp_cache()
-        self._console.print(
-            f"  [green]断点 {len(self._breakpoints)}[/]  [yellow]{name}[/]"
-        )
+        self._console.print(f"  [green]断点 {len(self._breakpoints)}[/]  [yellow]{name}[/]")
 
     @seize_val_err("opcode 需为十六进制整数 (支持 0x 前缀)")
     def cmd_bp_opcode(self, arg: str) -> None:
@@ -376,9 +371,7 @@ class BreakpointMixin(SharedMixinAttrs):
         """删除断点: bp delete <n> (1-based)."""
         idx = int(idx_str, 0) - 1
         if idx < 0 or idx >= len(self._breakpoints):
-            self._err(
-                f"断点编号超出范围: {idx_str} (当前 {len(self._breakpoints)} 个)"
-            )
+            self._err(f"断点编号超出范围: {idx_str} (当前 {len(self._breakpoints)} 个)")
             return
         removed = self._breakpoints.pop(idx)
         self._refresh_bp_cache()
@@ -422,21 +415,23 @@ class BreakpointMixin(SharedMixinAttrs):
         elif sub == "if":
             parsed = _parse_bp_condition(" ".join(rest[1:]))
             if parsed is None:
-                self._warn(
-                    "用法: bp if reg/csr <name> [==|!=|<|>|<=|>=] <值>"
-                )
+                self._warn("用法: bp if reg/csr <name> [==|!=|<|>|<=|>=] <值>")
                 return
             ct, cr, co, cv = parsed
             desc = f"if {ct} {cr} {co} 0x{cv:x}"
             bp = Breakpoint(
-                kind="cond", value=0, desc=desc,
-                cond_type=ct, cond_reg=cr, cond_op=co, cond_val=cv,
+                kind="cond",
+                value=0,
+                desc=desc,
+                cond_type=ct,
+                cond_reg=cr,
+                cond_op=co,
+                cond_val=cv,
             )
             self._breakpoints.append(bp)
             self._refresh_bp_cache()
             self._console.print(
-                f"  [green]条件断点 {len(self._breakpoints)}[/]  "
-                f"[yellow]{desc}[/]"
+                f"  [green]条件断点 {len(self._breakpoints)}[/]  [yellow]{desc}[/]"
             )
         elif sub == "opcode":
             if len(rest) < 2:

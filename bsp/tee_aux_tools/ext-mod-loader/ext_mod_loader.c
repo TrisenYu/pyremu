@@ -27,9 +27,6 @@
 #include "tee_enclave.h"
 #include "tee_ext_mod_svc.h"
 
-/* 四个生命周期命令经 syscall() 直调 ioctl: 内核把运行状态与退出码打包在同一 64 位
- * 返回值中, 而 libc 的 ioctl 原型返回 int, 会把高 32 位截掉. 返回负 errno 表示
- * 调用期失败, 其余取值为 TEE_IOC_ENTER 与 TEE_IOC_RESUME 的运行状态. */
 static long loader_ioctl(int fd, unsigned long cmd, void *arg) {
 	long rc = syscall(SYS_ioctl, fd, cmd, arg);
 	if (rc < 0) {
@@ -84,11 +81,15 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "load module table from '%s' failed (%d)\n", modules_dir, n);
 		return 1;
 	}
-	printf("[ext-mod-loader] %d modules from %s (images are read on request)\n",
-		   n, modules_dir);
+	printf(
+		"[ext-mod-loader] %d modules from %s (images are read on request)\n",
+		n,
+		modules_dir);
 	for (int i = 0; i < modules.count; i++) {
-		printf("[ext-mod-loader]   id=%u path=%s\n",
-			   modules.entries[i].module_id, modules.entries[i].path);
+		printf(
+			"[ext-mod-loader]   id=%u path=%s\n",
+			modules.entries[i].module_id,
+			modules.entries[i].path);
 	}
 
 	size_t payload_size = 0;
@@ -155,8 +156,9 @@ int main(int argc, char **argv) {
 	}
 
 	printf("[ext-mod-loader] serviced=%d\n", serviced);
-	printf("[ext-mod-loader] result: state=%d exit=%llu\n",
-		   TEE_RUN_STATE(rc),
-		   (unsigned long long)TEE_EXIT_CODE(rc));
+	printf(
+		"[ext-mod-loader] result: state=%d exit=%llu\n",
+		TEE_RUN_STATE(rc),
+		(unsigned long long)TEE_EXIT_CODE(rc));
 	return (TEE_RUN_STATE(rc) == TEE_RUN_EXITED && TEE_EXIT_CODE(rc) == 0) ? 0 : 1;
 }

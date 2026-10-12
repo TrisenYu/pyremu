@@ -40,28 +40,34 @@ mod mem {
 	struct Page([u8; 4096]);
 
 	static mut POOL: [Page; POOL_PAGES] = [Page([0; 4096]); POOL_PAGES];
-	static CURSOR: AtomicUsize = AtomicUsize::new(0);
+	static PAGES_USED: AtomicUsize = AtomicUsize::new(0);
 
 	/// 交付池中连续的 n 页, 返回首页地址; 余量不足时返回 `!0`。
 	///
-	/// 页表页由调用方自行清零, 故此处不写入内容。游标只前进不回退, 与目标侧的
+	/// 页表页由调用方自行清零, 故此处不写入内容。已用页数只前进不回退, 与目标侧的
 	/// 池分配器一致; 各用例按各自取得的页写入, 无共享。
 	pub fn try_alloc_smode_page(n: u64) -> u64 {
-		let first = CURSOR.fetch_add(n as usize, Ordering::SeqCst);
+		let first = PAGES_USED.fetch_add(n as usize, Ordering::SeqCst);
 		if first + n as usize > POOL_PAGES {
 			return !0u64;
 		}
 		core::ptr::addr_of_mut!(POOL) as u64 + (first as u64) * 4096
 	}
 
-	/// U 模式页池与 mmap 分区块在主机上不交付: 需要它们的用例 (进程式 clone 的地址
-	/// 空间复制) 不在本入口的覆盖范围内。
-	pub fn alloc_umode_page(_n: u64) -> u64 {
+	/// 主机上不申请 M 模式分区: 分区块由 M 模式按 2 MiB 交付, 主机上没有该通路, 故
+	/// 复制目标页的路径在申请处终止。
+	pub fn alloc_adjacent_pages(_pages: u64, _attr: u64) -> u64 {
 		!0u64
 	}
 
-	pub fn alloc_mmap_chunk_pa() -> u64 {
-		!0u64
+	/// 主机上不向 M 模式发起类别改判: 类别改判只经 510 号调用对飞地内存生效。
+	pub fn set_partition_attr(_pa: u64, _bytes: u64, _attr: u64) -> bool {
+		false
+	}
+
+	/// 主机上两个类别的来源都不交付, 类别只用于选择来源, 故一律取数据类。
+	pub fn attr_of_pte_flags(_flags: u64) -> u64 {
+		crate::constants::ENCLAVE_MEM_ATTR_DATA
 	}
 }
 

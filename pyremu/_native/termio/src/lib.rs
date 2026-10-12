@@ -1,22 +1,4 @@
 //! Terminal I/O background thread
-//!
-//! 两种模式:
-//! - **start 模式** (`terminal_io_start` -> `termio_thread`): 本线程是唯一
-//!   控制台写者, 持续 drain_tx 到 stdout。当前 Python 侧未启用此模式。
-//! - **attach 模式** (`terminal_io_attach` -> `termio_thread_simple`): 本线程
-//!   只负责 stdin -> RX ring; TX 到 stdout 由 CPU 引擎内联 `try_write_fd`
-//!   即时输出 (no_stdout=0)。线程不得再写 stdout, 否则键盘输入唤醒 poll 时
-//!   会把整个 TX ring 积压重放 (重复输出) 且 write_all 阻塞拖住输入读取。
-//!
-//! - **tx_drain**: start 模式下本线程独占写; Python 日志消费者维护自己的
-//!   独立读索引 (_tx_log_rd), 不依赖 tx_drain。
-//! - **rx_wr**: 本线程独占写; **rx_rd**: Python 独占写 (drain 后发布消费进度)。
-//!
-//! # 索引环绕约定
-//!
-//! 所有索引单调递增 (u32 wrapping), 槽位 = 索引 % 容量。容量必须为 2 的幂
-//! (需整除 2^32, 否则索引跨 u32 环绕时槽位错位)。
-
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -39,9 +21,6 @@ pub struct TermIoHandle {
 	pub rx_cap: u32,
 	/// RX write index — I/O thread exclusive writer (monotonic u32).
 	pub rx_wr: *mut AtomicU32,
-	/// RX read index — Python exclusive writer.  容量控制依据:
-	/// 剩余空间 = rx_cap - (rx_wr - rx_rd); 为 0 时线程停止读 stdin,
-	/// 数据留在内核 tty 缓冲 (对照 QEMU fd_chr_read_poll 流控).
 	pub rx_rd: *mut AtomicU32,
 	/// Shared TX ring buffer — CPU hart threads write (guest TXDATA).
 	/// Layout: entry e occupies bytes [2e] = hart_id, [2e+1] = byte value.

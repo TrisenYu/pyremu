@@ -6,19 +6,26 @@
 
 use core::ptr;
 
-use crate::ext_mod::vfs_ops::{mode_readable, mode_writable};
+use crate::ext_mod::vfs_ops::{ mode_readable, mode_writable };
 
 use super::consts::POLL_WAIT_ADDR;
-use super::super::concurrency::{thread, timer};
-use super::super::fdtable::{FDS, FdTarget, MAX_FD, Tables, open_file_of};
+use super::super::concurrency::{ thread, timer };
+use super::super::fdtable::{ FDS, FdTarget, MAX_FD, OpenFile, open_file_of };
 use super::super::net;
-use super::super::types::Timespec;
-use super::super::{EFAULT, EINVAL};
+use super::super::types::{ PollFd, Timespec };
+use super::super::{ EFAULT, EINVAL };
+
+/// 取描述符 *fd* 绑定的描述。取一次描述符表的锁, 取值后立即释放: 就绪状态的求法含协议栈
+/// 调用, 该调用会经 ecall 让出到宿主, 锁不得跨越它。
+fn open_file_snapshot(fd: u64) -> Option<OpenFile> {
+	let tables = FDS.lock();
+	open_file_of(&tables, fd).map(|(_, open_file)| open_file)
+}
 
 /// 求描述符 *fd* 在 *events* 上的就绪状态。控制台 fd 按打开标志的访问模式给出可读与
 /// 可写方向, 文件 fd 恒可读可写, 套接字 fd 按协议栈的可接收与可发送状态给出; 负 fd
 /// 返回 0, 空闲槽位与越界 fd 返回 POLLNVAL。
-fn fd_revents(tables: &Tables, fd: i64, events: u16) -> u16 {
+fn fd_revents(fd: i64, events: u16) -> u16 {
 	const POLLIN: u16 = 0x0001;
 	const POLLOUT: u16 = 0x0004;
 	const POLLNVAL: u16 = 0x0020;
@@ -26,7 +33,7 @@ fn fd_revents(tables: &Tables, fd: i64, events: u16) -> u16 {
 	let Ok(fd) = u64::try_from(fd) else {
 		return 0;
 	};
-	let Some((_, open_file)) = open_file_of(tables, fd) else {
+	let Some(open_file) = open_file_snapshot(fd) else {
 		return POLLNVAL;
 	};
 	match open_file.target {
@@ -57,17 +64,17 @@ fn fd_revents(tables: &Tables, fd: i64, events: u16) -> u16 {
 
 /// 扫描一遍描述符数组, 把各描述符的就绪状态写入 revents, 返回就绪的描述符个数。
 ///
-/// 每次扫描各自取一次 fd 表锁, 扫描之间不持锁: 等待期间须允许其它线程改动 fd 表。
+/// 每个描述符各自取一次 fd 表锁, 取到描述即释放: 等待期间须允许其它线程改动 fd 表, 而
+/// 套接字的就绪状态要经协议栈模块求出, 该调用会经 ecall 让出到宿主。
 fn scan_fds(fds: u64, nfds: u64) -> u64 {
-	let tables = FDS.lock();
 	let mut ready: u64 = 0;
 	for i in 0..nfds {
-		let slot = fds.wrapping_add(i.wrapping_mul(8));
-		let fd = (unsafe { (slot as *const i32).read_volatile() }) as i64;
-		let events = unsafe { (slot.wrapping_add(4) as *const u16).read_volatile() };
-		let revents = fd_revents(&tables, fd, events);
+		let slot = PollFd::at(fds, i);
+		let poll_fd = unsafe { ptr::read_unaligned(slot) };
+		let revents = fd_revents(poll_fd.fd as i64, poll_fd.events);
+		// 只回写 revents: fd 与 events 由载荷持有, 本层不改动。
 		unsafe {
-			(slot.wrapping_add(6) as *mut u16).write_volatile(revents);
+			ptr::write_unaligned(ptr::addr_of_mut!((*slot).revents), revents);
 		}
 		if revents != 0 {
 			ready += 1;
@@ -87,9 +94,13 @@ fn read_poll_timeout(timeout: u64) -> Result<Option<u64>, u64> {
 	if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
 		return Err(EINVAL);
 	}
-	Ok(Some(
-		(ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64),
-	))
+	Ok(
+		Some(
+			(ts.tv_sec as u64)
+				.saturating_mul(1_000_000_000)
+				.saturating_add(ts.tv_nsec as u64)
+		)
+	)
 }
 
 /// ppoll(73): 逐个求出描述符就绪状态并写入 revents, 返回就绪的描述符个数; 无描述符

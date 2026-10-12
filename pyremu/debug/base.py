@@ -111,7 +111,7 @@ class DebuggerBase(SharedMixinAttrs):
         # 覆盖 UART TX 回调: 每次写入后刷新 stdout, 确保不以 \\n 结尾的
         # 部分行, 如 shell 提示符 "# " 与字符回显, 立即显示, 而非留在
         # Python 的行缓冲中直到下一换行或 Ctrl+C。
-        if self._emu.uart is not None:
+        if self._emu.uart:
             self._emu.uart._tx_callback = self._uart_tx
 
         self._trap_displayed_mcause: int | None = None
@@ -194,7 +194,7 @@ class DebuggerBase(SharedMixinAttrs):
         """恢复到 REPL 的终端设置 (prompt_toolkit 自行管理 raw 模式)."""
         signal.signal(signal.SIGINT, self._sigint_repl)
         self._stop_stdin_daemon()
-        if self._emu._termio is not None:
+        if self._emu._termio:
             self._emu._termio.stop()
         self._restore_term()
         self._emu._stdin_forward_callback = None
@@ -218,7 +218,7 @@ class DebuggerBase(SharedMixinAttrs):
         if not self._stdin_forward:
             return
 
-        if self._emu.uart is not None:
+        if self._emu.uart:
             self._emu.uart.clear_rx()
 
         self._emu._stdin_forward_callback = self._idle_poll
@@ -253,7 +253,7 @@ class DebuggerBase(SharedMixinAttrs):
 
         # 启动 native termio 线程接管 stdin (事件驱动, 零轮询). 启动失败
         # (libtermio.so 缺失 / stdin 非 TTY) 时回退到 Python select daemon.
-        if self._emu._termio is not None:
+        if self._emu._termio:
             self._emu._termio.start()
         # TermIO daemon 已接管 stdin (native 模式), Python daemon 不需要再读.
         if self._emu._termio is None or not self._emu._termio.native_active:
@@ -262,7 +262,7 @@ class DebuggerBase(SharedMixinAttrs):
     def _restore_term(self) -> None:
         """恢复 _enter_run_mode 保存的终端属性."""
         try:
-            if self._saved_term_attrs is not None:
+            if self._saved_term_attrs:
                 termios.tcsetattr(
                     self._stdin_fd, termios.TCSANOW, self._saved_term_attrs
                 )
@@ -339,7 +339,7 @@ class DebuggerBase(SharedMixinAttrs):
     def _stop_stdin_daemon(self) -> None:
         """停止 stdin daemon 线程 (在恢复终端之前调用)."""
         self._stdin_daemon_running = False
-        if self._stdin_daemon_thread is not None:
+        if self._stdin_daemon_thread:
             self._emu._wake_event.set()  # 唤醒 select 使其检查 running 标志
             self._stdin_daemon_thread.join(timeout=1.0)
             self._stdin_daemon_thread = None
@@ -357,7 +357,7 @@ class DebuggerBase(SharedMixinAttrs):
         # 守护线程活跃时也走到这里: 原有 select+os.read 路径不受影响
         # 守护线程读出后 select 返回空, 此时不进行任何操作
 
-        if self._emu._termio is not None and self._emu._termio.native_active:
+        if self._emu._termio and self._emu._termio.native_active:
             # 从 RX 环形缓冲区读出并写入 UART FIFO, 内部处理 _rx_notify 的 TOCTOU 清零.
             had_input = self._emu._termio.drain_rx_feed_uart()
             self._flush_uart_if_present()
@@ -444,7 +444,7 @@ class DebuggerBase(SharedMixinAttrs):
             退出, 导致热自旋 100% CPU。
         """
         had_input = False
-        if self._emu._termio is not None:
+        if self._emu._termio:
             had_input = self._emu._termio.drain_rx()
             # _rx_notify 由 idle poll 在确认环形缓冲区已全部读出后清零
             termio = self._emu._termio

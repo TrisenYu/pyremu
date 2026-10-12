@@ -1,40 +1,33 @@
-// 轨道动力学载荷 (orbit) — 两套演示, 均强调辛积分器的长期正确性
+// 轨道动力学载荷orbit
 //
-// 演示 1 (限制性三体, 惯性系): 地球-月球-测试粒子三体。惯性系中, 地球
+// 演示 1: 地球-月球-测试粒子三体。惯性系中, 地球
 // (m1=1-μ) 与月球 (m2=μ) 绕共同质心做圆轨道, 测试粒子 (m3=1e-5, 限制性
 // 近似) 只受两主天体引力运动, 不扰动其圆轨道。归一化: 主天体间距 = 1,
 // 总质量 = 1, 引力常数 G = 1, 角速度 = 1。质量参数 μ = M_moon/(M_earth+M_moon)
-// = 0.012150668 (地月系统)。对比 RK4 (非辛) 的能量单调漂移 vs
-// Verlet/Yoshida (辛) 的能量有界振荡。
-//
-// 为什么用惯性系而非 CR3BP 旋转系: 旋转系运动方程含科里奥利项 (速度相关力),
-// 破坏哈密顿量可分离性 (H = T + V)。Störmer-Verlet/Yoshida 的辛性质仅对可分离
-// 哈密顿量成立 (utsuroi 文档明确: 速度相关力使 Verlet 退化为普通二阶方法,
-// 丧失能量有界保证)。惯性系中引力是纯位置函数, 哈密顿量可分离, 辛积分器
-// 严格适用。
+// = 0.012150668 对比 RK4 的能量单调漂移 vs
+// Verlet/Yoshida 的能量有界振荡。
 //
 // 软化长度: 测试粒子掠经主天体时 r->0, 引力奇异。采用 Plummer 软化
 // r_soft = sqrt(r^2+ε^2) — REBOUND / orbitr / CONCEPT 等开源 N-body 代码的
 // 标准正则化方案, 物理含义是把点质量替换为尺度半径 ε 的 Plummer 球。
-// ε = 0.01, 约为主天体间距的 1% (对应地月距离的 1%, 量级为月球半径的 2 倍).
+// ε = 0.01, 约为主天体间距的 1%.
 // 椭圆轨道远拱点距月球仍有安全余量, 软化仅作为避免近距掠过奇点的数值保险。
 //
 // 守恒量: 惯性系牛顿总机械能 E = Σ ½ m v^2 - Σ G m_i m_j / r_soft
-// (势能统计与动力学使用同一软化势能面, 故 E 才是演化系统的真守恒量).
 //
-// 演示 2 (J2 扁率拱线进动): 自转使行星呈扁球 (赤道隆起), 用 J2 系数描述。
-// 赤道轨道卫星受内向 1/r⁴ 摄动力, 拱线 (近拱点经度) 顺行进动, 率
-// dϖ/dN = 3π J2 (R/a)²/(1-e²)²。该摄动势是纯位置函数 (哈密顿量可分离),
+// 演示 2: 自转使行星呈扁球  用 J2 系数描述。
+// 赤道轨道卫星受内向 1/r⁴ 摄动力, 拱线 顺行进动, 率
+// dϖ/dN = 3π J2 (R/a)²/(1-e²)²。该摄动势是纯位置函数
 // 辛积分器严格适用; 用 Yoshida4 长期积分, 逐周期定位近拱点, 与解析理论对照。
 //
-// 积分器: 开源 utsuroi crate (RK4 + Störmer-Verlet + Yoshida4);
-// 运动方程与软化正则化均为教科书/开源标准形式 (自编).
+// 积分器: 开源 utsuroi crate;
+// 运动方程与软化正则化均为教科书/开源标准形式
 //
 // 飞地 ABI: main() 入口, 计算结果经 println! 输出, return 0 -> SUSPEND.
 use nalgebra::SVector;
 use utsuroi::{DynamicalSystem, Integrator, Rk4, State, StormerVerlet, Yoshida4};
 
-/// 三体状态维度: 3 粒子 × 3 坐标 (位置); 速度为其一阶导
+/// 三体状态维度: 3 粒子 × 3 坐标  速度为其一阶导
 const DIM: usize = 9;
 /// 质量参数 μ = M_moon/(M_earth+M_moon), 地球-月球系统标准值
 const MU: f64 = 0.012150668;
@@ -42,22 +35,22 @@ const MU: f64 = 0.012150668;
 const M1: f64 = 1.0 - MU;
 /// 月球质量
 const M2: f64 = MU;
-/// 测试粒子质量 (限制性近似: 远小于主天体, 不扰动其圆轨道)
+/// 测试粒子质量
 const M3: f64 = 1e-5;
-/// 软化长度 ε (Plummer 软化, 主天体有限尺度, 约主天体间距的 1%)
+/// 软化长度 ε
 const EPS: f64 = 0.01;
 /// 三粒子质量
 const MASS: [f64; 3] = [M1, M2, M3];
-/// 测试粒子绕地轨道半长轴 (归一化单位, 地月距的 50%)
+/// 测试粒子绕地轨道半长轴
 const ORB_A: f64 = 0.5;
 /// 测试粒子绕地轨道偏心率
 const ORB_E: f64 = 0.4;
 
-/// 演示 2 常量: 模型行星 (自转扁球) 与赤道轨道卫星
+/// 演示 2 常量: 模型行星 与赤道轨道卫星
 /// 卫星半长轴 3R 远在行星表面之外, 无需软化
-const J2_GM: f64 = 1.0; // 行星 GM (归一化)
-const J2_COEFF: f64 = 0.01; // 扁率系数 (类木行星量级, Jupiter J2≈0.0147)
-const J2_R: f64 = 1.0; // 行星半径 (归一化)
+const J2_GM: f64 = 1.0; // 行星 GM
+const J2_COEFF: f64 = 0.01; // 扁率系数
+const J2_R: f64 = 1.0; // 行星半径
 const SAT_A: f64 = 3.0; // 卫星半长轴 a = 3R
 const SAT_E: f64 = 0.2; // 卫星偏心率
 
@@ -98,7 +91,7 @@ impl DynamicalSystem for ThreeBody {
     }
 }
 
-/// J2 扁率行星 + 卫星系统 (赤道轨道, 3D 势能面)
+/// J2 扁率行星 + 卫星系统
 struct OblateSatellite;
 
 impl DynamicalSystem for OblateSatellite {
@@ -128,7 +121,7 @@ impl DynamicalSystem for OblateSatellite {
     }
 }
 
-/// 三体系统总机械能 (动能 + Plummer 软化势能, 与动力学同一势能面)
+/// 三体系统总机械能
 fn total_energy(st: &State<DIM, 2>) -> f64 {
     let y = st.y();
     let v = st.dy();
@@ -153,10 +146,10 @@ fn total_energy(st: &State<DIM, 2>) -> f64 {
     kin + pot
 }
 
-/// 构建初始条件: 主天体圆轨道 + 测试粒子绕地椭圆轨道 (远拱点释放).
+/// 构建初始条件: 主天体圆轨道 + 测试粒子绕地椭圆轨道
 ///
-/// t=0 时旋转系与惯性系重合, 主天体位于 x 轴圆轨道位相 (角速度 1);
-/// 测试粒子半长轴 a, 偏心率 e, 位于远拱点 (靠近月球侧).
+/// t=0 时旋转系与惯性系重合, 主天体位于 x 轴圆轨道位相;
+/// 测试粒子半长轴 a, 偏心率 e, 位于远拱点
 fn init_elliptical(a: f64, e: f64) -> State<DIM, 2> {
     let r_apo = a * (1.0 + e); // 远拱点距地球距离
     let v_apo = (M1 * (2.0 / r_apo - 1.0 / a)).sqrt(); // 远拱点开普勒速度
@@ -168,13 +161,13 @@ fn init_elliptical(a: f64, e: f64) -> State<DIM, 2> {
     // 月球 m2: 位于 x=1-μ, 圆轨道速度 (0, 1-μ)
     y0[3] = 1.0 - MU;
     v0[4] = 1.0 - MU;
-    // 测试粒子 m3: 绕地椭圆轨道远拱点 (地球右侧 x=-μ+r_apo), 速度沿 -y
+    // 测试粒子 m3: 绕地椭圆轨道远拱点, 速度沿 -y
     y0[6] = -MU + r_apo;
     v0[7] = -v_apo;
     State::new(y0, v0)
 }
 
-/// 用指定积分器推进, 采样总机械能, 返回 (末态能量, max|dE/E0|, 采样点数).
+/// 用指定积分器推进, 采样总机械能, 返回.
 ///
 /// RK4 经 `Integrator` trait 调用; Verlet/Yoshida 为 inherent 方法,
 /// 签名相同, 故用宏为三种积分器各生成一个专用函数.
@@ -201,14 +194,14 @@ bench!(bench_rk4, Rk4);
 bench!(bench_verlet, StormerVerlet);
 bench!(bench_yoshida, Yoshida4);
 
-/// J2 扁率拱线进动演示: 用辛积分器 (Yoshida4) 长期模拟, 逐轨道定位近拱点
-/// (抛物线插值 r(t) 极小值求亚步长时刻), 对近拱点方位角序列做线性最小二乘
-/// 拟合, 得平均进动率 (rad/周期), 与解析理论 dϖ/dN = 3πJ2(R/a)²/(1-e²)² 对照.
+/// J2 扁率拱线进动演示: 用辛积分器长期模拟, 逐轨道定位近拱点
+/// , 对近拱点方位角序列做线性最小二乘
+/// 拟合, 得平均进动率, 与解析理论 dϖ/dN = 3πJ2(R/a)²/(1-e²)² 对照.
 ///
 /// 直接几何定位比瞬时振动要素法鲁棒: 不依赖振动要素在摄动下的摆动 (在月球
 /// 三体情形实测该摆动幅值可达 0.4 rad, 使测量不可靠; 此处改为中心势问题).
 fn j2_precession(t_end: f64, dt: f64) {
-    // 卫星初始条件: 赤道平面椭圆轨道, 远拱点释放, 逆时针运动 (进动角为正)
+    // 卫星初始条件: 赤道平面椭圆轨道, 远拱点释放, 逆时针运动
     let r_apo = SAT_A * (1.0 + SAT_E);
     let v_apo = (J2_GM * (2.0 / r_apo - 1.0 / SAT_A)).sqrt();
     let mut y0 = SVector::<f64, 3>::zeros();
@@ -217,12 +210,12 @@ fn j2_precession(t_end: f64, dt: f64) {
     v0[1] = v_apo;
     let init = State::new(y0, v0);
 
-    // 轨道周期与理论进动率 (赤道轨道近拱点经度, 每周期)
+    // 轨道周期与理论进动率
     let period = 2.0 * std::f64::consts::PI * SAT_A.powf(1.5) / J2_GM.sqrt();
     let theory =
         3.0 * std::f64::consts::PI * J2_COEFF * (J2_R / SAT_A).powi(2) / (1.0 - SAT_E * SAT_E).powi(2);
 
-    // 滚动窗口保存最近 3 个积分步的 (t, r, 方位角), 供抛物线插值定位近拱点
+    // 滚动窗口保存最近 3 个积分步的(t, r, 方位角), 供抛物线插值定位近拱点
     let mut w_t = [0.0f64; 3];
     let mut w_r = [0.0f64; 3];
     let mut w_a = [0.0f64; 3];
@@ -287,7 +280,6 @@ fn j2_precession(t_end: f64, dt: f64) {
         }
     });
 
-    println!();
     println!("[orbit] Part 2: apsidal precession from planetary oblateness (J2)");
     println!(
         "[orbit]   model planet: J2 = {:.3}, R = {:.1}, GM = {:.1}; satellite a = {:.1}R, e = {:.2}",

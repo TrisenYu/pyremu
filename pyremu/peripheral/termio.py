@@ -617,14 +617,14 @@ class TerminalIO:
     # ----------------------------------------------------------
 
     def start_rx_daemon(self) -> None:
-        """启动 RX daemon 线程: 持续将 ring buffer -> UART FIFO.
+        """启动接收守护线程: 持续把接收环形缓冲区的字节写入 UART FIFO.
 
-        Rust termio 线程写 stdin 到 ring buffer 后置 _rx_notify=1,
-        daemon 检测到后调用 drain_rx() 搬运到 UART FIFO 并设置中断.
+        Rust termio 线程写 stdin 到接收环形缓冲区后置 _rx_notify=1,
+        守护线程检测到后调用 drain_rx() 把字节写入 UART FIFO 并置位中断.
         指令执行循环完全不需要参与数据搬运.
         """
         if self._rx_daemon_running or self._stdin_fd < 0 or self._rx_notify_r < 0:
-            # dummy fd (测试环境) 或管道已被 stop() 关闭且未重建: 无法 poll
+            # 测试环境下给出的是占位文件描述符, 或管道已被 stop() 关闭且未重建: 无法 poll
             return
         self._rx_daemon_running = True
         self._rx_daemon_thread = threading.Thread(
@@ -633,24 +633,24 @@ class TerminalIO:
         self._rx_daemon_thread.start()
 
     def stop_rx_daemon(self) -> None:
-        """停止 RX daemon 线程, 最终排空残留."""
+        """停止接收守护线程, 最后排空一次剩余的字节."""
         self._rx_daemon_running = False
-        if self._rx_daemon_thread is not None:
+        if self._rx_daemon_thread:
             self._rx_daemon_thread.join(timeout=1.0)
             self._rx_daemon_thread = None
         self.drain_rx()
 
     def _rx_daemon_tick(self, notify_r: int, poll: select.poll, timeout_ms: int = 500) -> bool:
-        """单次 RX daemon 迭代: 等待通知 (<= timeout_ms), 无论是否就绪都排空 ring.
+        """单次接收守护线程迭代: 等待通知 (最多 timeout_ms), 随后写入 UART FIFO.
 
-        事件驱动 + 超时兜底双重保障:
-        - 通知到达 -> poll 立即返回 -> 排空 ring buffer 到 UART FIFO.
-        - 通知字节可能丢失: Rust termio 线程的写端非阻塞, 突发输入时管道满
-          写 EAGAIN 通知被吞; 或 daemon 恰好排空管道后新数据在轮询间隔内到达
-          (通知写发生在 poll 返回之前, 字节残留管道中但 poll 已不再可读).
-          只靠通知唤醒会让输入滞留 ring buffer — 快速输入回显卡死 (用户报告).
-          poll 超时后无条件排空一次兜底, 输入最迟 timeout_ms 内送达 UART FIFO.
-        - ring 空时 drain_rx 是廉价 no-op (wr==rd 即返回), 轮询开销可忽略.
+        写入在每次迭代都执行, 通知只用来缩短等待:
+        - 通知到达 -> poll 立即返回, 随后写入.
+        - 通知字节可能丢失: Rust termio 线程的写端非阻塞, 突发输入时管道已满, 该次
+          写返回 EAGAIN, 通知未发出; 或守护线程恰好读完管道后新数据在轮询间隔内到达,
+          通知写在 poll 返回之前完成, 字节留在管道中而管道已不可读. 仅靠通知唤醒会让
+          输入留在接收环形缓冲区, 键入速度较快时回显停滞 (用户报告). 输入由 poll 超时
+          后的那一次写入 UART FIFO, 最迟时刻为 timeout_ms.
+        - 接收环形缓冲区为空时 drain_rx 不写入任何字节.
 
         Args:
             notify_r: 通知管道读端 fd.
@@ -667,18 +667,18 @@ class TerminalIO:
         if ready:
             if not self._drain_notify_pipe(notify_r):
                 return False  # 管道已失效 (EOF/出错): 停止 poll 该 fd
-        # 无论有无通知都排空 — 见 docstring 的超时兜底设计 (lost-notify 自愈).
+        # 无论有无通知都写入一次 — 通知字节可能丢失, 写入不依赖它.
         self.drain_rx()
         return True
 
     def _rx_daemon_loop(self) -> None:
-        """RX daemon 入口: 事件驱动 + 超时兜底, poll 等待通知后无条件排空.
+        """接收守护线程入口: 循环调用 _rx_daemon_tick, 直到通知管道失效.
 
-        Rust termio 线程写 ring buffer 后向 _rx_notify_w 写 1 字节 -> poll
-        立即返回 -> drain_rx() 搬运到 UART FIFO。突发输入时通知字节可能丢失
-        (写端非阻塞 + 管道满 EAGAIN), 故每次 poll 超时后也排空一次, 保证输入
-        最迟 0.5s 内送达 (与 _tx_archive_loop 的 0.2s 轮询兜底同一模式).
-        等待通知用 poll (见 _tx_archive_loop 注释: select() 无法 watch fd >= 1024).
+        Rust termio 线程写接收环形缓冲区后向 _rx_notify_w 写 1 字节 -> poll
+        立即返回 -> drain_rx() 把字节写入 UART FIFO。突发输入时通知字节可能丢失
+        (写端非阻塞 + 管道满返回 EAGAIN), 故每次 poll 超时后也写入一次, 保证输入
+        最迟 0.5s 内写入 (与 _tx_archive_loop 的 0.2s 轮询同一模式).
+        等待通知用 poll, 不用 select (见 _tx_archive_loop 注释: select() 无法监视 fd >= 1024).
         """
         notify_r = self._rx_notify_r
         if notify_r < 0:

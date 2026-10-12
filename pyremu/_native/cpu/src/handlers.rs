@@ -804,12 +804,6 @@ fn dispatch_privileged(
 			4
 		}
 		0x5a0 => {
-			// MFENCE.DID — TEE memory-domain fence: flush TLB entries
-			// matching the current hart's mdid from all harts' TLBs,
-			// and invalidate the L2 cache.  The L2 invalidation is
-			// handled by Python on exit; here we flush the local TLBs.
-			// This matches the Python ``handle_system`` / ``decoder.py``
-			// mfence.did implementation.
 			for e in state.itlb.iter_mut() {
 				if e.mdid == state.mdid {
 					e.valid = 0;
@@ -856,7 +850,7 @@ pub fn handle_system(
 				msip_pending: std::cell::Cell::new(std::ptr::null()),
 				hart_threads: std::cell::Cell::new(std::ptr::null()),
 				hart_states: std::cell::Cell::new(std::ptr::null()),
-				timebase_hz: 0, // CSR 临时上下文, 无 clock-source 推进
+				timebase_hz: 0,
 			};
 			let mut csr_ctx = csr::CsrContext::new(state, hart_id as u32, pmp, &conc_clint);
 			let advance = csr::handle_csr(&mut csr_ctx, f.rd, f.rs1, f.func12, f.func3, instr, instr_group);

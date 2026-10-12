@@ -11,7 +11,7 @@
 //!   musl 以 __thread_list_lock 是否等于自身 tid 判定可重入锁持有者, 而该锁
 //!   初值为 0, 故对外线程标识绝不能是 0 (见 vendor/musl env/__init_tls.c)。
 //! - 每个线程有独立的 S-mode 内核栈, 栈顶下方 264 字节即汇编 SAVE_CONTEXT
-//!   保存的陷阱帧 (crate::trap::TrapGprs)。线程切出后寄存器与用户 sp 留在
+//!   保存的陷态栈帧 (crate::trap_frame::TrapGprs)。线程切出后寄存器与用户 sp 留在
 //!   自身帧; sepc/sstatus 记入控制块, 切入时经 activate 写回 CSR 后 sret。
 //! - 切换统一经 trap_dispatch 的返回值驱动: 返回 0 不切换; 非 0 为目标线程
 //!   帧基址, entry.s 据此 `mv sp, a0` 换栈后走统一恢复路径 (见 entry.s)。
@@ -28,7 +28,7 @@
 
 use core::cell::UnsafeCell;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{ AtomicBool, AtomicU64, AtomicUsize, Ordering };
 
 use crate::csr;
 use crate::ecall_aux;
@@ -36,10 +36,10 @@ use crate::mem;
 use crate::syscall::concurrency::{ futex, proc, timer };
 use crate::syscall::types::Timespec;
 use crate::syscall::{ EAGAIN, EFAULT, EINVAL, ENOMEM };
-use crate::trap::{ TrapGprs, A0, TP };
+use crate::trap_frame::{ TrapGprs, A0, TP };
 use crate::constants::ENCLAVE_SUSPEND_IDLE;
 
-/// 汇编 SAVE_CONTEXT 的陷阱帧大小 (见 entry.s, 264 字节)。
+/// 汇编 SAVE_CONTEXT 的陷态栈帧大小 (见 entry.s, 264 字节)。
 pub const TRAP_FRAME_SIZE: u64 = 264;
 
 /// 每个新建线程的 S-mode 内核栈大小 (16 KiB)。
@@ -63,14 +63,35 @@ const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 /// 线程状态机。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ThreadState {
-	/// 槽位空闲, 可被 clone 复用 (内核栈保留)。
+	/// 槽位空闲, 可被 clone 复用。
 	Free,
 	/// 已就绪, 等待被调度。
 	Runnable,
-	/// 正在内核中执行 (仅当前线程)。
+	/// 正在内核中执行。
 	Running,
-	/// 阻塞于等待地址 (wait_addr 有效), 由唤醒原语转为 Runnable。
+	/// 阻塞于等待地址, 由唤醒原语转为 Runnable。
 	Blocked,
+}
+
+/// 线程本次进入 S 模式时的恢复点。
+///
+/// 每次陷阱来自 U 模式时记录一次, 见 [`note_trap_resume`]。记录供模块故障反馈使用: 模块
+/// 在运行中出错时, 出错点位于 S 模式之内, 该次陷阱的现场只有出错指令地址, 而被放弃的
+/// 系统调用是哪一个、返回值应写到哪里, 只能由进入 S 模式的那次陷阱给出。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TrapResume {
+	/// 尚未记录: 当前执行流不来自 U 模式。
+	None,
+	/// U 模式的 ecall: 恢复点为 ecall 的下一条指令, 被放弃的调用可经 a0 交回失败结果。
+	Ecall {
+		/// ecall 的下一条指令地址。
+		next: u64,
+	},
+	/// U 模式被中断: 恢复点为被中断的指令地址。没有可交回结果的位置, a0 保持原值。
+	Interrupted {
+		/// 被中断的指令地址。
+		pc: u64,
+	},
 }
 
 /// 线程控制块。线程表槽下标即内部线程标识 thread_id, 0 为启动主线程。
@@ -79,12 +100,14 @@ pub struct ThreadCtl {
 	pub state: ThreadState,
 	/// 所属进程的进程表槽下标 (见 concurrency::proc)。
 	pub proc: usize,
-	/// 本线程 S-mode 内核栈顶 VA; 陷阱帧基址 = kstack_top - TRAP_FRAME_SIZE。
+	/// 本线程 S-mode 内核栈顶 VA; 陷态栈帧基址 = kstack_top - TRAP_FRAME_SIZE。
 	pub kstack_top: u64,
 	/// 本线程切出时用户态下一条指令, 切入时写回 CSR sepc。
 	pub sepc: u64,
 	/// 本线程切出时的 sstatus, 切入时写回 CSR sstatus 供 sret 使用。
 	pub sstatus: u64,
+	/// 本线程进入 S 模式时的恢复点。
+	pub trap_resume: TrapResume,
 	/// 阻塞等待地址 (state == Blocked 时有效)。
 	pub wait_addr: u64,
 	/// 用户 TLS 控制块地址 (clone 的 tls 参数, 即 tp 寄存器的用户值)。
@@ -101,6 +124,7 @@ impl ThreadCtl {
 			kstack_top: 0,
 			sepc: 0,
 			sstatus: 0,
+			trap_resume: TrapResume::None,
 			wait_addr: 0,
 			thread_meta_info_addr: 0,
 			clear_child_thread_id: 0,
@@ -149,7 +173,9 @@ impl ThreadTable {
 }
 
 /// 线程表: BSS 零初始化后再以 init_main_thread 写入线程 0。
-static THREADS: ThreadTable = ThreadTable(UnsafeCell::new([ThreadCtl::free(); NUM_THREADS]));
+static THREADS: ThreadTable = ThreadTable(
+	UnsafeCell::new([ThreadCtl::free(); NUM_THREADS])
+);
 
 /// 调度状态: 当前线程标识、已登记的待切换目标、主线程内核栈顶与本次系统调用的重启请求。
 ///
@@ -249,44 +275,58 @@ pub fn note_boot_kstack_top(kstack_top: u64) {
 	SCHED.set_boot_kstack_top(kstack_top);
 }
 
-/// 登记主线程 (thread_id = 0) 并初始化调度状态。
+/// 登记主线程并初始化调度状态。
 ///
 /// 由 rust_main_after_mmu 在首次 sret 前调用一次。线程 0 的用户现场
-/// (入口 sepc 与 sstatus) 以参数显式传入, 不再从 CSR 回读: 该现场 CSR 必须在
-/// 全部 ecall 之后才写入 (理由见 rust_main_after_mmu 中的说明), 而本函数又必须
-/// 在写入之前完成登记, 两者顺序互斥, 故改由调用方传递。
+/// 以参数显式传入, 不再从 CSR 回读: 该现场 CSR 必须在
+/// 全部 ecall 之后才写入, 而本函数又必须在写入之前完成登记,
+/// 两者顺序互斥, 故改由调用方传递。
 pub fn init_main_thread(user_sepc: u64, user_sstatus: u64) {
-	THREADS.set(
-		0,
-		ThreadCtl {
-			state: ThreadState::Running,
-			proc: 0,
-			kstack_top: SCHED.boot_kstack_top(),
-			sepc: user_sepc,
-			sstatus: user_sstatus,
-			wait_addr: 0,
-			thread_meta_info_addr: 0,
-			clear_child_thread_id: 0,
-		},
-	);
+	THREADS.set(0, ThreadCtl {
+		state: ThreadState::Running,
+		proc: 0,
+		kstack_top: SCHED.boot_kstack_top(),
+		sepc: user_sepc,
+		sstatus: user_sstatus,
+		trap_resume: TrapResume::None,
+		wait_addr: 0,
+		thread_meta_info_addr: 0,
+		clear_child_thread_id: 0,
+	});
 	SCHED.set_current(0);
 	SCHED.clear_pending_target();
 	SCHED.set_restart_requested(false);
 }
 
-/// 返回当前线程的内部标识 (槽下标)。
+/// 返回当前线程的内部标识。
 pub fn current_thread_id() -> usize {
 	SCHED.current()
 }
 
-/// 返回当前线程的对外线程标识 (槽下标 + 1, 恒非零)。
+/// 返回当前线程的对外线程标识。
 pub fn current_external_thread_id() -> u64 {
 	(SCHED.current() + 1) as u64
 }
 
-/// 返回某线程陷阱帧基址 (其内核栈顶减帧大小)。
+/// 返回某线程陷态栈帧基址。
 pub fn frame_base(thread_id: usize) -> u64 {
 	THREADS.get(thread_id).kstack_top - TRAP_FRAME_SIZE
+}
+
+/// 登记当前线程进入 S 模式时的恢复点。
+///
+/// 由陷阱入口在陷阱来自 U 模式时调用。S 模式内嵌套发生的陷阱不再次
+/// 登记, 故 S 模式执行期间读到的值恒为进入 S 模式的那一次陷阱留下的恢复点。
+pub fn note_trap_resume(resume: TrapResume) {
+	let cur = SCHED.current();
+	THREADS.with(cur, |ctl| {
+		ctl.trap_resume = resume;
+	});
+}
+
+/// 取当前线程进入 S 模式时的恢复点; 未登记时返回 [`TrapResume::None`]。
+pub fn trap_resume() -> TrapResume {
+	THREADS.get(SCHED.current()).trap_resume
 }
 
 /// 是否有已登记的待切换目标 (供 trap.rs 判定是否走切换路径)。
@@ -294,19 +334,19 @@ pub fn switch_pending() -> bool {
 	SCHED.pending_target().is_some()
 }
 
-/// 自 1 起找第一个空闲槽位 (槽 0 恒为主线程)。
+/// 自 1 起找第一个空闲槽位。
 fn next_free_slot() -> Option<usize> {
 	(1..NUM_THREADS).find(|s| THREADS.get(*s).state == ThreadState::Free)
 }
 
-/// 自 after 起按槽位顺序找下一个可运行线程 (Round-robin, 不含自身)。
+/// 自 after 起按槽位顺序找下一个可运行线程 。
 fn next_runnable(after: usize) -> Option<usize> {
 	(1..NUM_THREADS)
 		.map(|off| (after + off) % NUM_THREADS)
 		.find(|s| THREADS.get(*s).state == ThreadState::Runnable)
 }
 
-/// 向用户地址写 32 位字 (S 模式以 sstatus.SUM = 1 直写 U 页)。
+/// 向用户地址写 32 位字。
 fn store_user_u32(addr: u64, val: u32) {
 	unsafe { ptr::write_volatile(addr as *mut u32, val) }
 }
@@ -317,20 +357,27 @@ fn store_user_u32(addr: u64, val: u32) {
 
 /// 创建共享地址空间线程。
 ///
-/// 参数 (Linux rv64 clone): flags = a0, stack = a1, ptid = a2, tls = a3,
-/// ctid = a4。返回子线程对外标识; 失败返回负 errno (EAGAIN / ENOMEM / EINVAL)。
+/// flags = a0, stack = a1, ptid = a2, tls = a3, ctid = a4。
+/// 返回子线程对外标识; 失败返回{EAGAIN, ENOMEM, EINVAL}。
 ///
 /// 子线程的首个用户现场为父帧拷贝后按 clone 语义改写:
-/// - a0 = 0 (子线程 clone 返回 0, 见 musl riscv64/clone.s 的 beqz 分支);
-/// - CLONE_SETTLS 时 tp = tls (Linux copy_thread 对子线程同样改写);
-/// - 用户 sp = stack (a1): musl 已把 func/arg 存到该栈顶, 子线程自 [sp] 取用,
-///   故子线程用户 sp 必须是传入的 stack, 而非父线程 sp (父 sp 未变)。
-pub fn clone_thread(gprs: &TrapGprs, flags: u64, stack: u64, ptid: u64, tls: u64, ctid: u64) -> u64 {
+/// - a0 = 0;
+/// - CLONE_SETTLS 时 tp = tls;
+/// - 用户 sp = stack : musl 已把 func/arg 存到该栈顶, 子线程自 [sp] 取用,
+///   故子线程用户 sp 必须是传入的 stack, 而非父线程 sp。
+pub fn clone_thread(
+	gprs: &TrapGprs,
+	flags: u64,
+	stack: u64,
+	ptid: u64,
+	tls: u64,
+	ctid: u64
+) -> u64 {
 	// 未请求共享地址空间即为进程式 clone: 交由进程层复制地址空间。
 	if proc::is_process_clone(flags) {
 		return proc::clone_process(gprs, flags);
 	}
-	// 共享地址空间但不属同一线程组 (CLONE_VM 而缺 CLONE_THREAD) 的用法本运行时不支持。
+	// 共享地址空间但不属同一线程组的用法本运行时不支持。
 	if (flags & (CLONE_VM | CLONE_THREAD)) != (CLONE_VM | CLONE_THREAD) {
 		return EINVAL;
 	}
@@ -346,10 +393,12 @@ pub fn clone_thread(gprs: &TrapGprs, flags: u64, stack: u64, ptid: u64, tls: u64
 		if top == 0 {
 			return ENOMEM;
 		}
-		THREADS.with(child, |ctl| ctl.kstack_top = top);
+		THREADS.with(child, |ctl| {
+			ctl.kstack_top = top;
+		});
 	}
 
-	// 构造子线程陷阱帧: 先整体拷贝父帧, 再按 clone 语义改写个别槽。
+	// 构造子线程陷态栈帧: 先整体拷贝父帧, 再按 clone 语义改写个别槽。
 	let dst = frame_base(child) as *mut TrapGprs;
 	unsafe {
 		ptr::copy_nonoverlapping(gprs as *const TrapGprs, dst, 1);
@@ -358,32 +407,40 @@ pub fn clone_thread(gprs: &TrapGprs, flags: u64, stack: u64, ptid: u64, tls: u64
 		if (flags & CLONE_SETTLS) != 0 {
 			cf.regs[TP] = tls;
 		}
-		cf.usp = stack;
+		cf.sp_before_trap = stack;
 	}
 
-	// 登记子线程控制块; 恢复现场取父线程此刻的 CSR (与父共享同一现场值)。
+	// 登记子线程控制块; 恢复现场取父线程此刻的 CSR。
 	// clear_child_thread_id 是线程退出时的清零并唤醒地址, 由 CHILD_CLEARTID 给出
-	// (musl 的 __tl_unlock 延后提交, 见 pthread_create.c __pthread_exit 尾部注释)。
 	let parent = SCHED.current();
 	THREADS.with(child, |ctl| {
 		ctl.state = ThreadState::Runnable;
 		ctl.proc = THREADS.get(parent).proc;
 		ctl.sepc = csr::read_sepc().wrapping_add(4);
 		ctl.sstatus = csr::read_sstatus();
+		ctl.trap_resume = TrapResume::None;
 		ctl.wait_addr = 0;
-		ctl.thread_meta_info_addr = if (flags & CLONE_SETTLS) != 0 { tls } else { gprs.tp() };
-		ctl.clear_child_thread_id = if (flags & CLONE_CHILD_CLEARTID) != 0 { ctid } else { 0 };
+		ctl.thread_meta_info_addr = if (flags & CLONE_SETTLS) != 0 {
+			tls
+		} else {
+			gprs.tp()
+		};
+		ctl.clear_child_thread_id = if (flags & CLONE_CHILD_CLEARTID) != 0 {
+			ctid
+		} else {
+			0
+		};
 	});
-	// PARENT_SETTID: 父线程可经 ptid 读取子线程标识 (musl 的 new->tid)。
+	// PARENT_SETTID: 父线程可经 ptid 读取子线程标识。
 	if (flags & CLONE_PARENT_SETTID) != 0 {
 		store_user_u32(ptid, (child + 1) as u32);
 	}
-	// CHILD_SETTID: 子线程自身可经 ctid 读取标识 (当前载荷不使用)。
+	// CHILD_SETTID: 子线程自身可经 ctid 读取标识。
 	if (flags & CLONE_CHILD_SETTID) != 0 {
 		store_user_u32(ctid, (child + 1) as u32);
 	}
 
-	// 子线程优先运行 (与 Linux 一致); 父线程现场由 finalize_switch 保存。
+	// 子线程优先运行; 父线程现场由 finalize_switch 保存。
 	SCHED.set_pending_target(child);
 	(child + 1) as u64
 }
@@ -395,7 +452,7 @@ pub fn clone_thread(gprs: &TrapGprs, flags: u64, stack: u64, ptid: u64, tls: u64
 /// 终止当前线程 (exit 93)。
 ///
 /// 线程组即进程: 组内还有其它线程时只释放本线程的槽位, 由调度器切到其它线程;
-/// 本线程是组内最后一个线程时整个进程退出 (见 proc::exit_process), 该进程是启动
+/// 本线程是组内最后一个线程时整个进程退出, 该进程是启动
 /// 进程时终止整个飞地。
 pub fn exit_current_thread(code: u64) -> u64 {
 	let cur = SCHED.current();
@@ -405,7 +462,7 @@ pub fn exit_current_thread(code: u64) -> u64 {
 		return 0;
 	}
 	// 清零 clear_child_thread_id 并唤醒一位等待者, 释放仍被本线程持有的
-	// __thread_list_lock (musl 在 SYS_exit 前一直持有该锁, 见 __pthread_exit)。
+	// __thread_list_lock。
 	let ctid = THREADS.get(cur).clear_child_thread_id;
 	if ctid != 0 {
 		store_user_u32(ctid, 0);
@@ -422,9 +479,9 @@ pub fn exit_current_thread(code: u64) -> u64 {
 	}
 }
 
-/// 释放线程槽位并把控制块复位 (内核栈保留供复用)。
+/// 释放线程槽位并把控制块复位。
 ///
-/// 一并复位本线程的等待定时器条目 (见 [timer::reset]): 槽位释放后没有调用方再取回该
+/// 一并复位本线程的等待定时器条目: 槽位释放后没有调用方再取回该
 /// 结果, 留下的条目会使定时器中断一直按它的截止时刻设定 stimecmp, 而该槽位被新线程
 /// 复用时还会继承这个截止时刻。
 fn release_slot(thread_id: usize) {
@@ -433,6 +490,7 @@ fn release_slot(thread_id: usize) {
 		ctl.proc = 0;
 		ctl.sepc = 0;
 		ctl.sstatus = 0;
+		ctl.trap_resume = TrapResume::None;
 		ctl.wait_addr = 0;
 		ctl.thread_meta_info_addr = 0;
 		ctl.clear_child_thread_id = 0;
@@ -440,7 +498,7 @@ fn release_slot(thread_id: usize) {
 	timer::reset(thread_id);
 }
 
-/// 统计某进程尚未释放的线程数 (含当前正在运行的线程)。
+/// 统计某进程尚未释放的线程数。
 fn live_thread_count(slot: usize) -> u64 {
 	(0..NUM_THREADS).filter(|s| is_live_thread_of(*s, slot)).count() as u64
 }
@@ -451,7 +509,7 @@ fn is_live_thread_of(thread_id: usize, slot: usize) -> bool {
 	ctl.state != ThreadState::Free && ctl.proc == slot
 }
 
-/// 释放某进程的全部线程 (进程退出时调用)。
+/// 释放某进程的全部线程。
 pub fn free_process_threads(slot: usize) {
 	for s in 0..NUM_THREADS {
 		if is_live_thread_of(s, slot) {
@@ -477,14 +535,14 @@ pub fn wake_process(slot: usize) {
 //  让出 / 抢占 / set_tid_address
 // ---------------------------------------------------------------
 
-/// 主动让出 CPU (sched_yield 124): 有他线程就绪则登记切换目标。
+/// 主动让出 CPU。
 pub fn sched_yield_current() {
 	if let Some(next) = next_runnable(SCHED.current()) {
 		SCHED.set_pending_target(next);
 	}
 }
 
-/// STIP 时间片边界抢占 (trap.rs 中断分支调用): 有他线程就绪则轮转。
+/// STIP 时间片边界抢占。
 pub fn maybe_preempt() {
 	if let Some(next) = next_runnable(SCHED.current()) {
 		SCHED.set_pending_target(next);
@@ -493,7 +551,7 @@ pub fn maybe_preempt() {
 
 /// 以 gprs 为模板建立某进程的首个线程, 返回其槽位; 无空闲槽位返回 None。
 ///
-/// 供进程式 clone 调用 (见 proc::clone_process)。子线程现场为父帧拷贝后只把 a0
+/// 供进程式 clone 调用。子线程现场为父帧拷贝后只把 a0
 /// 改写为 0 —— 子进程中 clone 返回 0; 用户 sp 由调用方传入, fork 语义下即父进程
 /// 此刻的用户 sp。
 pub fn spawn_process_thread(slot: usize, gprs: &TrapGprs, usp: u64) -> Option<usize> {
@@ -504,7 +562,9 @@ pub fn spawn_process_thread(slot: usize, gprs: &TrapGprs, usp: u64) -> Option<us
 		if top == 0 {
 			return None;
 		}
-		THREADS.with(child, |ctl| ctl.kstack_top = top);
+		THREADS.with(child, |ctl| {
+			ctl.kstack_top = top;
+		});
 	}
 
 	let dst = frame_base(child) as *mut TrapGprs;
@@ -512,7 +572,7 @@ pub fn spawn_process_thread(slot: usize, gprs: &TrapGprs, usp: u64) -> Option<us
 		ptr::copy_nonoverlapping(gprs as *const TrapGprs, dst, 1);
 		let cf = &mut *dst;
 		cf.regs[A0] = 0;
-		cf.usp = usp;
+		cf.sp_before_trap = usp;
 	}
 
 	THREADS.with(child, |ctl| {
@@ -520,6 +580,7 @@ pub fn spawn_process_thread(slot: usize, gprs: &TrapGprs, usp: u64) -> Option<us
 		ctl.proc = slot;
 		ctl.sepc = csr::read_sepc().wrapping_add(4);
 		ctl.sstatus = csr::read_sstatus();
+		ctl.trap_resume = TrapResume::None;
 		ctl.wait_addr = 0;
 		ctl.thread_meta_info_addr = gprs.tp();
 		ctl.clear_child_thread_id = 0;
@@ -527,12 +588,12 @@ pub fn spawn_process_thread(slot: usize, gprs: &TrapGprs, usp: u64) -> Option<us
 	Some(child)
 }
 
-/// 登记待切换目标线程 (供进程层在 clone 后指定子线程优先运行)。
+/// 登记待切换目标线程。
 pub fn set_pending_target(thread_id: usize) {
 	SCHED.set_pending_target(thread_id);
 }
 
-/// 登记切换到任一线程 (Round-robin, 不含自身), 返回是否找到。
+/// 切换到任一线程, 返回是否找到。
 ///
 /// 与 sched_yield_current 的区别在于返回值: 进程退出路径需据此判定本飞地是否
 /// 还有可运行线程, 无则终止飞地。
@@ -556,17 +617,28 @@ pub fn take_restart() -> bool {
 	SCHED.take_restart_requested()
 }
 
-/// 登记本线程的 clear_child_thread_id (set_tid_address 96), 返回本线程对外标识。
+/// 清除本次系统调用的重启请求。
+///
+/// 系统调用被放弃时调用: 放弃之后本次调用不再重新执行, 而遗留的重启请求会使下一次系统
+/// 调用的恢复点退回 ecall 本身, 重新执行一次并非本意的调用。取走请求的常规位置在陷阱
+/// 分发的尾部, 被放弃的调用不经过那里。
+pub fn clear_restart() {
+	SCHED.set_restart_requested(false);
+}
+
+/// 登记本线程的 clear_child_thread_id, 返回本线程对外标识。
 ///
 /// musl 主线程在 libc 初始化期以此登记 __thread_list_lock 地址, 并把返回值
-/// 当作自身 tid (见 env/__init_tls.c), 故必须返回非零的线程标识。
+/// 当作自身 tid, 故必须返回非零的线程标识。
 pub fn set_tid_address(addr: u64) -> u64 {
-	THREADS.with(SCHED.current(), |ctl| ctl.clear_child_thread_id = addr);
+	THREADS.with(SCHED.current(), |ctl| {
+		ctl.clear_child_thread_id = addr;
+	});
 	current_external_thread_id()
 }
 
 // ---------------------------------------------------------------
-//  阻塞队列原语 (futex 与线程退出释放 clear_child_thread_id 共用)
+//  阻塞队列原语
 // ---------------------------------------------------------------
 
 /// 阻塞当前线程于 wait_addr 并让出调度。
@@ -578,7 +650,7 @@ pub fn set_tid_address(addr: u64) -> u64 {
 ///   - 本线程的截止时刻已到: 结束本次等待, 由调用方取回到期结果;
 ///   - 本飞地内已无任何可运行线程, 且表中没有尚未到期的截止时刻: 循环交还宿主。
 ///
-/// 定时等待不在此处登记截止时刻: 截止时刻由 [timer] 设施持有 (见 concurrency/timer.rs),
+/// 定时等待不在此处登记截止时刻: 截止时刻由 [timer] 设施持有,
 /// 唤醒来源是定时器中断而非等待地址。
 pub fn block_current(wait_addr: u64) {
 	let cur = SCHED.current();
@@ -659,10 +731,15 @@ pub fn wake_blocked(wait_addr: u64, nr: u64) -> u64 {
 }
 
 /// FUTEX_REQUEUE 内核动作: 先唤醒至多 nr_wake 位, 再把至多 nr_requeue 位
-/// 仍阻塞于 wait_addr 的等待者迁移到 target_addr (保持阻塞)。返回唤醒数。
+/// 仍阻塞于 wait_addr 的等待者迁移到 target_addr。返回唤醒数。
 ///
 /// 供 cond 广播/移交把等待者从 cond 挂到互斥锁字上, 待锁释放时一并唤醒。
-pub fn requeue_blocked(wait_addr: u64, nr_wake: u64, nr_requeue: u64, target_addr: u64) -> u64 {
+pub fn requeue_blocked(
+	wait_addr: u64,
+	nr_wake: u64,
+	nr_requeue: u64,
+	target_addr: u64
+) -> u64 {
 	let woken = wake_blocked(wait_addr, nr_wake);
 	let mut requeued: u64 = 0;
 	for s in 0..NUM_THREADS {
@@ -670,7 +747,9 @@ pub fn requeue_blocked(wait_addr: u64, nr_wake: u64, nr_requeue: u64, target_add
 			break;
 		}
 		if is_blocked_on(s, wait_addr) {
-			THREADS.with(s, |ctl| ctl.wait_addr = target_addr);
+			THREADS.with(s, |ctl| {
+				ctl.wait_addr = target_addr;
+			});
 			requeued += 1;
 		}
 	}
@@ -683,8 +762,7 @@ pub fn requeue_blocked(wait_addr: u64, nr_wake: u64, nr_requeue: u64, target_add
 
 /// 完成一次切换: 先记录当前线程的恢复现场, 再激活已登记的切换目标。
 ///
-/// resume_sepc 为当前线程下次恢复的用户 PC (系统调用为 ecall + 4, 中断为
-/// 被中断的 pc)。返回目标线程帧基址 (entry.s 据此 mv sp, a0); 无目标返回 0。
+/// resume_sepc 为当前线程下次恢复的用户 PC。返回目标线程帧基址; 无目标返回 0。
 pub fn finalize_switch(resume_sepc: u64) -> u64 {
 	let cur = SCHED.current();
 	// 当前线程存活则保存现场 (已 Free 的退出线程无需保存)。
@@ -699,7 +777,9 @@ pub fn finalize_switch(resume_sepc: u64) -> u64 {
 	}
 	match SCHED.take_pending_target() {
 		Some(target) => {
-			THREADS.with(target, |ctl| ctl.state = ThreadState::Running);
+			THREADS.with(target, |ctl| {
+				ctl.state = ThreadState::Running;
+			});
 			SCHED.set_current(target);
 			// 目标线程属另一进程时切换地址空间. 必须在写完 sepc/sstatus 之前
 			// 完成: 此后不再有对本地址空间的访问, 而目标帧位于共享的 S 模式
@@ -715,53 +795,59 @@ pub fn finalize_switch(resume_sepc: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------
-//  线程类系统调用粘合
+//  线程类系统调用
 // ---------------------------------------------------------------
 //
 // 只做寄存器参数到本模块与 futex 模块原语的搬运; 返回值为要写入 a0 的值,
 // 负 errno 以无符号补码表示。
 
-/// clone (220): 创建共享地址空间线程, 或按进程式标志复制地址空间建立新进程。
-/// 参数 (Linux rv64): flags = a0, stack = a1, ptid = a2, tls = a3, ctid = a4。
-pub fn clone_handler(gprs: &TrapGprs, flags: u64, stack: u64, ptid: u64, tls: u64, ctid: u64) -> u64 {
+/// clone : 创建共享地址空间线程, 或按进程式标志复制地址空间建立新进程。
+/// 参数: flags = a0, stack = a1, ptid = a2, tls = a3, ctid = a4。
+pub fn clone_handler(
+	gprs: &TrapGprs,
+	flags: u64,
+	stack: u64,
+	ptid: u64,
+	tls: u64,
+	ctid: u64
+) -> u64 {
 	clone_thread(gprs, flags, stack, ptid, tls, ctid)
 }
 
-/// exit (93): 终止当前线程。本线程是组内最后一个线程时整个进程退出。
+/// exit: 终止当前线程。本线程是组内最后一个线程时整个进程退出。
 pub fn exit_handler(code: u64) -> u64 {
 	exit_current_thread(code)
 }
 
-/// gettid (178): 返回当前线程的对外标识。
+/// gettid: 返回当前线程的对外标识。
 pub fn gettid_handler() -> u64 {
 	current_external_thread_id()
 }
 
-/// sched_yield (124): 主动让出 CPU。若存在其它可运行线程, 由 trap.rs 完成切换。
+/// sched_yield: 主动让出 CPU。若存在其它可运行线程, 由 trap.rs 完成切换。
 pub fn sched_yield_handler() -> u64 {
 	sched_yield_current();
 	0
 }
 
-/// set_tid_address (96): 登记线程退出时的清零并唤醒地址, 返回当前线程对外标识。
+/// set_tid_address: 登记线程退出时的清零并唤醒地址, 返回当前线程对外标识。
 pub fn set_tid_address_handler(addr: u64) -> u64 {
 	set_tid_address(addr)
 }
 
-/// futex (98): 参数 (Linux rv64) 为 uaddr = a0, op = a1, val = a2,
+/// futex: 参数  为 uaddr = a0, op = a1, val = a2,
 /// timeout = a3, uaddr2 = a4。REQUEUE 以 a3 作 nr_requeue。
 pub fn futex_handler(uaddr: u64, op: u64, val: u64, arg3: u64, uaddr2: u64) -> u64 {
 	futex::futex(uaddr, op, val, arg3, uaddr2)
 }
 
-/// nanosleep (101): 参数为 req = a0 (指向 const struct timespec), rem = a1。
+/// nanosleep: 参数为 req = a0, rem = a1。
 ///
-/// 睡眠时长交给 [timer] 设施, 故等待 5 ms 的调用在 5 ms 后唤醒, 不受时间片周期限制。
-/// *rem* 不写回: 本运行时的阻塞系统调用在唤醒后重启整个调用 (见 trap.rs 的
-/// 取用 restart), 不向载荷返回 EINTR, 没有剩余时长需要报告。
-///
+/// 睡眠时长交给 [timer], 故等待 5 ms 的调用在 5 ms 后唤醒, 不受时间片周期限制。
+/// *rem* 不写回: 本运行时的阻塞系统调用在唤醒后重启整个调用,
+/// 不向载荷返回 EINTR, 没有剩余时长需要报告。
 /// 时长为 0 或为负时不进入阻塞, 立即返回 0; 指针为 0 返回 EFAULT, 时长字段越界
-/// (tv_sec 为负或 tv_nsec 不在 [0, 1_000_000_000) 内) 返回 EINVAL。
+/// 返回 EINVAL。
 pub fn nanosleep_handler(req: u64, rem: u64) -> u64 {
 	let _ = rem;
 	if req == 0 {
@@ -771,7 +857,9 @@ pub fn nanosleep_handler(req: u64, rem: u64) -> u64 {
 	if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
 		return EINVAL;
 	}
-	let nsec = (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64);
+	let nsec = (ts.tv_sec as u64)
+		.saturating_mul(1_000_000_000)
+		.saturating_add(ts.tv_nsec as u64);
 
 	let me = current_thread_id();
 	// 被中断后重新执行本调用时沿用表中已有的截止时刻, 不重新计一段完整的时长。

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from rich.table import Table
 
+from pyremu import configs_gen
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import translate_addr
 from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
@@ -109,7 +110,7 @@ class SymbolMixin(SharedMixinAttrs):
             return False
 
         if base_pa is None:
-            base_pa = self._emu._cfg.ram_base + 0x200000
+            base_pa = self._emu._cfg.ram_base + configs_gen.FW_RESERVED_MEM_SIZE
 
         min_vaddr = sym_image.entry_point
         load_offset = mask64((base_pa - min_vaddr))
@@ -167,7 +168,7 @@ class SymbolMixin(SharedMixinAttrs):
         fw_va = runtime_addr - self._load_offset
         fw_ranges = self._image.symbol_ranges
         name = self._resolve_symbol(self._image.symbols, fw_va, fw_ranges)
-        if name is not None:
+        if name:
             return name
         return self._sym_lookup_name(runtime_addr)
 

@@ -1,206 +1,15 @@
-//! 陷态分发。紧跟 smode_entry/trap_handler.c + ref-emod trap/exceptions.c。
+//! 陷态分发。
+use core::ptr;
+
 use crate::constants::*;
 use crate::csr;
 use crate::ecall_aux;
+use crate::ext_mod::table;
 use crate::hang;
+use crate::println;
 use crate::syscall;
 use crate::syscall::concurrency::{ proc, sched, thread, timer };
-
-#[cfg(feature = "diagnostic")]
-use crate::diag;
-// ---------------------------------------------------------------
-//  GPR 寄存器别名, 对应 smode_entry/trap_handler.h 中 CTX_INDEX_*
-// ---------------------------------------------------------------
-
-#[allow(unused)]
-pub const RA: usize = 1;
-pub const SP: usize = 2;
-pub const GP: usize = 3;
-pub const TP: usize = 4;
-pub const T0: usize = 5;
-pub const T1: usize = 6;
-pub const T2: usize = 7;
-pub const S0: usize = 8;
-pub const S1: usize = 9;
-pub const A0: usize = 10;
-pub const A1: usize = 11;
-pub const A2: usize = 12;
-pub const A3: usize = 13;
-pub const A4: usize = 14;
-pub const A5: usize = 15;
-pub const A6: usize = 16;
-pub const A7: usize = 17;
-pub const S2: usize = 18;
-pub const S3: usize = 19;
-pub const S4: usize = 20;
-pub const S5: usize = 21;
-pub const S6: usize = 22;
-pub const S7: usize = 23;
-pub const S8: usize = 24;
-pub const S9: usize = 25;
-pub const S10: usize = 26;
-pub const S11: usize = 27;
-pub const T3: usize = 28;
-pub const T4: usize = 29;
-pub const T5: usize = 30;
-pub const T6: usize = 31;
-
-// ---------------------------------------------------------------
-//  TrapGprs —— 与 entry.s 的 SAVE_CONTEXT 布局一致
-// ---------------------------------------------------------------
-
-/// 汇编 SAVE_CONTEXT 后的寄存器快照。
-/// 31 个 GPR + 用户 sp 槽 = 32 × 8 = 256 + 8 = 264 字节。
-#[repr(C)]
-pub struct TrapGprs {
-	/// x0..x31，x0 恒为 0，该字段为占位。
-	pub regs: [u64; 32],
-	/// 用户 sp, SAVE_CONTEXT 后由 csrrw t1, sscratch, x0; STORE t1, 偏移(sp) 填入。
-	pub usp: u64,
-}
-
-#[allow(unused)]
-impl TrapGprs {
-	// 所有 32 GPR 的 getter
-	#[inline]
-	pub fn zero(&self) -> u64 {
-		self.regs[0]
-	}
-	#[inline]
-	pub fn ra(&self) -> u64 {
-		self.regs[RA]
-	}
-	#[inline]
-	pub fn sp(&self) -> u64 {
-		self.regs[SP]
-	}
-	#[inline]
-	pub fn gp(&self) -> u64 {
-		self.regs[GP]
-	}
-	#[inline]
-	pub fn tp(&self) -> u64 {
-		self.regs[TP]
-	}
-	#[inline]
-	pub fn t0(&self) -> u64 {
-		self.regs[T0]
-	}
-	#[inline]
-	pub fn t1(&self) -> u64 {
-		self.regs[T1]
-	}
-	#[inline]
-	pub fn t2(&self) -> u64 {
-		self.regs[T2]
-	}
-	#[inline]
-	pub fn s0(&self) -> u64 {
-		self.regs[S0]
-	}
-	#[inline]
-	pub fn s1(&self) -> u64 {
-		self.regs[S1]
-	}
-	#[inline]
-	pub fn a0(&self) -> u64 {
-		self.regs[A0]
-	}
-	#[inline]
-	pub fn a1(&self) -> u64 {
-		self.regs[A1]
-	}
-	#[inline]
-	pub fn a2(&self) -> u64 {
-		self.regs[A2]
-	}
-	#[inline]
-	pub fn a3(&self) -> u64 {
-		self.regs[A3]
-	}
-	#[inline]
-	pub fn a4(&self) -> u64 {
-		self.regs[A4]
-	}
-	#[inline]
-	pub fn a5(&self) -> u64 {
-		self.regs[A5]
-	}
-	#[inline]
-	pub fn a6(&self) -> u64 {
-		self.regs[A6]
-	}
-	#[inline]
-	pub fn a7(&self) -> u64 {
-		self.regs[A7]
-	}
-	#[inline]
-	pub fn s2(&self) -> u64 {
-		self.regs[S2]
-	}
-	#[inline]
-	pub fn s3(&self) -> u64 {
-		self.regs[S3]
-	}
-	#[inline]
-	pub fn s4(&self) -> u64 {
-		self.regs[S4]
-	}
-	#[inline]
-	pub fn s5(&self) -> u64 {
-		self.regs[S5]
-	}
-	#[inline]
-	pub fn s6(&self) -> u64 {
-		self.regs[S6]
-	}
-	#[inline]
-	pub fn s7(&self) -> u64 {
-		self.regs[S7]
-	}
-	#[inline]
-	pub fn s8(&self) -> u64 {
-		self.regs[S8]
-	}
-	#[inline]
-	pub fn s9(&self) -> u64 {
-		self.regs[S9]
-	}
-	#[inline]
-	pub fn s10(&self) -> u64 {
-		self.regs[S10]
-	}
-	#[inline]
-	pub fn s11(&self) -> u64 {
-		self.regs[S11]
-	}
-	#[inline]
-	pub fn t3(&self) -> u64 {
-		self.regs[T3]
-	}
-	#[inline]
-	pub fn t4(&self) -> u64 {
-		self.regs[T4]
-	}
-	#[inline]
-	pub fn t5(&self) -> u64 {
-		self.regs[T5]
-	}
-	#[inline]
-	pub fn t6(&self) -> u64 {
-		self.regs[T6]
-	}
-
-	// syscall 返回时写回的 setter
-	#[inline]
-	pub fn set_a0(&mut self, v: u64) {
-		self.regs[A0] = v;
-	}
-	#[inline]
-	pub fn set_a7(&mut self, v: u64) {
-		self.regs[A7] = v;
-	}
-}
+use crate::trap_frame::TrapGprs;
 
 // ---------------------------------------------------------------
 //  C ABI 入口
@@ -208,9 +17,29 @@ impl TrapGprs {
 
 /// entry.s调用。通过csrr设置函数参数。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn trap_dispatch(gprs: &mut TrapGprs, sepc: u64, scause: u64, stval: u64) -> u64 {
-	// 返回值约定: 0 表示不切换线程; 非 0 为目标线程陷阱帧基址,
+pub unsafe extern "C" fn trap_dispatch(
+	gprs: &mut TrapGprs,
+	sepc: u64,
+	scause: u64,
+	stval: u64
+) -> u64 {
+	// 返回值约定: 0 表示不切换线程; 非 0 为目标线程陷态栈帧基址,
 	// entry.s 据此 mv sp, a0 换到目标帧后走统一的恢复与 sret 路径.
+	// sstatus.SPP 取 0 表示本次陷阱来自 U 模式, 取 1 表示来自 S 模式.
+	let is_from_user = (csr::read_sstatus() & csr::SSTATUS_SPP) == 0;
+	if is_from_user {
+		// 陷阱来自 U 模式时, 为当前线程记下 U 模式停在哪条指令上: ecall 记 ecall 之后的那条
+		// 指令, 其余记被中断的那条指令. S 模式之内发生的陷阱会覆盖 sepc, 故模块在运行中出错
+		// 时, 被放弃的系统调用是哪一个、失败结果写回哪里, 只能取自这一条记录, 见
+		// proc::deliver_module_fault.
+		let resume = if scause == 0x8 {
+			thread::TrapResume::Ecall { next: sepc + 4 }
+		} else {
+			thread::TrapResume::Interrupted { pc: sepc }
+		};
+		thread::note_trap_resume(resume);
+	}
+
 	// 中断
 	if (scause & (1 << 63)) != 0 {
 		let cause = InterruptCause::from_code(scause & !(1 << 63));
@@ -231,7 +60,7 @@ pub unsafe extern "C" fn trap_dispatch(gprs: &mut TrapGprs, sepc: u64, scause: u
 	// ECALL from U-mode
 	if scause == 0x8 {
 		let ret = syscall_dispatch(gprs);
-		// rt_sigreturn 恢复的现场覆盖整个陷阱帧 (含 a0), 且恢复点是被中断的 pc;
+		// rt_sigreturn 恢复的现场覆盖整个陷态栈帧 (含 a0), 且恢复点是被中断的 pc;
 		// 阻塞后重启的调用要退回 ecall 本身重新执行, 也不写回返回值. 两者都在
 		// 写回 a0 与推进 sepc 之前取走.
 		let resume_sepc = match proc::take_sigreturn() {
@@ -255,39 +84,35 @@ pub unsafe extern "C" fn trap_dispatch(gprs: &mut TrapGprs, sepc: u64, scause: u
 		return 0;
 	}
 
-	// 访问故障：转发到 M-mode
-	if scause == 0x5 || scause == 0x7 {
-		ecall_aux::enclave_call_unmatched_acc_fault(stval);
+	if is_unmatched_access_fault(scause) {
+		ecall_aux::enclave_call_unmatched_acc_fault(stval, scause);
 		return 0;
 	}
 
-	// 用户态 (sstatus.SPP=0) 不可恢复的同步异常: 载荷自身的缺陷 (页错误/非法指令/
-	// 地址错位/断点…)。按 Linux 的信号默认处置终止该进程, 而不是冻结挂起, 也不
-	// 牵连同一飞地内的其它进程。退出码取 128+sig, host 经 shutdown 收到
-	// EXITED_ERR(code) 精确反馈载荷异常终止, 由可信应用管理器决定后续处置
-	// (终止/重启/清空并上报)。被终止的进程是启动进程时整个飞地退出, 见
-	// proc::exit_process。
-	if (csr::read_sstatus() & csr::SSTATUS_SPP) == 0 {
-		#[cfg(feature = "diagnostic")]
-		diag::log(
-			format_args!(
-				"[trap] u-fault scause=0x{:x} stval=0x{:x} sepc=0x{:x} sig={}\n",
-				scause,
-				stval,
-				sepc,
-				user_fault_signal(scause)
-			)
-		);
+	// 用户态 不可恢复的同步异常: 载荷自身的缺陷。退出码取 128+sig
+	if is_from_user {
 		proc::exit_process(proc::current_slot(), 128 + user_fault_signal(scause));
-		// 进程层已登记切换目标; 无其它可运行线程时它已终止飞地, 不会返回。
+		// 进程层已登记切换目标;
+		// 无其它可运行线程时终止飞地且不返回
 		if thread::switch_pending() {
 			return thread::finalize_switch(sepc);
 		}
 		return 0;
 	}
 
-	// S 模式自身 (runtime 缺陷) 或无法归类的同步异常 —— 输出原因与完整现场
-	// (scause/stval/sepc) 后冻结挂起, 但仍响应 host 的终止请求
+	// 故障指令落在模块映像的窗口之内时, 该次故障归属到该模块: 先按 sepc 判定, sepc 不在
+	// 任何窗口之内时再按 stval 判定, 判据见 table::module_of。清空该模块的操作表缓存并把
+	// 故障交回用户态, 见 proc::deliver_module_fault; 当前执行流不来自 U 模式时该次故障没有
+	// 可交回的可信应用, 落到下方按管理程序自身的缺陷挂起。
+	if let Some(module_id) = table::module_of(sepc, stval) {
+		if let Some(target_frame) = proc::deliver_module_fault(module_id) {
+			return target_frame;
+		}
+	}
+
+	// 管理程序自身的同步缺陷, 或无法归属到任何模块的同步异常 —— 输出原因、scause / stval /
+	// sepc 与本次陷态携带的陷态栈帧后冻结挂起, 但仍响应宿主发来的终止请求。
+	report_trap_frame(gprs, sepc);
 	hang::fault_halt_exc(scause, stval, sepc, get_trap_reason(scause));
 }
 
@@ -325,6 +150,64 @@ fn get_trap_reason(cause: u64) -> &'static str {
 		0xf => "store/amo page fault",
 		_ => "unknown exception",
 	}
+}
+
+/// 报告本次陷态详情: 来源特权级、陷态栈帧的地址、帧内的 32 个通用寄存器、陷态入口读到的
+/// sepc 与当前的 satp。
+///
+/// `is_from_user` 取真表示本次陷态来自 U 模式, 取值由调用方按陷态入口读到的 sstatus.SPP
+/// 给出; 到达本处的分发路径可能已改写该 CSR, 此处重读得到的不再是陷态发生时的来源。
+///
+/// 寄存器一栏按 x0 至 x31 的次序排列, 每行四个, 名称取 ABI 名。x2 即 sp 的槽位在陷态入口
+/// 不被写入, 该栏改为取帧末尾的独立槽位: 陷态入口自 sscratch 取出被中断的 sp 后写入该
+/// 槽位, 该栏因而给出被中断的那段代码当时所用的栈指针。x0 槽位恒为陷态入口写入的 0。
+fn report_trap_frame(gprs: &TrapGprs, sepc: u64) {
+	println!(
+		"\n!!!!!!!!!!sittim-trap!!!!!!!!!!\n\
+		ctx-addr,sepc: {:016x} {:016x}\n\
+		ra,sp,gp,tp: {:016x} {:016x} {:016x} {:016x}\n\
+		t0,t1,t2   : {:016x} {:016x} {:016x}\n\
+		s0,s1,a0,a1: {:016x} {:016x} {:016x} {:016x}\n\
+		a2,a3,a4,a5: {:016x} {:016x} {:016x} {:016x}\n\
+		a6,a7,s2,s3: {:016x} {:016x} {:016x} {:016x}\n\
+		s4,s5,s6,s7: {:016x} {:016x} {:016x} {:016x}\n\
+		s8,s9,sa,sb: {:016x} {:016x} {:016x} {:016x}\n\
+		t3,t4,t5,t6: {:016x} {:016x} {:016x} {:016x}\n\
+		!!!!!!!!!!sittim-trap!!!!!!!!!!\n\n",
+		ptr::from_ref(gprs) as u64,
+		sepc,
+		gprs.ra(),
+		gprs.sp_before_trap,
+		gprs.gp(),
+		gprs.tp(),
+		gprs.t0(),
+		gprs.t1(),
+		gprs.t2(),
+		gprs.s0(),
+		gprs.s1(),
+		gprs.a0(),
+		gprs.a1(),
+		gprs.a2(),
+		gprs.a3(),
+		gprs.a4(),
+		gprs.a5(),
+		gprs.a6(),
+		gprs.a7(),
+		gprs.s2(),
+		gprs.s3(),
+		gprs.s4(),
+		gprs.s5(),
+		gprs.s6(),
+		gprs.s7(),
+		gprs.s8(),
+		gprs.s9(),
+		gprs.s10(),
+		gprs.s11(),
+		gprs.t3(),
+		gprs.t4(),
+		gprs.t5(),
+		gprs.t6()
+	);
 }
 
 // ---------------------------------------------------------------
@@ -372,30 +255,26 @@ fn interrupt_dispatch(cause: Option<InterruptCause>) {
 			sched::check_pending_requests();
 		}
 		Some(InterruptCause::SupervisorTimer) => {
-			// 定时器中断 — 重设定时器截止时间并记账时间片配额.
-			// 不调用 check_pending_requests(): host 请求 SHUTDOWN，
-			// 由 M-mode 经 IPI 注入 SSIP 异步通知.
+			// 定时器中断 — 重设定时器截止时间并记录当前时间片.
 			let now: u64;
 			unsafe {
 				core::arch::asm!("csrr {0}, time", out(reg) now);
 			}
-			// 定时等待到期检查 (见 concurrency/timer.rs): 逐个取走截止时刻已到的条目
-			// 并唤醒其所属线程, 由本次中断末尾的轮转登记交给它运行.
+			// 定时等待到期检查: 逐个取走截止时刻已到的条目并唤醒其所属线程.
 			while let Some(waiter) = timer::elapse_due(now) {
 				thread::wake_thread(waiter);
 			}
 
 			// 下次中断取「下一个时间片边界」与「表中最早的尚未到期时刻」中的较早者:
-			// 定时等待在截止时刻本身触发, 其精度不受时间片周期 (config.mk 的
-			// TIMER_INTERVAL) 限制. 取走的条目已不参与 next_deadline, 故不会为同一个
-			// 截止时刻反复设定.
+			// 定时等待在截止时刻本身触发, 其精度不受时间片周期限制.
+			// 取走的条目已不参与 next_deadline, 故不会为同一个截止时刻反复设定.
 			let slice_end = now + TIMER_INTERVAL;
 			let deadline = match timer::next_deadline() {
 				Some(d) if d < slice_end => d,
 				_ => slice_end,
 			};
-			// 直接改写 stimecmp (Sstc) 重设 S 模式定时器. 本平台已在设备树声明
-			// Sstc, S 模式可直接写该 CSR; 若改经 SBI TIME ecall 由 M 模式代写,
+			// 本平台已在设备树声明Sstc, S 模式可直接写该 CSR;
+			// 若改经 SBI TIME ecall 由 M 模式代写,
 			// M 模式在未识别 Sstc 时会改设 M 模式 mtimecmp, stimecmp 保持旧值,
 			// 使 STIP 持续置位.
 			csr::write_stimecmp(deadline);
@@ -403,7 +282,7 @@ fn interrupt_dispatch(cause: Option<InterruptCause>) {
 			// 间隔定时器检查 (见 proc.rs). 遍历全部进程而不只当前进程: 父进程的
 			// SIGALRM 常在子进程正在运行时到期.
 			proc::tick();
-			// 时间片检查 (见 sched.rs). TIME_QUOTA=0 时不触发 SUSPEND.
+			// 时间片检查. TIME_QUOTA=0 时不触发 SUSPEND.
 			sched::tick_and_check_quota();
 		}
 		None => {

@@ -112,7 +112,7 @@ def trap_is_interrupt(trap: TrapType) -> bool:
     return (code >> 63) & 1 == 1
 
 
-# mcause/scause 编码到 TrapType 名称的逆向映射, 惰性构建
+# mcause/scause 编码到 TrapType 名称的逆向映射
 _CAUSE_CODE_NAME: dict[int, str] = {code: trap.name for trap, code in _TRAP_CAUSE_CODE.items()}
 
 
@@ -127,7 +127,7 @@ def trap_cause_name(mcause_val: int) -> str:
         若未精确匹配则返回 ``"异常#N"`` 或 ``"中断#N"``.
     """
     name = _CAUSE_CODE_NAME.get(mcause_val)
-    if name is not None:
+    if name:
         return name
     is_irq = (mcause_val >> 63) & 1
     exc_code = mcause_val & 0x7FFF_FFFF_FFFF_FFFF

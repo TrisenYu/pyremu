@@ -28,6 +28,54 @@ SECTIONS {
 
 	. = ALIGN(0x1000);
 
+	//> section for elf header
+	.eh_frame : {
+		*(.eh_frame)
+		*(.eh_frame.*)
+		. = ALIGN(8);
+	}
+	.dynsym : {
+		*(.dynsym)
+		. = ALIGN(8);
+	}
+	.dynstr : {
+		*(.dynstr)
+		. = ALIGN(8);
+	}
+	.gnu.hash : {
+		*(.gnu.hash)
+		. = ALIGN(8);
+	}
+	.hash : {
+		*(.hash)
+		. = ALIGN(8);
+	}
+
+	.rela.dyn : {
+		_rela_dyn_start = .;
+		*(.rela.dyn)
+		*(.rela.*)
+		_rela_dyn_end = .;
+	}
+
+	. = ALIGN(0x1000);
+
+	_instr_class_end = .;
+
+	. = ALIGN(0x200000);
+	_data_class_start = .;
+	.dynamic : {
+		*(.dynamic)
+		. = ALIGN(8);
+	}
+	.got : {
+		*(.got)
+		*(.got.*)
+		. = ALIGN(8);
+	}
+
+	. = ALIGN(0x1000);
+
 	//> .data Section
 	_data_start = .;
 	.data : {
@@ -51,18 +99,8 @@ SECTIONS {
 	_bss_end = .;
 
 	. = ALIGN(0x1000);
-	_end = .;
 
-	/*
-		relocation table section
-		correct the base address of GOT in entry.S during the runtime.
-		Especially the R_RISCV_RELATIVE (type=3):
-			*(load_base + r_offset) = load_base + r_addend
-	*/
-	.rela.dyn : {
-		_rela_dyn_start = .;
-		*(.rela.dyn)
-		*(.rela.*)
-		_rela_dyn_end = .;
-	}
+	/* start address of memory pool */
+	. = ALIGN(0x200000);
+	_end = .;
 }

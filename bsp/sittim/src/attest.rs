@@ -8,10 +8,10 @@
 //! 工具必须同步更换; 两者不同步时验签必然失败。
 
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
-use p256::ecdsa::{Signature, VerifyingKey};
-use sha2::{Digest, Sha256};
+use p256::ecdsa::{ Signature, VerifyingKey };
+use sha2::{ Digest, Sha256 };
 
-use crate::constants::{ATTEST_PUB_KEY, LINEAR_MAP_OFFSET, SHA256_DIGEST, SIG_LEN};
+use crate::constants::{ ATTEST_PUB_KEY, LINEAR_MAP_OFFSET, SHA256_DIGEST, SIG_LEN };
 
 /// 计算消息的摘要, 长度为 [`SHA256_DIGEST`] 字节。
 ///
@@ -76,11 +76,15 @@ fn verify_trailer(data: &[u8]) -> bool {
 	// 解析压缩公钥 (33 字节 SEC1) 与签名 (64 字节 r‖s)。
 	let vk = match VerifyingKey::from_sec1_bytes(&ATTEST_PUB_KEY) {
 		Ok(k) => k,
-		Err(_) => return false,
+		Err(_) => {
+			return false;
+		}
 	};
 	let sig = match Signature::from_slice(sig_bytes) {
 		Ok(s) => s,
-		Err(_) => return false,
+		Err(_) => {
+			return false;
+		}
 	};
 
 	// 预哈希验证 (摘要已算好, 直接对 32 字节验证)。

@@ -13,7 +13,7 @@
 //!
 //! 中断仲裁后同步 mip.MEIP/SEIP: 仅在 IMSIC 缺席 (纯 legacy PLIC) 时由 Rust 内联
 //! 维护 (``plic_recompute_mip``); AIA 模式 (IMSIC present) 的 mip 由 IMSIC 驱动,
-//! Python 侧 ``_native_sync_plic_mip`` 在边界处合并 PLIC 兜底.
+//! IMSIC 无挂起时由 Python 侧 ``_native_sync_plic_mip`` 在边界处并入 PLIC 的挂起.
 
 use crate::ffi::FfiPlicCtx;
 use crate::state::HartState;
@@ -85,8 +85,8 @@ pub(crate) fn plic_pending_mip(plic: &FfiPlicCtx, hart_id: u32) -> u64 {
 
 /// 将某 hart 的 mip.MEIP/SEIP 位重新同步到内联 PLIC 仲裁结果.
 ///
-/// 仅 IMSIC 缺席 (纯 legacy) 时有效 — AIA 模式 mip 由 IMSIC eip 驱动, PLIC 只是
-/// 兜底源 (由 Python 边界处 ``_native_sync_plic_mip`` 合并), 此处不得覆盖.
+/// 仅 IMSIC 缺席 (纯 legacy) 时有效 — AIA 模式 mip 由 IMSIC eip 驱动, IMSIC 无挂起
+/// 时由 Python 边界处的 ``_native_sync_plic_mip`` 并入 PLIC 的挂起, 此处不得覆盖.
 #[inline]
 fn plic_recompute_mip(state: &mut HartState, plic: &FfiPlicCtx) {
 	if state.imsic_m.present != 0 || state.imsic_s.present != 0 {

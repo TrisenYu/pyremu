@@ -259,29 +259,29 @@ fn ratio_ok(ratio: f64) -> bool {
 
 fn main() {
     println!("=== FEM variable-coefficient diffusion-reaction (P1 triangles, complex) ===");
-    println!("[fem] problem: -div(a*grad(u)) + c*u = f, u=0 on boundary, domain [0,1]^2");
-    println!("[fem] a(x,y) = 1 + 0.4 sin(2pi x) sin(2pi y) + i (0.2 + 0.1 cos(2pi x) cos(2pi y))");
-    println!("[fem] c(x,y) = 0.5 + 0.3 cos(pi x) cos(pi y)");
-    println!("[fem] exact:   u = sum_k (wr_k + i wi_k) sin(k pi x) sin(k pi y), k = 1..3");
+    println!(" problem: -div(a*grad(u)) + c*u = f, u=0 on boundary, domain [0,1]^2");
+    println!(" a(x,y) = 1 + 0.4 sin(2pi x) sin(2pi y) + i (0.2 + 0.1 cos(2pi x) cos(2pi y))");
+    println!(" c(x,y) = 0.5 + 0.3 cos(pi x) cos(pi y)");
+    println!(" exact:   u = sum_k (wr_k + i wi_k) sin(k pi x) sin(k pi y), k = 1..3");
 
     // 两套网格, 验证二阶收敛
     let n1 = 8;
     let n2 = 16;
     let u1 = solve(n1);
     let u2 = solve(n2);
-    println!("\n[fem] mesh N={n1}: dofs = {}", (n1 - 1) * (n1 - 1));
-    println!("[fem] mesh N={n2}: dofs = {}", (n2 - 1) * (n2 - 1));
+    println!("\n mesh N={n1}: dofs = {}", (n1 - 1) * (n1 - 1));
+    println!(" mesh N={n2}: dofs = {}", (n2 - 1) * (n2 - 1));
 
     let (c1, r1, i1) = l2_errors(n1, &u1);
     let (c2, r2, i2) = l2_errors(n2, &u2);
-    println!("[fem] N={n1}: L2 error = {c1:.3e} (re {r1:.3e}, im {i1:.3e})");
-    println!("[fem] N={n2}: L2 error = {c2:.3e} (re {r2:.3e}, im {i2:.3e})");
+    println!(" N={n1}: L2 error = {c1:.3e} (re {r1:.3e}, im {i1:.3e})");
+    println!(" N={n2}: L2 error = {c2:.3e} (re {r2:.3e}, im {i2:.3e})");
 
     let rc = c1 / c2;
     let rr = r1 / r2;
     let ri = i1 / i2;
-    println!("[fem] error ratio complex/re/im = {rc:.3} / {rr:.3} / {ri:.3}");
-    println!("[fem] expected ~4 for 2nd-order P1");
+    println!(" error ratio complex/re/im = {rc:.3} / {rr:.3} / {ri:.3}");
+    println!(" expected ~4 for 2nd-order P1");
     let ok = ratio_ok(rc) && ratio_ok(rr) && ratio_ok(ri);
     println!(
         "[{}] second-order convergence (all three ratios in [3, 5])",
@@ -291,7 +291,7 @@ fn main() {
     // 中心点数值解 vs 精确解 (u(0.5,0.5) = Σ (-1)^((k-1)/2) 型权重之和)
     let center = (n2 / 2 - 1) * (n2 - 1) + (n2 / 2 - 1);
     println!(
-        "\n[fem] u(0.5,0.5) = {} (exact {}) at N={n2}",
+        "\n u(0.5,0.5) = {} (exact {}) at N={n2}",
         fmt_c(u2[center]),
         fmt_c(exact(0.5, 0.5))
     );

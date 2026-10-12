@@ -32,7 +32,7 @@ from pyremu.core.trap_def import TrapType
 from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.types import HartSnapshot, MemWriteTracker
-from pyremu.debug.utils import hex_addr
+from pyremu.debug.utils import hex_addr, read_code_bytes
 from pyremu.emulator import Emulator, RunStopReason, TimeoutError
 from pyremu.env_inject import Preloader
 from pyremu.utils.mask import mask64
@@ -124,14 +124,17 @@ class ExecutionMixin(SharedMixinAttrs):
         snap = self._save_snapshot()
 
         orig_write = h._mem_write_phy
-        assert orig_write is not None, "memory backend not attached"
+        assert orig_write, "memory backend not attached"
 
         tracker = MemWriteTracker(self._emu.bus, orig_write)
         h._mem_write_phy = tracker
 
         try:
             pc_before = h.pc
-            raw = self._try_read_va(h.pc, 4)
+            # 按取指语义读取指令字节: 取指只判定页面的可执行位, 数据读语义还要
+            # 求 R=1. 管理器把自身 .text 映射为只可执行, 故不能用数据读语义
+            # 读取指令, 该语义在此类页面上必定被拒.
+            raw = read_code_bytes(self._emu.bus, h, h.pc, 4)
             if raw is None:
                 deliver_trap(
                     h, TrapType.InstrPageFault,
@@ -234,6 +237,8 @@ class ExecutionMixin(SharedMixinAttrs):
                 continue
             _bp_addrs.append(bp.value)
             va = self._pa_to_va.get(bp.value)
+            # 判定用 None 比较: 虚拟地址 0 是合法映射, 用真值判定会漏掉该断点的
+            # 虚拟地址副本.
             if va is not None:
                 _bp_addrs.append(va)
         self._emu._bp_addrs = _bp_addrs
@@ -389,24 +394,25 @@ class ExecutionMixin(SharedMixinAttrs):
         # cbreak 模式与 _sigint_run handler, 导致 Ctrl+Q 失灵.
         self._enter_repl_mode()
 
-        if self._image is not None:
+        if self._image:
             emu.load_firmware(self._image, load_offset=self._load_offset)
 
         # 重建 DTB: 用原始 bootargs + 完整设备树 (含 virtio-blk)
         # 写入 emulator 记录的 DTB 地址, 固件 ELF 可能已覆写该区域.
+        # 判定用 None 比较: 设备树可以落在地址 0 (ram_base 为 0 的固件).
         if emu._dtb_addr is not None:
             emu.load_dtb(emu._dtb_addr)
         elif self._fdt_addr is not None:
             emu.load_dtb(self._fdt_addr)
-        elif emu._bootargs is not None:
+        elif emu._bootargs:
             _dtb_addr = emu._cfg.ram_base + emu._cfg.ram_size - 0x10000
             emu.load_dtb(_dtb_addr)
 
-        if self._kernel_path is not None:
+        if self._kernel_path:
             kernel_data = Path(self._kernel_path).read_bytes()
             emu.bus.write_ram_direct(self._kernel_addr, kernel_data)
 
-        if self._preload_path is not None:
+        if self._preload_path:
             preload_entry = Preloader(emu).inject_file(self._preload_path)
             for h in emu.harts:
                 h.csrs["misa"].val = (
@@ -433,7 +439,7 @@ class ExecutionMixin(SharedMixinAttrs):
         if not addr_str or addr_str in ("off", "none", "clear"):
             self._watch_ranges.clear()
             self._watch_hit = None
-            self._console.print("[dim]写监控已关闭[/]")
+            self._console.print("[dim]内存写监控已关闭[/]")
             return
         addr = self._resolve_addr(addr_str)
         if addr is None:
@@ -442,7 +448,7 @@ class ExecutionMixin(SharedMixinAttrs):
         size = int(size_str, 0)
         self._watch_ranges.append((addr, addr + size))
         self._console.print(
-            f"  [green]* 写监控[/] {hex_addr(addr)}-{hex_addr(addr + size)}"
+            f"  [green]* 内存写监控[/] {hex_addr(addr)}-{hex_addr(addr + size)}"
         )
 
     # ----------------------------------------------------------
@@ -505,7 +511,7 @@ class ExecutionMixin(SharedMixinAttrs):
         for h in self._emu.harts:
             for bp in self._breakpoints:
                 if bp.kind == "addr" and not bp.cond_type and not include_addr:
-                    continue  # 纯 addr 断点 — Rust 已逐指令比对
+                    continue
                 if self._check_single_bp(h, bp) is None:
                     return True
         return False

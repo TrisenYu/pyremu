@@ -284,8 +284,6 @@ static void print_summary(const struct node_stats *stats) {
 	std::size_t nodes = 0;
 	std::size_t bytes = 0;
 
-	std::printf("\njson_cpp: AST summary (per node kind, last iteration over %zu inputs)\n",
-				static_cast<std::size_t>(JSON_INPUT_COUNT));
 	std::printf("  %-8s %10s  %12s\n", "kind", "nodes", "bytes");
 	for (int k = 0; k < KIND_COUNT; k++) {
 		std::printf("  %-8s %10zu  %12zu\n", kind_names[k], stats->nodes[k],
@@ -294,7 +292,7 @@ static void print_summary(const struct node_stats *stats) {
 		bytes += stats->bytes[k];
 	}
 	std::printf("  %-8s %10zu  %12zu\n", "total", nodes, bytes);
-	std::printf("json_cpp: heap bytes (counted by the payload allocator): peak=%zu "
+	std::printf("heap bytes (counted by the payload allocator): peak=%zu "
 				"live_at_end=%zu\n",
 				peak_bytes, live_bytes);
 }
@@ -329,7 +327,7 @@ static int unwind_selfcheck(void) {
 	unsigned long phent = getauxval(AT_PHENT);
 	unsigned long phnum = getauxval(AT_PHNUM);
 	if (phdr == 0 || phent == 0 || phnum == 0) {
-		std::printf("json_cpp: FAIL unwinding: auxv lacks program headers "
+		std::printf("FAIL unwinding: auxv lacks program headers "
 					"(AT_PHDR=%lu AT_PHENT=%lu AT_PHNUM=%lu)\n",
 					phdr, phent, phnum);
 		return 1;
@@ -346,12 +344,12 @@ static int unwind_selfcheck(void) {
 
 	const int expected_dtor = frames + 1;
 	if (!caught || unwind_dtor_count != expected_dtor) {
-		std::printf("json_cpp: FAIL unwinding: caught=%d dtor=%d (expected %d)\n",
+		std::printf("FAIL unwinding: caught=%d dtor=%d (expected %d)\n",
 					caught, unwind_dtor_count, expected_dtor);
 		return 1;
 	}
 
-	std::printf("json_cpp: unwinding OK (AT_PHDR=0x%lx AT_PHENT=%lu AT_PHNUM=%lu, "
+	std::printf("unwinding OK (AT_PHDR=0x%lx AT_PHENT=%lu AT_PHNUM=%lu, "
 				"%d frames, %d dtors)\n",
 				phdr, phent, phnum, frames, unwind_dtor_count);
 	return 0;
@@ -374,7 +372,7 @@ int main() {
 		return 1;
 	}
 
-	std::printf("json_cpp: %zu inputs (%zu valid + %zu malformed) x %d iters = %zu checks\n",
+	std::printf("%zu inputs (%zu valid + %zu malformed) x %d iters = %zu checks\n",
 				static_cast<std::size_t>(JSON_INPUT_COUNT),
 				static_cast<std::size_t>(JSON_INPUT_COUNT) - n_malformed, n_malformed,
 				JSON_CPP_ITERS, static_cast<std::size_t>(JSON_INPUT_COUNT) * JSON_CPP_ITERS);
@@ -404,7 +402,7 @@ int main() {
 	}
 
 	if (n_failed != 0) {
-		std::printf("\njson_cpp: %zu failed checks\n", n_failed);
+		std::printf("\n%zu failed checks\n", n_failed);
 		std::printf("  marks: . valid-passed  ~ malformed-rejected  ! valid-failed  "
 					"# malformed-accepted\n");
 		for (std::size_t i = 0; i < JSON_INPUT_COUNT; i++) {
@@ -418,21 +416,15 @@ int main() {
 	print_summary(&stats);
 
 	if (live_bytes != 0) {
-		std::printf("json_cpp: FAIL %zu bytes still allocated after every input was "
+		std::printf("FAIL %zu bytes still allocated after every input was "
 					"released\n",
 					live_bytes);
 		return 1;
 	}
 	if (n_failed != 0) {
-		std::printf("json_cpp: FAIL %zu of %zu checks\n", n_failed,
+		std::printf("FAIL %zu of %zu checks\n", n_failed,
 					static_cast<std::size_t>(JSON_INPUT_COUNT) * JSON_CPP_ITERS);
 		return 1;
 	}
-	std::printf("json_cpp: %zu inputs (%zu valid + %zu malformed) x %d parse: "
-				"ALL OK (nlohmann %d.%d.%d)\n",
-				static_cast<std::size_t>(JSON_INPUT_COUNT),
-				static_cast<std::size_t>(JSON_INPUT_COUNT) - n_malformed, n_malformed,
-				JSON_CPP_ITERS, NLOHMANN_JSON_VERSION_MAJOR,
-				NLOHMANN_JSON_VERSION_MINOR, NLOHMANN_JSON_VERSION_PATCH);
 	return 0;
 }

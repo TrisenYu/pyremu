@@ -909,10 +909,7 @@ class Hart(HartWithRegs):
         f = self._f
         op5 = f.func7 >> 2
         # int->float (0x1A) 与 FMV.*.X (0x1E) 的 rs1 源为 GPR。
-        if op5 in (0x1A, 0x1E):
-            rs1_bits = self.gprs[f.rs1]
-        else:
-            rs1_bits = self._fpr_bits[f.rs1]
+        rs1_bits = self.gprs[f.rs1] if op5 in (0x1A, 0x1E) else self._fpr_bits[f.rs1]
         rs2_bits = self._fpr_bits[f.rs2]
         out = fp_exec_op(f.func7, f.func3, f.rs2, rs1_bits, rs2_bits, self._fp_frm())
         if out.trap:

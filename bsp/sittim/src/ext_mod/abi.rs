@@ -1,6 +1,7 @@
 //! 模块与运行时之间的二进制接口。
 //!
-//! 模块以扁平映像交付: 无 ELF 头, 无重定位, 入口在映像偏移 0。模块的入口经
+//! 模块以映像交付: 无 ELF 头, 无重定位, 映像偏移 0 处是映像描述块, 模块入口在映像内
+//! 的偏移由该描述块给出, 见 [`img_descriptor`](super::img_descriptor)。模块的入口经
 //! [`InitFn`] 交付自己的取用器, 运行时经取用器取得 [`ModuleInterface`]。
 //! 形态与 ref-impl/emod 的取用器一致。
 
@@ -68,7 +69,8 @@ pub struct ModuleInterface {
 /// 模块取用器。参数为运行时的管理器回调集合, 返回该模块的接口。
 pub type GetterFn = unsafe extern "C" fn(manager: *const Manager) -> ModuleInterface;
 
-/// 模块入口, 位于映像偏移 0。参数为运行时的管理器回调集合, 返回该模块的取用器。
+/// 模块入口。它在映像内的偏移由映像描述块给出, 见 [`img_descriptor`](super::img_descriptor)。
+/// 参数为运行时的管理器回调集合, 返回该模块的取用器。
 ///
 /// 取用器须可重复调用并返回相同接口: `ext_mod::loader` 在入口之后另调一次取用器,
 /// 用于校验模块编号并取得接口。

@@ -47,6 +47,8 @@ class MemWriteTracker:
     def _record_old(self, addr: int, size: int) -> None:
         """Best-effort: 在覆盖前读取旧值. 读不到就跳过记录, 不阻断写入."""
         old = self._bus.try_read(addr, size)
+        # 判定用 None 比较: 读取成功返回的字节串可能为空 (size 为 0 的访问),
+        # 用真值判定会把这一情形当作读取失败.
         if old is not None:
             self.changes.append(MemoryChange(addr=addr, old=old))
 

@@ -20,22 +20,21 @@ use core::ptr;
 use crate::syscall::concurrency::thread;
 use crate::syscall::{EAGAIN, EINVAL};
 
-// futex 操作码 (linux/futex.h)。高位为标志 (FUTEX_PRIVATE = 128 等),
-// 与操作 OR 在一起; 取低 7 位即得操作本身。
+// futex 操作码。高位为标志
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
 const FUTEX_REQUEUE: u64 = 3;
 const FUTEX_OP_MASK: u64 = 0x7f;
 
-/// 读取用户地址处的 32 位字 (futex 等待值比较用; S 模式以 SUM = 1 直读)。
+/// 读取用户地址处的 32 位字。
 fn read_user_u32(addr: u64) -> u32 {
 	unsafe { ptr::read_volatile(addr as *const u32) }
 }
 
-/// futex 系统调用入口。参数布局 (Linux rv64):
+/// futex 系统调用入口
 /// futex(uaddr = a0, op = a1, val = a2, timeout = a3, uaddr2 = a4)。
-/// REQUEUE 的第 4 参数实为 nr_requeue (复用 timeout 槽); 超时语义本运行时
-/// 未实现, 等待均按无限阻塞处理 (t-test1 未使用带超时的条件等待)。
+/// REQUEUE 的第 4 参数实为 nr_requeue ; 超时语义本运行时
+/// 未实现, 等待均按无限阻塞处理。
 pub fn futex(uaddr: u64, op: u64, val: u64, arg3: u64, uaddr2: u64) -> u64 {
 	match op & FUTEX_OP_MASK {
 		FUTEX_WAIT => futex_wait(uaddr, val),

@@ -515,8 +515,6 @@ unsafe fn run_harts(
 		handles.push(handle);
 	}
 
-	// Store thread handles for MSIP/unpark: 发送方 (MSIP) 与看门狗调用
-	// unpark() 唤醒接收方 hart 线程, 使其从 wfi_spin 的 park() 醒来.
 	let thread_slice: Box<[std::thread::Thread]> = thread_refs.into_boxed_slice();
 	cc_clint.hart_threads.set(thread_slice.as_ptr());
 	std::mem::forget(thread_slice); // pointer valid until run_harts returns

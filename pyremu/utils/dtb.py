@@ -484,26 +484,26 @@ def _dtb_simple_devices(
     virtio 节点带 interrupts 属性, 形制由 _dtb_virtio_node 给出.
     """
     p = cfg.periph
-    if spi is not None:
+    if spi:
         sw.begin_node(f"spi@{p.spi_base:x}")
         sw.property_string("compatible", "pyremu,spi0")
         sw.property("reg", _encode_reg_4mib(p.spi_base, 0x1000))
         sw.end_node()  # spi
-    if i2c_gen is not None:
+    if i2c_gen:
         sw.begin_node(f"i2c@{p.i2c_base:x}")
         sw.property_string("compatible", "pyremu,i2c0")
         sw.property("reg", _encode_reg_4mib(p.i2c_base, 0x1000))
         sw.end_node()  # i2c
-    if gpio is not None:
+    if gpio:
         sw.begin_node(f"gpio@{p.gpio_base:x}")
         sw.property_string("compatible", "pyremu,gpio0")
         sw.property("reg", _encode_reg_4mib(p.gpio_base, 0x1000))
         sw.end_node()  # gpio
-    if virtio_blk is not None:
+    if virtio_blk:
         _dtb_virtio_node(sw, p.virtio_blk_base, VIRTIO_BLK_IRQ)
     # M 模式一侧的网卡实例不进设备树: 内核会为树中出现的中断源在自己的 S context
     # 上使能它, 该中断源一置位即产生 SEIP, 而 SEIP 由宿主 S 模式支配.
-    if virtio_net_s is not None:
+    if virtio_net_s:
         _dtb_virtio_node(sw, p.virtio_net_s_base, VIRTIO_NET_S_IRQ)
 
 

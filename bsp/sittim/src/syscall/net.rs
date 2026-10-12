@@ -32,7 +32,7 @@ use crate::ext_mod::runtime;
 use super::concurrency::thread;
 use super::fdtable::{ FdTarget, alloc_socket_fd, fd_entry };
 use super::fs::O_NONBLOCK;
-use super::types::{ MsgHdr, SockaddrIn };
+use super::types::{ IoVec, MsgHdr, SockaddrIn };
 use super::{
 	EADDRINUSE,
 	EADDRNOTAVAIL,
@@ -66,8 +66,8 @@ const MSG_DONTWAIT: u64 = 0x40;
 const MSG_PEEK: u64 = 0x2;
 /// 报文首部的 msg_flags 字段中表示报文被截断的 MSG_TRUNC 编号。
 const MSG_TRUNC: i32 = 0x20;
-/// struct sockaddr_in 的字节数。
-const SOCKADDR_IN_SIZE: usize = 16;
+/// struct sockaddr_in 的字节数, 取自 [SockaddrIn] 的声明。
+const SOCKADDR_IN_SIZE: usize = core::mem::size_of::<SockaddrIn>();
 /// 一个 UDP 报文载荷的最大字节数 = 以太帧最大长度 1514 减去以太网首部 14、
 /// IPv4 首部 20 与 UDP 首部 8。
 pub const UDP_PAYLOAD_MAX: usize = 1472;
@@ -89,11 +89,20 @@ const SHUT_RDWR: u64 = 2;
 /// 接收的阻塞地址基址。每个套接字下标一个, 折算方式为基址加上下标乘以 8。
 const RECV_WAIT_ADDR_BASE: u64 = 0x7fff_1000_0000;
 
-/// 网络模块的操作表; 该模块未接入时返回 None。
+/// 网络模块的操作表。
 ///
-/// 首次调用时取入该模块, 宿主未提供它时返回 None。
-fn ops() -> Option<&'static NetOps> {
+/// 首次调用时取入该模块。取入失败返回错误码, 由系统调用处理函数原样上报给可信应用, 见
+/// [`runtime::acquire_net_ops`]。
+fn ops() -> Result<&'static NetOps, u64> {
 	runtime::acquire_net_ops()
+}
+
+/// 网络模块的操作表; 该模块不可用时返回 None。
+///
+/// 供按"模块可用与否"决定后续动作的调用点使用: 协议栈推进与套接字状态查询在模块不可用时
+/// 无事可做, 其失败不构成系统调用的失败结果。
+fn ops_if_avail() -> Option<&'static NetOps> {
+	ops().ok()
 }
 
 /// 地址族未指定的端点: 绑定时表示本地地址不作限定, 接收时作为来源的输出初值。
@@ -114,14 +123,14 @@ fn recv_wait_addr(index: u64) -> u64 {
 ///
 /// 发送之后与设备事件到达时调用, 见 [sched](super::concurrency::sched)。
 pub fn poll_stack() {
-	if let Some(ops) = ops() {
+	if let Some(ops) = ops_if_avail() {
 		unsafe { (ops.poll)() }
 	}
 }
 
 /// 唤醒全部有报文可接收的套接字上阻塞的线程。
 pub fn wake_receivers() {
-	let Some(ops) = ops() else {
+	let Some(ops) = ops_if_avail() else {
 		return;
 	};
 	for index in 0..ops.socket_slots {
@@ -135,7 +144,7 @@ pub fn wake_receivers() {
 ///
 /// ppoll 把套接字的就绪状态并入等待判据, 见 [fs](super::fs)。
 pub fn can_recv(index: u64) -> bool {
-	match ops() {
+	match ops_if_avail() {
 		Some(ops) => unsafe { (ops.can_recv)(index) }
 		None => false,
 	}
@@ -143,7 +152,7 @@ pub fn can_recv(index: u64) -> bool {
 
 /// 该套接字槽位是否可以发送报文; 模块未接入时返回假。
 pub fn can_send(index: u64) -> bool {
-	match ops() {
+	match ops_if_avail() {
 		Some(ops) => unsafe { (ops.can_send)(index) }
 		None => false,
 	}
@@ -151,7 +160,7 @@ pub fn can_send(index: u64) -> bool {
 
 /// 释放一个套接字槽位。fd 表释放套接字表项时调用, 见 [fs](super::fs)。
 pub fn close_socket(index: u64) {
-	if let Some(ops) = ops() {
+	if let Some(ops) = ops_if_avail() {
 		unsafe { (ops.close)(index) }
 	}
 }
@@ -274,8 +283,11 @@ pub fn socket_handler(domain: u64, sock_type: u64, protocol: u64) -> u64 {
 	if protocol != 0 && protocol != IPPROTO_UDP {
 		return EPROTONOSUPPORT;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	let index = unsafe { (ops.open)() };
 	if index == NET_NO_SLOT {
@@ -309,8 +321,11 @@ pub fn bind_handler(fd: u64, addr: u64, addrlen: u64) -> u64 {
 			return e;
 		}
 	};
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	// 未指定地址表示本地地址取任意, 本机地址表示只接受发往本机地址的报文; 其余地址
 	// 没有接收路径, 协议栈只认本机地址的入站报文。
@@ -342,8 +357,11 @@ pub fn connect_handler(fd: u64, addr: u64, addrlen: u64) -> u64 {
 	if endpoint.port == 0 {
 		return EDESTADDRREQ;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	if !is_local_subnet(ops, &endpoint) {
 		return ENETUNREACH;
@@ -366,8 +384,11 @@ pub fn getsockname_handler(fd: u64, addr: u64, addrlen: u64) -> u64 {
 	if let Err(e) = check_sockaddr_out(addr, addrlen) {
 		return e;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	write_sockaddr(addr, addrlen, &local_endpoint_of(ops, index));
 	0
@@ -384,8 +405,11 @@ pub fn getpeername_handler(fd: u64, addr: u64, addrlen: u64) -> u64 {
 	if let Err(e) = check_sockaddr_out(addr, addrlen) {
 		return e;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	let Some(endpoint) = peer_of(ops, index) else {
 		return ENOTCONN;
@@ -511,8 +535,11 @@ pub fn sendto_handler(fd: u64, buf: u64, len: u64, flags: u64, dest_addr: u64, a
 	if (flags & !MSG_DONTWAIT) != 0 {
 		return EOPNOTSUPP;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	send_common(ops, index, buf, len, dest_addr, addrlen)
 }
@@ -537,8 +564,11 @@ pub fn recvfrom_handler(fd: u64, buf: u64, len: u64, flags: u64, src_addr: u64, 
 			return e;
 		}
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	let is_nonblocking = (flags & MSG_DONTWAIT) != 0 || (open_flags & O_NONBLOCK) != 0;
 	match recv_common(ops, index, is_nonblocking, buf, len, (flags & MSG_PEEK) != 0) {
@@ -569,8 +599,11 @@ pub fn sendmsg_handler(fd: u64, msg: u64, flags: u64) -> u64 {
 	if msg == 0 {
 		return EFAULT;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	let hdr = unsafe { ptr::read_unaligned(msg as *const MsgHdr) };
 	let endpoint = match send_endpoint(ops, index, hdr.msg_name, hdr.msg_namelen as u64) {
@@ -614,8 +647,11 @@ pub fn recvmsg_handler(fd: u64, msg: u64, flags: u64) -> u64 {
 	if let Err(e) = check_iovecs(hdr.msg_iov, hdr.msg_iovlen as u64) {
 		return e;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	let mut payload = [0u8; UDP_PAYLOAD_MAX];
 	let is_nonblocking = (flags & MSG_DONTWAIT) != 0 || (open_flags & O_NONBLOCK) != 0;
@@ -657,14 +693,6 @@ pub fn recvmsg_handler(fd: u64, msg: u64, flags: u64) -> u64 {
 	written as u64
 }
 
-/// 取第 *index* 个 iovec 的缓冲区地址与长度, 每个 iovec 占 16 字节。
-fn iovec_at(io_vec_arr: u64, index: u64) -> (u64, u64) {
-	let slot = io_vec_arr.wrapping_add(index.wrapping_mul(16));
-	let base = unsafe { (slot as *const u64).read_volatile() };
-	let len = unsafe { (slot.wrapping_add(8) as *const u64).read_volatile() };
-	(base, len)
-}
-
 /// 校验 iovec 数组, 返回各项缓冲区容量之和。
 ///
 /// 项数大于 IOV_MAX 时返回 EINVAL; 数组地址为 0 而项数非零时返回 EFAULT; 长度为
@@ -678,7 +706,7 @@ fn check_iovecs(io_vec_arr: u64, io_vec_size: u64) -> Result<usize, u64> {
 	}
 	let mut total = 0usize;
 	for i in 0..io_vec_size {
-		let (base, len) = iovec_at(io_vec_arr, i);
+		let (base, len) = IoVec::at(io_vec_arr, i);
 		if len != 0 && base == 0 {
 			return Err(EFAULT);
 		}
@@ -694,7 +722,7 @@ fn scatter_iovecs(io_vec_arr: u64, io_vec_size: u64, payload: &[u8]) -> u64 {
 		if offset >= payload.len() {
 			break;
 		}
-		let (base, len) = iovec_at(io_vec_arr, i);
+		let (base, len) = IoVec::at(io_vec_arr, i);
 		let count = cmp::min(len as usize, payload.len() - offset);
 		if count == 0 {
 			continue;
@@ -716,7 +744,7 @@ fn gather_iovecs(io_vec_arr: u64, io_vec_size: u64, payload: &mut [u8]) -> Resul
 	}
 	let mut offset = 0usize;
 	for i in 0..io_vec_size {
-		let (base, len) = iovec_at(io_vec_arr, i);
+		let (base, len) = IoVec::at(io_vec_arr, i);
 		let count = len as usize;
 		if count == 0 {
 			continue;
@@ -735,8 +763,11 @@ pub fn read_socket(index: u64, open_flags: u32, buf: *mut u8, len: u64) -> u64 {
 	if buf.is_null() && len != 0 {
 		return EFAULT;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	let is_nonblocking = (open_flags & O_NONBLOCK) != 0;
 	match recv_common(ops, index, is_nonblocking, buf as u64, len, false) {
@@ -749,8 +780,11 @@ pub fn read_socket(index: u64, open_flags: u32, buf: *mut u8, len: u64) -> u64 {
 /// write 在套接字上的发送动作。等同于不给出目的地址的 sendto, 即发往经 connect
 /// 记录的对端地址。
 pub fn write_socket(index: u64, buf: *const u8, len: u64) -> u64 {
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	send_common(ops, index, buf as u64, len, 0, 0)
 }
@@ -761,8 +795,11 @@ pub fn readv_socket(index: u64, open_flags: u32, io_vec_arr: u64, io_vec_size: u
 	if let Err(e) = check_iovecs(io_vec_arr, io_vec_size) {
 		return e;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	let mut payload = [0u8; UDP_PAYLOAD_MAX];
 	let is_nonblocking = (open_flags & O_NONBLOCK) != 0;
@@ -832,7 +869,7 @@ pub fn getsockopt_handler(fd: u64, level: u64, optname: u64, optval: u64, optlen
 	if optval == 0 || optlen == 0 {
 		return EFAULT;
 	}
-	let buf_bytes = match ops() {
+	let buf_bytes = match ops_if_avail() {
 		Some(ops) => ops.payload_bytes as u32,
 		// 套接字槽位容量由协议栈的静态缓冲区决定, 该模块未接入时取 0。
 		None => 0,
@@ -868,8 +905,11 @@ pub fn shutdown_handler(fd: u64, how: u64) -> u64 {
 	if how > SHUT_RDWR {
 		return EINVAL;
 	}
-	let Some(ops) = ops() else {
-		return ENODEV;
+	let ops = match ops() {
+		Ok(ops) => ops,
+		Err(e) => {
+			return e;
+		}
 	};
 	if peer_of(ops, index).is_none() {
 		return ENOTCONN;

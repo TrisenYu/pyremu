@@ -9,7 +9,7 @@
 //! 仅用于在缺少随机数设备的平台上维持可用。
 
 use crate::ecall_aux;
-use crate::syscall::{EFAULT, EINVAL};
+use crate::syscall::{ EFAULT, EINVAL };
 
 /// 每次 ecall 搬运的字节数, 也是运行时栈上缓冲的大小。
 const RAND_CHUNK: usize = 256;
@@ -26,7 +26,7 @@ const GRND_INSECURE: u64 = 0x0004;
 /// 请 M-mode 用宿主随机数设备填满 *out*, 设备不可用时返回 0。
 fn fill_from_device(out: &mut [u8]) -> u64 {
 	let got = ecall_aux::enclave_call_get_rand_num(out);
-	if got == out.len() as u64 {
+	if got == (out.len() as u64) {
 		return got;
 	}
 	0
@@ -43,7 +43,9 @@ static mut FALLBACK_SEEDED: bool = false;
 /// 读取时间计数器。
 fn time_ticks() -> u64 {
 	let t: u64;
-	unsafe { core::arch::asm!("csrr {0}, 0xC01", out(reg) t) };
+	unsafe {
+		core::arch::asm!("csrr {0}, 0xC01", out(reg) t);
+	}
 	t
 }
 
@@ -53,7 +55,7 @@ fn fallback_word() -> u64 {
 		if !FALLBACK_SEEDED {
 			let seed = time_ticks();
 			// xorshift 的状态不能为 0, 否则永远输出 0。
-			FALLBACK_STATE = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+			FALLBACK_STATE = if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed };
 			FALLBACK_SEEDED = true;
 		}
 		let mut x = FALLBACK_STATE;
@@ -61,7 +63,7 @@ fn fallback_word() -> u64 {
 		x ^= x << 25;
 		x ^= x >> 27;
 		FALLBACK_STATE = x;
-		x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+		x.wrapping_mul(0x2545_f491_4f6c_dd1d)
 	}
 }
 
@@ -90,7 +92,7 @@ pub fn getrandom_handler(buf: *mut u8, buflen: u64, flags: u64) -> u64 {
 	if buf.is_null() && buflen != 0 {
 		return EFAULT;
 	}
-	if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 {
+	if (flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE)) != 0 {
 		return EINVAL;
 	}
 
@@ -107,7 +109,9 @@ pub fn getrandom_handler(buf: *mut u8, buflen: u64, flags: u64) -> u64 {
 			fill_fallback(&mut chunk[..n]);
 		}
 		for i in 0..n {
-			unsafe { buf.add((off + i as u64) as usize).write_volatile(chunk[i]) };
+			unsafe {
+				buf.add((off + (i as u64)) as usize).write_volatile(chunk[i]);
+			}
 		}
 		off += n as u64;
 	}

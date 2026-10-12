@@ -8,6 +8,7 @@ use crate::ext_mod::runtime;
 use crate::ext_mod::vfs_ops::VfsOps;
 use crate::sync_aux::SpinLock;
 
+use super::ENOENT;
 use super::sysfs;
 
 /// 挂载表容量。
@@ -66,18 +67,21 @@ fn mount(point: &[u8], fs: FileSystem) -> bool {
 	true
 }
 
-/// 取文件系统 *fs* 的操作表。根文件系统由模块交付, 宿主未提供该模块时返回 None。
-pub fn ops_of(fs: FileSystem) -> Option<&'static VfsOps> {
+/// 取文件系统 *fs* 的操作表。
+///
+/// 根文件系统由宿主交付的文件系统模块实现, 取入失败时返回错误码, 见
+/// [`runtime::acquire_vfs_ops`](crate::ext_mod::runtime::acquire_vfs_ops)。
+pub fn ops_of(fs: FileSystem) -> Result<&'static VfsOps, u64> {
 	match fs {
 		FileSystem::Rootfs => runtime::acquire_vfs_ops(),
-		FileSystem::Sysfs => Some(sysfs::ops()),
+		FileSystem::Sysfs => Ok(sysfs::ops()),
 	}
 }
 
 /// 把路径分派给挂载点前缀最长的文件系统, 返回该文件系统、它的操作表, 与它根下的路径。
 ///
-/// 路径不属于任何已登记的挂载点, 或该文件系统尚未交付时返回 None。
-pub fn resolve(path: &[u8]) -> Option<(FileSystem, &'static VfsOps, &[u8])> {
+/// 路径不属于任何已登记的挂载点返回 [`ENOENT`], 该文件系统尚未交付时返回取入失败的错误码。
+pub fn resolve(path: &[u8]) -> Result<(FileSystem, &'static VfsOps, &[u8]), u64> {
 	let best = {
 		let mounts = MOUNTS.lock();
 		mounts
@@ -85,10 +89,11 @@ pub fn resolve(path: &[u8]) -> Option<(FileSystem, &'static VfsOps, &[u8])> {
 			.flatten()
 			.filter(|item| covers(&item.point[..item.point_len], path))
 			.max_by_key(|item| item.point_len)
-			.copied()?
+			.copied()
+			.ok_or(ENOENT)?
 	};
 	let ops = ops_of(best.fs)?;
-	Some((best.fs, ops, relative(&best.point[..best.point_len], path)))
+	Ok((best.fs, ops, relative(&best.point[..best.point_len], path)))
 }
 
 /// 路径 *path* 是否落在挂载点 *point* 之下。

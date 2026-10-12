@@ -27,9 +27,7 @@ static long module_ioctl(int fd, unsigned long cmd, struct tee_enclave_args *arg
 
 /* 在表中查找模块. 未登记时返回 NULL. */
 static const struct tee_ext_mod_entry *module_lookup(
-	const struct tee_ext_mod_table *table,
-	uint32_t module_id
-) {
+	const struct tee_ext_mod_table *table, uint32_t module_id) {
 	for (int i = 0; i < table->count; i++) {
 		if (table->entries[i].module_id == module_id) {
 			return &table->entries[i];
@@ -71,13 +69,17 @@ int tee_ext_mod_table_load(struct tee_ext_mod_table *table, const char *dir) {
 			return -EINVAL;
 		}
 		if (table->count >= TEE_EXT_MOD_TABLE_MAX) {
-			fprintf(stderr, "more than %d modules in '%s'\n", TEE_EXT_MOD_TABLE_MAX, list_path);
+			fprintf(
+				stderr,
+				"more than %d modules in '%s'\n",
+				TEE_EXT_MOD_TABLE_MAX,
+				list_path);
 			fclose(fp);
 			return -E2BIG;
 		}
 
 		struct tee_ext_mod_entry *entry = &table->entries[table->count];
-		entry->module_id			   = (uint32_t)module_id;
+		entry->module_id				= (uint32_t)module_id;
 		n = snprintf(entry->path, sizeof(entry->path), "%s/%s", dir, name);
 		if (n < 0 || (size_t)n >= sizeof(entry->path)) {
 			fprintf(stderr, "module image path too long: '%s/%s'\n", dir, name);
@@ -92,7 +94,6 @@ int tee_ext_mod_table_load(struct tee_ext_mod_table *table, const char *dir) {
 	return table->count;
 }
 
-/* 取映像文件的字节数; 文件不可读或不是非空普通文件时返回 0. */
 static uint64_t image_size(const char *path) {
 	struct stat st;
 	if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
@@ -102,12 +103,7 @@ static uint64_t image_size(const char *path) {
 }
 
 /* 报告映像的字节数. 模块不存在时报告 0, 由 M 模式记为不存在的交付结果. */
-static int report_size(
-	int fd,
-	uint64_t enclave_id,
-	uint64_t token,
-	uint64_t size
-) {
+static int report_size(int fd, uint64_t enclave_id, uint64_t token, uint64_t size) {
 	struct tee_enclave_args args;
 	memset(&args, 0, sizeof(args));
 	args.enclave_id = enclave_id;
@@ -119,28 +115,19 @@ static int report_size(
 
 /* 交付映像的字节. 缓冲区在调用期间保持有效, 驱动经内核缓冲区中转后即不再引用它. */
 static int deliver_image(
-	int fd,
-	uint64_t enclave_id,
-	uint64_t token,
-	const void *image,
-	uint64_t size
-) {
+	int fd, uint64_t enclave_id, uint64_t token, const void *image, uint64_t size) {
 	struct tee_enclave_args args;
 	memset(&args, 0, sizeof(args));
-	args.enclave_id	  = enclave_id;
-	args.token		  = token;
+	args.enclave_id	   = enclave_id;
+	args.token		   = token;
 	args.image.buf_ptr = (uint64_t)image;
-	args.image.size	  = size;
+	args.image.size	   = size;
 
 	return (int)module_ioctl(fd, TEE_IOC_MODULE_IMG, &args);
 }
 
 int tee_ext_mod_serve(
-	int fd,
-	const struct tee_ext_mod_table *table,
-	uint64_t enclave_id,
-	uint64_t token
-) {
+	int fd, const struct tee_ext_mod_table *table, uint64_t enclave_id, uint64_t token) {
 	struct tee_enclave_args args;
 	memset(&args, 0, sizeof(args));
 	args.enclave_id = enclave_id;
@@ -148,7 +135,7 @@ int tee_ext_mod_serve(
 
 	long rc = module_ioctl(fd, TEE_IOC_MODULE_REQ, &args);
 	if (rc < 0) {
-		fprintf(stderr, "[module] req failed (errno=%ld)\n", -rc);
+		fprintf(stderr, "req failed (errno=%ld)\n", -rc);
 		return (int)rc;
 	}
 
@@ -158,35 +145,36 @@ int tee_ext_mod_serve(
 	}
 
 	const struct tee_ext_mod_entry *entry = module_lookup(table, module_id);
-	uint64_t kind						 = args.req.kind;
+	uint64_t kind						  = args.req.kind;
 
 	if (kind == TEE_MODULE_KIND_SIZE) {
 		uint64_t size = entry ? image_size(entry->path) : 0;
-		printf("[module] req enclave=%llu id=%u kind=size -> %llu\n",
-			   (unsigned long long)enclave_id, module_id,
-			   (unsigned long long)size);
+		printf("req enclave=%lu id=%u kind=size -> %llu\n", enclave_id, module_id, size);
 		return report_size(fd, enclave_id, token, size) < 0 ? -1 : 1;
 	}
 
 	if (kind == TEE_MODULE_KIND_LOAD) {
 		if (!entry) {
-			printf("[module] req enclave=%llu id=%u kind=load -> absent\n",
-				   (unsigned long long)enclave_id, module_id);
+			printf(
+				"req enclave=%llu id=%u kind=load -> absent\n",
+				(unsigned long long)enclave_id,
+				module_id);
 			return report_size(fd, enclave_id, token, 0) < 0 ? -1 : 1;
 		}
 
 		uint64_t size = image_size(entry->path);
 		FILE *fp	  = size ? fopen(entry->path, "rb") : NULL;
 		if (!fp) {
-			printf("[module] req enclave=%llu id=%u kind=load -> unreadable\n",
-				   (unsigned long long)enclave_id, module_id);
+			printf(
+				"req enclave=%llu id=%u kind=load -> unreadable\n",
+				(unsigned long long)enclave_id,
+				module_id);
 			return report_size(fd, enclave_id, token, 0) < 0 ? -1 : 1;
 		}
 
 		uint8_t *image = malloc((size_t)size);
 		if (!image) {
-			fprintf(stderr, "[module] out of memory for %llu bytes\n",
-					(unsigned long long)size);
+			fprintf(stderr, "out of memory for %llu bytes\n", (unsigned long long)size);
 			fclose(fp);
 			return -1;
 		}
@@ -198,16 +186,18 @@ int tee_ext_mod_serve(
 		int ret = deliver_image(fd, enclave_id, token, image, got);
 		free(image);
 		if (ret < 0) {
-			fprintf(stderr, "[module] deliver id=%u failed (errno=%d)\n", module_id, -ret);
+			fprintf(stderr, "deliver id=%u failed (errno=%d)\n", module_id, -ret);
 			return -1;
 		}
-		printf("[module] req enclave=%llu id=%u kind=load -> %zu bytes from %s\n",
-			   (unsigned long long)enclave_id, module_id, got, entry->path);
+		printf(
+			"req enclave=%llu id=%u kind=load -> %zu bytes from %s\n",
+			(unsigned long long)enclave_id,
+			module_id,
+			got,
+			entry->path);
 		return 1;
 	}
 
-	/* 未知类别: 以字节数 0 应答, 使该请求以"宿主侧不存在"结清, 飞地不致停在此处. */
-	fprintf(stderr, "[module] unknown kind %llu for id=%u\n",
-			(unsigned long long)kind, module_id);
+	fprintf(stderr, "unknown kind %llu for id=%u\n", (unsigned long long)kind, module_id);
 	return report_size(fd, enclave_id, token, 0) < 0 ? -1 : 1;
 }

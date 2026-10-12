@@ -8,8 +8,9 @@ use core::fmt::{self, Write};
 
 use crate::ecall_aux;
 
-/// 栈上格式化缓冲区。
-const BUF_SIZE: usize = 512;
+/// 单条消息的格式化缓冲区字节数。长度须容得下最长的一条消息, 即陷态现场的记录,
+/// 它逐项列出陷态栈帧内的全部通用寄存器, 见 crate::trap 的 report_trap_frame。
+const BUF_SIZE: usize = 1024;
 
 pub struct FmtBuf {
 	buf: [u8; BUF_SIZE],

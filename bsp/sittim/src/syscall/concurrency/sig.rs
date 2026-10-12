@@ -4,7 +4,7 @@
 //! - 处置表 (rt_sigaction)、屏蔽集合 (rt_sigprocmask)、待投递集合三者在 `SigState`,
 //!   作为进程控制块的一个字段随进程保存 (见 crate::syscall::concurrency::proc)。
 //! - 信号帧的构造与恢复 (`build_frame` / `restore_frame`) 是纯地址运算, 只读写
-//!   用户栈与陷阱帧, 不触碰进程表。
+//!   用户栈与陷态栈帧, 不触碰进程表。
 //! - 决定「投递给谁、投不投递、是否终止进程」的部分在 syscall::concurrency::proc ——
 //!   终止进程要动进程表与调度器, 属进程层职责。
 //!
@@ -15,7 +15,7 @@ use core::ptr;
 
 use crate::csr;
 use crate::syscall::EINVAL;
-use crate::trap::{ TrapGprs, A0, A1, A2, RA, SP };
+use crate::trap_frame::{ TrapGprs, A0, A1, A2, RA, SP };
 
 /// 登记的信号编号上界。只登记 1..=31 号标准信号: 待投递集合与屏蔽集合都是
 /// 单字位图, 位下标即信号编号; 实时信号 (32..=64) 本运行时未使用。
@@ -27,6 +27,9 @@ const SIG_IGN: u64 = 1;
 
 /// SIGALRM (musl signal.h), 间隔定时器到期时投递的信号。
 pub const SIGALRM: usize = 14;
+
+/// SIGBUS (musl signal.h), 模块在运行中出错时投递给可信应用的信号。
+pub const SIGBUS: usize = 7;
 
 /// rt_sigaction 的 new_action/old_action 参数中处理函数地址的字节偏移
 /// (struct k_sigaction: handler, flags, mask[2], unused; riscv64 无 SA_RESTORER)。
@@ -281,10 +284,10 @@ pub fn take_pending(st: &mut SigState) -> Option<usize> {
 //  信号帧
 // ---------------------------------------------------------------
 
-/// 在用户栈上构造信号帧, 改写陷阱帧使返回时进入处理函数, 返回处理函数地址
+/// 在用户栈上构造信号帧, 改写陷态栈帧使返回时进入处理函数, 返回处理函数地址
 /// (即应写入 sepc 的值)。
 pub fn build_frame(st: &mut SigState, sig: usize, handler: u64, gprs: &mut TrapGprs, sepc: u64) -> u64 {
-	let usp = gprs.usp;
+	let usp = gprs.sp_before_trap;
 	let frame = usp.wrapping_sub(FRAME_SIZE) & !0xf_u64;
 	let blocked_before = st.blocked;
 
@@ -310,7 +313,7 @@ pub fn build_frame(st: &mut SigState, sig: usize, handler: u64, gprs: &mut TrapG
 		st.blocked |= 1u64 << sig;
 	}
 
-	gprs.usp = frame;
+	gprs.sp_before_trap = frame;
 	gprs.regs[SP] = frame;
 	gprs.regs[A0] = sig as u64;
 	gprs.regs[A1] = frame + FRAME_SIGINFO_OFF;
@@ -324,7 +327,7 @@ pub fn build_frame(st: &mut SigState, sig: usize, handler: u64, gprs: &mut TrapG
 /// rt_sigreturn (139) 的核心: 从当前用户 sp 指向的信号帧恢复现场, 返回被中断的
 /// sepc (即恢复后应写入 sepc 的值, 而非 ecall 的下一条指令)。
 pub fn restore_frame(st: &mut SigState, gprs: &mut TrapGprs) -> u64 {
-	let frame = gprs.usp;
+	let frame = gprs.sp_before_trap;
 	unsafe {
 		let sepc = ptr::read_volatile((frame + FRAME_SEPC_OFF) as *const u64);
 		let sstatus = ptr::read_volatile((frame + FRAME_SSTATUS_OFF) as *const u64);
@@ -334,7 +337,7 @@ pub fn restore_frame(st: &mut SigState, gprs: &mut TrapGprs) -> u64 {
 			gprs as *mut TrapGprs as *mut u8,
 			core::mem::size_of::<TrapGprs>()
 		);
-		gprs.usp = ptr::read_volatile((frame + FRAME_USP_OFF) as *const u64);
+		gprs.sp_before_trap = ptr::read_volatile((frame + FRAME_USP_OFF) as *const u64);
 		// 帧内 sstatus 取自信号送达时刻, 其 SPP = 0 (来自 U 模式) 与 SPIE = 1
 		// 正是 sret 返回 U 模式所需的取值。
 		csr::write_sstatus(sstatus);

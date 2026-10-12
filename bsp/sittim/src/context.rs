@@ -4,7 +4,6 @@
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 
-use crate::constants::PAGE_SIZE;
 use crate::paging::Pte;
 
 // ---------------------------------------------------------------
@@ -26,10 +25,6 @@ impl PoolDesc {
 			size: 0,
 			used_pages: 0,
 		}
-	}
-
-	pub fn avail_bytes(&self) -> u64 {
-		self.size.saturating_sub(self.used_pages * PAGE_SIZE)
 	}
 }
 
@@ -78,21 +73,21 @@ pub struct EnclaveContext {
 	/// U-mode 堆已映射到的 VA 上界, 恒为 2 MiB 对齐。
 	pub umode_heap_mapped_end: u64,
 	/// mmap 匿名映射已交付的 4 KiB 页计数 (自 UMODE_MMAP_BASE 起)。
-	/// 右移 CHUNK_2M_SHIFT 位是已彻底写满的 2 MiB 块数, 也就是游标当前所在块的
-	/// 序号; 与块内页数掩码按位与是游标当下所在块内已交付的页数。
+	/// 右移 CHUNK_2M_SHIFT 位是已彻底写满的 2 MiB 块数, 即该计数落在的块的序号;
+	/// 与块内页数掩码按位与是同一个块内已交付的页数。
 	/// 例: 511 表示 0 块写满、当前块已用 511 页, 下一页仍在本块内; 512 表示 1 块
 	/// 写满、当前块自 0 起用。映射 VA 与块边界都由该计数导出
 	pub umode_mmap_pages_used: u64,
-	/// 当前 2 MiB 块的物理基址, 仅当该块按 4 KiB 页切分时有效;
-	/// 0 表示没有正在切分的块 (游标所在块由 2 MiB 超页覆盖, 或尚无映射)。
-	/// 每块的后备物理内存是独立一次分配 (页池或 M-mode 分区), 块间不保证连续,
+	/// 当前 2 MiB 块的物理基址; 它非零时描述的必是末页 (页计数减一) 所在的块, 块内
+	/// 交付按它加块内偏移算出物理地址。0 表示没有正在切分的块, 下一个不足一块的请求
+	/// 为它所在的块另行取得后备内存。
+	/// 每块的后备物理内存是独立一次 M-mode 分区申请, 块间不保证连续,
 	/// 无法由页计数导出; 已交付页的物理地址另有页表记录, 故只保留当前块。
 	pub umode_curr_mmap_pa: u64,
-	pub umode_pool: PoolDesc,
+	/// S-mode 页池 (页表与内核栈): 自管理器镜像末尾起的一段分区。
 	pub smode_pool: PoolDesc,
 	#[allow(dead_code)]
 	pub shared_buffer: Option<SharedBuf>,
-	pub umode_pool_pa_aligned: u64,
 	/// 飞地时间配额 (timer interrupt 次数), 0=不限.
 	pub time_quota: u64,
 	/// 当前时间片内已消耗的 timer interrupt 次数.
@@ -173,7 +168,7 @@ pub fn init_context(man_pa_start: u64, enclave_module_load_va: u64) {
 		(*ptr).manager_pa_start = man_pa_start;
 		(*ptr).enclave_module_load_va = enclave_module_load_va;
 		(*ptr).time_quota = crate::constants::TIME_QUOTA;
-		// 其余字段 = 0 (umode_heap_top, pools, ticks_consumed, shared_buffer, ...)
+		// 其余字段 = 0 (umode_heap_top, smode_pool, ticks_consumed, shared_buffer, ...)
 		// BSS 已保证全零, 无需显式赋值
 	});
 }

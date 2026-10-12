@@ -250,7 +250,7 @@ def _parse_elf(
     # 定位 .symtab 和 .strtab 节
     symtab_sec = binary.get_section(".symtab")
     strtab_sec = binary.get_section(".strtab")
-    if symtab_sec is not None and strtab_sec is not None:
+    if symtab_sec and strtab_sec:
         # 大型 ELF (>500K 符号, 如 Linux vmlinux) 跳过 LOCAL 非函数符号
         # (FILE/SECTION/NOTYPE 等) 以减少噪声; STT_FUNC 始终保留,
         # 无论是 LOCAL 还是 GLOBAL — 否则栈回溯会因缺少静态函数而解析错误.
@@ -327,7 +327,7 @@ def _parse_pe(
     symbols: dict[str, int] = {}
 
     exported = binary.get_export()
-    if exported is not None:
+    if exported:
         for exp in exported.entries:
             tmp = str(exp.name)
             if len(tmp) > 0:

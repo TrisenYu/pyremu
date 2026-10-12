@@ -37,11 +37,6 @@ $(OUT): $(OBJS)
 run: $(OUT)
 	$(QEMU) $(OUT)
 
-# ---- 无参数启动的自检 ----
-# 复现载荷以 argc=0, argv=NULL 启动的情形 (宿主经 TEE_IOC_ENTER 可不传参数).
-# 载荷的 main 在此按 -Dmain=cfrac_main 改名, 由 test/zero_argv_main.c 调用.
-# 断言: 打印内置合数的分解式, 退出码为 0, 不出现 usage 行.
-# 修复前这一组入参落入 usage 分支, 并因 progName 取自 *argv 而打印 "(null)".
 ARGV0_OUT  := $(BUILD)/cfrac_argv0
 ARGV0_OBJS := $(addprefix $(BUILD)/argv0_, $(notdir $(SRCS:.c=.o))) \
               $(BUILD)/argv0_zero_argv_main.o
@@ -62,14 +57,18 @@ $(ARGV0_OUT): $(ARGV0_OBJS)
 check-argv0: $(ARGV0_OUT)
 	@out=$$($(QEMU) $(ARGV0_OUT) 2>&1); rc=$$?; \
 	if [ $$rc -ne 0 ]; then \
-		echo "[FAIL] cfrac 无参数: 退出码 $$rc"; echo "$$out"; exit 1; \
+		echo "$$rc"; \
+		echo "$$out"; \
+		exit 1; \
 	fi; \
 	case "$$out" in \
 	*"17545186520507317056371138836327483792736 = "*) ;; \
-	*) echo "[FAIL] cfrac 无参数: 输出不是内置合数的分解式"; \
-	   echo "$$out"; exit 1 ;; \
+	*) \
+		echo ""; \
+		echo "$$out"; \
+		exit 1 ;; \
 	esac; \
-	echo "   [PASS] cfrac 无参数 (分解内置合数)"
+	echo ""
 
 clean:
 	rm -rf $(BUILD)

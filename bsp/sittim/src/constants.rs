@@ -46,6 +46,38 @@ pub const LEVEL_PAGE: u8 = 2; // 4 KiB 普通页
 pub const SV39_VPN_LEN: u8 = 9;
 
 // ---------------------------------------------------------------
+//  陷态原因
+// ---------------------------------------------------------------
+
+/// U 模式的 ecall: 可信应用发起系统调用.
+pub const SCAUSE_ECALL_FROM_UMODE: u64 = 0x8;
+/// 取指访问故障: 取指的物理地址未被任何 PMP 条目覆盖.
+pub const SCAUSE_INSTR_ACCESS: u64 = 0x1;
+/// 读访问故障.
+pub const SCAUSE_LOAD_ACCESS: u64 = 0x5;
+/// 写访问故障.
+pub const SCAUSE_STORE_ACCESS: u64 = 0x7;
+/// 取指页错误.
+pub const SCAUSE_INSTR_PAGE_FAULT: u64 = 0xc;
+/// 读页错误.
+pub const SCAUSE_LOAD_PAGE_FAULT: u64 = 0xd;
+/// 写页错误.
+pub const SCAUSE_STORE_PAGE_FAULT: u64 = 0xf;
+
+/// 该陷态原因是否由 PMP 条目未覆盖访问的物理地址引起.
+///
+/// 取指与读与写三类访问故障都属此列, 由 S 模式统一转发 M 模式按需装入该地址所属的区域,
+/// 装入后重试原访问. 页错误的取值为 [`SCAUSE_INSTR_PAGE_FAULT`] 与
+/// [`SCAUSE_LOAD_PAGE_FAULT`] 与 [`SCAUSE_STORE_PAGE_FAULT`], 由页表项的权限位判定给出,
+/// 与 PMP 条目无关, 不在此列.
+pub const fn is_unmatched_access_fault(scause: u64) -> bool {
+	matches!(
+		scause,
+		SCAUSE_INSTR_ACCESS | SCAUSE_LOAD_ACCESS | SCAUSE_STORE_ACCESS
+	)
+}
+
+// ---------------------------------------------------------------
 //  飞地扩展 ID 与函数号
 // ---------------------------------------------------------------
 
@@ -53,7 +85,12 @@ pub const ENCLAVE_EXT_ID: u64 = 0x2022_1222;
 
 pub const ENCLAVE_CALL_SUSPEND: u64 = 404;
 pub const ENCLAVE_CALL_SHUTDOWN: u64 = 403;
+/// 申请内存: a1 = 分区数, a2 = 类别 (见 ENCLAVE_MEM_ATTR_*);
+/// 返回 (已分配分区数, 物理起始地址).
 pub const ENCLAVE_CALL_MEM_ALLOC: u64 = 500;
+/// 设置一段内存的类别: a0 = 分区起始物理地址, a1 = 分区数, a2 = 新类别;
+/// 返回 0 表示成功, 其余取值为 SBI 错误码.
+pub const ENCLAVE_CALL_SET_MEM_CLASS: u64 = 510;
 pub const ENCLAVE_CALL_GET_ID: u64 = 407;
 pub const ENCLAVE_CALL_GET_HARTID: u64 = 408;
 pub const ENCLAVE_CALL_GET_AVAILABLE_MEM: u64 = 409;
@@ -69,6 +106,12 @@ pub const ENCLAVE_CALL_MODULE_RESULT: u64 = 508;
 /// 登记模块映像接收缓冲区: a0 = 缓冲区的起始虚拟地址, a1 = 缓冲区的字节数;
 /// 返回 0 表示登记成功, 非 0 为 SBI 错误码.
 pub const ENCLAVE_CALL_MODULE_IMG_RECV_BUF: u64 = 509;
+
+/// 2 MiB 分区的类别: 该分区只承载数据访问.
+/// 数值与 M 模式 enclave_types.h 的 enum mem_meta_attr 一一对应, 修改需两侧同步.
+pub const ENCLAVE_MEM_ATTR_DATA: u64 = 0;
+/// 2 MiB 分区的类别: 该分区会被本飞地作为指令取指.
+pub const ENCLAVE_MEM_ATTR_INSTR: u64 = 1;
 
 /// SUSPEND 让出原因: 自愿让出 (引导期交接 / 等待宿主服务), 必须交还宿主.
 pub const ENCLAVE_SUSPEND_VOLUNTARY: u64 = 0;
@@ -205,6 +248,46 @@ mod tests {
 	fn test_page_constants_consistent() {
 		assert_eq!(PAGE_SIZE, 1 << PAGE_SHIFT);
 		assert_eq!(CHUNK_2M_SIZE, 1 << CHUNK_2M_SHIFT);
+	}
+
+	/// 取指访问故障也属转发范围。
+	///
+	/// 修复前只转发读与写两类访问故障, 取指访问故障落到用户态不可恢复异常路径:
+	/// 飞地的指令类分区被淘汰后再次取指, 该次取指按段错误终止该进程
+	#[test]
+	fn test_instr_access_fault_is_forwarded() {
+		assert!(is_unmatched_access_fault(SCAUSE_INSTR_ACCESS));
+		assert!(is_unmatched_access_fault(SCAUSE_LOAD_ACCESS));
+		assert!(is_unmatched_access_fault(SCAUSE_STORE_ACCESS));
+	}
+
+	/// 三类页错误由页表权限位判定给出，与 PMP 条目无关。
+	#[test]
+	fn test_page_faults_are_not_forwarded() {
+		assert!(!is_unmatched_access_fault(SCAUSE_INSTR_PAGE_FAULT));
+		assert!(!is_unmatched_access_fault(SCAUSE_LOAD_PAGE_FAULT));
+		assert!(!is_unmatched_access_fault(SCAUSE_STORE_PAGE_FAULT));
+	}
+
+	/// 地址错位、非法指令、断点
+	#[test]
+	fn test_neighbouring_causes_are_not_forwarded() {
+		for cause in [
+			0x0u64,
+			0x2,
+			0x3,
+			0x4,
+			0x6,
+			SCAUSE_ECALL_FROM_UMODE,
+			0x9,
+			0xb,
+			0xe,
+		] {
+			assert!(
+				!is_unmatched_access_fault(cause),
+				"cause 0x{cause:x} must not be forwarded"
+			);
+		}
 	}
 
 	/// 单次内存申请的块数不随所需跨度增长。

@@ -6,7 +6,6 @@ use crate::concurrent::{
 };
 use crate::consts::*;
 use crate::decode::decode_fields;
-use crate::diag::fetch_fault;
 use crate::fpu::{handle_fp_load_concurrent, handle_fp_store_concurrent};
 use crate::handlers::{
 	handle_compressed, lr_clear_all, pmp_ok, try_handle_virtio, ClintCtx, DevCtx, PmpCtx,
@@ -977,8 +976,6 @@ fn fetch_instr_word(
 		match fetch_instr_safe(state, mem, fetch_pa, pc_before, hart_id) {
 			Some(w) => return Some(w),
 			None => {
-				// 页内取指失败: 翻译结果落在 RAM 窗口之外.
-				fetch_fault(state, pmp, pc_before, fetch_pa, "noram");
 				return None;
 			}
 		}
@@ -987,7 +984,6 @@ fn fetch_instr_word(
 	let fetch_pa2 = translate_fetch_pc_concurrent(state, ctx, pc_before.wrapping_add(2))?;
 	// PMP check on the second page as well.
 	if !pmp_ok(state, fetch_pa2, 4, false, true, pmp) {
-		fetch_fault(state, pmp, pc_before, fetch_pa2, "pmp-cross");
 		deliver_trap(
 			state,
 			mcause_val(exc_code::INSTR_ACCESS_FAULT, false),
@@ -1300,7 +1296,6 @@ fn step_fetch_instr(
 
 	// -- PMP execute check --
 	if !pmp_ok(state, fetch_pa, 4, false, true, pmp) {
-		fetch_fault(state, pmp, pc_before, fetch_pa, "pmp");
 		deliver_trap(
 			state,
 			mcause_val(exc_code::INSTR_ACCESS_FAULT, false),

@@ -8,7 +8,6 @@ use core::cell::UnsafeCell;
 use core::ops::{ Deref, DerefMut };
 use core::sync::atomic::{ AtomicI32, Ordering };
 
-/// 自旋锁守卫 — unlock 在 drop 时自动完成。
 pub struct SpinGuard<'a, T> {
 	lock: &'a SpinLock<T>,
 }
@@ -34,7 +33,7 @@ impl<T> Drop for SpinGuard<'_, T> {
 	}
 }
 
-/// 自旋锁。`lock()` 返回守卫，离开作用域自动释放。
+/// 自旋锁。离开作用域自动释放。
 pub struct SpinLock<T> {
 	lock: AtomicI32,
 	data: UnsafeCell<T>,
@@ -53,11 +52,9 @@ impl<T> SpinLock<T> {
 		}
 	}
 
-	/// 获取锁。自旋直到成功。
 	pub fn lock(&self) -> SpinGuard<'_, T> {
 		// TAS: while amoswap.w != 0 { spin }
 		while self.lock.swap(1, Ordering::Acquire) != 0 {
-			// 自旋提示: 对应 ref-emod 的 spin_lock_check 与 spin_trylock 重试循环
 			core::hint::spin_loop();
 		}
 		SpinGuard { lock: self }
@@ -84,7 +81,6 @@ mod tests {
 
 	use super::SpinLock;
 
-	/// 取得守卫后数据可读可写, 守卫离开作用域后锁被释放且数据保留。
 	#[test]
 	fn test_lock_guard_accesses_data_and_drop_releases() {
 		let lock = SpinLock::new(0u32);
@@ -96,11 +92,10 @@ mod tests {
 			*guard = 7;
 		}
 		assert!(!lock.is_locked());
-		let guard = lock.try_lock().expect("锁已释放");
+		let guard = lock.try_lock().expect("lock has been released");
 		assert_eq!(*guard, 7);
 	}
 
-	/// 本线程持有守卫期间 try_lock 返回 None 而不进入自旋, 释放后可再次取得。
 	#[test]
 	fn test_try_lock_fails_while_lock_is_held() {
 		let lock = SpinLock::new(0u32);
@@ -110,7 +105,6 @@ mod tests {
 		assert!(lock.try_lock().is_some());
 	}
 
-	/// 另一线程持有锁期间 is_locked 为真且 try_lock 返回 None, 该线程释放后可取得。
 	#[test]
 	fn test_try_lock_observes_another_thread_holding_the_lock() {
 		let lock = Arc::new(SpinLock::new(0u32));
@@ -120,17 +114,17 @@ mod tests {
 		let holder = thread::spawn(move || {
 			let mut guard = holder_lock.lock();
 			*guard = 11;
-			held_tx.send(()).expect("通知已持有锁");
-			release_rx.recv().expect("等待释放锁");
+			held_tx.send(()).expect("lock has been hold");
+			release_rx.recv().expect("wait for releasing lock");
 		});
 
-		held_rx.recv().expect("等待另一线程持有锁");
+		held_rx.recv().expect("");
 		assert!(lock.is_locked());
 		assert!(lock.try_lock().is_none());
-		release_tx.send(()).expect("通知释放锁");
-		holder.join().expect("持有线程结束");
+		release_tx.send(()).expect("notifying for releasing the lock");
+		holder.join().expect("end of the lock's lifetime");
 		assert!(!lock.is_locked());
-		let guard = lock.try_lock().expect("锁已释放");
+		let guard = lock.try_lock().expect("lock has been released");
 		assert_eq!(*guard, 11);
 	}
 }

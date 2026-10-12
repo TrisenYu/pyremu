@@ -14,27 +14,31 @@ Usage::
     result = mask64(v1 + v2)   # 等价于 (v1 + v2) & 0xFFFF_FFFF_FFFF_FFFF
     lo = mask32(value)         # 等价于 value & 0xFFFF_FFFF
 """
-
-MASK08: int = 0xFF
-MASK16: int = (MASK08 << 8) | MASK08
+MASK04: int = 0xF
+MASK08: int = (MASK04 << 4) | MASK04
+MASK12: int = (MASK08 << 4) | MASK04
+MASK16: int = (MASK12 << 4) | MASK04
 MASK32: int = (MASK16 << 16) | MASK16
 MASK64: int = (MASK32 << 32) | MASK32
 
 
 def mask64(val: int) -> int:
-    """将 *val* 截断为 64-bit 无符号整数 ``[0, 2^64)``."""
     return val & MASK64
 
 def mask32(val: int) -> int:
-    """将 *val* 截断为 32-bit 无符号整数 ``[0, 2^32)``."""
     return val & MASK32
 
 def mask16(val: int) -> int:
-    """将 *val* 截断为 16-bit 无符号整数 ``[0, 2^16)``."""
     return val & MASK16
+
+def mask12(val: int) -> int:
+    return val & MASK12
 
 def mask08(val: int) -> int:
     return val & MASK08
+
+def mask04(val: int) -> int:
+    return val & MASK04
 
 # ---------------------------------------------------------------
 #  Sign-extend helpers (moved from disassem.py to break circular import)

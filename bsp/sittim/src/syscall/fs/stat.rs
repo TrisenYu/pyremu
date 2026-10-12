@@ -13,13 +13,14 @@ use super::consts::{
 use super::mount;
 use super::super::fdtable::{FDS, FdTarget, fd_target};
 use super::super::types::Timespec;
-use super::super::{EBADF, EFAULT, EINVAL, ENOENT, ENOSYS};
+use super::super::{EBADF, EFAULT, EINVAL, ENOENT};
 use super::{fd_node, read_path, vfs_errno};
 
 // ---------------------------------------------------------------
-//  musl riscv64 `struct stat` 布局 (128 字节, repr(C))
+//  musl riscv64 的 `struct stat` 布局
 // ---------------------------------------------------------------
 
+/// 载荷侧的 ABI; 字节数与各字段偏移由下方的编译期断言给出。
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Stat {
@@ -40,6 +41,13 @@ struct Stat {
 	st_ctim: Timespec,
 	__unused: [u32; 2],
 }
+
+const _: () = assert!(core::mem::size_of::<Stat>() == 128);
+const _: () = assert!(core::mem::offset_of!(Stat, st_size) == 48);
+const _: () = assert!(core::mem::offset_of!(Stat, st_blocks) == 64);
+const _: () = assert!(core::mem::offset_of!(Stat, st_atim) == 72);
+const _: () = assert!(core::mem::offset_of!(Stat, st_mtim) == 88);
+const _: () = assert!(core::mem::offset_of!(Stat, st_ctim) == 104);
 
 impl Stat {
 	/// 构建一个字段全零的 stat, 仅按需回填非零字段。
@@ -99,12 +107,24 @@ pub fn fstat_handler(fd: u64, stat_ptr: u64) -> u64 {
 		return EFAULT;
 	}
 	let mut st = Stat::zero();
-	let tables = FDS.lock();
-	match fd_target(&tables, fd) {
-		Some(FdTarget::Console) => fill_stat_console(&mut st),
-		Some(FdTarget::Vfs(fs, node)) => {
-			let Some(ops) = mount::ops_of(fs) else {
-				return ENOSYS;
+	let target = {
+		let tables = FDS.lock();
+		match fd_target(&tables, fd) {
+			Some(target) => target,
+			None => {
+				return EBADF;
+			}
+		}
+	};
+	match target {
+		FdTarget::Console => fill_stat_console(&mut st),
+		FdTarget::Vfs(fs, node) => {
+			// 操作表在描述符表的锁之外取得与调用: 取入文件系统模块的路径会经 ecall 让出到宿主。
+			let ops = match mount::ops_of(fs) {
+				Ok(ops) => ops,
+				Err(e) => {
+					return e;
+				}
 			};
 			let mut vstat = VfsStat::zero();
 			if !(unsafe { (ops.stat)(node, &mut vstat) }) {
@@ -112,10 +132,7 @@ pub fn fstat_handler(fd: u64, stat_ptr: u64) -> u64 {
 			}
 			fill_stat_from_vfs(&vstat, &mut st);
 		}
-		Some(FdTarget::Socket(_)) => fill_stat_socket(&mut st),
-		None => {
-			return EBADF;
-		}
+		FdTarget::Socket(_) => fill_stat_socket(&mut st),
 	}
 	unsafe {
 		ptr::write_volatile(stat_ptr, st);
@@ -128,7 +145,7 @@ pub fn fstat_handler(fd: u64, stat_ptr: u64) -> u64 {
 /// *flags* 只接受 [`STAT_FLAG_BITS`] 覆盖的位, 出现其余位返回 EINVAL。*flags* 含
 /// [`AT_EMPTY_PATH`] 而路径取空时, 目标取 *dirfd* 自身绑定的节点; *dirfd* 无效或绑定的
 /// 不是文件系统节点时返回 EBADF。路径经 [mount] 分派给它所属的文件系统; 该文件系统尚未
-/// 交付时返回 ENOSYS。
+/// 交付时返回取入失败给出的错误码, 见 [mount::resolve]。
 pub fn fstatat_handler(dirfd: u64, pathname: u64, stat_ptr: u64, flags: u64) -> u64 {
 	if flags & !STAT_FLAG_BITS != 0 {
 		return EINVAL;
@@ -153,14 +170,20 @@ pub fn fstatat_handler(dirfd: u64, pathname: u64, stat_ptr: u64, flags: u64) -> 
 			};
 			found
 		};
-		let Some(ops) = mount::ops_of(fs) else {
-			return ENOSYS;
+		let ops = match mount::ops_of(fs) {
+			Ok(ops) => ops,
+			Err(e) => {
+				return e;
+			}
 		};
 		(ops, node)
 	} else {
 		let path = &path_buf[..plen];
-		let Some((_, ops, sub)) = mount::resolve(path) else {
-			return ENOSYS;
+		let (_, ops, sub) = match mount::resolve(path) {
+			Ok(found) => found,
+			Err(e) => {
+				return e;
+			}
 		};
 		let mut node: i16 = NIL;
 		let status = unsafe { (ops.resolve)(sub.as_ptr(), sub.len() as u64, &mut node) };

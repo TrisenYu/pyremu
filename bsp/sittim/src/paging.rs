@@ -1,5 +1,4 @@
-//! Sv39 页表管理。逻辑紧跟 ref-emod/emod_manager/memory/page_table.c，
-//! 但用卫语句替代原 C 的深层嵌套。
+//! Sv39 页表管理。逻辑紧跟 ref-emod/emod_manager/memory/page_table.c
 //!
 //! 关键约定：
 //! - MMU 开启后（satp != 0），中间页表指针通过 LINEAR_MAP_OFFSET 换算。
@@ -397,19 +396,39 @@ pub fn get_pa(va: u64) -> Option<u64> {
 //  初始化
 // ---------------------------------------------------------------
 
-/// 为 MMU 启用的瞬间建立双重映射 (PA=VA + PA+OFFSET->PA)。
+/// 为 MMU 启用的瞬间建立双重映射 (PA=VA + PA+OFFSET->PA)，覆盖本次授予的
+/// `partition_num` 个 2 MiB 分区。
 ///
-/// `csrw satp` 后 PC 仍在低物理地址，必须有一条 PA->PA 的映射
-/// 让 CPU 能继续取指，直到代码通过高 VA 访问 trampoline。
+/// `csrw satp` 后 PC 仍在低物理地址，必须有一条 PA->PA 的映射让 CPU 能继续取指，
+/// 直到代码通过高 VA 访问 trampoline。运行时的可写数据段与 S 模式页池也以物理
+/// 地址访问 (PIE 重定位后的全局变量与页表根都在这里)，故恒等映射须覆盖授予的
+/// 全部分区。首个分区承载代码与只读数据，另给执行权限；其余分区只承载可写数据
+/// 与页池，不给执行权限。
 ///
 /// 同时建立 LINEAR_MAP_OFFSET 映射，供 `pte_ptr()` 在 MMU 使能后
-/// 通过 PA+OFFSET 访问页表结构体 (根表 + 中间表均在池 PA 范围内).
-pub fn identity_map_trampoline(pa: u64) -> Result<(), MapError> {
+/// 通过 PA+OFFSET 访问页表结构体 (根表 + 中间表均在授予的分区内).
+pub fn identity_map_trampoline(pa: u64, partition_num: u64) -> Result<(), MapError> {
 	let base = align_down(pa, CHUNK_2M_SIZE);
-	// 代码执行: identity VA=PA
-	map_page(base, base, PTE_R | PTE_W | PTE_X, LEVEL_MEGA)?;
-	// 页表访问: VA = PA + LINEAR_MAP_OFFSET (pte_ptr 使用)
-	map_page(base.wrapping_add(LINEAR_MAP_OFFSET), base, PTE_R | PTE_W, LEVEL_MEGA)
+
+	for i in 0..partition_num {
+		let part_pa = base + i * CHUNK_2M_SIZE;
+		// 代码执行: identity VA=PA
+		let identity_flags = if i == 0 {
+			PTE_R | PTE_W | PTE_X
+		} else {
+			PTE_R | PTE_W
+		};
+		map_page(part_pa, part_pa, identity_flags, LEVEL_MEGA)?;
+		// 页表访问: VA = PA + LINEAR_MAP_OFFSET (pte_ptr 使用)
+		map_page(
+			part_pa.wrapping_add(LINEAR_MAP_OFFSET),
+			part_pa,
+			PTE_R | PTE_W,
+			LEVEL_MEGA,
+		)?;
+	}
+
+	Ok(())
 }
 
 /// 构建 satp 值（Sv39 模式，ASID=0）。
@@ -579,8 +598,8 @@ const USER_ROOT_ENTRIES: usize = 256;
 
 /// 复制用户页时使用的临时映射 VA。
 ///
-/// 目标页的物理地址不保证落在 S 模式的线性窗口内 (U 模式页池之外的物理区由
-/// M 模式按 2 MiB 分区交付, 地址任意), 故源页与目标页都要先临时映射进当前
+/// 目标页的物理地址不保证落在 S 模式的线性窗口内: U 模式的物理内存由 M 模式按
+/// 2 MiB 分区交付, 分区可落在任意物理地址, 故源页与目标页都要先临时映射进当前
 /// 地址空间才能读写。四个 VA 取在用户空间上界附近, 远离载荷的段/堆/栈/mmap 区;
 /// 按层级分成两组, 因为同一 VA 先以 2 MiB 叶子映射、再以 4 KiB 叶子映射时,
 /// 后者会因前者的超级页覆盖而无法安装。
@@ -631,31 +650,82 @@ unsafe fn copy_chunk_pa(src_pa: u64, dst_pa: u64) -> bool {
 	true
 }
 
-/// 交付一个 4 KiB 目标页: 先取 U 模式页池, 池中不足时向 M 模式申请一个
-/// 2 MiB 分区并逐页切分 (与 mmap 取块的方式一致)。失败返回 `!0u64`。
-fn fork_alloc_page() -> u64 {
-	let pa = mem::alloc_umode_page(1);
-	if pa != !0u64 {
-		return pa;
+/// 复制期间交付目标页的分区块, 下标即类别 (见 `ENCLAVE_MEM_ATTR_*`), 一个分区只承载
+/// 一个类别。
+///
+/// 指令类的目标页在写入期间必须可写, 故其块一律按数据类取得: 该块既是本类别正在
+/// 切分的块, 又是等待改判为指令类的块, 后者至多一个。`FORK_CHUNK_LEFT` 为 0 表示
+/// 本类别没有可继续切分的块 (尚无块, 或整块已一次性交付), 后续的页请求另取新块。
+static mut FORK_CHUNK_PA: [u64; 2] = [0; 2];
+static mut FORK_CHUNK_LEFT: [u64; 2] = [0; 2];
+
+/// 把等待改判的块改为指令类, 返回是否成功; 无等待的块时返回 true。
+///
+/// 失败时该块仍为数据类, 其内的页不可取指, 调用方据此判定本次复制失败。
+/// 改判一经完成, 该块只登记读与执行权限, 故本类别正在切分的块一并作废: 块内剩余的
+/// 页不再交付, 后续请求另取新块。
+fn fork_seal_chunk() -> bool {
+	let pa = unsafe { FORK_CHUNK_PA[ENCLAVE_MEM_ATTR_INSTR as usize] };
+	if pa == 0 {
+		return true;
 	}
 	unsafe {
-		if FORK_CHUNK_LEFT == 0 {
-			let chunk = mem::alloc_mmap_chunk_pa();
-			if chunk == !0u64 {
-				return !0u64;
-			}
-			FORK_CHUNK_PA = chunk;
-			FORK_CHUNK_LEFT = CHUNK_2M_PAGES;
-		}
-		let pa = FORK_CHUNK_PA + (CHUNK_2M_PAGES - FORK_CHUNK_LEFT) * PAGE_SIZE;
-		FORK_CHUNK_LEFT -= 1;
-		pa
+		FORK_CHUNK_PA[ENCLAVE_MEM_ATTR_INSTR as usize] = 0;
+		FORK_CHUNK_LEFT[ENCLAVE_MEM_ATTR_INSTR as usize] = 0;
 	}
+	mem::set_partition_attr(pa, CHUNK_2M_SIZE, ENCLAVE_MEM_ATTR_INSTR)
 }
 
-/// 复制期间用于交付 4 KiB 目标页的分区块游标, 由 fork_alloc_page 维护。
-static mut FORK_CHUNK_PA: u64 = 0;
-static mut FORK_CHUNK_LEFT: u64 = 0;
+/// 为 `attr` 类别取一个新的分区块, 返回其物理基址; 失败返回 `!0u64`。
+///
+/// 指令类的块按数据类取得, 由 [`fork_seal_chunk`] 在写入完成后改判; 取块前先改判
+/// 先前等待的块, 其剩余空间随即不再交付。
+fn fork_take_chunk(attr: u64) -> u64 {
+	if attr == ENCLAVE_MEM_ATTR_INSTR && !fork_seal_chunk() {
+		return !0u64;
+	}
+	let chunk = mem::alloc_adjacent_pages(CHUNK_2M_PAGES, ENCLAVE_MEM_ATTR_DATA);
+	if chunk == !0u64 {
+		return !0u64;
+	}
+	unsafe {
+		FORK_CHUNK_PA[attr as usize] = chunk;
+		FORK_CHUNK_LEFT[attr as usize] = CHUNK_2M_PAGES;
+	}
+	chunk
+}
+
+/// 交付一个 4 KiB 目标页, 类别为 `attr`, 自该类别正在切分的块中取; 失败返回 `!0u64`。
+fn fork_alloc_page(attr: u64) -> u64 {
+	if unsafe { FORK_CHUNK_LEFT[attr as usize] } == 0 {
+		if fork_take_chunk(attr) == !0u64 {
+			return !0u64;
+		}
+	}
+	let left = unsafe { FORK_CHUNK_LEFT[attr as usize] };
+	let pa = unsafe { FORK_CHUNK_PA[attr as usize] } + (CHUNK_2M_PAGES - left) * PAGE_SIZE;
+	unsafe { FORK_CHUNK_LEFT[attr as usize] = left - 1 };
+	pa
+}
+
+/// 为一个 2 MiB 目标分区取物理基址, 类别为 `attr`; 失败返回 `!0u64`。
+///
+/// 指令类的目标分区同样按数据类取得, 由调用方在整块写入完成后调用
+/// [`fork_seal_chunk`] 改判。整块交付, 不改动本类别正在切分的块。
+fn fork_alloc_chunk(attr: u64) -> u64 {
+	if attr == ENCLAVE_MEM_ATTR_DATA {
+		return mem::alloc_adjacent_pages(CHUNK_2M_PAGES, ENCLAVE_MEM_ATTR_DATA);
+	}
+	if !fork_seal_chunk() {
+		return !0u64;
+	}
+	let chunk = mem::alloc_adjacent_pages(CHUNK_2M_PAGES, ENCLAVE_MEM_ATTR_DATA);
+	if chunk == !0u64 {
+		return !0u64;
+	}
+	unsafe { FORK_CHUNK_PA[ENCLAVE_MEM_ATTR_INSTR as usize] = chunk };
+	chunk
+}
 
 /// 某一层级第 i 个槽位对应的 VA 基址。
 #[inline]
@@ -698,17 +768,24 @@ unsafe fn copy_table_level(src: *const Pte, dst: *mut Pte, level: u8, va_base: u
 				// 2 MiB 映射), 出现即说明复制规则与实际布局不一致。
 				return false;
 			}
-			let dst_pa = if level == LEVEL_MEGA { mem::alloc_mmap_chunk_pa() } else { fork_alloc_page() };
+			// 目的页沿用源页的类别: 分区的类别由映射的可执行位决定, 复制后的页
+			// 承接同一段映射的权限位。
+			let attr = mem::attr_of_pte_flags(s.0);
+			let dst_pa = if level == LEVEL_MEGA {
+				fork_alloc_chunk(attr)
+			} else {
+				fork_alloc_page(attr)
+			};
 			if dst_pa == !0u64 {
 				return false;
 			}
 			let src_pa = s.ppn() << PAGE_SHIFT;
-			let copied = if level == LEVEL_MEGA {
-				unsafe { copy_chunk_pa(src_pa, dst_pa) }
-			} else {
-				unsafe { copy_page_pa(src_pa, dst_pa) }
-			};
-			if !copied {
+			if level == LEVEL_MEGA {
+				// 整块写入完毕后才改判为指令类: 改判之后该块只剩读与执行权限。
+				if !unsafe { copy_chunk_pa(src_pa, dst_pa) } || !fork_seal_chunk() {
+					return false;
+				}
+			} else if !unsafe { copy_page_pa(src_pa, dst_pa) } {
 				return false;
 			}
 			let mut d = s;
@@ -758,43 +835,55 @@ pub fn fork_address_space() -> u64 {
 	}
 	let parent = root_table();
 	let child = unsafe { pte_ptr(child_pa) };
-
 	unsafe {
 		core::ptr::write_bytes(child as *mut u8, 0, PAGE_SIZE as usize);
+	}
+	unsafe {
 		for i in USER_ROOT_ENTRIES..512usize {
 			*child.add(i) = *parent.add(i);
 		}
-		for i in 0..USER_ROOT_ENTRIES {
-			let s = *parent.add(i);
-			if (s.0 & PTE_V) == 0 {
-				continue;
-			}
-			if s.is_leaf() {
-				// 用户空间不产生根层叶子; 运行时自身的映射照抄共用。
-				if (s.0 & PTE_U) != 0 {
-					return !0u64;
-				}
-				*child.add(i) = s;
-				continue;
-			}
-			let t = mem::try_alloc_smode_page(1);
-			if t == !0u64 {
+	}
+	for i in 0..USER_ROOT_ENTRIES {
+		let s = unsafe { *parent.add(i) };
+		if (s.0 & PTE_V) == 0 {
+			continue;
+		}
+		if s.is_leaf() {
+			// 用户空间不产生根层叶子; 运行时自身的映射照抄共用。
+			if (s.0 & PTE_U) != 0 {
 				return !0u64;
 			}
+			unsafe {
+				*child.add(i) = s;
+			}
+			continue;
+		}
+		let t = mem::try_alloc_smode_page(1);
+		if t == !0u64 {
+			return !0u64;
+		}
+		unsafe {
 			core::ptr::write_bytes(pte_ptr(t) as *mut u8, 0, PAGE_SIZE as usize);
-			let mut d = s;
-			d.set_ppn(t >> PAGE_SHIFT);
+		}
+		let mut d = s;
+		d.set_ppn(t >> PAGE_SHIFT);
+		unsafe {
 			*child.add(i) = d;
-			let ok = copy_table_level(
+		}
+		let ok = unsafe {
+			copy_table_level(
 				pte_ptr(s.ppn() << PAGE_SHIFT) as *const Pte,
 				pte_ptr(t),
 				LEVEL_MEGA,
 				slot_va(i, LEVEL_GIGA)
-			);
-			if !ok {
-				return !0u64;
-			}
+			)
+		};
+		if !ok {
+			return !0u64;
 		}
+	}
+	if !fork_seal_chunk() {
+		return !0u64;
 	}
 	child_pa
 }
@@ -806,17 +895,6 @@ pub fn fork_address_space() -> u64 {
 #[cfg(test)]
 mod tests {
 	use crate::paging::*;
-	use std::sync::{ Mutex, MutexGuard };
-
-	/// 登记页表根是一项全局状态, 而测试默认并行执行, 故凡调用 `set_root` 的用例先
-	/// 取得该锁, 使各自的根表不被其它用例改写。
-	static SERIAL: Mutex<()> = Mutex::new(());
-
-	/// 前一个用例 panic 后 `Mutex::lock` 返回 `Err`, 此处经 `into_inner` 取回其中的
-	/// 守卫继续, 使后续用例照常执行而不连带失败。
-	fn serial() -> MutexGuard<'static, ()> {
-		SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-	}
 
 	/// 用例内构造的页表页: 页表项给出的物理地址即本数组的地址。
 	#[repr(align(4096))]
@@ -872,8 +950,6 @@ mod tests {
 	/// 故缺陷只表现为后两块始终未映射, 在首次写入时触发存储页错误。
 	#[test]
 	fn test_mega_page_in_range_installs_each_leaf() {
-		let _guard = serial();
-
 		let mut root = Table([Pte(0); 512]);
 		let leaf = Table([Pte(0); 512]);
 
@@ -911,8 +987,6 @@ mod tests {
 	/// 得到副本而非与父进程共用同一批物理页。
 	#[test]
 	fn test_set_leaf_flags_preserves_rsw_and_ppn() {
-		let _guard = serial();
-
 		let va = 0x1000_0000_u64;
 		let pa = 0x8000_0000_u64;
 
@@ -926,28 +1000,18 @@ mod tests {
 		assert!(set_leaf_flags(va, PTE_U | PTE_R));
 
 		let pte = unsafe { leaf_pte(&mid, va) };
-		assert_eq!(pte.ppn() << PAGE_SHIFT, pa, "物理地址被改写");
-		assert!((pte.0 & PTE_RSW_SHARED) != 0, "共享属性丢失");
-		assert!((pte.0 & PTE_W) == 0, "写权限未被收回");
-		assert!((pte.0 & PTE_R) != 0, "读权限丢失");
+		assert_eq!(pte.ppn() << PAGE_SHIFT, pa, "");
+		assert!((pte.0 & PTE_RSW_SHARED) != 0, "");
+		assert!((pte.0 & PTE_W) == 0, "");
+		assert!((pte.0 & PTE_R) != 0, "");
 		// mremap 搬移共享映射时经该函数取源映射的标志位, 该处同样要给出 RSW。
-		assert!(
-			(leaf_pte_flags(va).expect("叶子项应存在") & PTE_RSW_SHARED) != 0,
-			"共享属性未随标志位给出"
-		);
+		assert!((leaf_pte_flags(va).expect("") & PTE_RSW_SHARED) != 0, "");
 
 		set_root(0);
 	}
 
-	/// 拆分 2 MiB 超级页时, 512 条 4 KiB 叶子都必须保留 RSW 与权限位。
-	///
-	/// 修复前该函数只照抄叶子的低 8 位标志, 落在位 8 的 PTE_RSW_SHARED 被丢弃:
-	/// mprotect 只覆盖超级页的一部分时拆出 4 KiB 叶子, 拆出的页自此按私有页处理,
-	/// fork 不再与父进程共用物理页。
 	#[test]
 	fn test_split_mega_leaf_preserves_rsw() {
-		let _guard = serial();
-
 		// VA 取在 2 MiB 区间内的第 7 页, 使拆分不依赖 VA 恰好落在区间起点。
 		let va = 0x2000_7000_u64;
 		let pa = 0x8000_0000_u64;
@@ -962,22 +1026,38 @@ mod tests {
 		assert!(split_mega_leaf(va));
 
 		let slot = mid.0[super::get_vpn(va, 1)];
-		assert!((slot.0 & PTE_V) != 0, "超级页槽位被清空");
-		assert!(!slot.is_leaf(), "超级页槽位仍按叶子解释");
+		assert!((slot.0 & PTE_V) != 0, "");
+		assert!(!slot.is_leaf(), "");
 
 		let l3 = (slot.ppn() << PAGE_SHIFT) as *const Pte;
 		for i in 0..512_usize {
 			let pte = unsafe { *l3.add(i) };
-			assert!((pte.0 & PTE_V) != 0, "第 {i} 页没有映射项");
-			assert!((pte.0 & PTE_RSW_SHARED) != 0, "第 {i} 页的共享属性丢失");
+			assert!((pte.0 & PTE_V) != 0, "{i} does not set shared pte");
+			assert!((pte.0 & PTE_RSW_SHARED) != 0, "{i} lossed shared attributes");
 			assert_eq!(
 				pte.0 & (PTE_U | PTE_R | PTE_W),
 				flags & (PTE_U | PTE_R | PTE_W),
-				"第 {i} 页的权限位不对"
+				"{i} sets wrong rwx-bits"
 			);
-			assert_eq!(pte.ppn() << PAGE_SHIFT, pa + (i as u64) * PAGE_SIZE, "第 {i} 页的物理地址不对");
+			assert_eq!(pte.ppn() << PAGE_SHIFT, pa + (i as u64) * PAGE_SIZE, "{i} sets a wrong pa");
 		}
 
 		set_root(0);
+	}
+
+	#[test]
+	fn test_fork_seal_chunk_retires_the_instr_cursor() {
+		unsafe {
+			super::FORK_CHUNK_PA = [0x8000_0000, 0x4000_0000];
+			super::FORK_CHUNK_LEFT = [7, 512];
+		}
+		super::fork_seal_chunk();
+
+		unsafe {
+			assert_eq!(super::FORK_CHUNK_PA[ENCLAVE_MEM_ATTR_INSTR as usize], 0);
+			assert_eq!(super::FORK_CHUNK_LEFT[ENCLAVE_MEM_ATTR_INSTR as usize], 0);
+			assert_eq!(super::FORK_CHUNK_PA[ENCLAVE_MEM_ATTR_DATA as usize], 0x8000_0000);
+			assert_eq!(super::FORK_CHUNK_LEFT[ENCLAVE_MEM_ATTR_DATA as usize], 7);
+		}
 	}
 }

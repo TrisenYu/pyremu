@@ -234,7 +234,6 @@ class DispatchMixin(SharedMixinAttrs):
             if not raw and self._last_command is None:
                 continue
             elif not raw:
-                assert self._last_command is not None
                 raw = self._last_command
                 if (
                     raw.startswith("disasm ")

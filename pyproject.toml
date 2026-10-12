@@ -3,7 +3,7 @@ name = "pyremu"
 version = "1.0.0"
 description = "a riscv emulator"
 readme = "docs/README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "annotated-types==0.8.0",
     "coverage==7.16.0",

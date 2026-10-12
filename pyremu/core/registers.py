@@ -49,76 +49,76 @@ class FPR(BaseModel):
 #  GPR / FPR 预构建列表 & 工厂函数
 # ============================================================
 
-_rst_reg = partial(Reg, val=0)
+_gpr_builder = partial(Reg, val=0)
 _gpr = [
-    _rst_reg(name="x0", alias="zero"),
-    _rst_reg(name="x1", alias="ra"),
-    _rst_reg(name="x2", alias="sp"),
-    _rst_reg(name="x3", alias="gp"),
-    _rst_reg(name="x4", alias="tp"),
-    _rst_reg(name="x5", alias="t0"),
-    _rst_reg(name="x6", alias="t1"),
-    _rst_reg(name="x7", alias="t2"),
-    _rst_reg(name="x8", alias="s0"),
-    _rst_reg(name="x9", alias="s1"),
-    _rst_reg(name="x10", alias="a0"),
-    _rst_reg(name="x11", alias="a1"),
-    _rst_reg(name="x12", alias="a2"),
-    _rst_reg(name="x13", alias="a3"),
-    _rst_reg(name="x14", alias="a4"),
-    _rst_reg(name="x15", alias="a5"),
-    _rst_reg(name="x16", alias="a6"),
-    _rst_reg(name="x17", alias="a7"),
-    _rst_reg(name="x18", alias="s2"),
-    _rst_reg(name="x19", alias="s3"),
-    _rst_reg(name="x20", alias="s4"),
-    _rst_reg(name="x21", alias="s5"),
-    _rst_reg(name="x22", alias="s6"),
-    _rst_reg(name="x23", alias="s7"),
-    _rst_reg(name="x24", alias="s8"),
-    _rst_reg(name="x25", alias="s9"),
-    _rst_reg(name="x26", alias="s10"),
-    _rst_reg(name="x27", alias="s11"),
-    _rst_reg(name="x28", alias="t3"),
-    _rst_reg(name="x29", alias="t4"),
-    _rst_reg(name="x30", alias="t5"),
-    _rst_reg(name="x31", alias="t6"),
+    _gpr_builder(name="x0", alias="zero"),
+    _gpr_builder(name="x1", alias="ra"),
+    _gpr_builder(name="x2", alias="sp"),
+    _gpr_builder(name="x3", alias="gp"),
+    _gpr_builder(name="x4", alias="tp"),
+    _gpr_builder(name="x5", alias="t0"),
+    _gpr_builder(name="x6", alias="t1"),
+    _gpr_builder(name="x7", alias="t2"),
+    _gpr_builder(name="x8", alias="s0"),
+    _gpr_builder(name="x9", alias="s1"),
+    _gpr_builder(name="x10", alias="a0"),
+    _gpr_builder(name="x11", alias="a1"),
+    _gpr_builder(name="x12", alias="a2"),
+    _gpr_builder(name="x13", alias="a3"),
+    _gpr_builder(name="x14", alias="a4"),
+    _gpr_builder(name="x15", alias="a5"),
+    _gpr_builder(name="x16", alias="a6"),
+    _gpr_builder(name="x17", alias="a7"),
+    _gpr_builder(name="x18", alias="s2"),
+    _gpr_builder(name="x19", alias="s3"),
+    _gpr_builder(name="x20", alias="s4"),
+    _gpr_builder(name="x21", alias="s5"),
+    _gpr_builder(name="x22", alias="s6"),
+    _gpr_builder(name="x23", alias="s7"),
+    _gpr_builder(name="x24", alias="s8"),
+    _gpr_builder(name="x25", alias="s9"),
+    _gpr_builder(name="x26", alias="s10"),
+    _gpr_builder(name="x27", alias="s11"),
+    _gpr_builder(name="x28", alias="t3"),
+    _gpr_builder(name="x29", alias="t4"),
+    _gpr_builder(name="x30", alias="t5"),
+    _gpr_builder(name="x31", alias="t6"),
 ]
 
-_rst_fpr = partial(FPR, val=0.0)
+_fpr_builder = partial(FPR, val=0.0)
 _fpr = [
-    _rst_fpr(name="f0", alias="ft0"),
-    _rst_fpr(name="f1", alias="ft1"),
-    _rst_fpr(name="f2", alias="ft2"),
-    _rst_fpr(name="f3", alias="ft3"),
-    _rst_fpr(name="f4", alias="ft4"),
-    _rst_fpr(name="f5", alias="ft5"),
-    _rst_fpr(name="f6", alias="ft6"),
-    _rst_fpr(name="f7", alias="ft7"),
-    _rst_fpr(name="f8", alias="fs0"),
-    _rst_fpr(name="f9", alias="fs1"),
-    _rst_fpr(name="f10", alias="fa0"),
-    _rst_fpr(name="f11", alias="fa1"),
-    _rst_fpr(name="f12", alias="fa2"),
-    _rst_fpr(name="f13", alias="fa3"),
-    _rst_fpr(name="f14", alias="fa4"),
-    _rst_fpr(name="f15", alias="fa5"),
-    _rst_fpr(name="f16", alias="fa6"),
-    _rst_fpr(name="f17", alias="fa7"),
-    _rst_fpr(name="f18", alias="fs2"),
-    _rst_fpr(name="f19", alias="fs3"),
-    _rst_fpr(name="f20", alias="fs4"),
-    _rst_fpr(name="f21", alias="fs5"),
-    _rst_fpr(name="f22", alias="fs6"),
-    _rst_fpr(name="f23", alias="fs7"),
-    _rst_fpr(name="f24", alias="fs8"),
-    _rst_fpr(name="f25", alias="fs9"),
-    _rst_fpr(name="f26", alias="fs10"),
-    _rst_fpr(name="f27", alias="fs11"),
-    _rst_fpr(name="f28", alias="ft8"),
-    _rst_fpr(name="f29", alias="ft9"),
-    _rst_fpr(name="f30", alias="ft10"),
-    _rst_fpr(name="f31", alias="ft11"),
+    _fpr_builder(name="f0", alias="ft0"),
+    _fpr_builder(name="f1", alias="ft1"),
+    _fpr_builder(name="f2", alias="ft2"),
+    _fpr_builder(name="f3", alias="ft3"),
+    _fpr_builder(name="f4", alias="ft4"),
+    _fpr_builder(name="f5", alias="ft5"),
+    _fpr_builder(name="f6", alias="ft6"),
+    _fpr_builder(name="f7", alias="ft7"),
+    _fpr_builder(name="f8", alias="fs0"),
+    _fpr_builder(name="f9", alias="fs1"),
+    _fpr_builder(name="f10", alias="fa0"),
+    _fpr_builder(name="f11", alias="fa1"),
+    _fpr_builder(name="f12", alias="fa2"),
+    _fpr_builder(name="f13", alias="fa3"),
+    _fpr_builder(name="f14", alias="fa4"),
+    _fpr_builder(name="f15", alias="fa5"),
+    _fpr_builder(name="f16", alias="fa6"),
+    _fpr_builder(name="f17", alias="fa7"),
+    _fpr_builder(name="f18", alias="fs2"),
+    _fpr_builder(name="f19", alias="fs3"),
+    _fpr_builder(name="f20", alias="fs4"),
+    _fpr_builder(name="f21", alias="fs5"),
+    _fpr_builder(name="f22", alias="fs6"),
+    _fpr_builder(name="f23", alias="fs7"),
+    _fpr_builder(name="f24", alias="fs8"),
+    _fpr_builder(name="f25", alias="fs9"),
+    _fpr_builder(name="f26", alias="fs10"),
+    _fpr_builder(name="f27", alias="fs11"),
+    _fpr_builder(name="f28", alias="ft8"),
+    _fpr_builder(name="f29", alias="ft9"),
+    _fpr_builder(name="f30", alias="ft10"),
+    _fpr_builder(name="f31", alias="ft11"),
 ]
 
 
@@ -381,22 +381,18 @@ csr_bank: dict[int, CSR] = {
 # miselect / mireg / siselect / sireg / mtopei / stopei / mtopi / stopi
 # 必须在 AIA 禁用时统一不可达, 防止内核/固件误判 IMSIC 存在.
 AIA_CSR_ADDRS: tuple[int, ...] = (
-    0x150, 0x151,  # siselect, sireg
-    0x15C,         # stopei
-    0x350, 0x351,  # miselect, mireg
-    0x35C,         # mtopei
-    0xDB0,         # stopi
-    0xFB0,         # mtopi
+    0x150,
+    0x151,  # siselect, sireg
+    0x15C,  # stopei
+    0x350,
+    0x351,  # miselect, mireg
+    0x35C,  # mtopei
+    0xDB0,  # stopi
+    0xFB0,  # mtopi
 )
 
 
 def sync_aia_csr_gate(enabled: bool) -> None:
-    """按 AIA 开关设置上述 8 个 AIA CSR 的可达性.
-
-    门控作用于 csr_bank 这一模块级状态, 导入时按编译期开关执行一次. 测试
-    用 force_config 切换开关后再调用本函数, 使门控与新取值一致; 故本函数
-    两个方向都可用, 不只做关闭.
-    """
     for addr in AIA_CSR_ADDRS:
         csr_bank[addr].implemented = bool(enabled)
 
@@ -441,6 +437,7 @@ def gpr_idx_from_name(name: str) -> int | None:
 def register_fpr():
     """返回 32 个 FPR 的独立副本."""
     return deepcopy(_fpr)
+
 
 # 批量生成编号连续的 CSR
 for i in range(0, 4):

@@ -1,6 +1,7 @@
 //! 示例模块: 导出一个恒返回固定值的系统调用处理函数, 用于贯通取入、验签与调用通路。
 //!
-//! 映像的入口在偏移 0, 无 ELF 头, 无重定位项, 见 ../module.ld 与 ../Makefile。
+//! 映像无 ELF 头, 无重定位项; 偏移 0 处是映像描述块, 入口在映像内的偏移由该描述块给出,
+//! 见 ../module.ld 与 ../Makefile。
 //!
 //! 接口结构体与管理器回调集合按 `#[path]` 取自 sittim 的 src/ext_mod, 与运行时共用
 //! 同一份定义。
@@ -51,7 +52,7 @@ const HANDLER_RESULT: u64 = 0x5A5A_0000_0000_0001;
 /// 映像, 而映像在链接时不知道自己将被放在哪个基址。
 static mut SYSCALLS: SyscallTable = SyscallTable { handlers: [None; SYSCALL_TABLE_LEN] };
 
-/// 模块入口, 位于映像偏移 0。
+/// 模块入口。它在映像内的偏移由映像描述块给出。
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.init")]
 pub unsafe extern "C" fn module_init(_manager: *const Manager) -> GetterFn {
@@ -68,13 +69,14 @@ const _: InitFn = module_init;
 ///
 /// 本模块不导出操作表, 故 `ops` 取空指针。
 unsafe extern "C" fn get_interface(_manager: *const Manager) -> ModuleInterface {
+	let syscalls = &raw const SYSCALLS;
 	ModuleInterface {
 		desc: ModuleDesc {
 			module_id: MODULE_ID,
 			name: MODULE_NAME,
 			signature: 0,
 		},
-		syscalls: &raw const SYSCALLS,
+		syscalls,
 		ops: core::ptr::null(),
 	}
 }

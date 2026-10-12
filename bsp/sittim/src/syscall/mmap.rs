@@ -3,6 +3,8 @@
 
 use crate::constants::{
 	CHUNK_2M_SIZE,
+	ENCLAVE_MEM_ATTR_DATA,
+	ENCLAVE_MEM_ATTR_INSTR,
 	LEVEL_GIGA,
 	LEVEL_MEGA,
 	LEVEL_PAGE,
@@ -70,10 +72,17 @@ fn prot_to_pte(prot: u64) -> u64 {
 /// 时带该位的用户叶子共用同一物理页, 父子进程的写入互相可见; 取 MAP_PRIVATE 时
 /// 不带该位, 每个进程各自持有副本。两者都只支持匿名映射, 带文件描述符的调用返回
 /// ENOSYS。映射类型位取其余取值时返回 EINVAL。
+///
+/// 请求同时带 PROT_WRITE 与 PROT_EXEC 时返回 EINVAL: 一个 2 MiB 分区整体属于一个
+/// 类别, 类别即该分区登记的 PMP 权限, 可写与可执行不能落在同一分区上。
 pub fn mmap_handler(addr: u64, len: u64, prot: u64, flags: u64, _fd: u64, _off: u64) -> u64 {
 	// 仅支持匿名映射
 	if (flags & MAP_ANONYMOUS) == 0 {
 		return ENOSYS;
+	}
+
+	if (prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC) {
+		return EINVAL;
 	}
 
 	let map_type = flags & MAP_TYPE;
@@ -94,7 +103,7 @@ pub fn mmap_handler(addr: u64, len: u64, prot: u64, flags: u64, _fd: u64, _off: 
 	// MAP_FIXED: 调用方指定地址, 按 4 KiB 粒度就地映射。
 	if (flags & MAP_FIXED) != 0 {
 		let va = align_down(addr, PAGE_SIZE);
-		if !mem::map_umode_pages(va, pages, pte_flags) {
+		if !mem::map_umode_pages(va, pages, pte_flags) || !seal_instr_mapping(va, pages, pte_flags) {
 			return ENOMEM;
 		}
 		return va;
@@ -102,7 +111,7 @@ pub fn mmap_handler(addr: u64, len: u64, prot: u64, flags: u64, _fd: u64, _off: 
 
 	// 常规路径: 由映射区的页计数决定放置与粒度 (见 mem::take_mmap_region)。
 	let va = mem::take_mmap_region(total_bytes, pte_flags);
-	if va == 0 {
+	if va == 0 || !seal_instr_mapping(va, pages, pte_flags) {
 		return ENOMEM;
 	}
 	va
@@ -114,9 +123,10 @@ pub fn mmap_handler(addr: u64, len: u64, prot: u64, flags: u64, _fd: u64, _off: 
 
 /// 解除 [addr, addr + len) 的 VA 映射, 使后续访问落入 access fault 由 S/M 侧裁决。
 ///
-/// 物理页不在本函数归还: umode 页池是 bump 分配器 (无单页归还能力), 2 MiB 池内存
-/// 统一由 M-mode 在飞地 shutdown 时经 clear_enclave_mem_region 整块回收。此处只负责
-/// 清空页表项并刷新翻译缓存, 与运行时的「不信任应用 free、shutdown 整体回收」约定一致。
+/// 物理页不在本函数归还: U 模式的物理内存由 M 模式按 2 MiB 分区交付, 本运行时只申请
+/// 不归还, 交付的整块内存统一由 M 模式在飞地终止时经 clear_enclave_mem_region 回收。
+/// 此处只负责清空页表项并刷新翻译缓存, 与运行时的「不信任应用 free、终止时整体回收」
+/// 约定一致。
 pub fn munmap_handler(addr: u64, len: u64) -> u64 {
 	// 参数合法性: Linux munmap 要求地址 4 KiB 对齐且长度非零, 违者 EINVAL。
 	if (addr & (PAGE_SIZE - 1)) != 0 || len == 0 {
@@ -161,6 +171,83 @@ pub fn munmap_handler(addr: u64, len: u64) -> u64 {
 //  mprotect handler (226)
 // ---------------------------------------------------------------
 
+/// 请求区间内是否存在可执行位与 `wants_exec` 不一致的叶子项。
+///
+/// 4 KiB 叶子逐个比较, 2 MiB 超页整张比较一次。未映射之处与层级不明的叶子返回
+/// false, 由随后的改写循环报出错误。
+fn range_changes_exec(start: u64, end: u64, wants_exec: bool) -> bool {
+	let mut va = start;
+	while va < end {
+		let Some(level) = paging::va_real_page_level(va) else {
+			return false;
+		};
+		if level != LEVEL_PAGE && level != LEVEL_MEGA {
+			return false;
+		}
+		let Some(flags) = paging::leaf_pte_flags(va) else {
+			return false;
+		};
+		if ((flags & PTE_X) != 0) != wants_exec {
+			return true;
+		}
+		va += if level == LEVEL_MEGA { CHUNK_2M_SIZE } else { PAGE_SIZE };
+	}
+	false
+}
+
+/// 把 `[start, end)` 覆盖的每个 2 MiB 分区改判为 `attr`。
+///
+/// 区间端点按 2 MiB 对齐时, 每个 2 MiB 虚拟块整体落在一个物理分区内, 故由块首的
+/// 虚拟地址查得的物理地址下取整到分区边界即是该分区的物理起始地址。
+///
+/// 改判前先核对覆盖的每个分区都可改判: 分区由本次映射独占, 不与飞地管理器镜像
+/// 自身占用的分区共用。任一分区不可改判时返回错误码, 且不改动任何分区。
+/// 返回 0 表示全部改判成功, 其余取值为错误码。
+fn reclass_covered_partitions(start: u64, end: u64, attr: u64) -> u64 {
+	let mut va = start;
+	while va < end {
+		let Some(pa) = paging::get_pa(va) else {
+			return ENOMEM;
+		};
+		if !mem::is_dedicated_partition(pa) {
+			return EINVAL;
+		}
+		va += CHUNK_2M_SIZE;
+	}
+
+	va = start;
+	while va < end {
+		let Some(pa) = paging::get_pa(va) else {
+			return ENOMEM;
+		};
+		if !mem::set_partition_attr(pa, CHUNK_2M_SIZE, attr) {
+			return EINVAL;
+		}
+		va += CHUNK_2M_SIZE;
+	}
+	0
+}
+
+/// 把指令类映射封口: 覆盖的每个分区改判为指令类, 叶子项恢复为请求的权限。
+///
+/// 指令类映射的物理区在取得时按数据类登记并映射为可写。mmap 不向新映射写入内容,
+/// 取得后立即封口; mremap 的私有映射搬移在复制完成后封口。映射不带 PTE_X 时不涉及
+/// 改判, 直接返回 true。
+fn seal_instr_mapping(va: u64, pages: u64, flags: u64) -> bool {
+	if (flags & PTE_X) == 0 {
+		return true;
+	}
+	if reclass_covered_partitions(va, va + pages * PAGE_SIZE, ENCLAVE_MEM_ATTR_INSTR) != 0 {
+		return false;
+	}
+	for i in 0..pages {
+		if !paging::set_leaf_flags(va + i * PAGE_SIZE, flags) {
+			return false;
+		}
+	}
+	true
+}
+
 /// mprotect(226) 处理函数。
 ///
 /// musl 的线程栈按 mmap(PROT_NONE) 之后 mprotect(PROT_READ | PROT_WRITE) 两步取得,
@@ -169,11 +256,19 @@ pub fn munmap_handler(addr: u64, len: u64) -> u64 {
 ///
 /// 粒度跟随页表叶子层级: 4 KiB 叶子就地改写标志位; 2 MiB 超页在请求区间覆盖整张
 /// 超页时就地改写, 只覆盖一部分时先拆成 4 KiB 叶子再逐页改写。
+///
+/// 改可执行位另有两项约束。其一, 2 MiB 分区的类别由该分区内映射的可执行位决定,
+/// 故改判可执行位即改判分区类别, 要求 `addr` 与 `len` 均按 2 MiB 对齐, 改判与改写
+/// 一并落到整数个分区上; 未对齐即返回 EINVAL, 不触及任何映射。其二, 覆盖的每个分区
+/// 都须由本次映射独占, 落在飞地管理器镜像自身所占分区之内的同样返回 EINVAL。
 pub fn mprotect_handler(addr: u64, len: u64, prot: u64) -> u64 {
 	if (addr & (PAGE_SIZE - 1)) != 0 {
 		return EINVAL;
 	}
 	if (prot & !(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 {
+		return EINVAL;
+	}
+	if (prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC) {
 		return EINVAL;
 	}
 	if len == 0 {
@@ -183,6 +278,17 @@ pub fn mprotect_handler(addr: u64, len: u64, prot: u64) -> u64 {
 	let start = addr;
 	let end = align_up(addr + len, PAGE_SIZE);
 	let flags = prot_to_pte(prot);
+
+	if range_changes_exec(start, end, (prot & PROT_EXEC) != 0) {
+		if (start & (CHUNK_2M_SIZE - 1)) != 0 || (len & (CHUNK_2M_SIZE - 1)) != 0 {
+			return EINVAL;
+		}
+		let attr = if (prot & PROT_EXEC) != 0 { ENCLAVE_MEM_ATTR_INSTR } else { ENCLAVE_MEM_ATTR_DATA };
+		let err = reclass_covered_partitions(start, end, attr);
+		if err != 0 {
+			return err;
+		}
+	}
 
 	let mut va = start;
 	while va < end {
@@ -278,12 +384,14 @@ pub fn mremap_handler(old_addr: u64, old_size: u64, new_size: u64, flags: u64, n
 		None => PTE_U | PTE_V | PTE_R | PTE_W,
 	};
 	let is_shared = (flags_from_src & PTE_RSW_SHARED) != 0;
+	let pages = align_up(new_size, PAGE_SIZE) >> PAGE_SHIFT;
+	// 共享映射搬到固定地址时目的与源指向同一批物理页, 没有新建的映射区要封口。
+	let is_src_alias = is_shared && (flags & MREMAP_FIXED) != 0;
 
 	// 另择地址: 私有映射复制仍有效的字节数再解除旧映射, 共享映射改为让目的地址
 	// 指向源映射的同一批物理页。
 	let dst = if (flags & MREMAP_FIXED) != 0 {
 		let va = new_addr;
-		let pages = align_up(new_size, PAGE_SIZE) >> PAGE_SHIFT;
 		let ok = if is_shared {
 			mem::alias_umode_pages(old_addr, va, pages, flags_from_src)
 		} else {
@@ -304,12 +412,13 @@ pub fn mremap_handler(old_addr: u64, old_size: u64, new_size: u64, flags: u64, n
 	let copy_len = if old_size < new_size { old_size } else { new_size };
 	if !is_shared {
 		unsafe {
-			core::ptr::copy_nonoverlapping(
-				old_addr as *const u8,
-				dst as *mut u8,
-				copy_len as usize
-			);
+			core::ptr::copy_nonoverlapping(old_addr as *const u8, dst as *mut u8, copy_len as usize);
 		}
+	}
+
+	// 指令类映射的物理区在取得时按数据类登记并映射为可写, 复制完成后封口。
+	if !is_src_alias && !seal_instr_mapping(dst, pages, flags_from_src) {
+		return ENOMEM;
 	}
 
 	// MREMAP_FIXED 的目标由调用方指定, 旧区间保留由调用方自理。

@@ -25,6 +25,7 @@ PMA (Physical Memory Attributes):
 
 from abc import ABC, abstractmethod
 import ctypes
+from functools import partialmethod
 
 from pyremu._native import (
     bus_read_ram,
@@ -32,6 +33,7 @@ from pyremu._native import (
     native_available,
 )
 from pyremu.configs_gen import PYREMU_NO_L2
+from pyremu.utils.wrapper import silent_on_err
 
 # Module-level cache for native pointers to bytearray buffers.
 # Stored here (not on Bus instances) so that deepcopy() never
@@ -94,6 +96,14 @@ class Bus:
     - 由调用方 mem_check_aux.translate_addr 保证这些地址不插入 TLB
     - 通过 is_device_addr() 供外部判断
     """
+    def read_ulen(self, addr: int, len: int) -> int | None:
+        ret = self.try_read(addr, len)
+        return int.from_bytes(ret, 'little', signed=False) if ret else None
+
+    read_u64 = partialmethod(read_ulen, len=8)
+    read_u32 = partialmethod(read_ulen, len=4)
+    read_u16 = partialmethod(read_ulen, len=2)
+    read_u08 = partialmethod(read_ulen, len=1)
 
     def __init__(
         self,
@@ -113,8 +123,6 @@ class Bus:
         self._shadow_base: int | None = None
         self._shadow_size: int = 0
 
-        # Rust native fast-path (zero-allocation RAM read/write).
-        # All native state is stored as plain Python ints (deepcopy-safe).
         self._use_native: bool = native_available()
         self._ram_native_ptr: int = 0
         self._read_out_ptr: int = 0
@@ -122,17 +130,18 @@ class Bus:
             tmp = (ctypes.c_uint8 * ram_size).from_buffer(self._ram)
             self._ram_native_ptr = ctypes.cast(tmp, ctypes.c_void_p).value  # type: ignore[arg-type]
             self._ram_buf_type = ctypes.c_uint8 * ram_size
-            # Read-out buffer: a single c_uint64, pointer cached as int.
             self._read_out = ctypes.c_uint64(0)
             self._read_out_ptr = ctypes.cast(
                 ctypes.pointer(self._read_out), ctypes.c_void_p
-            ).value  # type: ignore[arg-type]
+            ).value
 
         # 设备查找缓存 — 按基址排序的 (base, end, device) 列表, 用于二分查找.
         # add_device 后置 None, 首次 _find_device 时重建.
         self._device_cache: list[tuple[int, int, Device]] | None = None
 
         # 若 L2 缓存存在, 注入 RAM 后端回调. L2 缓存只缓存 RAM, 不缓存设备.
+        # 判定用 None 比较: CacheBase 定义了 __len__ (返回有效条目数), 空缓存的
+        # 真值为假, 用真值判定会使后端回调在本处被跳过.
         if self._l2 is not None:
             self._l2.set_ram_backend(
                 read_fn=self._ram_read_direct,
@@ -144,17 +153,13 @@ class Bus:
     # ----------------------------------------------------------
 
     def add_device(self, base_addr: int, device: Device) -> None:
-        """注册一个内存映射设备."""
+        """注册一个内存映射设备"""
         device.base_addr = base_addr
         self._devices[base_addr] = device
         self._device_cache = None  # 下次 _find_device 时重建
 
     def _find_device(self, addr: int) -> tuple[Device | None, int]:
-        """二分查找地址对应的设备及设备内偏移.
-
-        将 O(n) 线性扫描替换为 O(log n) 二分查找.
-        缓存按基址排序的 (base, end, device) 列表, 仅在 add_device 后重建.
-        """
+        """二分查找地址对应的设备及设备内偏移"""
         if self._device_cache is None:
             self._device_cache = sorted(
                 (base, base + dev.size, dev)
@@ -194,6 +199,8 @@ class Bus:
         """判断物理地址是否属于主存 (Main Memory)."""
         if self._ram_base <= addr < self._ram_end:
             return True
+        # 判定用 None 比较: 影子映射的基址可以取 0 (固件最低段 VMA 为 0 而 RAM
+        # 在高地址时), 用真值判定会把这一映射当作未建立.
         if self._shadow_base is not None:
             return self._shadow_base <= addr < self._shadow_base + self._shadow_size
         return False
@@ -253,8 +260,15 @@ class Bus:
     def _ram_read_direct(self, addr: int, size: int) -> bytes:
         """直接从 RAM 读取 (绕过 L2 缓存).
 
-        *addr* 超出 RAM 范围时返回全 0 (模拟未映射物理地址).
         """
+        # 越界地址在此处即行返回, 不进入 Rust 快路径. 调用方可能传入任意
+        # 64 位取值, 其中包含由栈帧指针一类故障现场算出的负数地址
+        # (如 bt 读 fp-16 得到 -1); 这类取值经 ctypes 转为无符号数后不再
+        # 落在任何窗口内, 由本判断挡在 FFI 之外.
+        off = self._ram_offset(addr, size)
+        if off is None:
+            return b"\x00" * size
+
         # Rust native fast path: only for regular access sizes (1/2/4/8).
         # L2 cache line fills (64 B) would overflow the 8-byte read-out buffer.
         if self._use_native and self._ram_native_ptr and size in (1, 2, 4, 8) and \
@@ -267,10 +281,6 @@ class Bus:
         ):
             return ctypes.string_at(self._read_out_ptr, size)
 
-        # Pure Python fallback
-        off = self._ram_offset(addr, size)
-        if off is None:
-            return b"\x00" * size
         return bytes(self._ram[off : off + size])
 
     def _ram_write_direct(self, addr: int, data: bytes) -> None:
@@ -279,6 +289,11 @@ class Bus:
         *addr* 超出 RAM 范围时静默丢弃 (由上层 PMA 检查保证不会发生).
         """
         data_len = len(data)
+        # 越界地址不进入 Rust 快路径, 理由同 _ram_read_direct
+        ofs = self._ram_offset(addr, data_len)
+        if ofs is None:
+            return
+
         # Rust native fast path: only for regular access sizes (1/2/4/8).
         # L2 cache line fills produce larger writes via the Python path.
         if self._use_native and self._ram_native_ptr and data_len in (1, 2, 4, 8) and \
@@ -291,10 +306,6 @@ class Bus:
         ):
             return
 
-        # Pure Python fallback
-        ofs = self._ram_offset(addr, data_len)
-        if ofs is None:
-            return
         self._ram[ofs : ofs + data_len] = data
 
     def write_ram_direct(self, addr: int, data: bytes) -> None:
@@ -315,9 +326,7 @@ class Bus:
         Returns:
             回写的缓存行数; 无 L2 缓存时返回 0.
         """
-        if self._l2 is not None:
-            return self._l2.flush_all()
-        return 0
+        return self._l2.flush_all() if self._l2 is not None else 0
 
     def invalidate_l2(self) -> int:
         """使 L2 缓存全部行失效 (脏行先回写).
@@ -328,9 +337,7 @@ class Bus:
         Returns:
             失效的缓存行数; 无 L2 缓存时返回 0.
         """
-        if self._l2 is not None:
-            return self._l2.invalidate_all()
-        return 0
+        return self._l2.invalidate_all() if self._l2 is not None else 0
 
     # ----------------------------------------------------------
     #  总线读写 (外部接口 — Hart 的 _mem_read_phy / _mem_write_phy 使用)
@@ -339,7 +346,7 @@ class Bus:
     def read(self, addr: int, size: int) -> bytes:
         """总线读: 设备 MMIO 直通优先, 其次是 L2 缓存, 最后通过访问 RAM 得到."""
         dev, offset = self._find_device(addr)
-        if dev is not None:
+        if dev:
             return dev.read(offset, size)
 
         if self.is_ram_addr(addr) and NO_L2:
@@ -373,7 +380,7 @@ class Bus:
     def write(self, addr: int, data: bytes) -> None:
         """总线写: 设备 MMIO 直通优先, 其次是 L2 缓存, 最后通过访问 RAM 写入."""
         dev, offset = self._find_device(addr)
-        if dev is not None:
+        if dev:
             dev.write(offset, data)
             return
 
@@ -390,33 +397,22 @@ class Bus:
     # ----------------------------------------------------------
     #  安全读写 (不抛异常, 供调试器等外部调用方使用)
     # ----------------------------------------------------------
+    def try_read(self, addr: int, size: int) -> bytes:
+        """安全读取物理内存 — 读取不产生异常.
 
-    def try_read(self, addr: int, size: int) -> bytes | None:
-        """安全读取物理内存 — 失败返回 None 而非抛异常.
-
-        与 read() 的区别: 将设备/L2 缓存的异常转换为 None 返回值,
-        调用方无需 try/except. 适用于调试器、内存 dump 等尽力而为的场景.
+        本函数与 read() 是同一入口, 自身不捕获异常. 未落入任何设备与 RAM 窗口的
+        地址由 _ram_read_direct 返回 size 个零字节;
+        设备读实现抛出的异常沿 read() 向上传播.
+        适用于调试器、内存 dump 等尽力而为的场景.
 
         Args:
             addr: 物理地址.
             size: 读取字节数 (1/2/4/8).
 
         Returns:
-            成功时返回 bytes, 失败 (设备异常/访问越界) 返回 None.
+            读到的字节串.
         """
         return self.read(addr, size)
-
-    def read_u64(self, addr: int) -> int | None:
-        ret = self.try_read(addr, 8)
-        if ret is None:
-            return None
-        return int.from_bytes(ret, 'little')
-
-    def read_u32(self, addr: int) -> int | None:
-        ret = self.try_read(addr, 4)
-        if ret is None:
-            return None
-        return int.from_bytes(ret, 'little')
 
     def try_write(self, addr: int, data: bytes) -> bool:
         """安全写入物理内存 — 返回 bool 表示成功与否.
@@ -433,9 +429,9 @@ class Bus:
         """
         try:
             self.write(addr, data)
-            return True
         except Exception:
             return False
+        return True
 
     # ----------------------------------------------------------
     #  属性

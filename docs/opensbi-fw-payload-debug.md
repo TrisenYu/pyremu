@@ -89,7 +89,7 @@ hart -> 死等另外 2 个。
 
 ### 直接跳转 payload 失败
 
-`--prog-cnt=0x80200000` 绕过 OpenSBI 初始化直接执行 payload, 但
+`--prog-cnt=0x80400000` 绕过 OpenSBI 初始化直接执行 payload, 但
 payload 通过 `jalr` 调用 SBI 函数表 -> 表为空指针 -> 跳转到 0x0 ->
 IllInstr (0x00000000 非法指令)。
 

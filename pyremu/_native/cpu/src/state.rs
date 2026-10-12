@@ -1,7 +1,7 @@
 //! `#[repr(C)]` state structures that cross the Python FFI boundary.
 
 use core::fmt;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{ AtomicU32, AtomicU64, AtomicU8, Ordering };
 
 include!("configs_gen.rs");
 
@@ -54,7 +54,11 @@ impl fmt::Debug for TlbEntry {
 		write!(
 			f,
 			"TlbEntry(vpn={:#x} ppn={:#x} perm={} level={} v={})",
-			self.vpn, self.ppn, self.perm, self.level, self.valid
+			self.vpn,
+			self.ppn,
+			self.perm,
+			self.level,
+			self.valid
 		)
 	}
 }
@@ -232,30 +236,30 @@ pub struct HartState {
 #[derive(Clone, Copy)]
 pub struct HartDiag {
 	// ---- CLINT inline handler call counters ----
-	pub clint_msip_set: u64,      // sync_msip observed edge transitions
-	pub clint_msip_clr: u64,      // (unused, reserved)
-	pub clint_mtc_wr: u64,        // direct CLINT MSIP writes seen in WFI
-	pub clint_msip_wr0: u64,      // MMIO write-0 to MSIP
-	pub clint_msip_wr1: u64,      // MMIO write-1 to MSIP
-	pub clint_wr1_remote: u64,    // write-1 to another hart
-	pub clint_wr1_self: u64,      // write-1 to self
-	pub cooldown_start: u64,      // MRET/SRET with CLINT MSIP=1
-	pub wfi_wake_msip: u64,       // WFI woke due to MSIP
-	pub wfi_wake_mtip: u64,       // WFI woke due to timer
-	pub wfi_wake_other: u64,      // WFI woke due to other interrupt
-	pub trap_msip_total: u64,     // MSIP traps delivered
+	pub clint_msip_set: u64, // sync_msip observed edge transitions
+	pub clint_msip_clr: u64, // (unused, reserved)
+	pub clint_mtc_wr: u64, // direct CLINT MSIP writes seen in WFI
+	pub clint_msip_wr0: u64, // MMIO write-0 to MSIP
+	pub clint_msip_wr1: u64, // MMIO write-1 to MSIP
+	pub clint_wr1_remote: u64, // write-1 to another hart
+	pub clint_wr1_self: u64, // write-1 to self
+	pub cooldown_start: u64, // MRET/SRET with CLINT MSIP=1
+	pub wfi_wake_msip: u64, // WFI woke due to MSIP
+	pub wfi_wake_mtip: u64, // WFI woke due to timer
+	pub wfi_wake_other: u64, // WFI woke due to other interrupt
+	pub trap_msip_total: u64, // MSIP traps delivered
 	pub trap_msip_delegated: u64, // MSIP traps delegated to S-mode
 	/// Last CLINT MSIP edge-counter value.  ``sync_msip`` compares the
 	/// current edge counter against this to detect new MSIP edges.
 	pub msip_last_seen: u64,
-	pub msip_masked_by_msie: u64,   // MSIP pending but MSIE=0
-	pub msip_pending_no_trap: u64,  // MSIP pending but no trap delivered
-	pub nt_mip_snapshot: u64,       // mip at first no_trap
-	pub nt_mie_snapshot: u64,       // mie at first no_trap
-	pub msie_cleared_at_pc: u64,    // PC where MSIE was explicitly cleared
+	pub msip_masked_by_msie: u64, // MSIP pending but MSIE=0
+	pub msip_pending_no_trap: u64, // MSIP pending but no trap delivered
+	pub nt_mip_snapshot: u64, // mip at first no_trap
+	pub nt_mie_snapshot: u64, // mie at first no_trap
+	pub msie_cleared_at_pc: u64, // PC where MSIE was explicitly cleared
 	pub wfi_wake_no_msip_trap: u64, // WFI woke by MSIP edge but no trap
-	pub nt_mode: u8,                // mode at first no_trap
-	pub nt_clint_raw: u8,           // CLINT MSIP raw byte at first no_trap
+	pub nt_mode: u8, // mode at first no_trap
+	pub nt_clint_raw: u8, // CLINT MSIP raw byte at first no_trap
 	pub _pad2: [u8; 6],
 	pub nt_pending: u64, // mip & mie at first no_trap
 }
@@ -328,7 +332,7 @@ pub mod riscv_mode {
 mod tests {
 	use super::*;
 	use crate::ffi::InstrToBeExec;
-	use std::mem::{align_of, size_of};
+	use std::mem::{ align_of, size_of };
 
 	#[test]
 	fn tlb_entry_size() {
@@ -424,7 +428,7 @@ mod tests {
 		if crate::CFG_AIA {
 			hs.imsic_m.present = 1;
 			hs.imsic_s.present = 1;
-		};
+		}
 		assert_eq!(hs.gprs[0], 0);
 		assert_eq!(hs.mode, riscv_mode::M);
 	}

@@ -4,7 +4,8 @@
 //! 返回值的编解码即载荷侧的接口), 运行时处理时涉及协议栈的部分经本模块导出的操作表
 //! 调用。故本模块的系统调用处理函数表全为空槽位, 运行时自身的调用点见 [`OPS`]。
 //!
-//! 映像的入口在偏移 0, 无 ELF 头, 无重定位项, 见 ../module.ld 与 ../Makefile。
+//! 映像无 ELF 头, 无重定位项; 偏移 0 处是映像描述块, 入口在映像内的偏移由该描述块给出,
+//! 见 ../module.ld 与 ../Makefile。
 //!
 //! 接口结构体、管理器回调集合与操作表按 `#[path]` 取自 sittim 的 src/ext_mod, 与运行时
 //! 共用同一份定义。
@@ -73,7 +74,7 @@ static SYSCALLS: SyscallTable = SyscallTable { handlers: [None; SYSCALL_TABLE_LE
 /// 而映像在链接时不知道自己将被放在哪个基址。
 static mut OPS: MaybeUninit<NetOps> = MaybeUninit::uninit();
 
-/// 模块入口, 位于映像偏移 0。
+/// 模块入口。它在映像内的偏移由映像描述块给出。
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.init")]
 pub unsafe extern "C" fn module_init(manager: *const Manager) -> GetterFn {

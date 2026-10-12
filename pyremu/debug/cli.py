@@ -11,6 +11,7 @@ import sys
 
 from loguru import logger
 
+from pyremu import configs_gen
 from pyremu.debug import Debugger
 from pyremu.debug.utils import fmt_size, RAM_MUL
 from pyremu.emulator import Emulator
@@ -56,7 +57,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="物理内存基址 (默认 0x80000000)",
     )
     p.add_argument(
-        "--fdt", type=lambda x: int(x, 0) if x is not None else None,
+        "--fdt", type=lambda x: int(x, 0) if x else None,
         default=-1, nargs="?", const=-1,
         help="设备树加载地址 (默认 RAM 顶端 −64 KiB)",
     )
@@ -100,7 +101,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--sym-base", type=lambda x: int(x, 0), default=None,
         metavar="ADDR",
-        help="符号文件的加载基址 (默认 ram_base + 0x200000)",
+        help="符号文件的加载基址 (默认 ram_base + 固件映像保留区大小)",
     )
     p.add_argument(
         "--kernel", type=str, default=None, metavar="PATH",
@@ -109,7 +110,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--kernel-addr", type=lambda x: int(x, 0), default=None,
         metavar="ADDR",
-        help="内核 Image 加载地址 (默认 ram_base + 0x200000)",
+        help="内核 Image 加载地址 (默认 ram_base + 固件映像保留区大小)",
     )
     p.add_argument(
         "--bootargs", type=str, default=None, metavar="ARGS",
@@ -216,10 +217,12 @@ def _configure_fdt(
     """根据 CLI 参数配置设备树, 返回 DTB 加载地址 (或 None)."""
     if ns.no_fdt:
         return None
-    if ns.fdt_file is not None:
+    if ns.fdt_file:
         parts = ns.fdt_file.rsplit(":", 1)
         file_path = parts[0]
         custom_addr = int(parts[1], 0) if len(parts) > 1 else None
+        # 判定用 None 比较: 地址 0 是合法入参 (ram_base 为 0 的固件), 用真值判定会
+        # 把这一取值当作未给出.
         addr: int = (
             custom_addr
             if custom_addr is not None
@@ -227,7 +230,7 @@ def _configure_fdt(
         )
         emu.load_dtb_file(file_path, addr=addr)
         return addr
-    if ns.fdt is not None:
+    if ns.fdt:
         addr = (
             ns.fdt
             if ns.fdt != -1
@@ -283,7 +286,7 @@ def _load_initrd(
     """加载 initramfs 到 RAM 并记录范围 (必须在生成 DTB 之前调用).
 
     默认地址置于 DTB (RAM 顶端 −64 KiB) 下方, 按 2 MiB 向下对齐,
-    以避开内核 Image (ram_base + 0x200000) 区域。
+    以避开内核 Image (ram_base + 固件映像保留区大小) 区域。
     """
     if path is None:
         return
@@ -335,6 +338,8 @@ def debugger(args: list[str] | None = None) -> None:
     )
 
     effective_entry = image.entry_point + load_offset
+    # 判定用 None 比较: 入口地址 0 是合法入参 (sifive_u54 预设即取 0), 用真值判定
+    # 会把这一取值当作未给出而改用映像入口.
     prog_cnt = ns.prog_cnt if ns.prog_cnt is not None else effective_entry
 
     # --disk: 启用 virtio-blk (base 置于 watchdog 之后的空闲 MMIO 槽)。
@@ -345,7 +350,7 @@ def debugger(args: list[str] | None = None) -> None:
     periph.virtio_net_s_base = _VIRTIO_NET_S_BASE
     periph.virtio_net_m_base = _VIRTIO_NET_M_BASE
     bootargs = ns.bootargs
-    if ns.disk is not None:
+    if ns.disk:
         periph.virtio_blk_base = _VIRTIO_BLK_BASE
         if bootargs is None:
             # debootstrap --variant=minbase 不创建 /sbin/init, 而它是指向
@@ -374,7 +379,7 @@ def debugger(args: list[str] | None = None) -> None:
     )
     emu = Emulator(plat_cfg, bootargs=bootargs)
     emu.load_firmware(image, load_offset=load_offset)
-    if ns.hart_logs is not None and emu.uart is not None:
+    if ns.hart_logs and emu.uart:
         emu.uart.set_hart_log_dir(ns.hart_logs)
         logger.info(f"各 hart 串口输出另存至: {ns.hart_logs}/hart<N>.log")
     for h in emu.harts:
@@ -397,9 +402,10 @@ def debugger(args: list[str] | None = None) -> None:
     preload_entry = _setup_preload(emu, ns, fdt_addr, ns.ram_base)
     target_entry = (
         _setup_entry_symbol(emu, image, ns.entry_symbol)
-        if ns.entry_symbol is not None else None
+        if ns.entry_symbol else None
     )
 
+    # 判定用 None 比较: 预加载载荷与入口符号都可以落在地址 0.
     if preload_entry is not None:
         for h in emu.harts:
             h.pc = preload_entry
@@ -417,9 +423,9 @@ def debugger(args: list[str] | None = None) -> None:
 
     kernel_info = _load_kernel_image(
         emu, ns.kernel, ns.kernel_addr,
-        default_addr=ns.ram_base + 0x200000,
+        default_addr=ns.ram_base + configs_gen.FW_RESERVED_MEM_SIZE,
     )
-    if kernel_info is not None:
+    if kernel_info:
         dbg._kernel_path, dbg._kernel_addr = kernel_info
 
     if ns.sym:

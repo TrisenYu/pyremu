@@ -62,7 +62,7 @@ $(NATIVE_SO) $(TERMIO_SO): $(NATIVE_SRC) $(CONFIG_GEN_RS)
 	cargo build --release --manifest-path $(NATIVE_DIR)/Cargo.toml --workspace $(CARGO_FLAGS)
 	install -m 755 $(NATIVE_DIR)/target/release/libdecode.so $(NATIVE_SO)
 	install -m 755 $(NATIVE_DIR)/target/release/libtermio.so $(TERMIO_SO)
-	@echo "libdecode.so + libtermio.so 已构建"
+	@echo "libdecode.so and libtermio.so have built"
 
 build-native: $(NATIVE_SO) $(TERMIO_SO)
 phony += build-native
@@ -84,33 +84,20 @@ $(SITTIM_BIN): $(wildcard $(SITTIM_DIR)/src/*.rs) $(wildcard $(SITTIM_DIR)/src/*
 build-rust: $(SITTIM_BIN)
 phony += build-rust
 
-# 对bsp/opensbi的编译配置
+# fw_basic_flag 变化时强制重建固件
+FW_CFG_STAMP = $(bins_dir)/fw_cfg.stamp
 
-# 按 DBG_MEM_INTERACT 开关同步 CONFIG_DBG_MEM_INTERACT 到 opensbi 平台 defconfig。
-# 通过 $(shell ...) 在 make 解析阶段执行 (任何目标求值之前), 从而在 make 判定 fw_*.elf
-# 是否过期之前就更新 defconfig 的 mtime: defconfig 属于 FW_SRC_DEPS, 其 mtime 变化会令
-# fw_*.elf 过期并重编, 开关切换后无需手动 distclean 即生效。
-define dbg_mem_sync_sh
-if [ "$(DBG_MEM_INTERACT)" = "1" ]; then \
-	grep -qx 'CONFIG_DBG_MEM_INTERACT=y' \
-		$(FW_SRC_DIR)/platform/generic/configs/defconfig \
-		|| echo 'CONFIG_DBG_MEM_INTERACT=y' \
-			>> $(FW_SRC_DIR)/platform/generic/configs/defconfig; \
-else \
-	grep -q '^CONFIG_DBG_MEM_INTERACT=' \
-		$(FW_SRC_DIR)/platform/generic/configs/defconfig \
-		&& sed -i '/^CONFIG_DBG_MEM_INTERACT=/d' \
-			$(FW_SRC_DIR)/platform/generic/configs/defconfig; \
-fi
-endef
-__dbg_mem_sync := $(shell $(dbg_mem_sync_sh))
+$(FW_CFG_STAMP): FORCE
+	@mkdir -p $(bins_dir)
+	@printf '%s\n' $(fw_basic_flag) > $@.tmp
+	@cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
 
-$(FW_BUILD_DIR)/fw_payload.elf: $(SITTIM_BIN) $(FW_SRC_DEPS)
+$(FW_BUILD_DIR)/fw_payload.elf: $(SITTIM_BIN) $(FW_SRC_DEPS) $(FW_CFG_STAMP)
 	$(MAKE) -C $(FW_SRC_DIR) distclean
 	$(MAKE) -C $(FW_SRC_DIR) $(FW_MAKE_FLAGS) -j$$(nproc)
 
 # fw_jump 同样内嵌 sittim.bin (firmware/objects.mk _ENCLAVE_DEFAULT),
-$(FW_BUILD_DIR)/fw_jump.elf: $(SITTIM_BIN) $(FW_SRC_DEPS)
+$(FW_BUILD_DIR)/fw_jump.elf: $(SITTIM_BIN) $(FW_SRC_DEPS) $(FW_CFG_STAMP)
 	$(MAKE) -C $(FW_SRC_DIR) distclean
 	$(MAKE) -C $(FW_SRC_DIR) $(FW_JUMP_FLAGS) -j$$(nproc)
 
@@ -142,7 +129,7 @@ $(fw_jump): $(FW_BUILD_DIR)/fw_jump.elf
 kei-sav: $(fw_payload)
 	$(MAKE) -C bsp/kei-boot kei-sav
 
-$(fw_payload_linux): $(SITTIM_BIN) $(FW_SRC_DEPS)
+$(fw_payload_linux): $(SITTIM_BIN) $(FW_SRC_DEPS) $(FW_CFG_STAMP)
 	@echo "构建 opensbi + Linux 内核 payload..."
 	$(MAKE) -C $(FW_SRC_DIR) distclean $(FW_MAKE_FLAGS) \
 		FW_PAYLOAD_PATH=$(realpath $(LINUX_IMG))
@@ -151,7 +138,7 @@ $(fw_payload_linux): $(SITTIM_BIN) $(FW_SRC_DEPS)
 	@mkdir -p $(elf_dir)
 	cp $(FW_BUILD_DIR)/fw_payload.elf $(fw_payload_linux)
 	cp $(FW_BUILD_DIR)/fw_payload.bin $(fw_payload_linux:.elf=.bin)
-	@echo "凭linux作为载荷的固件已拷贝: $(fw_payload_linux)"
+	@echo "copy $(fw_payload_linux) as bootstrap payload"
 
 build-fw-linux: $(fw_payload_linux)
 phony += build-fw-linux
@@ -233,7 +220,6 @@ phony += emu-linux-sh
 
 # ---- 测试 ----
 # 限制: 4 GiB 虚拟内存, --ignore 排除 ordering-dependent 失败.
-# ---- 测试 ----
 test-build:
 	$(MAKE) -C tests all
 phony += test-build

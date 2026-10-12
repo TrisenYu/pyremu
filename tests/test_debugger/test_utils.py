@@ -7,15 +7,15 @@
 import pytest
 
 from pyremu.debug.utils import (
-    EXC_NAMES,
-    IRQ_NAMES,
-    MAX_INSTR_COUNT,
     check_rv64_addr,
+    EXC_NAMES,
     fmt_instr_count,
     fmt_size,
     group_order,
     hex_addr,
     ip_bits,
+    IRQ_NAMES,
+    MAX_INSTR_COUNT,
     trap_cause_name,
 )
 
@@ -59,10 +59,10 @@ class TestFmtInstrCount:
         assert fmt_instr_count(999999) == "999.999K"
 
     def test_m(self):
-        assert fmt_instr_count(1_000_000) == "1.000000M"
+        assert fmt_instr_count(1_000_000) == "1.000M"
 
     def test_b(self):
-        assert fmt_instr_count(1_000_000_000) == "1.0000000B"
+        assert fmt_instr_count(1_000_000_000) == "1.000B"
 
 
 class TestTrapCauseName:

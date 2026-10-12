@@ -283,7 +283,7 @@ class HartWithRegs:
     def _csr_read_raw(self, csr_name: str) -> int:
         """Read CSR value bypassing pydantic model (hot path, ~10% faster)."""
         csr = self.csrs[csr_name]
-        assert csr is not None, f"CSR {csr_name!r} not found in hart {self.id}"
+        assert csr, f"CSR {csr_name!r} not found in hart {self.id}"
         return csr.__dict__["val"]
 
     def read_csr(self, csr_id: int) -> int:
@@ -292,9 +292,9 @@ class HartWithRegs:
             return -1
         # 硬件计数器 — 从 CLINT 动态读取 (time / timeh)
         # RISC-V 规范: time / timeh 是内存映射 CLINT mtime 的只读 CSR 镜像
-        if csr_name == "time" and self._interrupt_ctrl is not None:
+        if csr_name == "time" and self._interrupt_ctrl:
             return self._interrupt_ctrl.get_mtime()
-        if csr_name == "timeh" and self._interrupt_ctrl is not None:
+        if csr_name == "timeh" and self._interrupt_ctrl:
             return mask32(self._interrupt_ctrl.get_mtime() >> 32)
         # sstatus 是 mstatus 的受限视图, 读取 sstatus 时返回 mstatus 的对应位
         if csr_name == "sstatus":
@@ -351,7 +351,7 @@ class HartWithRegs:
         Callers MUST ensure *csr_name* is valid and no side-effects are required.
         """
         csr = self.csrs[csr_name]
-        assert csr is not None, f"CSR {csr_name!r} not found in hart {self.id}"
+        assert csr, f"CSR {csr_name!r} not found in hart {self.id}"
         csr.__dict__["val"] = mask64(val)# type: ignore[index]  # pydantic MappingProxyType vs runtime dict
         if csr_name in self._INT_SENSITIVE_CSRS:
             self._int_state_version += 1
@@ -423,17 +423,17 @@ class HartWithRegs:
             old_mip = self._csr_read_raw("mip")
             new_mip = (old_mip & ~(1 << 1)) | (val & (1 << 1))
             self._csr_write_raw("mip", new_mip)
-        elif self._imsic is not None and csr_name == "miselect":
+        elif self._imsic and csr_name == "miselect":
             self._imsic_select_m = mask32(val)
             self._csr_write_raw(csr_name, self._imsic_select_m)
-        elif self._imsic is not None and csr_name == "siselect":
+        elif self._imsic and csr_name == "siselect":
             self._imsic_select_s = mask32(val)
             self._csr_write_raw(csr_name, self._imsic_select_s)
-        elif self._imsic is not None and csr_name == "mireg":
+        elif self._imsic and csr_name == "mireg":
             self._imsic.csr_write(self.id, 'M', self._imsic_select_m, val)
-        elif self._imsic is not None and csr_name == "sireg":
+        elif self._imsic and csr_name == "sireg":
             self._imsic.csr_write(self.id, 'S', self._imsic_select_s, val)
-        elif self._imsic is not None and csr_name in ("stopei", "mtopei"):
+        elif self._imsic and csr_name in ("stopei", "mtopei"):
             # Writing to stopei/mtopei claims the specified IID per AIA spec.
             iid = (val >> 16) & 0x7FF
             if iid == 0:
@@ -445,7 +445,7 @@ class HartWithRegs:
                 self.mip_val &= ~(1 << iid)
             elif csr_name == "stopei": # and iid == 1
                 self.mip_val &= ~(1 << iid)
-        elif self._imsic is not None and csr_name in ("stopi", "mtopi"):
+        elif self._imsic and csr_name in ("stopi", "mtopi"):
             # Writing to stopi/mtopi claims the specified IID per AIA spec.
             iid = (val >> 16) & 0x7FF
             if csr_name == "mtopi":
@@ -465,7 +465,7 @@ class HartWithRegs:
                 stc, now = 0, 0
                 if "stimecmp" in self.csrs:
                     stc = self._csr_read_raw("stimecmp")
-                if self._interrupt_ctrl is not None:
+                if self._interrupt_ctrl:
                     now = self._interrupt_ctrl.get_mtime()
                 if 0 < stc <= now:
                     self._csr_write_raw("stimecmp", now + 4)
@@ -714,7 +714,7 @@ class HartWithRegs:
     def interrupt_ctrl(self, ctrl):
         self._interrupt_ctrl = ctrl
         # 自动注册中断状态变化回调 — 即使外部替换 CLINT 也不漏通知
-        if ctrl is not None:
+        if ctrl:
             ctrl.set_int_state_change_callback(self.notify_int_state_change)
 
     @property
@@ -781,7 +781,7 @@ class HartWithRegs:
         # batch 退出后的补步, 共享比较正确; 失效可避免把陈旧的 Rust deadline
         # 经 marshal 带回去造成错误判定.
         self._stip_deadline = 0
-        if self._interrupt_ctrl is not None:
+        if self._interrupt_ctrl:
             now = self._interrupt_ctrl.get_mtime()
             if stimecmp_val > 0 and now >= stimecmp_val:
                 self.mip_val |= 1 << 5
@@ -801,7 +801,7 @@ class HartWithRegs:
         delivered via MEIP and reported as IID=11 (MEI); the actual minor
         identity is read from MTOPEI.
         """
-        if self._imsic is not None:
+        if self._imsic:
             topei = self._imsic.peek_topei(self.id, 'M')
             if topei != 0:
                 # All IMSIC M-file interrupts (IPI + external) -> MEI=11.
@@ -818,7 +818,7 @@ class HartWithRegs:
             # clear the CLINT level bit for the next IPI.
             self.mip_val &= ~(1 << 3)
             return val
-        if self._interrupt_ctrl is not None and (self.mie_val & (1 << 7)):
+        if self._interrupt_ctrl and (self.mie_val & (1 << 7)):
             now = self._interrupt_ctrl.get_mtime()
             mtc = self._interrupt_ctrl.get_mtimecmp(self.id)
             if self._timer_pending(now, mtc):
@@ -834,7 +834,7 @@ class HartWithRegs:
         delivered via SEIP and reported as IID=9 (SEI); the actual minor
         identity is read from STOPEI.
         """
-        if self._imsic is not None:
+        if self._imsic:
             topei = self._imsic.peek_topei(self.id, 'S')
             if topei != 0:
                 # All IMSIC S-file interrupts (IPI + external) -> SEI=9.
@@ -851,7 +851,7 @@ class HartWithRegs:
             # bit must be cleared to prevent re-delivery.
             self.mip_val &= ~(1 << 1)
             return val
-        if self._interrupt_ctrl is not None and (self.mie_val & (1 << 5)):
+        if self._interrupt_ctrl and (self.mie_val & (1 << 5)):
             now = self._interrupt_ctrl.get_mtime()
             stc = self._csr_read_raw("stimecmp") if "stimecmp" in self.csrs else 0
             if self._timer_pending(now, stc):

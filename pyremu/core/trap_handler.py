@@ -98,7 +98,7 @@ def _imsic_clear_ipi_on_trap(hart: HartWithRegs, exc_code: int) -> None:
     imsic = hart._imsic
     if imsic is None:
         return
-    # 经 IMSIC 公共入口 (持锁) 清除 eip, 与 RX daemon 的 set_ip_number RMW
+    # 经 IMSIC 并发安全清除 eip, 与 RX daemon 的 set_ip_number RMW
     # 互斥, 避免 eip[word] 的丢失更新.
     imsic.clear_ipi_on_trap(hart.id, exc_code)
 
@@ -214,7 +214,7 @@ def _trap_deliver_smode(
         return
     if exc_code == 3:  # MSIP (delegated to S)
         ctrl = hart._interrupt_ctrl
-        if ctrl is not None:
+        if ctrl:
             ctrl.clear_ipi(hart.id)
         _imsic_clear_ipi_on_trap(hart, exc_code)
     elif exc_code == 1:  # SSIP
@@ -279,7 +279,7 @@ def _trap_deliver_mmode(
     # MSIP 中断: 同步清零 CLINT MSIP + IMSIC eip (legacy mode).
     if is_interrupt and exc_code == 3:  # MSIP (mcause code 3)
         ctrl = hart._interrupt_ctrl
-        if ctrl is not None:
+        if ctrl:
             ctrl.clear_ipi(hart.id)
         _imsic_clear_ipi_on_trap(hart, exc_code)
 
@@ -595,13 +595,10 @@ def try_wfi_wakeup(
     若从 WFI 中被唤醒, 置位 _wfi_woken 标志以供 WFI handler 消费 (while
     循环的 WFI NOP 路径). 返回 True 表示唤醒成功.
     """
-    if not hart._waiting or hart._halted:
+    if not hart._waiting or hart._halted or hart._interrupt_ctrl is None:
         return False
 
     ctrl = hart._interrupt_ctrl
-    if ctrl is None:
-        return False
-
     # 将 CLINT 中断状态同步到 mip CSR (与 check_pending_interrupts 相同)
     has_pending, mip_bits, _ = ctrl.check_interrupt(hart.id)
 

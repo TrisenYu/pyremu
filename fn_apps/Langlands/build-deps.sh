@@ -1,36 +1,27 @@
 #!/bin/sh
 # SPDX-LICENSE-IDENTIFIER: MIT
-#
-# 交叉编译 Langlands 载荷的数学库依赖, 产出 riscv64 musl 静态库。
+# Last modified at 2026/10/12 星期一 10:55:24
 #
 #   GMP 6.3.0   任意精度整数与有理数, MPFR 与 FLINT 的底层依赖
 #   MPFR 4.2.2  任意精度浮点
-#   FLINT 3.6.0 数论与任意精度球算术(ball arithmetic)库, 含 arb (带误差界的实数) 与
-#               acb (带误差界的复数), 以及 Dirichlet 特征、Dirichlet L 函数、模形式
-#               (eta, j, 模判别式) 与 Ramanujan tau 函数等现成例程
+#   FLINT 3.6.0 数论与任意精度球算术(ball arithmetic)库, 含arb与acb
+#               以及 Dirichlet 特征、Dirichlet L 函数、模形式
+#               与 Ramanujan tau 函数等现成例程
 #
-# 源码来自仓库根的三个 git 子模块 vendor/gmp / vendor/mpfr / vendor/flint (见 .gitmodules)。
-# GMP 官方只用 Mercurial 管理源码, 不提供 git 仓库, vendor/gmp 是上游 Mercurial 仓库的 git
-# 镜像, 固定在 6.3.0 的发布提交上。
+# 三棵源码树都不含生成好的 configure, 只有 configure.ac 与各自的引导入口, 故本脚本先检查依赖而
+# 再构建;
+# 需安装 autoconf、automake 与 libtool, 缺 libtool 时 Debian 系执行 apt install libtool-bin。
 #
-# 三棵源码树都不含生成好的 configure, 只有 configure.ac 与各自的引导入口, 故本脚本先引导
-# 再构建 (GMP 走 autoreconf); 引导需要本机安装 autoconf、automake 与 libtool, 缺 libtool 时
-# Debian 系执行 apt install libtool-bin。
-#
-# 库的构建在源码树之外进行 (VPATH 构建), 产物落在 build/ 之下; 源码树只被写入引导生成的
-# 文件 (configure、Makefile.in 等), 需要时以 git submodule foreach git clean -xdf 清理。
-#
-# 产物 (位于 .gitignore 的 **/build/ 之下, 不进 git):
-#   build/sysroot/  头文件与静态库, 由各载荷 Makefile 以 DEPS_SYSROOT 引用
-#   build/gmp/  build/mpfr/  build/flint/  三个库的构建目录
+# 产物:
+#   build/sysroot/
+#   build/{gmp,mpfr,flint}  三个库的构建目录
 #   build/logs/     各库的 configure 与编译日志
 #
 # 用法:
 #   ./build-deps.sh                  从 vendor/{gmp,mpfr,flint} 构建
-#   FORCE=1 ./build-deps.sh          重新引导与编译 (先删除 build/)
-#   JOBS=N ./build-deps.sh           指定并行度, 默认取 nproc
+#   FORCE=1 ./build-deps.sh
+#   JOBS=4 ./build-deps.sh
 #   SRC_ROOT=/path ./build-deps.sh   从其它位置的 gmp/ mpfr/ flint/ 源码树构建
-#                                    (该目录下三个源码树的名称与本脚本一致; 用于验证脚本改动)
 
 set -eu
 

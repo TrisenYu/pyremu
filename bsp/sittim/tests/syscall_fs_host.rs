@@ -1,19 +1,6 @@
 //! 文件系统系统调用层在主机目标上的单元测试入口。
-//!
-//! 本层是文件系统模块与载荷之间的转接: 描述符表与打开文件描述、fd 偏移、访问模式判定与
-//! 错误码折算都由它给出, 目录树与文件数据由模块持有。两侧各自的存储形态不同, 故本入口按
-//! 源码包含三处源码: 运行时的 `src/syscall/fs/`、描述符表 `src/syscall/fdtable.rs` 与模块的
-//! 节点层 `modules/fs/src/ramfs.rs`, 后者经 `modules/fs/src/table.rs` 按操作表的形态暴露给
-//! 前者。这样用例覆盖的是两侧真实相遇的那一层, 而不是任一侧单独的桩。
-//!
-//! 本层对平台的依赖集中在三处, 由本文件给出替身: 控制台原语 [`io`]、套接字接口 [`net`]
-//! 与模块取用 [`ext_mod::runtime`]。三处的替身只记录调用与给出可设置的返回值, 不改变本层
-//! 的判定。
-//!
-//! 不在覆盖范围内的一项: 本层经 `read_stdin` 读取标准输入时, 飞地内该原语恒返回文件结束;
-//! 主机侧由 [`io`] 给出可设置的输入源, 故读入路径的正例只在本入口内成立。
-
 #![allow(dead_code)]
+#![allow(unused_imports)]
 
 use core::sync::atomic::Ordering;
 use std::sync::MutexGuard;
@@ -152,12 +139,15 @@ mod ext_mod {
 
 		/// 取用文件系统模块的操作表。首次取用时建立根目录, 与飞地内取入后调用模块入口的
 		/// 效果一致。
-		pub fn acquire_vfs_ops() -> Option<&'static VfsOps> {
+		///
+		/// 宿主未提供该模块时返回 [`ENOENT`](crate::ENOENT), 与飞地内
+		/// `LoadError::NotFound` 的折算一致。
+		pub fn acquire_vfs_ops() -> Result<&'static VfsOps, u64> {
 			if VFS_MISSING.load(Ordering::SeqCst) {
-				return None;
+				return Err(crate::ENOENT);
 			}
 			static OPS: OnceLock<VfsOps> = OnceLock::new();
-			Some(OPS.get_or_init(|| {
+			Ok(OPS.get_or_init(|| {
 				let ops = crate::fs_table::fill_ops();
 				unsafe { (ops.init)() };
 				ops
@@ -433,19 +423,20 @@ mod tests {
 		entries
 	}
 
-	/// 宿主未提供文件系统模块时, 涉及路径的入口一律返回 ENOSYS。
+	/// 宿主未提供文件系统模块时, 涉及路径的入口返回取入失败给出的错误码, 即 ENOENT;
+	/// 该取值与"路径不存在"不同, 但两者在可信应用侧都表示目标不可达。
 	#[test]
-	fn test_path_entries_report_enosys_without_the_module() {
+	fn test_path_entries_report_enoent_without_the_module() {
 		let _guard = world();
 		ext_mod::runtime::VFS_MISSING.store(true, Ordering::SeqCst);
 		let path = cstr("/unreachable");
 		let mut st = StatBuf([0u8; 128]);
 		let stat_ptr = st.0.as_mut_ptr() as u64;
-		assert_eq!(fs::openat_handler(AT_FDCWD, path.as_ptr() as u64, 0, 0), ENOSYS);
-		assert_eq!(fs::mkdirat_handler(AT_FDCWD, path.as_ptr() as u64, 0o755), ENOSYS);
-		assert_eq!(fs::unlinkat_handler(AT_FDCWD, path.as_ptr() as u64, 0), ENOSYS);
-		assert_eq!(fs::faccessat_handler(AT_FDCWD, path.as_ptr() as u64, 0, 0), ENOSYS);
-		assert_eq!(fs::fstatat_handler(AT_FDCWD, path.as_ptr() as u64, stat_ptr, 0), ENOSYS);
+		assert_eq!(fs::openat_handler(AT_FDCWD, path.as_ptr() as u64, 0, 0), ENOENT);
+		assert_eq!(fs::mkdirat_handler(AT_FDCWD, path.as_ptr() as u64, 0o755), ENOENT);
+		assert_eq!(fs::unlinkat_handler(AT_FDCWD, path.as_ptr() as u64, 0), ENOENT);
+		assert_eq!(fs::faccessat_handler(AT_FDCWD, path.as_ptr() as u64, 0, 0), ENOENT);
+		assert_eq!(fs::fstatat_handler(AT_FDCWD, path.as_ptr() as u64, stat_ptr, 0), ENOENT);
 	}
 
 	/// 相对路径只在 dirfd 取 AT_FDCWD 时可用; 绝对路径不受 dirfd 限制。

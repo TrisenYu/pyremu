@@ -580,11 +580,10 @@ class Emulator:
     def close(self) -> None:
         """释放本 Emulator 占用的全部 I/O 资源 (幂等).
 
-        生命周期结束 (调试器退出 / 测试 teardown / GC) 时显式调用:
+        生命周期结束 (调试器退出 / 测试 teardown / GC) 时调用:
         ``TerminalIO.stop()`` 停止后台线程并关闭 3 个管道 (6 个 fd), 再关闭
-        UART hart 日志文件。修复前这些资源从不释放 — 测试套件中每实例泄漏
-        6 个 fd, 累积到 3k+ 后触发 select() fd>=1024 静默死亡 (见
-        [[termio-fd-leak-select-poll]] 记忆)。``__del__`` 兜底未显式 close 的实例。
+        UART hart 日志文件。fd 不释放时每个实例占用 6 个, 进程内 fd 号达到 1024
+        之后 select() 无法监视该 fd。``__del__`` 释放未显式 close 的实例。
         """
         if self._closed:
             return
@@ -595,7 +594,7 @@ class Emulator:
             self.uart.close_logs()
 
     def __del__(self) -> None:
-        """对象回收兜底: 生命周期结束而未显式 close() 的实例也释放 fd."""
+        """对象回收时释放资源: 未显式调用 close() 的实例在此释放 fd."""
         try:
             self.close()
         except Exception:
@@ -1179,10 +1178,10 @@ class Emulator:
     def _native_marshal_uart(self) -> UartInfo:
         """UART info — 让 Rust inline 处理 TXDATA + IE/IP/TXCTRL 寄存器访问.
 
-        TX 环形缓冲和写索引由 TerminalIO 提供。tx_notify_fd 为兼容性字段
-        (Rust 从不写, daemon 靠 poll 超时排空兜底); no_stdout 保持 0, Rust
-        负责即时输出 stdout — 非阻塞写, 对端不可写时丢弃 (见 uart.rs
-        try_write_fd), 防止 CPU 引擎线程阻塞在控制台输出上。
+        发送环形缓冲区与写索引由 TerminalIO 提供。tx_notify_fd 为兼容性字段,
+        Rust 从不写它: 归档线程按 poll 超时读出该缓冲区, 不依赖该通知。
+        no_stdout 保持 0, Rust 负责即时输出 stdout — 非阻塞写, 对端不可写时丢弃
+        (见 uart.rs try_write_fd), 防止 CPU 引擎线程阻塞在控制台输出上。
         """
         if self._termio is None:
             return UartInfo(base=0)
@@ -1190,8 +1189,8 @@ class Emulator:
         ctx = self._native_uart_ffi
         if uart is None or ctx is None:
             return UartInfo(base=0)
-        # 此处只刷新 termio 持有或每次启动会变的字段; 寄存器字段由设备侧状态
-        # 变化时自行同步 (UART._publish_native_regs), 这里再同步一次仅作兜底.
+        # 此处刷新 termio 持有的字段与 UART 基址; 寄存器字段由下一行的
+        # uart._publish_native_regs() 写入.
         ctx.base = uart.base_addr
         ctx.tx_buf = ctypes.cast(self._termio.tx_buf, ctypes.c_void_p).value
         ctx.tx_cap = len(self._termio.tx_buf)
@@ -1682,7 +1681,6 @@ class Emulator:
 
             if use_native:
                 self._speedup_for_cmd_step(active)
-                # 时钟源超时 — 引擎已置 TIMEOUT, 抛出 (死循环/连续执行兜底).
                 if self._run_stop_reason == RunStopReason.TIMEOUT:
                     raise TimeoutError(
                         timeout,

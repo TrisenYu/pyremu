@@ -21,15 +21,14 @@
 
 use core::ptr;
 
+use crate::ext_mod::runtime;
 use crate::syscall::concurrency::sig::{ self, SigState };
 use crate::syscall::concurrency::thread;
-use crate::syscall::{ EAGAIN, ECHILD, EINVAL, ENOMEM, ESRCH };
+use crate::syscall::{ EAGAIN, ECHILD, ENODEV, EINVAL, ENOMEM, ESRCH };
 use crate::constants::{ CHUNK_2M_PAGES, PAGE_SHIFT, TIMER_FREQ };
 use crate::mem_prim::align::align_up;
-use crate::csr;
-use crate::ecall_aux;
-use crate::paging;
-use crate::trap::{ TrapGprs, A0 };
+use crate::{csr, ecall_aux, paging};
+use crate::trap_frame::{ TrapGprs, A0 };
 
 /// 进程表容量。启动进程占用槽位 0。
 pub const NUM_PROCS: usize = 8;
@@ -77,9 +76,9 @@ pub struct ProcCtl {
 	mem_ctx: TaMemCtx,
 }
 
-/// 一个可信应用的内存上下文: 其地址空间上四个推进位置的取值。
+/// 一个可信应用的内存上下文: 其地址空间上五个推进位置的取值。
 ///
-/// 四个取值随地址空间走而不随线程走。进程式 clone 之后父子进程各自继续调用 brk 与
+/// 五个取值随地址空间走而不随线程走。进程式 clone 之后父子进程各自继续调用 brk 与
 /// mmap, 共享同一组取值会使一方的映射落在另一方已经用过的虚拟地址上, 或使双方从
 /// 同一段物理内存取得后备。正在运行的那个应用的一份在 EnclaveContext 中, 其余应用
 /// 的一份随进程控制块保存, 由 activate 在进程切换时换入换出。
@@ -234,7 +233,7 @@ fn current_ta_mem_ctx() -> TaMemCtx {
 /// fork 之后子进程的内存上下文。
 ///
 /// 堆的两个取值直接继承: 子进程的堆页是父进程那些页的副本, 双方此后的 brk 扩堆各自
-/// 经 alloc_umode_page 取新的物理页, 同一虚拟地址在两进程中对应不同的物理页。
+/// 经 mem::grow_umode_va 取新的物理页, 同一虚拟地址在两进程中对应不同的物理页。
 ///
 /// 映射区的两个取值须调整。curr_mmap_pa 指向父进程映射区当前分块的物理内存, 而该
 /// 分块的页已按父进程的映射区虚拟地址段交出; 子进程若沿用, 双方的下一次小块映射会
@@ -276,7 +275,7 @@ fn load_cursors(slot: usize) {
 ///
 /// 由 thread::finalize_switch 在目标线程属于另一个进程时调用。两个地址空间共享
 /// S 模式的全部映射 (运行时自身段、线性窗口、页池、内核栈), 故切换 satp 后仍在
-/// 执行的陷阱处理代码、正要返回的陷阱帧与页表根自身都依然可达。
+/// 执行的陷阱处理代码、正要返回的陷态栈帧与页表根自身都依然可达。
 pub fn activate(slot: usize) {
 	let from = unsafe { CURRENT_PROC };
 	if from == slot {
@@ -338,7 +337,7 @@ pub fn clone_process(gprs: &TrapGprs, flags: u64) -> u64 {
 		return ENOMEM;
 	}
 
-	let child_thread = match thread::spawn_process_thread(child_slot, gprs, gprs.usp) {
+	let child_thread = match thread::spawn_process_thread(child_slot, gprs, gprs.sp_before_trap) {
 		Some(t) => t,
 		None => {
 			return EAGAIN;
@@ -568,6 +567,69 @@ pub fn take_sigreturn() -> Option<u64> {
 		SIGRETURN_SEPC = None;
 		v
 	}
+}
+
+// ---------------------------------------------------------------
+//  模块故障反馈
+// ---------------------------------------------------------------
+
+/// 处置一次由模块引起的故障: 清空该模块的操作表缓存, 把该次故障交回用户态。
+///
+/// 处置分两步。其一, 清除该模块的操作表缓存, 使下一次调用重新向该模块取一次操作表, 而不是
+/// 继续使用出错那份映像登记的表。登记表本身不改动: 一次调用出错只使该次调用失败, 后续调用
+/// 仍取用同一个模块, 宿主重新交付映像之后即可用上修好的那份。其二, 按可信应用对
+/// [`SIGBUS`](sig::SIGBUS) 的处置把故障交回用户态: 有处理函数则在用户帧上建立信号帧,
+/// 无处理函数则终止该进程, 忽略则该次故障不产生别的作用。三种处置下被放弃的系统调用都以
+/// [`ENODEV`] 失败返回。
+///
+/// 返回陷阱入口换栈所用的目标帧基址, 即进入 S 模式的那次陷阱所留的帧; 当前执行流不来自
+/// U 模式时返回 None, 由调用方按管理程序自身缺陷处理。
+pub fn deliver_module_fault(module_id: u32) -> Option<u64> {
+	// 进入 S 模式的那次陷阱留下的恢复点: 被放弃的系统调用与它的返回值位置都由它给出。
+	// 没有该记录说明当前执行流不来自 U 模式, 本次故障没有可交回的可信应用。
+	let (resume_pc, is_failed_call) = match thread::trap_resume() {
+		thread::TrapResume::None => return None,
+		thread::TrapResume::Ecall { next } => (next, true),
+		thread::TrapResume::Interrupted { pc } => (pc, false),
+	};
+
+	// 出错那份映像登记的操作表此后不再交出; 登记保留, 下一次调用重新取用该模块。
+	runtime::clear_module_cache(module_id);
+	// 被放弃的调用不再重新执行, 遗留的重启请求须一并清除。
+	thread::clear_restart();
+	// 用户帧即进入 S 模式的那次陷阱所留的帧, 与 S 模式当前所用的栈不重叠。本次陷阱来自
+	// S 模式之内, 该帧未被改动, 仍保有用户态的寄存器现场。
+	let frame_base = thread::frame_base(thread::current_thread_id());
+	let outer = unsafe { &mut *(frame_base as *mut TrapGprs) };
+	if is_failed_call {
+		outer.regs[A0] = ENODEV;
+	}
+
+	// 本次陷阱来自 S 模式, sstatus.SPP 为 1 而 SPIE 为 0。回到 U 模式要求 SPP 为 0 而
+	// SPIE 为 1: 二者既是本次 sret 的返回目标与中断使能状态, 也随信号帧保存下来供处理
+	// 函数返回时恢复现场。
+	let sstatus = csr::read_sstatus();
+	csr::write_sstatus((sstatus & !csr::SSTATUS_SPP) | csr::SSTATUS_SPIE);
+
+	let state = current_sig();
+	let sepc = match sig::disposition(state, sig::SIGBUS) {
+		sig::Disposition::Handle(handler) => {
+			sig::build_frame(state, sig::SIGBUS, handler, outer, resume_pc)
+		}
+		sig::Disposition::Terminate => {
+			exit_process(unsafe { CURRENT_PROC }, sig::SIGNAL_EXIT_OFFSET + sig::SIGBUS as u64);
+			resume_pc
+		}
+		// 可信应用忽略该信号: 本次故障除弃用该模块之外不产生别的作用。
+		sig::Disposition::Ignore => resume_pc,
+	};
+
+	// 终止进程可能已登记切换目标 (见 exit_process), 由切换收尾一并写好 sepc 与 sstatus。
+	if thread::switch_pending() {
+		return Some(thread::finalize_switch(sepc));
+	}
+	csr::write_sepc(sepc);
+	Some(frame_base)
 }
 
 // ---------------------------------------------------------------

@@ -67,7 +67,7 @@ def seize_val_err(
                 return fn(*args, **kwargs)
             except ValueError:
                 self_arg = args[0] if args else None
-                if err_msg and self_arg is not None and hasattr(self_arg, "_err"):
+                if err_msg and self_arg and hasattr(self_arg, "_err"):
                     self_arg._err(err_msg)
                 elif err_msg:
                     print(f"错误: {err_msg}")
@@ -107,7 +107,7 @@ def print_exc_on_err(fn):
             return fn(*args, **kwargs)
         except Exception:
             self_arg = args[0] if args else None
-            if self_arg is not None and hasattr(self_arg, "_console"):
+            if self_arg and hasattr(self_arg, "_console"):
                 self_arg._console.print_exception()
             else:
                 print(format_exc())

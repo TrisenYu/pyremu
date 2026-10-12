@@ -294,7 +294,7 @@ def decode_fields(instr: int) -> DecodedFields:
     Uses the native Rust library if available; otherwise falls back to
     pure Python.
     """
-    if _lib is not None:
+    if _lib:
         return _lib.decode_fields(instr)
     return _decode_fields_py(instr)
 
@@ -418,7 +418,7 @@ def decode_compressed(half: int) -> CompressedFields:
     Uses the native Rust library if available; otherwise falls back to
     pure Python.
     """
-    if _lib is not None:
+    if _lib:
         return _lib.decode_compressed(half)
     return _decode_compressed_py(half)
 
@@ -479,7 +479,7 @@ def pmp_check(
 
 def sv39_decompose_va(va: int) -> Sv39Vpn:
     """Decompose a 39-bit virtual address into VPN[2:0] and page offset."""
-    if _lib is not None:
+    if _lib:
         return _lib.sv39_decompose_va(va)
     vpn = Sv39Vpn()
     va &= 0xFFFF_FFFF_FFFF_FFFF
@@ -492,7 +492,7 @@ def sv39_decompose_va(va: int) -> Sv39Vpn:
 
 def pte_parse(raw: int) -> PteFields:
     """Parse a raw 64-bit Sv39 PTE into its component fields."""
-    if _lib is not None:
+    if _lib:
         return _lib.pte_parse(raw)
     raw &= 0xFFFF_FFFF_FFFF_FFFF
     PTE_V = 1 << 0
@@ -512,7 +512,7 @@ def pte_parse(raw: int) -> PteFields:
 
 def pte_assemble_pa(ppn: int, va: int, level: int) -> int:
     """Compute physical address from leaf PTE PPN, original VA, and page level."""
-    if _lib is not None:
+    if _lib:
         return _lib.pte_assemble_pa(ppn, va, level)
     if level == 1:
         # 2 MiB superpage: PPN[8:0] from VA[20:12]
@@ -524,7 +524,7 @@ def pte_assemble_pa(ppn: int, va: int, level: int) -> int:
 
 def sv39_page_size(level: int) -> int:
     """Return page size in bytes for a given Sv39 leaf level."""
-    if _lib is not None:
+    if _lib:
         return _lib.sv39_page_size(level)
     return 2 * 1024 * 1024 if level == 1 else 4096
 
@@ -562,7 +562,7 @@ def _alu_ill() -> Alu64:
 
 def exec_alu_op(funct3: int, funct7: int, v1: int, v2: int) -> Alu64:
     """RISC-V R-type ALU: returns Alu64(value, trap)."""
-    if _lib is not None:
+    if _lib:
         return _lib.exec_alu_op(funct3, funct7, v1, v2)
     # Pure Python fallback
     if funct3 == 0b000:
@@ -644,7 +644,7 @@ def exec_alu_op(funct3: int, funct7: int, v1: int, v2: int) -> Alu64:
 
 def exec_op_imm(funct3: int, funct7: int, v1: int, imm: int) -> Alu64:
     """RISC-V I-type ALU: returns Alu64(value, trap)."""
-    if _lib is not None:
+    if _lib:
         return _lib.exec_op_imm(funct3, funct7, v1, imm)
     shamt = imm & 0x3F
     funct6 = funct7 >> 1
@@ -676,7 +676,7 @@ def exec_op_imm(funct3: int, funct7: int, v1: int, imm: int) -> Alu64:
 
 def exec_op32(funct3: int, funct7: int, v1: int, v2: int) -> Alu64:
     """RISC-V RV64 32-bit word ALU: returns Alu64(value, trap)."""
-    if _lib is not None:
+    if _lib:
         return _lib.exec_op32(funct3, funct7, v1, v2)
     w1 = v1 & 0xFFFF_FFFF
     w2 = v2 & 0xFFFF_FFFF
@@ -722,7 +722,7 @@ def exec_op32(funct3: int, funct7: int, v1: int, v2: int) -> Alu64:
 
 def exec_op_imm32(funct3: int, funct7: int, v1: int, imm: int) -> Alu64:
     """RISC-V RV64 32-bit immediate ALU: returns Alu64(value, trap)."""
-    if _lib is not None:
+    if _lib:
         return _lib.exec_op_imm32(funct3, funct7, v1, imm)
     w1 = v1 & 0xFFFF_FFFF
     shamt = imm & 0x1F
@@ -793,7 +793,7 @@ def bus_read_ram(
     Returns 1 if the address falls within RAM (primary or shadow); 0 otherwise.
     Caller falls back to device / L2-cache / error logic on failure.
     """
-    if _lib is not None:
+    if _lib:
         return _lib.bus_read_ram(
             ram_buf,
             ram_size,
@@ -821,7 +821,7 @@ def bus_write_ram(
 
     Returns 1 if the address falls within RAM; 0 otherwise.
     """
-    if _lib is not None:
+    if _lib:
         return _lib.bus_write_ram(
             ram_buf,
             ram_size,
@@ -1252,30 +1252,30 @@ def run_parallel(
     # --- FfiPmpCtx ---
     _pmp_cfg_buf = None
     _pmp_addr_buf = None
-    if pmp is not None and pmp.num > 0:
+    if pmp and pmp.num > 0:
         _pmp_cfg_buf = pmp.cfg
         _pmp_addr_buf = pmp.addr
 
     pmp_ffi = FfiPmpCtx()
     pmp_ffi.cfg = ctypes.cast(_pmp_cfg_buf, ctypes.c_void_p).value if _pmp_cfg_buf else 0
     pmp_ffi.addr = ctypes.cast(_pmp_addr_buf, ctypes.c_void_p).value if _pmp_addr_buf else 0
-    pmp_ffi.num = pmp.num if pmp is not None else 0
-    pmp_ffi.pmpsplit = pmp.pmpsplit if pmp is not None else 0
+    pmp_ffi.num = pmp.num if pmp else 0
+    pmp_ffi.pmpsplit = pmp.pmpsplit if pmp else 0
 
     # --- FfiClintCtx ---
     nh = max(int(num_harts), 1)
     _mtc_buf = (ctypes.c_uint64 * nh)()
     _msip_buf = (ctypes.c_uint8 * nh)()
     _mtime_val = ctypes.c_uint64(0)
-    if clint is not None:
+    if clint:
         _mtime_val.value = clint.mtime
-        if clint.mtimecmp is not None:
+        if clint.mtimecmp:
             for i in range(min(nh, len(clint.mtimecmp))):
                 _mtc_buf[i] = int(clint.mtimecmp[i])
         else:
             for i in range(nh):
                 _mtc_buf[i] = 0xFFFF_FFFF_FFFF_FFFF
-        if clint.msip is not None:
+        if clint.msip:
             for i in range(min(nh, len(clint.msip))):
                 _msip_buf[i] = int(clint.msip[i])
     else:
@@ -1286,12 +1286,12 @@ def run_parallel(
     clint_ffi.mtime = ctypes.addressof(_mtime_val)
     clint_ffi.mtimecmp = ctypes.cast(_mtc_buf, ctypes.c_void_p).value
     clint_ffi.msip = ctypes.cast(_msip_buf, ctypes.c_void_p).value
-    clint_ffi.base = clint.base if clint is not None else 0
-    clint_ffi.timebase_hz = clint.timebase_hz if clint is not None else 0
+    clint_ffi.base = clint.base if clint else 0
+    clint_ffi.timebase_hz = clint.timebase_hz if clint else 0
 
     # --- DevMMIOAddrInfo ---
     dev_ffi = DevMMIOAddrInfo()
-    if dev is not None and dev.bases is not None and dev.ends is not None:
+    if dev and dev.bases and dev.ends:
         dev_ffi.bases = ctypes.cast(dev.bases, ctypes.c_void_p).value
         dev_ffi.ends = ctypes.cast(dev.ends, ctypes.c_void_p).value
         dev_ffi.num = len(dev.bases)
@@ -1299,11 +1299,14 @@ def run_parallel(
     # --- FfiUartCtx ---
     # 调用方提供持久上下文时直接复用 (其寄存器字段由设备侧持续改写, 见
     # UART._publish_native_regs); 否则按参数值构建一次性快照.
-    uart_ffi = uart.ffi if uart is not None and uart.ffi is not None else FfiUartCtx()
+    uart_ffi = uart.ffi if uart and uart.ffi else FfiUartCtx()
     _tx_buf = None
     _tx_wr = None
-    if uart is not None and uart.ffi is None:
+    if uart and uart.ffi is None:
         uart_ffi.base = uart.base
+        # 这三项按"是否提供"判定, 不能用真值判定: 它们可以是 ctypes 标量, 其真值
+        # 取自当前取值 (c_uint32(0) 与 c_uint8(0) 均为假), 真值判定会把取值为 0 的
+        # 写游标与接收通知标志当作未提供, 从而向引擎传空指针.
         if uart.tx_buf is not None:
             _tx_buf = uart.tx_buf
             uart_ffi.tx_buf = ctypes.cast(_tx_buf, ctypes.c_void_p).value
@@ -1324,7 +1327,7 @@ def run_parallel(
     # --- FfiVirtIOCtx ---
     _virtio_ffi = FfiVirtIOCtx()
     _virtio_ffi_ptr = None
-    if virtio is not None and virtio.base != 0:
+    if virtio and virtio.base != 0:
         _virtio_ffi.base = virtio.base
         _virtio_ffi.capacity = virtio.capacity
         _virtio_ffi.queue_num_max = virtio.queue_num_max
@@ -1344,7 +1347,7 @@ def run_parallel(
     # --- FfiPlicCtx --- 持久数组指针直传 (Rust inline 读写, 设备线程 write-through)
     _plic_ffi = FfiPlicCtx()
     _plic_ffi_ptr = None
-    if plic is not None and plic.base != 0:
+    if plic and plic.base != 0:
         _plic_ffi.base = plic.base
         _plic_ffi.num_sources = plic.num_sources
         _plic_ffi.num_contexts = plic.num_contexts
@@ -1368,6 +1371,9 @@ def run_parallel(
     _hart_ctx.states = ctypes.cast(states, ctypes.c_void_p).value or 0
     _hart_ctx.num_harts = num_harts
     _hart_ctx.result = ctypes.cast(ctypes.byref(result), ctypes.c_void_p).value or 0
+    # 这几个参数按"是否提供"判定, 不能用真值判定: ctypes 标量的真值取自它的当前
+    # 取值 (c_uint8(0) 为假), 真值判定会把取值为 0 的停止标志与代数计数器当作
+    # 未提供, 从而向引擎传空指针.
     _hart_ctx.stop_flag = (
         ctypes.cast(ctypes.pointer(stop_flag), ctypes.c_void_p).value
         if stop_flag is not None else 0
@@ -1430,17 +1436,17 @@ def run_parallel(
     # Also sync MSIP and MTIMECMP — concurrent CLINT inline handling may have
     # modified the shared atomic arrays; copy modifications back to the
     # caller's ClintInfo so the emulator's CLINT sync path picks them up.
-    if clint is not None:
+    if clint:
         clint.mtime = _mtime_val.value
-        if clint.msip is not None:
+        if clint.msip:
             for i in range(min(nh, len(clint.msip))):
                 clint.msip[i] = int(_msip_buf[i])
-        if clint.mtimecmp is not None:
+        if clint.mtimecmp:
             for i in range(min(nh, len(clint.mtimecmp))):
                 clint.mtimecmp[i] = int(_mtc_buf[i])
 
     # Return the virtio FFI struct so the caller can read back changed fields.
-    return _virtio_ffi if virtio is not None else None
+    return _virtio_ffi if virtio else None
 
 
 # ============================================================
@@ -1529,7 +1535,7 @@ def termio_start(handle: TermIoHandle) -> int:
 
 def termio_stop() -> None:
     """Signal the I/O thread to stop and wait for it to exit."""
-    if _termio_lib is not None:
+    if _termio_lib:
         _termio_lib.terminal_io_stop()
 
 
@@ -1542,7 +1548,7 @@ def termio_attach(handle: TermIoHandle) -> int:
 
 def termio_is_running() -> bool:
     """Return True if the terminal I/O thread is currently running."""
-    if _termio_lib is not None:
+    if _termio_lib:
         return _termio_lib.terminal_io_is_running() != 0
     return False
 
@@ -1554,6 +1560,6 @@ def termio_set_emu_stop_flag(ptr: int) -> None:
     Ctrl+Q 时直接写该标志, 绕过 SIGINT -> Python handler 往返 (主线程阻塞在
     run_parallel 时信号处理器不执行, 直连路径保证 Rust 引擎仍能即时停止).
     """
-    if _termio_lib is not None:
+    if _termio_lib:
         _termio_lib.terminal_io_set_emu_stop_flag(ptr)
 

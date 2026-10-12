@@ -236,10 +236,11 @@ mem_read(hart, va, size) / mem_write(hart, va, data)
 - 设备 MMIO 绕过 L2 缓存, 直通设备 (读写可能有副作用)
 - `AccessFaultError` 供上层 PMA 违例使用
 
-**安全读写** — Bus 同时提供不抛异常的版本, 供调试器等外部调用方使用:
-- `try_read(addr, size) -> bytes | None` — 失败返回 None
-- `try_write(addr, data) -> bool` — 失败返回 False
-- 将设备/L2 缓存异常统一转换为返回值, 调用方无需 try/except
+**安全读写** — Bus 提供供调试器等外部调用方使用的读写入口:
+- `try_read(addr, size) -> bytes` — 与 `read()` 同一入口, 自身不捕获异常; 未落入任何设备与
+  RAM 窗口的地址返回 `size` 个零字节, 设备读实现抛出的异常沿 `read()` 向上传播
+- `try_write(addr, data) -> bool` — 将设备/L2 缓存的异常转换为 False 返回值, 调用方无需
+  try/except
 
 ### Trap handling & delegation
 
@@ -783,14 +784,16 @@ def mem_read(hart: HartWithRegs, addr: int, size: int) -> bytes: ...
 当多个调用方围绕同一 API 重复 try/except 时, 应在 API 层提供安全包装:
 
 ```python
-# ❌ 每个调用方各自 try/except
-try: data = bus.read(addr, 4)
-except Exception: data = None
-
-# ✅ 在 API 层一次性封装
-def try_read(self, addr, size) -> bytes | None: ...
-data = bus.try_read(addr, 4)
-if data is None: ...
+# 合理的做法
+@seize_err_if_any()
+def foo(): ...
+# 不太合理的做法
+def foo():
+	try:
+		...
+	except Exception as e:
+		print(e)
+		return
 ```
 
 ## Error handling

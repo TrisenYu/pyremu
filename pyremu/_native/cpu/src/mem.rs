@@ -32,7 +32,10 @@ fn ram_offset(
 	shadow_base: u64,
 	shadow_size: u64,
 ) -> Option<u64> {
-	let end = pa + size as u64;
+	// checked_add: 调用方传入的 pa 是任意 64 位值, 其中包含 Python 侧由
+	// 负数地址经 ctypes 转换得到的 2^64-1 一类取值. 使下面的范围判定误判为
+	// 命中, 随后的拷贝越过 bytearray 造成越界访问.
+	let end = pa.checked_add(size as u64)?;
 	// Primary RAM window
 	if pa >= ram_base && end <= ram_base + ram_size {
 		return Some(pa - ram_base);
@@ -219,6 +222,56 @@ mod tests {
 			0x8000_0010,
 			&0u8 as *const u8,
 			4,
+		);
+		assert_eq!(ok, 0);
+	}
+
+	/// 地址加长度按模 2^64 回卷时不得判为窗口内命中.
+	///
+	/// 触发值 `u64::MAX` 即 Python 侧负数地址 (如 fp-16 得到 -1) 经 ctypes
+	/// 转换后的取值: 加 8 回卷为 7, 落在 [ram_base, ram_base + ram_size) 之内,
+	/// 修复前会据此算出 0xFFFF_FFFF_7FFF_FFFF 的偏移并越界拷贝.
+	#[test]
+	fn test_read_addr_wraparound_rejected() {
+		let ram: Vec<u8> = vec![0; 16];
+		let mut out = [0u8; 8];
+		let ok = bus_read_ram(
+			ram.as_ptr(),
+			16,
+			0x8000_0000,
+			0,
+			0,
+			u64::MAX,
+			8,
+			out.as_mut_ptr(),
+		);
+		assert_eq!(ok, 0);
+
+		let ok = bus_read_ram(
+			ram.as_ptr(),
+			16,
+			0x8000_0000,
+			0,
+			0,
+			u64::MAX - 3,
+			8,
+			out.as_mut_ptr(),
+		);
+		assert_eq!(ok, 0);
+	}
+
+	#[test]
+	fn test_write_addr_wraparound_rejected() {
+		let mut ram: Vec<u8> = vec![0; 16];
+		let ok = bus_write_ram(
+			ram.as_mut_ptr(),
+			16,
+			0x8000_0000,
+			0,
+			0,
+			u64::MAX,
+			&0u8 as *const u8,
+			8,
 		);
 		assert_eq!(ok, 0);
 	}

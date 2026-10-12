@@ -8,12 +8,21 @@
 #![allow(dead_code)]
 
 pub mod abi;
+pub mod img_descriptor;
 pub mod loader;
 pub mod man;
 pub mod net_ops;
 pub mod table;
 pub mod transport;
 pub mod vfs_ops;
+
+/// 系统调用的错误码。
+///
+/// 取入失败经系统调用的返回值上报给可信应用, 故取入路径要取用错误码。而取入路径在主机
+/// 目标的用例入口内也要编译, 该入口不含 `crate::syscall`。错误码单独成篇, 故按源码路径
+/// 包含它: 本模块与 `crate::syscall::errno` 是同一份文件。
+#[path = "../syscall/errno.rs"]
+pub mod errno;
 
 #[cfg(target_arch = "riscv64")]
 pub mod runtime;

@@ -3,8 +3,20 @@
 #
 # 扩展模块映像的构建与签名。
 #
-# 模块映像是一份连续的二进制文件: 没有 ELF 头, 没有重定位项, 模块入口在文件偏移 0,
-# 末尾 64 字节是 ECDSA (secp256r1) 签名 r‖s。签名者为 bsp/tee_aux_tools/sign-mod。
+# 模块映像是一份连续的二进制文件: 没有 ELF 头, 没有重定位项, 末尾 64 字节是 ECDSA
+# (secp256r1) 签名 r‖s。签名者为 bsp/tee_aux_tools/sign-mod。
+#
+# 映像偏移 0 处是 64 字节的映像描述块, 由 module.ld 的段内数据命令生成: 它声明模块入口在
+# 映像内的偏移、映像本体的字节数与可写静态数据的起始偏移。取入方按声明的偏移调用入口, 并在
+# 调用之前逐项核对描述块, 不符即拒绝, 见 src/ext_mod/img_descriptor.rs。入口偏移自此不为 0,
+# 故按旧约定构建的映像与本批映像互不兼容, modules/ 与固件的重建须同批进行。
+#
+# 映像中初值非零的部分即描述块、.text 与 .rodata, 由 objcopy 连续写出, 映像本体的末尾由
+# module.ld 的 _image_body_end 给出。可写的静态数据须全部落在 BSS 段, 且该段的起始地址须等于
+# 映像本体按页取整的结果: 取入方自映像起点至该边界按指令类映射为可读可执行, 槽位其余部分按
+# 数据类映射为可读写, 故落在可执行部分之内的可写数据在装入后不可写。BSS 段不含初值, 因而不
+# 写入映像文件。这两项约束由 module.ld 强制: 该脚本把 BSS 段的起始地址对齐到页边界, 并在
+# .data 段非空时中断链接。
 #
 # 位置无关性由编译参数保证, 并由 check-pic 目标逐次核对:
 #   relocation-model=pic 使取址按当前 PC 计算, 大型 switch 的分支表 (.LJTI) 随之取
@@ -35,7 +47,7 @@ CARGO_OUT   := target/$(TARGET)/release
 
 BUILD_DIR := build
 
-# 部署目录: 各映像扁平放入, 并附上清单 modules.list. 清单所列的文件名相对该目录给出,
+# 部署目录: 各映像放入, 并附上清单 modules.list. 清单所列的文件名相对该目录给出,
 # 与映像在此目录中的名称一致. rootfs 侧的安装直接取本目录的内容.
 DIST_DIR := dist
 
@@ -69,7 +81,7 @@ check-pic: $(MODULES:%=$(BUILD_DIR)/%.bin)
 	@mkdir -p $(PIC_CHECK_DIR)
 	@for m in $(MODULES); do \
 		$(LD) -T module.ld --image-base=$(PIC_CHECK_BASE) $(CARGO_OUT)/lib$$m.a -o $(PIC_CHECK_DIR)/$$m.elf; \
-		$(OBJCOPY) -O binary --set-section-flags .bss=alloc,load,contents $(PIC_CHECK_DIR)/$$m.elf $(PIC_CHECK_DIR)/$$m.bin; \
+		$(OBJCOPY) -O binary $(PIC_CHECK_DIR)/$$m.elf $(PIC_CHECK_DIR)/$$m.bin; \
 		if ! cmp -s $(BUILD_DIR)/$$m.bin $(PIC_CHECK_DIR)/$$m.bin; then \
 			echo "$$m: different binary file"; exit 1; \
 		fi; \
@@ -89,7 +101,7 @@ $(BUILD_DIR)/%.elf: $(CARGO_OUT)/lib%.a module.ld
 	$(LD) -T module.ld $< -o $@
 
 $(BUILD_DIR)/%.bin: $(BUILD_DIR)/%.elf
-	$(OBJCOPY) -O binary --set-section-flags .bss=alloc,load,contents $< $@
+	$(OBJCOPY) -O binary $< $@
 
 $(BUILD_DIR)/%.signed.bin: $(BUILD_DIR)/%.bin $(SIGN_TOOL)
 	$(SIGN_TOOL) $(KEY) $< $@

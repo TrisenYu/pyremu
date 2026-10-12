@@ -6,6 +6,11 @@
 incremental = true
 target = "riscv64imacfd-unknown-none-elf"
 
+[env]
+# 宿主用例共用进程内的全局状态: 页表根、桩件的调用记录、S 模式页池。用例依次执行,
+# 使各用例读到的是自己写入的状态。
+RUST_TEST_THREADS = "1"
+
 [target.riscv64imac-unknown-none-elf]
 # 必要时再切回扩充厂商私有指令的编译器
 linker = "/usr/bin/ld.lld"

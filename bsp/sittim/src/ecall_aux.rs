@@ -88,13 +88,32 @@ pub fn enclave_call_module_result() -> (u64, u64, u64, u64) {
 /// 才让出请求交付。返回 0 表示已登记, 其余取值为 SBI 错误码。
 #[inline]
 pub fn enclave_call_module_img_recv_buf(va: u64, len: u64) -> u64 {
-	unsafe { ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_MODULE_IMG_RECV_BUF, va, len, 0) }.0
+	(unsafe { ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_MODULE_IMG_RECV_BUF, va, len, 0) }).0
 }
 
 /// Request 2 MiB memory chunks from M-mode.
+/// `attr` 给出这批分区的类别, 取值见 ENCLAVE_MEM_ATTR_*.
 /// Returns `(allocated_count, physical_address)`.
-pub fn enclave_call_mem_alloc(chunk_nums: u64) -> (u64, u64) {
-	unsafe { ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_MEM_ALLOC, 0, chunk_nums, 0) }
+pub fn enclave_call_mem_alloc(chunk_nums: u64, attr: u64) -> (u64, u64) {
+	unsafe { ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_MEM_ALLOC, 0, chunk_nums, attr) }
+}
+
+/// 设置 [paddr, paddr + partition_num * 2 MiB) 的类别。
+/// 区间须按 2 MiB 分区对齐并整体落在本飞地拥有的分区内。
+/// 返回 0 表示成功, 其余取值为 SBI 错误码。
+#[inline]
+pub fn enclave_call_set_mem_attr(paddr: u64, partition_num: u64, attr: u64) -> u64 {
+	(
+		unsafe {
+			ecall_3(
+				ENCLAVE_EXT_ID,
+				ENCLAVE_CALL_SET_MEM_CLASS,
+				paddr,
+				partition_num,
+				attr
+			)
+		}
+	).0
 }
 
 /// Query remaining pool capacity from M-mode.
@@ -171,21 +190,17 @@ pub fn enclave_call_get_rand_num(buf: &mut [u8]) -> u64 {
 	let Some(pa) = va_to_pa(buf.as_ptr() as u64) else {
 		return 0;
 	};
-	unsafe { ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_GET_RAND_NUM, pa, buf.len() as u64, 0) }.0
+	(
+		unsafe {
+			ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_GET_RAND_NUM, pa, buf.len() as u64, 0)
+		}
+	).0
 }
 
-/// Forward an unmatched access fault to M-mode for diagnosis.
-/// Called when S-mode cannot resolve a load/store access fault (scause 5/7).
 #[inline]
-pub fn enclave_call_unmatched_acc_fault(stval: u64) {
+pub fn enclave_call_unmatched_acc_fault(stval: u64, scause: u64) {
 	unsafe {
-		ecall_3(
-			ENCLAVE_EXT_ID,
-			ENCLAVE_CALL_UNMATCHED_ACC_FAULT,
-			stval,
-			0,
-			0,
-		);
+		ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_UNMATCHED_ACC_FAULT, stval, scause, 0);
 	}
 }
 

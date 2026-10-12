@@ -29,7 +29,9 @@ pub(crate) fn atomic_minmax_u32(atomic: &AtomicU32, funct5: u8, rs2: u32) -> u64
 				return 0;
 			}
 		};
-		match atomic.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
+		match
+			atomic.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed)
+		{
 			Ok(v) => {
 				return v as u64;
 			}
@@ -52,7 +54,9 @@ pub(crate) fn atomic_minmax_u64(atomic: &AtomicU64, funct5: u8, rs2: u64) -> u64
 				return 0;
 			}
 		};
-		match atomic.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
+		match
+			atomic.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed)
+		{
 			Ok(v) => {
 				return v;
 			}
@@ -60,6 +64,161 @@ pub(crate) fn atomic_minmax_u64(atomic: &AtomicU64, funct5: u8, rs2: u64) -> u64
 				continue;
 			}
 		}
+	}
+}
+
+/// LR.W / LR.D: load the word or doubleword at *off* and record the reservation at *pa*.
+///
+/// RISC-V spec §8.2: LR.W sign-extends the loaded 32-bit value to 64 bits on RV64.
+#[inline]
+fn exec_lr(state: &mut HartState, width: u8, rd: u8, pa: u64, off: usize, ctx: &WalkCtx) {
+	let loaded: u64 = if width == 4 {
+		let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
+		let raw = atomic.load(Ordering::Acquire);
+		raw as i32 as i64 as u64
+	} else {
+		let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU64) };
+		atomic.load(Ordering::Acquire)
+	};
+	state.reservation_valid = 1;
+	state.reservation_addr = pa;
+	state.reservation_value = loaded;
+	// Register this reservation so other harts' stores will clear it.
+	lr_set(ctx, state.mhartid as u8, pa);
+	state.gprs[rd as usize] = if rd != 0 { loaded } else { 0 };
+}
+
+/// SC.W / SC.D: write *rs2_val* at *off* if the reservation at *pa* is still held.
+#[inline]
+fn exec_sc(
+	state: &mut HartState,
+	width: u8,
+	rs2_val: u64,
+	rd: u8,
+	pa: u64,
+	off: usize,
+	ctx: &WalkCtx
+) {
+	let shared_ok = lr_check(ctx, state.mhartid as u8, pa);
+	if !shared_ok || state.reservation_valid == 0 || state.reservation_addr != pa {
+		state.reservation_valid = 0;
+		if rd != 0 {
+			state.gprs[rd as usize] = 1;
+		}
+		return;
+	}
+	// Clear ALL reservations BEFORE the CAS, with SeqCst fence,
+	// so other harts see the clear before (or with) the new value.
+	lr_clear_all(ctx);
+	std::sync::atomic::fence(Ordering::SeqCst);
+	// CAS with the LR-loaded value as expected.
+	let success = if width == 4 {
+		let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
+		atomic
+			.compare_exchange(
+				state.reservation_value as u32,
+				rs2_val as u32,
+				Ordering::Release,
+				Ordering::Relaxed
+			)
+			.is_ok()
+	} else {
+		let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU64) };
+		atomic
+			.compare_exchange(
+				state.reservation_value,
+				rs2_val,
+				Ordering::Release,
+				Ordering::Relaxed
+			)
+			.is_ok()
+	};
+	state.reservation_valid = 0;
+	if rd != 0 {
+		state.gprs[rd as usize] = if success { 0 } else { 1 };
+	}
+}
+
+/// AMOSWAP / AMOADD / AMOXOR / AMOAND / AMOOR / AMOMIN / AMOMAX / AMOMINU / AMOMAXU:
+/// read the word or doubleword at *off*, combine it with *rs2_val* per *funct5*,
+/// write the result back, and return the pre-write value in *rd*.
+#[inline]
+fn exec_amo_rmw(
+	state: &mut HartState,
+	funct5: u8,
+	width: u8,
+	rs2_val: u64,
+	rd: u8,
+	off: usize,
+	ctx: &WalkCtx
+) {
+	// Clear reservations BEFORE the atomic write (ABA fix).
+	lr_clear_all(ctx);
+	std::sync::atomic::fence(Ordering::SeqCst);
+	let old: u64 = if width == 4 {
+		let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
+		let rv = rs2_val as u32;
+		match funct5 {
+			0b00001 => atomic.swap(rv, Ordering::AcqRel) as u64,
+			0b00000 => atomic.fetch_add(rv, Ordering::AcqRel) as u64,
+			0b00100 => atomic.fetch_xor(rv, Ordering::AcqRel) as u64,
+			0b01100 => atomic.fetch_and(rv, Ordering::AcqRel) as u64,
+			0b01000 => atomic.fetch_or(rv, Ordering::AcqRel) as u64,
+			_ => atomic_minmax_u32(atomic, funct5, rv),
+		}
+	} else {
+		let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU64) };
+		let old_val = match funct5 {
+			0b00001 => atomic.swap(rs2_val, Ordering::AcqRel),
+			0b00000 => atomic.fetch_add(rs2_val, Ordering::AcqRel),
+			0b00100 => atomic.fetch_xor(rs2_val, Ordering::AcqRel),
+			0b01100 => atomic.fetch_and(rs2_val, Ordering::AcqRel),
+			0b01000 => atomic.fetch_or(rs2_val, Ordering::AcqRel),
+			_ => atomic_minmax_u64(atomic, funct5, rs2_val),
+		};
+		old_val
+	};
+	if rd != 0 {
+		state.gprs[rd as usize] = if width == 4 { old as u64 } else { old };
+	}
+}
+
+/// Execute one LR / SC / AMO operation per the ``funct5`` field.
+/// Returns the PC advance (4), or 0 for an illegal encoding (caller handles).
+#[inline]
+fn exec_amo_op(
+	state: &mut HartState,
+	funct5: u8,
+	width: u8,
+	rs2_val: u64,
+	rd: u8,
+	pa: u64,
+	off: usize,
+	ctx: &WalkCtx
+) -> u64 {
+	match funct5 {
+		0b00010 => {
+			exec_lr(state, width, rd, pa, off, ctx);
+			4
+		}
+		0b00011 => {
+			exec_sc(state, width, rs2_val, rd, pa, off, ctx);
+			4
+		}
+		// AMOSWAP / AMOADD / AMOXOR / AMOAND / AMOOR / AMOMIN / AMOMAX / AMOMINU / AMOMAXU
+		| 0b00001
+		| 0b00000
+		| 0b00100
+		| 0b01100
+		| 0b01000
+		| 0b10000
+		| 0b10100
+		| 0b11000
+		| 0b11100 => {
+			exec_amo_rmw(state, funct5, width, rs2_val, rd, off, ctx);
+			4
+		}
+		_ => 0, // illegal — caller handles
 	}
 }
 
@@ -98,7 +257,14 @@ pub(crate) fn handle_amo_concurrent(
 	}
 
 	let off = match
-		ram_offset(pa, width as u32, ctx.ram_base, ctx.ram_size, ctx.shadow_base, ctx.shadow_size)
+		ram_offset(
+			pa,
+			width as u32,
+			ctx.ram_base,
+			ctx.ram_size,
+			ctx.shadow_base,
+			ctx.shadow_size
+		)
 	{
 		Some(o) => o as usize,
 		None => {
@@ -106,99 +272,7 @@ pub(crate) fn handle_amo_concurrent(
 		}
 	};
 
-	match funct5 {
-		0b00010 => {
-			// LR.W / LR.D
-			// RISC-V spec §8.2: LR.W sign-extends the loaded 32-bit value to
-			// 64 bits on RV64.
-			let loaded: u64 = if width == 4 {
-				let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
-				let raw = atomic.load(Ordering::Acquire);
-				raw as i32 as i64 as u64
-			} else {
-				let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU64) };
-				atomic.load(Ordering::Acquire)
-			};
-			state.reservation_valid = 1;
-			state.reservation_addr = pa;
-			state.reservation_value = loaded;
-			// Register this reservation so other harts' stores will clear it.
-			lr_set(ctx, state.mhartid as u8, pa);
-			state.gprs[rd as usize] = if rd != 0 { loaded } else { 0 };
-			4
-		}
-		0b00011 => {
-			// SC.W / SC.D
-			let shared_ok = lr_check(ctx, state.mhartid as u8, pa);
-			if !shared_ok || state.reservation_valid == 0 || state.reservation_addr != pa {
-				state.reservation_valid = 0;
-				if rd != 0 {
-					state.gprs[rd as usize] = 1;
-				}
-				return 4;
-			}
-			// Clear ALL reservations BEFORE the CAS, with SeqCst fence,
-			// so other harts see the clear before (or with) the new value.
-			lr_clear_all(ctx);
-			std::sync::atomic::fence(Ordering::SeqCst);
-			// CAS with the LR-loaded value as expected.
-			let success = if width == 4 {
-				let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
-				atomic
-					.compare_exchange(
-						state.reservation_value as u32,
-						rs2_val as u32,
-						Ordering::Release,
-						Ordering::Relaxed
-					)
-					.is_ok()
-			} else {
-				let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU64) };
-				atomic
-					.compare_exchange(state.reservation_value, rs2_val, Ordering::Release, Ordering::Relaxed)
-					.is_ok()
-			};
-			state.reservation_valid = 0;
-			if rd != 0 {
-				state.gprs[rd as usize] = if success { 0 } else { 1 };
-			}
-			4
-		}
-		// AMOSWAP / AMOADD / AMOXOR / AMOAND / AMOOR / AMOMIN / AMOMAX / AMOMINU / AMOMAXU
-		0b00001 | 0b00000 | 0b00100 | 0b01100 | 0b01000 | 0b10000 | 0b10100 | 0b11000 | 0b11100 => {
-			// Clear reservations BEFORE the atomic write (ABA fix).
-			lr_clear_all(ctx);
-			std::sync::atomic::fence(Ordering::SeqCst);
-			let old: u64 = if width == 4 {
-				let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU32) };
-				let rv = rs2_val as u32;
-				match funct5 {
-					0b00001 => atomic.swap(rv, Ordering::AcqRel) as u64,
-					0b00000 => atomic.fetch_add(rv, Ordering::AcqRel) as u64,
-					0b00100 => atomic.fetch_xor(rv, Ordering::AcqRel) as u64,
-					0b01100 => atomic.fetch_and(rv, Ordering::AcqRel) as u64,
-					0b01000 => atomic.fetch_or(rv, Ordering::AcqRel) as u64,
-					_ => atomic_minmax_u32(atomic, funct5, rv),
-				}
-			} else {
-				let atomic = unsafe { &*(ctx.ram.add(off) as *const AtomicU64) };
-				let old_val = match funct5 {
-					0b00001 => atomic.swap(rs2_val, Ordering::AcqRel),
-					0b00000 => atomic.fetch_add(rs2_val, Ordering::AcqRel),
-					0b00100 => atomic.fetch_xor(rs2_val, Ordering::AcqRel),
-					0b01100 => atomic.fetch_and(rs2_val, Ordering::AcqRel),
-					0b01000 => atomic.fetch_or(rs2_val, Ordering::AcqRel),
-					_ => atomic_minmax_u64(atomic, funct5, rs2_val),
-				};
-				old_val
-			};
-			if rd != 0 {
-				state.gprs[rd as usize] = if width == 4 { old as u64 } else { old };
-			}
-			4
-		}
-		_ => 0, // illegal — caller handles
-	}
+	exec_amo_op(state, funct5, width, rs2_val, rd, pa, off, ctx)
 }
 
 pub(crate) fn handle_amo_concurrent_dispatch(
@@ -264,7 +338,17 @@ pub(crate) fn handle_amo_concurrent_dispatch(
 		return EXIT_SENTINEL;
 	}
 
-	let advance = handle_amo_concurrent(state, funct5, f.func3, rs2_val, f.rd, tr.pa, ctx, pmp, dev);
+	let advance = handle_amo_concurrent(
+		state,
+		funct5,
+		f.func3,
+		rs2_val,
+		f.rd,
+		tr.pa,
+		ctx,
+		pmp,
+		dev
+	);
 
 	if advance == EXIT_SENTINEL {
 		let info = StopInfo {

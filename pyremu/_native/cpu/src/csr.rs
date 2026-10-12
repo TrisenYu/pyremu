@@ -267,10 +267,6 @@ pub fn csr_read(ctx: &mut CsrContext, addr: u16) -> (u64, u8) {
         // but reading them should not trap. Return 0.
         0xC00 | 0xC02 | 0xC80 | 0xC82 => (0, CSR_OK),
 
-        // TEE CSRs (mdid=0x5C0, pmpsplit=0x5C1) — memory domain ID
-        // and PMP virtualization split register.
-        // mdid 是完整 64-bit: 收窄到 u8 会使 >=256 的飞地 ID 别名回 0 (host),
-        // 既绕过 PMP 隔离 (mdid!=0 判定失效), 又让 SUSPEND handler 误判 host.
         0x5C0 => (ctx.state.mdid, CSR_OK),
         0x5C1 => (ctx.state.pmpsplit as u64, CSR_OK),
 
@@ -362,7 +358,6 @@ pub fn csr_read(ctx: &mut CsrContext, addr: u16) -> (u64, u8) {
             }
             let mut val: u64 = 0;
             let base = entry_base as usize;
-            // 仅读取 [base, num) 内的条目, 越界条目按 0 处理 (未实现).
             let n = ((ctx.pmp.num as usize) - base).min(8);
             for i in 0..n {
                 let b = unsafe { *ctx.pmp.cfg.add(base + i) } as u64;
@@ -514,8 +509,6 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
             CSR_OK
         }
 
-        // TEE CSRs (mdid / pmpsplit)
-        // mdid 完整 64-bit 保存 — 见读路径注释, 收窄到 u8 是 batch-4 挂死根因.
         0x5C0 => { ctx.state.mdid = val; CSR_OK }
         0x5C1 => { ctx.state.pmpsplit = val as u8; CSR_OK }
 
@@ -1557,9 +1550,8 @@ mod tests {
 		}
 	}
 
-	/// TEE CSR (mdid 0x5C0 / pmpsplit 0x5C1) 不受 AIA 门控影响.
 	#[test]
-	fn tee_csrs_not_gated_by_aia() {
+	fn interrupt_no_act_for_mdid_and_pmpsplit() {
 		let mut s = test_state();
 		let clint = test_clint(0);
 		let mut ctx = test_csr_ctx(&mut s, &clint);
@@ -1575,11 +1567,8 @@ mod tests {
 		assert_eq!(ctx.state.pmpsplit, 1);
 	}
 
-	/// mdid 必须完整 64-bit 保存 — 修复前 `val as u8` 使 csrw mdid, 300 截断为 44,
-	/// csrw mdid, 256 截断为 0 (别名回 host). 这是 stress batch-4 (2000 并发飞地)
-	/// 挂死的根因: SUSPEND handler 读到 curr==0 误判 host 请求 -> sbi_hart_hang.
 	#[test]
-	fn tee_mdid_full_width_write() {
+	fn full_width_write_mdid() {
 		let mut s = test_state();
 		let clint = test_clint(0);
 		let mut ctx = test_csr_ctx(&mut s, &clint);

@@ -18,19 +18,20 @@ mod println;
 mod sync_aux;
 mod syscall;
 mod trap;
+mod trap_frame;
 
 use core::panic::PanicInfo;
 
 use crate::constants::*;
-use crate::mem_prim::align::{align_down, align_up};
+use crate::mem_prim::align::align_up;
 use crate::syscall::concurrency::proc;
 use crate::syscall::concurrency::thread;
 
 unsafe extern "C" {
 	static _end: u8;
+	static _instr_class_end: u8;
 }
 
-// entry.s 是 RISC-V 汇编, 只有固件构建编译它。
 core::arch::global_asm!(include_str!("entry.s"));
 
 // ---------------------------------------------------------------
@@ -48,29 +49,37 @@ pub struct BootInfo {
 
 /// 阶段一入口 — 由 entry.s 调用。
 ///
-/// 参数通过寄存器传入 (entry.s 已保存 M-mode 的 a0/a1/a2 并重新排列):
-///   a0 = ret_boot_info:  *mut BootInfo  (返回值写入此处)
-///   a1 = enclave_id
-///   a2 = man_pa_start                 (M-mode 分配的池物理地址)
-///   a3 = man_size                      (Rust 二进制大小)
-///
-/// 不直接返回 BootInfo 结构体 (>16 字节会触发 RISC-V psABI
-/// 隐式指针传递，破坏调用约定)。
+/// 所有参数按RISC-V调用规范通过a0~a4寄存器传入
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_main_before_mmu(
+pub unsafe extern "C" fn main_before_mmu(
 	ret_boot_info: *mut BootInfo,
 	_enclave_id: u64,
 	man_pa_start: u64,
 	_man_size: u64,
+	partition_num: u64,
 ) {
-	// _end 符号已由 entry.s 中的 PIE 重定位调整至运行时地址 (base_pa + link_addr),
-	// 无需再加 load_offset, 否则会 double-count base_pa.
+	// _end 与 _instr_class_end 符号已由 entry.s 中的 PIE 重定位调整至运行时地址
+	// (base_pa + link_addr), 无需再加 load_offset, 否则会 double-count base_pa.
 	let end_pa = &raw const _end as u64;
+	let instr_class_end = &raw const _instr_class_end as u64;
+	let man_size = end_pa - man_pa_start;
+
+	// 授予的区间以 2 MiB 分区为单位划分类别, 故镜像必须落在整数个分区内, 判据见
+	// [`mem::check_img_layout`]。
+	if let Err(msg) = mem::check_img_layout(
+		man_pa_start,
+		instr_class_end,
+		end_pa,
+		partition_num,
+	) {
+		hang::fault_halt(msg);
+	}
 
 	context::init_context(man_pa_start, ENCLAVE_MODULE_LOAD_VA_INIT);
 
-	let pool_offset = end_pa - man_pa_start;
-	let pool_size = align_down(align_up(end_pa, CHUNK_2M_SIZE) - end_pa, PAGE_SIZE);
+	// 页池自镜像末尾起, 覆盖授予的其余分区: 前若干分区由镜像占用, 其余归页池。
+	let pool_offset = man_size;
+	let pool_size = partition_num * CHUNK_2M_SIZE - man_size;
 	mem::init_smode_pool(pool_offset, pool_size);
 	mem::map_smode_page_pool(pool_offset, pool_size);
 	mem::map_sections();
@@ -81,7 +90,7 @@ pub unsafe extern "C" fn rust_main_before_mmu(
 	if !paging::setup_linear_map() {
 		hang::fault_halt("setup_linear_map: page table\n");
 	}
-	if let Err(e) = paging::identity_map_trampoline(man_pa_start) {
+	if let Err(e) = paging::identity_map_trampoline(man_pa_start, partition_num) {
 		hang::fault_halt(e.name());
 	}
 
@@ -106,14 +115,10 @@ pub unsafe extern "C" fn rust_main_before_mmu(
 // ---------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rust_main_after_mmu() {
+pub unsafe extern "C" fn main_after_mmu() {
 	// 引导期交接: 必须交还宿主, 由宿主在 ENTER 返回路径上传入载荷信息.
 	let (payload_pa, payload_size, argc) =
 		ecall_aux::enclave_call_suspend(ENCLAVE_SUSPEND_VOLUNTARY);
-	#[cfg(feature = "diagnostic")]
-	println!(
-		"Sittim: payload pa=0x{payload_pa:x} size=0x{payload_size:x} argc={argc}\n"
-	);
 
 	// 完整性证明: 执行载荷前先验证其尾部 ECDSA 签名。
 	// 载荷布局 [ bare | 64 字节签名 ]; 对 bare 做 SHA-256 后验签。
@@ -126,41 +131,39 @@ pub unsafe extern "C" fn rust_main_after_mmu() {
 	}
 
 	// argv 块基址必须与 M-mode enter_enclave_handler 的投递目标一致:
-	// ext_ecall.c 中 payload_argv_paddr = ROUNDUP(payload_base_pa + payload_size, PAGE_SIZE),
-	// 即载荷末页之后第一个页. 多偏移一页会指向 argv 块之外, 使 map_user_argv
-	// 读到空白页 (argv 内容在其前一页).
-	let argv_pa = payload_pa + align_up(payload_size, PAGE_SIZE);
-	let pool_start = align_down(argv_pa, CHUNK_2M_SIZE);
-	let pool_offset = align_up(argv_pa, PAGE_SIZE) - pool_start;
-	let pool_size = align_down(
-		align_up(argv_pa + PAGE_SIZE, CHUNK_2M_SIZE) + CHUNK_2M_SIZE - (argv_pa + PAGE_SIZE),
-		PAGE_SIZE,
-	);
-	context::ctx_mut().umode_pool_pa_aligned = pool_start;
-	mem::init_umode_pool(pool_offset, pool_size);
+	// enter.c 中 payload_argv_paddr = ROUNDUP(payload_base_pa + payload_size, PARTITION_SIZE),
+	// 即载荷末字节之后的第一个 2 MiB 分区边界. 该边界同时是指令类与数据类的分界
+	// (载荷所在分区归指令类, 该分区归数据类, 一个分区只承载一个类别),
+	// 故两侧算式必须一致: 少偏移会与载荷的末个分区重叠, 多偏移会使 argv 块落在
+	// 分区之外, map_user_argv 读到空白页.
+	let argv_pa = payload_pa + align_up(payload_size, CHUNK_2M_SIZE);
+	// M-mode 为 argv 与 U 模式栈另授一个分区 (enter.c 的 argv 分区): argv 数据落在
+	// 该分区的首地址, U 模式栈落在该分区的末尾, 见 mem::alloc_map_umode_stack.
+	// 堆与 mmap 区不再出自任何页池, 由 grow_umode_va / take_mmap_region 经 500 号
+	// 调用逐个申请数据类分区.
 
-	// M-mode 移交的载荷/argv 物理区 (载荷后紧跟 argv) 落在池的低物理地址,
-	// 不在 setup_linear_map 的 [5 GiB, 18 GiB) 全局线性窗口内, 故在读取前
-	// 把 [payload_pa, pool_start + pool_offset + pool_size) 补建到
-	// LINEAR_MAP_OFFSET 别名, 供 elf::load_elf / map_user_argv /
+	// M-mode 移交的载荷/argv 物理区 (载荷后紧跟 argv) 不在 setup_linear_map 的
+	// [5 GiB, 18 GiB) 全局线性窗口内, 故在读取前把 [payload_pa, argv_pa + CHUNK_2M_SIZE)
+	// 补建到 LINEAR_MAP_OFFSET 别名, 供 elf::load_elf / map_user_argv /
 	// setup_musl_stack 经 PA+OFFSET 读取.
 	//
-	// 上界取整个池的末尾, 不取 argv 块末尾: U-mode 池占用 argv 块之后的同一段
-	// 物理区, 池内的页同样以 PA+OFFSET 别名被 S 模式访问, 只映射到 argv 块末尾
-	// 会使池内首次访问触发取数页错误。
-	if !paging::map_linear_range(payload_pa, pool_start + pool_offset + pool_size) {
+	// 上界取 argv 分区的末尾: argv 数据的字节数取决于各字符串的长度, 此处只知道
+	// argc; 取分区末尾即覆盖 argv 指针数组所在的页与该分区内的其余页.
+	if !paging::map_linear_range(payload_pa, argv_pa + CHUNK_2M_SIZE) {
 		hang::fault_halt("map_linear_range: page table\n");
 	}
 
-	// 建立飞地文件系统 (挂载表 + 根文件系统 + 内核自带的伪文件系统) 与 fd 表, 供载荷的
-	// open/read/close 等系统调用使用。文件内容经 fs::vfs_inject_file 在载荷运行前注入。
+	/*
+		建立飞地文件系统与 fd 表, 供载荷的
+		open/read/close 等系统调用使用。
+		文件内容经 fs::vfs_inject_file 在载荷运行前注入。
+		从载荷镜像末尾解析宿主预置的文件清单, 逐条注入文件系统。
+	*/
 	syscall::fs::mount_init();
 	syscall::fs::vfs_init();
-	// 从载荷镜像末尾解析宿主预置的文件清单 (compound payload trailer), 逐条注入
-	// 文件系统。chibicc 等需 fopen 的载荷由此获得自检源文件; 无清单的载荷返回 0。
 	syscall::inject_manifest(payload_pa, payload_size);
 
-	let umode_sp = mem::alloc_map_umode_stack();
+	let umode_sp = mem::alloc_map_umode_stack(argv_pa);
 	mem::map_user_argv(argv_pa, argc);
 	let payload = elf::load_elf(payload_pa, payload_size);
 
@@ -200,12 +203,6 @@ pub unsafe extern "C" fn rust_main_after_mmu() {
 	// ecall.
 	csr::write_stimecmp(now + TIMER_INTERVAL);
 
-	#[cfg(feature = "diagnostic")]
-	println!(
-		"Sittim entry=0x{:x} phdr=0x{:x} phnum={} sp=0x{umode_sp:x} argv_pa=0x{argv_pa:x} argc={argc} -> sret\n",
-		payload.entry, payload.phdr_va, payload.phnum
-	);
-
 	// 登记启动进程 (槽位 0) 与主线程并建立调度状态. 用户现场经参数传入 (见
 	// thread::init_main_thread 的说明), 不依赖 CSR 的写入时机.
 	proc::init_main_process();
@@ -220,10 +217,22 @@ pub unsafe extern "C" fn rust_main_after_mmu() {
 	csr::write_sie(csr::STI | csr::SSI);
 }
 
-// ---------------------------------------------------------------
-//  musl 栈布局: sp 指向 argc | argv[] | NULL | envp[] | NULL | auxv[]
-// ---------------------------------------------------------------
+/*
+    musl 栈布局:
+	sp ->  argc
+	      ------
+		  argv[]
+		  ------
+		   NULL
+		  ------
+		  envp[]
+		  ------
+		   NULL
+		  ------
+		  auvx[]
+		  ------
 
+*/
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
@@ -236,7 +245,9 @@ const AT_GID: u64 = 13;
 
 unsafe fn push_u64(sp: &mut u64, val: u64) {
 	*sp = sp.wrapping_sub(8);
-	unsafe { core::ptr::write_volatile(*sp as *mut u64, val); }
+	unsafe {
+		core::ptr::write_volatile(*sp as *mut u64, val);
+	}
 }
 
 /// 向 U-mode 栈写入 musl _start 期望的 argc/argv/envp/auxv 布局。

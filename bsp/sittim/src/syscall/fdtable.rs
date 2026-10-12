@@ -67,8 +67,11 @@ impl Tables {
 }
 
 /// 全局描述符表与描述表。飞地 S-mode 运行在单 hart 上且系统调用不可重入 (中断只登记
-/// 抢占、待系统调用返回后才切换线程), 用自旋锁仅为保持与共享资源访问约定一致, 锁的
-/// 持有区间不含任何 ecall 或让出, 不会自死锁。
+/// 抢占、待系统调用返回后才切换线程), 用自旋锁仅为保持与共享资源访问约定一致。
+///
+/// 锁的持有区间只含查表与写回, 不含模块调用: 文件系统模块与协议栈模块的调用会经 ecall
+/// 让出到宿主, 持锁让出会使该锁在本 hart 被应答之前一直被占用。调用方按 [open_file_of]
+/// 取得描述, 在锁外完成模块调用后经 [write_back_open_file] 写回。
 pub static FDS: SpinLock<Tables> = SpinLock::new(Tables::empty());
 
 /// 描述绑定的对象。
@@ -112,6 +115,16 @@ pub fn open_file_of(tables: &Tables, fd: u64) -> Option<(usize, OpenFile)> {
 /// *open_file_idx* 须取自 [open_file_of], 该下标在描述未被释放之前一直指代同一项描述。
 pub fn store_open_file(tables: &mut Tables, open_file_idx: usize, open_file: OpenFile) {
 	tables.open_files[open_file_idx] = Some(open_file);
+}
+
+/// 取描述符表的锁, 把改动后的描述 *open_file* 写回它在描述表中的槽位。
+///
+/// 供在锁外完成模块调用的调用方写回: [store_open_file] 要求调用方持有该锁, 而模块调用会
+/// 经 ecall 让出到宿主。*open_file_idx* 须取自 [open_file_of], 在同一系统调用之内一直指代
+/// 同一项描述 —— 让出期间本飞地不再执行, 故没有其它改动者。
+pub fn write_back_open_file(open_file_idx: usize, open_file: OpenFile) {
+	let mut tables = FDS.lock();
+	store_open_file(&mut tables, open_file_idx, open_file);
 }
 
 /// 取描述符 *fd* 在描述符表中的下标; 编号超出下标类型的表示范围, 或落在描述符表之外时

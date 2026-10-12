@@ -10,11 +10,15 @@
 //!
 //! 一次取入在宿主应答并经 RESUME 交还之前不返回, 期间本飞地不再执行, 故同一飞地不会有
 //! 第二个模块请求与它重叠 —— M 模式为每个飞地只记录一个待决请求。
+//!
+//! 取用失败按 [`LoadError::to_errno`](super::loader::LoadError::to_errno) 交回一个错误码, 由调用方原样作为系统调用的返回值
+//! 上报给可信应用: 宿主未提供该模块与映像有缺陷两种情形由此在可信应用侧可以区分。
 
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use super::abi::GetterFn;
+use super::errno::{ENODEV, ENOENT};
 use super::man::Manager;
 use super::net_ops::NetOps;
 use super::transport::EcallTransport;
@@ -24,6 +28,9 @@ use crate::constants::{LINEAR_MAP_OFFSET, NET_BASE, TIMER_FREQ};
 use crate::csr;
 use crate::ecall_aux;
 use crate::mem;
+
+#[cfg(feature = "diagnostic")]
+use crate::diag;
 
 /// 网卡与协议栈模块的编号, 与 `modules/net` 的 `MODULE_ID` 及 `modules.list` 的条目一致。
 const MODULE_ID_NET: u32 = 4;
@@ -95,49 +102,88 @@ static VFS_ABSENT: AtomicBool = AtomicBool::new(false);
 ///
 /// 已登记时直接返回登记的操作表; 未登记时经 [`TRANSPORT`] 向固件提出交付申请, 由宿主
 /// 提供映像。宿主未提供该模块的结论一旦得出即记入 *absent*, 后续调用不再提出申请 ——
-/// 载荷若反复调用同一个系统调用, 每次都让出到宿主会使其陷入空转。
+/// 载荷若反复调用同一个系统调用, 每次都让出到宿主会使其陷入空转。该标志只由
+/// [`LoadError::NotFound`](super::loader::LoadError::NotFound) 置位: 其余失败源于映像本身,
+/// 映像重新交付后下一次调用可以重试
+/// 取入, 故不置位。
 ///
-/// *init* 在操作表取到之后、写入缓存之前调用, 返回假即视为取入失败。
+/// *init* 在操作表取到之后、写入缓存之前调用, 返回假即视为该模块不可用。
+///
+/// 失败按 [`LoadError::to_errno`](super::loader::LoadError::to_errno) 返回错误码, 模块自身初始化失败返回 [`ENODEV`]。
 fn acquire<T>(
 	cell: &AtomicPtr<T>,
 	absent: &AtomicBool,
 	module_id: u32,
 	init: fn(&T) -> bool,
-) -> Option<&'static T> {
+) -> Result<&'static T, u64> {
 	let cached = cell.load(Ordering::Acquire);
 	if !cached.is_null() {
 		// 指针只在取入成功之后写入, 且写入之前模块已经取入并验签, 指向的表此后只读。
-		return Some(unsafe { &*cached });
+		return Ok(unsafe { &*cached });
 	}
 	if absent.load(Ordering::Acquire) {
-		return None;
+		// 该标志只由 NotFound 置位, 故此处与该种失败的取值一致。
+		return Err(ENOENT);
 	}
 	let ops = match acquire_ops_table::<T>(module_id, &TRANSPORT, &MANAGER) {
 		Ok(ops) => ops,
-		Err(_) => {
-			absent.store(true, Ordering::Release);
-			return None;
+		Err(err) => {
+			#[cfg(feature = "diagnostic")]
+			diag::log(format_args!(
+				"sittim-extmod!load-failed!: id={} reason={:?} errno=0x{:x}\n",
+				module_id,
+				err,
+				err.to_errno()
+			));
+			if err.is_module_absent() {
+				absent.store(true, Ordering::Release);
+			}
+			return Err(err.to_errno());
 		}
 	};
-	if !init(ops) {
-		absent.store(true, Ordering::Release);
-		return None;
+	let is_module_ready = init(ops);
+	if !is_module_ready {
+		return Err(ENODEV);
 	}
+
 	cell.store(ptr::from_ref(ops).cast_mut(), Ordering::Release);
-	Some(ops)
+	Ok(ops)
 }
 
-/// 网卡模块的操作表; 该模块不可用时返回 None。
+/// 网卡模块的操作表。
 ///
-/// 平台不提供该设备 (`NET_BASE` 取 0) 时直接返回 None, 不提出申请。
-pub fn acquire_net_ops() -> Option<&'static NetOps> {
+/// 平台不提供该设备 (`NET_BASE` 取 0) 时返回 [`ENODEV`], 不向宿主提出申请; 其余失败按
+/// [`LoadError::to_errno`](super::loader::LoadError::to_errno) 给出错误码。
+pub fn acquire_net_ops() -> Result<&'static NetOps, u64> {
 	if NET_BASE == 0 {
-		return None;
+		return Err(ENODEV);
 	}
 	acquire(&NET_OPS, &NET_ABSENT, MODULE_ID_NET, |ops| unsafe { (ops.init)() })
 }
 
-/// 文件系统模块的操作表; 该模块不可用时返回 None。
-pub fn acquire_vfs_ops() -> Option<&'static VfsOps> {
+/// 文件系统模块的操作表; 失败按 [`LoadError::to_errno`](super::loader::LoadError::to_errno) 给出错误码。
+pub fn acquire_vfs_ops() -> Result<&'static VfsOps, u64> {
 	acquire(&VFS_OPS, &VFS_ABSENT, MODULE_ID_VFS, |ops| unsafe { (ops.init)() })
+}
+
+/// 清除该模块的操作表缓存与粘性标志。
+///
+/// 模块在运行中出错之后调用: 缓存内的操作表取自出错的那份映像, 本函数之后不再交出它;
+/// 粘性标志一并清除, 两者描述的同一份映像交付随之被一并撤销, 宿主重新交付映像之后的下
+/// 一次调用重新取入该模块。
+///
+/// 编号不对应本模块接入的任何一个模块时不改动任何东西。缓存指针与粘性标志都只被本飞地
+/// 的执行流读写, 且调用时出错的就是当前唯一执行流, 故清除时没有在途的调用者。
+pub fn clear_module_cache(module_id: u32) {
+	match module_id {
+		MODULE_ID_NET => {
+			NET_OPS.store(ptr::null_mut(), Ordering::Release);
+			NET_ABSENT.store(false, Ordering::Release);
+		}
+		MODULE_ID_VFS => {
+			VFS_OPS.store(ptr::null_mut(), Ordering::Release);
+			VFS_ABSENT.store(false, Ordering::Release);
+		}
+		_ => {}
+	}
 }

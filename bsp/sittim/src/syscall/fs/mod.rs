@@ -9,7 +9,7 @@
 //!
 //! 目录树与文件数据由文件系统持有, 其存储形态只在文件系统内, 故本层按不透明的节点下标
 //! 与之交互。偏移、O_APPEND、复制与轮询等描述符一级的语义留在本层: 本层取得描述后改动其
-//! 偏移或标志, 再经 [super::fdtable::store_open_file] 写回。
+//! 偏移或标志, 再经 [super::fdtable::write_back_open_file] 写回。
 //!
 //! 文件系统只交出 ino、节点类别、权限位、链接数、长度与块数, musl riscv64 的 `struct stat`
 //! 中文件类型的编码 (S_IFDIR/S_IFREG) 由本层按节点类别补齐。
@@ -99,26 +99,27 @@ pub(super) fn fd_node(tables: &Tables, fd: u64) -> Option<(FileSystem, i16)> {
 
 /// 取 fd 所属的描述下标、描述本身、它绑定的文件系统节点下标与该文件系统的操作表。fd
 /// 绑定的不是文件时返回 *not_file_err*, 无效描述符返回 EBADF, 该文件系统尚未交付时返回
-/// ENOSYS。
+/// 取入失败给出的错误码, 见 [mount::ops_of]。
 ///
-/// 描述按取得时的取值交给调用方, 调用方改动其偏移或标志后须经
-/// [super::fdtable::store_open_file] 写回; 同一把锁的持有期间没有其它改动者, 故写回不会
-/// 覆盖别人的改动。
+/// 描述符表的锁只在查表期间持有, 操作表在锁外取得: 取入文件系统模块的路径会经 ecall
+/// 让出到宿主, 自旋锁不得跨越它。描述按取得时的取值交给调用方, 调用方改动其偏移或标志
+/// 后须经 [super::fdtable::write_back_open_file] 写回。
 #[inline]
-pub(super) fn fd_vfs_node(
-	tables: &Tables, fd: u64, not_file_err: u64,
+pub(super) fn fd_vfs_ops(
+	fd: u64, not_file_err: u64,
 ) -> Result<(usize, OpenFile, i16, &'static VfsOps), u64> {
-	let Some((open_file_idx, open_file)) = open_file_of(tables, fd) else {
-		return Err(EBADF);
+	let (open_file_idx, open_file, fs, node) = {
+		let tables = FDS.lock();
+		match open_file_of(&tables, fd) {
+			Some((open_file_idx, open_file)) => match open_file.target {
+				FdTarget::Vfs(fs, node) => (open_file_idx, open_file, fs, node),
+				FdTarget::Console | FdTarget::Socket(_) => return Err(not_file_err),
+			},
+			None => return Err(EBADF),
+		}
 	};
-	match open_file.target {
-		FdTarget::Vfs(fs, node) =>
-			match mount::ops_of(fs) {
-				Some(ops) => Ok((open_file_idx, open_file, node, ops)),
-				None => Err(ENOSYS),
-			}
-		FdTarget::Console | FdTarget::Socket(_) => Err(not_file_err),
-	}
+	let ops = mount::ops_of(fs)?;
+	Ok((open_file_idx, open_file, node, ops))
 }
 
 // ---------------------------------------------------------------
@@ -147,7 +148,7 @@ pub fn vfs_init() {
 /// 供启动阶段 (载荷运行前) 用宿主下发的数据预置文件; 路径不属于已登记的挂载点, 或该
 /// 文件系统尚未交付时返回假。
 pub fn vfs_inject_file(path: &[u8], data: &[u8]) -> bool {
-	let Some((_, ops, sub)) = mount::resolve(path) else {
+	let Ok((_, ops, sub)) = mount::resolve(path) else {
 		return false;
 	};
 	unsafe { (ops.inject_file)(sub.as_ptr(), sub.len() as u64, data.as_ptr(), data.len() as u64) }

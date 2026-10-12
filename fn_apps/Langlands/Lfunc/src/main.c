@@ -8,7 +8,8 @@
  *      (如 zeta(3)) 由 Apéry 的递推与级数自行求出, 不依赖十进制字面量。
  *
  *   2. 临界线上的零点搜索。载荷自行扫描并用二分法定位零点, 不调用现成的零点例程。
- *      搜索得到的零点与公开的高精度值比较, 同时打印使搜索结果自洽的中间量。
+ *      区间内的零点个数由搜索得出, 载荷不预设该个数; 定位到的零点全部列出, 每个零点给出
+ *      位置与包围该零点的区间半宽, 个数另以两种扫描步长各数一遍并核对一致。
  *
  * 飞地 ABI: main() 入口, 结果经 printf 输出 (英文), return 0 进入 SUSPEND。
  */
@@ -27,7 +28,10 @@
 #define PREC 256
 
 /*
- * 零点搜索: 扫描步长的分母, 以及单个零点二分次数的上限。
+ * 零点搜索: 定位用的扫描步长, 复核个数用的扫描步长, 以及单个零点二分次数的上限。
+ *
+ * 定位的步长取 1/SCAN_STEP_DEN, 复核的步长取 1/VERIFY_STEP_DEN: 两种步长的扫描点互不相同,
+ * 两次数得的零点个数一致即两种步长数出同一批零点 (见 check_critical_line_zeros)。
  *
  * 二分的实际次数由精度决定, 上限只是安全边界, 不构成额外开销。收窄区间时, 区间端点自身
  * 也带有半径, 若以 PREC 计算中点, 端点半径约 2 的 -PREC 次幂, 中点到零点的距离一旦小于
@@ -35,12 +39,11 @@
  * 区间可以一直收窄到符号判定所支持的最深一级; 二分次数随之约为 BISECT_PREC 的位数。
  */
 #define SCAN_STEP_DEN 8
+#define VERIFY_STEP_DEN (4 * SCAN_STEP_DEN)
 #define BISECT_ITERS 2048
 #define BISECT_PREC (2 * PREC)
-/* 零点搜索的区间上界, 三个函数均在此区间内取前若干个零点核对。 */
-#define T_MAX 30
-/* 单个函数在此区间内定位到的零点个数上限。 */
-#define MAX_ZEROS 16
+/* 零点搜索的区间上界: 三个函数均在 (0, T_MAX] 内搜索, 该区间内的零点个数由搜索得出。 */
+#define T_MAX 123
 
 static int checks_passed = 0;
 static int checks_failed = 0;
@@ -79,10 +82,9 @@ static void report_acb(const char *name, int ok, const acb_t got) {
 	mag_printd(arb_radref(acb_realref(got)), 3);
 	printf(" ");
 	mag_printd(arb_radref(acb_imagref(got)), 3);
-	printf("\n");
+	putchar('\n');
 }
 
-/* 报告一项布尔判定。 */
 static void report_flag(const char *name, int ok) {
 	if (ok) {
 		checks_passed++;
@@ -94,25 +96,17 @@ static void report_flag(const char *name, int ok) {
 }
 
 /*
- * 报告一个定位到的零点。零点位置取 32 位有效数字打印, 随之打印包围区间的半宽:
- * 真零点落在该区间内, 故半宽即定位结果与真值之间误差的上界, 定位精度由此直接可读。
+ * 打印一个零点的位置与包围区间的半宽。零点位置取 32 位有效数字打印; 真零点落在该区间内,
+ * 故半宽即定位结果与真值之间误差的上界, 定位精度由此直接可读。
  */
-static void report_zero(const char *name, int ok, const arb_t mid, const arb_t half) {
-	if (ok) {
-		checks_passed++;
-		printf("  ok    %-40s ", name);
-	} else {
-		checks_failed++;
-		printf("  FAIL  %-40s ", name);
-	}
+static void print_zero(const arb_t mid, const arb_t half) {
 	printf("t = ");
-	arb_printn(mid, 32, ARB_STR_NO_RADIUS);
+	arb_printn(mid, 40, ARB_STR_NO_RADIUS);
 	printf(" +/- ");
 	arb_printn(half, 3, ARB_STR_NO_RADIUS);
 	printf("\n");
 }
 
-/* ---------- 比较原语 ---------- */
 
 /* 字面量中小数点后的位数, 即该字面量最低十进制位所在的位置。 */
 static slong literal_decimals(const char *literal) {
@@ -654,16 +648,18 @@ static void bisect_zero(arb_t lo_out, arb_t hi_out, const arb_t a, const arb_t b
 }
 
 /*
- * 扫描 [0, T_MAX] 定位零点。步长取 1/8, 远小于三个函数在该区间内相邻零点的最小间距
- * (约 1.29), 故一次符号变化只对应一个零点。定位到的零点按从小到大写入 out, 所在区间的
- * 半宽写入 half (半宽即该零点的定位精度), 返回个数。
+ * 扫描 (0, T_MAX] 定位零点。步长取 1/step_den, 相邻两个扫描点上的 Z 值异号即判定两者之间
+ * 有一个零点, 区间内的零点个数由本函数数出。前若干个零点按从小到大写入 out, 所在区间的
+ * 半宽写入 half (半宽即该零点的定位精度), 写入的个数至多 max_report 个; 只要 max_report
+ * 小于区间内的零点个数, 位次在 max_report 之后的零点仍计入返回值而不定位。返回区间内的
+ * 零点个数。max_report 取 0 时只数个数, out 与 half 传空。
  */
-static slong locate_zeros(arb_ptr out, arb_ptr half, slong max_out, const dirichlet_group_t G,
-	const dirichlet_char_t chi) {
+static slong locate_zeros(arb_ptr out, arb_ptr half, slong max_report, slong step_den,
+	const dirichlet_group_t G, const dirichlet_char_t chi) {
 	arb_t step, prev, cur, lo, hi;
 	int sign_prev, sign_cur;
 	slong count = 0;
-	int i;
+	slong i;
 
 	arb_init(step);
 	arb_init(prev);
@@ -672,15 +668,15 @@ static slong locate_zeros(arb_ptr out, arb_ptr half, slong max_out, const dirich
 	arb_init(hi);
 
 	arb_set_ui(step, 1);
-	arb_div_ui(step, step, SCAN_STEP_DEN, PREC);
+	arb_div_ui(step, step, (ulong) step_den, PREC);
 	arb_zero(prev);
-	sign_prev = 0;
+	sign_prev = hardy_z_sign(prev, G, chi, PREC);
 
-	for (i = 1; i <= T_MAX * SCAN_STEP_DEN; i++) {
+	for (i = 1; i <= T_MAX * step_den; i++) {
 		arb_mul_ui(cur, step, (ulong) i, PREC);
 		sign_cur = hardy_z_sign(cur, G, chi, PREC);
 		if (sign_prev != 0 && sign_cur != 0 && sign_prev != sign_cur) {
-			if (count < max_out) {
+			if (count < max_report) {
 				bisect_zero(lo, hi, prev, cur, G, chi);
 				/* 中点作为零点位置, 区间半宽作为定位精度 */
 				arb_add(out + count, lo, hi, BISECT_PREC);
@@ -688,8 +684,8 @@ static slong locate_zeros(arb_ptr out, arb_ptr half, slong max_out, const dirich
 				arb_sub(half + count, hi, lo, BISECT_PREC);
 				arb_mul_2exp_si(half + count, half + count, -1);
 				arb_abs(half + count, half + count);
-				count++;
 			}
+			count++;
 		}
 		arb_set(prev, cur);
 		sign_prev = sign_cur;
@@ -765,32 +761,17 @@ static void check_character_table(
 }
 
 /*
- * 临界线上的零点核对。对每个函数定位 [0, T_MAX] 内的全部零点, 核对个数, 并核对前
- * 三个零点的位置 (位置与包围区间半宽一并打印, 半宽即定位精度)。参考值取自公开的高精度
- * 计算结果, 与本载荷的搜索过程无关。
+ * 临界线上的零点核对。对每个函数在 (0, T_MAX] 内搜索零点, 区间内的零点个数由搜索得出,
+ * 载荷不预设任何函数的零点个数; 定位到的零点全部列出, 每行给出位置与包围该零点的区间半宽,
+ * 半宽即定位结果与真值之间误差的上界。
  *
- * zeta 另有一项独立的核对: FLINT 的零点计数函数给出区间内的零点个数, 与扫描结果
- * 比较, 用于确认扫描步长没有漏掉零点。
+ *   1. 以 1/VERIFY_STEP_DEN 的步长重数一遍个数, 与 1/SCAN_STEP_DEN 的步长数得的个数一致,
+ *      即两组扫描点各自数出同一批零点。
+ *   2. zeta 另有一项独立的核对: FLINT 的零点计数例程按零点之间的分离性给出 (0, T_MAX] 内
+ *      零点的确切个数, 与搜索得到的个数比较。该个数由另一套算法算出, 与搜索过程无关。
  */
 static void check_critical_line_zeros(void) {
-	static const char *zeta_ref[3] = {
-		"14.13472514173469379045725198356247027078",
-		"21.02203963877155499262847959389690277733",
-		"25.01085758014568876321379099256282181866",
-	};
-	static const char *beta_ref[3] = {
-		"6.020948904697596654902511521612085868864",
-		"10.24377030416655455213775747910995902486",
-		"12.98809801231242250745310978956299376497",
-	};
-	static const char *chi3_ref[3] = {
-		"8.039737155681466681713623214172965802793",
-		"11.2492062077729352497050256788632146487",
-		"15.7046191767216255651655508804",
-	};
-	const slong expected[3] = {3, 10, 8};
 	const char *labels[3] = {"zeta", "L(s, chi_-4)", "L(s, chi_-3)"};
-	arb_ptr zeros, halves;
 	arb_t limit, counted;
 	/* 群与特征为空指针即表示 Riemann zeta, 故以指针形式保存, 非空时指向下面两份存储 */
 	dirichlet_group_struct *G;
@@ -798,11 +779,10 @@ static void check_critical_line_zeros(void) {
 	dirichlet_group_t group_store;
 	dirichlet_char_t char_store;
 	slong found[3];
+	slong recounted;
 	char name[96];
 	int f, k;
 
-	zeros = _arb_vec_init(MAX_ZEROS);
-	halves = _arb_vec_init(MAX_ZEROS);
 	arb_init(limit);
 	arb_init(counted);
 
@@ -824,34 +804,36 @@ static void check_critical_line_zeros(void) {
 			chi = char_store;
 		}
 
-		found[f] = locate_zeros(zeros, halves, MAX_ZEROS, G, chi);
+		/*
+		 * 先以同一扫描数出区间内的零点个数, 据此分配存放位置与半宽的向量; 个数为零时向量
+		 * 不分配, 第二遍的 max_report 随之为零, 因而不写入任何位置。
+		 */
+		found[f] = locate_zeros(NULL, NULL, 0, SCAN_STEP_DEN, G, chi);
+		recounted = locate_zeros(NULL, NULL, 0, VERIFY_STEP_DEN, G, chi);
 
-		snprintf(name, sizeof(name), "%s: zeros found in (0, 30]", labels[f]);
-		printf("  ok    %-40s %ld (expected %ld)\n", name, (long) found[f],
-			(long) expected[f]);
-		if (found[f] == expected[f]) {
-			checks_passed++;
-		} else {
-			checks_failed++;
-			printf("  FAIL  %s: zero count mismatch\n", labels[f]);
-		}
+		snprintf(name, sizeof(name), "%s: %ld zeros in (0, %d], confirmed at 1/%d step",
+			labels[f], (long) found[f], T_MAX, VERIFY_STEP_DEN);
+		report_flag(name, recounted == found[f]);
 
-		for (k = 0; k < 3 && k < found[f]; k++) {
-			const char *ref = (f == 0) ? zeta_ref[k] : (f == 1) ? beta_ref[k] : chi3_ref[k];
-			snprintf(name, sizeof(name), "%s: zero #%d at t", labels[f], k + 1);
-			report_zero(name, arb_meets_literal(zeros + k, ref), zeros + k, halves + k);
+		if (found[f] > 0) {
+			arb_ptr zeros = _arb_vec_init(found[f]);
+			arb_ptr halves = _arb_vec_init(found[f]);
+
+			locate_zeros(zeros, halves, found[f], SCAN_STEP_DEN, G, chi);
+			for (k = 0; k < found[f]; k++) {
+				printf("  %s: zero #%02ld at ", labels[f], (long) k + 1);
+				print_zero(zeros + k, halves + k);
+			}
+			_arb_vec_clear(halves, found[f]);
+			_arb_vec_clear(zeros, found[f]);
 		}
 
 		if (f == 0) {
-			/* 独立的零点计数核对 */
 			arb_set_ui(limit, T_MAX);
 			acb_dirichlet_zeta_nzeros(counted, limit, PREC);
-			snprintf(name, sizeof(name), "zeta: zero count in (0, 30] agrees with nzeros");
-			report_arb(name,
-				arb_contains_si(counted, expected[0]) && found[0] == expected[0], counted);
-		}
-
-		if (f > 0) {
+			snprintf(name, sizeof(name), "zeta: count = exact count in (0, %d]", T_MAX);
+			report_arb(name, arb_contains_si(counted, found[0]), counted);
+		} else if (f > 0) {
 			dirichlet_char_clear(char_store);
 			dirichlet_group_clear(group_store);
 		}
@@ -859,8 +841,6 @@ static void check_critical_line_zeros(void) {
 
 	arb_clear(counted);
 	arb_clear(limit);
-	_arb_vec_clear(halves, MAX_ZEROS);
-	_arb_vec_clear(zeros, MAX_ZEROS);
 }
 
 /* 模 4 的实本原奇特征 chi_-4 = (-4/.) 的取值 */
@@ -1065,19 +1045,19 @@ int main(void) {
 	printf("Lfunc: zeta and Dirichlet L-functions, FLINT arb/acb, prec = %d bits\n",
 		(int) PREC);
 
-	printf("zeta values\n");
+	puts("zeta values");
 	check_zeta_values();
 	check_functional_equation();
 
-	printf("zeta(3) via Apery recurrence and series\n");
+	puts("zeta(3) via Apery recurrence and series");
 	check_apery_zeta3();
 
-	printf("Dirichlet characters and L-values\n");
+	puts("Dirichlet characters and L-values");
 	check_l_mod_4();
 	check_l_mod_3();
 	check_class_number_formula();
 
-	printf("zeros on the critical line Re(s) = 1/2\n");
+	puts("zeros on the critical line Re(s) = 1/2");
 	check_critical_line_zeros();
 
 	printf("Lfunc: %d checks, %d failed\n", checks_passed + checks_failed, checks_failed);

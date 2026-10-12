@@ -7,8 +7,8 @@
 预加载注入器 — 将外部提供的 shellcode / 二进制机器码写入 RAM.
 
 shellcode 来源:
-- 外部文件 (裸 RISC-V 指令流, 类似 objcopy -O binary 产物)
-- 或用户用 snippets 模块手动组装的字节序列
+- RISC-V 指令流, 类似 objcopy -O binary 产物
+- 或手动定义的字节序列
 
 注入后 Emulator 将从 shellcode 入口开始执行, shellcode 负责
 设置环境并跳转到目标程序入口。
@@ -19,7 +19,6 @@ shellcode 来源:
   DTB:       0x87ff0000 - 0x87ff046c  (ram_base + ram_size - 64KiB)
   Preload:   0x87fe0000 - 0x87fe008c  (ram_base + ram_size - 128KiB)
 """
-
 from pathlib import Path
 
 from pyremu.emulator import Emulator
@@ -60,7 +59,9 @@ class Preloader:
         """
         if addr is None:
             addr = (
-                self._emu.bus.ram_base + self._emu.bus.ram_size - self.DEFAULT_ADDR_OFFSET
+                self._emu.bus.ram_base +
+                self._emu.bus.ram_size -
+                self.DEFAULT_ADDR_OFFSET
             ) & ~0xF
 
         self._emu.bus.write(addr, code)

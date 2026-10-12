@@ -68,18 +68,29 @@ fw_basic_flag += PLATFORM_RISCV_XLEN=64
 fw_basic_flag += PLATFORM_RISCV_ABI=lp64
 fw_basic_flag += FW_SKIP_BSS_ZERO=1
 
-# 实验性调试扩展: make emu-linux-sh DBG_MEM_INTERACT=1 时开启 M-mode 侧内存
-# 申请/释放统计，这对应 lib/enclave_ext/Kconfig 的 CONFIG_DBG_MEM_INTERACT
-# 该开关在 makefile 的 opensbi 构建规则中把 CONFIG_DBG_MEM_INTERACT=y 注入平台
-# defconfig, 经 distclean 后重新生成的 .config 生效; 置 0 时设置为n/完整移除.
+DBG_ENCLAVE_STATS ?= 0
 DBG_MEM_INTERACT ?= 0
+DBG_PMP_CACHE ?= 0
 
-# 仅当 configs.mk / 命令行显式定义了保留内存区域时才覆盖 Kconfig 默认值.
-ifdef RESERVED_MEM_BASE
-	fw_basic_flag += CONFIG_POOL_BASE=$(RESERVED_MEM_BASE)
-endif
-ifdef RESERVED_MEM_SIZE
-	fw_basic_flag += CONFIG_POOL_SIZE=$(RESERVED_MEM_SIZE)
+# 以下取值经 bsp/custom-opensbi/Makefile 并入固件的 .config, 命令行上的 CONFIG_* 变量即覆盖项.
+# 池的起始与大小在 pyremu 侧读同一对变量, 见 emu-configs.mk.
+fw_basic_flag += CONFIG_POOL_BASE=$(RESERVED_MEM_BASE)
+fw_basic_flag += CONFIG_POOL_SIZE=$(RESERVED_MEM_SIZE)
+
+# 调试统计开关 (见 bsp/custom-opensbi/lib/enclave_ext/Kconfig). 伞项为 0 时不写入这三项,
+# 取值由 Kconfig 默认值决定; 伞项为 1 时两个分项都显式给出, 使开关的取值不受默认值影响.
+ifeq ($(DBG_ENCLAVE_STATS),1)
+	fw_basic_flag += CONFIG_DBG_ENCLAVE_STATS=y
+	ifeq ($(DBG_MEM_INTERACT),1)
+		fw_basic_flag += CONFIG_DBG_MEM_INTERACT=y
+	else
+		fw_basic_flag += CONFIG_DBG_MEM_INTERACT=n
+	endif
+	ifeq ($(DBG_PMP_CACHE),1)
+		fw_basic_flag += CONFIG_DBG_PMP_CACHE=y
+	else
+		fw_basic_flag += CONFIG_DBG_PMP_CACHE=n
+	endif
 endif
 
 ## ---- fw_payload 构建 (内嵌 payload) ----
@@ -89,11 +100,12 @@ FW_MAKE_FLAGS += FW_PAYLOAD=y
 ## ---- fw_jump 构建 (无内嵌 payload, mret 后跳转到 FW_JUMP_ADDR) ----
 FW_JUMP_FLAGS := $(fw_basic_flag)
 FW_JUMP_FLAGS += FW_JUMP=y
-FW_JUMP_FLAGS += FW_JUMP_ADDR=0x80200000
+FW_JUMP_FLAGS += FW_JUMP_ADDR=0x80400000
 
 # ---- Linux 内核启动 ----
 # fw_payload 模式: Linux Image 嵌入 OpenSBI, 经 M 模式向 S 模式移交后直接启动 (ZSBL 设 coldboot_done=1)。
-# fw_jump 模式: OpenSBI 经 mret 跳至 0x80200000, 内核 Image 预载该地址, vmlinux 供调试符号。
+# fw_jump 模式: OpenSBI 经 mret 跳至 0x80400000, 内核 Image 预载该地址, vmlinux 供调试符号。
+# 该地址等于 FW_RESERVED_MEM_BASE + FW_RESERVED_MEM_SIZE, 即固件映像保留区的上界。
 LINUX_IMG        = $(linux_dir)/arch/riscv/boot/Image
 LINUX_VMLINUX    = $(linux_dir)/vmlinux
 fw_payload_linux = $(elf_dir)/custom_opensbi_fw_payload_linux.elf

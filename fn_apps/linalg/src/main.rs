@@ -1,10 +1,4 @@
-//! linalg — 稠密矩阵线性代数 (Cholesky 分解 + 求解)
-//!
-//! 用 nalgebra 对一个大稠密对称正定矩阵做 Cholesky 分解并回代求解,
-//! 以残差校验数值正确性。矩阵阶数选得足够大, 使单个 f64 稠密矩阵的
-//! 运行期堆占用 (n²×8 字节) 明显超过飞地内存池的 2 MiB 分区粒度,
-//! 从而在 TEE 中触发多分区分配 / OOM 拒绝 / 释放路径。
-//!
+//! linalg — 稠密矩阵Cholesky分解及求解
 //! 数值设计:
 //!   - 系数矩阵 A 为严格对角占优的对称正定矩阵 (对角 = n, 非对角按
 //!     |i-j| 衰减), 保证 Cholesky 分解存在且条件数良好, 不会病态。
@@ -46,7 +40,7 @@ fn main() {
     let x_true = DVector::from_fn(N, |i, _| (i + 1) as f64);
     let b = &a * &x_true;
 
-    // Cholesky 分解原地消费 a, 随后回代求解 A·x = b。
+    // 原地Cholesky分解 a, 回代求解 A·x = b。
     let chol = a.cholesky().expect("matrix must be symmetric positive definite");
     let x = chol.solve(&b);
 
@@ -54,5 +48,4 @@ fn main() {
     let resid = (&x - &x_true).amax();
     let verdict = if resid < TOL { "PASS" } else { "FAIL" };
     println!("[linalg] max|x - x_true| = {resid:.3e}  {verdict}");
-    println!("=== linalg: done ===");
 }

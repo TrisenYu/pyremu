@@ -16,4 +16,4 @@ def yield_cpu(interval: float = 0.001) -> None:
 def fmt_now_ms() -> str:
     """取操作系统当前本地时间, 精确到毫秒 (YYYY/MM/DD-HH:MM:SS.mmm)."""
     now = datetime.now()
-    return f"{now:%Y/%m/%d-%H:%M:%S}.{now.microsecond // 1000:03d}"
+    return f"{now:%Y/%m/%d/%H:%M:%S}.{now.microsecond // 1000:03d}"

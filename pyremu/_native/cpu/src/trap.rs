@@ -3,12 +3,12 @@
 //! Implements medeleg / mideleg-based delegation to S-mode, matching the
 //! Python ``deliver_trap`` in ``trap_handler.py``.
 
-use crate::concurrent::{ConcurrentClintCtx, ModuleState};
+use crate::concurrent::{ ConcurrentClintCtx, ModuleState };
 use crate::hart_sched::read_gpr;
 use crate::interrupt::clint::write_mtimecmp;
 use crate::interrupt::imsic_clear_ipi_on_trap;
 use crate::ffi::FfiDevCtx;
-use crate::state::{riscv_mode, HartState};
+use crate::state::{ riscv_mode, HartState };
 use std::sync::atomic::Ordering;
 // ============================================================
 //  Trap cause codes (mcause / scause compatible)
@@ -35,11 +35,7 @@ pub mod exc_code {
 /// Build an ``mcause``-compatible value: bit 63 = interrupt flag, lower bits = code.
 #[inline]
 pub fn mcause_val(code: u64, is_interrupt: bool) -> u64 {
-	if is_interrupt {
-		code | (1u64 << 63)
-	} else {
-		code
-	}
+	if is_interrupt { code | (1u64 << 63) } else { code }
 }
 
 // ============================================================
@@ -87,14 +83,14 @@ fn mode_to_spp(mode: u8) -> u64 {
 /// Returns ``0`` (caller should NOT advance PC — PC already redirected).
 pub fn deliver_trap(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	let is_interrupt = (code >> 63) != 0;
-	let exc_code = code & 0x7FFF_FFFF_FFFF_FFFF;
+	let exc_code = code & 0x7fff_ffff_ffff_ffff;
 
 	// M-mode traps are never delegated.
 	let delegate = if state.mode != riscv_mode::M {
 		if is_interrupt {
-			state.mideleg & (1 << exc_code) != 0
+			(state.mideleg & (1 << exc_code)) != 0
 		} else {
-			state.medeleg & (1 << exc_code) != 0
+			(state.medeleg & (1 << exc_code)) != 0
 		}
 	} else {
 		false
@@ -150,7 +146,7 @@ pub fn deliver_trap_smode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	let stvec = state.stvec;
 	let tvec_mode = stvec & 0x3;
 	let tvec_base = stvec & !0x3;
-	let exc_code = code & 0x7FFF_FFFF_FFFF_FFFFu64;
+	let exc_code = code & 0x7fff_ffff_ffff_ffffu64;
 	let is_interrupt = (code >> 63) != 0;
 
 	if tvec_mode == 0 || !is_interrupt {
@@ -218,7 +214,7 @@ pub fn deliver_trap_mmode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	// calls sbi_ipi_process().  Without clearing here, MSIP stays set
 	// forever -> infinite re-delivery loop on every instruction boundary.
 	let is_interrupt = (code >> 63) != 0;
-	let exc_code = code & 0x7FFF_FFFF_FFFF_FFFFu64;
+	let exc_code = code & 0x7fff_ffff_ffff_ffffu64;
 
 	// In AIA mode (eidelivery==1), OpenSBI dispatches via MTOPI
 	// (sbi_trap_aia_irq) which reads compute_mtopi -> clears MSIP there.
@@ -279,7 +275,7 @@ pub fn deliver_trap_mmode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	let mtvec = state.mtvec;
 	let tvec_mode = mtvec & 0x3;
 	let tvec_base = mtvec & !0x3;
-	let exc_code = code & 0x7FFF_FFFF_FFFF_FFFFu64;
+	let exc_code = code & 0x7fff_ffff_ffff_ffffu64;
 	let is_interrupt = (code >> 63) != 0;
 
 	if tvec_mode == 0 || !is_interrupt {
@@ -309,7 +305,7 @@ pub(crate) fn priv_ecall_concurrent(
 	_instr: u32,
 	clint: &ConcurrentClintCtx,
 	_module: &ModuleState,
-	dev: &dyn FfiDevCtx,
+	dev: &dyn FfiDevCtx
 ) -> u64 {
 	// SBI 是 S 模式到 M 模式的接口, 只有 S 模式发起的 ecall 才可能命中下面的
 	// 快速路径. U 模式发起的 ecall 按 RISC-V 约定一律以 ECALL_UMODE 投递给
@@ -338,7 +334,7 @@ pub(crate) fn priv_ecall_concurrent(
 		return advance;
 	}
 
-	if a7 == 0x54494D45 && a6 == 0 {
+	if a7 == 0x54494d45 && a6 == 0 {
 		// SBI_TIME set_timer — programs the M-mode mtimecmp comparator
 		// so that MTIP fires at the requested absolute time.  The S-mode
 		// stimecmp (SSTC) is an INDEPENDENT device; do NOT overwrite it
@@ -346,14 +342,14 @@ pub(crate) fn priv_ecall_concurrent(
 		// SSTC is advertised in the ISA string.
 		let stime_val = read_gpr(state, 10);
 		let hid = state.mhartid as usize;
-		if hid < clint.num_harts as usize {
-			unsafe { &*clint.mtimecmp.add(hid) }.store(stime_val, Ordering::Release);
+		if hid < (clint.num_harts as usize) {
+			(unsafe { &*clint.mtimecmp.add(hid) }).store(stime_val, Ordering::Release);
 			// 与 CLINT MMIO 写路径 (write_mtimecmp_for_target) 对齐: 设定一次性
 			// mtip_deadline。否则 mtip_deadline 保持 0, sync_mtip 落入共享 mtime
 			// 比较分支, 被其他活跃 hart 经 fetch_max 推高的共享 mtime 过早触发 ->
 			// mret 后立即再次 trap 的活锁 (飞地走 sbi_set_timer, 而非 SSTC stimecmp,
 			// 是唯一命中此坏路径的调用方)。
-			let now = unsafe { &*clint.mtime }.load(Ordering::Acquire);
+			let now = (unsafe { &*clint.mtime }).load(Ordering::Acquire);
 			write_mtimecmp(state, now, stime_val, clint.timebase_hz);
 		}
 		state.gprs[10] = 0;
@@ -412,7 +408,7 @@ pub(crate) fn priv_mret_concurrent(state: &mut HartState, instr: u32) -> u64 {
 pub(crate) fn priv_sret_concurrent(
 	state: &mut HartState,
 	instr: u32,
-	_ctx: &crate::translate::WalkCtx,
+	_ctx: &crate::translate::WalkCtx
 ) -> u64 {
 	if state.mode < riscv_mode::S {
 		deliver_illegal_instruction(state, instr as u64);
@@ -420,11 +416,7 @@ pub(crate) fn priv_sret_concurrent(
 	}
 	let spp = (state.mstatus >> 8) & 1;
 	let spie = (state.mstatus >> 5) & 1;
-	state.mode = if spp == 0 {
-		riscv_mode::U
-	} else {
-		riscv_mode::S
-	};
+	state.mode = if spp == 0 { riscv_mode::U } else { riscv_mode::S };
 	state.mstatus &= !(1 << 1);
 	if spie != 0 {
 		state.mstatus |= 1 << 1;
@@ -459,7 +451,7 @@ mod tests {
 	use super::*;
 	use crate::ffi::FfiUartCtx;
 	use std::cell::Cell;
-	use std::sync::atomic::{AtomicU64, AtomicU8};
+	use std::sync::atomic::{ AtomicU64, AtomicU8 };
 
 	fn default_state() -> HartState {
 		let mut s: HartState = unsafe { std::mem::zeroed() };
@@ -474,7 +466,7 @@ mod tests {
 	fn single_hart_clint(
 		mtime: &AtomicU64,
 		mtimecmp: &AtomicU64,
-		msip: &AtomicU8,
+		msip: &AtomicU8
 	) -> ConcurrentClintCtx {
 		ConcurrentClintCtx {
 			base: 0x2000000,
@@ -514,15 +506,11 @@ mod tests {
 		let mut s = default_state();
 		s.mode = riscv_mode::S;
 		s.medeleg = 1 << exc_code::ILL_INSTR; // delegate ill-instr
-		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0xDEAD);
-		assert_eq!(
-			s.mode,
-			riscv_mode::S,
-			"should stay in S-mode when delegated"
-		);
+		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0xdead);
+		assert_eq!(s.mode, riscv_mode::S, "should stay in S-mode when delegated");
 		assert_eq!(s.sepc, 0x1000, "sepc should save faulting PC");
 		assert_eq!(s.scause, mcause_val(exc_code::ILL_INSTR, false));
-		assert_eq!(s.stval, 0xDEAD);
+		assert_eq!(s.stval, 0xdead);
 		assert_eq!(s.pc, 0x80004000, "should jump to stvec base");
 	}
 
@@ -531,7 +519,7 @@ mod tests {
 		let mut s = default_state();
 		s.mode = riscv_mode::M;
 		s.medeleg = 1 << exc_code::ILL_INSTR; // delegation ignored in M-mode
-		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0xBEEF);
+		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0xbeef);
 		assert_eq!(s.mode, riscv_mode::M, "M-mode traps never delegate");
 		assert_eq!(s.mepc, 0x1000);
 		assert_eq!(s.mcause, mcause_val(exc_code::ILL_INSTR, false));
@@ -543,7 +531,7 @@ mod tests {
 		let mut s = default_state();
 		s.mode = riscv_mode::S;
 		s.medeleg = 0; // nothing delegated
-		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0xBEEF);
+		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0xbeef);
 		assert_eq!(s.mode, riscv_mode::M, "should switch to M-mode");
 		assert_eq!(s.mepc, 0x1000);
 	}
@@ -597,11 +585,11 @@ mod tests {
 	#[test]
 	fn deliver_ill_instr_saves_mepc() {
 		let mut s = default_state();
-		s.pc = 0xBEEF;
-		deliver_illegal_instruction(&mut s, 0xDEAD_BEEF);
-		assert_eq!(s.mepc, 0xBEEF);
+		s.pc = 0xbeef;
+		deliver_illegal_instruction(&mut s, 0xdead_beef);
+		assert_eq!(s.mepc, 0xbeef);
 		assert_eq!(s.mcause, mcause_val(exc_code::ILL_INSTR, false));
-		assert_eq!(s.mtval, 0xDEAD_BEEF);
+		assert_eq!(s.mtval, 0xdead_beef);
 	}
 
 	#[test]
@@ -622,11 +610,7 @@ mod tests {
 		let mut s = default_state();
 		s.mstatus = 0; // MIE=0
 		deliver_illegal_instruction(&mut s, 0);
-		assert_eq!(
-			s.mstatus & MSTATUS_MPIE,
-			0,
-			"MPIE should be 0 when MIE was 0"
-		);
+		assert_eq!(s.mstatus & MSTATUS_MPIE, 0, "MPIE should be 0 when MIE was 0");
 	}
 
 	#[test]
@@ -739,8 +723,8 @@ mod tests {
 		s.mode = riscv_mode::S;
 		s.mip.store(1 << 3, Ordering::Release); // MSIP set — not delegatable
 		s.mstatus |= 1 << 1; // SIE = 1
-					   // MSIP is non-delegatable, so it goes through deliver_trap->M-mode
-					   // path, which calls _trap_deliver_mmode internally.
+		// MSIP is non-delegatable, so it goes through deliver_trap->M-mode
+		// path, which calls _trap_deliver_mmode internally.
 		deliver_trap(&mut s, mcause_val(3, true), 0);
 		assert_eq!(
 			s.mip.load(Ordering::Acquire) & (1 << 3),
@@ -769,7 +753,7 @@ mod tests {
 		// a0 = 目标绝对时间 (未来值), a6 = 0, a7 = SBI_TIME (0x54494D45).
 		state.gprs[10] = 11000;
 		state.gprs[16] = 0;
-		state.gprs[17] = 0x5449_4D45;
+		state.gprs[17] = 0x5449_4d45;
 
 		let mtime = AtomicU64::new(1000);
 		let mtimecmp = AtomicU64::new(0);
@@ -795,7 +779,8 @@ mod tests {
 		assert_eq!(state.gprs[10], 0, "a0 应清零为 0");
 		assert_eq!(mtimecmp.load(Ordering::Acquire), 11000, "mtimecmp 应被写入");
 		assert_ne!(
-			state.mtip_deadline, 0,
+			state.mtip_deadline,
+			0,
 			"sbi_set_timer 必须设定 mtip_deadline (回归: 曾为 0 -> 共享 mtime 活锁)"
 		);
 		assert!(
@@ -839,10 +824,7 @@ mod tests {
 
 		priv_ecall_concurrent(&mut state, 0, &clint, &module, &uart);
 
-		assert_eq!(
-			tx_wr, 0,
-			"U 模式 ecall 不得被串口快速路径认领而写出字符"
-		);
+		assert_eq!(tx_wr, 0, "U 模式 ecall 不得被串口快速路径认领而写出字符");
 		assert_eq!(
 			state.scause,
 			mcause_val(exc_code::ECALL_UMODE, false),
@@ -873,10 +855,10 @@ mod tests {
 
 		let advance = priv_ecall_concurrent(&mut state, 0, &clint, &module, &uart);
 
-		assert_eq!(advance, 4, "S 模式 SBI putchar 应返回 advance=4");
-		assert_eq!(tx_wr, 1, "应写出一个字符");
-		assert_eq!(tx_buf[0], 0x41, "写出的字符应为 a0 的低字节");
-		assert_eq!(state.gprs[10], 0, "a0 应置为 SBI 成功返回值 0");
-		assert_eq!(state.pc, 0x1000, "快速路径不投递陷态, PC 由调用方推进");
+		assert_eq!(advance, 4, "should gain advance=4");
+		assert_eq!(tx_wr, 1, "should write one char");
+		assert_eq!(tx_buf[0], 0x41, "should output the lower bytes of a0");
+		assert_eq!(state.gprs[10], 0, "should return 0");
+		assert_eq!(state.pc, 0x1000, "should not trap");
 	}
 }

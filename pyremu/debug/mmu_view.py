@@ -13,8 +13,8 @@ from rich.table import Table
 from pyremu.debug._attrs import SharedMixinAttrs
 from pyremu.debug.utils import fmt_size, hex_addr
 from pyremu.memory.mmu import pte_flags_str, sv39_decompose_va
-from pyremu.utils.mask import mask64
 from pyremu.memory.pmp import (
+    decode_napot,
     PMP_A_MASK,
     PMP_A_NA4,
     PMP_A_NAPOT,
@@ -24,8 +24,8 @@ from pyremu.memory.pmp import (
     PMP_R,
     PMP_W,
     PMP_X,
-    decode_napot,
 )
+from pyremu.utils.mask import mask64
 from pyremu.utils.wrapper import seize_val_err
 
 
@@ -49,7 +49,7 @@ class MmuViewMixin(SharedMixinAttrs):
     def cmd_pmp(self) -> None:
         """显示所有 PMP 条目的保护地址范围与权限 (含原始寄存器值)."""
         h = self.hart
-        num = h._pmp.num_entries if h._pmp is not None else 0
+        num = h._pmp.num_entries if h._pmp else 0
 
         if num == 0:
             self._console.print("[dim]PMP 未配置 (num_entries=0)[/]")

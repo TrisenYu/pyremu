@@ -117,27 +117,27 @@ fn dos(nk: usize) -> (Vec<f64>, Vec<f64>, f64) {
 
 fn main() {
     println!("=== graphene tight-binding band structure + DOS (nalgebra, num-complex) ===");
-    println!("[graphene] hopping t = {T}, bond length a = 1 (normalized units)");
+    println!(" hopping t = {T}, bond length a = 1 (normalized units)");
 
     // 高对称点 (倒空间坐标)
     let gamma = [0.0, 0.0];
     let kdirac = [4.0 * PI / (3.0 * 3.0_f64.sqrt()), 0.0]; // K = (4π/(3√3), 0)
     let mpt = [PI / 3.0_f64.sqrt(), -PI / 3.0]; // M = (π/√3, -π/3)
 
-    println!("\n[graphene] diagonalized 2x2 Hermitian H(k) at high-symmetry points:");
+    println!("\n diagonalized 2x2 Hermitian H(k) at high-symmetry points:");
     let e_gamma = band_energies(gamma);
     let e_k = band_energies(kdirac);
     let e_m = band_energies(mpt);
     println!(
-        "[graphene]   Gamma (0,0)   E- = {:.6}, E+ = {:.6} (expect -3/+3)",
+        "   Gamma (0,0)   E- = {:.6}, E+ = {:.6} (expect -3/+3)",
         e_gamma[0], e_gamma[1]
     );
     println!(
-        "[graphene]   K (Dirac)     E- = {:.2e}, E+ = {:.2e} (expect 0)",
+        "   K (Dirac)     E- = {:.2e}, E+ = {:.2e} (expect 0)",
         e_k[0], e_k[1]
     );
     println!(
-        "[graphene]   M (saddle)    E- = {:.6}, E+ = {:.6} (expect -1/+1)",
+        "   M (saddle)    E- = {:.6}, E+ = {:.6} (expect -1/+1)",
         e_m[0], e_m[1]
     );
 
@@ -154,7 +154,7 @@ fn main() {
         let vx = band_energies([kdirac[0] + eps, 0.0])[1] / eps;
         let vy = band_energies([kdirac[0], eps])[1] / eps;
         println!(
-            "[graphene]   eps={eps:.0e}: vF_x={vx:.6}, vF_y={vy:.6} (isotropic, theory {theory_vf})"
+            "   eps={eps:.0e}: vF_x={vx:.6}, vF_y={vy:.6} (isotropic, theory {theory_vf})"
         );
         if (vx - theory_vf).abs() > 1e-3 || (vy - theory_vf).abs() > 1e-3 {
             pass_vf = false;
@@ -171,11 +171,11 @@ fn main() {
     let de = centers[1] - centers[0];
     let integral: f64 = density.iter().map(|&d| d * de).sum();
     println!(
-        "\n[graphene] DOS over BZ grid (nk=120, {} energy bins):",
+        "\n DOS over BZ grid (nk=120, {} energy bins):",
         centers.len()
     );
-    println!("[graphene]   integral rho(E) dE = {integral:.6} (expect 2, two bands)");
-    println!("[graphene]   van Hove peak at E = {peak_e:.4} (expect ~1, M saddle point)");
+    println!("   integral rho(E) dE = {integral:.6} (expect 2, two bands)");
+    println!("   van Hove peak at E = {peak_e:.4} (expect ~1, M saddle point)");
     println!(
         "[{}] DOS normalization + van Hove peak near E=t",
         if (integral - 2.0).abs() < 0.05 && (peak_e - 1.0).abs() < 0.15 {

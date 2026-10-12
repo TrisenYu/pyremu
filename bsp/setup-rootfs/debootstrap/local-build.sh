@@ -8,7 +8,7 @@ set -euo pipefail
 
 SUITE="trixie"
 ROOTFS_DIR="./tmp-rootfs" # relative path to this shell script
-MIRROR="https://mirrors.aliyun.com/debian"
+MIRROR="https://mirrors.tuna.tsinghua.edu.cn/debian"
 EXT4_IMG_SIZE_MB=4096
 EXT4_IMG_FILE="./riscv-sd.ext4"
 CPIO_OUT="./debian-riscv-initrd.cpio.gz"
@@ -35,6 +35,9 @@ STRESS_DEST="${ROOTFS_DIR}/eval/stress-test"
 # both regress.sh and the module loader.
 MODULE_SRC="$(cd "$(dirname "$0")/../../../bsp/sittim/modules" && pwd)"
 MODULE_DEST="${ROOTFS_DIR}/modules"
+# The module build invokes the signer as its last step, so that tree receives build
+# products from this script too.
+MODULE_SIGN_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_aux_tools/sign-mod" && pwd)"
 # Module loader: a host program, deployed as /eval/ext-mod-loader together with its
 # eval.mk (installed as that directory's Makefile).
 EXT_MOD_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_aux_tools/ext-mod-loader" && pwd)"
@@ -319,6 +322,15 @@ if [ -n "${CARGO_BIN}" ]; then
     install -m644 "${MODULE_SRC}"/dist/* "${MODULE_DEST}/"
     echo ">> Enclave modules installed:"
     ls -la "${MODULE_DEST}"
+    # This script runs as root while both trees belong to the invoker: the module build
+    # writes target/, build/ and dist/ into them, and the signer writes its own target/.
+    # An artifact left owned by root cannot be replaced by a later rebuild run as the
+    # invoker: the dist target starts with "rm -rf dist", so a root-owned dist stops it
+    # at its first command, and the same holds for every file under target/.
+    if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
+        chown -R "${SUDO_USER}:${SUDO_USER}" "${MODULE_SRC}" "${MODULE_SIGN_SRC}"
+        echo ">> ownership of module source trees returned to ${SUDO_USER}"
+    fi
 else
     echo ">> SKIP enclave modules: cargo not found"
 fi
