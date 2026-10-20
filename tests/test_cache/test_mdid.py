@@ -5,11 +5,11 @@
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import (
-    AccessFault,
+    AccessFaultError,
     inject_memory_backend,
     mem_read,
     mem_write,
-    MemoryAccessFault,
+    MemoryAccessError,
 )
 from pyremu.core.trap_def import trap_cause_code, TrapType
 from pyremu.emulator import Emulator
@@ -332,11 +332,13 @@ class TestTLBAutoMdid:
 
         h.mode = RiscvMode.S  # MMU 翻译仅在 S/U 模式生效
         h.satp_val = (8 << 60) | (L1_BASE >> PAGE_SHIFT)  # Sv39
+        # PMP: 1 条 NAPOT 规则覆盖全部地址空间 R+W+X, 否则 S 模式下页表遍历被拒绝
+        h.csrs["pmpcfg0"].val, h.csrs["pmpaddr0"].val = 0x1F, 0x003F_FFFF_FFFF_FFFF
 
         # 触发地址翻译, TLB 插入
         try:
             mem_read(h, 0x0, 4)
-        except MemoryAccessFault:
+        except MemoryAccessError:
             pass  # PMP/Access 拒绝时 TLB 不插入, 测试下面断言自然失败
 
         # 验证 TLB 条目被标记为 mdid=7
@@ -928,7 +930,7 @@ class TestPmpsplitMdidIntegration:
         # 飞地写 host 区域, 落入 StAccessFault
         try:
             mem_write(hart, 0x8000_1000, b"\xcc\xdd")
-        except AccessFault:
+        except AccessFaultError:
             pass
         assert hart.mcause_val == 7, (
             f"飞地写 host 区域应 StAccessFault(7), 实际 mcause={hart.mcause_val}"

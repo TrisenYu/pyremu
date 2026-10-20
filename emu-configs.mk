@@ -29,6 +29,8 @@ FW_RESERVED_MEM_SIZE ?= 0x400000
 # 通过 makefile 生成 pyremu/configs_gen.py, 替代各处硬编码与 os.environ.get.
 # TLB 条目数
 TLB_ENTRIES          ?= 256
+# PMP 条目数. 固件在启动时按可访问的 pmpaddr / pmpcfg 探测该数目，同时可能影响固件的PMP_COUNT
+PMP_ENTRIES          ?= 16
 # mtime/mcycle 随宿主机时间推进
 CPU_FREQ_HZ          ?= 1000000000
 # 调试器 run/continue 的时钟源超时 (秒), 0 = 禁用
@@ -66,22 +68,14 @@ APLIC_S_BASE         ?= 0x0C000000
 APLIC_M_BASE         ?= 0x0C008000
 
 
-# ---- 诊断用相关配置
-# 诊断日志路径
-PYREMU_DIAG_LOG      ?= /tmp/pyremu_diag.log
-# 1 = 把诊断信息打印到 stderr
-PYREMU_DIAG_VERBOSE  ?= 0
-# 1 = 追踪 sret 返回 U 模式时的寄存器状态 (默认打开, 供飞地诊断用)
-PYREMU_TRACE_SRET    ?= 1
-# 1 = 追踪全部 trap 投递
-PYREMU_TRACE_TRAPS   ?= 0
-# 1 = 追踪 PMP 匹配
-PYREMU_TRACE_PMP     ?= 0
-# AIA 诊断打印间隔 (批次), 0 = 关闭
-PYREMU_AIA_DIAG_INTERVAL ?= 100
+# ---- 模拟器行为开关
 # 1 = 关闭 L2 缓存: RAM 访问全部绕过 L2 缓存
 PYREMU_NO_L2         ?= 0
 # 1 = 关闭 TLB: 查询与插入一并跳过, 每次地址翻译都完整遍历 Sv39 页表
 PYREMU_NO_TLB        ?= 0
+# 1 = 带 marker 的 ebreak 由模拟器内联服务, 固件输出写标准错误
+# 0 = 不拦截该序列, ebreak 按普通断点投递, 固件控制台回落到 UART 并写入每 hart 的日志
+#     以 SYS_EXIT 停机序列收尾的用例随之无法结束连续执行
+PYREMU_HAS_SEMIHOSTING ?= 0
 
 export

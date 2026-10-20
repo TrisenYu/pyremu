@@ -49,7 +49,7 @@ use net_ops::{
 	NET_BIND_NO_FREE_PORT, NET_BIND_NOT_READY, NET_BIND_OK, NET_BIND_PORT_IN_USE, NET_NO_SLOT,
 };
 
-/// 模块编号, 与 ref-impl/emod 的 `EMODULE_ID_NET` 取同一值。
+/// 模块编号。
 const MODULE_ID: u32 = 4;
 
 /// 模块名, 不足 [`MODULE_NAME_LEN`] 的部分以 0 填充。

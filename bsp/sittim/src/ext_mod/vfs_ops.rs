@@ -8,7 +8,7 @@
 //! 套接字也在运行时一侧实现, 故本表不含 fd 参数, 也不涉及这两类对象。
 //!
 //! 各项的结果取 [`VfsStatus`], 折算为 errno 由运行时完成; 模块内不出现 errno 编号, 两侧
-//! 因此不必共用一套错误码。形态与 ref-impl/emod 的 `emod_vfs_api_t` 一致。
+//! 因此不必共用一套错误码。
 
 // ---------------------------------------------------------------
 //  打开标志
@@ -39,12 +39,12 @@ pub const AT_REMOVEDIR: u32 = 0x200;
 
 /// 打开标志的访问模式位是否允许读出。`O_RDONLY` 与 `O_RDWR` 允许, `O_WRONLY` 不允许。
 pub const fn mode_readable(flags: u32) -> bool {
-	flags & O_ACCMODE != O_WRONLY
+	(flags & O_ACCMODE) != O_WRONLY
 }
 
 /// 打开标志的访问模式位是否允许写入。`O_WRONLY` 与 `O_RDWR` 允许, `O_RDONLY` 不允许。
 pub const fn mode_writable(flags: u32) -> bool {
-	flags & O_ACCMODE != O_RDONLY
+	(flags & O_ACCMODE) != O_RDONLY
 }
 
 // ---------------------------------------------------------------
@@ -141,7 +141,13 @@ pub struct VfsOps {
 	/// 读取位置写回 *pos*; 成功时把写入的字节数写入 *out_written*。末级不是目录时返回
 	/// [`NotDir`](VfsStatus::NotDir), 下标无效或缓冲区容纳不下更多条目时返回
 	/// [`Invalid`](VfsStatus::Invalid)。
-	pub getdents: unsafe extern "C" fn(i16, *mut u64, *mut u8, u64, *mut u64) -> VfsStatus,
+	pub getdents: unsafe extern "C" fn(
+		i16,
+		*mut u64,
+		*mut u8,
+		u64,
+		*mut u64
+	) -> VfsStatus,
 	/// 创建目录 *path*, *mode* 为权限位。
 	pub mkdir: unsafe extern "C" fn(*const u8, u64, u32) -> VfsStatus,
 	/// 删除 *path* 所指的对象。*flags* 含 [`AT_REMOVEDIR`] 时目标须是目录, 不含时目标须是
@@ -151,9 +157,7 @@ pub struct VfsOps {
 	pub access: unsafe extern "C" fn(*const u8, u64) -> VfsStatus,
 }
 
-// ---------------------------------------------------------------
-//  测试
-// ---------------------------------------------------------------
+
 
 #[cfg(test)]
 mod tests {

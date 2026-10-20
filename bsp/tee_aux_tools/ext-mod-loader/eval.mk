@@ -6,7 +6,8 @@
 #   make install      加载 TEE 驱动 (insmod)
 #   make uninstall    卸载 TEE 驱动
 #
-# 模块目录 /modules 由 local-build.sh 安装: 模块映像与清单 modules.list 同处该目录.
+# 模块目录 /modules 由 local-build.sh 安装: 模块映像位于该目录. 模块编号与映像文件名的
+# 对应在本工具编译时确定.
 
 DRV		= ../tee_enclave_drv.ko
 BIN		= ext_mod_loader

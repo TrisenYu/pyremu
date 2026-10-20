@@ -14,7 +14,7 @@ use crate::handlers::{
 use crate::hart_sched::{ ram_offset, read_gpr };
 use crate::peripheral::is_device_addr;
 use crate::state::{ exit_reason, HartState };
-use crate::translate::{ translate_va, TranslateFault, WalkCtx };
+use crate::translate::{ rwx_write, translate_va, TranslateFault, WalkCtx };
 use crate::trap::{ deliver_illegal_instruction, deliver_trap, exc_code, mcause_val };
 
 pub(crate) fn atomic_minmax_u32(atomic: &AtomicU32, funct5: u8, rs2: u32) -> u64 {
@@ -302,7 +302,7 @@ pub(crate) fn handle_amo_concurrent_dispatch(
 		return 0;
 	}
 
-	let tr = match translate_va(state, ctx, va, true, false) {
+	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);

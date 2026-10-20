@@ -112,26 +112,18 @@ class TestNetNodePresence:
             cells = struct.unpack(f">{len(raw) // 4}I", raw)
             assert VIRTIO_NET_M_IRQ not in cells, f"飞地侧源号出现在 interrupts={cells}"
 
-    def test_enclave_side_only_yields_no_node(self) -> None:
-        """只启用飞地侧实例时, 设备树中不存在任何 virtio 节点.
-
-        这是上一条的加强形式: 源号本身 (3) 可能与其它属性的取值重合, 故另按节点
-        路径断言. 改动前该用例失败 (M 侧实例被无条件写入节点).
-        """
-        fdt = _fdt(_cfg(is_net_s=False, is_net_m=True))
+    @pytest.mark.parametrize(
+        "is_s_nic,is_m_nic",
+        [(False, True), (False, False)]
+    )
+    def test_nic_fdt_node(
+        self,
+        is_s_nic: bool,
+        is_m_nic: bool
+    ) -> None:
+        fdt = _fdt(_cfg(is_net_s=is_s_nic, is_net_m=is_m_nic))
         assert _find(fdt, f"/soc/virtio@{NET_M_BASE:x}") < 0
         assert _find(fdt, f"/soc/virtio@{NET_S_BASE:x}") < 0
-
-    def test_disabled_instance_yields_no_node(self) -> None:
-        """两个实例都未启用时不存在 virtio 节点."""
-        fdt = _fdt(_cfg(is_net_s=False, is_net_m=False))
-        assert _find(fdt, f"/soc/virtio@{NET_S_BASE:x}") < 0
-        assert _find(fdt, f"/soc/virtio@{NET_M_BASE:x}") < 0
-
-
-# ============================================================
-#  中断属性编码
-# ============================================================
 
 
 class TestNetNodeInterruptEncoding:

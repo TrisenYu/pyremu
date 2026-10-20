@@ -4,8 +4,8 @@
 Usage:
     from pyremu.configs_aux import cfg_str, cfg_bool
 
-    diag_path = cfg_str("PYREMU_DIAG_LOG")          # str, env 优先, 否则 configs_gen
-    verbose = cfg_bool("PYREMU_DIAG_VERBOSE")        # bool: ""/"0" -> False
+    bins_dir = cfg_str("BINS_DIR")            # str, env 优先, 否则 configs_gen
+    no_l2 = cfg_bool("PYREMU_NO_L2")          # bool: ""/"0" -> False
 """
 
 from __future__ import annotations

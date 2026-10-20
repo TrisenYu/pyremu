@@ -1,10 +1,8 @@
 #!/usr/bin/env sh
-# 从 LLVM 源码树交叉编译 libc++/libc++abi/libunwind 三件套, 装入 bsp/musl-gc-sysroot,
-# 补齐 riscv64-linux-musl 静态 C++ 标准库。
+# 从 LLVM 源码树交叉编译 libc++/libc++abi/libunwind并设置到bsp/musl-gc-sysroot,
+# 从而便于 riscv64-linux-musl 使用静态 C++ 标准库。
 #
-# 前置: 先运行 bsp/build-musl-sysroot.sh 生成 C 运行库 (libc.a/libgcc.a/crt*),
-#       本脚本只追加 C++ 运行库与头, 不重建 C 库。
-# 用途: fn_apps/dune (DUNE FEM, C++20) 等 C++ 载荷交叉编译时的 stdlib。
+# 用途: C++ 载荷如fn_apps/dune交叉编译时的 stdlib。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -16,16 +14,14 @@ CLANG="clang"
 CLANGXX="clang++"
 LLVM_AR="llvm-ar"
 LLVM_RANLIB="llvm-ranlib"
-
-# 必须由命令行参数提供的项 (无默认值)
 LLVM_SRC=""
 
 usage() {
     cat >&2 <<EOF
 用法: $0 -s <llvm-src> [-h]
 
-    -s <path>   LLVM 源码树路径  (必填, 例: $ROOT/vendor/riscv-llvm-toolchain)
-    -h          显示本帮助
+    -s <path>   path to LLVM source tree  (Required. e.g.: $ROOT/vendor/riscv-llvm-toolchain)
+    -h          print this help
 EOF
     exit 1
 }
@@ -44,18 +40,17 @@ fi
 
 for tool in "$CLANG" "$CLANGXX" cmake ninja "$LLVM_AR" "$LLVM_RANLIB"; do
     if ! command -v "$tool" >/dev/null 2>&1; then
-        echo "错误: 缺少工具 $tool" >&2
+        echo "err: miss $tool" >&2
         exit 1
     fi
 done
 
-# cmake 对 CMAKE_AR/CMAKE_RANLIB 不做 PATH 查找, 传裸名会按相对路径解析,
-# 故此处解析为绝对路径供 cmake 使用。
+# 此处解析为绝对路径供 cmake 使用。
 LLVM_AR="$(command -v llvm-ar)"
 LLVM_RANLIB="$(command -v llvm-ranlib)"
 
 if [ ! -f "$SYSROOT/lib/libc.a" ]; then
-    echo "错误: 缺少 $SYSROOT/lib/libc.a, 请先运行 bsp/build-musl-sysroot.sh" >&2
+    echo "err: miss $SYSROOT/lib/libc.a, run bsp/build-musl-sysroot.sh first" >&2
     exit 1
 fi
 
@@ -116,5 +111,5 @@ cmake -G Ninja \
 ninja -C "$BUILD_DIR" -j8
 ninja -C "$BUILD_DIR" install
 
-echo "已装入 C++ 标准库到: $SYSROOT"
+echo "C++ stdlib was installed to $SYSROOT"
 ls -1 "$SYSROOT/lib"

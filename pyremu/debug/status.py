@@ -199,7 +199,7 @@ class StatusMixin(SharedMixinAttrs):
         active_hart = self._hart_id
 
         tbl = Table(
-            title=f"Harts ({total} total)  [dim]* = 当前[/]",
+            title=f"Total: {total} Hart(s)",
             border_style="blue",
         )
         tbl.add_column("", style="cyan", width=1)
@@ -207,7 +207,7 @@ class StatusMixin(SharedMixinAttrs):
         tbl.add_column("PC", style="green")
         tbl.add_column("Mode", style="yellow", width=5)
         tbl.add_column("State", width=8)
-        tbl.add_column("Instr", justify="right")
+        tbl.add_column("InstrNum", justify="right")
         for h in harts:
             mark = "*" if h.id == active_hart else " "
             if h._halted:

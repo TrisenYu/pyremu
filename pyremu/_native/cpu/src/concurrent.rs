@@ -17,10 +17,6 @@ use std::sync::{
 // the test functions can reference them without qualification changes.
 use crate::hart_sched::*;
 
-// 无条件导入: diag 模块始终编译, 函数体在 feature 关闭时为 no-op.
-#[allow(unused)]
-use crate::diag;
-
 use crate::ffi::{
 	FfiBpCtx, FfiClintCtx, FfiDevicesCtx, FfiExtIrqCtx, FfiHartCtx, FfiInterruptCtx,
 	FfiMemCtx, FfiPlicCtx, FfiTlbCtx, FfiUartCtx, FfiVirtIoCtx, InstrToBeExec, EMPTY_UART,
@@ -223,19 +219,24 @@ pub struct ModuleState {
 	pub wfi_flags: Box<[AtomicU8]>,
 	/// Number of non-halted harts. Set once before threads spawn, read-only after.
 	pub active_hart_num: u32,
-	/// Global TLB generation counter — incremented (Release) by any hart
-	/// that executes SFENCE.VMA.  Each hart locally samples this counter
-	/// (Acquire) at instruction boundaries and flushes its own TLB when
-	/// it detects a mismatch against its per-hart slot in ``tlb_gen_per_hart``.
-	/// This provides broadcast-TLB-invalidation semantics without explicit
-	/// IPI-driven shootdown: over-invalidation never breaks correctness,
-	/// and it closes the window where hart A's page-table write followed by
-	/// local SFENCE.VMA is invisible to hart B's TLB hit.
-	pub tlb_gen: AtomicU64,
-	/// Per-hart last-seen TLB generation.  When a hart's value is less than
-	/// the global ``tlb_gen``, it must flush both itlb and dtlb before its
-	/// next instruction fetch or data access.
-	pub tlb_gen_per_hart: Box<[AtomicU64]>,
+	/// 已发生的 TLB 刷新次数. 使既有翻译条目失效的动作各算一次: 客机执行
+	/// SFENCE.VMA 或改写 satp, 调试器刷新 TLB 或回滚快照, 装入固件. 每发生
+	/// 一次即加一, 由执行该动作的一方加. 该计数由调用方持有, 引擎每轮结束
+	/// 写回, 故两个调用之间积累的刷新对下一轮仍然可见.
+	///
+	/// 用计数而不是一个"已失效"标志: 标志上的清除与置位并发时, 清除可能覆盖
+	/// 紧随其后的置位, 使某个 hart 漏掉一次失效; 计数只增不减, 各 hart 比较
+	/// 取值即可判定, 多标记不影响正确性. 由此不必为跨 hart 失效发送核间中断.
+	pub tlb_flush_cnt: AtomicU64,
+	/// 各 hart 上次见到的 ``tlb_flush_cnt``. 与 ``tlb_flush_cnt`` 不相等时,
+	/// 该 hart 在取下一条指令或访问数据之前把自己两个 TLB 的条目全部标为陈旧,
+	/// 下一次访问重新遍历页表.
+	pub tlb_flush_cnt_per_hart: Box<[AtomicU64]>,
+	/// 调用方是否给出了上述两处计数的存放位置. 为真时计数跨调用保留, 引擎
+	/// 进入执行循环时不清空任何条目. 为假时计数只在本轮内有效, 各 hart 在
+	/// 进入执行循环之前清空自己的两个 TLB — 上一轮留下的条目是否仍然有效
+	/// 没有判定依据.
+	pub is_flush_cnt_persistent: bool,
 	/// Per-hart LR/SC reservation slots.  Each slot holds the PA reserved by
 	/// that hart (0 = no reservation).  Any store to a PA clears matching
 	/// reservations from ALL harts, ensuring correct multi-hart LR/SC semantics
@@ -271,7 +272,9 @@ impl ModuleState {
 	pub fn new(
 		num_harts: u32,
 		active_hart_num: u32,
-		init_tlb_gen: u64,
+		init_flush_cnt: u64,
+		init_flush_cnt_per_hart: Box<[u64]>,
+		is_flush_cnt_persistent: bool,
 		time_base_val: u64,
 		instr_ref_num: Box<[u64]>,
 	) -> Self {
@@ -279,9 +282,9 @@ impl ModuleState {
 		let mut gv = Vec::with_capacity(num_harts as usize);
 		let mut rv = Vec::with_capacity(num_harts as usize);
 		let mut mv = Vec::with_capacity(num_harts as usize * MSIP_PENDING_STRIDE);
-		for _ in 0..num_harts {
+		for hid in 0..num_harts as usize {
 			v.push(AtomicU8::new(0));
-			gv.push(AtomicU64::new(0));
+			gv.push(AtomicU64::new(init_flush_cnt_per_hart[hid]));
 			rv.push(AtomicU64::new(0));
 		}
 		for _ in 0..num_harts as usize * MSIP_PENDING_STRIDE {
@@ -293,8 +296,9 @@ impl ModuleState {
 			wfi_count: AtomicU32::new(0),
 			wfi_flags: v.into_boxed_slice(),
 			active_hart_num,
-			tlb_gen: AtomicU64::new(init_tlb_gen),
-			tlb_gen_per_hart: gv.into_boxed_slice(),
+			tlb_flush_cnt: AtomicU64::new(init_flush_cnt),
+			tlb_flush_cnt_per_hart: gv.into_boxed_slice(),
+			is_flush_cnt_persistent,
 			lr_reserved: rv.into_boxed_slice(),
 			msip_pending: mv.into_boxed_slice(),
 			st_time_val: std::time::Instant::now(),
@@ -548,19 +552,23 @@ unsafe fn sum_instrs(states: *mut HartState, num_harts: u32, instr_group: *mut I
 	(*instr_group).total_instrs = total;
 }
 
+/// 把本轮结束时的刷新计数写回调用方持有的两处存放位置.
+///
+/// 两处指针须同时给出: 只给出其中之一时, 本轮执行循环的刷新计数自 0 起算,
+/// 写回会把调用方持有的取值改小, 故一律不写回.
 #[inline]
-unsafe fn writeback_tlb(
-	gen_ptr: *mut u64,
-	gen_per_hart_ptr: *mut u64,
+unsafe fn writeback_tlb_flush_cnt(
+	flush_cnt_ptr: *mut u64,
+	flush_cnt_per_hart_ptr: *mut u64,
 	module: &ModuleState,
 	num_harts: u32,
 ) {
-	if gen_ptr.is_null() {
+	if flush_cnt_ptr.is_null() || flush_cnt_per_hart_ptr.is_null() {
 		return;
 	}
-	*gen_ptr = module.tlb_gen.load(Ordering::Relaxed);
+	*flush_cnt_ptr = module.tlb_flush_cnt.load(Ordering::Relaxed);
 	for i in 0..num_harts as usize {
-		*gen_per_hart_ptr.add(i) = module.tlb_gen_per_hart[i].load(Ordering::Relaxed);
+		*flush_cnt_per_hart_ptr.add(i) = module.tlb_flush_cnt_per_hart[i].load(Ordering::Relaxed);
 	}
 }
 
@@ -689,21 +697,32 @@ pub unsafe extern "C" fn run_parallel(
 	// 该把 mtime 快进到哪个截止. 无条件设置本指针
 	cc_clint.hart_states.set(states as *const HartState);
 
-	// 3. Module state (TLB gen persists between different speedup stage)
-	let tlb_gen_ptr = if tlb.is_null() {
+	// 3. Module state (TLB 刷新计数跨调用保留, 见 FfiTlbCtx)
+	let flush_cnt_ptr = if tlb.is_null() {
 		std::ptr::null_mut()
 	} else {
-		unsafe { (*tlb).gen }
+		unsafe { (*tlb).flush_cnt }
 	};
-	let tlb_gen_per_hart_ptr = if tlb.is_null() {
+	let flush_cnt_per_hart_ptr = if tlb.is_null() {
 		std::ptr::null_mut()
 	} else {
-		unsafe { (*tlb).gen_per_hart }
+		unsafe { (*tlb).flush_cnt_per_hart }
 	};
-	let init_gen = if tlb_gen_ptr.is_null() {
+	// 两个指针都在才有跨调用的判定依据: 计数从调用方数组恢复, 而不是每轮从 0
+	// 起算. 从 0 起算时, 只要调用方一侧的刷新次数不为 0, 每个 hart 在每轮的第一条
+	// 指令处都会判定为陈旧, 引擎内的翻译在每轮边界全部作废.
+	let is_flush_cnt_persistent = !flush_cnt_ptr.is_null() && !flush_cnt_per_hart_ptr.is_null();
+	let init_flush_cnt = if is_flush_cnt_persistent {
+		unsafe { *flush_cnt_ptr }
+	} else {
 		0
+	};
+	let init_flush_cnt_per_hart: Box<[u64]> = if is_flush_cnt_persistent {
+		(0..num_harts as usize)
+			.map(|hid| unsafe { *flush_cnt_per_hart_ptr.add(hid) })
+			.collect()
 	} else {
-		unsafe { *tlb_gen_ptr }
+		vec![0u64; num_harts as usize].into_boxed_slice()
 	};
 	// time_base_val = marshal 时的 mtime 值, instr_ref_num = 每 hart 起始指令计数,
 	// advance_clock_source 据此以指令增量推进 (见 NS_PER_INSTR).
@@ -713,7 +732,9 @@ pub unsafe extern "C" fn run_parallel(
 	let module = Arc::new(ModuleState::new(
 		num_harts,
 		active,
-		init_gen,
+		init_flush_cnt,
+		init_flush_cnt_per_hart,
+		is_flush_cnt_persistent,
 		unsafe { *clint_raw.mtime },
 		instr_ref_num,
 	));
@@ -782,7 +803,7 @@ pub unsafe extern "C" fn run_parallel(
 		// 6. Collect results — single unsafe block for all write-backs
 		collect_stop(&module, hart.instr_group);
 		sum_instrs(states, num_harts, hart.instr_group);
-		writeback_tlb(tlb_gen_ptr, tlb_gen_per_hart_ptr, &module, num_harts);
+		writeback_tlb_flush_cnt(flush_cnt_ptr, flush_cnt_per_hart_ptr, &module, num_harts);
 		writeback_mtime(clint_raw, &cc_clint);
 	}
 }
@@ -890,8 +911,8 @@ mod tests {
 			count: 0,
 		};
 		let mut tlb = FfiTlbCtx {
-			gen: std::ptr::null_mut(),
-			gen_per_hart: std::ptr::null_mut(),
+			flush_cnt: std::ptr::null_mut(),
+			flush_cnt_per_hart: std::ptr::null_mut(),
 		};
 		run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 	}
@@ -1015,8 +1036,8 @@ mod tests {
 				count: 0,
 			};
 			let mut tlb = FfiTlbCtx {
-				gen: std::ptr::null_mut(),
-				gen_per_hart: std::ptr::null_mut(),
+				flush_cnt: std::ptr::null_mut(),
+				flush_cnt_per_hart: std::ptr::null_mut(),
 			};
 			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}
@@ -1130,8 +1151,8 @@ mod tests {
 			count: 0,
 		};
 		let mut tlb = FfiTlbCtx {
-			gen: std::ptr::null_mut(),
-			gen_per_hart: std::ptr::null_mut(),
+			flush_cnt: std::ptr::null_mut(),
+			flush_cnt_per_hart: std::ptr::null_mut(),
 		};
 		run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		(instr_group.exit_reason, instr_group.total_instrs)
@@ -1468,8 +1489,8 @@ mod tests {
 				count: 0,
 			};
 			let mut tlb = FfiTlbCtx {
-				gen: std::ptr::null_mut(),
-				gen_per_hart: std::ptr::null_mut(),
+				flush_cnt: std::ptr::null_mut(),
+				flush_cnt_per_hart: std::ptr::null_mut(),
 			};
 			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}
@@ -1598,8 +1619,8 @@ mod tests {
 			count: 0,
 		};
 		let mut tlb = FfiTlbCtx {
-			gen: std::ptr::null_mut(),
-			gen_per_hart: std::ptr::null_mut(),
+			flush_cnt: std::ptr::null_mut(),
+			flush_cnt_per_hart: std::ptr::null_mut(),
 		};
 		run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 	}
@@ -1778,12 +1799,6 @@ mod tests {
 			);
 		}
 
-		// MSI MUST have been detected by Hart 1's sync_msip.
-		assert!(
-			states[1].diag.msip_last_seen > 0,
-			"Hart 1 should have detected MSIP via sync_msip"
-		);
-
 		// mcause MUST indicate MSI was delivered (bit 63=1=interrupt, code=3=MSI).
 		let is_interrupt = (states[1].mcause >> 63) != 0;
 		let cause_code = states[1].mcause & 0x7FFF_FFFF_FFFF_FFFF;
@@ -1904,8 +1919,8 @@ mod tests {
 				count: 0,
 			};
 			let mut tlb = FfiTlbCtx {
-				gen: std::ptr::null_mut(),
-				gen_per_hart: std::ptr::null_mut(),
+				flush_cnt: std::ptr::null_mut(),
+				flush_cnt_per_hart: std::ptr::null_mut(),
 			};
 			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}
@@ -2009,8 +2024,8 @@ mod tests {
 				count: 0,
 			};
 			let mut tlb = FfiTlbCtx {
-				gen: std::ptr::null_mut(),
-				gen_per_hart: std::ptr::null_mut(),
+				flush_cnt: std::ptr::null_mut(),
+				flush_cnt_per_hart: std::ptr::null_mut(),
 			};
 			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}

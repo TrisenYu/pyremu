@@ -21,13 +21,13 @@
 
 use core::ptr;
 
-use crate::ext_mod::runtime;
+use crate::ext_mod::{ runtime, table };
 use crate::syscall::concurrency::sig::{ self, SigState };
 use crate::syscall::concurrency::thread;
 use crate::syscall::{ EAGAIN, ECHILD, ENODEV, EINVAL, ENOMEM, ESRCH };
 use crate::constants::{ CHUNK_2M_PAGES, PAGE_SHIFT, TIMER_FREQ };
 use crate::mem_prim::align::align_up;
-use crate::{csr, ecall_aux, paging};
+use crate::{ csr, ecall_aux, paging };
 use crate::trap_frame::{ TrapGprs, A0 };
 
 /// 进程表容量。启动进程占用槽位 0。
@@ -337,7 +337,9 @@ pub fn clone_process(gprs: &TrapGprs, flags: u64) -> u64 {
 		return ENOMEM;
 	}
 
-	let child_thread = match thread::spawn_process_thread(child_slot, gprs, gprs.sp_before_trap) {
+	let child_thread = match
+		thread::spawn_process_thread(child_slot, gprs, gprs.sp_before_trap)
+	{
 		Some(t) => t,
 		None => {
 			return EAGAIN;
@@ -544,7 +546,9 @@ pub fn deliver_pending(gprs: &mut TrapGprs, sepc: u64) -> Option<u64> {
 			exit_process(slot, sig::SIGNAL_EXIT_OFFSET + (sig_num as u64));
 			None
 		}
-		sig::Disposition::Handle(handler) => { Some(sig::build_frame(state, sig_num, handler, gprs, sepc)) }
+		sig::Disposition::Handle(handler) => {
+			Some(sig::build_frame(state, sig_num, handler, gprs, sepc))
+		}
 	}
 }
 
@@ -573,14 +577,14 @@ pub fn take_sigreturn() -> Option<u64> {
 //  模块故障反馈
 // ---------------------------------------------------------------
 
-/// 处置一次由模块引起的故障: 清空该模块的操作表缓存, 把该次故障交回用户态。
+/// 处置一次由模块引起的故障: 注销该模块并清空它的操作表缓存, 把该次故障交回用户态。
 ///
-/// 处置分两步。其一, 清除该模块的操作表缓存, 使下一次调用重新向该模块取一次操作表, 而不是
-/// 继续使用出错那份映像登记的表。登记表本身不改动: 一次调用出错只使该次调用失败, 后续调用
-/// 仍取用同一个模块, 宿主重新交付映像之后即可用上修好的那份。其二, 按可信应用对
-/// [`SIGBUS`](sig::SIGBUS) 的处置把故障交回用户态: 有处理函数则在用户帧上建立信号帧,
-/// 无处理函数则终止该进程, 忽略则该次故障不产生别的作用。三种处置下被放弃的系统调用都以
-/// [`ENODEV`] 失败返回。
+/// 处置分三步。其一, 把该模块的槽位转为失败态, 见 [`table::mark_failed`]: 取入过程中的槽位
+/// 回到空闲, 已登记的槽位不再交出取用器, 故该模块的下一次调用重新请求宿主交付映像, 出错的
+/// 那份映像不再被调入。其二, 清除该模块的操作表缓存, 使该模块的下一次调用重新取一次操作表,
+/// 而不是继续使用出错那份映像登记的表。其三, 按可信应用对 [`SIGBUS`](sig::SIGBUS) 的处置把
+/// 故障交回用户态: 有处理函数则在用户帧上建立信号帧, 无处理函数则终止该进程, 忽略则该次故障
+/// 不产生别的作用。三种处置下被放弃的系统调用都以 [`ENODEV`] 失败返回。
 ///
 /// 返回陷阱入口换栈所用的目标帧基址, 即进入 S 模式的那次陷阱所留的帧; 当前执行流不来自
 /// U 模式时返回 None, 由调用方按管理程序自身缺陷处理。
@@ -588,12 +592,17 @@ pub fn deliver_module_fault(module_id: u32) -> Option<u64> {
 	// 进入 S 模式的那次陷阱留下的恢复点: 被放弃的系统调用与它的返回值位置都由它给出。
 	// 没有该记录说明当前执行流不来自 U 模式, 本次故障没有可交回的可信应用。
 	let (resume_pc, is_failed_call) = match thread::trap_resume() {
-		thread::TrapResume::None => return None,
+		thread::TrapResume::None => {
+			return None;
+		}
 		thread::TrapResume::Ecall { next } => (next, true),
 		thread::TrapResume::Interrupted { pc } => (pc, false),
 	};
 
-	// 出错那份映像登记的操作表此后不再交出; 登记保留, 下一次调用重新取用该模块。
+	// 槽位转为失败态, 出错那份映像此后不再被调入。取入期间出错时该槽位正处在取入状态, 而
+	// 请求交付的那个调用不会再返回, 本行是该槽位唯一的释放点。
+	table::mark_failed(module_id);
+	// 出错那份映像登记的操作表此后不再交出。
 	runtime::clear_module_cache(module_id);
 	// 被放弃的调用不再重新执行, 遗留的重启请求须一并清除。
 	thread::clear_restart();
@@ -617,7 +626,12 @@ pub fn deliver_module_fault(module_id: u32) -> Option<u64> {
 			sig::build_frame(state, sig::SIGBUS, handler, outer, resume_pc)
 		}
 		sig::Disposition::Terminate => {
-			exit_process(unsafe { CURRENT_PROC }, sig::SIGNAL_EXIT_OFFSET + sig::SIGBUS as u64);
+			exit_process(
+				unsafe {
+					CURRENT_PROC
+				},
+				sig::SIGNAL_EXIT_OFFSET + (sig::SIGBUS as u64)
+			);
 			resume_pc
 		}
 		// 可信应用忽略该信号: 本次故障除弃用该模块之外不产生别的作用。
@@ -711,7 +725,11 @@ fn advance_itimer(slot: usize, now: u64) -> bool {
 		if !p.used || p.exited || p.itimer_next == 0 || now < p.itimer_next {
 			return false;
 		}
-		p.itimer_next = if p.itimer_interval != 0 { p.itimer_next + p.itimer_interval } else { 0 };
+		p.itimer_next = if p.itimer_interval != 0 {
+			p.itimer_next + p.itimer_interval
+		} else {
+			0
+		};
 		sig::post(&mut p.sig, sig::SIGALRM);
 		true
 	}
@@ -790,7 +808,12 @@ pub fn tgkill_handler(tgid: u64, _tid: u64, sig: u64) -> u64 {
 /// rt_sigaction (134): 参数 (Linux rv64) 为 sig = a0, new_action = a1,
 /// old_action = a2, sigsetsize = a3。sigsetsize 只描述信号集合宽度, 本运行时不读
 /// new_action 的 mask 栏, 故不参与处理。
-pub fn sigaction_handler(sig_num: u64, new_action: u64, old_action: u64, _sigsetsize: u64) -> u64 {
+pub fn sigaction_handler(
+	sig_num: u64,
+	new_action: u64,
+	old_action: u64,
+	_sigsetsize: u64
+) -> u64 {
 	sigaction(sig_num, new_action, old_action)
 }
 

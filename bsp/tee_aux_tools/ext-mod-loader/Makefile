@@ -22,11 +22,13 @@ OUT_DIR	  = bin
 INCLUDES  = -I../cache-probe-exploit -I../ext-mod-svc
 SVC_SRC	  = ../ext-mod-svc/tee_ext_mod_svc.c
 SVC_HDR	  = ../ext-mod-svc/tee_ext_mod_svc.h
+SVC_INC	  = ../ext-mod-svc/ext_mod_table.inc
 
 all: $(OUT_DIR)/ext_mod_loader
 phony += all
 
-$(OUT_DIR)/ext_mod_loader: ext_mod_loader.c ../cache-probe-exploit/tee_enclave.h $(SVC_SRC) $(SVC_HDR)
+$(OUT_DIR)/ext_mod_loader: ext_mod_loader.c ../cache-probe-exploit/tee_enclave.h \
+                           $(SVC_SRC) $(SVC_HDR) $(SVC_INC)
 	@mkdir -p $(@D)
 	$(CROSS_CC) $(CFLAGS) $(INCLUDES) ext_mod_loader.c $(SVC_SRC) -o $@
 

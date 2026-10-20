@@ -9,13 +9,15 @@ use std::sync::Mutex;
 use crate::csr;
 use crate::decode::{ decode_compressed, CompressedFields, DecodedFields };
 use crate::ffi::InstrToBeExec;
-use crate::state::{ exit_reason, riscv_mode, HartState };
+use crate::state::{ exit_reason, riscv_mode, HartState, CFG_HAS_SEMIHOSTING };
 pub(crate) use crate::translate::{
 	lr_check,
 	lr_clear_all,
 	lr_set,
 	ram_read,
 	ram_write,
+	rwx_read,
+	rwx_write,
 	translate_va,
 	TranslateFault,
 	TranslateResult,
@@ -264,7 +266,7 @@ pub fn handle_load(
 	}
 
 	// Translate VA -> PA
-	let tr = match translate_va(state, ctx, va, false, false) {
+	let tr = match translate_va(state, ctx, va, rwx_read(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -400,7 +402,7 @@ pub fn handle_store(
 	}
 
 	// Translate VA -> PA
-	let tr = match translate_va(state, ctx, va, true, false) {
+	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -500,7 +502,7 @@ pub fn handle_fp_load(
 		return 0;
 	}
 
-	let tr = match translate_va(state, ctx, va, false, false) {
+	let tr = match translate_va(state, ctx, va, rwx_read(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -573,7 +575,7 @@ pub fn handle_fp_store(
 		return 0;
 	}
 
-	let tr = match translate_va(state, ctx, va, true, false) {
+	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -716,6 +718,12 @@ fn dispatch_privileged(
 	match func12 {
 		0 => handle_ecall_inline(state, instr, instr_group, clint),
 		1 => {
+			// 内联服务关闭: 与 Python 引擎的 trap_ebreak 一致, 投递断点异常
+			if !CFG_HAS_SEMIHOSTING {
+				let ebreak_pc = state.pc;
+				deliver_trap(state, mcause_val(exc_code::BREAKPOINT, false), ebreak_pc);
+				return 0;
+			}
 			// EBREAK — if this is a semihosting sequence, handle it inline;
 			// otherwise treat as NOP (no external debugger attached).
 			if let Some(advance) = try_semihosting(state, ctx, state.pc) {
@@ -866,12 +874,10 @@ pub fn handle_system(
 				unsafe {
 					*clint.msip.add(hart_id as usize) = 0;
 				}
-				state.diag.clint_msip_clr = state.diag.clint_msip_clr.wrapping_add(1);
 			} else if msip_in_mip != 0 && msip_in_clint == 0 {
 				// CLINT was cleared directly (e.g. sw) but state.mip is
 				// stale — sync state.mip down.  Do NOT set CLINT.
 				state.mip.fetch_and(!(1 << 3), Ordering::AcqRel);
-				state.diag.clint_msip_clr = state.diag.clint_msip_clr.wrapping_add(1);
 			}
 			advance
 		}
@@ -1025,7 +1031,7 @@ pub fn handle_amo(
 	}
 
 	// Translate VA -> PA
-	let tr = match translate_va(state, ctx, va, true, false) {
+	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -1433,6 +1439,12 @@ fn handle_c2(
 			let rd_rs1 = cf.rd;
 			let rs2 = cf.rs2;
 			if rd_rs1 == 0 && rs2 == 0 {
+				// 内联服务关闭: 与 Python 引擎的 trap_ebreak 一致, 投递断点异常
+				if !CFG_HAS_SEMIHOSTING {
+					let ebreak_pc = state.pc;
+					deliver_trap(state, mcause_val(exc_code::BREAKPOINT, false), ebreak_pc);
+					return 0;
+				}
 				// C.EBREAK — treated as NOP (see EBREAK above)
 				return 2;
 			} else if rs2 == 0 {
@@ -1552,7 +1564,7 @@ fn load_mem_compressed(
 	dev: &DevCtx,
 	clint: &ClintCtx
 ) -> Option<u64> {
-	let tr = match translate_va(state, ctx, va, false, false) {
+	let tr = match translate_va(state, ctx, va, rwx_read(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -1611,7 +1623,7 @@ fn store_mem_compressed(
 	dev: &DevCtx,
 	clint: &ClintCtx
 ) -> u64 {
-	let tr = match translate_va(state, ctx, va, true, false) {
+	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -1691,8 +1703,7 @@ const SH_SYS_OPEN: u64 = 0x01;
 const SH_SYS_WRITEC: u64 = 0x03;
 const SH_SYS_WRITE: u64 = 0x05;
 const SH_SYS_ISTTY: u64 = 0x09;
-/// SYS_EXIT — 停机序列操作码 (ARM semihosting 约定, QEMU 裸机测试
-/// 类似的固件退出方式).
+/// SYS_EXIT — 停机序列操作码
 pub(crate) const SH_SYS_EXIT: u64 = 0x18;
 
 /// Read a u64 from RAM at physical address *pa* (Bare-Mode, VA = PA).
@@ -1818,7 +1829,7 @@ fn semihosting_dispatch(ctx: &WalkCtx, op: u64, param_block: u64, hart_id: u64) 
 }
 
 /// 检查 *ebreak_pc* 前后是否为 semihosting marker 序列
-/// (``slli x0, x0, 0x1f; ebreak; srai x0, x0, 7``, ARM 约定).
+/// ``slli x0, x0, 0x1f; ebreak; srai x0, x0, 7``.
 /// 仅 VA=PA (M 模式, Bare 翻译) 时成立.
 pub(crate) fn semihosting_match(ctx: &WalkCtx, ebreak_pc: u64) -> bool {
 	// Semihosting only runs with VA = PA (M‑mode, Bare translation).
@@ -1841,14 +1852,20 @@ pub(crate) fn semihosting_match(ctx: &WalkCtx, ebreak_pc: u64) -> bool {
 	next == u32::from_le(SEMIHOSTING_POST)
 }
 
+// 内联服务由配置项 PYREMU_HAS_SEMIHOSTING 控制, 生成值见
+// ``configs_gen.rs`` 的 ``CFG_HAS_SEMIHOSTING``. 取值为 0 时 marker 序列按普通
+// ebreak 投递断点 trap: 固件的 semihosting 探测因此判定宿主不支持, 控制台回落到
+// UART, 输出经 TX 环形缓冲区写入每 hart 的日志.
+
 /// Check whether *ebreak_pc* is part of a semihosting call sequence.
 ///
 /// If the instructions before and after ``ebreak`` match the semihosting
 /// marker pattern this function handles the operation, updates ``a0``,
 /// and returns ``Some(8)`` (skip the 4‑byte ebreak + 4‑byte exit marker).
-/// Returns ``None`` for a normal ebreak.
+/// Returns ``None`` for a normal ebreak, and for every ebreak when
+/// ``CFG_HAS_SEMIHOSTING`` is false.
 pub fn try_semihosting(state: &mut HartState, ctx: &WalkCtx, ebreak_pc: u64) -> Option<u64> {
-	if !semihosting_match(ctx, ebreak_pc) {
+	if !CFG_HAS_SEMIHOSTING || !semihosting_match(ctx, ebreak_pc) {
 		return None;
 	}
 
@@ -2024,7 +2041,7 @@ mod tests {
 			ram_base,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -2070,7 +2087,7 @@ mod tests {
 			ram_base,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -2100,7 +2117,7 @@ mod tests {
 			ram_base,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -2176,7 +2193,7 @@ mod tests {
 			ram_base,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -2222,7 +2239,7 @@ mod tests {
 			ram_base,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};

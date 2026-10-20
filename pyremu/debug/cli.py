@@ -88,7 +88,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--preload-addr", type=lambda x: int(x, 0), default=None,
-        help="预加载 shellcode 的加载地址 (默认 RAM 顶端 −64 KiB)",
+        help="预加载 shellcode 的加载地址 (默认 RAM 顶端 −128 KiB)",
     )
     p.add_argument(
         "--entry-symbol", type=str, default=None,

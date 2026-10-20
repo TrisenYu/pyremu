@@ -12,15 +12,13 @@ from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import parse_firmware
 from tests.loader import MultiProgramLoader
 
-KERNEL_ELF = examed_elf_dir("kernel.elf")
-
 
 def _make_emu(*procs: str):
-    if not KERNEL_ELF.exists():
-        pytest.skip(f"{KERNEL_ELF} 不存在, 先运行 make -C tests/src-env build-multi")
+    if not examed_elf_dir("kernel.elf").exists():
+        pytest.skip("KERNEL_ELF 不存在")
 
-    kernel = parse_firmware(str(KERNEL_ELF))
-    assert kernel is not None, f"{KERNEL_ELF} 解析失败"
+    kernel = parse_firmware(str(examed_elf_dir("kernel.elf")))
+    assert kernel is not None, "KERNEL_ELF 解析失败"
     emu = Emulator(PlatformConfig.qemu_virt())
     emu.load_firmware(kernel)
     loader = MultiProgramLoader(emu, kernel)
@@ -86,6 +84,4 @@ class TestPreemptCorrectness:
         """fib + nqueen 同时运行 — 基本正确性."""
         _, loader = _make_emu("u_nqueen_entry", "u_fib_entry")
         out = loader.run(uart_input=b"7\n")
-        assert "fib(7)=13" in out
-        # nqueen 输出可能因交错而难以精确匹配, 但 exit 应出现
-        assert "exit: code=0" in out
+        assert "fib(7)=13" in out and "exit: code=0" in out

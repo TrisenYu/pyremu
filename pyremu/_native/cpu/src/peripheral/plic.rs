@@ -8,7 +8,7 @@
 //!
 //! 状态全部放在 Python 侧分配的共享 ctypes 数组 (``FfiPlicCtx``) 中:
 //! Rust 内联读写 (claim 清 pending / complete 重挂 / enable 写), Python 在
-//! 加速执行边界 marshal/unmarshal, 设备 ``raise_device_irq`` 直接 write-through
+//! 加速执行边界 marshal/unmarshal, 设备中断投递目标直接 write-through
 //! pending/level, 保证 batch 内新设备中断对 Rust 可见 (与 CLINT/virtio 模式一致).
 //!
 //! 中断仲裁后同步 mip.MEIP/SEIP: 仅在 IMSIC 缺席 (纯 legacy PLIC) 时由 Rust 内联

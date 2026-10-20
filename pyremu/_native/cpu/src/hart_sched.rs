@@ -1,41 +1,87 @@
 use std::cell::Cell;
 use crate::atom_instr::handle_amo_concurrent_dispatch;
 use crate::concurrent::{
-	advance_clock_source, ConcurrentClintCtx, ModuleState, SharedDevCtx,
-	SharedMemCtx, SharedPmpCtx, StopInfo,
+	advance_clock_source,
+	ConcurrentClintCtx,
+	ModuleState,
+	SharedDevCtx,
+	SharedMemCtx,
+	SharedPmpCtx,
+	StopInfo,
 };
 use crate::consts::*;
 use crate::decode::decode_fields;
-use crate::fpu::{handle_fp_load_concurrent, handle_fp_store_concurrent};
+use crate::fpu::{ handle_fp_load_concurrent, handle_fp_store_concurrent };
 use crate::handlers::{
-	handle_compressed, lr_clear_all, pmp_ok, try_handle_virtio, ClintCtx, DevCtx, PmpCtx,
+	handle_compressed,
+	lr_clear_all,
+	pmp_ok,
+	try_handle_virtio,
+	ClintCtx,
+	DevCtx,
+	PmpCtx,
 	EXIT_SENTINEL,
 };
 use crate::interrupt::{
 	check_and_deliver_interrupt_concurrent,
-	clint::{sync_msip, sync_mtip, try_handle_clint_concurrent},
-	imsic_topei_peek, sync_ext_irq_mip, try_handle_imsic_concurrent,
+	clint::{ sync_msip, sync_mtip, try_handle_clint_concurrent },
+	imsic_topei_peek,
+	sync_ext_irq_mip,
+	try_handle_imsic_concurrent,
 	try_handle_imsic_read_concurrent,
 	wfi::wfi_spin,
-	IID_M_IPI, IID_S_IPI,
+	IID_M_IPI,
+	IID_S_IPI,
 };
 use crate::op_dispatcher::{
-	handle_alu, handle_auipc, handle_br, handle_fence, handle_fp_fma, handle_fp_op, handle_jal,
-	handle_jalr, handle_lui, handle_op32, handle_op_imm, handle_op_imm32,
+	handle_alu,
+	handle_auipc,
+	handle_br,
+	handle_fence,
+	handle_fp_fma,
+	handle_fp_op,
+	handle_jal,
+	handle_jalr,
+	handle_lui,
+	handle_op32,
+	handle_op_imm,
+	handle_op_imm32,
 };
 use crate::peripheral::{
 	is_device_addr,
-	plic::{plic_sync_mip_if_legacy, try_handle_plic_concurrent},
+	plic::{ plic_sync_mip_if_legacy, try_handle_plic_concurrent },
 	uart::try_handle_uart_concurrent,
 };
-use crate::ffi::{FfiDevCtx, FfiExtIrqCtx, FfiPlicCtx, FfiUartCtx, InstrToBeExec, MemCtx};
-use crate::state::{exit_reason, riscv_mode, HartState};
-use crate::translate::{tlb_flush_all, tlb_mark_all_dirty, translate_va, TranslateFault, WalkCtx};
-use crate::trap::{
-	deliver_illegal_instruction, deliver_trap, exc_code, mcause_val, priv_ecall_concurrent,
-	priv_mret_concurrent, priv_sret_concurrent, priv_wfi_concurrent,
+use crate::ffi::{
+	FfiDevCtx,
+	FfiExtIrqCtx,
+	FfiPlicCtx,
+	FfiUartCtx,
+	InstrToBeExec,
+	MemCtx,
 };
-use std::sync::atomic::{self, AtomicU32, AtomicU64, Ordering};
+use crate::state::{ exit_reason, riscv_mode, HartState, CFG_HAS_SEMIHOSTING };
+use crate::translate::{
+	rwx_exec,
+	rwx_read,
+	rwx_write,
+	tlb_flush_all,
+	tlb_mark_all_dirty,
+	translate_va,
+	TranslateFault,
+	WalkCtx,
+};
+use crate::trap::{
+	deliver_illegal_instruction,
+	deliver_trap,
+	exc_code,
+	mcause_val,
+	priv_ecall_concurrent,
+	priv_mret_concurrent,
+	priv_sret_concurrent,
+	priv_wfi_concurrent,
+};
+use std::sync::atomic::{ self, AtomicU32, AtomicU64, Ordering };
 
 pub(crate) fn ram_offset(
 	pa: u64,
@@ -43,22 +89,28 @@ pub(crate) fn ram_offset(
 	ram_base: u64,
 	ram_size: u64,
 	shadow_base: u64,
-	shadow_size: u64,
+	shadow_size: u64
 ) -> Option<u64> {
-	let end = pa + size as u64;
+	let end = pa + (size as u64);
 	if pa >= ram_base && end <= ram_base + ram_size {
 		return Some(pa - ram_base);
 	}
-	if shadow_size > 0 {
-		let sh_end = shadow_base + shadow_size;
-		if pa >= shadow_base && end <= sh_end {
-			return Some(pa - shadow_base);
-		}
+	if shadow_size <= 0 {
+		return None;
+	}
+	let sh_end = shadow_base + shadow_size;
+	if pa >= shadow_base && end <= sh_end {
+		return Some(pa - shadow_base);
 	}
 	None
 }
 
-pub(crate) fn fetch_instr(ram: *const u8, ram_size: u64, ram_base: u64, pa: u64) -> Option<u32> {
+pub(crate) fn fetch_instr(
+	ram: *const u8,
+	ram_size: u64,
+	ram_base: u64,
+	pa: u64
+) -> Option<u32> {
 	let offset = pa.wrapping_sub(ram_base);
 	if offset > ram_size.saturating_sub(4) {
 		return None;
@@ -68,10 +120,10 @@ pub(crate) fn fetch_instr(ram: *const u8, ram_size: u64, ram_base: u64, pa: u64)
 	// observes instruction bytes written by another hart (e.g. store instruction
 	// writing to a page that is later made executable).
 	atomic::fence(Ordering::Acquire);
-	let b0 = unsafe { *ptr } as u32;
-	let b1 = unsafe { *ptr.add(1) } as u32;
-	let b2 = unsafe { *ptr.add(2) } as u32;
-	let b3 = unsafe { *ptr.add(3) } as u32;
+	let b0 = (unsafe { *ptr }) as u32;
+	let b1 = (unsafe { *ptr.add(1) }) as u32;
+	let b2 = (unsafe { *ptr.add(2) }) as u32;
+	let b3 = (unsafe { *ptr.add(3) }) as u32;
 	Some(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
 }
 
@@ -80,7 +132,7 @@ pub(crate) fn fetch_instr_safe(
 	mem: &MemCtx,
 	pa: u64,
 	pc_before: u64,
-	_hart_id: u8,
+	_hart_id: u8
 ) -> Option<u32> {
 	match fetch_instr(mem.ram, mem.ram_size, mem.ram_base, pa) {
 		Some(w) => Some(w),
@@ -88,7 +140,7 @@ pub(crate) fn fetch_instr_safe(
 			deliver_trap(
 				state,
 				mcause_val(exc_code::INSTR_ACCESS_FAULT, false),
-				pc_before,
+				pc_before
 			);
 			None
 		}
@@ -101,11 +153,7 @@ pub(crate) fn sext(val: u64, bits: u32) -> u64 {
 }
 
 pub(crate) fn read_gpr(state: &HartState, rs: u8) -> u64 {
-	if rs == 0 {
-		0
-	} else {
-		state.gprs[rs as usize]
-	}
+	if rs == 0 { 0 } else { state.gprs[rs as usize] }
 }
 
 pub(crate) fn write_gpr(state: &mut HartState, rd: u8, val: u64) {
@@ -143,7 +191,7 @@ pub(crate) fn dispatch_concurrent(
 	dev: &DevCtx,
 	clint: &ConcurrentClintCtx,
 	uart: &FfiUartCtx,
-	module: &ModuleState,
+	module: &ModuleState
 ) -> u64 {
 	match f.opcode {
 		0b01100_11 => {
@@ -161,8 +209,10 @@ pub(crate) fn dispatch_concurrent(
 		0b00011_11 => handle_fence(state, f, instr),
 
 		// Loads / Stores — need CLINT inline handling for concurrent path
-		0b00000_11 => handle_load_concurrent(state, f, instr, ctx, pmp, dev, clint, uart, module),
-		0b01000_11 => handle_store_concurrent(state, f, instr, ctx, pmp, dev, clint, uart, module),
+		0b00000_11 =>
+			handle_load_concurrent(state, f, instr, ctx, pmp, dev, clint, uart, module),
+		0b01000_11 =>
+			handle_store_concurrent(state, f, instr, ctx, pmp, dev, clint, uart, module),
 
 		// FP loads / stores (FLW/FLD/FSW/FSD)
 		0b00001_11 => handle_fp_load_concurrent(state, f, instr, ctx, pmp, dev, module),
@@ -170,15 +220,27 @@ pub(crate) fn dispatch_concurrent(
 
 		// System
 		0b11100_11 => {
-			handle_system_concurrent(state, f, instr, ctx, hart_id, clint, pmp, module, uart)
+			handle_system_concurrent(
+				state,
+				f,
+				instr,
+				ctx,
+				hart_id,
+				clint,
+				pmp,
+				module,
+				uart
+			)
 		}
 
 		// AMO — concurrent atomic path
-		0b01011_11 => handle_amo_concurrent_dispatch(state, f, instr, ctx, pmp, dev, module),
+		0b01011_11 =>
+			handle_amo_concurrent_dispatch(state, f, instr, ctx, pmp, dev, module),
 
 		// F/D floating point (compute — OP-FP + FMA); pure compute like ALU
 		0b10100_11 => handle_fp_op(state, f, instr),
-		0b10000_11 | 0b10001_11 | 0b10010_11 | 0b10011_11 => handle_fp_fma(state, f, instr),
+		0b10000_11 | 0b10001_11 | 0b10010_11 | 0b10011_11 =>
+			handle_fp_fma(state, f, instr),
 
 		_ => {
 			deliver_illegal_instruction(state, instr as u64);
@@ -193,21 +255,21 @@ pub(crate) fn read_ram_cross_page(
 	va: u64,
 	pa_first: u64,
 	size: u8,
-	pmp: &PmpCtx,
+	pmp: &PmpCtx
 ) -> (u64, bool) {
-	let page_off = va & 0xFFF;
+	let page_off = va & 0xfff;
 	let bytes_first = (0x1000 - page_off) as u8;
 
 	// Read bytes on the first page.
 	let mut result: u64 = 0;
 	for b in 0..bytes_first {
-		let byte = ram_read_raw(ctx, pa_first + b as u64, 1);
+		let byte = ram_read_raw(ctx, pa_first + (b as u64), 1);
 		result |= byte << (b * 8);
 	}
 
 	// Translate the second VA page.
 	let va2 = va.wrapping_add(bytes_first as u64);
-	let tr2 = match translate_va(state, ctx, va2, false, false) {
+	let tr2 = match translate_va(state, ctx, va2, rwx_read(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va2);
@@ -242,20 +304,20 @@ pub(crate) fn write_ram_cross_page(
 	pa_first: u64,
 	val: u64,
 	size: u8,
-	pmp: &PmpCtx,
+	pmp: &PmpCtx
 ) -> bool {
-	let page_off = va & 0xFFF;
+	let page_off = va & 0xfff;
 	let bytes_first = (0x1000 - page_off) as u8;
 
 	// Write bytes on the first page.
 	for b in 0..bytes_first {
 		let byte = (val >> (b * 8)) as u8;
-		ram_write_raw(ctx, pa_first + b as u64, byte as u64, 1);
+		ram_write_raw(ctx, pa_first + (b as u64), byte as u64, 1);
 	}
 
 	// Translate the second VA page.
 	let va2 = va.wrapping_add(bytes_first as u64);
-	let tr2 = match translate_va(state, ctx, va2, true, false) {
+	let tr2 = match translate_va(state, ctx, va2, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va2);
@@ -277,12 +339,7 @@ pub(crate) fn write_ram_cross_page(
 	// Write bytes on the second page.
 	for b in bytes_first..size {
 		let byte = (val >> (b * 8)) as u8;
-		ram_write_raw(
-			ctx,
-			tr2.pa.wrapping_add((b - bytes_first) as u64),
-			byte as u64,
-			1,
-		);
+		ram_write_raw(ctx, tr2.pa.wrapping_add((b - bytes_first) as u64), byte as u64, 1);
 	}
 
 	true
@@ -297,7 +354,7 @@ pub(crate) fn handle_load_concurrent(
 	dev: &DevCtx,
 	clint: &ConcurrentClintCtx,
 	uart: &FfiUartCtx,
-	module: &ModuleState,
+	module: &ModuleState
 ) -> u64 {
 	let base = read_gpr(state, f.rs1);
 	let va = base.wrapping_add(f.imm12_se);
@@ -315,9 +372,9 @@ pub(crate) fn handle_load_concurrent(
 		}
 	};
 
-	let aligned = va & (size as u64 - 1) == 0;
+	let aligned = (va & ((size as u64) - 1)) == 0;
 
-	let tr = match translate_va(state, ctx, va, false, false) {
+	let tr = match translate_va(state, ctx, va, rwx_read(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -335,7 +392,16 @@ pub(crate) fn handle_load_concurrent(
 	}
 
 	// CLINT inline
-	if let Some(data) = try_handle_clint_concurrent(tr.pa, false, 0, state, clint, module) {
+	if
+		let Some(data) = try_handle_clint_concurrent(
+			tr.pa,
+			false,
+			0,
+			state,
+			clint,
+			module
+		)
+	{
 		let result_val = if signed {
 			match size {
 				1 => sext(data, 8),
@@ -367,7 +433,15 @@ pub(crate) fn handle_load_concurrent(
 	}
 
 	// UART inline read — prevent TX FIFO polling from exiting speedup
-	if let Some(data) = try_handle_uart_concurrent(tr.pa, false, 0, state.mhartid as u8, uart) {
+	if
+		let Some(data) = try_handle_uart_concurrent(
+			tr.pa,
+			false,
+			0,
+			state.mhartid as u8,
+			uart
+		)
+	{
 		let result_val = if signed {
 			match size {
 				1 => sext(data, 8),
@@ -393,7 +467,16 @@ pub(crate) fn handle_load_concurrent(
 	// PLIC inline — kernel 直映射访问 PLIC (priority/pending/enable/threshold/claim)
 	// 是 EXT4 recovery 阶段 batch 频繁退出的根因, 必须内联处理.
 	// claim 清 pending 后内部立即重算 mip.MEIP/SEIP, 避免延后到 step_interrupts.
-	if let Some(data) = try_handle_plic_concurrent(tr.pa, false, 0, size, state, dev.plic) {
+	if
+		let Some(data) = try_handle_plic_concurrent(
+			tr.pa,
+			false,
+			0,
+			size,
+			state,
+			dev.plic
+		)
+	{
 		let result_val = if signed {
 			match size {
 				1 => sext(data, 8),
@@ -421,15 +504,15 @@ pub(crate) fn handle_load_concurrent(
 	}
 
 	// Bounds check: ram_offset returns None for PA outside [ram_base, ram_base+ram_size).
-	if ram_offset(
-		tr.pa,
-		size as u32,
-		ctx.ram_base,
-		ctx.ram_size,
-		ctx.shadow_base,
-		ctx.shadow_size,
-	)
-	.is_none()
+	if
+		ram_offset(
+			tr.pa,
+			size as u32,
+			ctx.ram_base,
+			ctx.ram_size,
+			ctx.shadow_base,
+			ctx.shadow_size
+		).is_none()
 	{
 		deliver_trap(state, mcause_val(exc_code::LD_ACCESS_FAULT, false), va);
 		return 0;
@@ -439,7 +522,7 @@ pub(crate) fn handle_load_concurrent(
 	// at VA 0x1FF8 is naturally aligned but crosses a 4 KiB page boundary.
 	// The two VA pages may map to non-consecutive PA pages, so we must
 	// translate the second page independently and splice bytes.
-	let val = if (va & 0xFFF) + size as u64 > 0x1000 {
+	let val = if (va & 0xfff) + (size as u64) > 0x1000 {
 		let (v, ok) = read_ram_cross_page(state, ctx, va, tr.pa, size, pmp);
 		if !ok {
 			return 0;
@@ -451,7 +534,7 @@ pub(crate) fn handle_load_concurrent(
 		// Misaligned within same physical page: simple byte-by-byte.
 		let mut result: u64 = 0;
 		for b in 0..size {
-			let byte = ram_read_raw(ctx, tr.pa + b as u64, 1);
+			let byte = ram_read_raw(ctx, tr.pa + (b as u64), 1);
 			result |= byte << (b * 8);
 		}
 		result
@@ -479,7 +562,7 @@ pub(crate) fn handle_store_concurrent(
 	dev: &DevCtx,
 	clint: &ConcurrentClintCtx,
 	uart: &FfiUartCtx,
-	module: &ModuleState,
+	module: &ModuleState
 ) -> u64 {
 	let base = read_gpr(state, f.rs1);
 	let va = base.wrapping_add(f.imm_s);
@@ -496,9 +579,9 @@ pub(crate) fn handle_store_concurrent(
 	// Diagnostic: log when a small value (1..0xFF) is stored — catches
 	// tag values like DT_RELA=7 being written to data structures.
 
-	let aligned = va & (size as u64 - 1) == 0;
+	let aligned = (va & ((size as u64) - 1)) == 0;
 
-	let tr = match translate_va(state, ctx, va, true, false) {
+	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -523,7 +606,15 @@ pub(crate) fn handle_store_concurrent(
 	}
 
 	// UART inline — prevent sbi_printf from quiting the speedup execution
-	if let Some(_) = try_handle_uart_concurrent(tr.pa, true, val, state.mhartid as u8, uart) {
+	if
+		let Some(_) = try_handle_uart_concurrent(
+			tr.pa,
+			true,
+			val,
+			state.mhartid as u8,
+			uart
+		)
+	{
 		return 4;
 	}
 
@@ -533,13 +624,12 @@ pub(crate) fn handle_store_concurrent(
 	}
 
 	// IMSIC inline: route IPI identities through CLINT MSIP fast path
-	if try_handle_imsic_concurrent(tr.pa, val, state, clint) {
-		return 4;
-	}
-
 	// PLIC inline — priority/enable/threshold/complete 写内联处理; 写后立即
 	// 重算 mip.MEIP/SEIP, 覆盖 "先挂起后使能" 的延迟投递与 claim 后电平重挂场景.
-	if try_handle_plic_concurrent(tr.pa, true, val, size, state, dev.plic).is_some() {
+	if
+		try_handle_imsic_concurrent(tr.pa, val, state, clint) ||
+		try_handle_plic_concurrent(tr.pa, true, val, size, state, dev.plic).is_some()
+	{
 		return 4;
 	}
 
@@ -556,22 +646,22 @@ pub(crate) fn handle_store_concurrent(
 	}
 
 	// Bounds check
-	if ram_offset(
-		tr.pa,
-		size as u32,
-		ctx.ram_base,
-		ctx.ram_size,
-		ctx.shadow_base,
-		ctx.shadow_size,
-	)
-	.is_none()
+	if
+		ram_offset(
+			tr.pa,
+			size as u32,
+			ctx.ram_base,
+			ctx.ram_size,
+			ctx.shadow_base,
+			ctx.shadow_size
+		).is_none()
 	{
 		deliver_trap(state, mcause_val(exc_code::ST_ACCESS_FAULT, false), va);
 		return 0;
 	}
 
 	// Cross-page check must come BEFORE alignment check (see handle_load_concurrent).
-	if (va & 0xFFF) + size as u64 > 0x1000 {
+	if (va & 0xfff) + (size as u64) > 0x1000 {
 		if !write_ram_cross_page(state, ctx, va, tr.pa, val, size, pmp) {
 			return 0;
 		}
@@ -581,23 +671,27 @@ pub(crate) fn handle_store_concurrent(
 		// Misaligned within same physical page: simple byte-by-byte.
 		for b in 0..size {
 			let byte = (val >> (b * 8)) as u8;
-			ram_write_raw(ctx, tr.pa + b as u64, byte as u64, 1);
+			ram_write_raw(ctx, tr.pa + (b as u64), byte as u64, 1);
 		}
 	}
 	4
 }
 
 pub(crate) fn ram_read_raw(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
-	let off = match ram_offset(
-		pa,
-		size as u32,
-		ctx.ram_base,
-		ctx.ram_size,
-		ctx.shadow_base,
-		ctx.shadow_size,
-	) {
+	let off = match
+		ram_offset(
+			pa,
+			size as u32,
+			ctx.ram_base,
+			ctx.ram_size,
+			ctx.shadow_base,
+			ctx.shadow_size
+		)
+	{
 		Some(o) => o as usize,
-		None => return 0,
+		None => {
+			return 0;
+		}
 	};
 	let ptr = ctx.ram as *mut u8;
 	match size {
@@ -610,8 +704,8 @@ pub(crate) fn ram_read_raw(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
 		}
 		2 => {
 			atomic::fence(Ordering::Acquire);
-			let b0 = unsafe { *ptr.add(off) } as u64;
-			let b1 = unsafe { *ptr.add(off + 1) } as u64;
+			let b0 = (unsafe { *ptr.add(off) }) as u64;
+			let b1 = (unsafe { *ptr.add(off + 1) }) as u64;
 			b0 | (b1 << 8)
 		}
 		4 if (pa & 3) == 0 => {
@@ -620,10 +714,10 @@ pub(crate) fn ram_read_raw(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
 		}
 		4 => {
 			atomic::fence(Ordering::Acquire);
-			let b0 = unsafe { *ptr.add(off) } as u64;
-			let b1 = unsafe { *ptr.add(off + 1) } as u64;
-			let b2 = unsafe { *ptr.add(off + 2) } as u64;
-			let b3 = unsafe { *ptr.add(off + 3) } as u64;
+			let b0 = (unsafe { *ptr.add(off) }) as u64;
+			let b1 = (unsafe { *ptr.add(off + 1) }) as u64;
+			let b2 = (unsafe { *ptr.add(off + 2) }) as u64;
+			let b3 = (unsafe { *ptr.add(off + 3) }) as u64;
 			b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 		}
 		8 if (pa & 7) == 0 => {
@@ -633,19 +727,23 @@ pub(crate) fn ram_read_raw(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
 		}
 		8 => {
 			atomic::fence(Ordering::Acquire);
-			let b0 = unsafe { *ptr.add(off) } as u64;
-			let b1 = unsafe { *ptr.add(off + 1) } as u64;
-			let b2 = unsafe { *ptr.add(off + 2) } as u64;
-			let b3 = unsafe { *ptr.add(off + 3) } as u64;
-			let b4 = unsafe { *ptr.add(off + 4) } as u64;
-			let b5 = unsafe { *ptr.add(off + 5) } as u64;
-			let b6 = unsafe { *ptr.add(off + 6) } as u64;
-			let b7 = unsafe { *ptr.add(off + 7) } as u64;
-			let val = b0
-				| (b1 << 8) | (b2 << 16)
-				| (b3 << 24) | (b4 << 32)
-				| (b5 << 40) | (b6 << 48)
-				| (b7 << 56);
+			let b0 = (unsafe { *ptr.add(off) }) as u64;
+			let b1 = (unsafe { *ptr.add(off + 1) }) as u64;
+			let b2 = (unsafe { *ptr.add(off + 2) }) as u64;
+			let b3 = (unsafe { *ptr.add(off + 3) }) as u64;
+			let b4 = (unsafe { *ptr.add(off + 4) }) as u64;
+			let b5 = (unsafe { *ptr.add(off + 5) }) as u64;
+			let b6 = (unsafe { *ptr.add(off + 6) }) as u64;
+			let b7 = (unsafe { *ptr.add(off + 7) }) as u64;
+			let val =
+				b0 |
+				(b1 << 8) |
+				(b2 << 16) |
+				(b3 << 24) |
+				(b4 << 32) |
+				(b5 << 40) |
+				(b6 << 48) |
+				(b7 << 56);
 			val
 		}
 		_ => 0,
@@ -653,16 +751,20 @@ pub(crate) fn ram_read_raw(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
 }
 
 pub(crate) fn ram_write_raw(ctx: &WalkCtx, pa: u64, val: u64, size: u8) {
-	let off = match ram_offset(
-		pa,
-		size as u32,
-		ctx.ram_base,
-		ctx.ram_size,
-		ctx.shadow_base,
-		ctx.shadow_size,
-	) {
+	let off = match
+		ram_offset(
+			pa,
+			size as u32,
+			ctx.ram_base,
+			ctx.ram_size,
+			ctx.shadow_base,
+			ctx.shadow_size
+		)
+	{
 		Some(o) => o as usize,
-		None => return,
+		None => {
+			return;
+		}
 	};
 	// RISC-V spec §8.2: invalidate all LR reservations BEFORE the
 	// store becomes visible.  With SeqCst ordering, observers see
@@ -676,12 +778,18 @@ pub(crate) fn ram_write_raw(ctx: &WalkCtx, pa: u64, val: u64, size: u8) {
 	let ptr = ctx.ram as *mut u8;
 	match size {
 		1 => {
-			unsafe { *ptr.add(off) = val as u8 };
+			unsafe {
+				*ptr.add(off) = val as u8;
+			}
 			atomic::fence(Ordering::Release);
 		}
 		2 => {
-			unsafe { *ptr.add(off) = val as u8 };
-			unsafe { *ptr.add(off + 1) = (val >> 8) as u8 };
+			unsafe {
+				*ptr.add(off) = val as u8;
+			}
+			unsafe {
+				*ptr.add(off + 1) = (val >> 8) as u8;
+			}
 			atomic::fence(Ordering::Release);
 		}
 		4 if (pa & 3) == 0 => {
@@ -689,10 +797,18 @@ pub(crate) fn ram_write_raw(ctx: &WalkCtx, pa: u64, val: u64, size: u8) {
 			a.store(val as u32, Ordering::Release);
 		}
 		4 => {
-			unsafe { *ptr.add(off) = val as u8 };
-			unsafe { *ptr.add(off + 1) = (val >> 8) as u8 };
-			unsafe { *ptr.add(off + 2) = (val >> 16) as u8 };
-			unsafe { *ptr.add(off + 3) = (val >> 24) as u8 };
+			unsafe {
+				*ptr.add(off) = val as u8;
+			}
+			unsafe {
+				*ptr.add(off + 1) = (val >> 8) as u8;
+			}
+			unsafe {
+				*ptr.add(off + 2) = (val >> 16) as u8;
+			}
+			unsafe {
+				*ptr.add(off + 3) = (val >> 24) as u8;
+			}
 			atomic::fence(Ordering::Release);
 		}
 		8 if (pa & 7) == 0 => {
@@ -700,14 +816,30 @@ pub(crate) fn ram_write_raw(ctx: &WalkCtx, pa: u64, val: u64, size: u8) {
 			a.store(val, Ordering::Release);
 		}
 		8 => {
-			unsafe { *ptr.add(off) = val as u8 };
-			unsafe { *ptr.add(off + 1) = (val >> 8) as u8 };
-			unsafe { *ptr.add(off + 2) = (val >> 16) as u8 };
-			unsafe { *ptr.add(off + 3) = (val >> 24) as u8 };
-			unsafe { *ptr.add(off + 4) = (val >> 32) as u8 };
-			unsafe { *ptr.add(off + 5) = (val >> 40) as u8 };
-			unsafe { *ptr.add(off + 6) = (val >> 48) as u8 };
-			unsafe { *ptr.add(off + 7) = (val >> 56) as u8 };
+			unsafe {
+				*ptr.add(off) = val as u8;
+			}
+			unsafe {
+				*ptr.add(off + 1) = (val >> 8) as u8;
+			}
+			unsafe {
+				*ptr.add(off + 2) = (val >> 16) as u8;
+			}
+			unsafe {
+				*ptr.add(off + 3) = (val >> 24) as u8;
+			}
+			unsafe {
+				*ptr.add(off + 4) = (val >> 32) as u8;
+			}
+			unsafe {
+				*ptr.add(off + 5) = (val >> 40) as u8;
+			}
+			unsafe {
+				*ptr.add(off + 6) = (val >> 48) as u8;
+			}
+			unsafe {
+				*ptr.add(off + 7) = (val >> 56) as u8;
+			}
 			atomic::fence(Ordering::Release);
 		}
 		_ => {}
@@ -724,21 +856,19 @@ fn handle_csr_concurrent(
 	instr: u32,
 	hart_id: u8,
 	clint: &ConcurrentClintCtx,
-	pmp: &PmpCtx,
+	pmp: &PmpCtx
 ) -> u64 {
 	let mut dummy = unsafe { std::mem::zeroed() };
 	let mut csr_ctx = crate::csr::CsrContext::new(state, hart_id as u32, pmp, clint);
-	let advance = crate::csr::handle_csr(
+	return crate::csr::handle_csr(
 		&mut csr_ctx,
 		f.rd,
 		f.rs1,
 		f.func12,
 		f.func3,
 		instr,
-		&mut dummy,
+		&mut dummy
 	);
-
-	advance
 }
 
 pub(crate) fn handle_system_concurrent(
@@ -750,7 +880,7 @@ pub(crate) fn handle_system_concurrent(
 	clint: &ConcurrentClintCtx,
 	pmp: &PmpCtx,
 	module: &ModuleState,
-	dev: &dyn FfiDevCtx,
+	dev: &dyn FfiDevCtx
 ) -> u64 {
 	if f.func3 != 0b000 {
 		return handle_csr_concurrent(state, f, instr, hart_id, clint, pmp);
@@ -758,14 +888,22 @@ pub(crate) fn handle_system_concurrent(
 
 	// func3 == 0b000: privileged instructions
 	match f.func12 {
-		0 => return priv_ecall_concurrent(state, instr, clint, module, dev),
+		0 => {
+			return priv_ecall_concurrent(state, instr, clint, module, dev);
+		}
 		1 => {
+			// 内联服务关闭: 与 Python 引擎的 trap_ebreak 一致, 投递断点异常
+			if !CFG_HAS_SEMIHOSTING {
+				let ebreak_pc = state.pc;
+				deliver_trap(state, mcause_val(exc_code::BREAKPOINT, false), ebreak_pc);
+				return 0;
+			}
 			// EBREAK — semihosting 或普通 breakpoint.
 			// SYS_EXIT: 停机序列 — 一个 hart 执行即可停止整个引擎,
-			// 状态保留在 live 数组中, 由上层
-			// 消费 (调试器接管 / run() 返回). 裸 ebreak 保持 NOP.
-			if state.gprs[10] == crate::handlers::SH_SYS_EXIT
-				&& crate::handlers::semihosting_match(ctx, state.pc)
+			// 状态保留在 live 数组中
+			if
+				state.gprs[10] == crate::handlers::SH_SYS_EXIT &&
+				crate::handlers::semihosting_match(ctx, state.pc)
 			{
 				module.request_stop(StopInfo {
 					reason: exit_reason::EBREAK,
@@ -780,40 +918,36 @@ pub(crate) fn handle_system_concurrent(
 			}
 			return 4;
 		}
-		0x302 => return priv_mret_concurrent(state, instr),
-		0x102 => return priv_sret_concurrent(state, instr, ctx),
-		0x105 => return priv_wfi_concurrent(state, instr),
+		0x302 => {
+			return priv_mret_concurrent(state, instr);
+		}
+		0x102 => {
+			return priv_sret_concurrent(state, instr, ctx);
+		}
+		0x105 => {
+			return priv_wfi_concurrent(state, instr);
+		}
 		f_val if (f_val >> 5) == 0x09 => {
-			// SFENCE.VMA — flush local TLB + broadcast to all harts.
+			// SFENCE.VMA — 刷新本 hart 的两个 TLB, 并使其余 hart 的条目作废.
 			//
-			// RISC-V SFENCE.VMA only flushes the local hart's TLB; remote
-			// shootdown requires an IPI.  We implement broadcast semantics
-			// via a global generation counter: every hart that detects a
-			// generation mismatch flushes its own TLB at its next instruction
-			// boundary.  This is legal because over-invalidation never breaks
-			// correctness, and it closes the coherency window where hart A
-			// writes a PTE + SFENCE.VMA but hart B's TLB still has the stale
-			// entry.
-			//
-			// Ordering: flush the local TLB first, then increment the global
-			// generation (Release).  On x86-64, ``fetch_add`` with Release is
-			// ``lock xadd`` — a full hardware barrier that makes all prior
-			// PTE stores globally visible before the generation change is
-			// observed by other harts.  Paired with the Acquire load in the
-			// Mark this hart's own TLB entries dirty; other harts
-			// will detect the gen change and mark their own entries
-			// dirty at the next instruction boundary.
+			// RISC-V 的 SFENCE.VMA 只刷新执行该指令的 hart 的 TLB, 刷新其余 hart
+			// 的条目需要发送核间中断. 这里改为: 执行该指令的 hart 把刷新计数加一,
+			// 其余 hart 在取下一条指令之前比较该计数与自己上次见到的取值, 不相等
+			// 即把自己的条目全部标为陈旧. 多标记不影响正确性, 故不必发送核间中断;
+			// 这样也消除了"A 写入页表项并执行 SFENCE.VMA, 而 B 的 TLB 中仍留着
+			// 陈旧条目"这一情形.
 			tlb_flush_all(&mut state.itlb);
 			tlb_flush_all(&mut state.dtlb);
-			let new_gen = module
-				.tlb_gen
+			let new_cnt = module.tlb_flush_cnt
 				.fetch_add(1, std::sync::atomic::Ordering::Release)
 				.wrapping_add(1);
-			module.tlb_gen_per_hart[hart_id as usize]
-				.store(new_gen, std::sync::atomic::Ordering::Relaxed);
+			module.tlb_flush_cnt_per_hart[hart_id as usize].store(
+				new_cnt,
+				std::sync::atomic::Ordering::Relaxed
+			);
 			return 4;
 		}
-		0x5A0 => {
+		0x5a0 => {
 			// MFENCE.DID
 			for e in state.itlb.iter_mut() {
 				if e.mdid == state.mdid {
@@ -844,9 +978,9 @@ pub(crate) fn exec_compressed_concurrent(
 	dev: &DevCtx,
 	clint: &ConcurrentClintCtx,
 	module: &ModuleState,
-	breakpoints: &[u64],
+	breakpoints: &[u64]
 ) -> bool {
-	let half = (instr_word & 0xFFFF) as u16;
+	let half = (instr_word & 0xffff) as u16;
 	let mut instr_group: InstrToBeExec = unsafe { std::mem::zeroed() };
 	let _serial_clint = ClintCtx {
 		base: clint.base,
@@ -875,7 +1009,7 @@ pub(crate) fn exec_compressed_concurrent(
 		ctx,
 		pmp,
 		dev,
-		&_serial_clint,
+		&_serial_clint
 	);
 
 	if advance == EXIT_SENTINEL {
@@ -903,7 +1037,7 @@ pub(crate) fn post_instr_checks(
 	state: &mut HartState,
 	hart_id: u8,
 	module: &ModuleState,
-	breakpoints: &[u64],
+	breakpoints: &[u64]
 ) -> bool {
 	state.total_instrs = state.total_instrs.wrapping_add(1);
 
@@ -935,11 +1069,12 @@ pub(crate) fn translate_fetch_pc_concurrent(
 	state: &mut HartState,
 	ctx: &WalkCtx,
 	pc: u64,
+	pmp: &PmpCtx
 ) -> Option<u64> {
 	if state.mmu_mode == 0 || state.mode == riscv_mode::M || state.mode == riscv_mode::D {
 		return Some(pc); // Bare mode / M-mode / D-mode: VA == PA
 	}
-	match translate_va(state, ctx, pc, false, true) {
+	match translate_va(state, ctx, pc, rwx_exec(), pmp) {
 		Ok(t) => Some(t.pa),
 		Err(TranslateFault::PageFault(c)) => {
 			deliver_trap(state, mcause_val(c, false), pc);
@@ -970,25 +1105,23 @@ fn fetch_instr_word(
 	page_offset: u64,
 	fetch_pa: u64,
 	pmp: &PmpCtx,
-	hart_id: u8,
+	hart_id: u8
 ) -> Option<u32> {
-	if page_offset < 0xFFE {
+	if page_offset < 0xffe {
 		match fetch_instr_safe(state, mem, fetch_pa, pc_before, hart_id) {
-			Some(w) => return Some(w),
+			Some(w) => {
+				return Some(w);
+			}
 			None => {
 				return None;
 			}
 		}
 	}
 	// 2 bytes on first page, 2 bytes on second page.
-	let fetch_pa2 = translate_fetch_pc_concurrent(state, ctx, pc_before.wrapping_add(2))?;
+	let fetch_pa2 = translate_fetch_pc_concurrent(state, ctx, pc_before.wrapping_add(2), pmp)?;
 	// PMP check on the second page as well.
 	if !pmp_ok(state, fetch_pa2, 4, false, true, pmp) {
-		deliver_trap(
-			state,
-			mcause_val(exc_code::INSTR_ACCESS_FAULT, false),
-			pc_before,
-		);
+		deliver_trap(state, mcause_val(exc_code::INSTR_ACCESS_FAULT, false), pc_before);
 		return None;
 	}
 	// Read 2 bytes from each physical page and combine (little-endian).
@@ -1016,7 +1149,7 @@ fn make_contexts(
 	mem: SharedMemCtx,
 	pmp: SharedPmpCtx,
 	dev: SharedDevCtx,
-	module: &ModuleState,
+	module: &ModuleState
 ) -> (MemCtx, PmpCtx, DevCtx, WalkCtx) {
 	let mem_val = MemCtx {
 		ram: mem.ram,
@@ -1044,25 +1177,24 @@ fn make_contexts(
 		ram_base: mem_val.ram_base,
 		shadow_base: mem_val.shadow_base,
 		shadow_size: mem_val.shadow_size,
-		tlb_gen: &module.tlb_gen as *const AtomicU64,
+		tlb_flush_cnt: &module.tlb_flush_cnt as *const AtomicU64,
 		lr_reserved: mem.lr_reserved,
 		num_harts: module.wfi_flags.len() as u32,
 	};
 	(mem_val, pmp_val, dev_val, walk)
 }
 
-/// Mark this hart's TLB entries dirty if another hart executed SFENCE.VMA.
-/// Dirty entries are re-walked on next access rather than flushed — this
-/// preserves cached translations that are still valid.
+/// 本 hart 上次见到的刷新计数与该计数不相等时, 把它两个 TLB 的条目全部标为陈旧.
+/// 条目按陈旧重走页表, 不直接丢弃: 仍然有效的翻译得以保留.
 fn mark_tlb_dirty_if_stale(state: &mut HartState, module: &ModuleState, hart_id: u8) {
-	let global_gen = module.tlb_gen.load(Ordering::Acquire);
-	let my_gen = module.tlb_gen_per_hart[hart_id as usize].load(Ordering::Relaxed);
-	if my_gen == global_gen {
+	let flush_cnt = module.tlb_flush_cnt.load(Ordering::Acquire);
+	let seen = module.tlb_flush_cnt_per_hart[hart_id as usize].load(Ordering::Relaxed);
+	if seen == flush_cnt {
 		return;
 	}
 	tlb_mark_all_dirty(&mut state.itlb);
 	tlb_mark_all_dirty(&mut state.dtlb);
-	module.tlb_gen_per_hart[hart_id as usize].store(global_gen, Ordering::Relaxed);
+	module.tlb_flush_cnt_per_hart[hart_id as usize].store(flush_cnt, Ordering::Relaxed);
 }
 
 /// Handle WFI wait / wake.  Returns ``(Step, just_woke)``.
@@ -1074,7 +1206,7 @@ fn handle_wfi_state(
 	module: &ModuleState,
 	stop_flag: *const u8,
 	uart: &FfiUartCtx,
-	ext_irq: *mut FfiExtIrqCtx,
+	ext_irq: *mut FfiExtIrqCtx
 ) -> (Step, bool) {
 	if state.waiting == 0 {
 		return (Step::Next, false);
@@ -1090,15 +1222,17 @@ fn handle_wfi_state(
 		});
 		return (Step::Exit, false);
 	}
-	if !wfi_spin(
-		state,
-		hart_id as usize,
-		clint,
-		module,
-		stop_flag,
-		uart.rx_notify,
-		ext_irq,
-	) {
+	if
+		!wfi_spin(
+			state,
+			hart_id as usize,
+			clint,
+			module,
+			stop_flag,
+			uart.rx_notify,
+			ext_irq
+		)
+	{
 		// exit from WFI: flush TLB in case another hart did
 		// SFENCE.VMA while we were spinning.
 		mark_tlb_dirty_if_stale(state, module, hart_id);
@@ -1115,7 +1249,7 @@ fn step_interrupts(
 	_hart_id: u8,
 	clint: &ConcurrentClintCtx,
 	just_woke_from_wfi: bool,
-	plic: *mut FfiPlicCtx,
+	plic: *mut FfiPlicCtx
 ) -> bool {
 	sync_mtip(state, clint);
 	// When just woke from WFI, wfi_sync_and_check already called sync_msip
@@ -1237,19 +1371,21 @@ fn step_interrupts(
 	// trap into an unprocessable irqchip -> sbi_trap_error -> sbi_hart_hang
 	// -> the whole SMP boot freezes (observed: mcause=0x800000000000000b on
 	// every hart right after the `riscv-plic: plic@c000000:` DT node).
-	if state.imsic_m.present != 0
-		&& (state.mip.load(Ordering::Acquire) & (1 << 11)) != 0
-		&& (state.mie & (1 << 11)) == 0
+	if
+		state.imsic_m.present != 0 &&
+		(state.mip.load(Ordering::Acquire) & (1 << 11)) != 0 &&
+		(state.mie & (1 << 11)) == 0
 	{
 		state.mie |= 1 << 11;
 	}
 	// 该自动使能只对宿主上下文 (mdid == HOST_MDID) 成立. 飞地驻留时 SEIP 的产生取决于
 	// PLIC 的 S context 使能位图 / IMSIC S 文件的 eidelivery 与 eie, 这些状态由宿主
 	// 写入且不随上下文切换恢复, 故替飞地打开该位只会把宿主的设备中断反复投进飞地.
-	if state.imsic_s.present != 0
-		&& state.mdid == HOST_MDID
-		&& (state.mip.load(Ordering::Acquire) & (1 << 9)) != 0
-		&& (state.mie & (1 << 9)) == 0
+	if
+		state.imsic_s.present != 0 &&
+		state.mdid == HOST_MDID &&
+		(state.mip.load(Ordering::Acquire) & (1 << 9)) != 0 &&
+		(state.mie & (1 << 9)) == 0
 	{
 		state.mie |= 1 << 9;
 	}
@@ -1276,13 +1412,13 @@ fn step_fetch_instr(
 	pmp: &PmpCtx,
 	mem: &MemCtx,
 	module: &ModuleState,
-	breakpoints: &[u64],
+	breakpoints: &[u64]
 ) -> Result<(u64, u32), Step> {
 	let pc_before = state.pc;
-	let page_offset = pc_before & 0xFFF;
+	let page_offset = pc_before & 0xfff;
 
 	// -- VA -> PA translation --
-	let fetch_pa: u64 = match translate_fetch_pc_concurrent(state, ctx, pc_before) {
+	let fetch_pa: u64 = match translate_fetch_pc_concurrent(state, ctx, pc_before, pmp) {
 		Some(pa) => pa,
 		None => {
 			let step = if post_instr_checks(state, hart_id, module, breakpoints) {
@@ -1296,11 +1432,7 @@ fn step_fetch_instr(
 
 	// -- PMP execute check --
 	if !pmp_ok(state, fetch_pa, 4, false, true, pmp) {
-		deliver_trap(
-			state,
-			mcause_val(exc_code::INSTR_ACCESS_FAULT, false),
-			pc_before,
-		);
+		deliver_trap(state, mcause_val(exc_code::INSTR_ACCESS_FAULT, false), pc_before);
 		let step = if post_instr_checks(state, hart_id, module, breakpoints) {
 			Step::Continue
 		} else {
@@ -1310,16 +1442,9 @@ fn step_fetch_instr(
 	}
 
 	// -- Read instruction word (cross-page aware) --
-	let instr_word = match fetch_instr_word(
-		state,
-		ctx,
-		mem,
-		pc_before,
-		page_offset,
-		fetch_pa,
-		pmp,
-		hart_id,
-	) {
+	let instr_word = match
+		fetch_instr_word(state, ctx, mem, pc_before, page_offset, fetch_pa, pmp, hart_id)
+	{
 		Some(w) => w,
 		None => {
 			let step = if post_instr_checks(state, hart_id, module, breakpoints) {
@@ -1358,8 +1483,8 @@ fn step_fetch_instr(
 /// 提前退出可让该搬运尽早发生; 未被占用时内联置位已足够, 无需退出.
 #[inline]
 fn imsic_owns_ext_line(state: &HartState) -> bool {
-	(state.imsic_m.present != 0 && state.imsic_m.eidelivery != 0)
-		|| (state.imsic_s.present != 0 && state.imsic_s.eidelivery != 0)
+	(state.imsic_m.present != 0 && state.imsic_m.eidelivery != 0) ||
+		(state.imsic_s.present != 0 && state.imsic_s.eidelivery != 0)
 }
 
 pub(crate) fn hart_worker(
@@ -1373,26 +1498,24 @@ pub(crate) fn hart_worker(
 	module: &ModuleState,
 	breakpoints: &[u64],
 	stop_flag: *const u8,
-	ext_irq: *mut FfiExtIrqCtx,
+	ext_irq: *mut FfiExtIrqCtx
 ) {
 	let (_mem_val, _pmp_val, _dev_val, ctx) = make_contexts(mem, pmp, dev, module);
 	let mem = &_mem_val;
 	let pmp = &_pmp_val;
 	let dev = &_dev_val;
 
-	// HartState persists across FFI calls — stale TLB entries from a
-	// previous speedup execution with epoch=0 would match the fresh ModuleState's
-	// tlb_gen=0, producing incorrect VA->PA hits and memory corruption
-	// (garbage inode metadata -> "Permission denied" / ENOTDIR in ext4).
-	tlb_flush_all(&mut state.itlb);
-	tlb_flush_all(&mut state.dtlb);
+	if !module.is_flush_cnt_persistent {
+		tlb_flush_all(&mut state.itlb);
+		tlb_flush_all(&mut state.dtlb);
+	}
 
 	loop {
 		// ---- Guards ----
 		if module.stop_flag.load(Ordering::Acquire) {
 			return;
 		}
-		if !stop_flag.is_null() && unsafe { *stop_flag != 0 } {
+		if !stop_flag.is_null() && (unsafe { *stop_flag != 0 }) {
 			return;
 		}
 		// mtime 按每 hart 指令增量推进 (见 advance_clock_source, NS_PER_INSTR) —
@@ -1419,9 +1542,10 @@ pub(crate) fn hart_worker(
 		// 退出原因 RX_WAIT 不写入 Python 侧 stop_flag, 调试器不会把它当作
 		// 暂停事件; 通知位由 Python 在每轮结束时清零, 故每个输入突发至多
 		// 触发一次退出, 不会退化成每轮空转 (见 Emulator._speedup_for_cmd_step)。
-		if imsic_owns_ext_line(state)
-			&& !uart.rx_notify.is_null()
-			&& unsafe { *uart.rx_notify != 0 }
+		if
+			imsic_owns_ext_line(state) &&
+			!uart.rx_notify.is_null() &&
+			(unsafe { *uart.rx_notify != 0 })
 		{
 			module.request_stop(StopInfo {
 				reason: exit_reason::RX_WAIT,
@@ -1441,11 +1565,23 @@ pub(crate) fn hart_worker(
 		}
 
 		// ---- WFI ----
-		let (wfi_step, just_woke_from_wfi) =
-			handle_wfi_state(state, hart_id, clint, dev, module, stop_flag, uart, ext_irq);
+		let (wfi_step, just_woke_from_wfi) = handle_wfi_state(
+			state,
+			hart_id,
+			clint,
+			dev,
+			module,
+			stop_flag,
+			uart,
+			ext_irq
+		);
 		match wfi_step {
-			Step::Exit => return,
-			Step::Continue => continue,
+			Step::Exit => {
+				return;
+			}
+			Step::Continue => {
+				continue;
+			}
 			Step::Next => {}
 		}
 
@@ -1458,35 +1594,51 @@ pub(crate) fn hart_worker(
 		mark_tlb_dirty_if_stale(state, module, hart_id);
 
 		// ---- Fetch ----
-		let (pc_before, instr_word) =
-			match step_fetch_instr(state, hart_id, &ctx, pmp, mem, module, breakpoints) {
-				Ok(v) => v,
-				Err(Step::Continue) => continue,
-				Err(Step::Exit) => return,
-				Err(Step::Next) => unreachable!(),
-			};
+		let (pc_before, instr_word) = match
+			step_fetch_instr(state, hart_id, &ctx, pmp, mem, module, breakpoints)
+		{
+			Ok(v) => v,
+			Err(Step::Continue) => {
+				continue;
+			}
+			Err(Step::Exit) => {
+				return;
+			}
+			Err(Step::Next) => unreachable!(),
+		};
 
 		// ---- Decode & execute ----
 		let f = decode_fields(instr_word);
 		if f.is_compressed != 0 {
-			if !exec_compressed_concurrent(
-				state,
-				instr_word,
-				pc_before,
-				hart_id,
-				&ctx,
-				pmp,
-				dev,
-				clint,
-				module,
-				breakpoints,
-			) {
+			if
+				!exec_compressed_concurrent(
+					state,
+					instr_word,
+					pc_before,
+					hart_id,
+					&ctx,
+					pmp,
+					dev,
+					clint,
+					module,
+					breakpoints
+				)
+			{
 				return;
 			}
 			continue;
 		}
 		let advance = dispatch_concurrent(
-			state, &f, instr_word, &ctx, hart_id, pmp, dev, clint, uart, module,
+			state,
+			&f,
+			instr_word,
+			&ctx,
+			hart_id,
+			pmp,
+			dev,
+			clint,
+			uart,
+			module
 		);
 		if advance == EXIT_SENTINEL {
 			if module.stop_flag.load(Ordering::Acquire) {
@@ -1517,12 +1669,18 @@ pub(crate) fn hart_worker(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::concurrent::{ConcurrentClintCtx, ModuleState, StopInfo, MSIP_PENDING_STRIDE, NS_PER_INSTR};
-	use crate::handlers::{DevCtx, PmpCtx};
+	use crate::concurrent::{
+		ConcurrentClintCtx,
+		ModuleState,
+		StopInfo,
+		MSIP_PENDING_STRIDE,
+		NS_PER_INSTR,
+	};
+	use crate::handlers::{ DevCtx, PmpCtx };
 	use crate::ffi::FfiUartCtx;
-	use crate::state::{riscv_mode, HartState, TlbEntry};
+	use crate::state::{ riscv_mode, HartState, TlbEntry };
 	use crate::translate::WalkCtx;
-	use std::sync::atomic::{AtomicU64, AtomicU8};
+	use std::sync::atomic::{ AtomicU64, AtomicU8 };
 
 	/// Build a permissive PMP context: single TOR entry covering all of
 	/// memory with R/W/X.  Needed because pmp_ok per RISC-V spec §3.7.1
@@ -1530,7 +1688,7 @@ mod tests {
 	fn make_permissive_pmp(cfg: &mut [u8], addr: &mut [u64]) -> PmpCtx {
 		// TOR entry: covers [0, addr[0]) = [0, u64::MAX) — entire address space.
 		// PMP_R(1) | PMP_W(2) | PMP_X(4) | PMP_A_TOR(8)
-		cfg[0] = 0x0F;
+		cfg[0] = 0x0f;
 		addr[0] = u64::MAX;
 		PmpCtx {
 			cfg: cfg.as_mut_ptr(),
@@ -1548,7 +1706,7 @@ mod tests {
 		pa_a: u64,
 		va_b: u64,
 		pa_b: u64,
-		perm: u64,
+		perm: u64
 	) -> u64 {
 		let vpn_a = crate::mmu::sv39_decompose_va(va_a);
 		let vpn_b = crate::mmu::sv39_decompose_va(va_b);
@@ -1556,26 +1714,26 @@ mod tests {
 		assert_eq!(vpn_a.vpn2, vpn_b.vpn2);
 		assert_eq!(vpn_a.vpn1, vpn_b.vpn1);
 
-		let satp = 8u64 << 60 | 5; // Sv39, root PPN = 5
+		let satp = (8u64 << 60) | 5; // Sv39, root PPN = 5
 
 		// L2 (PA 0x5000): pointer to L1 at PPN=6
-		let l2_off = 0x5000usize + (vpn_a.vpn2 * 8) as usize;
+		let l2_off = 0x5000usize + ((vpn_a.vpn2 * 8) as usize);
 		let l2_val = (6u64 << 10) | crate::translate::PTE_V;
 		ram[l2_off..l2_off + 8].copy_from_slice(&l2_val.to_le_bytes());
 
 		// L1 (PA 0x6000): pointer to L0 at PPN=7
-		let l1_off = 0x6000usize + (vpn_a.vpn1 * 8) as usize;
+		let l1_off = 0x6000usize + ((vpn_a.vpn1 * 8) as usize);
 		let l1_val = (7u64 << 10) | crate::translate::PTE_V;
 		ram[l1_off..l1_off + 8].copy_from_slice(&l1_val.to_le_bytes());
 
 		// L0 (PA 0x7000): two leaf entries
 		let ppn_a = pa_a >> 12;
-		let l0_off_a = 0x7000usize + (vpn_a.vpn0 * 8) as usize;
+		let l0_off_a = 0x7000usize + ((vpn_a.vpn0 * 8) as usize);
 		let l0_val_a = (ppn_a << 10) | perm | crate::translate::PTE_V;
 		ram[l0_off_a..l0_off_a + 8].copy_from_slice(&l0_val_a.to_le_bytes());
 
 		let ppn_b = pa_b >> 12;
-		let l0_off_b = 0x7000usize + (vpn_b.vpn0 * 8) as usize;
+		let l0_off_b = 0x7000usize + ((vpn_b.vpn0 * 8) as usize);
 		let l0_val_b = (ppn_b << 10) | perm | crate::translate::PTE_V;
 		ram[l0_off_b..l0_off_b + 8].copy_from_slice(&l0_val_b.to_le_bytes());
 
@@ -1604,17 +1762,17 @@ mod tests {
 			0x1000,
 			0x2000,
 			0x3000,
-			crate::translate::PTE_R | crate::translate::PTE_W | crate::translate::PTE_U,
+			crate::translate::PTE_R | crate::translate::PTE_W | crate::translate::PTE_U
 		);
 
 		// Write pattern: 0xAA bytes at end of first PA page, 0xBB at start of second.
 		// VA 0x1FFC ->PA 0x1FFC (bytes_first = 4, on page A)
 		// VA 0x2000 ->PA 0x3000 (bytes 4-7 of the 8-byte read, on page B)
-		for i in 0x1FFC..0x2000 {
-			ram[i] = 0xAA;
+		for i in 0x1ffc..0x2000 {
+			ram[i] = 0xaa;
 		}
 		for i in 0x3000..0x3004 {
-			ram[i] = 0xBB;
+			ram[i] = 0xbb;
 		}
 
 		let mut state: HartState = unsafe { std::mem::zeroed() };
@@ -1632,7 +1790,7 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1642,13 +1800,14 @@ mod tests {
 		let pmp = make_permissive_pmp(&mut _pmp_cfg, &mut _pmp_addr);
 
 		// 8-byte read at VA 0x1FFC — crosses page boundary.
-		let (val, ok) = read_ram_cross_page(&mut state, &ctx, 0x1FFC, 0x1FFC, 8, &pmp);
+		let (val, ok) = read_ram_cross_page(&mut state, &ctx, 0x1ffc, 0x1ffc, 8, &pmp);
 		assert!(ok, "cross-page read must succeed");
 
 		// Expected: little-endian assembly of 4 bytes 0xAA + 4 bytes 0xBB.
-		let expected: u64 = 0xBBBB_BBBB_AAAA_AAAA;
+		let expected: u64 = 0xbbbb_bbbb_aaaa_aaaa;
 		assert_eq!(
-			val, expected,
+			val,
+			expected,
 			"cross-page read: expected 0x{expected:016X}, got 0x{val:016X}\
              \n  (4 bytes from PA 0x1FFC + 4 bytes from PA 0x3000)"
 		);
@@ -1667,7 +1826,7 @@ mod tests {
 			0x1000,
 			0x2000,
 			0x3000,
-			crate::translate::PTE_R | crate::translate::PTE_W | crate::translate::PTE_U,
+			crate::translate::PTE_R | crate::translate::PTE_W | crate::translate::PTE_U
 		);
 
 		let mut state: HartState = unsafe { std::mem::zeroed() };
@@ -1684,7 +1843,7 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1693,14 +1852,14 @@ mod tests {
 		let pmp = make_permissive_pmp(&mut _pmp_cfg, &mut _pmp_addr);
 
 		// Write 0xCCCCCCCC_DDDDDDDD at VA 0x1FFC (4 bytes to each page).
-		let val: u64 = 0xCCCC_CCCC_DDDD_DDDD;
-		let ok = write_ram_cross_page(&mut state, &ctx, 0x1FFC, 0x1FFC, val, 8, &pmp);
+		let val: u64 = 0xcccc_cccc_dddd_dddd;
+		let ok = write_ram_cross_page(&mut state, &ctx, 0x1ffc, 0x1ffc, val, 8, &pmp);
 		assert!(ok, "cross-page write must succeed");
 
 		// Lower 4 bytes (0xDDDDDDDD) go to PA 0x1FFC-0x1FFF (page A).
-		assert_eq!(&ram[0x1FFC..0x2000], &[0xDD, 0xDD, 0xDD, 0xDD]);
+		assert_eq!(&ram[0x1ffc..0x2000], &[0xdd, 0xdd, 0xdd, 0xdd]);
 		// Upper 4 bytes (0xCCCCCCCC) go to PA 0x3000-0x3003 (page B, non-consecutive).
-		assert_eq!(&ram[0x3000..0x3004], &[0xCC, 0xCC, 0xCC, 0xCC]);
+		assert_eq!(&ram[0x3000..0x3004], &[0xcc, 0xcc, 0xcc, 0xcc]);
 		// PA 0x2000-0x2FFF must remain untouched.
 		assert!(
 			ram[0x2000..0x3000].iter().all(|&b| b == 0),
@@ -1729,7 +1888,7 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1777,7 +1936,7 @@ mod tests {
 		let _wfi_flags: Vec<std::sync::atomic::AtomicU8> = (0..1)
 			.map(|_| std::sync::atomic::AtomicU8::new(0))
 			.collect();
-		let _tlb_gen: Vec<std::sync::atomic::AtomicU64> = (0..1)
+		let _tlb_flush_cnt: Vec<std::sync::atomic::AtomicU64> = (0..1)
 			.map(|_| std::sync::atomic::AtomicU64::new(0))
 			.collect();
 		let _msip_pending: Vec<std::sync::atomic::AtomicU64> = (0..MSIP_PENDING_STRIDE)
@@ -1789,8 +1948,9 @@ mod tests {
 			wfi_count: std::sync::atomic::AtomicU32::new(0),
 			wfi_flags: _wfi_flags.into_boxed_slice(),
 			active_hart_num: 1,
-			tlb_gen: std::sync::atomic::AtomicU64::new(0),
-			tlb_gen_per_hart: _tlb_gen.into_boxed_slice(),
+			tlb_flush_cnt: std::sync::atomic::AtomicU64::new(0),
+			tlb_flush_cnt_per_hart: _tlb_flush_cnt.into_boxed_slice(),
+			is_flush_cnt_persistent: false,
 			lr_reserved: Box::new([]),
 			msip_pending: _msip_pending.into_boxed_slice(),
 			st_time_val: std::time::Instant::now(),
@@ -1804,15 +1964,24 @@ mod tests {
 		// Write known data at the target address (0x100 + 0x336 = 0x436)
 		let target_pa = 0x100u64 + 0x336u64;
 		ram[target_pa as usize] = 0x42;
-		ram[target_pa as usize + 1] = 0x13;
+		ram[(target_pa as usize) + 1] = 0x13;
 
 		let adv = handle_load_concurrent(
-			&mut state, &f, instr, &ctx, &pmp, &dev, &clint, &uart, &module,
+			&mut state,
+			&f,
+			instr,
+			&ctx,
+			&pmp,
+			&dev,
+			&clint,
+			&uart,
+			&module
 		);
 		assert_eq!(adv, 4);
 		// After lhu: a5 should be 0x1342 (little-endian: 0x42 | 0x13<<8)
 		assert_eq!(
-			state.gprs[15], 0x1342,
+			state.gprs[15],
+			0x1342,
 			"LHU rd==rs1: loaded value must be 0x1342, not the old address"
 		);
 	}
@@ -1829,7 +1998,7 @@ mod tests {
 		state.stvec = 0x80000400; // S-mode trap vector
 		state.medeleg = 1 << 13; // Delegate LdPageFault to S-mode
 		state.gprs[15] = 7; // a5 = 7 (the DT_RELA crash value)
-					  // Empty RAM ->any page walk will fail (PTE.V=0)
+		// Empty RAM ->any page walk will fail (PTE.V=0)
 		let mut ram = vec![0u8; 0x1000];
 		let ctx = WalkCtx {
 			ram: ram.as_mut_ptr(),
@@ -1837,7 +2006,7 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
@@ -1884,7 +2053,7 @@ mod tests {
 		let _wfi_flags: Vec<std::sync::atomic::AtomicU8> = (0..1)
 			.map(|_| std::sync::atomic::AtomicU8::new(0))
 			.collect();
-		let _tlb_gen: Vec<std::sync::atomic::AtomicU64> = (0..1)
+		let _tlb_flush_cnt: Vec<std::sync::atomic::AtomicU64> = (0..1)
 			.map(|_| std::sync::atomic::AtomicU64::new(0))
 			.collect();
 		let _msip_pending: Vec<std::sync::atomic::AtomicU64> = (0..MSIP_PENDING_STRIDE)
@@ -1896,8 +2065,9 @@ mod tests {
 			wfi_count: std::sync::atomic::AtomicU32::new(0),
 			wfi_flags: _wfi_flags.into_boxed_slice(),
 			active_hart_num: 1,
-			tlb_gen: std::sync::atomic::AtomicU64::new(0),
-			tlb_gen_per_hart: _tlb_gen.into_boxed_slice(),
+			tlb_flush_cnt: std::sync::atomic::AtomicU64::new(0),
+			tlb_flush_cnt_per_hart: _tlb_flush_cnt.into_boxed_slice(),
+			is_flush_cnt_persistent: false,
 			lr_reserved: Box::new([]),
 			msip_pending: _msip_pending.into_boxed_slice(),
 			st_time_val: std::time::Instant::now(),
@@ -1909,20 +2079,26 @@ mod tests {
 		let f = crate::decode::decode_fields(instr);
 
 		let adv = handle_load_concurrent(
-			&mut state, &f, instr, &ctx, &pmp, &dev, &clint, &uart, &module,
+			&mut state,
+			&f,
+			instr,
+			&ctx,
+			&pmp,
+			&dev,
+			&clint,
+			&uart,
+			&module
 		);
 		// Page fault delivered, PC redirected ->advance = 0
 		assert_eq!(adv, 0, "page fault must return 0 (PC already redirected)");
 		// a5 MUST retain its original value (7), NOT be overwritten
 		assert_eq!(
-			state.gprs[15], 7,
+			state.gprs[15],
+			7,
 			"rd==rs1 on page fault: a5 must stay 7, not be corrupted to 0 or loaded data"
 		);
 		// PC must have changed (to stvec)
-		assert_ne!(
-			state.pc, 0,
-			"PC must be redirected to stvec after page fault"
-		);
+		assert_ne!(state.pc, 0, "PC must be redirected to stvec after page fault");
 	}
 
 	/// CSR with rd==rs1: old CSR value read before rs1, then written to rd.
@@ -1931,7 +2107,7 @@ mod tests {
 	fn csrrw_rd_equals_rs1_swaps_correctly() {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mode = riscv_mode::M;
-		state.gprs[15] = 0xDEADBEEF; // a5 = value to write to CSR
+		state.gprs[15] = 0xdeadbeef; // a5 = value to write to CSR
 		state.stvec = 0x80001000; // stvec = old value
 
 		let mut result = unsafe { std::mem::zeroed() };
@@ -1957,12 +2133,14 @@ mod tests {
 		assert_eq!(adv, 4);
 		// a5 should now hold old stvec (0x80001000), not 0xDEADBEEF
 		assert_eq!(
-			csr_ctx.state.gprs[15], 0x80001000,
+			csr_ctx.state.gprs[15],
+			0x80001000,
 			"CSRRW rd==rs1: a5 must swap to old CSR value"
 		);
 		// stvec should now hold the old a5 value (0xDEADBEEF)
 		assert_eq!(
-			csr_ctx.state.stvec, 0xDEADBEEF,
+			csr_ctx.state.stvec,
+			0xdeadbeef,
 			"CSRRW rd==rs1: CSR must get old a5 value"
 		);
 	}
@@ -1972,7 +2150,7 @@ mod tests {
 	fn csrrs_rd_equals_rs1_sets_bits_correctly() {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mode = riscv_mode::M;
-		state.gprs[10] = 0x0000000F; // a0 = mask to set
+		state.gprs[10] = 0x0000000f; // a0 = mask to set
 		state.mie = 0x00000088; // MIE currently has MTIE+MSIE set
 
 		let mut result = unsafe { std::mem::zeroed() };
@@ -1998,14 +2176,12 @@ mod tests {
 		assert_eq!(adv, 4);
 		// a0 should hold old MIE value (0x88), not the mask
 		assert_eq!(
-			csr_ctx.state.gprs[10], 0x88,
+			csr_ctx.state.gprs[10],
+			0x88,
 			"CSRRS rd==rs1: a0 must hold old MIE, not 0x0F"
 		);
 		// MIE should now be 0x88 | 0x0F = 0x8F
-		assert_eq!(
-			csr_ctx.state.mie, 0x8F,
-			"CSRRS rd==rs1: MIE must have 0x0F bits set"
-		);
+		assert_eq!(csr_ctx.state.mie, 0x8f, "CSRRS rd==rs1: MIE must have 0x0F bits set");
 	}
 
 	/// 回归: 内核 rdtime 惯用法 ``csrrs rd, time, x0`` (S 模式, mcounteren.TM=1)
@@ -2018,7 +2194,7 @@ mod tests {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mode = riscv_mode::S;
 		state.mcounteren = 0b111; // 允许 S 模式读 cycle (bit 0) / time (bit 1) / instret (bit 2)
-		let mtime_atomic = AtomicU64::new(0x1234_5678_9ABC_DEF0);
+		let mtime_atomic = AtomicU64::new(0x1234_5678_9abc_def0);
 
 		let mut result = unsafe { std::mem::zeroed() };
 		let pmp = PmpCtx {
@@ -2040,33 +2216,53 @@ mod tests {
 		let mut csr_ctx = crate::csr::CsrContext::new(&mut state, 0, &pmp, &clint);
 
 		// csrrs a0, time, x0 — funct3=010, rd=10, rs1=0, csr=0xC01
-		let adv = crate::csr::handle_csr(&mut csr_ctx, 10, 0, 0xC01, 2, 0xc010_2573, &mut result);
+		let adv = crate::csr::handle_csr(
+			&mut csr_ctx,
+			10,
+			0,
+			0xc01,
+			2,
+			0xc010_2573,
+			&mut result
+		);
 		assert_eq!(
-			adv, 4,
+			adv,
+			4,
 			"rdtime 必须在一轮加速中完成 (advance=4), 修复前返回 EXIT_SENTINEL"
 		);
+		assert_eq!(result.exit_reason, 0, "rdtime 不得设置退出原因, 修复前为 ECALL");
 		assert_eq!(
-			result.exit_reason, 0,
-			"rdtime 不得设置退出原因, 修复前为 ECALL"
-		);
-		assert_eq!(
-			csr_ctx.state.gprs[10], 0x1234_5678_9ABC_DEF0,
+			csr_ctx.state.gprs[10],
+			0x1234_5678_9abc_def0,
 			"a0 必须读到 CLINT 实时 mtime"
 		);
 
 		// timeh (0xC81): csrrs a1, timeh, x0 — 高 32 位
 		result.exit_reason = 0;
-		let adv = crate::csr::handle_csr(&mut csr_ctx, 11, 0, 0xC81, 2, 0xc810_25f3, &mut result);
+		let adv = crate::csr::handle_csr(
+			&mut csr_ctx,
+			11,
+			0,
+			0xc81,
+			2,
+			0xc810_25f3,
+			&mut result
+		);
 		assert_eq!(adv, 4, "rdtimeh 必须一轮加速中完成");
 		assert_eq!(result.exit_reason, 0, "rdtimeh 不得设置退出原因");
-		assert_eq!(
-			csr_ctx.state.gprs[11], 0x1234_5678,
-			"a1 必须读到 mtime 高 32 位"
-		);
+		assert_eq!(csr_ctx.state.gprs[11], 0x1234_5678, "a1 必须读到 mtime 高 32 位");
 
 		// cycle (0xC00): csrrs a2, cycle, x0 — 同样只读, 写回忽略
 		result.exit_reason = 0;
-		let adv = crate::csr::handle_csr(&mut csr_ctx, 12, 0, 0xC00, 2, 0xc000_2673, &mut result);
+		let adv = crate::csr::handle_csr(
+			&mut csr_ctx,
+			12,
+			0,
+			0xc00,
+			2,
+			0xc000_2673,
+			&mut result
+		);
 		assert_eq!(adv, 4, "rdcycle 必须一轮加速中完成");
 		assert_eq!(result.exit_reason, 0, "rdcycle 不得设置退出原因");
 	}
@@ -2130,18 +2326,28 @@ mod tests {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mhartid = 0;
 		state.total_instrs = 2600;
-		let mut module = ModuleState::new(1, 1, 0, base_mtime, vec![1000u64].into_boxed_slice());
+		let mut module = ModuleState::new(
+			1,
+			1,
+			0,
+			vec![0u64].into_boxed_slice(),
+			false,
+			base_mtime,
+			vec![1000u64].into_boxed_slice()
+		);
 
 		// 两种流逝下推进量必须一致: 1600 条 * 20ns/instr * 10MHz = 320 ticks.
 		for elapsed_ms in [10u64, 100u64] {
-			module.st_time_val = std::time::Instant::now()
+			module.st_time_val = std::time::Instant
+				::now()
 				.checked_sub(std::time::Duration::from_millis(elapsed_ms))
 				.expect("Instant 减法不应下溢");
 			mtime_atomic.store(base_mtime, Ordering::Relaxed);
 			advance_clock_source(&module, &clint, &state);
 			let delta = mtime_atomic.load(Ordering::Relaxed) - base_mtime;
 			assert_eq!(
-				delta, 320,
+				delta,
+				320,
 				"mtime 必须纯按指令增量推进 (1600 条 -> 320 ticks @20ns/instr), \
 				 与流逝 ({elapsed_ms}ms) 无关; 实际 {delta}"
 			);
@@ -2177,16 +2383,26 @@ mod tests {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mhartid = 0;
 		state.total_instrs = 1000;
-		let mut module = ModuleState::new(1, 1, 0, base_mtime, vec![1000u64].into_boxed_slice());
+		let mut module = ModuleState::new(
+			1,
+			1,
+			0,
+			vec![0u64].into_boxed_slice(),
+			false,
+			base_mtime,
+			vec![1000u64].into_boxed_slice()
+		);
 
-		module.st_time_val = std::time::Instant::now()
+		module.st_time_val = std::time::Instant
+			::now()
 			.checked_sub(std::time::Duration::from_millis(100))
 			.expect("Instant 减法不应下溢");
 		mtime_atomic.store(base_mtime, Ordering::Relaxed);
 		advance_clock_source(&module, &clint, &state);
 		let delta = mtime_atomic.load(Ordering::Relaxed) - base_mtime;
 		assert_eq!(
-			delta, 0,
+			delta,
+			0,
 			"0 指令的空闲批次不得推进 mtime (时钟源仅指令, WFI 补偿在 Python 侧); \
 			 实际 {delta}"
 		);
@@ -2220,17 +2436,26 @@ mod tests {
 		};
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mhartid = 0;
-		let mut module =
-			ModuleState::new(1, 1, 0, base_mtime, vec![ref_instrs].into_boxed_slice());
+		let module = ModuleState::new(
+			1,
+			1,
+			0,
+			vec![0u64].into_boxed_slice(),
+			false,
+			base_mtime,
+			vec![ref_instrs].into_boxed_slice()
+		);
 
 		// 1024 条指令跨 204 个 tick; 起点先落在 tick 内部, 使两种情形都出现.
 		for delta in 5u64..1024 {
 			state.total_instrs = ref_instrs + delta;
 			advance_clock_source(&module, &clint, &state);
-			let expected = base_mtime + delta * timebase_hz * NS_PER_INSTR / 1_000_000_000;
+			let expected =
+				base_mtime + (delta * timebase_hz * NS_PER_INSTR) / 1_000_000_000;
 			let actual = mtime_atomic.load(Ordering::Relaxed);
 			assert_eq!(
-				actual, expected,
+				actual,
+				expected,
 				"指令增量 {delta} 处 mtime 必须等于逐条取最大值的取值; \
 				 实际 {actual}, 期望 {expected}"
 			);
@@ -2306,7 +2531,10 @@ mod tests {
 		state.imsic_m.present = 1;
 		// 使 IMSIC M-file 持有 IPI 位, 让 stale-bit 清理保留 MEIP
 		// (否则 eidelivery=0 且无 IPI 时会清除 MEIP, 后续断言失去意义).
-		state.imsic_m.eip[0].store(1 << crate::interrupt::imsic::IID_M_IPI, Ordering::Release);
+		state.imsic_m.eip[0].store(
+			1 << crate::interrupt::imsic::IID_M_IPI,
+			Ordering::Release
+		);
 
 		step_interrupts(&mut state, 0, &clint, false, std::ptr::null_mut());
 

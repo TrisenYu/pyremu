@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -99,6 +100,13 @@ class ExecutionMixin(SharedMixinAttrs):
         for name, val in snap.csr_vals.items():
             if name not in h.csrs:
                 continue
+            if name == "satp":
+                # 经 property setter 写入以同步缓存的 MMU 模式; 快照中的 satp 与
+                # 当前取值不同时翻译条目随之作废, 不一致时保持原样.
+                if h.satp_val != val:
+                    h.satp_val = val
+                    h.note_tlb_flush()
+                continue
             h.csrs[name].val = val
         h.mode = RiscvMode(snap.mode)
         if snap.reservation_valid:
@@ -156,6 +164,9 @@ class ExecutionMixin(SharedMixinAttrs):
 
             check_pending_interrupts(h)
             self._instr_count += 1
+            # mcycle 与 minstret 按本 hart 的指令数折算, 单步路径同样要计入,
+            # 否则单步执行时这两个计数器不变.
+            h._total_instrs += 1
 
             self._emu.sync_counters(1)
         finally:
@@ -196,12 +207,14 @@ class ExecutionMixin(SharedMixinAttrs):
         self._snapshot = None
         self._mem_changes = []
         self._instr_count -= 1
+        # 单步计入的指令数随回滚一并撤销, 使 mcycle 与 minstret 的镜像与
+        # 快照恢复的取值一致.
+        self.hart._total_instrs = max(0, self.hart._total_instrs - 1)
         self._console.print("[dim]已撤销上一条指令[/]")
 
     # ----------------------------------------------------------
     #  运行循环
     # ----------------------------------------------------------
-
 
     def _run_loop(
         self,
@@ -215,6 +228,7 @@ class ExecutionMixin(SharedMixinAttrs):
           在 live 数组中; stop_flag 由本函数消费后回到 REPL.
         - 固件停机序列, 即 semihosting SYS_EXIT, 随后由调试器接管.
         - addr 断点命中, 由 Rust 内联比对并以 EXIT_BREAKPOINT 退出, 随后报告.
+          条件不成立时越过该指令并继续运行, 不回到 REPL.
         - 全部 hart halted.
         - 时钟源超时, 即 TimeoutError.
 
@@ -243,30 +257,64 @@ class ExecutionMixin(SharedMixinAttrs):
                 _bp_addrs.append(va)
         self._emu._bp_addrs = _bp_addrs
 
-        try:
-            self._emu.run(timeout=timeout, yield_every=0)
-        except TimeoutError:
+        # 每轮 run() 各自计时, 故以截止时刻为准, 使条件断点的自动恢复
+        # 不延长用户设定的超时.
+        deadline = time.monotonic() + timeout if timeout > 0 else 0.0
+        timed_out = False
+        while True:
+            if deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+            else:
+                remaining = 0.0
+            try:
+                self._emu.run(timeout=remaining, yield_every=0)
+            except TimeoutError:
+                timed_out = True
+                break
+            finally:
+                # 引擎可能在无退出事件时长时间运行; 一轮结束刷新 UART 输出.
+                self._flush_uart_if_present()
+
+            if not self._handle_run_stop():
+                break
+
+        if timed_out:
             self._warn(f"运行超时 ({timeout:.0f}s), 强制停止")
             self._show_trap_context(self.hart)
-        finally:
-            # 引擎可能在无退出事件时长时间运行; 一轮结束刷新 UART 输出.
-            self._flush_uart_if_present()
 
+        self._running = False
+        self._enter_repl_mode()
+
+    def _handle_run_stop(self) -> bool:
+        """处理一轮运行的停止事件.
+
+        Returns:
+            True 表示继续运行 — 引擎按地址断点停下而条件不成立时, 越过
+            该指令后继续; False 表示把控制交还给 REPL.
+        """
         reason = self._emu._run_stop_reason
         if self._emu._native_stop_flag.value != 0:
             # Ctrl+Q 事件 — 全部 hart 已暂停, 消费标志后回到 REPL.
             self._emu._native_stop_flag.value = 0
         if reason == RunStopReason.BREAKPOINT:
-            self._check_multi_hart_bp(include_addr=True)
-        elif reason == RunStopReason.EBREAK:
+            if self._check_multi_hart_bp(include_addr=True):
+                return False
+            # 引擎按地址停下而条件不成立: 越过该指令后继续运行,
+            # 不把这处命中报告给用户.
+            if self._step_over_bp_at_pc():
+                return True
+            # 当前 PC 处没有可越过的断点, 继续运行会立即再次停下.
+            self._warn("引擎以断点事件退出, 但当前 PC 未匹配任何断点")
+        if reason == RunStopReason.EBREAK:
             self._console.print(
                 "[dim]固件执行停机序列 (semihosting SYS_EXIT) — 全部 hart 停止[/]"
             )
         elif all(h._halted for h in self._emu.harts):
             self._warn("所有 Hart 已暂停")
-
-        self._running = False
-        self._enter_repl_mode()
+        return False
 
     # ----------------------------------------------------------
     #  运行命令
@@ -294,41 +342,53 @@ class ExecutionMixin(SharedMixinAttrs):
             return
         self.cmd_pc()
 
-    def cmd_continue(self) -> None:
-        self._console.print("[dim]继续执行 (Ctrl+Q 暂停)...[/]")
-        # 若任一 hart 的 PC 恰好落在地址断点上, 先步进越过该断点,
-        # 否则引擎的 pre-execution 检查会立即再次命中同一断点.
-        # 必须遍历全部 hart (不仅是当前 hart), 因为断点可能命中的是
-        # 用户当前未选中的 hart.
+    def _step_over_bp_at_pc(self) -> bool:
+        """越过当前 PC 处的地址断点执行一条指令.
+
+        断点在指令执行之前比对, 不越过该指令就直接恢复运行, 引擎会立即
+        再次命中同一断点. 暂时摘除命中的断点, 步进后重装, 使
+        ``_bp_addrs`` 与 ``_breakpoints`` 保持一致. 必须遍历全部 hart,
+        因为断点可能命中的是用户当前未选中的 hart.
+
+        Returns:
+            True 表示已执行一次步进; False 表示没有 hart 停在地址断点上.
+        """
         bps_to_skip: list = []
         bp_values_to_skip: set[int] = set()
         for h in self._emu.harts:
             if h._halted or h._waiting:
                 continue
             for bp in self._breakpoints:
-                if not (bp.kind == "addr"
-                        and self._bp_match_pc(h, h.pc, bp.value)):
+                if not (
+                    bp.kind == "addr" and self._bp_match_pc(h, h.pc, bp.value)
+                ):
                     continue
                 if bp not in bps_to_skip:
                     bps_to_skip.append(bp)
                     bp_values_to_skip.add(bp.value)
                 break
-        if bps_to_skip:
-            for bp in bps_to_skip:
-                self._breakpoints.remove(bp)
-            # 同步更新 _bp_addrs, 否则 Rust 引擎仍会命中已移除的断点
-            saved_bp_addrs = self._emu._bp_addrs
-            self._emu._bp_addrs = [
-                a for a in saved_bp_addrs if a not in bp_values_to_skip
-            ]
-            # 纯 Python 单步 (emu.step 全 hart 各一条) 精确跳过断点处指令,
-            # 恢复断点后继续连续执行.
-            try:
-                self._emu.step()
-            finally:
-                self._breakpoints.extend(bps_to_skip)
-                self._refresh_bp_cache()
-                self._emu._bp_addrs = saved_bp_addrs
+        if not bps_to_skip:
+            return False
+        for bp in bps_to_skip:
+            self._breakpoints.remove(bp)
+        # 同步更新 _bp_addrs, 否则 Rust 引擎仍会命中已移除的断点
+        saved_bp_addrs = self._emu._bp_addrs
+        self._emu._bp_addrs = [a for a in saved_bp_addrs if a not in bp_values_to_skip]
+        # 纯 Python 单步 (emu.step 全 hart 各一条) 精确跳过断点处指令,
+        # 恢复断点后继续连续执行.
+        try:
+            self._emu.step()
+        finally:
+            self._breakpoints.extend(bps_to_skip)
+            self._refresh_bp_cache()
+            self._emu._bp_addrs = saved_bp_addrs
+        return True
+
+    def cmd_continue(self) -> None:
+        self._console.print("[dim]继续执行 (Ctrl+Q 暂停)...[/]")
+        # 若任一 hart 的 PC 恰好落在地址断点上, 先步进越过该断点,
+        # 否则引擎的 pre-execution 检查会立即再次命中同一断点.
+        self._step_over_bp_at_pc()
         self._run_loop()
 
     def cmd_run(self, n: int = 1) -> None:
@@ -497,9 +557,9 @@ class ExecutionMixin(SharedMixinAttrs):
     def _check_multi_hart_bp(self, include_addr: bool = False) -> bool:
         """多 hart 执行后检查断点.
 
-        addr (无条件) — native 连续执行时由 Rust 内联比对, 引擎以
+        addr — native 连续执行时由 Rust 内联比对, 引擎以
         EXIT_BREAKPOINT 退出后经 ``include_addr=True`` 在此报告;
-        纯 Python 路径 (cmd_run / step_one) 无 Rust 比对, 恒传
+        cmd_run / step_one 无 Rust 比对, 恒传
         ``include_addr=True``. instr/opcode/cond/addr_with_cond —
         需 Python 侧求值.
 

@@ -1,13 +1,5 @@
 /* stress_payload.c - 飞地压力测试载荷 (musl 静态链接)
  *
- * 每个飞地内执行固定的 CPU + 内存压力操作，参数硬编码。
- * 通过大量创建飞地 (2/20/200/2000/20000) 测试:
- *   - 内存槽占用与释放的正确性
- *   - 宿主机与飞地应用完成上下文切换的稳定性
- *   - PMP 重新配置的并发安全
- *   - brk/mmap ecall 路径的可靠性
- *   - mfence.did TLB/L2 按域刷新的隔离性
- *
  * 编译: make stress_payload
  *
  * SPDX-License-Identifier: MIT
@@ -23,25 +15,20 @@
 #define MMAP_PAGES	 6
 #define MIXED_ROUNDS 3
 
-/* ================================================================
- *  main — 按固定顺序执行全部操作, 参数硬编码
- * ================================================================ */
-
 int main(void) {
 	int rc = 0;
 
 	for (int round = 0; round < MIXED_ROUNDS; round++) {
 		printf(
-			"[stress] round %d: fib(%u)=%lu\n",
+			"[stress] round %d: fib(%u)=%lu\n"\
+            "[stress] round %d: primes(<=%u)=%lu\n",
 			round,
 			FIB_N,
-			stress_fib(FIB_N));
-
-		printf(
-			"[stress] round %d: primes(<=%u)=%lu\n",
-			round,
+			stress_fib(FIB_N),
+            round,
 			PRIME_MAX,
-			stress_prime_sieve(PRIME_MAX));
+			stress_prime_sieve(PRIME_MAX)
+        );
 
 		stress_malloc_cycle(MALLOC_COUNT);
 		printf("[stress] round %d: malloc(%d) done\n", round, (unsigned)MALLOC_COUNT);

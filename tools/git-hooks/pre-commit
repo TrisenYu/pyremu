@@ -1,0 +1,106 @@
+#!/bin/sh
+# 提交前格式化: 只处理本次纳入索引的代码文件, 不改动工作区的其余文件.
+#
+# 语言与工具:
+#   .py        uv run ruff format 与 uv run ruff check
+#   .rs        rustfmt, 版本由文件所在 crate 的 Cargo.toml 给出, 找不到时取 2021
+#   .c / .h    clang-format -i, 配置由 clang-format 按文件所在目录向上查找
+#              本仓库的 .clang-format 需要 clang-format 20 及以上
+#
+# 缺失时提示并以 1 退出.
+# 任一步骤失败即退出 1, 且不把格式化结果加入索引;
+# 全部通过后重新 git add 本次纳入索引的文件.
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+require_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "pre-commit: $1 not found in PATH" >&2
+        exit 1
+    fi
+}
+
+# 由文件所在目录向上查找最近的 Cargo.toml, 取其 edition; 找不到时取 2021.
+crate_edition() {
+    dir=$(dirname "$1")
+    while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
+        if [ -f "$dir/Cargo.toml" ]; then
+            edition=$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\)".*/\1/p' \
+                "$dir/Cargo.toml" | head -n 1)
+            if [ -n "$edition" ]; then
+                echo "$edition"
+                return 0
+            fi
+        fi
+        dir=$(dirname "$dir")
+    done
+    echo 2021
+}
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+PY_FILES=$(printf '%s\n' "$STAGED" | grep '\.py$')
+RS_FILES=$(printf '%s\n' "$STAGED" | grep '\.rs$')
+C_FILES=$(printf '%s\n' "$STAGED" | grep -E '\.(c|h)$')
+
+if [ -n "$PY_FILES" ]; then
+    require_tool uv
+    echo "==> ruff format ..."
+    uv run ruff format $PY_FILES
+    echo "==> ruff check ..."
+    uv run ruff check $PY_FILES
+    status=$?
+
+    if [ $status -ne 0 ]; then
+        echo ""
+        echo "ruff check failed. Fix errors above, then:"
+        echo "  uv run ruff check --fix <files>"
+        echo "  git add <files>"
+        exit 1
+    fi
+fi
+
+if [ -n "$RS_FILES" ]; then
+    require_tool rustfmt
+    echo "==> rustfmt ..."
+    for f in $RS_FILES; do
+        if [ ! -f "$f" ]; then
+            continue
+        fi
+        edition=$(crate_edition "$f")
+        # skip_children: 只格式化本文件, 不连带其声明的子模块.
+        rustfmt --config skip_children=true --edition "$edition" "$f"
+        if [ $? -ne 0 ]; then
+            echo ""
+            echo "rustfmt failed on $f (edition $edition)."
+            exit 1
+        fi
+    done
+fi
+
+if [ -n "$C_FILES" ]; then
+    require_tool clang-format
+    echo "==> clang-format ..."
+    for f in $C_FILES; do
+        if [ ! -f "$f" ]; then
+            continue
+        fi
+        clang-format -i "$f"
+        if [ $? -ne 0 ]; then
+            echo ""
+            echo "clang-format failed on $f."
+            exit 1
+        fi
+    done
+fi
+
+# 重新纳入由格式化改写过的文件
+for f in $PY_FILES $RS_FILES $C_FILES; do
+    if [ -f "$f" ]; then
+        git add -- "$f"
+    fi
+done
+echo "==> pre-commit OK"

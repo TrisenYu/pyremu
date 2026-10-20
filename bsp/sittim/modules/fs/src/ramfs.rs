@@ -266,7 +266,10 @@ fn as_dir(fs: &VfsState, node: i16) -> Result<i16, VfsStatus> {
 ///
 /// 路径中间的名字没有命中返回 [`NoEntry`](VfsStatus::NoEntry), 命中的节点不是目录返回
 /// [`NotDir`](VfsStatus::NotDir)。
-fn split_target<'a>(fs: &mut VfsState, path: &'a [u8]) -> Result<PathTarget<'a>, VfsStatus> {
+fn split_target<'a>(
+	fs: &mut VfsState,
+	path: &'a [u8]
+) -> Result<PathTarget<'a>, VfsStatus> {
 	let (dir_path, name) = split_path(path)?;
 	let dir = resolve(fs, dir_path, false)?;
 	let dir = as_dir(fs, dir)?;
@@ -519,6 +522,55 @@ pub fn inject_file(path: &[u8], data: &[u8]) -> bool {
 	(unsafe { write_file(&mut fs, node, 0, data.as_ptr(), data.len() as u64) }).is_ok()
 }
 
+/// 取 *path* 的最后一个名字所指的节点; 未命中且 *flags* 含 [`O_CREAT`] 时按 *mode* 创建。
+///
+/// 最后一个名字只指代目录时给出该目录。命中或只指代目录而 *flags* 含 `O_CREAT | O_EXCL`
+/// 时返回 [`Exists`](VfsStatus::Exists); 未命中而 *flags* 不含 [`O_CREAT`] 时返回
+/// [`NoEntry`](VfsStatus::NoEntry); 创建时同时含 [`O_DIRECTORY`] 则建立目录, 否则建立文件,
+/// 节点用尽时返回 [`NoMemory`](VfsStatus::NoMemory)。
+///
+/// 本函数只取节点, 不按节点类别校验访问方向, 也不截断: 这两项由 [`open`] 完成。
+fn open_node(
+	fs: &mut VfsState,
+	path: &[u8],
+	flags: u32,
+	mode: u32
+) -> Result<i16, VfsStatus> {
+	match split_target(fs, path)? {
+		// 最后一个名字只指代目录: O_CREAT 与 O_EXCL 判为已存在
+		PathTarget::Dir(dir, _) => {
+			if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
+				return Err(VfsStatus::Exists);
+			}
+			Ok(dir)
+		}
+		PathTarget::Child(dir, name) =>
+			match find_child(fs, dir, name) {
+				NIL => {
+					if (flags & O_CREAT) == 0 {
+						return Err(VfsStatus::NoEntry);
+					}
+					let kind = if (flags & O_DIRECTORY) != 0 {
+						VFS_KIND_DIR
+					} else {
+						VFS_KIND_FILE
+					};
+					let created = create_child(fs, dir, name, kind, mode);
+					if created == NIL {
+						return Err(VfsStatus::NoMemory);
+					}
+					Ok(created)
+				}
+				existing => {
+					if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
+						return Err(VfsStatus::Exists);
+					}
+					Ok(existing)
+				}
+			}
+	}
+}
+
 /// 打开 *path*, 成功时返回节点下标。
 ///
 /// 未命中且 *flags* 含 [`O_CREAT`] 时按 *mode* 创建: 同时含 [`O_DIRECTORY`] 时创建目录,
@@ -528,35 +580,7 @@ pub fn inject_file(path: &[u8], data: &[u8]) -> bool {
 /// [`O_TRUNC`] 且要求写入访问且它是文件时截断到 0 字节。
 pub fn open(path: &[u8], flags: u32, mode: u32) -> Result<i16, VfsStatus> {
 	let mut fs = VFS.lock();
-	let node = match split_target(&mut fs, path)? {
-		// 最后一个名字只指代目录: O_CREAT 与 O_EXCL 判为已存在
-		PathTarget::Dir(dir, _) => {
-			if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
-				return Err(VfsStatus::Exists);
-			}
-			dir
-		}
-		PathTarget::Child(dir, name) =>
-			match find_child(&fs, dir, name) {
-				NIL => {
-					if (flags & O_CREAT) == 0 {
-						return Err(VfsStatus::NoEntry);
-					}
-					let kind = if (flags & O_DIRECTORY) != 0 { VFS_KIND_DIR } else { VFS_KIND_FILE };
-					let created = create_child(&mut fs, dir, name, kind, mode);
-					if created == NIL {
-						return Err(VfsStatus::NoMemory);
-					}
-					created
-				}
-				existing => {
-					if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
-						return Err(VfsStatus::Exists);
-					}
-					existing
-				}
-			}
-	};
+	let node = open_node(&mut fs, path, flags, mode)?;
 	// 最后一个名字所指节点的类别决定可用的访问方向与 O_DIRECTORY 是否成立
 	let kind = fs.nodes[node as usize].kind;
 	if kind == VFS_KIND_DIR {
@@ -662,7 +686,12 @@ pub fn truncate(node: i16, len: u64) -> VfsStatus {
 /// 节点不是目录时返回 [`NotDir`](VfsStatus::NotDir)。下标无效时返回
 /// [`Invalid`](VfsStatus::Invalid); 缓冲区容纳不下一个条目时同样返回 [`Invalid`], 使调用方
 /// 能够区分目录已读完与缓冲区过小。
-pub fn getdents(node: i16, pos: &mut u64, buf: *mut u8, count: u64) -> Result<u64, VfsStatus> {
+pub fn getdents(
+	node: i16,
+	pos: &mut u64,
+	buf: *mut u8,
+	count: u64
+) -> Result<u64, VfsStatus> {
 	if !is_node_valid(node) {
 		return Err(VfsStatus::Invalid);
 	}
@@ -807,10 +836,6 @@ pub fn access(path: &[u8]) -> VfsStatus {
 	}
 }
 
-// ---------------------------------------------------------------
-//  测试
-// ---------------------------------------------------------------
-
 #[cfg(test)]
 pub(crate) mod tests {
 	use std::sync::{ Mutex, MutexGuard };
@@ -886,7 +911,12 @@ pub(crate) mod tests {
 
 	/// 断言状态码等于 *expect*; 状态枚举不实现 `Debug`, 故按编码比较。
 	fn assert_status(got: VfsStatus, expect: VfsStatus) {
-		assert!((got as u32) == (expect as u32), "期望状态码 {}, 实际 {}", expect as u32, got as u32);
+		assert!(
+			(got as u32) == (expect as u32),
+			"期望状态码 {}, 实际 {}",
+			expect as u32,
+			got as u32
+		);
 	}
 
 	/// 建一个文件并返回其节点下标。
@@ -905,7 +935,11 @@ pub(crate) mod tests {
 	fn read_all(node: i16) -> Vec<u8> {
 		let size = stat_of(node).size as u64;
 		let mut buf = vec![0u8; size as usize];
-		assert_eq!(ok_written(read(node, 0, buf.as_mut_ptr(), size)), size, "未读到全部数据");
+		assert_eq!(
+			ok_written(read(node, 0, buf.as_mut_ptr(), size)),
+			size,
+			"未读到全部数据"
+		);
 		buf
 	}
 
@@ -931,8 +965,12 @@ pub(crate) mod tests {
 		while at < buf.len() {
 			let base = buf.as_ptr();
 			let ino = unsafe { core::ptr::read_unaligned(base.add(at) as *const u64) };
-			let off = unsafe { core::ptr::read_unaligned(base.add(at + 8) as *const i64) };
-			let reclen = unsafe { core::ptr::read_unaligned(base.add(at + 16) as *const u16) };
+			let off = unsafe {
+				core::ptr::read_unaligned(base.add(at + 8) as *const i64)
+			};
+			let reclen = unsafe {
+				core::ptr::read_unaligned(base.add(at + 16) as *const u16)
+			};
 			let dtype = buf[at + 18];
 			assert!((reclen as usize) >= 20, "目录项长度放不下名称");
 			assert!((reclen as usize) % 8 == 0, "目录项长度未按 8 字节对齐");
@@ -1053,7 +1091,12 @@ pub(crate) mod tests {
 		assert!(matches!(open(b"/x", O_RDONLY, 0), Err(VfsStatus::NoEntry)));
 		let created = ok_node(open(b"/x", O_CREAT | O_RDWR, 0o640));
 		assert_eq!(stat_of(created).mode, 0o640);
-		assert!(matches!(open(b"/x", O_CREAT | O_EXCL | O_RDWR, 0o644), Err(VfsStatus::Exists)));
+		assert!(
+			matches!(
+				open(b"/x", O_CREAT | O_EXCL | O_RDWR, 0o644),
+				Err(VfsStatus::Exists)
+			)
+		);
 		assert_eq!(ok_node(open(b"/x", O_CREAT | O_RDWR, 0o644)), created);
 
 		assert!(
@@ -1113,7 +1156,11 @@ pub(crate) mod tests {
 		assert_eq!(stat_of(node).size, 8, "覆盖写不改变文件长度");
 		assert_eq!(read_all(node), b"abXYefgh");
 
-		assert_eq!(ok_written(write(node, 0, buf.as_ptr(), 0)), 0, "长度为 0 的写入不改变文件");
+		assert_eq!(
+			ok_written(write(node, 0, buf.as_ptr(), 0)),
+			0,
+			"长度为 0 的写入不改变文件"
+		);
 		assert_eq!(stat_of(node).size, 8);
 	}
 
@@ -1158,7 +1205,12 @@ pub(crate) mod tests {
 		let node = create_file(b"/f");
 
 		let mut data = vec![0x5au8; DATA_ARENA + 1];
-		assert!(matches!(write(node, 0, data.as_ptr(), data.len() as u64), Err(VfsStatus::NoSpace)));
+		assert!(
+			matches!(
+				write(node, 0, data.as_ptr(), data.len() as u64),
+				Err(VfsStatus::NoSpace)
+			)
+		);
 		assert_eq!(stat_of(node).size, 0, "被拒的写入不改变文件");
 
 		data.truncate(DATA_ARENA);
@@ -1175,7 +1227,9 @@ pub(crate) mod tests {
 		let node = create_file(b"/f");
 		assert_eq!(ok_written(write(node, 0, b"head".as_ptr(), 4)), 4);
 
-		assert!(matches!(write(node, u64::MAX, b"x".as_ptr(), 1), Err(VfsStatus::NoSpace)));
+		assert!(
+			matches!(write(node, u64::MAX, b"x".as_ptr(), 1), Err(VfsStatus::NoSpace))
+		);
 		assert_eq!(stat_of(node).size, 4, "被拒的写入不改变文件");
 		assert_eq!(read_all(node), b"head");
 	}
@@ -1324,8 +1378,12 @@ pub(crate) mod tests {
 		let mut buf = [0u8; 64];
 		let mut pos = 0u64;
 		// "." 的条目长 24 字节, 23 字节与 0 字节都容纳不下
-		assert!(matches!(getdents(d, &mut pos, buf.as_mut_ptr(), 23), Err(VfsStatus::Invalid)));
-		assert!(matches!(getdents(d, &mut pos, buf.as_mut_ptr(), 0), Err(VfsStatus::Invalid)));
+		assert!(
+			matches!(getdents(d, &mut pos, buf.as_mut_ptr(), 23), Err(VfsStatus::Invalid))
+		);
+		assert!(
+			matches!(getdents(d, &mut pos, buf.as_mut_ptr(), 0), Err(VfsStatus::Invalid))
+		);
 		assert_eq!(pos, 0, "未写入任何条目时读取位置不推进");
 		// 刚好容纳一个条目
 		assert_eq!(ok_written(getdents(d, &mut pos, buf.as_mut_ptr(), 24)), 24);
@@ -1340,8 +1398,18 @@ pub(crate) mod tests {
 		let mut buf = [0u8; 64];
 		let mut pos = 0u64;
 
-		assert!(matches!(getdents(node, &mut pos, buf.as_mut_ptr(), 64), Err(VfsStatus::NotDir)));
-		assert!(matches!(getdents(-1, &mut pos, buf.as_mut_ptr(), 64), Err(VfsStatus::Invalid)));
+		assert!(
+			matches!(
+				getdents(node, &mut pos, buf.as_mut_ptr(), 64),
+				Err(VfsStatus::NotDir)
+			)
+		);
+		assert!(
+			matches!(
+				getdents(-1, &mut pos, buf.as_mut_ptr(), 64),
+				Err(VfsStatus::Invalid)
+			)
+		);
 		assert_eq!(pos, 0);
 	}
 
@@ -1441,7 +1509,10 @@ pub(crate) mod tests {
 			.collect();
 		assert_eq!(names.len(), 4, "两个文件与两项自身");
 		names.sort();
-		assert_eq!(names, vec![b".".to_vec(), b"..".to_vec(), b"f1".to_vec(), b"f3".to_vec()]);
+		assert_eq!(
+			names,
+			vec![b".".to_vec(), b"..".to_vec(), b"f1".to_vec(), b"f3".to_vec()]
+		);
 		assert!(matches!(resolve_path(b"/d/f2"), Err(VfsStatus::NoEntry)));
 
 		let mut st = VfsStat::zero();
@@ -1471,7 +1542,12 @@ pub(crate) mod tests {
 			let path = format!("/n{i}");
 			ok_node(open(path.as_bytes(), O_CREAT | O_RDWR, 0o644));
 		}
-		assert!(matches!(open(b"/overflow", O_CREAT | O_RDWR, 0o644), Err(VfsStatus::NoMemory)));
+		assert!(
+			matches!(
+				open(b"/overflow", O_CREAT | O_RDWR, 0o644),
+				Err(VfsStatus::NoMemory)
+			)
+		);
 		assert_status(mkdir(b"/overflow_dir", 0o755), VfsStatus::NoMemory);
 		assert!(!inject_file(b"/overflow_file", b"x"));
 

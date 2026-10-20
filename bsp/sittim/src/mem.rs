@@ -1,4 +1,4 @@
-//! 页池分配器与内存管理。紧跟 ref-emod memory.c + page_pool.c 逻辑。
+//! 页池分配器与内存管理。 memory.c + page_pool.c 逻辑。
 //!
 //! 设计要点：
 //! - 用相对偏移量而非绝对地址，方便日后迁移。
@@ -57,19 +57,19 @@ pub fn alloc_smode_page(n: u64) -> u64 {
 	pa
 }
 
-/// S-mode 页池分配 (不挂起): 池耗尽返回 `!0u64`, 由调用方决定向上报错还是视为致命。
+/// S-mode 页池分配: 池耗尽返回 `!0u64`, 由调用方决定向上报错还是视为致命。
 ///
 /// 载荷可控的路径 (brk / mmap 触发的页表扩容) 必须走本函数: 这些请求不得让
 /// 可信管理程序自身停止服务, 否则载荷一次越界的内存请求即可使整个飞地失联,
-/// 对宿主表现为 (suspended), 与载荷仍在计算无法区分。
+/// 对宿主表现为, 与载荷仍在计算无法区分。
 #[inline]
 pub fn try_alloc_smode_page(n: u64) -> u64 {
 	pool_alloc(n)
 }
 
 /// 向 M 模式申请一段可容纳 `pages` 个 4 KiB 页的连续分区, 分区类别取 `attr`
-/// (取值见 `ENCLAVE_MEM_ATTR_*`)。返回该段分区的物理基址, 池中无足够的连续分区时
-/// 返回 `!0u64`, 此时不占用任何分区。
+/// 正常返回该段分区的物理基址, 池中无足够的连续分区时
+/// 否则返回 `!0u64`, 此时不占用任何分区。
 ///
 /// 供需要把整段虚拟区间落在连续物理区的调用方使用: 一次申请即保证区间内各处连续,
 /// 不必逐页申请再拼接。分区数向上取整到 2 MiB, 故所得区间不小于请求的字节数。
@@ -268,7 +268,7 @@ pub fn alloc_map_umode_stack(argv_pa: u64) -> u64 {
 
 /// 将用户 argv 从 PA 映射到 U-mode VA。
 ///
-/// argv 数据 (argc 个指针与各字符串含结尾 null) 落在 argv 分区的首个 4 KiB 页内, 故只
+/// argv 数据位于 argv 分区的首个 4 KiB 页内, 故只
 /// 映射这一个页; M 模式在 ENTER 时已核对总字节数不超过 `PAGE_SIZE`。各指针改写为
 /// 页内偏移与栈顶 VA 之和, 与线性映射视图中的字符串一一对应。
 pub fn map_user_argv(argv_pa: u64, argc: u64) {
@@ -303,6 +303,9 @@ pub fn map_user_argv(argv_pa: u64, argc: u64) {
 ///
 /// 取得的分区类别由 `flags` 的可执行位决定 (见 [`attr_of_pte_flags`])。
 pub fn grow_umode_va(from: u64, to: u64, flags: u64) -> u64 {
+	// 用户空间的映射止于 UMODE_VA_LIMIT: 越界的块与低半区共用根表项, 建立映射会改写
+	// 另一个 VA 的页表项。上界之下按块推进, 故返回的上界可能略低于请求的上界。
+	let to = if to > UMODE_VA_LIMIT { UMODE_VA_LIMIT } else { to };
 	let mut va = from;
 	let attr = attr_of_pte_flags(flags);
 
@@ -348,6 +351,9 @@ pub fn attr_of_pte_flags(flags: u64) -> u64 {
 /// 指令类映射的物理区先按数据类申请并映射为可写, 供调用方写入内容; 写入完成后由
 /// 调用方把分区改判为指令类, 并把叶子项恢复为 `flags`。
 pub fn map_umode_pages(va: u64, pages: u64, flags: u64) -> bool {
+	if !is_umode_page_range(va, pages) {
+		return false;
+	}
 	let pa = alloc_adjacent_pages(pages, ENCLAVE_MEM_ATTR_DATA);
 	if pa == !0u64 {
 		return false;
@@ -365,6 +371,9 @@ pub fn map_umode_pages(va: u64, pages: u64, flags: u64) -> bool {
 /// 供 mremap 搬移共享映射使用: 共享映射的目的区间必须与源区间共用物理页, 逐字节
 /// 复制会使两个地址各自持有副本, 与共享语义相反。源区间有未映射的页时返回 false。
 pub fn alias_umode_pages(src_va: u64, dst_va: u64, pages: u64, flags: u64) -> bool {
+	if !is_umode_page_range(dst_va, pages) {
+		return false;
+	}
 	for i in 0..pages {
 		let Some(pa) = paging::get_pa(src_va + i * PAGE_SIZE) else {
 			return false;
@@ -412,6 +421,36 @@ fn mmap_region_end() -> u64 {
 	mmap_page_va(context::ctx().umode_mmap_pages_used)
 }
 
+/// mmap 匿名映射区可交付的页数: 自 UMODE_MMAP_BASE 起至用户空间上界。
+const MMAP_REGION_PAGES: u64 = (UMODE_VA_LIMIT - UMODE_MMAP_BASE) >> PAGE_SHIFT;
+
+/// 虚拟地址区间 [start, start + bytes) 是否整体落在用户空间内。
+///
+/// Sv39 按 VPN 的 9 位字段查表, 不小于 `UMODE_VA_LIMIT` 的 VA 与低半区的某个 VA 共用
+/// 同一组页表项, 在该区间建立映射会改写另一个 VA 的页表项。上方溢出同样视为越界。
+pub fn is_umode_va_range(start: u64, bytes: u64) -> bool {
+	match start.checked_add(bytes) {
+		Some(end) => end <= UMODE_VA_LIMIT,
+		None => false,
+	}
+}
+
+/// 自 *st_va* 起 *page_num* 个 4 KiB 页是否整体落在用户空间内。
+fn is_umode_page_range(st_va: u64, page_num: u64) -> bool {
+	let Some(bytes) = page_num.checked_mul(PAGE_SIZE) else {
+		return false;
+	};
+	page_num != 0 && is_umode_va_range(st_va, bytes)
+}
+
+/// 自页计数 *st_page* 起 *page_num* 个 4 KiB 页是否仍在 mmap 映射区内。
+fn is_mmap_pages_in_region(st_page: u64, page_num: u64) -> bool {
+	match st_page.checked_add(page_num) {
+		Some(end) => end <= MMAP_REGION_PAGES,
+		None => false,
+	}
+}
+
 /// 从 mmap 匿名映射区取一段 VA 并建成映射, 返回起始 VA; 失败返回 0。
 ///
 /// 映射区按 4 KiB 页计数推进 (umode_mmap_pages_used), 映射 VA 与块边界都由该
@@ -422,10 +461,12 @@ fn mmap_region_end() -> u64 {
 /// 数据类的请求可与其他数据类请求共用同一块的后备物理内存: 一个 2 MiB 块最多拆成
 /// 512 次 4 KiB 页使用。指令类的请求整块独占, 不参与块内切分, 见下。
 pub fn take_mmap_region(bytes: u64, pte_flags: u64) -> u64 {
-	let pages = align_up(bytes, PAGE_SIZE) >> PAGE_SHIFT;
-	if pages == 0 {
+	// 长度不小于用户空间上界时, 按页与按块的取整都会向上溢出而出小值, 后续算式因此
+	// 接受一个远大于映射区的区间。提前拒绝使算式只在无溢出的区间内求值。
+	if bytes == 0 || bytes > UMODE_VA_LIMIT {
 		return 0;
 	}
+	let pages = align_up(bytes, PAGE_SIZE) >> PAGE_SHIFT;
 
 	// 指令类的请求整块独占, 不参与块内切分: 交付的物理区随后整块改判为指令类,
 	// 块内若有其它映射会随之失去原有权限。物理区按数据类取得并映射为可写, 供调用方
@@ -433,6 +474,9 @@ pub fn take_mmap_region(bytes: u64, pte_flags: u64) -> u64 {
 	if attr_of_pte_flags(pte_flags) == ENCLAVE_MEM_ATTR_INSTR {
 		let aligned = align_up(context::ctx().umode_mmap_pages_used, CHUNK_2M_PAGES);
 		let blocks = align_up(pages * PAGE_SIZE, CHUNK_2M_SIZE) >> CHUNK_2M_SHIFT;
+		if !is_mmap_pages_in_region(aligned, blocks * CHUNK_2M_PAGES) {
+			return 0;
+		}
 		let va = mmap_page_va(aligned);
 		let pa = alloc_adjacent_pages(blocks * CHUNK_2M_PAGES, ENCLAVE_MEM_ATTR_DATA);
 		if pa == !0u64 {
@@ -443,7 +487,7 @@ pub fn take_mmap_region(bytes: u64, pte_flags: u64) -> u64 {
 		}
 		// 已交付页计数越过块边界, 原正在切分的块不再交付, 其后备物理内存随之作废。
 		context::ctx_mut().umode_curr_mmap_pa = 0;
-		context::ctx_mut().umode_mmap_pages_used = aligned + (blocks << CHUNK_2M_SHIFT);
+		context::ctx_mut().umode_mmap_pages_used = aligned + blocks * CHUNK_2M_PAGES;
 		return va;
 	}
 
@@ -452,12 +496,11 @@ pub fn take_mmap_region(bytes: u64, pte_flags: u64) -> u64 {
 		// 块内不能再落 4 KiB 页, 故页计数不在块边界时先推进到块边界, 当前块的余量
 		// 作废 (只损失地址空间, 无物理代价)。
 		let used = context::ctx().umode_mmap_pages_used;
-		let aligned = if (used & (CHUNK_2M_PAGES - 1)) != 0 {
-			((used >> CHUNK_2M_SHIFT) + 1) << CHUNK_2M_SHIFT
-		} else {
-			used
-		};
+		let aligned = align_up(used, CHUNK_2M_PAGES);
 		let blocks = align_up(pages * PAGE_SIZE, CHUNK_2M_SIZE) >> CHUNK_2M_SHIFT;
+		if !is_mmap_pages_in_region(aligned, blocks * CHUNK_2M_PAGES) {
+			return 0;
+		}
 		let va = mmap_page_va(aligned);
 		let end = va + blocks * CHUNK_2M_SIZE;
 		if grow_umode_va(va, end, pte_flags) < end {
@@ -466,11 +509,14 @@ pub fn take_mmap_region(bytes: u64, pte_flags: u64) -> u64 {
 		// 交付之后的页计数落在块边界, 正在切分的块不再被交付, 其后的不足一块的请求
 		// 另行取得后备内存。
 		context::ctx_mut().umode_curr_mmap_pa = 0;
-		context::ctx_mut().umode_mmap_pages_used = aligned + (blocks << CHUNK_2M_SHIFT);
+		context::ctx_mut().umode_mmap_pages_used = aligned + blocks * CHUNK_2M_PAGES;
 		return va;
 	}
 
 	// 不足一整块: 在块内按 4 KiB 页交付, 页计数每跨过块边界就为新的块取后备内存。
+	if !is_mmap_pages_in_region(context::ctx().umode_mmap_pages_used, pages) {
+		return 0;
+	}
 	let va = mmap_region_end();
 	let mut done = 0u64;
 	// 正在切分的块的后备物理内存基址。交付失败时该值不写回, 使它始终描述末页所在的
@@ -557,8 +603,16 @@ fn is_mmap_grow_in_place_allowed(old_end: u64, new_end: u64) -> bool {
 /// 之后, 同一块内的后继映射也满足「末页已映射」这一较弱的条件, 按它扩容会覆盖后继
 /// 映射。mremap 不带 prot, 新增页沿用原映射末页的权限位。
 pub fn grow_mmap_in_place(addr: u64, old_size: u64, new_size: u64) -> bool {
-	let old_end = align_up(addr + old_size, PAGE_SIZE);
-	let new_end = align_up(addr + new_size, PAGE_SIZE);
+	// 末址越过用户空间上界, 或两者的加法向上溢出时, 页计数与块边界都不再成立。
+	let (Some(old_raw), Some(new_raw)) = (addr.checked_add(old_size), addr.checked_add(new_size))
+	else {
+		return false;
+	};
+	if new_raw > UMODE_VA_LIMIT {
+		return false;
+	}
+	let old_end = align_up(old_raw, PAGE_SIZE);
+	let new_end = align_up(new_raw, PAGE_SIZE);
 
 	// 收缩: 只回退页计数, 页表项与物理内存保留 (与 munmap 一致, 不回收物理页)。
 	if new_end <= old_end {
@@ -598,6 +652,10 @@ pub fn sys_brk_handler(new_brk: u64) -> u64 {
 	let old_top = context::ctx().umode_heap_top;
 	if new_brk == 0 {
 		return old_top; // 仅查询
+	}
+	// 越过用户空间上界的堆顶无法建立映射, 按增长失败返回旧值。
+	if new_brk > UMODE_VA_LIMIT {
+		return old_top;
 	}
 
 	if new_brk <= old_top {
@@ -660,9 +718,7 @@ pub fn check_img_layout(
 	Ok(())
 }
 
-// ---------------------------------------------------------------
-//  测试
-// ---------------------------------------------------------------
+
 
 #[cfg(test)]
 mod tests {

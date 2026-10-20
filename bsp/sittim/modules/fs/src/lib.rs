@@ -41,13 +41,18 @@ mod table;
 use core::mem::MaybeUninit;
 
 use abi::{
-	GetterFn, InitFn, ModuleDesc, ModuleInterface, SyscallTable, MODULE_NAME_LEN,
+	GetterFn,
+	InitFn,
+	ModuleDesc,
+	ModuleInterface,
+	SyscallTable,
+	MODULE_NAME_LEN,
 	SYSCALL_TABLE_LEN,
 };
 use man::Manager;
 use vfs_ops::VfsOps;
 
-/// 模块编号, 与 ref-impl/emod 的 `EMODULE_ID_VFS` 取同一值。
+/// 模块编号。
 const MODULE_ID: u32 = 3;
 
 /// 模块名, 不足 [`MODULE_NAME_LEN`] 的部分以 0 填充。
@@ -76,7 +81,9 @@ static mut OPS: MaybeUninit<VfsOps> = MaybeUninit::uninit();
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.init")]
 pub unsafe extern "C" fn module_init(_manager: *const Manager) -> GetterFn {
-	unsafe { core::ptr::addr_of_mut!(OPS).cast::<VfsOps>().write(table::fill_ops()) };
+	unsafe {
+		(&raw mut OPS).cast::<VfsOps>().write(table::fill_ops());
+	}
 	get_interface
 }
 
@@ -92,7 +99,7 @@ unsafe extern "C" fn get_interface(_manager: *const Manager) -> ModuleInterface 
 			signature: 0,
 		},
 		syscalls: &raw const SYSCALLS,
-		ops: core::ptr::addr_of!(OPS).cast::<u8>(),
+		ops: (&raw const OPS).cast::<u8>(),
 	}
 }
 

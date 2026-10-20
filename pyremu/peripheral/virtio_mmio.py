@@ -263,16 +263,17 @@ class VirtQueue:
 class VirtioMMIO:
     """virtio-mmio 寄存器堆、队列调度与中断状态.
 
-    宿主设备类持有本对象, 并把 Device 接口的读写委托给它。设备语义经三个回调给出:
+    宿主设备类持有本对象, 并把 Device 接口的读写委托给它。本对象不保存任何指向宿主
+    设备的引用: 设备持有本对象, 本对象若再持有设备的绑定方法, 二者互相持有, 该环使
+    设备及其持有的主存不经引用计数释放。设备侧的四项分工因此改为传数据、传当次调用的
+    函数, 或由设备自行处理:
 
-    - config_read: 读 0x100 起的设备特定配置空间, 参数为配置空间内的偏移;
-    - handle_request: 处理一个描述符链, 参数为队列与该描述符链,
-      返回 (是否成功, 记入 used ring 的写入字节数);
-    - on_irq: 中断线电平变化, 参数为真表示拉高、假表示拉低。
-
-    另有一个可选回调 on_notify: 队列通知先交设备, 返回真表示设备已自行处理该队列,
-    传输层不再走通用遍历。接收方向的队列由设备在帧到达时主动填充缓冲区, 不能按通用
-    遍历消费驱动挂上的可用项, 故留出这个缺口。不给该回调时行为与单队列块设备一致。
+    - 配置空间: 0x000 至 0x0ff 由本对象解码; 0x100 起为设备特定配置空间, 其字节映像由
+      设备在构造时给出并存于 cfg_space_data 属性, 设备自身的配置发生变化时由设备
+      改写该属性;
+    - QueueNotify: 由设备在自己的 write 中处理, 本对象对该寄存器不做动作;
+    - 请求处理: 设备在每次 process_queue 调用时传入处理描述符链的函数;
+    - 中断: 中断投递目标与中断源号在构造时给出, 二者都不指向宿主设备。
 
     Usage::
 
@@ -283,9 +284,8 @@ class VirtioMMIO:
             queue_num_max=256,
             mem_read=bus.read,
             mem_write=bus.write,
-            config_read=dev.config_read,
-            handle_request=dev.handle_request,
-            on_irq=dev.set_irq_level,
+            irq=VIRTIO_BLK_IRQ,
+            on_irq=irq_sink,
         )
     """
 
@@ -298,25 +298,22 @@ class VirtioMMIO:
         queue_num_max: int,
         mem_read: Callable[[int, int], bytes],
         mem_write: Callable[[int, bytes], None],
-        config_read: Callable[[int], int],
-        handle_request: Callable[[VirtQueue, list[VirtqDesc]], tuple[bool, int]],
-        on_irq: Callable[[bool], None],
+        irq: int = 0,
+        on_irq: Callable[[int, bool], None] | None = None,
+        cfg_space_data: bytes = b"",
         chain_max_desc: int = 64,
-        on_notify: Callable[[int], bool] | None = None,
     ) -> None:
         # 单条请求允许的最大描述符数, 设备可据此限制链长
         self.chain_max_desc = chain_max_desc
-        # 可选: 队列通知先交设备处理. 返回真表示设备已自行处理该队列,
-        # 传输层不再走通用遍历. 接收方向的队列由设备在帧到达时主动填充,
-        # 不能按通用遍历消费驱动挂上的缓冲区, 故需要这个缺口.
-        self._on_notify = on_notify
         self.device_id = device_id
         self.device_features = device_features
         self.queue_num_max = queue_num_max
+        # 0x100 起的设备特定配置空间, 按字节寻址
+        self.cfg_space_data = cfg_space_data
         self._mem_read = mem_read
         self._mem_write = mem_write
-        self._config_read = config_read
-        self._handle_request = handle_request
+        # 中断源号为 0 或未给出中断投递目标时, 电平变化不投递
+        self._irq = irq
         self._on_irq = on_irq
 
         self.queues = [
@@ -335,9 +332,9 @@ class VirtioMMIO:
     def read(self, offset: int, size: int) -> bytes:
         if size not in (1, 2, 4, 8):
             return b"\x00" * size
-        # 读取宽度小于 4 字节时只取低位: 配置空间按字节映像返回以该偏移为起始的小端字
-        # (见 _config_read), 高出本次读取宽度的字节不属于本次读。驱动读 MAC 这类起始
-        # 偏移不保证 4 字节对齐的字段时按单字节读, 不截位会在该处溢出。
+        # 读取宽度小于 4 字节时只取低位: 配置空间按字节映像返回以该偏移为起始的小端字,
+        # 高出本次读取宽度的字节不属于本次读。驱动读 MAC 这类起始偏移不保证 4 字节对齐的
+        # 字段时按单字节读, 不截位会在该处溢出。
         val = self.mmio_read(offset) & ((1 << (size * 8)) - 1)
         return val.to_bytes(size, "little")
 
@@ -384,7 +381,12 @@ class VirtioMMIO:
             return self.status
 
         if offset >= VIRTIO_MMIO_CONFIG_OFFSET:
-            return self._config_read(offset - VIRTIO_MMIO_CONFIG_OFFSET)
+            # 配置空间按字节寻址: 取以该偏移为起始的 4 字节小端字. 进入本分支时 offset 不小于
+            # VIRTIO_MMIO_CONFIG_OFFSET, 故 local 非负; 切片越出映像末尾时只取到实际存在的
+            # 字节, 不足 4 字节的部分由 ljust 补 0
+            local = offset - VIRTIO_MMIO_CONFIG_OFFSET
+            word = self.cfg_space_data[local : local + 4].ljust(4, b"\x00")
+            return int.from_bytes(word, "little")
 
         # 未实现的寄存器, 返回 0
         return 0
@@ -392,7 +394,7 @@ class VirtioMMIO:
     # ---- MMIO 写 ----
 
     def mmio_write(self, offset: int, val: int, size: int) -> None:
-        """写入 MMIO 寄存器."""
+        """写入 MMIO 寄存器. QueueNotify 由设备处理, 本方法对该寄存器不做动作."""
         if offset == VIRTIO_MMIO_DEVICE_FEATURES_SEL:
             self.device_features_sel = val
 
@@ -417,12 +419,6 @@ class VirtioMMIO:
             queue.ready = val != 0
             if queue.ready:
                 queue.last_avail_idx = 0
-
-        elif offset == VIRTIO_MMIO_QUEUE_NOTIFY:
-            queue = self.queue_at(val)
-            if queue is not None and queue.ready and \
-            (self._on_notify is None or not self._on_notify(queue.index)):
-                self.process_queue(queue.index)
 
         elif offset == VIRTIO_MMIO_INTERRUPT_ACK:
             self.interrupt_status &= ~val
@@ -466,11 +462,18 @@ class VirtioMMIO:
 
     # ---- 队列调度 ----
 
-    def process_queue(self, index: int, max_descriptors: int = 0) -> bool:
+    def process_queue(
+        self,
+        index: int,
+        handle_request: Callable[[VirtQueue, list[VirtqDesc]], tuple[bool, int]],
+        max_descriptors: int = 0,
+    ) -> bool:
         """处理第 *index* 条队列中待处理的请求.
 
         Args:
             index: 队列索引.
+            handle_request: 处理一个描述符链的函数, 参数为队列与该描述符链,
+                返回 (是否成功, 记入 used ring 的写入字节数).
             max_descriptors: 单次最多处理的描述符链数, 0 表示不限制。
 
         Returns:
@@ -488,7 +491,7 @@ class VirtioMMIO:
                 break
 
             desc_head = queue.avail_head(queue.last_avail_idx)
-            ok, written = self._process_chain(queue, desc_head)
+            ok, written = self._process_chain(queue, desc_head, handle_request)
             if not ok:
                 # 单个请求失败不影响后续请求的处理
                 pass
@@ -504,23 +507,33 @@ class VirtioMMIO:
 
         return queue.last_avail_idx != avail_idx  # 仍有未处理? 调用方需再次调用
 
-    def _process_chain(self, queue: VirtQueue, desc_head: int) -> tuple[bool, int]:
+    def _process_chain(
+        self,
+        queue: VirtQueue,
+        desc_head: int,
+        handle_request: Callable[[VirtQueue, list[VirtqDesc]], tuple[bool, int]],
+    ) -> tuple[bool, int]:
         """取出一个描述符链并交给设备处理. 链不可解析时按失败计入 used ring."""
         chain = queue.descriptor_chain(desc_head, self.chain_max_desc)
         if chain is None:
             return False, 0
-        return self._handle_request(queue, chain)
+        return handle_request(queue, chain)
 
     # ---- 中断 ----
 
     def raise_irq(self) -> None:
         """向中断控制器拉高本设备中断源."""
-        self._on_irq(True)
+        self._set_irq_level(True)
 
     def lower_irq_if_idle(self) -> None:
         """中断已被确认且无残留状态位时, 拉低中断源."""
         if self.interrupt_status == 0:
-            self._on_irq(False)
+            self._set_irq_level(False)
+
+    def _set_irq_level(self, level: bool) -> None:
+        """按电平向中断控制器投递本设备中断源. 中断源号为 0 或未给出投递目标时不做动作."""
+        if self._on_irq is not None and self._irq:
+            self._on_irq(self._irq, level)
 
     # ---- 重置 ----
 

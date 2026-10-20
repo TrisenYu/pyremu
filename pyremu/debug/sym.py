@@ -148,7 +148,7 @@ class SymbolMixin(SharedMixinAttrs):
         hart = self.hart
         if hart.mmu_mode == 0:
             return mask64((va_like + self._sym_load_offset))
-        ok, pa = translate_addr(hart, va_like)
+        ok, pa = translate_addr(hart, va_like, is_hart_access=False)
         return pa if ok else va_like
 
     def _sym_lookup_name(self, addr: int) -> str | None:

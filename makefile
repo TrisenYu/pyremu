@@ -53,8 +53,10 @@ $(CONFIG_GEN_RS): FORCE
 	@echo 'pub const CFG_NO_L2: bool = $(if $(filter 1,$(PYREMU_NO_L2)),true,false);' >> $@.tmp
 	@echo 'pub const CFG_AIA: bool = $(if $(filter 1,$(PYREMU_AIA)),true,false);' >> $@.tmp
 	@echo 'pub const CFG_H_EXT: bool = $(if $(filter 1,$(PYREMU_H_EXT)),true,false);' >> $@.tmp
+	@echo 'pub const CFG_HAS_SEMIHOSTING: bool = $(if $(filter 1,$(PYREMU_HAS_SEMIHOSTING)),true,false);' >> $@.tmp
 	@echo 'pub const IMSIC_M_BASE: u64 = $(IMSIC_M_BASE);' >> $@.tmp
 	@echo 'pub const IMSIC_S_BASE: u64 = $(IMSIC_S_BASE);' >> $@.tmp
+	@echo 'pub const CPU_FREQ_HZ: u64 = $(CPU_FREQ_HZ);' >> $@.tmp
 	@cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
 
 $(NATIVE_SO) $(TERMIO_SO): $(NATIVE_SRC) $(CONFIG_GEN_RS)
@@ -64,6 +66,7 @@ $(NATIVE_SO) $(TERMIO_SO): $(NATIVE_SRC) $(CONFIG_GEN_RS)
 	install -m 755 $(NATIVE_DIR)/target/release/libtermio.so $(TERMIO_SO)
 	@echo "libdecode.so and libtermio.so have built"
 
+# 加速执行库
 build-native: $(NATIVE_SO) $(TERMIO_SO)
 phony += build-native
 
@@ -76,17 +79,40 @@ FORCE:
 phony += FORCE
 
 
-# ---- Rust S-mode Runtime ----
-# 编译 sittim.bin, 供 opensbi 嵌入 .sittim 段
-$(SITTIM_BIN): $(wildcard $(SITTIM_DIR)/src/*.rs) $(wildcard $(SITTIM_DIR)/src/**/*.rs)
+# 编译 sittim.bin, 供 opensbi 嵌入 .sittim 段.
+#
+# 依赖分两类:
+#   源文件类: src 下全部 .rs; 生成 configs_gen.rs 的输入 config.mk 与 Makefile;
+#     生成 link.ld 的输入 link.ld.S; 以及 Cargo 清单. 任一文件更新即重建.
+#   编译控制类: config.mk 各项以 ?= 给出默认值, 命令行上的同名变量经递归 make 传给
+#     子 make 并覆盖默认值. 这一来源不改变任何文件的时间戳, 故以一份取值戳记判定,
+#     写法与 FW_CFG_STAMP 相同; 不在 config.mk 内、但经命令行覆盖即改变编译结果的
+#     变量一并列入戳记.
+#
+# 取值得在父 make 中可见才能写入戳记, 故一并读入该配置文件; 各项以 ?= 给出默认值,
+# 命令行覆盖优先生效.
+include $(SITTIM_DIR)/config.mk
+SITTIM_CFG_VARS := $(shell sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)[[:space:]]*?=.*/\1/p' $(SITTIM_DIR)/config.mk)
+SITTIM_CFG_VARS += CARGO_FLAGS
+SITTIM_CFG_STAMP = $(bins_dir)/sittim_cfg.stamp
+$(SITTIM_CFG_STAMP): FORCE
+	@mkdir -p $(bins_dir)
+	@printf '%s\n' $(foreach v,$(SITTIM_CFG_VARS),$(v)=$($(v))) > $@.tmp
+	@cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
+
+SITTIM_SRC_DEPS := $(shell find $(SITTIM_DIR)/src -name '*.rs' 2>/dev/null)
+SITTIM_SRC_DEPS += $(SITTIM_DIR)/config.mk $(SITTIM_DIR)/Makefile $(SITTIM_DIR)/link.ld.S
+SITTIM_SRC_DEPS += $(SITTIM_DIR)/Cargo.toml $(SITTIM_DIR)/Cargo.lock
+
+$(SITTIM_BIN): $(SITTIM_SRC_DEPS) $(SITTIM_CFG_STAMP)
 	$(MAKE) -C $(SITTIM_DIR) build
 
 build-rust: $(SITTIM_BIN)
 phony += build-rust
 
-# fw_basic_flag 变化时强制重建固件
-FW_CFG_STAMP = $(bins_dir)/fw_cfg.stamp
 
+# fw_basic_flag 变化时强制重建
+FW_CFG_STAMP = $(bins_dir)/fw_cfg.stamp
 $(FW_CFG_STAMP): FORCE
 	@mkdir -p $(bins_dir)
 	@printf '%s\n' $(fw_basic_flag) > $@.tmp
@@ -101,13 +127,7 @@ $(FW_BUILD_DIR)/fw_jump.elf: $(SITTIM_BIN) $(FW_SRC_DEPS) $(FW_CFG_STAMP)
 	$(MAKE) -C $(FW_SRC_DIR) distclean
 	$(MAKE) -C $(FW_SRC_DIR) $(FW_JUMP_FLAGS) -j$$(nproc)
 
-build-fw: $(FW_BUILD_DIR)/fw_payload.elf
-phony += build-fw
 
-build-fw-jump: $(fw_jump)
-phony += build-fw-jump
-
-# ---- 固件产物拷贝 ----
 # 将 opensbi 构建产物复制到 tests/ 目录, 供模拟器加载
 # 当构建产物比 tests/ 中的副本更新时自动触发
 $(fw_payload): $(FW_BUILD_DIR)/fw_payload.elf
@@ -117,20 +137,13 @@ $(fw_payload): $(FW_BUILD_DIR)/fw_payload.elf
 	cp $(FW_BUILD_DIR)/fw_dynamic.elf $(fw_dynamic)
 	@echo "固件已拷贝: $(fw_payload)"
 
-# fw_jump 独立拷贝规则: 仅重编 fw_jump (make build-fw-jump) 时也刷新部署副本,
-# 避免 fw_jump.elf 已更新而 build/elf/custom_opensbi_fw_jump.elf 仍旧的情况.
 $(fw_jump): $(FW_BUILD_DIR)/fw_jump.elf
 	@mkdir -p $(elf_dir)
 	cp $(FW_BUILD_DIR)/fw_jump.elf $(fw_jump)
 	@echo "固件已拷贝: $(fw_jump)"
 
-# ---- kei.sav 构建 ----
-# 依赖固件产物, 保证启动模拟器前固件已构建完成; kei.sav 本身已不再从固件 ELF 提取符号
-kei-sav: $(fw_payload)
-	$(MAKE) -C bsp/kei-boot kei-sav
-
 $(fw_payload_linux): $(SITTIM_BIN) $(FW_SRC_DEPS) $(FW_CFG_STAMP)
-	@echo "构建 opensbi + Linux 内核 payload..."
+	@echo "构建opensbi与Linux内核..."
 	$(MAKE) -C $(FW_SRC_DIR) distclean $(FW_MAKE_FLAGS) \
 		FW_PAYLOAD_PATH=$(realpath $(LINUX_IMG))
 	$(MAKE) -C $(FW_SRC_DIR) $(FW_MAKE_FLAGS) \
@@ -140,24 +153,39 @@ $(fw_payload_linux): $(SITTIM_BIN) $(FW_SRC_DEPS) $(FW_CFG_STAMP)
 	cp $(FW_BUILD_DIR)/fw_payload.bin $(fw_payload_linux:.elf=.bin)
 	@echo "copy $(fw_payload_linux) as bootstrap payload"
 
+
+build-fw: $(FW_BUILD_DIR)/fw_payload.elf
+phony += build-fw
+
+build-fw-jump: $(fw_jump)
+phony += build-fw-jump
+
+# 依赖固件产物, 保证启动模拟器前固件已构建完成
+kei-sav: $(fw_payload)
+	$(MAKE) -C bsp/kei-boot kei-sav
+
+
 build-fw-linux: $(fw_payload_linux)
 phony += build-fw-linux
 
 # ---- initramfs 打包 debootstrap 目录下生成cpio与gzip ----
-# 用 fakeroot (若可用) 保留属主与 /dev 节点。
 $(INITRAMFS):
 	@test -d $(ROOTFS_DIR) || { echo "缺少 rootfs 目录: $(ROOTFS_DIR) (先运行 debootstrap)"; exit 1; }
 	@mkdir -p $(bins_dir)
-	cd $(ROOTFS_DIR) && \
-	  if command -v fakeroot >/dev/null 2>&1; then FAKE=fakeroot; else FAKE=; echo "[warn] 无 fakeroot, 属主/设备节点可能丢失"; fi; \
-	  find . -print0 | $$FAKE cpio --null -o --format=newc 2>/dev/null | gzip -9 > $(CURDIR)/$(INITRAMFS)
+	cd $(ROOTFS_DIR) && if command -v fakeroot >/dev/null 2>&1; then \
+		FAKE=fakeroot; \
+	else \
+		FAKE=; \
+		echo "[warn] 无 fakeroot"; \
+	fi; \
+	find . -print0 | $$FAKE cpio --null -o --format=newc 2>/dev/null | \
+		gzip -9 > $(CURDIR)/$(INITRAMFS)
 	@echo "initramfs 已生成: $(INITRAMFS) ($$(du -h $(INITRAMFS) | cut -f1))"
 
 build-initramfs: $(INITRAMFS)
 phony += build-initramfs
 
 
-# ---- 设备树: 生成 DTB 并还原 DTS ----
 # 用 tools/dump_dtb.py 构造平台预设dtb二进制文件，
 # 再用 dtc 还原为人类可读的 build/emu.dts。
 gen-dtb: __pyenv-check
@@ -175,7 +203,6 @@ pkg-up: __pyenv-check
 # ---- 主入口: 启动模拟器 ----
 # 完整依赖链: Rust 编译、固件编译、拷贝、kei.sav、模拟器
 emu: kei-sav __pyenv-check
-	PYREMU_TRACE_TRAPS=1 PYREMU_TRACE_PMP=1 \
 	python -m pyremu.debugger --hart-logs=output/ $(pyargs)
 phony += emu
 
@@ -226,13 +253,13 @@ phony += test-build
 
 test: __pyenv-check test-build
 	$(MAKE) -C bsp/sittim test
-	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 uv run pytest -v -x \
-		--ignore=tests/test_multihart_diff.py
+	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 uv run pytest -v -x
 phony += test
 
 cov-test: __pyenv-check test-build
+	find pyremu tests examples -type d -name __pycache__ -prune -exec rm -rf {} +
 	ulimit -v 4194304 && PYTHONUNBUFFERED=1 PYTHON_GIL=0 uv run pytest -v -x \
-		--cov=pyremu --cov-report=term --ignore=tests/test_multihart_diff.py --full-trace
+		--cov=pyremu --cov-report=term --full-trace
 phony += cov-test
 
 .PHONY: $(phony)

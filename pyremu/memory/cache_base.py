@@ -45,8 +45,8 @@ class CacheLineBase:
     tag: int = 0
     valid: bool = False
     dirty: bool = False
-    last_access: int = 0  # 全局时钟值, LRU 替换时比较
-    mdid: int = 0  # 内存域 ID (供 TEE 飞地隔离, mfence.did 按域刷新)
+    last_access: int = 0
+    mdid: int = 0
 
 
 class CacheBase(ABC):
@@ -235,6 +235,16 @@ class CacheBase(ABC):
     @property
     def num_entries(self) -> int:
         return self._num_entries
+
+    @property
+    def hits(self) -> int:
+        """命中次数 — 查找得到有效条目 (含权限检查未通过的条目)."""
+        return self._hits
+
+    @property
+    def misses(self) -> int:
+        """未命中次数 — 查找未得到有效条目."""
+        return self._misses
 
     @property
     def hit_rate(self) -> float:

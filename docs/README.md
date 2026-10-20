@@ -6,9 +6,9 @@
 |r   | riscv/rust|
 |emu | emulator  |
 
-Pyremu 是一个用 Python (CPython 3.14) 编写的 **RISC-V 指令集模拟器与交互式调试器**，面向固件调试、TEE 开发、操作系统调试等场景。
+Pyremu 是一个用 CPython3.15.0 编写的 **RISC-V 指令集模拟器与交互式调试器**，面向固件调试、TEE 开发、操作系统调试等场景。
 
-可模拟多 hart 执行，支持 RV64 **IMAFDC** 指令扩展与 Zicsr/Zifencei/Zbb/Sstc，U/S/M 三级特权级，Sv39 虚拟内存，L2 缓存 MESI 一致性协议，以及 CLINT、PLIC、AIA (IMSIC 与 APLIC) 等中断控制器。
+可模拟多 hart 执行，支持 RV64 **IMAFDC** 指令扩展与 Zicsr/Zifencei/Zbb/Sstc，U/S/M 三级特权级，Sv39 虚拟内存，L2 缓存 MESI 一致性协议，以及 CLINT、PLIC、AIA基础的 (IMSIC 与 APLIC) 等中断控制器。
 
 ## 快速上手
 
@@ -30,8 +30,7 @@ python examples/demo_emulator.py
 make test                         # 仅运行对pyremu的测试项
 make cov-test                     # 带覆盖率的测试
 
-uv run pytest tests/              # 全部测试 (须加 --ignore=tests/test_multihart_diff.py，
-                                  # 该文件在整套运行时因共享状态而结果依赖执行顺序)
+uv run pytest tests/              # 全部测试
 uv run pytest tests/test_trap.py  # 单个套件
 uv run ruff check .               # 代码风格
 uv run ruff format .              # 自动格式化
@@ -59,40 +58,42 @@ uv run python tools/jmp_instr_counter.py  # 统计基本块终结指令的静态
 
 ```
 pyremu/
-├── emulator.py            多 hart 执行循环 (run: 并发加速执行; step: 逐指令交错, 停止条件)
+├── emulator.py            多 hart 执行循环
 ├── debugger.py            rvdb 交互式调试器入口
-├── platform.py            PlatformConfig 平台配置 (预设dataclass，一定程度支持从JSON/TOML/YAML解析得到)
+├── platform.py            PlatformConfig 平台配置，预设dataclass，一定程度支持从JSON/TOML/YAML解析得到
 ├── core/                  处理器核心: hart / decoder / trap_handler / mem_check_aux / 寄存器
-├── memory/                内存子系统: mmu (仅Sv39)/tlb/l2cache(MESI)/bus/pmp
+├── memory/                内存子系统: sv39-mmu /tlb/l2cache(MESI)/bus/pmp
 ├── peripheral/            外设: uart / virtio_mmio / virtio_blk / virtio_net / spi / i2c / gpio / watchdog / crng / termio
 ├── interrupt/             中断: controller / clint / plic / aplic / imsic / aia
-├── utils/                 工具: disassem (反汇编) / parse_bin (固件解析) / dtb (设备树)
-├── debug/                 调试器实现 (REPL 命令分发, 栈回溯, 断点)
-├── env_inject/            运行时注入 (shellcode 预加载)
-└── _native/               Rust 并发执行引擎 (libdecode.so + libtermio.so)
+├── utils/                 工具: disassem, parse_bin, dtb, mask 
+├── debug/                 调试器实现
+├── env_inject/            运行时注入
+└── _native/               Rust 并发执行引擎，以动态链接库存在{libdecode, libtermio}.so
 
 bsp/                       板级支持包
 ├── sittim/                S-mode 飞地运行时
-├── tee_aux_tools/         TEE 辅助工具源 (驱动 + /eval 评测套件)
-│   ├── linux-driver/        Linux 飞地内核驱动 (/dev/tee_enclave)
-│   ├── cache-probe-exploit/ TEE 评测套件 (缓存侧信道等, 部署为 /eval/cache-probe-exploit)
-│   └── stress-test/         TEE 压力测试套件 (部署为 /eval/stress-test)
-├── linux/                 内核源码树 (供驱动模块构建)
+├── tee_aux_tools/         辅助驱动与/eval评测套件
+│   ├── linux-driver/        Linux 飞地内核驱动/dev/tee_enclave
+│   ├── cache-probe-exploit/ TEE 评测套件，如缓存侧信道等, 部署在根文件系统中的/eval/cache-probe-exploit
+│   └── stress-test/         TEE 压力测试套件, 部署在根文件系统中的/eval/stress-test
+├── linux/                 内核源码树，**需要自己复制到这个项目**
 ├── kei-boot/              模拟器的零阶段加载器
-└── setup-rootfs/          根文件系统构建 (debootstrap + 测试程序/驱动打包)
+└── setup-rootfs/          debootstrap构建根文件系统，并打包测试程序/驱动打包
 
-fn_apps/                   飞地可信应用载荷 (Rust + C, 静态 musl 链接)
+fn_apps/                   飞地可信应用载荷
 ├── orbit/ chem/ graphene/ ising/ fem/ dsp/ linalg/   Rust 计算载荷
 ├── knots/                 C 计算载荷
-└── bin/                   构建产物 (供飞地加载)
+└── bin/ build/            构建产物
 
-tests/                     pytest 套件 + 测试源码
-├── test_*.py              单元/集成测试 (trap / mmu / pmp / tlb / clint / emulator / debugger ...)
-└── src-*/                 src-env (汇编) / src-alg (算法基准) / src-rv8 (toy, 部署为 /eval/toy-progs)
+tests/                     pytest 套件与部分测试项源码
+├── test_*{.py, ...}       单元/集成测试
+├── src-env/  
+├── src-alg/  
+└── src-rv8/                部署到根文件系统/eval/toy-progs
 
-examples/                  编程式使用示例 (纯 Python API / M->S / S->U 演示)
-docs/                      设计文档与 CHANGELOG (CHANGELOG.md 为索引, 条目按月归档于 docs/changelogs/)
-tools/                     开发辅助脚本 (设备树导出，基本块终结指令计数，性能基准插桩等)
+examples/                  编程接口使用示例
+docs/                      设计文档与 CHANGELOG
+tools/                     辅助性脚本工具
 vendor/                    第三方子模块 (musl 等)
 ```
 
@@ -106,10 +107,9 @@ rvdbg[0] step 10         # 单步 10 条指令
 rvdbg[0] regs            # 全部寄存器
 rvdbg[0] mem 0x80000000 64  # 内存 dump
 rvdbg[0] csr satp        # CSR 读写
-rvdbg[0] undo            # 快照回滚
 ```
 
-依赖 `prompt_toolkit` 提供 Tab 补全与历史记录，历史记录写入 `~/.pyremu_history`；`rich` 提供彩色格式化的命令行输出。历史文件超过 10000 行时，仅保留最近 5000 行。
+依赖 `prompt_toolkit` 提供 Tab 补全与历史记录，历史记录写入 `~/.pyremu_history`；`rich` 提供彩色格式化的命令行输出。历史文件仅保留最近 5000 行。
 
 
 ## Rust Native 并发执行引擎

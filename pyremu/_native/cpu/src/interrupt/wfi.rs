@@ -293,7 +293,7 @@ mod tests {
 			hart_threads: Cell::new(std::ptr::null()),
 			hart_states: Cell::new(std::ptr::null()),
 		};
-		let module = ModuleState::new(1, 1, 0, 0, vec![0].into_boxed_slice());
+		let module = ModuleState::new(1, 1, 0, vec![0].into_boxed_slice(), false, 0, Box::new([]));
 
 		// msip_pending=false (本 hart 无挂起 MSIP), 无定时器截止, 但 MSIP 字节的
 		// edge counter 非零. 修复后只看电平位 -> 正常退出 Some(false);
@@ -340,7 +340,7 @@ mod tests {
 		// active_hart_num=4 > wfi_count=1 -> all_in_wfi() 为 false, 本 hart 不会走
 		// all-idle 快速退出 (WFI_WAIT) 分支, 而是真正 park 等待 -> 恰好落入
 		// park_timeout 自醒路径.
-		let module = Arc::new(ModuleState::new(1, 4, 0, 0, vec![0].into_boxed_slice()));
+		let module = Arc::new(ModuleState::new(1, 4, 0, vec![0].into_boxed_slice(), false, 0, Box::new([])));
 		let module2 = Arc::clone(&module);
 		let (tx, rx) = mpsc::channel();
 

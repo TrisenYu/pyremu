@@ -1,204 +1,131 @@
-# pyremu RISC-V 启动流程
+# pyremu 启动流程
 
-> 基于 SiFive HiFive Unleashed 启动链 (ZSBL -> FSBL -> OpenSBI)
-> 最后更新: 2026-06-21
+启动链沿用 SiFive HiFive Unleashed 的分工: ZSBL -> OpenSBI -> S 模式下一阶段. 下列各点按
+执行次序给出启动期间的必要过程. 
 
-## 总体架构
+地址以默认配置为准: `ram_base = 0x8000_0000`,
+`ram_size = 128 MiB`, 固件映像保留区为 `[0x8000_0000, 0x8040_0000)`.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ pyremu Emulator (模拟 HiFive Unleashed)                  │
-│                                                          │
-│  RAM: 0x80000000 - 0x88000000 (128 MiB)                  │
-│  UART: 0x10000000 (SiFive NS16550)                       │
-│  CLINT: 0x02000000 (mtime + mtimecmp + MSIP)             │
-│                                                          │
-│  ┌─────────────────────────────────────────────────┐     │
-│  │ ZSBL stub (0x87FE0000, ~40 B)                    │     │
-│  │   -> 读 mhartid, 设 a1=DTB, 跳 FSBL               │     │
-│  ├─────────────────────────────────────────────────┤     │
-│  │ FSBL stub (0x87FE0028, ~100 B)                    │     │
-│  │   -> 置 coldboot flag, 设 mtvec,                  │     │
-│  │     patch fw_next_mode->0 (冷启动可选),            │     │
-│  │     unimp -> trap -> OpenSBI                       │     │
-│  ├─────────────────────────────────────────────────┤     │
-│  │ DTB (0x87FF0000, ~1 KB)                           │     │
-│  │   自动生成 or --fdt-file                          │     │
-│  ├─────────────────────────────────────────────────┤     │
-│  │ DTB 副本 (0x82200000)                              │     │
-│  │   fdt_get_address() 返回值                        │     │
-│  └─────────────────────────────────────────────────┘     │
-│                                                          │
-│  ┌─────────────────────────────────────────────────┐     │
-│  │ OpenSBI (0x80000000, PIE 搬迁)                    │     │
-│  │   fw_jump.elf / fw_payload.elf                    │     │
-│  │   -> fw_platform_init -> sbi_init -> init_coldboot  │     │
-│  │   -> sbi_hart_hang (WFI 空闲)                      │     │
-│  └─────────────────────────────────────────────────┘     │
-└──────────────────────────────────────────────────────────┘
-```
+## 一、模拟器初始化与上电
 
-## 启动流程 (逐步)
+1. **创建平台.** `Emulator` 按 `PlatformConfig` 创建总线、L2 缓存、CLINT、PLIC 或
+   IMSIC+APLIC、UART 等外设, 并为每个 hart 创建寄存器组、TLB 与 PMP. 每个 hart 的 PC
+   取 `prog_cnt`, 特权级取 M 模式.
 
-### 阶段 1: Emulator 初始化
+2. **加载固件.** `parse_firmware()` 解析 ELF, `Emulator.load_firmware()` 把各段写入 RAM.
+   固件链接在 `0x00000000` 基址而 RAM 起始于 `ram_base` 时, 各段写入 `vaddr + ram_base`, 同时经
+   `Bus.apply_pie_ofs()` 登记链接地址区间, 使固件按链接地址给出的取值仍指向同一批字节;
+   PC 置为映像入口地址.
 
-1. `Emulator(cfg)` — 创建 Bus, L2 缓存, CLINT, UART, harts
-2. `emu.load_firmware(image, load_offset=ram_base)` — PIE 搬迁
-3. `emu.load_dtb(addr)` — 生成 DTB 写入 RAM, 设所有 hart a1=DTB
-4. Debugger patches:
-   - `0x94`: BSS 循环 `blt` -> `j 0x98` (保留 coldboot flag)
-   - `misa = (2 << 0) | (1 << 20)` (MXL=RV64 + U-bit)
-   - DTB 副本 @ `ram_base + 0x2200000` (`fdt_get_address()`)
-5. Preloader 注入 ZSBL+FSBL stub @ `ram_base + ram_size - 128KiB`
-6. 设 PC = preload_addr -> 启动
+3. **注入 ZSBL.** 调试器把 `--preload` 指定的裸二进制注入 RAM. 该文件由
+   [bsp/kei-boot/kei.sav.S](../bsp/kei-boot/kei.sav.S) 构建, 链接基址为 0, 全部地址取
+   PC 相对寻址. 未给出 `--preload-addr` 时注入到 `ram_base + ram_size - 128 KiB`;
+   全部 hart 的 PC 置为该地址. 随后调试器把每个 hart 的 `misa` 写为 MXL=RV64|S|U,
+   使固件的特权级判定能够通过.
 
-### 阶段 2: ZSBL stub
+4. **准备设备树.** 未给出 `--no-fdt` 时, 调试器在 `ram_base + ram_size - 64 KiB` 生成
+   DTB 并写入全部 hart 的 `a1`; 另在 `ram_base + FW_PAYLOAD_FDT_OFFSET` 即
+   `0x8220_0000` 写入一份副本, 该地址是固件为下一阶段准备的 FDT 位置. 其后依次预载
+   `--kernel` 指定的内核 Image、`--initrd` 指定的 initramfs, 并按 `--disk` 启用
+   virtio-blk. 给出 `--no-fdt` 时调试器不生成也不交付 DTB, 其余初始化不变; 此时 ZSBL
+   仍执行 `lla a1, _start + 0x10000`, 在默认注入地址下 `a1` 即
+   `ram_base + ram_size - 64 KiB`, 而该处是零填充的内存. 不读取 `a1` 的裸机程序可以
+   照常运行; 本仓库的 OpenSBI 固件在该地址上读不到合法的 FDT 头, `fw_platform_init`
+   进入停机循环, 且此时串口尚未初始化, 故没有任何输出.
 
-```
-csrrs t0, mhartid, x0     # 读 hart ID
-beq   t0, zero, +12       # boot hart 跳过 WFI
-wfi                        # 非 boot hart: 等待中断
-j     -4                   # 循环
-# boot hart:
-auipc a1, ...              # a1 = DTB (PC 相对寻址)
-auipc t0, ...              # t0 = FSBL 入口
-jalr  zero, 0(t0)          # 跳 FSBL
-```
+## 二、ZSBL
 
-### 阶段 3: FSBL stub (warm)
+5. **早期设置.** ZSBL 把 `mtvec` 指向 `AL1S_HANG`, 清零自身 BSS 段.
 
-```
-# 置位 coldboot flag @ 0x800842F8
-imm64 t0, 0x800842F8
-imm64 t1, 1
-sw    t1, 0(t0)            # *(flag) = 1
+6. **处理器自检.** 依次执行加、减、乘、除、取余、逻辑、移位、比较、`jal` 与 `jalr`
+   各项检查. 任一项结果不符即跳转 `AL1S_CPU_FAIL` 后停机; 通过后进入访存自检.
 
-# 设 mtvec = OpenSBI 入口 (0x80000000)
-imm64 t0, 0x80000000
-csrrw x0, mtvec, t0
+7. **访存自检.** 读取 `RAM_BASE` 处的 8 字节. 该地址不属于任何存储区时触发访问故障,
+   经 `mtvec` 进入停机; 读取成功即通过.
 
-# a0 = mhartid, a1 = DTB
-csrrs a0, mhartid, x0
-auipc a1, ...              # DTB (PC 相对)
+8. **移交 OpenSBI.** 清零 t1 至 t6, 置 `a0 = mhartid`, `a1 = _start + 0x10000`, 即上一步
+   写入的 DTB 地址 `ram_base + ram_size - 64 KiB`, 跳转 `RAM_BASE` 处的 OpenSBI.
 
-# unimp -> trap -> mtvec -> OpenSBI
-unimp
-```
+## 三、OpenSBI 冷启动
 
-### 阶段 3': FSBL stub (cold — 额外)
+9. **选择启动 hart.** `fw_boot_hart()` 返回 -1, 表示不指定启动 hart. 各 hart 经
+   `amoswap.w` 竞争 `_boot_lottery`, 未取得者进入 `_wait_for_boot_hart`, 循环读取
+   `_boot_status`.
 
-比 warm 多一步: patch `fw_next_mode` 返回 0
+10. **Opensbi重定位.** 启动 hart 遍历 `__rela_dyn_start` 至 `__rela_dyn_end` 的
+    `R_RISCV_RELATIVE` 项, 按实际装载地址改写 GOT; 随后清零除 `ra` 与 `a0` 至 `a4`
+    之外的寄存器. 本项目的固件以 `FW_SKIP_BSS_ZERO=1` 构建, BSS 清零一步不执行.
 
-```
-# fw_next_mode @ 0x80000780: li a0,1 -> addi a0,x0,0
-imm64 t0, 0x80000780
-imm64 t1, 0x00000513       # addi a0, x0, 0
-sw    t1, 0(t0)
+11. **平台早期初始化.** 设置临时 `mtvec` 与临时栈, 调用 `fw_platform_init(FDT)`:
+    解析根节点与 `/cpus`, 得到 hart 数量与各 hart 编号, 初始化设备树中的 override 驱动,
+    并按 `/chosen` 内的配置确定允许冷启动的 hart. 返回值仍为传入的 FDT 地址.
 
-# fw_next_mode+4: c.ret
-imm64 t1, 0x8082           # c.jr ra
-sw    t1, 4(t0)
-```
+12. **建立 scratch 与重定位 FDT.** `_scratch_init` 为每个 hart 分配 scratch 与栈, 写入
+    固件起止地址、`next_arg1`、`next_addr`、`next_mode`、热启动入口与平台描述符.
+    随后按 FDT 头部给出的长度把 DTB 复制到 `fw_next_arg1()` 给出的地址
+    `0x8220_0000`, 源地址与目标地址相同时跳过. 最后置 `_boot_status` 为
+    `BOOT_STATUS_BOOT_HART_DONE`, 进入 `_start_warm`; 其余 hart 读到该状态后同样进入
+    `_start_warm`.
 
-### 阶段 4: OpenSBI 启动
+## 四、OpenSBI 初始化
 
-```
-fw_boot_hart() -> -1 (自己是 boot hart)
-_try_lottery (AMOSWAP) -> 抢到
-PIE relocation (~7500 步)
-_reset_regs (清 GPR, 保留 a0-a4)
-BSS zero (patch: 单次迭代 -> flag 存活)
-mtvec 设置, mstatus 设置, stack 设置
-fw_platform_init(FDT):
-  fdt_path_offset("/") -> root
-  fdt_path_offset("/cpus") -> hart_count=1
-  fdt_parse_hart_id -> hartid
-  fdt_driver_init_by_offset -> 初始化 override 驱动
-  (CLINT/UART 通过 fdt_driver_init_all 由 coldboot 初始化)
-_start_warm -> sbi_init
-init_coldboot:
-  sbi_domain_init
-  sbi_timer_init -> fdt_timer_init -> aclint-mtimer
-  sbi_platform_early_init -> generic_early_init -> fdt_serial_init -> sifive_uart
-  sbi_boot_print_banner -> UART 输出 Logo
-  sbi_boot_print_general / sbi_boot_print_hart -> UART 输出
-  sbi_domain_startup
-  sbi_hsm_hart_start_finish -> sbi_hart_hang (WFI 空闲)
-```
+13. **每 hart 设置.** `_start_warm` 清空 `mie`, 由 `mhartid` 求出 hart 序号, 据此取
+    scratch 与栈, 写入 `mscratch`, 设置正式 `mtvec` 为 `_trap_handler`, 调用 `sbi_init()`.
 
-### 阶段 5: WFI 空闲
+14. **sbi_init.** 按 `next_mode` 判定下一特权级; 冷启动 hart 经 `coldboot_lottery` 选出,
+    执行 `init_coldboot()`, 其余 hart 执行 `init_warmboot()` 并等待冷启动完成.
 
-```
-_wfi_loop:
-  wfi
-  j _wfi_loop
-```
+15. **init_coldboot.** 依次完成: scratch 与堆初始化、域初始化、HSM 初始化、hart 初始化,
+    其中包含 PMP 条目数探测; 定时器初始化, 由设备树的 CLINT 节点给出; 平台早期初始化,
+    由 `/chosen/stdout-path` 初始化串口; PMU 与 DBTR 初始化; 打印启动横幅; 中断控制器
+    初始化, 按构建取 PLIC 或 IMSIC+APLIC; IPI、TLB 与 FWFT 初始化; 域终结; 平台最终
+    初始化; SSE 与 ecall 初始化; 打印域与 hart 信息; `sbi_domain_startup` 启动各域;
+    `sbi_hart_protection_configure` 配置 PMP 隔离; `init_sm()` 注册飞地 ecall 扩展,
+    建立飞地内存位图与宿主请求队列, 并激活宿主域的 lPMP.
 
-OpenSBI 完成初始化, 所有 hart 进入 WFI 等待 SBI ecall 或中断。
+16. **次级 hart 初始化.** 其余 hart 经 `init_warm_startup()` 完成每 hart 初始化, 并经
+    `init_sm_warm()` 激活自身的 lPMP, 使 S 模式与 U 模式访存不被全局拒绝.
 
-## DTB 必须的节点
+## 五、移交 S 模式
 
-```
-/ {
-    chosen { stdout-path = "/soc/serial@10000000"; }
-    cpus {
-        cpu@0 {
-            reg = <0>;
-            compatible = "riscv";
-            mmu-type = "riscv,sv39";
-            riscv,isa = "rv64imac";
-            interrupt-controller {
-                compatible = "riscv,cpu-intc";
-                #interrupt-cells = <1>;
-                interrupt-controller;
-                phandle = <1>;
-            };
-        };
-    };
-    memory@80000000 { reg = <0x0 0x80000000 0x0 0x8000000>; };
-    soc {
-        clint@2000000 {
-            compatible = "riscv,clint0";
-            interrupts-extended = <&cpu_intc 3 &cpu_intc 7>;
-        };
-        serial@10000000 {
-            compatible = "sifive,uart0";
-            status = "okay";
-        };
-    };
-};
-```
+17. **切换特权级.** 各 hart 在初始化末尾调用 `sbi_hsm_hart_start_finish()`, 取 scratch 中
+    的 `next_addr`、`next_mode` 与 `next_arg1`, 经 `sbi_hart_switch_mode()` 设置
+    `mepc = next_addr` 与 `mstatus.MPP = S`, 执行 `mret`.
 
-## Emulator 修复记录
+18. **下一阶段入口.** 入口地址由固件形态决定: `fw_payload` 为内嵌载荷, 位于
+    `_fw_start + FW_PAYLOAD_OFFSET` 即 `0x8040_0000`, 缺省载荷为 OpenSBI test payload,
+    可用 `FW_PAYLOAD_PATH` 换成内核或其他镜像; `fw_jump` 为 `FW_JUMP_ADDR`
+    即 `0x8040_0000`, 该处由调试器经 `--kernel` 预载内核 Image. 移交时
+    `a0 = mhartid`, `a1 = FDT 地址`, 默认为 `0x8220_0000` 处的副本.
 
-| Bug | 症状 | 修复 |
-|-----|------|------|
-| `_sext` 负 Python int | BEQ/BNE 误判 | 规范化到 [0, 2^64) |
-| C.ADD -> C.MV | PIE 循环 GOT 未重定位 | bit12 判断 ADD vs MV |
-| C.SUB sf=3 未实现 | IllInstr in _scratch_init | 新增 sf=3 分支 |
-| DTB CLINT ie 格式 | timer init SBI_ENODEV | phandle 引用 + cpu-intc 子节点 |
-| `misa` MXL+U-bit 缺失 | coldboot 被跳过 | debugger 注入 |
-| `fw_next_mode`=1 | warm boot 路径 | cold stub patch -> 0 |
-| `fdt_get_address`=0x2200000 | serial init 读错 FDT | DTB 副本 @ 正确地址 |
-| BSS 零填充清除 flag | init_warmboot 死循环等待 | debugger patch blt->j |
+19. **S 模式启动.** 下一阶段建立页表, 写 `satp`, 经 `sfence.vma` 后打开地址翻译, 再进入
+    内核或载荷自身的启动流程. 
+	内嵌的 `.sittim` 段是 S 模式飞地管理器, 启动期间只作为
+    数据随固件装入, 
+	由 M 模式在 CREATE 调用中复制进飞地内存池后才开始执行.
 
-## 预加载映像
+## 设备树约定
 
-预加载映像由 [bsp/kei-boot/kei.sav.S](../bsp/kei-boot/kei.sav.S) 经 makefile 构建,
-产出 `build/firm-bin/kei.sav`:
+固件与下一阶段依赖以下节点:
+
+- `/chosen`: `stdout-path` 指向串口, 可含 `bootargs` 与 initramfs 范围; 固件据此初始化
+  控制台.
+- `/cpus`: `timebase-frequency`, 以及每个 `cpu@N` 的 `reg`、`compatible`、`mmu-type`
+  与 `interrupt-controller` 子节点; 固件据此得到 hart 数量与编号.
+- `/memory`: 物理内存范围.
+- `/soc`: CLINT 节点, 经 `interrupts-extended` 引用各 hart 的 `cpu-intc`; 串口节点;
+  中断控制器与外设节点.
+- `/reserved-memory`: 固件映像保留区与飞地内存池, 均为 `no-map` 区间, 使内核的线性
+  映射与分配器避开这两段.
+
+## 启动命令
 
 ```bash
 make kei-sav
-# -> build/firm-bin/kei.sav
-```
-
-`tests/src-env/zsbl/` 存放 ZSBL 与 FSBL 的汇编源码, 当前未接入任何 makefile.
-
-## 命令行
-
-```bash
 python -m pyremu.debugger --ram-base=0x80000000 \
-    --preload build/firm-bin/kei.sav \
-    build/elf/custom_opensbi_fw_jump.elf
-# 使用 --harts=2 启用两个 hart
+    --preload=build/firm-bin/kei.sav \
+    build/elf/custom_opensbi_fw_payload.elf
 ```
+
+`make emu` 使用同一组参数, 并另加 `--harts` 与 `--hart-logs`. `make emu-linux-sh`
+改用 `fw_jump` 固件, 并追加 `--kernel`、`--sym`、`--fdt -1`、`--disk` 与内核命令行参数.

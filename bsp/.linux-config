@@ -412,6 +412,11 @@ CONFIG_RISCV_ISA_ZICBOM=y
 CONFIG_RISCV_ISA_ZICBOZ=y
 CONFIG_RISCV_ISA_ZICBOP=y
 CONFIG_RISCV_ISA_SVRSW60T59B=y
+# 本质: 该开关关闭时内核不打开用户进程的浮点状态, 进程的浮点状态为 Off, 首条 F/D 指令
+# 产生 IllegalInstruction, 内核按 SIGILL 终止该进程。
+# 例: Lfunc 打印首行后即因一条 c.fsdsp 被终止。
+# 该文件在每次构建时被复制为内核树的 .config; 需要浮点支持时把下一行行首的 "# " 去掉。
+# CONFIG_FPU=y
 # CONFIG_FPU is not set
 CONFIG_IRQ_STACKS=y
 CONFIG_THREAD_SIZE_ORDER=2

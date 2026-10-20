@@ -47,6 +47,44 @@ fn handle_uart_read(offset: u64, uart: &FfiUartCtx) -> Option<u64> {
 	}
 }
 
+/// 向 TX 环形缓冲区写入一条 ``[hid, byte]`` 条目.
+///
+/// 每条目占 2 字节, 条目容量为 ``tx_cap / 2``; ``tx_wr`` 以条目为单位单调递增,
+/// 取模对象即条目容量. 写入成功时按 ``no_stdout`` 决定是否即时回显到 stdout.
+/// 返回 false 表示环形缓冲区未挂接: 指针为空或条目容量为零.
+pub(crate) fn uart_tx_push(uart: &FfiUartCtx, hid: u8, byte: u8) -> bool {
+	if uart.tx_buf.is_null() || uart.tx_wr.is_null() {
+		return false;
+	}
+	let ecap = uart.tx_cap / 2;
+	if ecap == 0 {
+		return false;
+	}
+	let wr_atomic = unsafe { &*(uart.tx_wr as *const AtomicU32) };
+	while UART_TX_LOCK
+		.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+		.is_err()
+	{
+		std::hint::spin_loop();
+	}
+	let w = wr_atomic.load(Ordering::Relaxed);
+	let e = (w % ecap) as usize;
+	unsafe {
+		*uart.tx_buf.add(2 * e) = hid;
+		*uart.tx_buf.add(2 * e + 1) = byte;
+	}
+	wr_atomic.store(w.wrapping_add(1), Ordering::Release);
+	UART_TX_LOCK.store(false, Ordering::Release);
+	// Python TX (_tx_callback) 负责 stdout 时 (no_stdout=1):
+	// 仅写 ring buffer, 由 drain_tx_logs->_flush_hart->_tx_callback 输出.
+	if uart.no_stdout == 0 {
+		// 非阻塞写 stdout — 对端不可写时丢弃, 绝不阻塞 CPU 引擎线程
+		// (见 try_write_fd 注释).
+		try_write_fd(libc::STDOUT_FILENO, byte);
+	}
+	true
+}
+
 pub(crate) fn try_handle_uart_concurrent(
 	pa: u64,
 	is_write: bool,
@@ -70,33 +108,10 @@ pub(crate) fn try_handle_uart_concurrent(
 		return None;
 	}
 	// IE, TXCTRL, RXCTRL, IP, DIV -> Python for PLIC updates.
-	let ecap = uart.tx_cap / 2;
-	if ecap <= 0 {
+	if uart.tx_cap < 2 {
 		return Some(0);
 	}
-	let wr_atomic = unsafe { &*(uart.tx_wr as *const AtomicU32) };
-	while UART_TX_LOCK
-		.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-		.is_err()
-	{
-		std::hint::spin_loop();
-	}
-	let w = wr_atomic.load(Ordering::Relaxed);
-	let e = (w % ecap) as usize;
-	let byte = write_data as u8;
-	unsafe {
-		*uart.tx_buf.add(2 * e) = hid;
-		*uart.tx_buf.add(2 * e + 1) = byte;
-	}
-	wr_atomic.store(w.wrapping_add(1), Ordering::Release);
-	UART_TX_LOCK.store(false, Ordering::Release);
-	// Python TX (_tx_callback) 负责 stdout 时 (no_stdout=1):
-	// 仅写 ring buffer, 由 drain_tx_logs->_flush_hart->_tx_callback 输出.
-	if uart.no_stdout == 0 {
-		// 非阻塞写 stdout — 对端不可写时丢弃, 绝不阻塞 CPU 引擎线程
-		// (见 try_write_fd 注释).
-		try_write_fd(libc::STDOUT_FILENO, byte);
-	}
+	uart_tx_push(uart, hid, write_data as u8);
 	return Some(0);
 }
 
@@ -105,6 +120,64 @@ pub(crate) static UART_TX_LOCK: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 mod tests {
 	use super::try_write_fd;
+	use super::uart_tx_push;
+	use crate::ffi::FfiUartCtx;
+
+	/// 构造一个仅启用发送环形缓冲区的串口上下文.
+	/// ``no_stdout = 1`` 使写入不进 stdout.
+	fn ctx_with_ring(tx_buf: *mut u8, tx_cap: u32, tx_wr: *mut u32) -> FfiUartCtx {
+		FfiUartCtx {
+			base: 0x1000_0000,
+			tx_buf,
+			tx_cap,
+			tx_wr,
+			ie: 0,
+			txctrl: 0,
+			rxctrl: 0,
+			rx_fifo_len: 0,
+			tx_notify_fd: -1,
+			no_stdout: 1,
+			rx_notify: std::ptr::null_mut(),
+		}
+	}
+
+	/// 回归: 环形缓冲区的每条目为 ``[hid, byte]`` 两字节, 条目容量为
+	/// ``tx_cap / 2``, 写索引按条目递增并以条目容量取模.
+	///
+	/// 修复前该路径按字节索引 (``wr & (tx_cap - 1)``) 写入单个字节, 归档侧按
+	/// 两字节条目解码时得到错位的 (hid, byte) 对.
+	#[test]
+	fn uart_tx_push_writes_hid_byte_entries() {
+		let mut buf = [0u8; 8]; // 4 条目的容量
+		let mut wr: u32 = 0;
+		let ctx = ctx_with_ring(buf.as_mut_ptr(), 8, &mut wr as *mut u32);
+
+		for (hid, byte) in [(1u8, b'a'), (2, b'b'), (3, b'c'), (4, b'd'), (5, b'e')] {
+			assert!(uart_tx_push(&ctx, hid, byte));
+		}
+
+		// 第 5 条按条目容量 4 取模, 覆盖第 1 条.
+		assert_eq!(wr, 5);
+		assert_eq!(buf, [5, b'e', 2, b'b', 3, b'c', 4, b'd']);
+	}
+
+	/// 环形缓冲区未挂接时返回 false, 调用方据此回落通用陷阱投递.
+	#[test]
+	fn uart_tx_push_rejects_unattached_ring() {
+		let mut wr: u32 = 0;
+		let mut buf = [0u8; 8];
+
+		let no_buf = ctx_with_ring(std::ptr::null_mut(), 8, &mut wr as *mut u32);
+		assert!(!uart_tx_push(&no_buf, 0, b'x'));
+
+		let no_wr = ctx_with_ring(buf.as_mut_ptr(), 8, std::ptr::null_mut());
+		assert!(!uart_tx_push(&no_wr, 0, b'x'));
+
+		// 字节容量不足一条目.
+		let small = ctx_with_ring(buf.as_mut_ptr(), 1, &mut wr as *mut u32);
+		assert!(!uart_tx_push(&small, 0, b'x'));
+		assert_eq!(wr, 0);
+	}
 
 	/// 回归: 宿主 stdout 对端不可写 (管道满 / 对端暂停) 时, try_write_fd 必须
 	/// 返回 0 丢弃字节而非阻塞 — 否则 CPU 引擎线程被卡死在 libc::write 上,

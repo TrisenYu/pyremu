@@ -1,8 +1,7 @@
 OUTPUT_ARCH("riscv")
 ENTRY(module_init)
 
-SECTIONS
-{
+SECTIONS {
 	.module_desc : ALIGN(8) {
 		LONG(0x31444d53)                           /* magic: "SMD1" read in little endian */
 		LONG(1)                                    /* abi_version */
@@ -48,7 +47,8 @@ SECTIONS
 
 	ASSERT(
 		SIZEOF(.data) == 0,
-		"module image: writable statics with non-zero initial value belong in the BSS section")
+		"module image: writable statics with non-zero initial value belong in the BSS section"
+	)
 
 	/DISCARD/ : {
 		*(.eh_frame .eh_frame.*)

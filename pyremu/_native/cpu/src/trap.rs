@@ -770,7 +770,7 @@ mod tests {
 			hart_states: Cell::new(std::ptr::null()),
 			timebase_hz: 10_000_000,
 		};
-		let module = ModuleState::new(1, 1, 0, 0, vec![0].into_boxed_slice());
+		let module = ModuleState::new(1, 1, 0, vec![0].into_boxed_slice(), false, 0, Box::new([]));
 		let uart: FfiUartCtx = unsafe { std::mem::zeroed() };
 
 		let advance = priv_ecall_concurrent(&mut state, 0, &clint, &module, &uart);
@@ -816,7 +816,7 @@ mod tests {
 		let mtimecmp = AtomicU64::new(0);
 		let msip = AtomicU8::new(0);
 		let clint = single_hart_clint(&mtime, &mtimecmp, &msip);
-		let module = ModuleState::new(1, 1, 0, 0, vec![0].into_boxed_slice());
+		let module = ModuleState::new(1, 1, 0, vec![0].into_boxed_slice(), false, 0, Box::new([]));
 
 		let mut tx_buf = [0u8; 8];
 		let mut tx_wr: u32 = 0;
@@ -847,8 +847,11 @@ mod tests {
 		let mtimecmp = AtomicU64::new(0);
 		let msip = AtomicU8::new(0);
 		let clint = single_hart_clint(&mtime, &mtimecmp, &msip);
-		let module = ModuleState::new(1, 1, 0, 0, vec![0].into_boxed_slice());
+		let module = ModuleState::new(1, 1, 0, vec![0].into_boxed_slice(), false, 0, Box::new([]));
 
+		// 归档侧按 ``[hid, byte]`` 两字节条目解码, 故该快速路径写入的条目
+		// 必须带发出该字节的 hart 标识.
+		state.mhartid = 2;
 		let mut tx_buf = [0u8; 8];
 		let mut tx_wr: u32 = 0;
 		let uart = uart_ctx_with_tx_buffer(tx_buf.as_mut_ptr(), &mut tx_wr as *mut u32);
@@ -856,8 +859,9 @@ mod tests {
 		let advance = priv_ecall_concurrent(&mut state, 0, &clint, &module, &uart);
 
 		assert_eq!(advance, 4, "should gain advance=4");
-		assert_eq!(tx_wr, 1, "should write one char");
-		assert_eq!(tx_buf[0], 0x41, "should output the lower bytes of a0");
+		assert_eq!(tx_wr, 1, "should write one entry");
+		assert_eq!(tx_buf[0], 2, "entry byte 0 should carry the hart id");
+		assert_eq!(tx_buf[1], 0x41, "entry byte 1 should carry the character");
 		assert_eq!(state.gprs[10], 0, "should return 0");
 		assert_eq!(state.pc, 0x1000, "should not trap");
 	}

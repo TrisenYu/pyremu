@@ -16,9 +16,10 @@ use crate::constants::{
 	PTE_V,
 	PTE_W,
 	PTE_X,
+	UMODE_VA_LIMIT,
 };
 use crate::mem;
-use crate::mem_prim::align::{ align_down, align_up };
+use crate::mem_prim::align::align_up;
 use crate::paging;
 
 use super::{ EINVAL, ENOMEM, ENOSYS };
@@ -75,7 +76,14 @@ fn prot_to_pte(prot: u64) -> u64 {
 ///
 /// 请求同时带 PROT_WRITE 与 PROT_EXEC 时返回 EINVAL: 一个 2 MiB 分区整体属于一个
 /// 类别, 类别即该分区登记的 PMP 权限, 可写与可执行不能落在同一分区上。
-pub fn mmap_handler(addr: u64, len: u64, prot: u64, flags: u64, _fd: u64, _off: u64) -> u64 {
+pub fn mmap_handler(
+	addr: u64,
+	len: u64,
+	prot: u64,
+	flags: u64,
+	_fd: u64,
+	_off: u64
+) -> u64 {
 	// 仅支持匿名映射
 	if (flags & MAP_ANONYMOUS) == 0 {
 		return ENOSYS;
@@ -90,20 +98,32 @@ pub fn mmap_handler(addr: u64, len: u64, prot: u64, flags: u64, _fd: u64, _off: 
 		return EINVAL;
 	}
 
-	let pages = align_up(len, PAGE_SIZE) >> PAGE_SHIFT;
-	if pages == 0 {
+	// 长度越界时按页取整会向上溢出而给出一个小值, 后续算式因此接受一个远大于用户
+	// 空间的区间。提前拒绝使算式只在无溢出的区间内求值。
+	if len == 0 || len > UMODE_VA_LIMIT {
 		return EINVAL;
 	}
+	let pages = align_up(len, PAGE_SIZE) >> PAGE_SHIFT;
 	let total_bytes = pages * PAGE_SIZE;
 	let mut pte_flags = prot_to_pte(prot);
 	if map_type == MAP_SHARED {
 		pte_flags |= PTE_RSW_SHARED;
 	}
 
-	// MAP_FIXED: 调用方指定地址, 按 4 KiB 粒度就地映射。
+	// MAP_FIXED: 调用方指定地址, 按 4 KiB 粒度就地映射。Linux 要求该地址按页对齐,
+	// 未对齐返回 EINVAL; 区间落在用户空间之外时无法建立映射, 返回 ENOMEM。
 	if (flags & MAP_FIXED) != 0 {
-		let va = align_down(addr, PAGE_SIZE);
-		if !mem::map_umode_pages(va, pages, pte_flags) || !seal_instr_mapping(va, pages, pte_flags) {
+		if (addr & (PAGE_SIZE - 1)) != 0 {
+			return EINVAL;
+		}
+		let va = addr;
+		if !mem::is_umode_va_range(va, total_bytes) {
+			return ENOMEM;
+		}
+		if
+			!mem::map_umode_pages(va, pages, pte_flags) ||
+			!seal_instr_mapping(va, pages, pte_flags)
+		{
 			return ENOMEM;
 		}
 		return va;
@@ -132,20 +152,26 @@ pub fn munmap_handler(addr: u64, len: u64) -> u64 {
 	if (addr & (PAGE_SIZE - 1)) != 0 || len == 0 {
 		return EINVAL;
 	}
+	// 区间越过用户空间上界时, 页表遍历按 VPN 的 9 位字段索引根表, 会落到管理器自身
+	// 占用的根表项上; 上方溢出同样使末址失去意义。两种情形均返回 EINVAL。
+	if !mem::is_umode_va_range(addr, len) {
+		return EINVAL;
+	}
 
-	let start = align_down(addr, PAGE_SIZE);
+	let start = addr;
 	let end = align_up(addr + len, PAGE_SIZE);
 
 	// 逐段解除映射, 粒度跟随页表叶子层级:
 	//   4 KiB 普通页单页解除; 2 MiB / 1 GiB 超页整块解除并跳过整块,
-	//   避免在超页内部再次解引用 (超页之下不存在叶子项)。
+	//   避免在2MB超级页内部再次解引用。
 	let giga_size = 0x4000_0000_u64;
 	let mut va = start;
 	while va < end {
 		match paging::va_real_page_level(va) {
 			None => {
 				va += PAGE_SIZE;
-			} // 本就未映射, 直接跳过
+			}
+			// 本就未映射, 直接跳过
 			Some(LEVEL_PAGE) => {
 				paging::unmap_page(va, LEVEL_PAGE);
 				va += PAGE_SIZE;
@@ -160,7 +186,8 @@ pub fn munmap_handler(addr: u64, len: u64) -> u64 {
 			}
 			Some(_) => {
 				va += PAGE_SIZE;
-			} // 未知层级不应出现, 保守跳过
+			}
+			// 未知层级不应出现, 保守跳过
 		}
 	}
 
@@ -237,7 +264,10 @@ fn seal_instr_mapping(va: u64, pages: u64, flags: u64) -> bool {
 	if (flags & PTE_X) == 0 {
 		return true;
 	}
-	if reclass_covered_partitions(va, va + pages * PAGE_SIZE, ENCLAVE_MEM_ATTR_INSTR) != 0 {
+	if
+		reclass_covered_partitions(va, va + pages * PAGE_SIZE, ENCLAVE_MEM_ATTR_INSTR) !=
+		0
+	{
 		return false;
 	}
 	for i in 0..pages {
@@ -274,6 +304,10 @@ pub fn mprotect_handler(addr: u64, len: u64, prot: u64) -> u64 {
 	if len == 0 {
 		return 0;
 	}
+	// 与 munmap 同一判据: 越界的区间在根表上会落到管理器自身的项。
+	if !mem::is_umode_va_range(addr, len) {
+		return EINVAL;
+	}
 
 	let start = addr;
 	let end = align_up(addr + len, PAGE_SIZE);
@@ -283,7 +317,11 @@ pub fn mprotect_handler(addr: u64, len: u64, prot: u64) -> u64 {
 		if (start & (CHUNK_2M_SIZE - 1)) != 0 || (len & (CHUNK_2M_SIZE - 1)) != 0 {
 			return EINVAL;
 		}
-		let attr = if (prot & PROT_EXEC) != 0 { ENCLAVE_MEM_ATTR_INSTR } else { ENCLAVE_MEM_ATTR_DATA };
+		let attr = if (prot & PROT_EXEC) != 0 {
+			ENCLAVE_MEM_ATTR_INSTR
+		} else {
+			ENCLAVE_MEM_ATTR_DATA
+		};
 		let err = reclass_covered_partitions(start, end, attr);
 		if err != 0 {
 			return err;
@@ -331,7 +369,13 @@ pub fn mprotect_handler(addr: u64, len: u64, prot: u64) -> u64 {
 ///
 /// 与 Linux 的一处差别: Linux 允许 old_size 取 0, 此时整段映射按新建立处理, 只用于
 /// 复制共享映射区。本实现没有可供复制的共享后备, 故该取值一并返回 EINVAL。
-fn check_mremap_params(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr: u64) -> u64 {
+fn check_mremap_params(
+	old_addr: u64,
+	old_size: u64,
+	new_size: u64,
+	flags: u64,
+	new_addr: u64
+) -> u64 {
 	if (flags & !MREMAP_KNOWN_FLAGS) != 0 {
 		return EINVAL;
 	}
@@ -341,6 +385,11 @@ fn check_mremap_params(old_addr: u64, old_size: u64, new_size: u64, flags: u64, 
 	if old_size == 0 || new_size == 0 {
 		return EINVAL;
 	}
+	// 旧区间越出用户空间, 或新长度已不可能落在用户空间内时, 后续的末址算式与页表
+	// 遍历都不成立。新长度是否放得进映射区由 mem::take_mmap_region 判定。
+	if !mem::is_umode_va_range(old_addr, old_size) || new_size > UMODE_VA_LIMIT {
+		return EINVAL;
+	}
 	if (flags & MREMAP_FIXED) != 0 {
 		if (new_addr & (PAGE_SIZE - 1)) != 0 {
 			return EINVAL;
@@ -348,6 +397,10 @@ fn check_mremap_params(old_addr: u64, old_size: u64, new_size: u64, flags: u64, 
 		// 指定固定地址意味着必然搬移, 故 MREMAP_FIXED 蕴含 MREMAP_MAYMOVE。
 		if (flags & MREMAP_MAYMOVE) == 0 {
 			return EINVAL;
+		}
+		// 目的区间须落在用户空间内, 与 mmap 的 MAP_FIXED 同一判据与错误码。
+		if !mem::is_umode_va_range(new_addr, new_size) {
+			return ENOMEM;
 		}
 	}
 	0
@@ -361,7 +414,13 @@ fn check_mremap_params(old_addr: u64, old_size: u64, new_size: u64, flags: u64, 
 ///
 /// 搬移路径的目的映射沿用源映射末页的标志位, 故源为共享映射时目的仍与源共用同一
 /// 物理页, 源为私有映射时才逐字节复制。
-pub fn mremap_handler(old_addr: u64, old_size: u64, new_size: u64, flags: u64, new_addr: u64) -> u64 {
+pub fn mremap_handler(
+	old_addr: u64,
+	old_size: u64,
+	new_size: u64,
+	flags: u64,
+	new_addr: u64
+) -> u64 {
 	let invalid = check_mremap_params(old_addr, old_size, new_size, flags, new_addr);
 	if invalid != 0 {
 		return invalid;
@@ -369,7 +428,10 @@ pub fn mremap_handler(old_addr: u64, old_size: u64, new_size: u64, flags: u64, n
 
 	// 原地扩容/收缩: 判断条件与页映射都在 memory 侧 (需要映射区的页计数与后备
 	// 块物理基址)。
-	if (flags & MREMAP_FIXED) == 0 && mem::grow_mmap_in_place(old_addr, old_size, new_size) {
+	if
+		(flags & MREMAP_FIXED) == 0 &&
+		mem::grow_mmap_in_place(old_addr, old_size, new_size)
+	{
 		return old_addr;
 	}
 
@@ -412,7 +474,11 @@ pub fn mremap_handler(old_addr: u64, old_size: u64, new_size: u64, flags: u64, n
 	let copy_len = if old_size < new_size { old_size } else { new_size };
 	if !is_shared {
 		unsafe {
-			core::ptr::copy_nonoverlapping(old_addr as *const u8, dst as *mut u8, copy_len as usize);
+			core::ptr::copy_nonoverlapping(
+				old_addr as *const u8,
+				dst as *mut u8,
+				copy_len as usize
+			);
 		}
 	}
 

@@ -1,17 +1,17 @@
 //! AF_INET 的 SOCK_DGRAM 套接字系统调用。
 //!
 //! 套接字状态由网络模块的协议栈按套接字下标持有, 本模块做参数校验、sockaddr 的读写与
-//! 接收的阻塞语义; 涉及协议栈的动作经该模块导出的操作表调用, 见
-//! [net_ops](crate::ext_mod::net_ops) 与 [runtime](crate::ext_mod::runtime)。fd 表项
-//! 只记该下标, 见 [fs](super::fs) 的 FdTarget。
+//! 接收的阻塞语义; 涉及协议栈的动作经该模块导出的操作表调用。fd 表项只记该下标。
 //!
 //! 接收的阻塞地址由套接字下标折算, 与 futex 的等待地址、wait4 的阻塞地址同属一类:
-//! 只参与唤醒匹配, 内核从不解引用。报文到达时由 M 模式转发的接收事件唤醒, 见
-//! [sched](super::concurrency::sched)。
+//! 只参与唤醒匹配, 内核从不解引用。报文到达时由 M 模式转发的接收事件唤醒。
 //!
-//! 网络模块未接入时 fd 表内不可能有套接字表项 (socket 调用本身就要求该模块), 故各处理
-//! 函数在该情形下返回 ENODEV。
-
+//! 网络模块未接入时 fd 表内不可能有套接字表项, 因为建立套接字本身就要求该模块已接入, 故
+//! 各处理函数在取入该模块失败时返回
+//! [`LoadError::to_errno`](crate::ext_mod::loader::LoadError::to_errno) 给出的错误码:
+//! 	`ENOENT`: 宿主未提供该模块
+//! 	`EINVAL`: 映像与布局约定不符
+//! 	`ENODEV`: 只由本模块的 `bind_error` 对网络模块报告的绑定结果产生
 use core::cmp;
 use core::ptr;
 
@@ -97,12 +97,20 @@ fn ops() -> Result<&'static NetOps, u64> {
 	runtime::acquire_net_ops()
 }
 
-/// 网络模块的操作表; 该模块不可用时返回 None。
+/// 取入网络模块之后的操作表; 该模块不可用时返回 None。
 ///
-/// 供按"模块可用与否"决定后续动作的调用点使用: 协议栈推进与套接字状态查询在模块不可用时
-/// 无事可做, 其失败不构成系统调用的失败结果。
+/// 供按"模块可用与否"决定后续动作的调用点使用: 套接字状态查询在模块不可用时无事可做, 其
+/// 失败不构成系统调用的失败结果。本函数会发起取入, 故只可在系统调用上下文中调用。
 fn ops_if_avail() -> Option<&'static NetOps> {
 	ops().ok()
+}
+
+/// 已取入的网络模块的操作表; 该模块尚未取入时返回 None, 不发起取入。
+///
+/// 与 [ops_if_avail] 的差别只在此: 本函数的调用点位于中断上下文以及系统调用的收尾处, 其中
+/// 不得让出宿主, 也无从向可信应用上报取入失败。
+fn ops_if_loaded() -> Option<&'static NetOps> {
+	runtime::loaded_net_ops()
 }
 
 /// 地址族未指定的端点: 绑定时表示本地地址不作限定, 接收时作为来源的输出初值。
@@ -119,18 +127,23 @@ fn recv_wait_addr(index: u64) -> u64 {
 	RECV_WAIT_ADDR_BASE + index * 8
 }
 
-/// 推进协议栈一次。
+/// 推进协议栈一次, 返回是否已推进。
 ///
-/// 发送之后与设备事件到达时调用, 见 [sched](super::concurrency::sched)。
-pub fn poll_stack() {
-	if let Some(ops) = ops_if_avail() {
-		unsafe { (ops.poll)() }
+/// 该模块尚未取入时返回假, 且不发起取入: 调用点位于中断上下文与系统调用的收尾处, 该处不得
+/// 让出宿主。调用方按本函数的返回值把事件记入待处理标志。
+pub fn poll_stack_if_loaded() -> bool {
+	match ops_if_loaded() {
+		Some(ops) => {
+			unsafe { (ops.poll)() }
+			true
+		}
+		None => false,
 	}
 }
 
-/// 唤醒全部有报文可接收的套接字上阻塞的线程。
+/// 唤醒全部有报文可接收的套接字上阻塞的线程; 该模块尚未取入时无事可做。
 pub fn wake_receivers() {
-	let Some(ops) = ops_if_avail() else {
+	let Some(ops) = ops_if_loaded() else {
 		return;
 	};
 	for index in 0..ops.socket_slots {
@@ -253,7 +266,10 @@ fn write_sockaddr(addr: u64, addrlen: u64, endpoint: &NetEndpoint) {
 /// 前缀长度都由操作表给出, 故按位比较: 掩码取前缀位为 1、其余位为 0, 目的地址与本机
 /// 地址各自与掩码按位与之后比较。前缀长度按 32 截断, 更长的前缀等同于全部 32 位。
 fn is_local_subnet(ops: &NetOps, endpoint: &NetEndpoint) -> bool {
-	let (Some(dst), Some(local)) = (endpoint.octets_v4(), ops.local_addr.octets_v4()) else {
+	let (Some(dst), Some(local)) = (
+		endpoint.octets_v4(),
+		ops.local_addr.octets_v4(),
+	) else {
 		return false;
 	};
 	let prefix_bits = cmp::min(ops.local_prefix_len as u32, 32);
@@ -423,7 +439,12 @@ pub fn getpeername_handler(fd: u64, addr: u64, addrlen: u64) -> u64 {
 ///
 /// *dest_addr* 为 0 且未记录对端地址时返回 EDESTADDRREQ; 目的端口为 0 时返回
 /// EDESTADDRREQ; 目的地址在本机子网之外时返回 ENETUNREACH。
-fn send_endpoint(ops: &NetOps, index: u64, dest_addr: u64, addrlen: u64) -> Result<NetEndpoint, u64> {
+fn send_endpoint(
+	ops: &NetOps,
+	index: u64,
+	dest_addr: u64,
+	addrlen: u64
+) -> Result<NetEndpoint, u64> {
 	if dest_addr == 0 {
 		return match peer_of(ops, index) {
 			Some(endpoint) => Ok(endpoint),
@@ -458,7 +479,14 @@ fn send_bytes(ops: &NetOps, index: u64, endpoint: &NetEndpoint, data: &[u8]) -> 
 ///
 /// 缓冲区地址为 0 而长度为非零时返回 EFAULT; 报文长于 UDP 载荷上限时返回 EMSGSIZE;
 /// 目的端点的错误码由 send_endpoint 给出。
-fn send_common(ops: &NetOps, index: u64, buf: u64, len: u64, dest_addr: u64, addrlen: u64) -> u64 {
+fn send_common(
+	ops: &NetOps,
+	index: u64,
+	buf: u64,
+	len: u64,
+	dest_addr: u64,
+	addrlen: u64
+) -> u64 {
 	if len > 0 && buf == 0 {
 		return EFAULT;
 	}
@@ -525,7 +553,14 @@ fn recv_common(
 
 /// sendto(206): 发送一个 UDP 报文。*dest_addr* 为 0 时使用经 connect 记录的对端
 /// 地址。
-pub fn sendto_handler(fd: u64, buf: u64, len: u64, flags: u64, dest_addr: u64, addrlen: u64) -> u64 {
+pub fn sendto_handler(
+	fd: u64,
+	buf: u64,
+	len: u64,
+	flags: u64,
+	dest_addr: u64,
+	addrlen: u64
+) -> u64 {
 	let index = match socket_index(fd) {
 		Ok((index, _)) => index,
 		Err(e) => {
@@ -546,7 +581,14 @@ pub fn sendto_handler(fd: u64, buf: u64, len: u64, flags: u64, dest_addr: u64, a
 
 /// recvfrom(207): 接收一个 UDP 报文。*src_addr* 非 0 时一并写入报文来源的地址与
 /// 端口。缓冲区容量为 0 时返回 0, 缓冲区地址不作要求。
-pub fn recvfrom_handler(fd: u64, buf: u64, len: u64, flags: u64, src_addr: u64, addrlen: u64) -> u64 {
+pub fn recvfrom_handler(
+	fd: u64,
+	buf: u64,
+	len: u64,
+	flags: u64,
+	src_addr: u64,
+	addrlen: u64
+) -> u64 {
 	let (index, open_flags) = match socket_index(fd) {
 		Ok(entry) => entry,
 		Err(e) => {
@@ -728,7 +770,11 @@ fn scatter_iovecs(io_vec_arr: u64, io_vec_size: u64, payload: &[u8]) -> u64 {
 			continue;
 		}
 		unsafe {
-			ptr::copy_nonoverlapping(payload.as_ptr().add(offset), base as *mut u8, count);
+			ptr::copy_nonoverlapping(
+				payload.as_ptr().add(offset),
+				base as *mut u8,
+				count
+			);
 		}
 		offset += count;
 	}
@@ -737,7 +783,11 @@ fn scatter_iovecs(io_vec_arr: u64, io_vec_size: u64, payload: &[u8]) -> u64 {
 
 /// 按 iovec 的次序把各缓冲区汇集到 *payload*, 返回汇集后的字节数。
 /// 各缓冲区容量之和大于 *payload* 的长度时返回 EMSGSIZE。
-fn gather_iovecs(io_vec_arr: u64, io_vec_size: u64, payload: &mut [u8]) -> Result<usize, u64> {
+fn gather_iovecs(
+	io_vec_arr: u64,
+	io_vec_size: u64,
+	payload: &mut [u8]
+) -> Result<usize, u64> {
 	let total = check_iovecs(io_vec_arr, io_vec_size)?;
 	if total > payload.len() {
 		return Err(EMSGSIZE);
@@ -750,7 +800,11 @@ fn gather_iovecs(io_vec_arr: u64, io_vec_size: u64, payload: &mut [u8]) -> Resul
 			continue;
 		}
 		unsafe {
-			ptr::copy_nonoverlapping(base as *const u8, payload.as_mut_ptr().add(offset), count);
+			ptr::copy_nonoverlapping(
+				base as *const u8,
+				payload.as_mut_ptr().add(offset),
+				count
+			);
 		}
 		offset += count;
 	}
@@ -791,7 +845,12 @@ pub fn write_socket(index: u64, buf: *const u8, len: u64) -> u64 {
 
 /// readv 在套接字上的接收动作: 取一个报文, 按 iovec 的次序逐一写入, 返回写入 iovec
 /// 的字节数。各缓冲区容量之和不足报文长度时丢弃其余字节。
-pub fn readv_socket(index: u64, open_flags: u32, io_vec_arr: u64, io_vec_size: u64) -> u64 {
+pub fn readv_socket(
+	index: u64,
+	open_flags: u32,
+	io_vec_arr: u64,
+	io_vec_size: u64
+) -> u64 {
 	if let Err(e) = check_iovecs(io_vec_arr, io_vec_size) {
 		return e;
 	}
@@ -804,7 +863,14 @@ pub fn readv_socket(index: u64, open_flags: u32, io_vec_arr: u64, io_vec_size: u
 	let mut payload = [0u8; UDP_PAYLOAD_MAX];
 	let is_nonblocking = (open_flags & O_NONBLOCK) != 0;
 	let n = match
-		recv_common(ops, index, is_nonblocking, payload.as_mut_ptr() as u64, UDP_PAYLOAD_MAX as u64, false)
+		recv_common(
+			ops,
+			index,
+			is_nonblocking,
+			payload.as_mut_ptr() as u64,
+			UDP_PAYLOAD_MAX as u64,
+			false
+		)
 	{
 		Ok(RecvOutcome::Received(n, _)) => n,
 		Ok(RecvOutcome::Restart) => {
@@ -834,7 +900,13 @@ pub fn writev_socket(index: u64, io_vec_arr: u64, io_vec_size: u64) -> u64 {
 ///
 /// 只接受 SOL_SOCKET 层的收发缓冲区容量两项: 容量由协议栈的静态缓冲区固定, 本调用
 /// 返回成功但不改变容量。其余层与选项未实现, 返回 ENOPROTOOPT。
-pub fn setsockopt_handler(fd: u64, level: u64, optname: u64, optval: u64, optlen: u64) -> u64 {
+pub fn setsockopt_handler(
+	fd: u64,
+	level: u64,
+	optname: u64,
+	optval: u64,
+	optlen: u64
+) -> u64 {
 	if let Err(e) = socket_index(fd) {
 		return e;
 	}
@@ -859,7 +931,13 @@ pub fn setsockopt_handler(fd: u64, level: u64, optname: u64, optval: u64, optlen
 ///
 /// 支持 SOL_SOCKET 层的 SO_TYPE、SO_DOMAIN、SO_ERROR 与收发缓冲区容量, 其余层与
 /// 选项返回 ENOPROTOOPT。
-pub fn getsockopt_handler(fd: u64, level: u64, optname: u64, optval: u64, optlen: u64) -> u64 {
+pub fn getsockopt_handler(
+	fd: u64,
+	level: u64,
+	optname: u64,
+	optval: u64,
+	optlen: u64
+) -> u64 {
 	if let Err(e) = socket_index(fd) {
 		return e;
 	}

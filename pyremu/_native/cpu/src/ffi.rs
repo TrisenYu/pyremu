@@ -2,12 +2,12 @@
 //!
 //! 集中存放所有跨 FFI 边界的参数结构体: 内存/PMP/CLINT/PLIC/UART/virtio/
 //! watchdog/断点/TLB, 以及设备快速路径接口 (``FfiDevCtx``). 处理器自身的状态
-//! (``HartState`` / ``TlbEntry`` / ``ImsicFile`` / ``HartDiag``) 保留在
-//! [state](crate::state).
+//! (``HartState`` / ``TlbEntry`` / ``ImsicFile``) 保留在 [state](crate::state).
 //!
 //! 布局约束: 每个结构体在 Python 侧都有 ctypes 镜像, 两侧必须逐字段一致,
 //! 否则 Rust 会在错误偏移读取字段而引发段错误。
 
+use crate::peripheral::uart::uart_tx_push;
 use crate::state::HartState;
 
 #[repr(C)]
@@ -67,7 +67,7 @@ pub struct FfiClintCtx {
 /// (claim/complete 语义), 避免 kernel 直映射访问 PLIC 时的 batch 退出.
 ///
 /// Python 持有底层 ctypes 数组, 并在每次加速执行边界 marshal/unmarshal;
-/// 设备侧 ``raise_device_irq`` 也会直接写入本数组 (write-through), 保证 batch
+/// 设备中断投递目标也会经 ``set_irq`` 直接写入本数组 (write-through), 保证 batch
 /// 内新到达的设备中断对 Rust 可见.
 #[repr(C)]
 pub struct FfiPlicCtx {
@@ -112,11 +112,12 @@ pub struct FfiWatchdogCtx {
 pub struct FfiUartCtx {
 	/// UART MMIO base address (e.g. 0x10000000).
 	pub base: u64,
-	/// Ring buffer for TX characters (1-byte entries, ``tx_cap`` slots).
+	/// Ring buffer for TX entries: each entry is the two bytes ``[hid, byte]``,
+	/// so the entry capacity is ``tx_cap / 2``.
 	pub tx_buf: *mut u8,
-	/// Capacity of ``tx_buf`` (must be power of two, <= 256 MiB).
+	/// Byte capacity of ``tx_buf`` (must be power of two, <= 256 MiB).
 	pub tx_cap: u32,
-	/// Write-index into ``tx_buf`` (monotonic, wraps at ``tx_cap``).
+	/// Write-index into ``tx_buf`` in entries (monotonic, wraps at ``tx_cap / 2``).
 	/// Updated atomically by Rust; Python reads after acceleration.
 	pub tx_wr: *mut u32,
 	/// Shadow copy of UART IE register (offset 0x10), written by Python
@@ -180,12 +181,6 @@ pub trait FfiDevCtx: Send + Sync {
 	/// 回落通用 trap 投递.
 	fn try_ecall(&self, state: &mut HartState, ext_id: u64, func_id: u64) -> Option<u64>;
 
-	/// 向设备写入单字节 (供通用 putchar 路径使用).
-	/// 返回 true 表示成功.
-	fn write_byte(&self, _byte: u8) -> bool {
-		false
-	}
-
 	/// 设备名称 (供诊断日志使用).
 	fn name(&self) -> &'static str;
 }
@@ -202,25 +197,12 @@ impl FfiDevCtx for FfiUartCtx {
 			return None;
 		}
 		let c = state.gprs[10] as u8;
-		if self.write_byte(c) {
+		if uart_tx_push(self, state.mhartid as u8, c) {
 			state.gprs[10] = 0; // SBI success
 			Some(4) // advance past ecall instruction
 		} else {
 			None
 		}
-	}
-
-	fn write_byte(&self, byte: u8) -> bool {
-		if self.tx_buf.is_null() || self.tx_wr.is_null() || self.tx_cap == 0 {
-			return false;
-		}
-		unsafe {
-			let wr = self.tx_wr.read_volatile();
-			let mask = self.tx_cap - 1;
-			*self.tx_buf.add((wr & mask) as usize) = byte;
-			self.tx_wr.write_volatile(wr.wrapping_add(1));
-		}
-		true
 	}
 
 	fn name(&self) -> &'static str {
@@ -356,12 +338,12 @@ pub struct FfiBpCtx {
 	pub count: u32,
 }
 
-/// TLB generation counter passed across the FFI boundary (mutable —
-/// Rust writes back the values so they persist across calls).
+/// TLB 刷新计数跨 FFI 边界传递的两处存放位置. 两处均由调用方持有, 引擎每轮
+/// 结束把取值写回, 故两个调用之间积累的刷新对下一轮仍然可见.
 #[repr(C)]
 pub struct FfiTlbCtx {
-	pub gen: *mut u64,
-	pub gen_per_hart: *mut u64,
+	pub flush_cnt: *mut u64,
+	pub flush_cnt_per_hart: *mut u64,
 }
 
 /// Empty UART context for when no UART is configured.

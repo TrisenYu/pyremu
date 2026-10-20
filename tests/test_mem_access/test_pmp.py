@@ -14,7 +14,7 @@ from pyremu.core.mem_check_aux import (
     inject_memory_backend,
     mem_read,
     mem_write,
-    MemoryAccessFault,
+    MemoryAccessError,
 )
 from pyremu.core.registers import CSR, CsrAccess
 from pyremu.emulator import Emulator
@@ -345,7 +345,7 @@ class TestPmpInHart:
         hart.mode = RiscvMode.U
         try:
             mem_write(hart, 0x8000_1000, b"\x11\x22")
-        except MemoryAccessFault:
+        except MemoryAccessError:
             pass
         assert hart.mcause_val == 7, f"应为 StAccessFault(7), 实际 {hart.mcause_val}"
 
@@ -356,7 +356,7 @@ class TestPmpInHart:
         hart._mem_write_phy(0x8000_1000, b"\xde\xad")
         try:
             mem_read(hart, 0x8000_1000, 4)
-        except MemoryAccessFault:
+        except MemoryAccessError:
             pass
         assert hart.mcause_val == 5, f"应为 LdAccessFault(5), 实际 {hart.mcause_val}"
 

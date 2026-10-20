@@ -1,10 +1,10 @@
-//! memcpy / memset 宽字优化实现。紧跟 custom-opensbi mem_man.c:544-647 的
-//! `calc_mem_leap` 模式：优先 8 字节搬移，余数按 {4, 2, 1} 字节递减处理。
-//! ref-emod string.c 的 memcpy 仍是逐字节循环，此处一并修正。
+//! memcpy / memset 宽字优化实现。
 
-/// MemLeapCnt 辅助结构 — 将长度分解为 8 字节块数 + 余数 bitmask。
+/// MemLeapCnt 辅助结构
 struct MemLeapCnt {
+	/// 步长为8的可用次数
 	times8: u64,
+	/// 余数部分
 	mod8: u8,
 }
 
@@ -16,8 +16,6 @@ fn calc_mem_leap(x: u64) -> MemLeapCnt {
 	}
 }
 
-/// 等效于 C 标准库 `memset(dst, byte, size)`。
-/// 将 byte 广播为 64 位常量后按 8/4/2/1 字节写入。
 #[allow(unused)]
 pub unsafe fn memset(dst: *mut u8, byte: u8, size: u64) {
 	let fill64 = (byte as u64).wrapping_mul(0x0101_0101_0101_0101);
@@ -33,27 +31,25 @@ pub unsafe fn memset(dst: *mut u8, byte: u8, size: u64) {
 	}
 
 	// remainder: 4 / 2 / 1
-	if cnt.mod8 & 0x4 != 0 {
+	if (cnt.mod8 & 0x4) != 0 {
 		unsafe {
 			(d as *mut u32).write_unaligned(fill64 as u32);
 			d = d.add(4);
 		}
 	}
-	if cnt.mod8 & 0x2 != 0 {
+	if (cnt.mod8 & 0x2) != 0 {
 		unsafe {
 			(d as *mut u16).write_unaligned(fill64 as u16);
 			d = d.add(2);
 		}
 	}
-	if cnt.mod8 & 0x1 != 0 {
+	if (cnt.mod8 & 0x1) != 0 {
 		unsafe {
 			d.write(byte);
 		}
 	}
 }
 
-/// 等效于 C 标准库 `memcpy(dst, src, size)`。
-/// 优先 8 字节搬移，余数按 {4, 2, 1} 字节递减处理。
 #[allow(unused)]
 pub unsafe fn memcpy(dst: *mut u8, src: *const u8, size: u64) {
 	let cnt = calc_mem_leap(size);
@@ -70,21 +66,21 @@ pub unsafe fn memcpy(dst: *mut u8, src: *const u8, size: u64) {
 	}
 
 	// remainder: 4 / 2 / 1
-	if cnt.mod8 & 0x4 != 0 {
+	if (cnt.mod8 & 0x4) != 0 {
 		unsafe {
 			(d as *mut u32).write_unaligned((s as *const u32).read_unaligned());
 			d = d.add(4);
 			s = s.add(4);
 		}
 	}
-	if cnt.mod8 & 0x2 != 0 {
+	if (cnt.mod8 & 0x2) != 0 {
 		unsafe {
 			(d as *mut u16).write_unaligned((s as *const u16).read_unaligned());
 			d = d.add(2);
 			s = s.add(2);
 		}
 	}
-	if cnt.mod8 & 0x1 != 0 {
+	if (cnt.mod8 & 0x1) != 0 {
 		unsafe {
 			d.write(s.read());
 		}
@@ -93,7 +89,7 @@ pub unsafe fn memcpy(dst: *mut u8, src: *const u8, size: u64) {
 
 #[cfg(test)]
 mod tests {
-	use super::{memcpy, memset};
+	use super::{ memcpy, memset };
 
 	/// 缓冲区总长, 以及其中可供被测函数写入的区间 [REGION_START, REGION_END)。
 	const BUF_LEN: usize = 80;
@@ -101,7 +97,7 @@ mod tests {
 	const REGION_LEN: usize = 64;
 	const REGION_END: usize = REGION_START + REGION_LEN;
 	/// 缓冲区的初值; 写入越出指定区间时, 区间之外的字节不再是该值。
-	const INIT: u8 = 0xA5;
+	const INIT: u8 = 0xa5;
 
 	/// 用 REGION_START 与 REGION_LEN 划出写入区间的缓冲区。
 	struct Buf {
@@ -126,8 +122,8 @@ mod tests {
 
 		/// 指定区间之外的字节是否仍为初值。
 		fn is_outside_intact(&self) -> bool {
-			self.raw[..REGION_START].iter().all(|&b| b == INIT)
-				&& self.raw[REGION_END..].iter().all(|&b| b == INIT)
+			self.raw[..REGION_START].iter().all(|&b| b == INIT) &&
+				self.raw[REGION_END..].iter().all(|&b| b == INIT)
 		}
 	}
 
@@ -137,10 +133,15 @@ mod tests {
 		let mut dst = Buf::new();
 		let src = [0x11u8; REGION_LEN];
 		unsafe {
-			memset(dst.ptr(), 0xAA, 0);
+			memset(dst.ptr(), 0xaa, 0);
 			memcpy(dst.ptr(), src.as_ptr(), 0);
 		}
-		assert!(dst.region().iter().all(|&b| b == INIT));
+		assert!(
+			dst
+				.region()
+				.iter()
+				.all(|&b| b == INIT)
+		);
 		assert!(dst.is_outside_intact());
 	}
 
@@ -149,11 +150,19 @@ mod tests {
 	fn test_memset_covers_the_requested_length() {
 		for size in 0..=REGION_LEN as u64 {
 			let mut dst = Buf::new();
-			unsafe { memset(dst.ptr(), 0xAA, size) };
+			unsafe {
+				memset(dst.ptr(), 0xaa, size);
+			}
 			let n = size as usize;
 			let region = dst.region();
-			assert!(region[..n].iter().all(|&b| b == 0xAA), "size={size}");
-			assert!(region[n..].iter().all(|&b| b == INIT), "size={size}");
+			assert!(
+				region[..n].iter().all(|&b| b == 0xaa),
+				"size={size}"
+			);
+			assert!(
+				region[n..].iter().all(|&b| b == INIT),
+				"size={size}"
+			);
 			assert!(dst.is_outside_intact(), "size={size}");
 		}
 	}
@@ -163,11 +172,13 @@ mod tests {
 	fn test_memset_repeats_the_fill_byte_across_the_word() {
 		for size in [4u64, 5, 6, 7, 8, 9, 15, 16, 17, 23, 31, 33] {
 			let mut dst = Buf::new();
-			unsafe { memset(dst.ptr(), 0xAA, size) };
+			unsafe {
+				memset(dst.ptr(), 0xaa, size);
+			}
 			let n = size as usize;
 			let filled = &dst.region()[..n];
 			assert!(
-				filled.iter().all(|&b| b == 0xAA),
+				filled.iter().all(|&b| b == 0xaa),
 				"size={size} 写入 {filled:02x?}"
 			);
 		}
@@ -180,14 +191,19 @@ mod tests {
 			for size in [1u64, 7, 8, 13] {
 				let mut dst = Buf::new();
 				let p = unsafe { dst.ptr().add(off) };
-				unsafe { memset(p, 0x5A, size) };
+				unsafe {
+					memset(p, 0x5a, size);
+				}
 				let n = size as usize;
 				let region = dst.region();
 				assert!(
-					region[off..off + n].iter().all(|&b| b == 0x5A),
+					region[off..off + n].iter().all(|&b| b == 0x5a),
 					"off={off} size={size}"
 				);
-				assert!(region[..off].iter().all(|&b| b == INIT), "off={off}");
+				assert!(
+					region[..off].iter().all(|&b| b == INIT),
+					"off={off}"
+				);
 				assert!(
 					region[off + n..].iter().all(|&b| b == INIT),
 					"off={off} size={size}"
@@ -205,10 +221,18 @@ mod tests {
 		}
 		for size in 0..=REGION_LEN as u64 {
 			let mut dst = Buf::new();
-			unsafe { memcpy(dst.ptr(), src.as_ptr(), size) };
+			unsafe {
+				memcpy(dst.ptr(), src.as_ptr(), size);
+			}
 			let n = size as usize;
 			assert_eq!(&dst.region()[..n], &src[..n], "size={size}");
-			assert!(dst.region()[n..].iter().all(|&b| b == INIT), "size={size}");
+			assert!(
+				dst
+					.region()
+					[n..].iter()
+					.all(|&b| b == INIT),
+				"size={size}"
+			);
 			assert!(dst.is_outside_intact(), "size={size}");
 		}
 	}
@@ -218,7 +242,7 @@ mod tests {
 	fn test_memcpy_unaligned_ends() {
 		let mut src = [0u8; REGION_LEN];
 		for (i, b) in src.iter_mut().enumerate() {
-			*b = (i as u8) ^ 0x5A;
+			*b = (i as u8) ^ 0x5a;
 		}
 		for src_off in 0..REGION_START {
 			for dst_off in 0..REGION_START {
@@ -227,7 +251,9 @@ mod tests {
 					let n = size as usize;
 					let s = unsafe { src.as_ptr().add(src_off) };
 					let d = unsafe { dst.ptr().add(dst_off) };
-					unsafe { memcpy(d, s, size) };
+					unsafe {
+						memcpy(d, s, size);
+					}
 					assert_eq!(
 						&dst.region()[dst_off..dst_off + n],
 						&src[src_off..src_off + n],

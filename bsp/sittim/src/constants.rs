@@ -2,11 +2,6 @@
 //!
 //! 平台可调常量由 Makefile 从 config.mk 生成 configs_gen.rs 注入。
 //!
-//! 参照：
-//!   ref-emod/emod_manager/config.mk           VA 布局
-//!   smode_entry/ecall_types.h                 ENCLAVE_EXT_ID = 0x20221222
-//!   custom-opensbi/include/enclave_ext/enclave_types.h  函数 ID
-//!
 //! 此文件为完整常量参考，未使用的项目有意保留。
 
 #![allow(dead_code)]
@@ -66,10 +61,10 @@ pub const SCAUSE_STORE_PAGE_FAULT: u64 = 0xf;
 
 /// 该陷态原因是否由 PMP 条目未覆盖访问的物理地址引起.
 ///
-/// 取指与读与写三类访问故障都属此列, 由 S 模式统一转发 M 模式按需装入该地址所属的区域,
-/// 装入后重试原访问. 页错误的取值为 [`SCAUSE_INSTR_PAGE_FAULT`] 与
-/// [`SCAUSE_LOAD_PAGE_FAULT`] 与 [`SCAUSE_STORE_PAGE_FAULT`], 由页表项的权限位判定给出,
-/// 与 PMP 条目无关, 不在此列.
+/// 取指与读与写三类访问故障都属此列, 由 S 模式统一转发 M 模式按需加载该地址所属的区域;
+/// M 模式加载成功才重试原访问, 加载无法使该次访问成立时按故障的来源处置, 见 trap.rs 的
+/// 转发分支. 页错误的取值为 [`SCAUSE_INSTR_PAGE_FAULT`] 与 [`SCAUSE_LOAD_PAGE_FAULT`] 与
+/// [`SCAUSE_STORE_PAGE_FAULT`], 由页表项的权限位判定给出, 与 PMP 条目无关, 不在此列.
 pub const fn is_unmatched_access_fault(scause: u64) -> bool {
 	matches!(
 		scause,
@@ -80,7 +75,6 @@ pub const fn is_unmatched_access_fault(scause: u64) -> bool {
 // ---------------------------------------------------------------
 //  飞地扩展 ID 与函数号
 // ---------------------------------------------------------------
-
 pub const ENCLAVE_EXT_ID: u64 = 0x2022_1222;
 
 pub const ENCLAVE_CALL_SUSPEND: u64 = 404;
@@ -94,15 +88,21 @@ pub const ENCLAVE_CALL_SET_MEM_CLASS: u64 = 510;
 pub const ENCLAVE_CALL_GET_ID: u64 = 407;
 pub const ENCLAVE_CALL_GET_HARTID: u64 = 408;
 pub const ENCLAVE_CALL_GET_AVAILABLE_MEM: u64 = 409;
+/// 转发访问故障: a0 = 故障虚拟地址, a1 = 故障的 scause.
+/// 返回 0 表示 M 模式已加载该地址所属的区域, 重试原访问即可;
+/// 返回 M 模式 enclave_types.h 的 SBI_ERR_ENCLAVE_ACCESS_UNRECOVERABLE, 取值为 -17,
+/// 表示该次访问不可恢复, 重试不会成功.
 pub const ENCLAVE_CALL_UNMATCHED_ACC_FAULT: u64 = 506;
-/// 取随机字节: a0 = 目标物理地址 (本飞地内存), a1 = 字节数; 返回实际写入的字节数.
+/// 取随机字节: a0 = 目标物理地址, a1 = 字节数; 返回实际写入的字节数.
 pub const ENCLAVE_CALL_GET_RAND_NUM: u64 = 507;
 pub const ENCLAVE_CALL_REQUEST_SHUTDOWN: u64 = 410;
 pub const ENCLAVE_CALL_QUERY_REQUESTS: u64 = 411;
-/// 取回本飞地模块请求的结果: a0 = 交付结果 (见 ENCLAVE_MODULE_STATUS_*),
+
+/// 取回本飞地模块请求的结果: a0 = 交付结果,
 /// a1 = 宿主报告的映像字节数, a2 = 映像起始处的物理地址,
 /// a3 = 宿主实际写入的字节数. 读取后 M 模式把交付结果复位为 ENCLAVE_MODULE_STATUS_NONE.
 pub const ENCLAVE_CALL_MODULE_RESULT: u64 = 508;
+
 /// 登记模块映像接收缓冲区: a0 = 缓冲区的起始虚拟地址, a1 = 缓冲区的字节数;
 /// 返回 0 表示登记成功, 非 0 为 SBI 错误码.
 pub const ENCLAVE_CALL_MODULE_IMG_RECV_BUF: u64 = 509;
@@ -110,6 +110,7 @@ pub const ENCLAVE_CALL_MODULE_IMG_RECV_BUF: u64 = 509;
 /// 2 MiB 分区的类别: 该分区只承载数据访问.
 /// 数值与 M 模式 enclave_types.h 的 enum mem_meta_attr 一一对应, 修改需两侧同步.
 pub const ENCLAVE_MEM_ATTR_DATA: u64 = 0;
+
 /// 2 MiB 分区的类别: 该分区会被本飞地作为指令取指.
 pub const ENCLAVE_MEM_ATTR_INSTR: u64 = 1;
 
@@ -185,6 +186,13 @@ pub const CHUNK_2M_PAGES: u64 = CHUNK_2M_SIZE / PAGE_SIZE;
 pub const MEM_ALLOC_BLOCKS_PER_CALL: u64 = 1;
 
 pub const UMODE_STACK_SIZE_TOTAL: u64 = 0x10_0000;
+
+/// Sv39 用户空间的地址上界。VA 小于该值时 VPN[2] 落在根表低半区的索引 0..256, 即全部
+/// 用户空间; 不小于该值的 VA 由运行时自身的线性窗口与管理器 VA 占用。
+///
+/// 用户态的 VA 由硬件按 VPN 的 9 位字段查表, 高于该上界的 VA 与低半区的某个 VA 共用同一
+/// 组页表项, 故越过上界的映射会静默改写别的 VA 的页表项。内存类系统调用据此拒绝越界区间。
+pub const UMODE_VA_LIMIT: u64 = 1 << 38;
 
 // ---------------------------------------------------------------
 //  ELF 常量

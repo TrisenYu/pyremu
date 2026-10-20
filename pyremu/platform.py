@@ -92,7 +92,7 @@ class PlatformConfig:
 
     isa: str = COMPILE_OPTS
     timebase_freq: int = 10_000_000  # 10 MHz
-    pmp_entries: int = 64  # PMP 条目数 (0=禁用, 8/16/64 常见)
+    pmp_entries: int = configs_gen.PMP_ENTRIES  # PMP 条目数 (0 = 禁用), 由 emu-configs.mk 给出
     interrupt_mode: InterruptMode = InterruptMode.LEGACY
     disk_image: str | None = None  # virtio-blk 磁盘镜像路径, None=不挂载
 

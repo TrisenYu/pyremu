@@ -32,15 +32,12 @@ pub struct Manager {
 	pub time_freq: u64,
 }
 
-// ---------------------------------------------------------------
-//  测试
-// ---------------------------------------------------------------
+
 
 #[cfg(test)]
 mod tests {
 	use super::Manager;
 
-	/// 回调集合的尺寸与字段偏移由项数决定, 模块侧按同一布局书写。
 	#[test]
 	fn test_manager_layout_is_fixed() {
 		assert_eq!(core::mem::size_of::<Manager>(), 7 * 8);

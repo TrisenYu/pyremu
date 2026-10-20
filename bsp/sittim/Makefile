@@ -7,7 +7,7 @@
 # configuration: edit config.mk or pass arguments via command line, e.g.
 #   make TIMER_INTERVAL=50000 UART_BASE=0x10011000
 
-CUSTOM_LLVM := /opt/custom-llvm/bin
+CUSTOM_LLVM ?= /opt/custom-llvm/bin
 OBJCOPY    := $(CUSTOM_LLVM)/llvm-objcopy
 CLANG      := $(CUSTOM_LLVM)/clang
 
@@ -30,42 +30,59 @@ phony = all
 
 all: build
 
-link.ld: link.ld.S config.mk Makefile
-	$(CLANG) -E -P -x c -DLINK_BASE=$(LINK_BASE) $< -o $@
+# 无条件执行的目标. 引用它的规则每次调用都重新求值, 内容不变时不改动产物的时间戳.
+FORCE:
+phony += FORCE
+
+# link.ld 由 link.ld.S 经预处理生成. LINK_BASE 可经命令行覆盖, 该来源不改变
+# link.ld.S 的时间戳, 故每次都重新生成, 内容不变时不改动 link.ld 的时间戳.
+link.ld: FORCE
+	$(CLANG) -E -P -x c -DLINK_BASE=$(LINK_BASE) link.ld.S -o $@.tmp
+	@cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
 
 phony += link.ld
 
-# When there is any change in config.mk or Makefile, regenerate constant here.
-src/configs_gen.rs: config.mk Makefile
-	@echo '// generated from config.mk by Makefile — do not edit' > $@
-	@echo 'pub const TIMER_INTERVAL: u64 = $(TIMER_INTERVAL);' >> $@
-	@echo 'pub const TIMER_FREQ: u64 = $(TIMER_FREQ);' >> $@
-	@echo 'pub const TIME_QUOTA: u64 = $(TIME_QUOTA);' >> $@
-	@echo 'pub const UART_BASE: u64 = $(UART_BASE);' >> $@
-	@echo 'pub const UART_TXDATA: u64 = $(UART_TXDATA);' >> $@
-	@echo 'pub const UART_RXDATA: u64 = $(UART_RXDATA);' >> $@
-	@echo 'pub const UART_TXCTRL: u64 = $(UART_TXCTRL);' >> $@
-	@echo 'pub const UART_TXEN: u32 = $(UART_TXEN);' >> $@
-	@echo 'pub const NET_BASE: u64 = $(NET_BASE);' >> $@
-	@echo 'pub const NET_SIZE: u64 = $(NET_SIZE);' >> $@
-	@echo 'pub const SMODE_STACK_SIZE: u64 = $(SMODE_STACK_SIZE);' >> $@
-	@echo 'pub const LINK_BASE: u64 = $(LINK_BASE);' >> $@
-	@echo 'pub const ENCLAVE_MAN_VA_START: u64 = $(ENCLAVE_MAN_VA_START);' >> $@
-	@echo 'pub const ENCLAVE_MODULE_LOAD_VA_INIT: u64 = $(ENCLAVE_MODULE_LOAD_VA_INIT);' >> $@
-	@echo 'pub const ENCLAVE_MODULE_WINDOW_SIZE: u64 = $(ENCLAVE_MODULE_WINDOW_SIZE);' >> $@
-	@echo 'pub const LINEAR_MAP_START: u64 = $(LINEAR_MAP_START);' >> $@
-	@echo 'pub const LINEAR_MAP_SIZE: u64 = $(LINEAR_MAP_SIZE);' >> $@
-	@echo 'pub const LINEAR_MAP_OFFSET: u64 = $(LINEAR_MAP_OFFSET);' >> $@
-	@echo 'pub const UMODE_HEAP_START_ALIGNED: u64 = $(UMODE_HEAP_START_ALIGNED);' >> $@
-	@echo 'pub const UMODE_STACK_TOP_VA: u64 = $(UMODE_STACK_TOP_VA);' >> $@
-	@echo 'pub const UMODE_MMAP_BASE: u64 = $(UMODE_MMAP_BASE);' >> $@
-	@echo 'pub const ATTEST_ENABLE: bool = $(ATTEST_ENABLE);' >> $@
-	@echo 'pub const ATTEST_PUB_KEY: [u8; 33] = [$(ATTEST_PUB_KEY)];' >> $@
+# configs_gen.rs 由 config.mk 生成. 各变量的取值有两个来源: config.mk 的文件内容,
+# 与命令行上的同名变量; 后者不改变任何文件的时间戳, 故每次都重新生成, 内容不变时
+# 不改动文件时间戳, 由 cargo 判定是否重编.
+src/configs_gen.rs: FORCE
+	@rm -f $@.tmp
+	@echo '// generated from config.mk by Makefile — do not edit' > $@.tmp
+	@echo 'pub const TIMER_INTERVAL: u64 = $(TIMER_INTERVAL);' >> $@.tmp
+	@echo 'pub const TIMER_FREQ: u64 = $(TIMER_FREQ);' >> $@.tmp
+	@echo 'pub const TIME_QUOTA: u64 = $(TIME_QUOTA);' >> $@.tmp
+	@echo 'pub const UART_BASE: u64 = $(UART_BASE);' >> $@.tmp
+	@echo 'pub const UART_TXDATA: u64 = $(UART_TXDATA);' >> $@.tmp
+	@echo 'pub const UART_RXDATA: u64 = $(UART_RXDATA);' >> $@.tmp
+	@echo 'pub const UART_TXCTRL: u64 = $(UART_TXCTRL);' >> $@.tmp
+	@echo 'pub const UART_TXEN: u32 = $(UART_TXEN);' >> $@.tmp
+	@echo 'pub const NET_BASE: u64 = $(NET_BASE);' >> $@.tmp
+	@echo 'pub const NET_SIZE: u64 = $(NET_SIZE);' >> $@.tmp
+	@echo 'pub const SMODE_STACK_SIZE: u64 = $(SMODE_STACK_SIZE);' >> $@.tmp
+	@echo 'pub const LINK_BASE: u64 = $(LINK_BASE);' >> $@.tmp
+	@echo 'pub const ENCLAVE_MAN_VA_START: u64 = $(ENCLAVE_MAN_VA_START);' >> $@.tmp
+	@echo 'pub const ENCLAVE_MODULE_LOAD_VA_INIT: u64 = $(ENCLAVE_MODULE_LOAD_VA_INIT);' >> $@.tmp
+	@echo 'pub const ENCLAVE_MODULE_WINDOW_SIZE: u64 = $(ENCLAVE_MODULE_WINDOW_SIZE);' >> $@.tmp
+	@echo 'pub const LINEAR_MAP_START: u64 = $(LINEAR_MAP_START);' >> $@.tmp
+	@echo 'pub const LINEAR_MAP_SIZE: u64 = $(LINEAR_MAP_SIZE);' >> $@.tmp
+	@echo 'pub const LINEAR_MAP_OFFSET: u64 = $(LINEAR_MAP_OFFSET);' >> $@.tmp
+	@echo 'pub const UMODE_HEAP_START_ALIGNED: u64 = $(UMODE_HEAP_START_ALIGNED);' >> $@.tmp
+	@echo 'pub const UMODE_STACK_TOP_VA: u64 = $(UMODE_STACK_TOP_VA);' >> $@.tmp
+	@echo 'pub const UMODE_MMAP_BASE: u64 = $(UMODE_MMAP_BASE);' >> $@.tmp
+	@echo 'pub const ATTEST_ENABLE: bool = $(ATTEST_ENABLE);' >> $@.tmp
+	@echo 'pub const ATTEST_PUB_KEY: [u8; 33] = [$(ATTEST_PUB_KEY)];' >> $@.tmp
+	@cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
 phony += src/configs_gen.rs
 
 
 gen-config: src/configs_gen.rs
 phony += gen-config
+
+# 测试侧的公钥由私钥文件生成, 取值的来源与上一目标相同.
+tests/configs_gen.rs: FORCE
+	@python3 ../../tools/gen_attest_key.py $(ATTEST_PRIV_KEY_PATH) > $@.tmp
+	@cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
+phony += tests/configs_gen.rs
 
 
 check: gen-config link.ld
@@ -78,21 +95,21 @@ build: check
 	@echo "[$(OUTPUT) built successfully]"
 phony += build
 
-# 扩展模块的映像与签名, 由 modules/ 下的独立工作区构建。
 modules:
 	$(MAKE) -C modules
 phony += modules
 
-# 测试须先由 gen-config 生成 src/configs_gen.rs, 该文件被 constants.rs 以 include!
-# 包含, 而 clean 会删除它。
-test: gen-config
+# use gen-config to first generate src/configs_gen.rs,
+# which will be included by constants.rs via include!,
+# while `make clean` can delete it.
+test: gen-config tests/configs_gen.rs
 	cargo test --target $(HOST_TARGET) $(CARGO_FLAGS)
 phony += test
 
 clean:
 	cargo clean
-	rm -f $(OUTPUT) src/configs_gen.rs link.ld
+	rm -f $(OUTPUT) src/configs_gen.rs tests/configs_gen.rs link.ld
 	$(MAKE) -C modules clean
 phony += clean
 
-.PHONY: $(phony) # all build check clean gen-config
+.PHONY: $(phony)

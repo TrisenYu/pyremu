@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
+from pyremu.configs_gen import PYREMU_HAS_SEMIHOSTING
 from pyremu.core.hart import (
     MSTATUS_MIE,
     MSTATUS_MPIE,
@@ -304,7 +305,7 @@ def trap_ecall(
     deliver_trap(hart, cause, tval=hart.pc, is_interrupt=False)
 
 
-# ---- RISC-V semihosting 序列, 沿用 ARM 与 QEMU 的约定 ----
+# ---- RISC-V semihosting 序列
 # 调用序列为 ``slli x0,x0,0x1f; ebreak; srai x0,x0,7``, 其中 a0 存放操作码, a1 存放
 # 参数块指针; marker 指令编码与 Rust 加速执行引擎 handlers.rs 的 SEMIHOSTING_PRE/POST
 # 保持一致.
@@ -427,7 +428,9 @@ def trap_ebreak(
     """EBREAK: 断点异常."""
     # semihosting marker 序列不投递断点 trap, 由 _semihosting_service 内联服务,
     # SYS_EXIT 置停机标记供 run() 返回. 加速执行引擎的处理与此一致, 详见上方注释.
-    if _semihosting_markers_match(hart):
+    # PYREMU_HAS_SEMIHOSTING=0 时该序列按普通 ebreak 投递断点 trap, 固件的探测因此
+    # 判定宿主不支持, 控制台回落到 UART.
+    if PYREMU_HAS_SEMIHOSTING and _semihosting_markers_match(hart):
         _semihosting_service(hart)
         return
     deliver_trap(hart, TrapType.Breakpoint, tval=hart.pc, is_interrupt=False)
@@ -658,7 +661,7 @@ def check_pending_interrupts(hart: HartWithRegs) -> bool:
     - S 模式 + SIE=0: 仅非委派 (M 级) 中断可抢占; 已委派中断被阻塞
     - U 模式: 全部中断全局使能
 
-    中断状态缓存: _int_state_version 跟踪所有中断相关状态变化.
+    中断状态缓存: int_state_version 跟踪所有中断相关状态变化.
     若版本号未变且 mtime 未到下一唤醒点, 直接返回 False (~50ns),
     避免每条指令遍历 CLINT+CSR+PLIC (~1272ns).
     """
@@ -668,8 +671,8 @@ def check_pending_interrupts(hart: HartWithRegs) -> bool:
     ctrl = hart._interrupt_ctrl
 
     # ---- 快速路径: 缓存命中 ----
-    if hart._int_cache_version == hart._int_state_version:
-        next_timer = hart._int_cache_next_timer
+    if hart.int_cache_version == hart.int_state_version.value:
+        next_timer = hart.int_cache_next_timer
         if next_timer == 0 or ctrl.get_mtime() < next_timer:
             return False
 
@@ -713,8 +716,8 @@ def check_pending_interrupts(hart: HartWithRegs) -> bool:
 
     if not has_pending and ext_mip == 0:
         # 无中断挂起则更新缓存供后续快速路径使用
-        hart._int_cache_version = hart._int_state_version
-        hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)
+        hart.int_cache_version = hart.int_state_version.value
+        hart.int_cache_next_timer = _compute_next_timer(hart, ctrl)
         return False
 
     # M 模式且 MIE=0 则关闭全局中断
@@ -798,8 +801,8 @@ def check_pending_interrupts_nested_enabled(
     ctrl = hart._interrupt_ctrl
 
     # ---- 快速路径: 缓存命中 ----
-    if hart._int_cache_version == hart._int_state_version:
-        next_timer = hart._int_cache_next_timer
+    if hart.int_cache_version == hart.int_state_version.value:
+        next_timer = hart.int_cache_next_timer
         if next_timer == 0 or ctrl.get_mtime() < next_timer:
             return False
 
@@ -840,8 +843,8 @@ def check_pending_interrupts_nested_enabled(
 
     if not has_pending and ext_mip == 0:
         # 无中断挂起则更新缓存
-        hart._int_cache_version = hart._int_state_version
-        hart._int_cache_next_timer = _compute_next_timer(hart, ctrl)
+        hart.int_cache_version = hart.int_state_version.value
+        hart.int_cache_next_timer = _compute_next_timer(hart, ctrl)
         return False
 
     if hart.mode == RiscvMode.M and not hart.mie:

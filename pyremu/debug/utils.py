@@ -115,7 +115,9 @@ def read_va_bytes(
     while remain > 0:
         page_off = cur & 0xFFF
         chunk = min(remain, 0x1000 - page_off)
-        ok, pa = translate_addr(hart, cur, is_execute=is_execute)
+        ok, pa = translate_addr(
+            hart, cur, is_execute=is_execute, is_hart_access=False
+        )
         if not ok:
             return None
         data = bus.try_read(pa, chunk)

@@ -87,14 +87,6 @@ impl LoadError {
 			| LoadError::ImgRecvBufRejected => ENOMEM,
 		}
 	}
-
-	/// 该失败是否表示宿主未提供该模块。
-	///
-	/// 只有这一种失败使运行时的粘性标志置位: 其余失败源于映像或接口自身, 映像重新交付
-	/// 之后的下一次调用可以重试取入。
-	pub const fn is_module_absent(self) -> bool {
-		matches!(self, LoadError::NotFound)
-	}
 }
 
 /// 保护模块窗口内下一个空闲 VA 的锁。
@@ -233,11 +225,13 @@ fn load_image(
 	let in_image = |ptr: *const u8, size: usize, align: usize| {
 		is_region_in_image(ptr, size, align, va, MODULE_SLOT_SIZE)
 	};
-	if !in_image(
-		interface.syscalls as *const u8,
-		core::mem::size_of::<SyscallTable>(),
-		core::mem::align_of::<SyscallTable>()
-	) {
+	if
+		!in_image(
+			interface.syscalls as *const u8,
+			core::mem::size_of::<SyscallTable>(),
+			core::mem::align_of::<SyscallTable>()
+		)
+	{
 		return Err(LoadError::BadSyscallTable);
 	}
 	// 操作表的类型由运行时与该模块共同约定, 本处不知道它的尺寸, 故只确认指针本身
@@ -295,7 +289,10 @@ fn open_img_recv_buf(size: u64) -> Result<(u64, u64), LoadError> {
 
 	if rw_pages != 0 {
 		let rw_pa = mem::alloc_adjacent_pages(rw_pages, ENCLAVE_MEM_ATTR_DATA);
-		if rw_pa == !0u64 || !mem::map_pages_at(va + exec_len, rw_pa, rw_pages, PTE_R | PTE_W) {
+		if
+			rw_pa == !0u64 ||
+			!mem::map_pages_at(va + exec_len, rw_pa, rw_pages, PTE_R | PTE_W)
+		{
 			return Err(LoadError::MapFailed);
 		}
 	}
@@ -318,4 +315,42 @@ fn seal_img_recv_buf(va: u64, exec_pa: u64, exec_len: u64) -> bool {
 		}
 	}
 	true
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// 映像与接口的布局不符的四种原因, 以及编号越界这一项。
+	const LAYOUT: [LoadError; 6] = [
+		LoadError::BadModuleId,
+		LoadError::BadImageDesc(DescError::BadMagic),
+		LoadError::AttestFailed,
+		LoadError::IdMismatch,
+		LoadError::BadSyscallTable,
+		LoadError::BadOpsTable,
+	];
+
+	/// 资源不足的五个原因。
+	const RESOURCE: [LoadError; 5] = [
+		LoadError::TooSmall,
+		LoadError::TooLarge,
+		LoadError::ShortWrite,
+		LoadError::MapFailed,
+		LoadError::ImgRecvBufRejected,
+	];
+
+	/// 每种取入失败都归入它所属的错误码, 可信应用据此区分"宿主未提供该模块"与"映像有
+	/// 缺陷": 布局与接口类归 EINVAL, 资源类归 ENOMEM, 未提供归 ENOENT, 正在取入归 EAGAIN。
+	#[test]
+	fn test_to_errno_maps_every_variant() {
+		for err in LAYOUT {
+			assert_eq!(err.to_errno(), EINVAL, "{err:?}");
+		}
+		for err in RESOURCE {
+			assert_eq!(err.to_errno(), ENOMEM, "{err:?}");
+		}
+		assert_eq!(LoadError::NotFound.to_errno(), ENOENT);
+		assert_eq!(LoadError::Loading.to_errno(), EAGAIN);
+	}
 }

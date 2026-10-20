@@ -11,7 +11,7 @@
 use std::fs;
 use std::process::ExitCode;
 
-use p256::ecdsa::signature::hazmat::PrehashSigner;
+use p256::ecdsa::signature::hazmat::{ PrehashSigner, PrehashVerifier };
 use p256::ecdsa::{Signature, SigningKey};
 use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::SecretKey;
@@ -46,9 +46,16 @@ fn run() -> Result<(), String> {
 	// 签名类型须显式给出: `SigningKey` 对定长 r‖s 与 DER 两种签名都实现了
 	// `PrehashSigner`, 仅凭返回值的后续用法无法定下其类型。
 	let digest = Sha256::digest(&input);
-	let signature: Signature = SigningKey::from(&secret)
+	let signer = SigningKey::from(&secret);
+	let signature: Signature = signer
 		.sign_prehash(&digest)
 		.map_err(|err| format!("cannot sign: {err}"))?;
+
+	// 用本签名者对应的公钥验证刚产生的签名, 与 sittim 的 attest::attest_image
+	// 同为 SHA-256 预哈希验证。
+	if signer.verifying_key().verify_prehash(&digest, &signature).is_err() {
+		return Err("the produced signature does not verify".to_string());
+	}
 
 	let signature_bytes = signature.to_bytes();
 	if signature_bytes.len() != SIG_LEN {

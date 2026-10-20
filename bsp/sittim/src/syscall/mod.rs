@@ -30,11 +30,6 @@ use crate::diag;
 use crate::trap_frame::TrapGprs;
 
 use types::*;
-
-// ---------------------------------------------------------------
-//  Errno
-// ---------------------------------------------------------------
-
 pub use errno::*;
 
 // ---------------------------------------------------------------
@@ -139,154 +134,150 @@ pub const SYSNUM_GETRANDOM: u64 = 278;
 /// 陷态栈帧以可变引用传入: rt_sigreturn 需要在调用内改写整个帧以恢复信号投递前的
 /// 寄存器现场, 其余调用只经 a0 传出返回值。
 pub fn syscall_handler(gprs: &mut TrapGprs) -> u64 {
-    let num = gprs.a7();
-    let a0 = gprs.a0();
-    let a1 = gprs.a1();
-    let a2 = gprs.a2();
-    let a3 = gprs.a3();
-    let a4 = gprs.a4();
-    let a5 = gprs.a5();
+	let num = gprs.a7();
+	let a0 = gprs.a0();
+	let a1 = gprs.a1();
+	let a2 = gprs.a2();
+	let a3 = gprs.a3();
+	let a4 = gprs.a4();
+	let a5 = gprs.a5();
 
-    let ret = match num {
-        // ---- I/O / 文件系统 ----
-        SYSNUM_OPENAT => fs::openat_handler(a0, a1, a2, a3),
-        SYSNUM_CLOSE => fs::close_handler(a0),
-        SYSNUM_DUP => fs::dup_handler(a0),
-        SYSNUM_DUP3 => fs::dup3_handler(a0, a1, a2),
-        SYSNUM_LSEEK => fs::lseek_handler(a0, a1, a2),
-        SYSNUM_READ => fs::read_handler(a0, a1 as *mut u8, a2),
-        SYSNUM_WRITE => fs::write_handler(a0, a1 as *const u8, a2),
-        SYSNUM_READV => fs::readv_handler(a0, a1, a2),
-        SYSNUM_WRITEV => fs::writev_handler(a0, a1, a2),
-        SYSNUM_PREAD => fs::pread64_handler(a0, a1 as *mut u8, a2, a3),
-        SYSNUM_PWRITE => fs::pwrite64_handler(a0, a1 as *const u8, a2, a3),
-        SYSNUM_FSTATAT => fs::fstatat_handler(a0, a1, a2, a3),
-        SYSNUM_FSTAT => fs::fstat_handler(a0, a1),
-        SYSNUM_GETDENTS => fs::getdents_handler(a0, a1 as *mut u8, a2),
-        SYSNUM_GETCWD => fs::getcwd_handler(a0, a1),
-        SYSNUM_MKDIRAT => fs::mkdirat_handler(a0, a1, a2),
-        SYSNUM_UNLINKAT => fs::unlinkat_handler(a0, a1, a2),
-        SYSNUM_FACCESSAT => fs::faccessat_handler(a0, a1, a2, a3),
-        SYSNUM_FCNTL => fs::fcntl_handler(a0, a1, a2),
-        SYSNUM_FSYNC => fs::fsync_handler(a0),
-        SYSNUM_FTRUNCATE => fs::ftruncate_handler(a0, a1),
-        SYSNUM_PPOLL => fs::ppoll_handler(a0, a1, a2),
+	let ret = match num {
+		// ---- I/O / 文件系统 ----
+		SYSNUM_OPENAT => fs::openat_handler(a0, a1, a2, a3),
+		SYSNUM_CLOSE => fs::close_handler(a0),
+		SYSNUM_DUP => fs::dup_handler(a0),
+		SYSNUM_DUP3 => fs::dup3_handler(a0, a1, a2),
+		SYSNUM_LSEEK => fs::lseek_handler(a0, a1, a2),
+		SYSNUM_READ => fs::read_handler(a0, a1 as *mut u8, a2),
+		SYSNUM_WRITE => fs::write_handler(a0, a1 as *const u8, a2),
+		SYSNUM_READV => fs::readv_handler(a0, a1, a2),
+		SYSNUM_WRITEV => fs::writev_handler(a0, a1, a2),
+		SYSNUM_PREAD => fs::pread64_handler(a0, a1 as *mut u8, a2, a3),
+		SYSNUM_PWRITE => fs::pwrite64_handler(a0, a1 as *const u8, a2, a3),
+		SYSNUM_FSTATAT => fs::fstatat_handler(a0, a1, a2, a3),
+		SYSNUM_FSTAT => fs::fstat_handler(a0, a1),
+		SYSNUM_GETDENTS => fs::getdents_handler(a0, a1 as *mut u8, a2),
+		SYSNUM_GETCWD => fs::getcwd_handler(a0, a1),
+		SYSNUM_MKDIRAT => fs::mkdirat_handler(a0, a1, a2),
+		SYSNUM_UNLINKAT => fs::unlinkat_handler(a0, a1, a2),
+		SYSNUM_FACCESSAT => fs::faccessat_handler(a0, a1, a2, a3),
+		SYSNUM_FCNTL => fs::fcntl_handler(a0, a1, a2),
+		SYSNUM_FSYNC => fs::fsync_handler(a0),
+		SYSNUM_FTRUNCATE => fs::ftruncate_handler(a0, a1),
+		SYSNUM_PPOLL => fs::ppoll_handler(a0, a1, a2),
 
-        // ---- 随机数 ----
-        SYSNUM_GETRANDOM => self::rand::getrandom_handler(a0 as *mut u8, a1, a2),
+		// ---- 随机数 ----
+		SYSNUM_GETRANDOM => self::rand::getrandom_handler(a0 as *mut u8, a1, a2),
 
-        // ---- 套接字 ----
-        SYSNUM_SOCKET => net::socket_handler(a0, a1, a2),
-        SYSNUM_BIND => net::bind_handler(a0, a1, a2),
-        SYSNUM_CONNECT => net::connect_handler(a0, a1, a2),
-        SYSNUM_GETSOCKNAME => net::getsockname_handler(a0, a1, a2),
-        SYSNUM_GETPEERNAME => net::getpeername_handler(a0, a1, a2),
-        SYSNUM_SENDTO => net::sendto_handler(a0, a1, a2, a3, a4, a5),
-        SYSNUM_RECVFROM => net::recvfrom_handler(a0, a1, a2, a3, a4, a5),
-        SYSNUM_SETSOCKOPT => net::setsockopt_handler(a0, a1, a2, a3, a4),
-        SYSNUM_GETSOCKOPT => net::getsockopt_handler(a0, a1, a2, a3, a4),
-        SYSNUM_SHUTDOWN => net::shutdown_handler(a0, a1),
-        SYSNUM_SENDMSG => net::sendmsg_handler(a0, a1, a2),
-        SYSNUM_RECVMSG => net::recvmsg_handler(a0, a1, a2),
-        // socketpair 只服务 AF_UNIX, listen 与 accept4 只服务 SOCK_STREAM,
-        // 三者在本轮的 AF_INET 的 SOCK_DGRAM 范围内均无对应实现。
-        SYSNUM_SOCKETPAIR | SYSNUM_LISTEN | SYSNUM_ACCEPT4 => EOPNOTSUPP,
+		// ---- 套接字 ----
+		SYSNUM_SOCKET => net::socket_handler(a0, a1, a2),
+		SYSNUM_BIND => net::bind_handler(a0, a1, a2),
+		SYSNUM_CONNECT => net::connect_handler(a0, a1, a2),
+		SYSNUM_GETSOCKNAME => net::getsockname_handler(a0, a1, a2),
+		SYSNUM_GETPEERNAME => net::getpeername_handler(a0, a1, a2),
+		SYSNUM_SENDTO => net::sendto_handler(a0, a1, a2, a3, a4, a5),
+		SYSNUM_RECVFROM => net::recvfrom_handler(a0, a1, a2, a3, a4, a5),
+		SYSNUM_SETSOCKOPT => net::setsockopt_handler(a0, a1, a2, a3, a4),
+		SYSNUM_GETSOCKOPT => net::getsockopt_handler(a0, a1, a2, a3, a4),
+		SYSNUM_SHUTDOWN => net::shutdown_handler(a0, a1),
+		SYSNUM_SENDMSG => net::sendmsg_handler(a0, a1, a2),
+		SYSNUM_RECVMSG => net::recvmsg_handler(a0, a1, a2),
+		// socketpair 只服务 AF_UNIX, listen 与 accept4 只服务 SOCK_STREAM,
+		// 三者在本轮的 AF_INET 的 SOCK_DGRAM 范围内均无对应实现。
+		SYSNUM_SOCKETPAIR | SYSNUM_LISTEN | SYSNUM_ACCEPT4 => EOPNOTSUPP,
 
-        // ---- 进程控制 ----
-        // exit(93) 仅终止当前线程; exit_group(94) 终止整个线程组 (进程)。
-        SYSNUM_EXIT => concurrency::thread::exit_handler(a0),
-        SYSNUM_EXIT_GROUP => concurrency::proc::exit_group_handler(a0),
-        SYSNUM_CLONE => concurrency::thread::clone_handler(gprs, a0, a1, a2, a3, a4),
-        SYSNUM_SCHED_YIELD => concurrency::thread::sched_yield_handler(),
-        SYSNUM_SET_TID_ADDRESS => concurrency::thread::set_tid_address_handler(a0),
-        SYSNUM_FUTEX => concurrency::thread::futex_handler(a0, a1, a2, a3, a4),
-        SYSNUM_WAIT4 => concurrency::proc::wait4_handler(a0, a1, a2, a3),
-        SYSNUM_SETITIMER => concurrency::proc::setitimer_handler(a0, a1, a2),
-        SYSNUM_NANOSLEEP => concurrency::thread::nanosleep_handler(a0, a1),
+		// ---- 进程控制 ----
+		// exit(93) 仅终止当前线程; exit_group(94) 终止整个线程组 (进程)。
+		SYSNUM_EXIT => concurrency::thread::exit_handler(a0),
+		SYSNUM_EXIT_GROUP => concurrency::proc::exit_group_handler(a0),
+		SYSNUM_CLONE => concurrency::thread::clone_handler(gprs, a0, a1, a2, a3, a4),
+		SYSNUM_SCHED_YIELD => concurrency::thread::sched_yield_handler(),
+		SYSNUM_SET_TID_ADDRESS => concurrency::thread::set_tid_address_handler(a0),
+		SYSNUM_FUTEX => concurrency::thread::futex_handler(a0, a1, a2, a3, a4),
+		SYSNUM_WAIT4 => concurrency::proc::wait4_handler(a0, a1, a2, a3),
+		SYSNUM_SETITIMER => concurrency::proc::setitimer_handler(a0, a1, a2),
+		SYSNUM_NANOSLEEP => concurrency::thread::nanosleep_handler(a0, a1),
 
-        // ---- 信号 ----
-        SYSNUM_KILL => concurrency::proc::kill_handler(a0, a1),
-        SYSNUM_TKILL => concurrency::proc::tkill_handler(a0, a1),
-        SYSNUM_TGKILL => concurrency::proc::tgkill_handler(a0, a1, a2),
-        SYSNUM_RT_SIGACTION => concurrency::proc::sigaction_handler(a0, a1, a2, a3),
-        SYSNUM_SIGPROCMASK => concurrency::proc::sigprocmask_handler(a0, a1, a2, a3),
-        SYSNUM_RT_SIGRETURN => concurrency::proc::sigreturn_handler(gprs),
+		// ---- 信号 ----
+		SYSNUM_KILL => concurrency::proc::kill_handler(a0, a1),
+		SYSNUM_TKILL => concurrency::proc::tkill_handler(a0, a1),
+		SYSNUM_TGKILL => concurrency::proc::tgkill_handler(a0, a1, a2),
+		SYSNUM_RT_SIGACTION => concurrency::proc::sigaction_handler(a0, a1, a2, a3),
+		SYSNUM_SIGPROCMASK => concurrency::proc::sigprocmask_handler(a0, a1, a2, a3),
+		SYSNUM_RT_SIGRETURN => concurrency::proc::sigreturn_handler(gprs),
 
-        // ---- 内存 ----
-        SYSNUM_BRK => mem::sys_brk_handler(a0),
-        SYSNUM_MMAP => mmap::mmap_handler(a0, a1, a2, a3, a4, a5),
-        SYSNUM_MUNMAP => mmap::munmap_handler(a0, a1),
-        SYSNUM_MREMAP => mmap::mremap_handler(a0, a1, a2, a3, a4),
-        SYSNUM_MPROTECT => mmap::mprotect_handler(a0, a1, a2),
+		// ---- 内存 ----
+		SYSNUM_BRK => mem::sys_brk_handler(a0),
+		SYSNUM_MMAP => mmap::mmap_handler(a0, a1, a2, a3, a4, a5),
+		SYSNUM_MUNMAP => mmap::munmap_handler(a0, a1),
+		SYSNUM_MREMAP => mmap::mremap_handler(a0, a1, a2, a3, a4),
+		SYSNUM_MPROTECT => mmap::mprotect_handler(a0, a1, a2),
 
-        // ---- 标识 ----
-        SYSNUM_UNAME => proc::uname_handler(a0 as *mut Utsname),
-        SYSNUM_GETPID => concurrency::proc::getpid_handler(),
-        SYSNUM_GETPPID => concurrency::proc::getppid_handler(),
-        SYSNUM_GETTID => concurrency::thread::gettid_handler(),
-        SYSNUM_GETUID => 0,
-        SYSNUM_GETEUID => 0,
-        SYSNUM_GETGID => 0,
-        SYSNUM_GETEGID => 0,
+		// ---- 标识 ----
+		SYSNUM_UNAME => proc::uname_handler(a0 as *mut Utsname),
+		SYSNUM_GETPID => concurrency::proc::getpid_handler(),
+		SYSNUM_GETPPID => concurrency::proc::getppid_handler(),
+		SYSNUM_GETTID => concurrency::thread::gettid_handler(),
+		SYSNUM_GETUID => 0,
+		SYSNUM_GETEUID => 0,
+		SYSNUM_GETGID => 0,
+		SYSNUM_GETEGID => 0,
 
-        // ---- 时间 ----
-        SYSNUM_GETTIMEOFDAY => proc::gettimeofday_handler(a0 as *mut Timeval),
-        SYSNUM_CLOCK_GETTIME => proc::clock_gettime_handler(a0, a1 as *mut Timespec),
-        SYSNUM_TIMES => proc::times_handler(a0 as *mut Tms),
+		// ---- 时间 ----
+		SYSNUM_GETTIMEOFDAY => proc::gettimeofday_handler(a0 as *mut Timeval),
+		SYSNUM_CLOCK_GETTIME => proc::clock_gettime_handler(a0, a1 as *mut Timespec),
+		SYSNUM_TIMES => proc::times_handler(a0 as *mut Tms),
 
-        // ---- 资源 ----
-        SYSNUM_GETRUSAGE => proc::getrusage_handler(a1 as *mut Rusage),
-        SYSNUM_GETCPU => proc::getcpu_handler(a0 as *mut u32, a1 as *mut u32),
-        SYSNUM_PRLIMIT64 => {
-            proc::prlimit64_handler(a0, a1 as *const Rlimit, a2 as *mut Rlimit)
-        }
-        SYSNUM_SYSINFO => proc::sysinfo_handler(a0 as *mut Sysinfo),
+		// ---- 资源 ----
+		SYSNUM_GETRUSAGE => proc::getrusage_handler(a1 as *mut Rusage),
+		SYSNUM_GETCPU => proc::getcpu_handler(a0 as *mut u32, a1 as *mut u32),
+		SYSNUM_PRLIMIT64 => {
+			proc::prlimit64_handler(a0, a1 as *const Rlimit, a2 as *mut Rlimit)
+		}
+		SYSNUM_SYSINFO => proc::sysinfo_handler(a0 as *mut Sysinfo),
 
-        // ---- 跳过 (无副作用) ----
-        SYSNUM_IOCTL
-        | SYSNUM_STATFS
-        | SYSNUM_FCHOWN
-        | SYSNUM_VHANGUP
-        | SYSNUM_SCHED_SETAFFINITY
-        | SYSNUM_SCHED_GETAFFINITY
-        | SYSNUM_SIGNALSTACK
-        | SYSNUM_SETPGID
-        | SYSNUM_GETPGID
-        | SYSNUM_SETSID
-        | SYSNUM_UMASK
-        | SYSNUM_PRCTL
-        | SYSNUM_FADVISE64
-        | SYSNUM_MSYNC
-        | SYSNUM_MADVISE => 0,
+		// ---- 跳过 (无副作用) ----
+		| SYSNUM_IOCTL
+		| SYSNUM_STATFS
+		| SYSNUM_FCHOWN
+		| SYSNUM_VHANGUP
+		| SYSNUM_SCHED_SETAFFINITY
+		| SYSNUM_SCHED_GETAFFINITY
+		| SYSNUM_SIGNALSTACK
+		| SYSNUM_SETPGID
+		| SYSNUM_GETPGID
+		| SYSNUM_SETSID
+		| SYSNUM_UMASK
+		| SYSNUM_PRCTL
+		| SYSNUM_FADVISE64
+		| SYSNUM_MSYNC
+		| SYSNUM_MADVISE => 0,
 
-        // ---- 未知 ----
-        _ => {
-            #[cfg(feature = "diagnostic")]
-            diag::log(format_args!("syscall: unknown {}\n", num));
-            ENOSYS
-        }
-    };
+		// ---- 未知 ----
+		_ => ENOSYS,
+	};
 
-    ret
+	// 中断路径到达的网卡事件: 该路径不得让出宿主, 网络模块尚未载入时无法按协议栈执行, 只能
+	// 记入待处理标志。此处尝试在载入网络模块后消耗。
+	concurrency::sched::check_pending_net_event();
+
+	ret
 }
 
-// ---------------------------------------------------------------
-//  载荷镜像末尾的宿主文件清单 (compound payload trailer)
-// ---------------------------------------------------------------
-
-/// trailer 固定长度 (magic 8 字节 + 四个 u32 偏移/长度)。
+/// 固定长度 (magic 8 字节 + 四个 u32 偏移/长度)。
 const MANIFEST_TRAILER: u64 = 24;
-/// trailer 起始 8 字节的识别魔数。
+/// 起始 8 字节的识别魔数。
 const MANIFEST_MAGIC: &[u8; 8] = b"VSFMANIF";
 
 /// 从物理地址 *p* 读取小端 u32。
 #[inline]
 unsafe fn read_u32_le(p: *const u8) -> u32 {
-    let mut b = [0u8; 4];
-    for i in 0..4 {
-        b[i] = unsafe { p.add(i).read_volatile() };
-    }
-    u32::from_le_bytes(b)
+	let mut b = [0u8; 4];
+	for i in 0..4 {
+		b[i] = unsafe { p.add(i).read_volatile() };
+	}
+	u32::from_le_bytes(b)
 }
 
 /// 解析载荷镜像末尾的宿主文件清单, 把 (path, data) 逐条注入文件系统。
@@ -302,38 +293,43 @@ unsafe fn read_u32_le(p: *const u8) -> u32 {
 /// 返回注入的文件数 (0 或 1)。无合法清单、越界或注入失败时返回 0, 不中断启动:
 /// 多数载荷不含清单, 这是常态而非错误。
 pub fn inject_manifest(payload_pa: u64, payload_size: u64) -> usize {
-    if payload_size < MANIFEST_TRAILER {
-        return 0;
-    }
-    // MMU 已开, 载荷物理区经 LINEAR_MAP_OFFSET 别名可读。
-    let base = payload_pa.wrapping_add(LINEAR_MAP_OFFSET);
-    let trailer = (base + payload_size - MANIFEST_TRAILER) as *const u8;
+	if payload_size < MANIFEST_TRAILER {
+		return 0;
+	}
+	// MMU 已开, 载荷物理区经 LINEAR_MAP_OFFSET 别名可读。
+	let base = payload_pa.wrapping_add(LINEAR_MAP_OFFSET);
+	let trailer = (base + payload_size - MANIFEST_TRAILER) as *const u8;
 
-    unsafe {
-        for i in 0..MANIFEST_MAGIC.len() {
-            if trailer.add(i).read_volatile() != MANIFEST_MAGIC[i] {
-                return 0;
-            }
-        }
-        let path_off = read_u32_le(trailer.add(8)) as u64;
-        let path_len = read_u32_le(trailer.add(12)) as u64;
-        let data_off = read_u32_le(trailer.add(16)) as u64;
-        let data_len = read_u32_le(trailer.add(20)) as u64;
+	unsafe {
+		for i in 0..MANIFEST_MAGIC.len() {
+			if trailer.add(i).read_volatile() != MANIFEST_MAGIC[i] {
+				return 0;
+			}
+		}
+		let path_off = read_u32_le(trailer.add(8)) as u64;
+		let path_len = read_u32_le(trailer.add(12)) as u64;
+		let data_off = read_u32_le(trailer.add(16)) as u64;
+		let data_len = read_u32_le(trailer.add(20)) as u64;
 
-        // 越界保护: 偏移 + 长度不得越过载荷镜像末尾 (trailer 起点)。
-        if path_off + path_len > payload_size - MANIFEST_TRAILER
-            || data_off + data_len > payload_size - MANIFEST_TRAILER
-        {
-            return 0;
-        }
-        let path =
-            core::slice::from_raw_parts((base + path_off) as *const u8, path_len as usize);
-        let data =
-            core::slice::from_raw_parts((base + data_off) as *const u8, data_len as usize);
-        if fs::vfs_inject_file(path, data) {
-            1
-        } else {
-            0
-        }
-    }
+		// 越界保护: 偏移 + 长度不得越过载荷镜像末尾 (trailer 起点)。
+		if
+			path_off + path_len > payload_size - MANIFEST_TRAILER ||
+			data_off + data_len > payload_size - MANIFEST_TRAILER
+		{
+			return 0;
+		}
+		let path = core::slice::from_raw_parts(
+			(base + path_off) as *const u8,
+			path_len as usize
+		);
+		let data = core::slice::from_raw_parts(
+			(base + data_off) as *const u8,
+			data_len as usize
+		);
+		if fs::vfs_inject_file(path, data) {
+			1
+		} else {
+			0
+		}
+	}
 }

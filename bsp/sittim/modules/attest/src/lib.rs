@@ -25,7 +25,7 @@ use abi::{
 };
 use man::Manager;
 
-/// 模块编号, 与 ref-impl/emod 的 `EMODULE_ID_DUMMY` 取同一值。
+/// 模块编号。
 const MODULE_ID: u32 = 7;
 
 /// 模块名, 不足 [`MODULE_NAME_LEN`] 的部分以 0 填充。

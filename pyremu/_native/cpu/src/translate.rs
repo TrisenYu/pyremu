@@ -19,6 +19,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::mmu::{pte_parse, sv39_decompose_va};
+use crate::pmp::{pmp_ok, PmpCtx};
 use crate::state::{riscv_mode, HartState, TlbEntry, CFG_NO_TLB, TLB_ENTRIES};
 
 // ============================================================
@@ -32,10 +33,10 @@ pub struct WalkCtx {
 	pub ram_base: u64,
 	pub shadow_base: u64,
 	pub shadow_size: u64,
-	/// Global TLB generation counter.  Hart checks this each instruction
-	/// boundary; on mismatch, it marks its own TLB entries dirty (not flush),
-	/// forcing re-walk on next access.
-	pub tlb_gen: *const AtomicU64,
+	/// 已发生的 TLB 刷新次数. 各 hart 在取下一条指令之前比较该计数与自己上次
+	/// 见到的取值, 不相等即把自己的条目全部标为陈旧. 条目不被丢弃, 下一次访问
+	/// 重走页表, 仍然有效的翻译得以保留.
+	pub tlb_flush_cnt: *const AtomicU64,
 	/// Per-hart LR reservation slots (indexed by hart_id).
 	/// LR sets `lr_reserved[hid] = pa`; any store clears all slots.
 	/// Allocated in ``ModuleState``, pointer passed through FFI.
@@ -56,6 +57,130 @@ pub struct TranslateResult {
 pub enum TranslateFault {
 	PageFault(u64), // cause code (12=Instr, 13=Load, 15=Store)
 	AccessFault,
+}
+
+// ============================================================
+//  Access kind: rwx
+// ============================================================
+
+/// 访问类别的位: 读权限、写权限、执行权限.
+///
+/// 一次访问由这三位的组合给出, 即 `translate_va` 的 `rwx` 参数. 三种访问由
+/// 三个构造函数给出, 判定取 `has_read` / `has_write` / `has_exec`.
+pub const RWX_READ: u8 = 0b001;
+pub const RWX_WRITE: u8 = 0b010;
+pub const RWX_EXEC: u8 = 0b100;
+
+/// 数据读取访问.
+#[inline]
+pub fn rwx_read() -> u8 {
+	RWX_READ
+}
+
+/// 数据写入访问. 写访问同时要求页面的读权限, 故取值为读位与写位.
+#[inline]
+pub fn rwx_write() -> u8 {
+	RWX_READ | RWX_WRITE
+}
+
+/// 取指访问.
+#[inline]
+pub fn rwx_exec() -> u8 {
+	RWX_EXEC
+}
+
+/// 本次访问是否请求读权限.
+#[inline]
+pub fn has_read(rwx: u8) -> bool {
+	rwx & RWX_READ != 0
+}
+
+/// 本次访问是否请求写权限.
+#[inline]
+pub fn has_write(rwx: u8) -> bool {
+	rwx & RWX_WRITE != 0
+}
+
+/// 本次访问是否请求执行权限.
+#[inline]
+pub fn has_exec(rwx: u8) -> bool {
+	rwx & RWX_EXEC != 0
+}
+
+/// 本次访问要求页表项具备的权限位.
+///
+/// 取指不要求 R 位: RISC-V 允许 X-only 页 (R=0, W=0, X=1) 被取指, X 检查由
+/// `translate_va` 的 `check_pte_perm` 后置完成. 数据读取在 `mstatus.MXR` 置位时
+/// 同样不要求 R 位: 此时仅可执行的页可被读取, R 与 X 的判定同样后置完成. 其余
+/// 情形数据读取要求 R. 数据写入要求 R 与 W, 与 MXR 无关.
+#[inline]
+fn pte_perm_needed(rwx: u8, is_mxr: bool) -> u64 {
+	let mut need = 0u64;
+	if has_read(rwx) && !has_exec(rwx) && !is_mxr {
+		need |= PTE_R;
+	}
+	if has_write(rwx) {
+		need |= PTE_R | PTE_W;
+	}
+	need
+}
+
+/// 记一次 TLB 翻译结果. 命中含权限检查未通过的命中: 该情形下 TLB 已给出翻译.
+#[inline]
+fn record_tlb_access(state: &mut HartState, is_execute: bool, is_hit: bool) {
+	let counter = match (is_execute, is_hit) {
+		(true, true) => &mut state.itlb_hits,
+		(true, false) => &mut state.itlb_misses,
+		(false, true) => &mut state.dtlb_hits,
+		(false, false) => &mut state.dtlb_misses,
+	};
+	*counter = counter.wrapping_add(1);
+}
+
+/// 查询 TLB 并记录本次翻译结果, 供 translate_va 在未命中时继续页表遍历.
+///
+/// CFG_NO_TLB 为真时不做查询也不记录, 一律按未命中处理.
+#[inline]
+fn tlb_probe_counted(
+	state: &mut HartState,
+	ctx: &WalkCtx,
+	va: u64,
+	vpn: u64,
+	asid: u16,
+	eff_mode: u8,
+	is_write: bool,
+	is_execute: bool,
+) -> TlbProbeResult {
+	if CFG_NO_TLB {
+		// CFG_NO_TLB 为真时 TLB 查询与插入一并跳过, 每次地址翻译都完整遍历
+		// Sv39 页表, 用于隔离地址翻译相关的性能问题. 该常量由 emu-configs.mk
+		// 经 Makefile 生成到 configs_gen.rs, 与 Python 侧读取的 PYREMU_NO_TLB
+		// 取同一值.
+		return TlbProbeResult::Walk(None);
+	}
+	let tlb = if is_execute {
+		&mut state.itlb
+	} else {
+		&mut state.dtlb
+	};
+	let probe = tlb_probe(
+		tlb,
+		vpn,
+		va,
+		asid,
+		if ctx.tlb_flush_cnt.is_null() {
+			None
+		} else {
+			Some(unsafe { &*ctx.tlb_flush_cnt })
+		},
+		eff_mode,
+		state.mstatus,
+		is_write,
+		is_execute,
+	);
+	let is_hit = !matches!(probe, TlbProbeResult::Walk(_));
+	record_tlb_access(state, is_execute, is_hit);
+	probe
 }
 
 // ============================================================
@@ -285,146 +410,195 @@ const SATP_MODE_SV39: u64 = 8;
 //  Sv39 3-level page-table walk — extracted helpers
 // ============================================================
 
+/// 读取一个页表项, 读取之前先经 PMP 检查.
+///
+/// hart 隐式读取页表页, 与显式访存受同一组 PMP 条目约束, 权限一律按读取判定,
+/// 特权级与 mstatus 取本次遍历发生时的取值. 被拒绝时返回
+/// `TranslateFault::AccessFault`, 由 `translate_va` 的调用方按原访问的类型投递
+/// 访问故障: 取指为 1, 读取为 5, 写入为 7, tval 取原访问的虚拟地址.
+#[inline]
+fn read_pte_checked(
+	state: &HartState,
+	pmp: &PmpCtx,
+	ctx: &WalkCtx,
+	addr: u64,
+) -> Result<u64, TranslateFault> {
+	if !pmp_ok(state, addr, 8, false, false, pmp) {
+		return Err(TranslateFault::AccessFault);
+	}
+	Ok(read_pte(ctx, addr))
+}
+
+/// 写入页表项之前先经 PMP 检查.
+///
+/// 遍历中置位页表项的 A 位与 D 位, 是 hart 在页表遍历期间对页表页发起的物理写入,
+/// 与遍历读取页表页受同一组 PMP 条目约束, 权限按写入判定. 被拒绝时返回
+/// `TranslateFault::AccessFault`, 由调用方按原访问的类型投递访问故障.
+#[inline]
+fn write_pte_cas_checked(
+	state: &HartState,
+	pmp: &PmpCtx,
+	ctx: &WalkCtx,
+	addr: u64,
+	expected: u64,
+	new_val: u64,
+) -> Result<bool, TranslateFault> {
+	if new_val == expected {
+		return Ok(true);
+	}
+	if !pmp_ok(state, addr, 8, true, false, pmp) {
+		return Err(TranslateFault::AccessFault);
+	}
+	Ok(write_pte_cas(ctx, addr, expected, new_val))
+}
+
 /// Read and validate the L2 (root) PTE; set A bit.
 /// Returns the raw value and parsed PTE on success.
-fn walk_l2(ctx: &WalkCtx, root_ppn: u64, vpn2: u64) -> Option<(u64, crate::mmu::PteFields)> {
+fn walk_l2(
+	ctx: &WalkCtx,
+	state: &HartState,
+	pmp: &PmpCtx,
+	root_ppn: u64,
+	vpn2: u64,
+) -> Result<Option<(u64, crate::mmu::PteFields)>, TranslateFault> {
 	let addr = (root_ppn << 12).wrapping_add(vpn2 * 8);
-	let raw = read_pte(ctx, addr);
+	let raw = read_pte_checked(state, pmp, ctx, addr)?;
 	let pte = pte_parse(raw);
 	if pte.v == 0 || pte.is_leaf == 0 && pte.is_ptr == 0 {
-		return None;
+		return Ok(None);
 	}
-	if raw & PTE_A == 0 {
-		if !write_pte_cas(ctx, addr, raw, raw | PTE_A) {
-			let raw2 = read_pte(ctx, addr);
-			let pte2 = pte_parse(raw2);
-			if pte2.v == 0 || pte2.is_leaf == 0 && pte2.is_ptr == 0 {
-				return None;
-			}
-			return Some((raw2, pte2));
+	if raw & PTE_A != 0 {
+		return Ok(Some((raw, pte)));
+	}
+	if !write_pte_cas_checked(state, pmp, ctx, addr, raw, raw | PTE_A)? {
+		let raw2 = read_pte_checked(state, pmp, ctx, addr)?;
+		let pte2 = pte_parse(raw2);
+		if pte2.v == 0 || pte2.is_leaf == 0 && pte2.is_ptr == 0 {
+			return Ok(None);
 		}
+		return Ok(Some((raw2, pte2)));
 	}
-	Some((raw, pte))
+	Ok(Some((raw, pte)))
 }
 
 /// From a valid L2 pointer, read L1; return `(raw, pte)` or `None`.
 /// Sets A bit atomically on the L1 PTE.
-fn walk_l1(ctx: &WalkCtx, l2_ppn: u64, vpn1: u64) -> Option<(u64, crate::mmu::PteFields)> {
+fn walk_l1(
+	ctx: &WalkCtx,
+	state: &HartState,
+	pmp: &PmpCtx,
+	l2_ppn: u64,
+	vpn1: u64,
+) -> Result<Option<(u64, crate::mmu::PteFields)>, TranslateFault> {
 	let addr = (l2_ppn << 12).wrapping_add(vpn1 * 8);
-	let raw = read_pte(ctx, addr);
+	let raw = read_pte_checked(state, pmp, ctx, addr)?;
 	let pte = pte_parse(raw);
 	if pte.v == 0 || pte.is_leaf == 0 && pte.is_ptr == 0 {
-		return None;
+		return Ok(None);
 	}
-	if raw & PTE_A == 0 {
-		if !write_pte_cas(ctx, addr, raw, raw | PTE_A) {
-			let raw2 = read_pte(ctx, addr);
-			let pte2 = pte_parse(raw2);
-			if pte2.v == 0 || pte2.is_leaf == 0 && pte2.is_ptr == 0 {
-				return None;
-			}
-			return Some((raw2, pte2));
+	if raw & PTE_A != 0 {
+		return Ok(Some((raw, pte)));
+	}
+	if !write_pte_cas_checked(state, pmp, ctx, addr, raw, raw | PTE_A)? {
+		let raw2 = read_pte_checked(state, pmp, ctx, addr)?;
+		let pte2 = pte_parse(raw2);
+		if pte2.v == 0 || pte2.is_leaf == 0 && pte2.is_ptr == 0 {
+			return Ok(None);
 		}
+		return Ok(Some((raw2, pte2)));
 	}
-	Some((raw, pte))
+	Ok(Some((raw, pte)))
 }
 
 /// Handle an L1 leaf (2 MiB superpage): check permissions, set A+D, assemble PA.
 fn walk_l1_leaf(
 	ctx: &WalkCtx,
+	state: &HartState,
+	pmp: &PmpCtx,
 	l1_addr: u64,
 	l1_raw: u64,
 	l1_ppn: u64,
 	perm: u8,
 	vpn0: u64,
 	offset: u64,
-	is_write: bool,
-	is_execute: bool,
-) -> Option<TranslateResult> {
-	// 取指不要求 R 位 — RISC-V 允许 X-only 页 (R=0, W=0, X=1) 被取指,
-	// X 检查由 translate_va 的 check_pte_perm 后置完成. 修复前此处对取指
-	// 也强制 PTE_R, 导致 runtime 的 X-only text (trap_vector 高 VA 映射)
-	// 取指被误判 InstrPageFault (Batch-20 trap loop 根因).
-	let need_perm = if is_write {
-		PTE_R | PTE_W
-	} else if is_execute {
-		0
-	} else {
-		PTE_R
-	};
+	rwx: u8,
+) -> Result<Option<TranslateResult>, TranslateFault> {
+	// MXR 置位时数据读取可落在仅可执行的页上, 由 check_pte_perm 后置判定,
+	// 此处不要求 R 位.
+	let is_mxr = (state.mstatus & (1 << 19)) != 0;
+	let need_perm = pte_perm_needed(rwx, is_mxr);
 	if perm as u64 & need_perm != need_perm {
-		return None;
+		return Ok(None);
 	}
 	let want_a = l1_raw & PTE_A == 0;
-	let want_d = is_write && l1_raw & PTE_D == 0;
-	if want_a || want_d {
-		let mut new_raw = l1_raw;
-		if want_a {
-			new_raw |= PTE_A;
-		}
-		if want_d {
-			new_raw |= PTE_D;
-		}
-		if !write_pte_cas(ctx, l1_addr, l1_raw, new_raw) {
-			// CAS failed: another hart modified this PTE concurrently.
-			// Re-read and re-validate to avoid using a stale mapping.
-			let raw2 = read_pte(ctx, l1_addr);
-			let pte2 = pte_parse(raw2);
-			if pte2.v == 0 || pte2.is_leaf == 0 {
-				return None;
-			}
-			if pte2.perm as u64 & need_perm != need_perm {
-				return None;
-			}
-			let ppn2 = (pte2.ppn & 0xFFFF_FFFF_FFFF_FE00u64) | vpn0;
-			let pa2 = (ppn2 << 12) | offset;
-			return Some(TranslateResult {
-				pa: pa2 & 0xFFFF_FFFF_FFFF_FFFF,
-				perm: pte2.perm,
-				level: 1,
-			});
-		}
-	}
-
+	let want_d = has_write(rwx) && l1_raw & PTE_D == 0;
 	// PPN[43:9] from PTE, PPN[8:0] from VA vpn0
 	let ppn = (l1_ppn & 0xFFFF_FFFF_FFFF_FE00u64) | vpn0;
 	let pa = (ppn << 12) | offset;
-	Some(TranslateResult {
+	if !want_a && !want_d {
+		return Ok(Some(TranslateResult {
+			pa: pa & 0xFFFF_FFFF_FFFF_FFFF,
+			perm,
+			level: 1,
+		}));
+	}
+
+	let mut new_raw = l1_raw;
+	if want_a {
+		new_raw |= PTE_A;
+	}
+	if want_d {
+		new_raw |= PTE_D;
+	}
+	if !write_pte_cas_checked(state, pmp, ctx, l1_addr, l1_raw, new_raw)? {
+		// CAS failed: another hart modified this PTE concurrently.
+		// Re-read and re-validate to avoid using a stale mapping.
+		let raw2 = read_pte_checked(state, pmp, ctx, l1_addr)?;
+		let pte2 = pte_parse(raw2);
+		if pte2.v == 0 || pte2.is_leaf == 0 || pte2.perm as u64 & need_perm != need_perm {
+			return Ok(None);
+		}
+		let ppn2 = (pte2.ppn & 0xFFFF_FFFF_FFFF_FE00u64) | vpn0;
+		let pa2 = (ppn2 << 12) | offset;
+		return Ok(Some(TranslateResult {
+			pa: pa2 & 0xFFFF_FFFF_FFFF_FFFF,
+			perm: pte2.perm,
+			level: 1,
+		}));
+	}
+	Ok(Some(TranslateResult {
 		pa: pa & 0xFFFF_FFFF_FFFF_FFFF,
 		perm,
 		level: 1,
-	})
+	}))
 }
 
 /// From a valid L1 pointer, read L0; return a 4 KiB leaf result or `None`.
 /// Sets A (always) and D (on write) bits on the leaf PTE.
 fn walk_l0(
 	ctx: &WalkCtx,
+	state: &HartState,
+	pmp: &PmpCtx,
 	l1_ppn: u64,
 	vpn0: u64,
 	offset: u64,
-	is_write: bool,
-	is_execute: bool,
-) -> Option<TranslateResult> {
+	rwx: u8,
+) -> Result<Option<TranslateResult>, TranslateFault> {
 	let addr = (l1_ppn << 12).wrapping_add(vpn0 * 8);
-	let raw = read_pte(ctx, addr);
+	let raw = read_pte_checked(state, pmp, ctx, addr)?;
 	let pte = pte_parse(raw);
 	if pte.v == 0 || pte.is_leaf == 0 {
-		return None;
+		return Ok(None);
 	}
-	// 与 walk_l1_leaf 相同: 取指不要求 R 位 (X-only 页可执行).
-	let need_perm = if is_write {
-		PTE_R | PTE_W
-	} else if is_execute {
-		0
-	} else {
-		PTE_R
-	};
+	// MXR 置位时数据读取可落在仅可执行的页上, 由 check_pte_perm 后置判定,
+	// 此处不要求 R 位.
+	let is_mxr = (state.mstatus & (1 << 19)) != 0;
+	let need_perm = pte_perm_needed(rwx, is_mxr);
 	if pte.perm as u64 & need_perm != need_perm {
-		return None;
+		return Ok(None);
 	}
 	let want_a = raw & PTE_A == 0;
-	let want_d = is_write && raw & PTE_D == 0;
+	let want_d = has_write(rwx) && raw & PTE_D == 0;
 	if want_a || want_d {
 		let mut new_raw = raw;
 		if want_a {
@@ -433,52 +607,30 @@ fn walk_l0(
 		if want_d {
 			new_raw |= PTE_D;
 		}
-		if !write_pte_cas(ctx, addr, raw, new_raw) {
-			let raw2 = read_pte(ctx, addr);
+		if !write_pte_cas_checked(state, pmp, ctx, addr, raw, new_raw)? {
+			let raw2 = read_pte_checked(state, pmp, ctx, addr)?;
 			let pte2 = pte_parse(raw2);
 			if pte2.v == 0 || pte2.is_leaf == 0 {
-				return None;
+				return Ok(None);
 			}
 			if pte2.perm as u64 & need_perm != need_perm {
-				return None;
+				return Ok(None);
 			}
 			let pa = (pte2.ppn << 12) | offset;
-			return Some(TranslateResult {
+			return Ok(Some(TranslateResult {
 				pa: pa & 0xFFFF_FFFF_FFFF_FFFF,
 				perm: pte2.perm,
 				level: 0,
-			});
+			}));
 		}
 	}
 
 	let pa = (pte.ppn << 12) | offset;
-	Some(TranslateResult {
+	Ok(Some(TranslateResult {
 		pa: pa & 0xFFFF_FFFF_FFFF_FFFF,
 		perm: pte.perm,
 		level: 0,
-	})
-}
-
-// ============================================================
-//  Diagnostic helpers — PTE consistency verification
-// ============================================================
-
-/// VPNs whose page walks are traced in detail (diagnostic builds only).
-/// Set ``PYREMU_TRACE_VPN`` env var (hex, no 0x prefix) at runtime to override.
-#[cfg(feature = "diagnostic")]
-#[allow(dead_code)]
-#[allow(unused)]
-fn is_trace_vpn(vpn: u64) -> bool {
-	static TRACE_VPN: AtomicU64 = AtomicU64::new(u64::MAX);
-	let mut target = TRACE_VPN.load(Ordering::Relaxed);
-	if target == u64::MAX {
-		target = std::env::var("PYREMU_TRACE_VPN")
-			.ok()
-			.and_then(|s| u64::from_str_radix(&s, 16).ok())
-			.unwrap_or(0);
-		TRACE_VPN.store(target, Ordering::Relaxed);
-	}
-	target != 0 && vpn == target
+	}))
 }
 
 // ============================================================
@@ -487,48 +639,56 @@ fn is_trace_vpn(vpn: u64) -> bool {
 
 /// Perform a full Sv39 page-table walk with hardware A/D bit updates.
 ///
-/// Returns ``Some(TranslateResult)`` on success (4 KiB or 2 MiB leaf),
-/// or ``None`` if the walk encounters an invalid/non-resident PTE.
+/// Returns ``Ok(Some(TranslateResult))`` on success (4 KiB or 2 MiB leaf),
+/// ``Ok(None)`` if the walk encounters an invalid/non-resident PTE, and
+/// ``Err(TranslateFault::AccessFault)`` when a PTE read, or the write that sets
+/// the A or D bit, is denied by PMP.
 pub fn sv39_walk(
 	ctx: &WalkCtx,
+	state: &HartState,
+	pmp: &PmpCtx,
 	satp: u64,
 	va: u64,
-	is_write: bool,
-	is_execute: bool,
-) -> Option<TranslateResult> {
+	rwx: u8,
+) -> Result<Option<TranslateResult>, TranslateFault> {
 	let mode = satp >> 60;
 	if mode != SATP_MODE_SV39 {
-		return None;
+		return Ok(None);
 	}
 	let root_ppn = satp & 0xF_FFFF_FFFF;
 	let vpn = sv39_decompose_va(va);
 
-	let (_l2_raw, l2_pte) = walk_l2(ctx, root_ppn, vpn.vpn2)?;
+	let (_l2_raw, l2_pte) = match walk_l2(ctx, state, pmp, root_ppn, vpn.vpn2)? {
+		Some(v) => v,
+		None => return Ok(None),
+	};
 
 	if l2_pte.is_ptr == 0 {
-		return None;
+		return Ok(None);
 	}
 
-	let (l1_raw, l1_pte) = walk_l1(ctx, l2_pte.ppn, vpn.vpn1)?;
+	let (l1_raw, l1_pte) = match walk_l1(ctx, state, pmp, l2_pte.ppn, vpn.vpn1)? {
+		Some(v) => v,
+		None => return Ok(None),
+	};
 
 	if l1_pte.is_leaf != 0 {
 		let l1_addr = (l2_pte.ppn << 12).wrapping_add(vpn.vpn1 * 8);
-		let r = walk_l1_leaf(
+		return walk_l1_leaf(
 			ctx,
+			state,
+			pmp,
 			l1_addr,
 			l1_raw,
 			l1_pte.ppn,
 			l1_pte.perm,
 			vpn.vpn0,
 			vpn.offset,
-			is_write,
-			is_execute,
-		)?;
-		return Some(r);
+			rwx,
+		);
 	}
 
-	let r = walk_l0(ctx, l1_pte.ppn, vpn.vpn0, vpn.offset, is_write, is_execute)?;
-	Some(r)
+	walk_l0(ctx, state, pmp, l1_pte.ppn, vpn.vpn0, vpn.offset, rwx)
 }
 
 // ============================================================
@@ -628,18 +788,19 @@ pub fn tlb_lookup(tlb: &mut [TlbEntry], vpn: u64, asid: u16) -> TlbResult {
 	let set = tlb_set(vpn);
 	for w in 0..TLB_WAYS {
 		let i = tlb_slot(set, w);
-		if tlb[i].valid != 0 && tlb[i].vpn == vpn {
-			// ASID-tagged: different address space -> miss.
-			// asid=0 (Bare mode) matches any entry (no tag).
-			if asid != 0 && tlb[i].asid != 0 && tlb[i].asid != asid {
-				continue;
-			}
-			if tlb[i].dirty != 0 {
-				return TlbResult::DirtyReuse(i);
-			}
-			tlb[i].accessed = 1;
-			return TlbResult::Hit(i);
+		if tlb[i].valid == 0 || tlb[i].vpn != vpn {
+			continue;
 		}
+		// ASID-tagged: different address space -> miss.
+		// asid=0 (Bare mode) matches any entry (no tag).
+		if asid != 0 && tlb[i].asid != 0 && tlb[i].asid != asid {
+			continue;
+		}
+		if tlb[i].dirty != 0 {
+			return TlbResult::DirtyReuse(i);
+		}
+		tlb[i].accessed = 1;
+		return TlbResult::Hit(i);
 	}
 	TlbResult::Miss
 }
@@ -694,8 +855,8 @@ pub fn tlb_insert(
 	tlb[idx].tlb_epoch = 0;
 }
 
-/// Mark all valid TLB entries as dirty (called when tlb_gen changes).
-/// The next lookup will re-walk and refresh the PPN.
+/// 把全部有效条目标为陈旧. 在 TLB 刷新计数发生变化时调用: 下一次查询重走页表,
+/// 取得当前的物理页号.
 #[inline]
 pub fn tlb_mark_all_dirty(tlb: &mut [TlbEntry]) {
 	for e in tlb.iter_mut() {
@@ -746,15 +907,15 @@ fn effective_mode(state: &HartState) -> Option<u8> {
 	if state.mode == riscv_mode::D {
 		return None;
 	}
-	if state.mode == riscv_mode::M {
-		let mprv = (state.mstatus >> 17) & 1;
-		let mpp = (state.mstatus >> 11) & 3;
-		if mprv == 0 || mpp == riscv_mode::M as u64 {
-			return None; // Bare translation
-		}
-		return Some(mpp as u8);
+	if state.mode != riscv_mode::M {
+		return Some(state.mode);
 	}
-	Some(state.mode)
+	let mprv = (state.mstatus >> 17) & 1;
+	let mpp = (state.mstatus >> 11) & 3;
+	if mprv == 0 || mpp == riscv_mode::M as u64 {
+		return None; // Bare translation
+	}
+	Some(mpp as u8)
 }
 
 /// Check PTE permissions with SUM / MXR / U-bit awareness.
@@ -828,36 +989,36 @@ fn fault_code(is_execute: bool, is_write: bool) -> u64 {
 //  TLB probe with SFENCE.VMA TOCTOU protection
 // ============================================================
 
-/// Result of probing the TLB with generation-counter TOCTOU protection.
+/// TLB 查询结果.
 enum TlbProbeResult {
-	/// Clean TLB hit — return this translation immediately.
+	/// 命中, 直接返回该翻译.
 	Hit(TranslateResult),
-	/// TLB hit but permission check failed — return this fault.
+	/// 命中, 但权限检查未通过, 返回该故障.
 	Fault(TranslateFault),
-	/// Fall through to page walk, optionally reusing this index.
+	/// 转页表遍历, 命中但已陈旧的条目所占用槽位可以复用.
 	Walk(Option<usize>),
 }
 
-/// Probe the TLB for *vpn*, with SFENCE.VMA TOCTOU protection when
-/// ``tlb_gen`` is available (multi-hart concurrent path).  Falls back to a
-/// plain lookup when ``tlb_gen`` is ``None``
+/// 查询 *vpn* 对应的条目. ``tlb_flush_cnt`` 非空时, 在命中之后再次读取该计数:
+/// 两次取值不相等说明查询期间有别的 hart 改写了页表, 该条目作废并转页表遍历.
+/// 为空时按普通查询处理, 用于单 hart 路径.
 #[inline]
 fn tlb_probe(
 	tlb: &mut [TlbEntry],
 	vpn: u64,
 	va: u64,
 	asid: u16,
-	tlb_gen: Option<&AtomicU64>,
+	tlb_flush_cnt: Option<&AtomicU64>,
 	eff_mode: u8,
 	mstatus: u64,
 	is_write: bool,
 	is_execute: bool,
 ) -> TlbProbeResult {
-	let gen_before = tlb_gen.map(|g| g.load(Ordering::Acquire));
+	let flush_cnt_before = tlb_flush_cnt.map(|g| g.load(Ordering::Acquire));
 	match tlb_lookup(tlb, vpn, asid) {
 		TlbResult::Hit(idx) => {
-			if let Some(g) = tlb_gen {
-				if gen_before != Some(g.load(Ordering::Acquire)) {
+			if let Some(g) = tlb_flush_cnt {
+				if flush_cnt_before != Some(g.load(Ordering::Acquire)) {
 					tlb[idx].valid = 0; // stale — invalidate, walk
 					return TlbProbeResult::Walk(None);
 				}
@@ -886,15 +1047,21 @@ fn tlb_probe(
 
 /// Translate a virtual address to a physical address.
 ///
-/// Returns ``Ok(TranslateResult)`` with PA, permissions, and level,
-/// or ``Err(TranslateFault)`` on failure.
+/// ``rwx`` gives the access kind: 本次访问请求的读权限、写权限与执行权限的位组合,
+/// 取值由 `rwx_read` / `rwx_write` / `rwx_exec` 给出. Returns
+/// ``Ok(TranslateResult)`` with PA, permissions, and level, or
+/// ``Err(TranslateFault)`` on failure. 页表遍历读取页表页与置位 A 位、D 位的写入
+/// 都先经 PMP 检查, 被拒绝时返回 ``TranslateFault::AccessFault``.
 pub fn translate_va(
 	state: &mut HartState,
 	ctx: &WalkCtx,
 	va: u64,
-	is_write: bool,
-	is_execute: bool,
+	rwx: u8,
+	pmp: &PmpCtx,
 ) -> Result<TranslateResult, TranslateFault> {
+	let is_write = has_write(rwx);
+	let is_execute = has_exec(rwx);
+
 	// ---- Bare mode / M-mode bypass ----
 	if state.mmu_mode != 8 {
 		return Ok(TranslateResult {
@@ -916,77 +1083,48 @@ pub fn translate_va(
 	};
 
 	let vpn = va >> 12;
-	let tlb = if is_execute {
-		&mut state.itlb
-	} else {
-		&mut state.dtlb
-	};
 
 	// ---- TLB lookup ----
 	let asid = ((state.satp >> 44) & 0xFFFF) as u16;
 
-	// Record gen before TLB probe so we can detect SFENCE.VMA broadcasts
-	// from other harts that happen DURING the page-table walk.  Without this
-	// re-check, a concurrent SFENCE.VMA after ``tlb_probe`` but before
-	// ``tlb_insert`` would leave a stale entry in the TLB — the next lookup
-	// would hit and return the now-invalid PPN.
-	let gen_before = if ctx.tlb_gen.is_null() {
+	// 查询之前先记下刷新计数. 遍历期间别的 hart 若改写了页表, 本次取得的页表项
+	// 已经失效, 该次翻译不写入 TLB, 由写入之前的那次比较判定.
+	let flush_cnt_before = if ctx.tlb_flush_cnt.is_null() {
 		None
 	} else {
-		Some(unsafe { &*ctx.tlb_gen }.load(Ordering::Acquire))
+		Some(unsafe { &*ctx.tlb_flush_cnt }.load(Ordering::Acquire))
 	};
 
-	let reuse_idx = if CFG_NO_TLB {
-		// CFG_NO_TLB 为真时 TLB 查询与插入一并跳过, 每次地址翻译都完整遍历
-		// Sv39 页表, 用于隔离地址翻译相关的性能问题. 该常量由 emu-configs.mk
-		// 经 Makefile 生成到 configs_gen.rs, 与 Python 侧读取的 PYREMU_NO_TLB
-		// 取同一值.
-		None
-	} else {
-		match tlb_probe(
-			tlb,
-			vpn,
-			va,
-			asid,
-			if ctx.tlb_gen.is_null() {
-				None
-			} else {
-				Some(unsafe { &*ctx.tlb_gen })
-			},
-			eff_mode,
-			state.mstatus,
-			is_write,
-			is_execute,
-		) {
+	let reuse_idx =
+		match tlb_probe_counted(state, ctx, va, vpn, asid, eff_mode, is_write, is_execute) {
 			TlbProbeResult::Hit(result) => return Ok(result),
 			TlbProbeResult::Fault(fault) => return Err(fault),
 			TlbProbeResult::Walk(reuse) => reuse,
-		}
-	};
+		};
 
 	// ---- Page-table walk ----
-	let result = sv39_walk(ctx, state.satp, va, is_write, is_execute)
-		.ok_or_else(|| TranslateFault::PageFault(fault_code(is_execute, is_write)))?;
+	let result = match sv39_walk(ctx, state, pmp, state.satp, va, rwx)? {
+		Some(r) => r,
+		None => return Err(TranslateFault::PageFault(fault_code(is_execute, is_write))),
+	};
 
 	if !check_pte_perm(result.perm, eff_mode, state.mstatus, is_write, is_execute) {
 		return Err(TranslateFault::PageFault(fault_code(is_execute, is_write)));
 	}
 
-	// ---- Re-check gen after walk, before TLB insert ----
-	// If another hart executed SFENCE.VMA during our walk, the PTE we just
-	// read may be stale.  Skip the TLB insert — the stale entry won't be
-	// cached, and the next lookup will re-walk with the current PTE.
-	// This closes the TOCTOU window between tlb_probe and tlb_insert.
-	let gen_valid = match gen_before {
+	// ---- 遍历完成之后, 写入 TLB 之前, 再次比较刷新计数 ----
+	// 两次取值不相等说明遍历期间页表被改写, 刚取得的页表项可能已失效. 此时不写入
+	// TLB: 陈旧条目不进入缓存, 下一次查询按当前的页表项重新遍历.
+	let is_flush_cnt_unchanged = match flush_cnt_before {
 		None => true,
 		Some(gb) => {
-			let ga = unsafe { &*ctx.tlb_gen }.load(Ordering::Acquire);
+			let ga = unsafe { &*ctx.tlb_flush_cnt }.load(Ordering::Acquire);
 			gb == ga
 		}
 	};
 
-	// ---- Insert into TLB (only if gen is still valid and TLB is enabled) ----
-	if gen_valid && !CFG_NO_TLB {
+	// ---- 刷新计数未变且 TLB 已启用时写入 TLB ----
+	if is_flush_cnt_unchanged && !CFG_NO_TLB {
 		let tlb_mut = if is_execute {
 			&mut state.itlb
 		} else {
@@ -1050,6 +1188,39 @@ mod tests {
 		ram[l0_off..l0_off + 8].copy_from_slice(&l0_val.to_le_bytes());
 
 		satp
+	}
+
+	/// 空 PMP 配置. 遍历发生在 M 模式且 MPRV=0, PMP 不施加判定, 页表页的读取全部放行.
+	fn no_pmp() -> PmpCtx {
+		PmpCtx { cfg: std::ptr::null_mut(), addr: std::ptr::null_mut(), num: 0 }
+	}
+
+	/// 以 M 模式与空 PMP 配置遍历页表.
+	fn walk_with_no_pmp(
+		ctx: &WalkCtx,
+		satp: u64,
+		va: u64,
+		rwx: u8,
+	) -> Option<TranslateResult> {
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mode = riscv_mode::M;
+		let pmp = no_pmp();
+		sv39_walk(ctx, &state, &pmp, satp, va, rwx).unwrap()
+	}
+
+	/// 以给定的 `mstatus` 在 M 模式与空 PMP 配置下遍历页表.
+	fn walk_with_mstatus(
+		ctx: &WalkCtx,
+		satp: u64,
+		va: u64,
+		rwx: u8,
+		mstatus: u64,
+	) -> Option<TranslateResult> {
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mode = riscv_mode::M;
+		state.mstatus = mstatus;
+		let pmp = no_pmp();
+		sv39_walk(ctx, &state, &pmp, satp, va, rwx).unwrap()
 	}
 
 	fn empty_tlb() -> [TlbEntry; TLB_ENTRIES] {
@@ -1254,12 +1425,12 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
 
-		let result = sv39_walk(&ctx, satp, 0x1000, false, false);
+		let result = walk_with_no_pmp(&ctx, satp, 0x1000, rwx_read());
 		assert!(result.is_some());
 		let l0_off = 0x2000usize + (sv39_decompose_va(0x1000).vpn0 * 8) as usize;
 		let l0_val = u64::from_le_bytes(ram[l0_off..l0_off + 8].try_into().unwrap());
@@ -1276,12 +1447,12 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
 
-		let result = sv39_walk(&ctx, satp, 0x2000, true, false);
+		let result = walk_with_no_pmp(&ctx, satp, 0x2000, rwx_write());
 		assert!(result.is_some());
 		let l0_off = 0x2000usize + (sv39_decompose_va(0x2000).vpn0 * 8) as usize;
 		let l0_val = u64::from_le_bytes(ram[l0_off..l0_off + 8].try_into().unwrap());
@@ -1302,12 +1473,12 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
 
-		let _result = sv39_walk(&ctx, satp, 0x3000, false, false);
+		let _result = walk_with_no_pmp(&ctx, satp, 0x3000, rwx_read());
 		let l2_off = (sv39_decompose_va(0x3000).vpn2 * 8) as usize;
 		let l2_val = u64::from_le_bytes(ram[l2_off..l2_off + 8].try_into().unwrap());
 		assert_ne!(l2_val & PTE_A, 0, "A bit should be set on L2 PTE");
@@ -1332,13 +1503,13 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
 
-		// 取指 (is_execute=true): 必须成功, 且翻译到正确的 PA.
-		let fetch = sv39_walk(&ctx, satp, va, false, true);
+		// 取指: 必须成功, 且翻译到正确的 PA.
+		let fetch = walk_with_no_pmp(&ctx, satp, va, rwx_exec());
 		assert!(
 			fetch.is_some(),
 			"fetch from an X-only leaf must succeed (returned None before the fix)"
@@ -1349,18 +1520,219 @@ mod tests {
 			"fetch from an X-only leaf must translate to the mapped PA"
 		);
 
-		// 数据读 (is_execute=false, is_write=false): R=0 页不可读, 仍应失败.
-		let load = sv39_walk(&ctx, satp, va, false, false);
+		// 数据读: R=0 页不可读, 仍应失败.
+		let load = walk_with_no_pmp(&ctx, satp, va, rwx_read());
 		assert!(
 			load.is_none(),
 			"data load from an X-only leaf must stay denied (PTE_R required)"
 		);
 
-		// 写 (is_write=true): R&W 均缺, 仍应失败.
-		let store = sv39_walk(&ctx, satp, va, true, false);
+		// 写: R&W 均缺, 仍应失败.
+		let store = walk_with_no_pmp(&ctx, satp, va, rwx_write());
 		assert!(
 			store.is_none(),
 			"store to an X-only leaf must stay denied (PTE_R|PTE_W required)"
+		);
+	}
+
+	#[test]
+	fn sv39_walk_honors_mxr_for_data_read_of_xonly_leaf() {
+		// 回归: OpenSBI 的 sbi_get_insn 以 MPRV|MXR 在 mepc 处读取半字, 该地址落在
+		// sittim 的 X-only .text 页上. 修复前 walk_l0 在 MXR 置位时仍要求 PTE_R,
+		// 数据读取返回 None, 固件把 store access fault 的模拟改报为取指页错误.
+		let mut ram = vec![0u8; 0x3000];
+		let va = 0xffff_ffe0_0001_7376u64;
+		let pa = 0x8301_7376u64;
+		let satp = setup_4k_page_table(&mut ram, va, pa, PTE_X);
+		let ctx = WalkCtx {
+			ram: ram.as_mut_ptr(),
+			ram_size: ram.len() as u64,
+			ram_base: 0,
+			shadow_base: 0,
+			shadow_size: 0,
+			tlb_flush_cnt: std::ptr::null(),
+			lr_reserved: std::ptr::null_mut(),
+			num_harts: 1,
+		};
+
+		let mxr = 1u64 << 19;
+		let load = walk_with_mstatus(&ctx, satp, va, rwx_read(), mxr);
+		assert!(
+			load.is_some(),
+			"data load from an X-only leaf must succeed when MXR is set (returned None before the fix)"
+		);
+		assert_eq!(
+			load.unwrap().pa,
+			pa,
+			"data load under MXR must translate to the mapped PA"
+		);
+
+		// MXR 未置位时数据读取仍然拒绝.
+		assert!(
+			walk_with_mstatus(&ctx, satp, va, rwx_read(), 0).is_none(),
+			"data load from an X-only leaf must stay denied when MXR is clear"
+		);
+
+		// 写不受 MXR 影响.
+		assert!(
+			walk_with_mstatus(&ctx, satp, va, rwx_write(), mxr).is_none(),
+			"store to an X-only leaf must stay denied when MXR is set"
+		);
+
+		// 成功的读取置位叶子的 A 位, 说明遍历走完了叶子项.
+		let l0_off = 0x2000usize + (sv39_decompose_va(va).vpn0 * 8) as usize;
+		let l0_val = u64::from_le_bytes(ram[l0_off..l0_off + 8].try_into().unwrap());
+		assert_ne!(l0_val & PTE_A, 0, "A bit should be set on the MXR read");
+	}
+
+	#[test]
+	fn sv39_walk_honors_mxr_for_data_read_of_xonly_superpage() {
+		// 同一判定位于 walk_l1_leaf, 覆盖 2 MiB 叶子项.
+		let mut ram = vec![0u8; 0x2000];
+		let va = 0xffff_ffe0_0040_0000u64;
+		let pa_mega = 0x8ae0_0000u64;
+		let vpn = sv39_decompose_va(va);
+		let satp = 8u64 << 60;
+
+		let l2_off = (vpn.vpn2 * 8) as usize;
+		let l2_val = (1u64 << 10) | PTE_V;
+		ram[l2_off..l2_off + 8].copy_from_slice(&l2_val.to_le_bytes());
+
+		let l1_off = 0x1000usize + (vpn.vpn1 * 8) as usize;
+		let l1_val = ((pa_mega >> 12) << 10) | PTE_X | PTE_V;
+		ram[l1_off..l1_off + 8].copy_from_slice(&l1_val.to_le_bytes());
+
+		let ctx = WalkCtx {
+			ram: ram.as_mut_ptr(),
+			ram_size: ram.len() as u64,
+			ram_base: 0,
+			shadow_base: 0,
+			shadow_size: 0,
+			tlb_flush_cnt: std::ptr::null(),
+			lr_reserved: std::ptr::null_mut(),
+			num_harts: 1,
+		};
+
+		let mxr = 1u64 << 19;
+		let load = walk_with_mstatus(&ctx, satp, va, rwx_read(), mxr);
+		assert!(
+			load.is_some(),
+			"data load from an X-only superpage must succeed when MXR is set (returned None before the fix)"
+		);
+		assert_eq!(
+			load.unwrap().pa,
+			pa_mega,
+			"data load under MXR must translate to the mapped PA"
+		);
+		assert!(
+			walk_with_mstatus(&ctx, satp, va, rwx_read(), 0).is_none(),
+			"data load from an X-only superpage must stay denied when MXR is clear"
+		);
+		// 写入不受 MXR 影响.
+		assert!(
+			walk_with_mstatus(&ctx, satp, va, rwx_write(), mxr).is_none(),
+			"store to an X-only superpage must stay denied when MXR is set"
+		);
+	}
+
+	/// 遍历阶段要求的权限位: 数据读取只在 MXR 清除时要求 R; 写入恒要求 R|W;
+	/// 取指不要求任何位, 由 `check_pte_perm` 后置判定.
+	#[test]
+	fn pte_perm_needed_defers_read_requirement_under_mxr() {
+		assert_eq!(
+			pte_perm_needed(rwx_read(), false),
+			PTE_R,
+			"a data read must require PTE_R when MXR is clear"
+		);
+		assert_eq!(
+			pte_perm_needed(rwx_read(), true),
+			0,
+			"a data read must not require PTE_R when MXR is set"
+		);
+		assert_eq!(
+			pte_perm_needed(rwx_write(), false),
+			PTE_R | PTE_W,
+			"a store must require PTE_R and PTE_W when MXR is clear"
+		);
+		assert_eq!(
+			pte_perm_needed(rwx_write(), true),
+			PTE_R | PTE_W,
+			"a store must require PTE_R and PTE_W when MXR is set"
+		);
+		assert_eq!(
+			pte_perm_needed(rwx_exec(), false),
+			0,
+			"a fetch must not require PTE_R"
+		);
+		assert_eq!(
+			pte_perm_needed(rwx_exec(), true),
+			0,
+			"a fetch must not require PTE_R when MXR is set"
+		);
+	}
+
+	/// MXR 置位时 TLB 命中的 X-only 条目必须放行数据读取, MXR 清除后同一条目
+	/// 必须报故障. 遍历阶段的放宽只对新装入的页面生效是不够的.
+	#[test]
+	fn tlb_probe_honors_mxr_for_xonly_entry() {
+		let mut tlb = empty_tlb();
+		let vpn = 0x0017_376u64;
+		let ppn = 0x8_3017u64;
+		tlb_insert(&mut tlb, None, vpn, ppn, PTE_X as u8, 0, 0, 0);
+
+		let mxr = 1u64 << 19;
+		let va = vpn << 12;
+		match tlb_probe(&mut tlb, vpn, va, 0, None, riscv_mode::S, mxr, false, false) {
+			TlbProbeResult::Hit(r) => assert_eq!(
+				r.pa,
+				ppn << 12,
+				"data load under MXR must translate to the entry's PA"
+			),
+			_ => panic!("data load of an X-only TLB entry must hit when MXR is set"),
+		}
+		assert!(
+			matches!(
+				tlb_probe(&mut tlb, vpn, va, 0, None, riscv_mode::S, 0, false, false),
+				TlbProbeResult::Fault(_)
+			),
+			"data load of an X-only TLB entry must fault when MXR is clear"
+		);
+		assert!(
+			matches!(
+				tlb_probe(&mut tlb, vpn, va, 0, None, riscv_mode::S, mxr, true, false),
+				TlbProbeResult::Fault(_)
+			),
+			"store to an X-only TLB entry must fault when MXR is set"
+		);
+	}
+
+	/// MXR 只放宽数据读取: 取指仍只认 X 位, 写入仍要求 R|W, 仅有 W 位的
+	/// 页不属于可执行页, 读取同样拒绝.
+	#[test]
+	fn mxr_widens_only_data_reads() {
+		let mxr = 1u64 << 19;
+		let xonly = PTE_X as u8;
+		assert!(
+			check_pte_perm(xonly, riscv_mode::S, mxr, false, false),
+			"MXR must allow a data read of an X-only page"
+		);
+		assert!(
+			!check_pte_perm(xonly, riscv_mode::S, mxr, true, false),
+			"MXR must not allow a store to an X-only page"
+		);
+		assert!(
+			check_pte_perm(xonly, riscv_mode::S, mxr, false, true),
+			"MXR must not affect a fetch of an X-only page"
+		);
+		let ronly = PTE_R as u8;
+		assert!(
+			!check_pte_perm(ronly, riscv_mode::S, mxr, false, true),
+			"MXR must not make an R-only page fetchable"
+		);
+		let wonly = PTE_W as u8;
+		assert!(
+			!check_pte_perm(wonly, riscv_mode::S, mxr, false, false),
+			"MXR must not make a W-only page readable"
 		);
 	}
 
@@ -1382,12 +1754,13 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
 
-		let result = translate_va(&mut state, &ctx, 0x8000_1000, false, false);
+		let pmp = no_pmp();
+		let result = translate_va(&mut state, &ctx, 0x8000_1000, rwx_read(), &pmp);
 		assert!(
 			result.is_ok(),
 			"M-mode with MPRV=0 must use Bare translation"
@@ -1412,12 +1785,13 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
 
-		let result = translate_va(&mut state, &ctx, 0x8000_1000, false, false);
+		let pmp = no_pmp();
+		let result = translate_va(&mut state, &ctx, 0x8000_1000, rwx_read(), &pmp);
 		assert!(
 			result.is_err(),
 			"MPRV=1+MPP=S must attempt Sv39 translation"
@@ -1441,12 +1815,13 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
 
-		let result = translate_va(&mut state, &ctx, 0x8000_1000, false, false);
+		let pmp = no_pmp();
+		let result = translate_va(&mut state, &ctx, 0x8000_1000, rwx_read(), &pmp);
 		assert!(
 			result.is_ok(),
 			"D-mode must use Bare translation (bypass Sv39)"
@@ -1470,16 +1845,145 @@ mod tests {
 			ram_base: 0,
 			shadow_base: 0,
 			shadow_size: 0,
-			tlb_gen: std::ptr::null(),
+			tlb_flush_cnt: std::ptr::null(),
 			lr_reserved: std::ptr::null_mut(),
 			num_harts: 1,
 		};
 
-		let pa = crate::hart_sched::translate_fetch_pc_concurrent(&mut state, &ctx, 0x8000_2000);
+		let pmp = no_pmp();
+		let pa = crate::hart_sched::translate_fetch_pc_concurrent(
+			&mut state,
+			&ctx,
+			0x8000_2000,
+			&pmp,
+		);
 		assert_eq!(
 			pa,
 			Some(0x8000_2000),
 			"D-mode fetch must bypass Sv39 (VA==PA)"
+		);
+	}
+
+	/// 页表遍历读取页表页时经 PMP 检查.
+	///
+	/// 遍历由 hart 隐式发起, 与显式访存受同一组 PMP 条目约束, 权限按读取判定.
+	/// 被拒绝时返回 `TranslateFault::AccessFault`, 由调用方按原访问的类型投递
+	/// 访问故障 (取指 1, 读取 5, 写入 7); 缺页异常只表示页表项无效.
+	#[test]
+	fn pte_read_denied_by_pmp_is_access_fault() {
+		let mut ram = vec![0u8; 0x3000];
+		let satp = setup_4k_page_table(&mut ram, 0x1000, 0x8000_0000, PTE_R | PTE_W);
+		let ctx = WalkCtx {
+			ram: ram.as_mut_ptr(),
+			ram_size: ram.len() as u64,
+			ram_base: 0,
+			shadow_base: 0,
+			shadow_size: 0,
+			tlb_flush_cnt: std::ptr::null(),
+			lr_reserved: std::ptr::null_mut(),
+			num_harts: 1,
+		};
+
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mode = riscv_mode::S;
+		state.mmu_mode = 8;
+		state.satp = satp;
+
+		// 只放开 L0 页 [0x2000, 0x4000), 根页表所在的页 0 不在任何条目之内.
+		// 根页表的页表项读取因此被拒绝, 此时尚未取得任何叶子项的权限.
+		let restricted_cfg = [0x1fu8]; // NAPOT | R | W | X
+		let restricted_addr = [0x0000_0000_0000_0bffu64]; // NAPOT, [0x2000, 0x4000)
+		let restricted_pmp = PmpCtx {
+			cfg: restricted_cfg.as_ptr() as *mut u8,
+			addr: restricted_addr.as_ptr() as *mut u64,
+			num: 1,
+		};
+
+		let walk = sv39_walk(&ctx, &state, &restricted_pmp, satp, 0x1000, rwx_read());
+		assert!(
+			matches!(walk, Err(TranslateFault::AccessFault)),
+			"page-table read outside every PMP entry must yield AccessFault"
+		);
+
+		// 同一条拒绝经由 translate_va 返回, 不是缺页异常. 调用方据此投递
+		// 访问故障并把原访问的虚拟地址写入 tval.
+		let tr = translate_va(&mut state, &ctx, 0x1000, rwx_write(), &restricted_pmp);
+		assert!(
+			matches!(tr, Err(TranslateFault::AccessFault)),
+			"store translation must report AccessFault, not PageFault(15)"
+		);
+
+		// 对照: 根页表也落在条目之内时, 同一次遍历成功. 故障来自 PMP 条目,
+		// 而不是页表本身.
+		let full_cfg = [0x1fu8];
+		let full_addr = [0x0000_0000_0000_07ffu64]; // NAPOT, [0, 0x4000)
+		let full_pmp = PmpCtx {
+			cfg: full_cfg.as_ptr() as *mut u8,
+			addr: full_addr.as_ptr() as *mut u64,
+			num: 1,
+		};
+		let walk = sv39_walk(&ctx, &state, &full_pmp, satp, 0x1000, rwx_read());
+		assert!(
+			matches!(walk, Ok(Some(_))),
+			"the same walk must succeed once the root page is covered"
+		);
+	}
+
+	/// 置位 A 位的写入被 PMP 拒绝时, 翻译返回访问故障.
+	///
+	/// 条目覆盖三个页表页但只有读权限: 遍历的读取放行, 置位 A 位的写入被拒绝,
+	/// 该次翻译按原访问投递访问故障, 页表项保持不变.
+	#[test]
+	fn pte_ad_write_denied_by_pmp_is_access_fault() {
+		let mut ram = vec![0u8; 0x3000];
+		let satp = setup_4k_page_table(&mut ram, 0x1000, 0x8000_0000, PTE_R | PTE_W);
+		let ctx = WalkCtx {
+			ram: ram.as_mut_ptr(),
+			ram_size: ram.len() as u64,
+			ram_base: 0,
+			shadow_base: 0,
+			shadow_size: 0,
+			tlb_flush_cnt: std::ptr::null(),
+			lr_reserved: std::ptr::null_mut(),
+			num_harts: 1,
+		};
+
+		let mut state: HartState = unsafe { std::mem::zeroed() };
+		state.mode = riscv_mode::S;
+		state.mmu_mode = 8;
+		state.satp = satp;
+
+		// NAPOT [0, 0x4000) 覆盖 L2 / L1 / L0 三个页表页, 权限只有读.
+		let read_only_cfg = [0x19u8]; // NAPOT | R
+		let full_addr = [0x0000_0000_0000_07ffu64];
+		let read_only_pmp = PmpCtx {
+			cfg: read_only_cfg.as_ptr() as *mut u8,
+			addr: full_addr.as_ptr() as *mut u64,
+			num: 1,
+		};
+
+		let walk = sv39_walk(&ctx, &state, &read_only_pmp, satp, 0x1000, rwx_read());
+		assert!(
+			matches!(walk, Err(TranslateFault::AccessFault)),
+			"A-bit update denied by PMP must yield AccessFault"
+		);
+
+		// 页表项未被部分改写.
+		let l2_off = (sv39_decompose_va(0x1000).vpn2 * 8) as usize;
+		let l2_val = u64::from_le_bytes(ram[l2_off..l2_off + 8].try_into().unwrap());
+		assert_eq!(l2_val & PTE_A, 0, "denied A-bit update must not write the PTE");
+
+		// 对照: 同一条目加上写权限之后, 同一次遍历成功.
+		let writable_cfg = [0x1bu8]; // NAPOT | R | W
+		let writable_pmp = PmpCtx {
+			cfg: writable_cfg.as_ptr() as *mut u8,
+			addr: full_addr.as_ptr() as *mut u64,
+			num: 1,
+		};
+		let walk = sv39_walk(&ctx, &state, &writable_pmp, satp, 0x1000, rwx_read());
+		assert!(
+			matches!(walk, Ok(Some(_))),
+			"the same walk must succeed once the write permission is granted"
 		);
 	}
 

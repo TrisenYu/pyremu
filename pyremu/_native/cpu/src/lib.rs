@@ -8,7 +8,6 @@ mod atom_instr;
 mod concurrent;
 mod consts;
 mod decode;
-mod diag;
 mod ffi;
 mod fpu;
 mod hart_sched;

@@ -21,7 +21,6 @@ YELLOW='\033[33m'
 NC='\033[0m' # No Color
 
 GCC_CROSS="riscv64-linux-gnu-gcc"
-
 QEMU_BIN="/usr/bin/qemu-riscv64-static"
 
 TOY_SRC="$(cd "$(dirname "$0")/../../../tests/src-rv8" && pwd)"
@@ -31,8 +30,8 @@ TEE_DEST="${ROOTFS_DIR}/eval/cache-probe-exploit"
 FNAPP_DEST="${TEE_DEST}/fn_apps"
 STRESS_SRC="$(cd "$(dirname "$0")/../../../bsp/tee_aux_tools/stress-test" && pwd)"
 STRESS_DEST="${ROOTFS_DIR}/eval/stress-test"
-# Enclave modules: images and their manifest modules.list share /modules, read by
-# both regress.sh and the module loader.
+# Enclave modules: the images are installed into /modules; the id-to-file mapping is
+# compiled into the regression tool and the module loader.
 MODULE_SRC="$(cd "$(dirname "$0")/../../../bsp/sittim/modules" && pwd)"
 MODULE_DEST="${ROOTFS_DIR}/modules"
 # The module build invokes the signer as its last step, so that tree receives build
@@ -313,11 +312,13 @@ fi
 
 # 8c. Enclave module images (bsp/sittim/modules). The host hands a module to the
 # enclave while it runs, so images are installed apart from the payloads: every
-# image sits in /modules next to the manifest modules.list, which names the files
-# relative to that directory. The make target `dist` writes that flattened copy.
+# image sits in /modules, and the tools name them relative to that directory. The
+# make target `dist` writes that flattened copy, and `mod-tbl` writes the host-side
+# module table from it -- the loader built in 8d includes that table, so both
+# targets belong to this step.
 if [ -n "${CARGO_BIN}" ]; then
     echo ">> Building enclave modules (cargo=${CARGO_BIN}) ..."
-    "${CARGO_ENV[@]}" make -C "${MODULE_SRC}" CARGO="${CARGO_BIN}" dist
+    "${CARGO_ENV[@]}" make -C "${MODULE_SRC}" CARGO="${CARGO_BIN}" dist mod-tbl
     mkdir -p "${MODULE_DEST}"
     install -m644 "${MODULE_SRC}"/dist/* "${MODULE_DEST}/"
     echo ">> Enclave modules installed:"
@@ -361,8 +362,7 @@ cd /eval/cache-probe-exploit || exit 1
 # Stage 1: one hart loads every payload under fn_apps, one enclave at a time.
 # The second argument is the module directory: payloads that request a module are
 # served from it while the regression keeps resuming the enclave. It is omitted
-# when the build installed no modules, because the regression rejects a directory
-# it cannot read the manifest from.
+# when the build installed no modules, because no image can be served then.
 if [ -d /modules ]; then
 	set -- /modules
 else

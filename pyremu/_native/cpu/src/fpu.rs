@@ -23,7 +23,7 @@ use crate::hart_sched::{
 };
 use crate::peripheral::is_device_addr;
 use crate::state::{ exit_reason, HartState };
-use crate::translate::{ translate_va, TranslateFault, WalkCtx };
+use crate::translate::{ rwx_read, rwx_write, translate_va, TranslateFault, WalkCtx };
 use crate::trap::{ deliver_illegal_instruction, deliver_trap, exc_code, mcause_val };
 
 // ============================================================
@@ -669,7 +669,7 @@ pub(crate) fn handle_fp_load_concurrent(
 	};
 	let aligned = (va & ((size as u64) - 1)) == 0;
 
-	let tr = match translate_va(state, ctx, va, false, false) {
+	let tr = match translate_va(state, ctx, va, rwx_read(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
@@ -763,7 +763,7 @@ pub(crate) fn handle_fp_store_concurrent(
 	};
 	let aligned = (va & ((size as u64) - 1)) == 0;
 
-	let tr = match translate_va(state, ctx, va, true, false) {
+	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);

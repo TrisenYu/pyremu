@@ -7,6 +7,8 @@
 //!
 //! 本模块提供策略 — 配额耗尽时主动让出 CPU, PMP 违规时决定处置方式.
 
+use core::sync::atomic::{ AtomicBool, Ordering };
+
 use crate::constants::{ ENCLAVE_REQ_NET_EVENT, ENCLAVE_REQ_SHUTDOWN, ENCLAVE_SUSPEND_QUOTA };
 use crate::context;
 use crate::ecall_aux;
@@ -62,6 +64,12 @@ pub fn ticks_consumed() -> u64 {
 	context::ctx().ticks_consumed
 }
 
+/// 网卡事件已到达而协议栈尚不可用。
+///
+/// M 模式的事件标志在 411 号调用返回时即清除, 故中断路径不处理的事件须在本处记下, 由
+/// `check_pending_net_event` 在该模块取入之后补做。
+static IS_NET_EVENT_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// 查询 M-mode 是否有 host 发来的待处理请求并执行对应操作。
 ///
 /// 当前支持的请求:
@@ -69,10 +77,10 @@ pub fn ticks_consumed() -> u64 {
 ///     token 已在 M-mode 验证, S-mode 信任 M-mode 的判断直接执行 SHUTDOWN.
 ///     Phase B 将替换为: S-mode 自行验证 host attestation quote.
 ///   - `ENCLAVE_REQ_NET_EVENT`: 飞地侧网卡有事件待处理.
-///     推进协议栈一次以收取设备已写入的帧, 唤醒在套接字上等待接收的线程,
-///     并唤醒在 ppoll 中等待描述符就绪的线程.
+///     经 `check_pending_net_event` 推进协议栈一次以收取设备已写入的帧, 唤醒在套接字上
+///     等待接收的线程, 并唤醒在 ppoll 中等待描述符就绪的线程.
 ///
-/// 在 timer interrupt 或 software interrupt 上下文中调用。
+/// 在 software interrupt 上下文中调用。
 /// SHUTDOWN 不返回 (通过 `enclave_call_exit` -> M-mode 清理 -> 切回 host).
 pub fn check_pending_requests() {
 	let flags = ecall_aux::enclave_call_query_requests();
@@ -85,10 +93,30 @@ pub fn check_pending_requests() {
 	}
 
 	if (flags & ENCLAVE_REQ_NET_EVENT) != 0 {
-		net::poll_stack();
-		net::wake_receivers();
-		// 等待描述符就绪的线程同样要重扫一遍: 就绪状态来自协议栈, 与等待地址
-		// 无关, 故按本模块的等待地址整体唤醒.
-		thread::wake_blocked(fs::POLL_WAIT_ADDR, u64::MAX);
+		// 事件标志已由 411 号调用清除, 先记入本模块的标志再统一处置: 网络模块尚未取入时
+		// 标志保留, 留待该模块取入之后补做.
+		IS_NET_EVENT_PENDING.store(true, Ordering::Release);
+		check_pending_net_event();
 	}
+}
+
+/// 处理已到达的网卡事件: 推进协议栈一次并唤醒等待中的线程。
+///
+/// 中断上下文与系统调用的收尾处各调用一次。网络模块尚未取入时不作处理并保留标志: 中断
+/// 上下文不得让出宿主, 故取入只由使用该模块的系统调用发起, 本函数不代为发起 —— 否则一次
+/// 与该模块无关的调用也会让出宿主, 并在宿主未提供该模块时得到一次取入失败。
+///
+/// 标志在推进成立之后才清除: 推进不成立时事件仍未处理, 清除会使等待中的报文没有收取者。
+pub fn check_pending_net_event() {
+	if !IS_NET_EVENT_PENDING.swap(false, Ordering::AcqRel) {
+		return;
+	}
+	if !net::poll_stack_if_loaded() {
+		IS_NET_EVENT_PENDING.store(true, Ordering::Release);
+		return;
+	}
+	net::wake_receivers();
+	// 等待描述符就绪的线程同样要重扫一遍: 就绪状态来自协议栈, 与等待地址
+	// 无关, 故按本模块的等待地址整体唤醒.
+	thread::wake_blocked(fs::POLL_WAIT_ADDR, u64::MAX);
 }

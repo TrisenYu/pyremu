@@ -1,6 +1,6 @@
 [package]
 name = "sittim"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [profile.dev]
@@ -14,7 +14,7 @@ codegen-units = 1
 
 [features]
 ## 特性1: 固件
-# 固件目标 (bin) 的启用开关. bin 含 RISC-V 汇编与 ecall, 只能在目标上编译;
+# 固件目标的启用开关. bin 含 RISC-V 汇编与 ecall, 只能在目标平台上执行;
 # 主机上执行 cargo test 时该特性不打开, bin 因此不参与构建, tests/ 下的
 # 纯逻辑测试入口才能单独编译.
 firm = []

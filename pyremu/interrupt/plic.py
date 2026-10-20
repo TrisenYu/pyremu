@@ -41,10 +41,6 @@ import threading
 
 from pyremu.memory.bus import Device
 
-# 诊断日志开关 (PYREMU_DIAG_VERBOSE=1): 打印 set_irq / claim / complete,
-# 用于确认外设完成中断是否被正确投递并被 hart claim/complete。
-
-
 # PLIC 常量 — 地址空间分区
 PLIC_PRIORITY_BASE = 0x000000
 PLIC_PRIORITY_STRIDE = 4

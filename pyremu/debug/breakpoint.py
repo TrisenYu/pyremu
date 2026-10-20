@@ -158,7 +158,7 @@ class BreakpointMixin(SharedMixinAttrs):
         if pc == bp_value:
             return True
         if hart.mmu_mode != 0 and hart.mode != RiscvMode.M:
-            ok, pa = translate_addr(hart, pc)
+            ok, pa = translate_addr(hart, pc, is_hart_access=False)
             if ok and pa == bp_value:
                 return True
         return False

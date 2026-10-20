@@ -131,7 +131,7 @@ class RegisterMixin(SharedMixinAttrs):
         for n in wanted:
             csr = h.csrs[n]
             line = (
-                f"  [cyan]{n:<{max_w}}[/] = [green]{hex_addr(csr.val)}[/]"
+                f" [cyan]{n:<{max_w}}[/] = [green]{hex_addr(csr.val)}[/]"
                 f" (dec: {csr.val})"
             )
             if n in ("mstatus", "mstatush"):
@@ -152,8 +152,15 @@ class RegisterMixin(SharedMixinAttrs):
             self._err(f"未知 CSR: {name} (用 'csr list' 查看可用列表)")
             return
         v = mask64(int(value, 0))
-        csr = h.csrs[name]
-        old, csr.val = csr.val, v
+        if name == "satp":
+            # 经 property setter 写入以同步缓存的 MMU 模式, 并使两处既有的翻译
+            # 条目作废.
+            old = h.satp_val
+            h.satp_val = v
+            h.note_tlb_flush()
+        else:
+            csr = h.csrs[name]
+            old, csr.val = csr.val, v
         self._console.print(
             f"[cyan]{name}[/]: [yellow]{hex_addr(old)}[/] -> [green]{hex_addr(v)}[/]"
         )

@@ -38,37 +38,55 @@ class TlbCacheMixin(SharedMixinAttrs):
     #  TLB 显示
     # ----------------------------------------------------------
 
+    @staticmethod
+    def _fmt_tlb_counters(hits: int, misses: int) -> str:
+        """格式化一组 TLB 计数: 命中、未命中与命中率."""
+        total = hits + misses
+        rate = hits / total if total > 0 else 0.0
+        color = "green" if rate > 0.9 else "yellow"
+        return f"hits={hits}, misses={misses}, rate=[{color}]{rate:.2%}[/]"
+
+    def _print_tlb_counters(self, name: str, tlb, is_execute: bool) -> int:
+        """输出单个 TLB 的条目数与两个执行引擎各自的计数, 返回两者之和.
+
+        *is_execute* 选定该表对应的加速执行引擎计数: 指令 TLB 与数据 TLB 各自累计.
+        """
+        engine_hits, engine_misses = (
+            self.hart.speedup_itlb_counts if is_execute else self.hart.speedup_dtlb_counts
+        )
+        engine_total = engine_hits + engine_misses
+
+        self._console.print(f"[bold]{name}[/]: {len(tlb)}/{tlb.size} entries")
+        self._console.print(
+            "  " + self._fmt_tlb_counters(engine_hits, engine_misses)
+        )
+        return engine_total
+
     def _show_tlb(
         self,
         name: str,
         tlb,
+        is_execute: bool,
         start_entry: int = 0,
         end_entry: int | None = _DEFAULT_TLB_LINES,
     ) -> None:
-        """显示单个 TLB 的有效条目及命中率.
+        """显示单个 TLB 的有效条目及两个执行引擎各自的计数.
 
-        *start_entry* / *end_entry* 限制显示的条目索引范围, 该范围左闭右开;
-        *end_entry* 为 None 时显示全部.
+        *is_execute* 选定该表对应的加速执行引擎计数: 指令 TLB 与数据 TLB 各
+        自累计. *start_entry* / *end_entry* 限制显示的条目索引范围, 该范围
+        左闭右开; *end_entry* 为 None 时显示全部.
         """
-        total = tlb._hits + tlb._misses
-        rate = tlb._hits / total if total > 0 else 0.0
-
-        title = (
-            f"[bold]{name}[/]: {len(tlb)}/{tlb.size} entries, "
-            f"hits={tlb._hits}, misses={tlb._misses}, "
-            f"rate=[{'green' if rate > 0.9 else 'yellow'}]{rate:.2%}[/]"
-        )
+        lookup_total = self._print_tlb_counters(name, tlb, is_execute)
 
         if len(tlb) == 0:
-            hint = ""
-            if total == 0 and self.hart.mmu_mode == 0:
-                hint = "\n[dim]# MMU 处于 Bare 模式 — TLB 不会被填充[/]"
-            self._console.print(f"{title}\n  (empty){hint}")
+            self._console.print("[dim]  (empty)[/]")
+            if lookup_total == 0 and self.hart.mmu_mode == 0:
+                self._console.print("[dim]  # MMU 处于 Bare 模式, TLB 不会被填充[/]")
             return
 
         has_mdid = any(e.mdid != 0 for e in tlb.entries if e.valid)
 
-        tbl = Table(title=title, border_style="blue")
+        tbl = Table(border_style="blue")
         tbl.add_column("#", style="dim", justify="right")
         tbl.add_column("VPN", style="cyan")
         tbl.add_column("PPN", style="green")
@@ -98,11 +116,7 @@ class TlbCacheMixin(SharedMixinAttrs):
             tbl.add_row(*row)
             shown += 1
 
-        if (
-            end_entry is not None
-            and shown < total_valid
-            and start_entry + shown < total_valid
-        ):
+        if end_entry is not None and shown < total_valid and start_entry + shown < total_valid:
             remaining = total_valid - start_entry - shown
             hint = (
                 f"[dim]… 还有 {remaining} 条, "
@@ -154,12 +168,12 @@ class TlbCacheMixin(SharedMixinAttrs):
         """
         h = self.hart
         if arg is None:
-            self._show_tlb("ITLB", h.itlb)
-            self._show_tlb("DTLB", h.dtlb)
+            self._show_tlb("ITLB", h.itlb, is_execute=True)
+            self._show_tlb("DTLB", h.dtlb, is_execute=False)
             return
         if arg == "-a":
-            self._show_tlb("ITLB", h.itlb, end_entry=None)
-            self._show_tlb("DTLB", h.dtlb, end_entry=None)
+            self._show_tlb("ITLB", h.itlb, is_execute=True, end_entry=None)
+            self._show_tlb("DTLB", h.dtlb, is_execute=False, end_entry=None)
             return
         if "-" in arg and not arg.startswith("-"):
             st_str, _, ed_str = arg.partition("-")
@@ -167,8 +181,8 @@ class TlbCacheMixin(SharedMixinAttrs):
             if st < 0 or ed <= st:
                 self._err(f"范围需满足 0 <= start < end, 得到 {st}-{ed}")
                 return
-            self._show_tlb("ITLB", h.itlb, start_entry=st, end_entry=ed)
-            self._show_tlb("DTLB", h.dtlb, start_entry=st, end_entry=ed)
+            self._show_tlb("ITLB", h.itlb, is_execute=True, start_entry=st, end_entry=ed)
+            self._show_tlb("DTLB", h.dtlb, is_execute=False, start_entry=st, end_entry=ed)
             return
         vpn = int(arg, 0)
         if not check_rv64_addr(vpn):
@@ -183,6 +197,7 @@ class TlbCacheMixin(SharedMixinAttrs):
         if vpn_str is None:
             h.itlb.flush_all()
             h.dtlb.flush_all()
+            h.note_tlb_flush()
             self._console.print("[dim]已刷新全部 ITLB + DTLB[/]")
             return
         vpn = int(vpn_str, 0)
@@ -191,6 +206,7 @@ class TlbCacheMixin(SharedMixinAttrs):
             return
         h.itlb.flush(vpn)
         h.dtlb.flush(vpn)
+        h.note_tlb_flush()
         self._console.print(f"[dim]已刷新 ITLB + DTLB 中 VPN=0x{vpn:09x}[/]")
 
     # ----------------------------------------------------------
@@ -272,8 +288,8 @@ class TlbCacheMixin(SharedMixinAttrs):
             return
 
         entries, ways, num_sets = l2.entries, l2.ways, l2.num_sets
-        err, target_set, target_way, range_start, range_end = (
-            self._parse_cache_args(arg, num_sets, ways)
+        err, target_set, target_way, range_start, range_end = self._parse_cache_args(
+            arg, num_sets, ways
         )
         if err:
             return
@@ -293,7 +309,8 @@ class TlbCacheMixin(SharedMixinAttrs):
             f"{ways}-way * {num_sets} sets, "
             f"line={l2.line_size} B, "
             f"hit_rate={l2.hit_rate:.3f}\n"
-            "MESI: " + " ".join(
+            "MESI: "
+            + " ".join(
                 f"{s}={mesi_counts.get(s, 0)}"
                 for s in ("MODIFIED", "EXCLUSIVE", "SHARED", "INVALID")
             )
@@ -321,9 +338,7 @@ class TlbCacheMixin(SharedMixinAttrs):
                 e = entries[set_idx * ways + way_idx]
                 if not e.valid:
                     continue
-                lines.append(
-                    self._fmt_cache_line(e, set_idx, way_idx, full_dump)
-                )
+                lines.append(self._fmt_cache_line(e, set_idx, way_idx, full_dump))
                 if checker():
                     break
             if checker():

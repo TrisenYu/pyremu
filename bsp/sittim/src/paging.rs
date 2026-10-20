@@ -1,4 +1,4 @@
-//! Sv39 页表管理。逻辑紧跟 ref-emod/emod_manager/memory/page_table.c
+//! Sv39 页表管理。逻辑/emod_manager/memory/page_table.c
 //!
 //! 关键约定：
 //! - MMU 开启后（satp != 0），中间页表指针通过 LINEAR_MAP_OFFSET 换算。
@@ -87,7 +87,23 @@ fn sfence_vma_all() {
 //  VA 辅助
 // ---------------------------------------------------------------
 
+/// Sv39 要求 VA 的位 63:39 全部等于位 38, 满足该等式的 VA 取规范形式。
+///
+/// 规范形式之外的 VA 与某个取规范形式的 VA 共用全部三级 VPN, 硬件无法区分二者。
+/// 按这样的 VA 遍历页表会命中另一段映射的页表项: 建立映射改写该页表项, 解除映射
+/// 与改写权限同样作用在它上面。
+///
+/// 管理器的链接地址与线性窗口基址都取规范形式, 故该判定不拒绝管理器自身使用的 VA。
+#[inline]
+fn is_canonical_va(va: u64) -> bool {
+	let extension = va >> 38;
+	extension == 0 || extension == (1 << 26) - 1
+}
+
 /// level 0 -> VPN[2] (bits 38:30), 1 -> VPN[1] (29:21), 2 -> VPN[0] (20:12)
+///
+/// 硬件按 VPN 的 9 位字段索引, 该函数据此截取, 不做规范形式检查。调用方须先经
+/// [`is_canonical_va`] 判定: 规范形式之外的 VA 在该索引上与别的 VA 重合。
 #[inline]
 fn get_vpn(va: u64, level: u8) -> usize {
 	match level {
@@ -101,7 +117,11 @@ fn get_vpn(va: u64, level: u8) -> usize {
 /// 物理地址 -> PTE 指针。satp 有效时叠加 LINEAR_MAP_OFFSET。
 #[inline]
 unsafe fn pte_ptr(pa: u64) -> *mut Pte {
-	if csr::read_satp() != 0 { pa.wrapping_add(LINEAR_MAP_OFFSET) as *mut Pte } else { pa as *mut Pte }
+	if csr::read_satp() != 0 {
+		pa.wrapping_add(LINEAR_MAP_OFFSET) as *mut Pte
+	} else {
+		pa as *mut Pte
+	}
 }
 
 // ---------------------------------------------------------------
@@ -125,11 +145,8 @@ pub fn set_root(root_va: u64) {
 
 /// 页表根的可解引用指针 (直接以当前映射地址解引用, 不经 pte_ptr)。
 ///
-/// `root_pa()` 返回的是**当前映射下**根表地址: 物理恒等主流程为 PA,
-/// 虚拟陷态处理为 VA, 二者均已被映射, 可直接解引用。根表不能像中间表
-/// 那样套 pte_ptr: 中间表拿到的恒为 PA, satp 有效时叠加 LINEAR 才对;
-/// 根表在虚拟上下文里已经是 VA, 再叠加 LINEAR 会落入 0xffffffa0...
-/// 未映射区, 触发页错误 (曾致 brk 扩容走表时 M/S 反复重定向死循环)。
+/// `root_pa()` 返回的是当前映射下根表地址: 物理恒等主流程为 PA,
+/// 虚拟陷态处理为 VA, 二者均已被映射, 可直接解引用。
 #[inline]
 fn root_table() -> *mut Pte {
 	let va = unsafe { ROOT_VA };
@@ -166,6 +183,8 @@ pub enum MapError {
 	NotMapped,
 	/// 页表页分配失败 (S-mode 页池耗尽)。
 	OutOfPool,
+	/// VA 不取规范形式, 按它遍历会命中另一段映射的页表项。
+	NonCanonical,
 }
 
 impl MapError {
@@ -175,6 +194,7 @@ impl MapError {
 			MapError::CoveredBySuperPage => "covered by super-page",
 			MapError::NotMapped => "not mapped",
 			MapError::OutOfPool => "s-mode page pool exhausted",
+			MapError::NonCanonical => "va not in canonical form",
 		}
 	}
 }
@@ -188,7 +208,17 @@ impl MapError {
 ///
 /// 中间层级若已是叶子 (超级页), 其下不存在页表页可继续下潜, 返回
 /// MapError::CoveredBySuperPage, 由调用方决定该 VA 区间是否已满足需求。
-fn get_leaf_pte(vaddr: u64, level: u8, alloc: bool) -> Result<&'static mut Pte, MapError> {
+///
+/// VA 不取规范形式时返回 MapError::NonCanonical, 且不改动任何一个页表项。
+fn get_leaf_pte(
+	vaddr: u64,
+	level: u8,
+	alloc: bool
+) -> Result<&'static mut Pte, MapError> {
+	if !is_canonical_va(vaddr) {
+		return Err(MapError::NonCanonical);
+	}
+
 	let mut table = root_table();
 
 	// 遍历中间层级: 从根表 (0) 到目标层级的前一级.
@@ -208,7 +238,11 @@ fn get_leaf_pte(vaddr: u64, level: u8, alloc: bool) -> Result<&'static mut Pte, 
 			}
 			// 新分配的页表页必须清零, 否则残留数据可能被误判为超级页
 			unsafe {
-				core::ptr::write_bytes(pte_ptr(next_pa) as *mut u8, 0, PAGE_SIZE as usize);
+				core::ptr::write_bytes(
+					pte_ptr(next_pa) as *mut u8,
+					0,
+					PAGE_SIZE as usize
+				);
 			}
 			pte.set_ppn(next_pa >> PAGE_SHIFT);
 			pte.0 |= PTE_V;
@@ -341,7 +375,17 @@ struct WalkResult {
 }
 
 /// 三层 Sv39 页表遍历。未命中时 level = -1。
+///
+/// VA 不取规范形式时同样给出 level = -1: 该 VA 的索引与别的 VA 重合, 按它取出的
+/// 页表项不属于它。
 fn walk_page_table(va: u64) -> WalkResult {
+	if !is_canonical_va(va) {
+		return WalkResult {
+			level: -1,
+			pte: Pte::empty(),
+		};
+	}
+
 	let idxs: [usize; 3] = [
 		((va & 0x7f_c000_0000) >> 30) as usize,
 		((va & 0x00_3fe0_0000) >> 21) as usize,
@@ -377,7 +421,7 @@ fn walk_page_table(va: u64) -> WalkResult {
 	}
 }
 
-/// VA -> PA。未映射返回 None。
+/// VA -> PA。未映射或 VA 不取规范形式时返回 None。
 ///
 /// 供无法用固定偏移换算的映射使用: 模块窗口的物理地址分散, 各块由独立一次向
 /// M 模式申请取得, 块间不保证连续, 只能按页表查询。
@@ -388,7 +432,8 @@ pub fn get_pa(va: u64) -> Option<u64> {
 	}
 
 	let base = r.pte.ppn() << PAGE_SHIFT;
-	let offset_bits = (PAGE_SHIFT as usize) + (2 - (r.level as usize)) * (SV39_VPN_LEN as usize);
+	let offset_bits =
+		(PAGE_SHIFT as usize) + (2 - (r.level as usize)) * (SV39_VPN_LEN as usize);
 	Some(base | (((1_u64 << offset_bits) - 1) & va))
 }
 
@@ -413,18 +458,14 @@ pub fn identity_map_trampoline(pa: u64, partition_num: u64) -> Result<(), MapErr
 	for i in 0..partition_num {
 		let part_pa = base + i * CHUNK_2M_SIZE;
 		// 代码执行: identity VA=PA
-		let identity_flags = if i == 0 {
-			PTE_R | PTE_W | PTE_X
-		} else {
-			PTE_R | PTE_W
-		};
+		let identity_flags = if i == 0 { PTE_R | PTE_W | PTE_X } else { PTE_R | PTE_W };
 		map_page(part_pa, part_pa, identity_flags, LEVEL_MEGA)?;
 		// 页表访问: VA = PA + LINEAR_MAP_OFFSET (pte_ptr 使用)
 		map_page(
 			part_pa.wrapping_add(LINEAR_MAP_OFFSET),
 			part_pa,
 			PTE_R | PTE_W,
-			LEVEL_MEGA,
+			LEVEL_MEGA
 		)?;
 	}
 
@@ -463,6 +504,10 @@ pub fn setup_linear_map() -> bool {
 /// 2 MiB 超级页覆盖"与"完全未映射"时使用 (map_linear_range 据此决定是否
 /// 向下一级页表建立页面关系, 避免在既有页面上做二次映射)。
 pub fn va_real_page_level(vaddr: u64) -> Option<u8> {
+	if !is_canonical_va(vaddr) {
+		return None;
+	}
+
 	let mut table = root_table();
 
 	for i in 0..3 {
@@ -487,6 +532,10 @@ pub fn va_real_page_level(vaddr: u64) -> Option<u8> {
 /// 映射的权限位, 否则同一段映射的前后两半权限不一致。返回值连同 RSW 一并给出,
 /// 使新增的页与原有的页同属共享映射或同属私有映射。
 pub fn leaf_pte_flags(vaddr: u64) -> Option<u64> {
+	if !is_canonical_va(vaddr) {
+		return None;
+	}
+
 	let mut table = root_table();
 
 	for i in 0..3 {
@@ -518,7 +567,10 @@ pub fn map_linear_range(pa_start: u64, pa_end: u64) -> bool {
 	let mut pa = start;
 	while pa < end {
 		let va = pa.wrapping_add(LINEAR_MAP_OFFSET);
-		if va_real_page_level(va).is_none() && map_page(va, pa, PTE_R | PTE_W, LEVEL_MEGA).is_err() {
+		if
+			va_real_page_level(va).is_none() &&
+			map_page(va, pa, PTE_R | PTE_W, LEVEL_MEGA).is_err()
+		{
 			return false;
 		}
 		pa += CHUNK_2M_SIZE;
@@ -573,7 +625,12 @@ pub struct SetPageConfig {
 pub fn map_page_in_range(cfg: &SetPageConfig, n_leaves: u64) -> u64 {
 	let stride = leaf_page_size(cfg.level);
 	for i in 0..n_leaves {
-		let r = map_page(cfg.vbase + i * stride, cfg.pbase + i * stride, cfg.flags, cfg.level);
+		let r = map_page(
+			cfg.vbase + i * stride,
+			cfg.pbase + i * stride,
+			cfg.flags,
+			cfg.level
+		);
 		if r.is_err() {
 			return i;
 		}
@@ -585,7 +642,8 @@ pub fn map_page_in_range(cfg: &SetPageConfig, n_leaves: u64) -> u64 {
 ///
 /// 越界层级按最小页处理, 与 `get_vpn` 对越界层级取索引 0 的处理一致。
 pub fn leaf_page_size(level: u8) -> u64 {
-	1_u64 << (PAGE_SHIFT + (SV39_VPN_LEN as u64) * (LEVEL_PAGE.saturating_sub(level) as u64))
+	1_u64 <<
+		(PAGE_SHIFT + (SV39_VPN_LEN as u64) * (LEVEL_PAGE.saturating_sub(level) as u64))
 }
 
 // ---------------------------------------------------------------
@@ -697,14 +755,17 @@ fn fork_take_chunk(attr: u64) -> u64 {
 
 /// 交付一个 4 KiB 目标页, 类别为 `attr`, 自该类别正在切分的块中取; 失败返回 `!0u64`。
 fn fork_alloc_page(attr: u64) -> u64 {
-	if unsafe { FORK_CHUNK_LEFT[attr as usize] } == 0 {
+	if (unsafe { FORK_CHUNK_LEFT[attr as usize] }) == 0 {
 		if fork_take_chunk(attr) == !0u64 {
 			return !0u64;
 		}
 	}
 	let left = unsafe { FORK_CHUNK_LEFT[attr as usize] };
-	let pa = unsafe { FORK_CHUNK_PA[attr as usize] } + (CHUNK_2M_PAGES - left) * PAGE_SIZE;
-	unsafe { FORK_CHUNK_LEFT[attr as usize] = left - 1 };
+	let pa =
+		(unsafe { FORK_CHUNK_PA[attr as usize] }) + (CHUNK_2M_PAGES - left) * PAGE_SIZE;
+	unsafe {
+		FORK_CHUNK_LEFT[attr as usize] = left - 1;
+	}
 	pa
 }
 
@@ -723,7 +784,9 @@ fn fork_alloc_chunk(attr: u64) -> u64 {
 	if chunk == !0u64 {
 		return !0u64;
 	}
-	unsafe { FORK_CHUNK_PA[ENCLAVE_MEM_ATTR_INSTR as usize] = chunk };
+	unsafe {
+		FORK_CHUNK_PA[ENCLAVE_MEM_ATTR_INSTR as usize] = chunk;
+	}
 	chunk
 }
 
@@ -745,7 +808,12 @@ fn slot_va(i: usize, level: u8) -> u64 {
 ///
 /// 非叶子项在目标表中新建一张同层级的表并递归, 使两张表的中间层级互不共享 ——
 /// 任一地址空间此后新增的用户映射都不会影响另一个。
-unsafe fn copy_table_level(src: *const Pte, dst: *mut Pte, level: u8, va_base: u64) -> bool {
+unsafe fn copy_table_level(
+	src: *const Pte,
+	dst: *mut Pte,
+	level: u8,
+	va_base: u64
+) -> bool {
 	for i in 0..512usize {
 		let s = unsafe { *src.add(i) };
 		if (s.0 & PTE_V) == 0 {
@@ -782,10 +850,10 @@ unsafe fn copy_table_level(src: *const Pte, dst: *mut Pte, level: u8, va_base: u
 			let src_pa = s.ppn() << PAGE_SHIFT;
 			if level == LEVEL_MEGA {
 				// 整块写入完毕后才改判为指令类: 改判之后该块只剩读与执行权限。
-				if !unsafe { copy_chunk_pa(src_pa, dst_pa) } || !fork_seal_chunk() {
+				if !(unsafe { copy_chunk_pa(src_pa, dst_pa) }) || !fork_seal_chunk() {
 					return false;
 				}
-			} else if !unsafe { copy_page_pa(src_pa, dst_pa) } {
+			} else if !(unsafe { copy_page_pa(src_pa, dst_pa) }) {
 				return false;
 			}
 			let mut d = s;
@@ -809,7 +877,12 @@ unsafe fn copy_table_level(src: *const Pte, dst: *mut Pte, level: u8, va_base: u
 			*dst.add(i) = d;
 		}
 		let ok = unsafe {
-			copy_table_level(pte_ptr(s.ppn() << PAGE_SHIFT) as *const Pte, pte_ptr(t), level + 1, va)
+			copy_table_level(
+				pte_ptr(s.ppn() << PAGE_SHIFT) as *const Pte,
+				pte_ptr(t),
+				level + 1,
+				va
+			)
 		};
 		if !ok {
 			return false;
@@ -887,10 +960,6 @@ pub fn fork_address_space() -> u64 {
 	}
 	child_pa
 }
-
-// ---------------------------------------------------------------
-//  测试
-// ---------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -996,7 +1065,9 @@ mod tests {
 		set_root(root.0.as_ptr() as u64);
 
 		// 末级表由 map_page 经 tests/paging_host.rs 的页池桩分配。
-		assert!(map_page(va, pa, PTE_U | PTE_R | PTE_W | PTE_RSW_SHARED, LEVEL_PAGE).is_ok());
+		assert!(
+			map_page(va, pa, PTE_U | PTE_R | PTE_W | PTE_RSW_SHARED, LEVEL_PAGE).is_ok()
+		);
 		assert!(set_leaf_flags(va, PTE_U | PTE_R));
 
 		let pte = unsafe { leaf_pte(&mid, va) };
@@ -1039,8 +1110,61 @@ mod tests {
 				flags & (PTE_U | PTE_R | PTE_W),
 				"{i} sets wrong rwx-bits"
 			);
-			assert_eq!(pte.ppn() << PAGE_SHIFT, pa + (i as u64) * PAGE_SIZE, "{i} sets a wrong pa");
+			assert_eq!(
+				pte.ppn() << PAGE_SHIFT,
+				pa + (i as u64) * PAGE_SIZE,
+				"{i} sets a wrong pa"
+			);
 		}
+
+		set_root(0);
+	}
+
+	/// 规范形式之外的 VA 一律被拒绝, 且不在与它共用根表索引的槽位上留下页表项。
+	///
+	/// VA 2^38 的 VPN[2] 为 0x100, 与线性窗口基址 LINEAR_MAP_OFFSET 的 VPN[2] 相同。
+	/// 修复前按该 VA 建立映射会在根表的 0x100 槽位上写入指向新页表页的指针项, 管理器
+	/// 随后的线性窗口访问与页表访问在该槽位上读到的是这张新表, 两处同时失效。
+	#[test]
+	fn test_non_canonical_va_leaves_the_shared_root_slot_alone() {
+		let va = 1_u64 << 38;
+		let root = Table([Pte(0); 512]);
+		set_root(root.0.as_ptr() as u64);
+
+		assert_eq!(
+			map_page(va, 0x8000_0000, PTE_U | PTE_R | PTE_W, LEVEL_PAGE),
+			Err(MapError::NonCanonical),
+			"a non-canonical va must be refused"
+		);
+
+		let index = super::get_vpn(LINEAR_MAP_OFFSET, 0);
+		assert_eq!(index, super::get_vpn(va, 0), "the two vas must share a root slot");
+		assert_eq!(
+			root.0[index].0, 0,
+			"the root slot shared with the linear window must stay empty"
+		);
+
+		assert_eq!(va_real_page_level(va), None, "no level for a non-canonical va");
+		assert_eq!(leaf_pte_flags(va), None, "no flags for a non-canonical va");
+		assert_eq!(get_pa(va), None, "no pa for a non-canonical va");
+		assert!(!unmap_page(va, LEVEL_PAGE), "nothing to unmap");
+
+		set_root(0);
+	}
+
+	/// 线性窗口的 VA 取规范形式, 其上的映射与遍历不受规范形式判定影响。
+	#[test]
+	fn test_linear_window_va_still_maps() {
+		let va = LINEAR_MAP_OFFSET + 0x8000_0000;
+		let root = Table([Pte(0); 512]);
+		set_root(root.0.as_ptr() as u64);
+
+		assert!(
+			map_page(va, 0x8000_0000, PTE_R | PTE_W, LEVEL_GIGA).is_ok(),
+			"the linear window is canonical"
+		);
+		assert_eq!(va_real_page_level(va), Some(LEVEL_GIGA), "");
+		assert_eq!(get_pa(va + 0x1234), Some(0x8000_1234), "");
 
 		set_root(0);
 	}

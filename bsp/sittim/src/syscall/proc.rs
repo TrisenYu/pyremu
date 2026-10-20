@@ -38,8 +38,8 @@ pub fn uname_handler(buf: *mut Utsname) -> u64 {
 
     let info = unsafe { &mut *buf };
     unsafe {
-        fill_uts_field(b"pyremu-enclave", &mut info.sysname);
-        fill_uts_field(b"pyremu", &mut info.nodename);
+        fill_uts_field(b"sittim-enclave", &mut info.sysname);
+        fill_uts_field(b"sittim", &mut info.nodename);
         // release 栏直接取本包的版本号, 不另抄一份字面量以免两处漂移。
         fill_uts_field(env!("CARGO_PKG_VERSION").as_bytes(), &mut info.release);
         fill_uts_field(b"sittim", &mut info.version);
@@ -75,7 +75,6 @@ pub fn clock_gettime_handler(clock_id: u64, tp: *mut Timespec) -> u64 {
         return EINVAL;
     }
 
-    // CLOCK_REALTIME=0, CLOCK_MONOTONIC=1
     if clock_id > 1 {
         return EINVAL;
     }

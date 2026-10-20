@@ -200,7 +200,6 @@ pub extern "C" fn pmp_check(
 		return 0;
 	}
 
-	// ---- Enclave mode (mdid != HOST_MDID): entries in [0, pmpsplit) are OFF ----
 	let enclave_mode = mdid != HOST_MDID;
 	if enclave_mode && pmpsplit > 0 && pmpsplit >= num_entries {
 		return 0;

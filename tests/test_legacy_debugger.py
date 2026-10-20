@@ -1930,47 +1930,6 @@ class TestStackWalk:
         dbg.hart.gprs[8] = 0
         dbg.cmd_frame("99")  # 超出范围
 
-    @pytest.mark.skip(
-        reason=(
-            "Bare 翻译下 SPP=U + RAM sepc 无法与合法 S->U trap 现场区分: "
-            "同寄存器状态在 test_smode_to_umode_boundary / "
-            "test_fallback_trap_offsets_for_s_to_u 中被断言为'应生成边界帧'。"
-            "二者矛盾, 代码选择保留边界帧 (Bare 下 U-mode PA 即 RAM 地址属合法 "
-            "trap); Sv39 残留 sepc 跳过由 test_stale_sepc_sv39_ram_addr_skipped 覆盖。"
-        )
-    )
-    def test_stale_sepc_from_ms_transition_skipped(self):
-        """M->S mret 残留 sepc (裸 PA) 不生成虚假边界帧 — 已跳过.
-
-        原意图: M->S 启动后 SPP=0, sepc 仍保留 M 模式设置的内核入口 PA
-        (如 0x80201048), 这不是真实 trap 现场, 不应显示为边界帧。
-
-        但在 Bare 翻译下该状态与合法 S->U trap 现场完全同构 (SPP=U + RAM
-        sepc), 无法仅凭寄存器状态区分, 故与上述 S->U 边界帧测试直接矛盾。
-        """
-        dbg = _make_dbg(ram_size=0x800000)
-        h = dbg.hart
-        # S 模式, 无有效 FP 链 (fp=0 使 FP 回溯立即终止)
-        h.mode = RiscvMode.S
-        h.gprs[8] = 0  # fp = 0
-        h.gprs[2] = 0x80001000  # sp
-        # 设置 mstatus: SPP=U (0)
-        h.csrs["mstatus"].val = (h.csrs["mstatus"].val & ~(1 << 8))  # SPP=0
-        # 模拟 M->S mret 后的 sepc: 内核入口 PA
-        h.csrs["sepc"].val = 0x80201048
-        # stvec 需指向合法代码 (用于 _parse_trap_save_offsets 反汇编)
-        # 写一条 ret (jalr x0, x1, 0) 到 stvec 位置
-        stvec_addr = 0x80008000
-        h.csrs["stvec"].val = stvec_addr
-        dbg._emu.bus.write(stvec_addr, (0x00008067).to_bytes(4, "little"))
-
-        frames = dbg._walk_frame_chain()
-        # 应只有帧 #0 (当前执行点), 不应有虚假的边界帧
-        assert len(frames) == 1, (
-            f"M->S 残留 sepc 不应生成边界帧, 但得到 {len(frames)} 帧"
-        )
-        assert frames[0].idx == 0
-
     def test_stale_sepc_sv39_ram_addr_skipped(self):
         """Sv39 启用后 SPP=S 时 sepc 为裸 RAM 地址 -> 残留 sepc, 不生成边界帧.
 

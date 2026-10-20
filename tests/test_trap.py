@@ -9,6 +9,7 @@ import struct
 import pytest
 
 from pyremu.configs_aux import examed_elf_dir, path_join
+from pyremu.core import trap_handler
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import (
     MSTATUS_MIE,
@@ -22,14 +23,14 @@ from pyremu.core.hart import (
     RiscvMode,
 )
 from pyremu.core.mem_check_aux import (
-    AccessFault,
-    AlignmentFault,
+    AccessFaultError,
+    AlignmentError,
     check_instruction_fetch,
     inject_memory_backend,
     mem_read,
     mem_write,
-    MemoryAccessFault,
-    PageFault,
+    MemoryAccessError,
+    PageFaultError,
 )
 from pyremu.core.trap_def import trap_cause_code, trap_is_interrupt, TrapType
 from pyremu.core.trap_handler import (
@@ -298,6 +299,24 @@ class TestSemihostingEbreak:
         trap_ebreak(hart)
         assert getattr(hart, "_semihosting_sys_exit", False) is True
         assert hart.mcause_val == 0, "SYS_EXIT 不得投递断点 trap"
+
+    def test_marker_ebreak_traps_when_semihosting_disabled(self, sh, monkeypatch):
+        """PYREMU_HAS_SEMIHOSTING=0 时 marker ebreak 按断点 trap 投递.
+
+        固件的 semihosting 探测依赖该 trap 判定宿主不支持, 故该序列不得被
+        内联服务吞掉; pc 与 a0 保持原值.
+        """
+        hart, bus = sh
+        self._place_ebreak(bus)
+        hart.pc = self._EBREAK_PC
+        hart.gprs[10] = 0x18
+        monkeypatch.setattr(trap_handler, "PYREMU_HAS_SEMIHOSTING", 0)
+        trap_ebreak(hart)
+        assert hart.mcause_val == 3, "内联服务关闭 -> 断点 trap"
+        assert hart.mepc_val == self._EBREAK_PC, "mepc 指向 ebreak 本身"
+        assert hart.pc == 0x80010000, "跳转到 mtvec"
+        assert hart.gprs[10] == 0x18, "不得改写 a0"
+        assert getattr(hart, "_semihosting_sys_exit", False) is False
 
     def test_unknown_op_returns_minus1(self, sh, capfd):
         """native 不识别操作码 -> -1, 空写, pc 前进 8."""
@@ -1054,12 +1073,30 @@ class TestCsrPrivilege:
     # ---- 合法访问不受影响 ----
 
     def test_umode_can_read_umode_csr(self, hart):
-        """U 模式可以读取 U-mode CSR (cycle)."""
+        """U 模式在 mcounteren 与 scounteren 使能后可以读取 cycle."""
         hart.mode = RiscvMode.U
+        hart.csrs["mcounteren"].val = 1 << 0  # CY
+        hart.csrs["scounteren"].val = 1 << 0  # CY
         # CSRRS x5, cycle, x0: rs1=0 表示只读 (不写 CSR)
         instr = self._csrrs(rd=5, rs1=0, csr=0xC00)  # cycle
         advance = hart.exec_instr(instr)
         assert advance == 4, "合法 CSR 读应正常推进 PC"
+
+    def test_umode_cycle_read_without_scounteren_traps(self, hart):
+        """U 模式读取 cycle: scounteren 未置位时 -> IllInstr."""
+        hart.mode = RiscvMode.U
+        hart.csrs["mcounteren"].val = 0b111
+        hart.csrs["scounteren"].val = 0
+        hart.exec_instr(self._csrrs(rd=5, rs1=0, csr=0xC00))
+        assert hart.mcause_val == 2, "scounteren 未使能时读取 cycle 应触发 IllInstr"
+
+    def test_smode_cycle_read_without_mcounteren_traps(self, hart):
+        """S 模式读取 cycle: mcounteren 未置位时 -> IllInstr."""
+        hart.mode = RiscvMode.S
+        hart.csrs["mcounteren"].val = 0
+        hart.csrs["scounteren"].val = 0b111
+        hart.exec_instr(self._csrrs(rd=5, rs1=0, csr=0xC00))
+        assert hart.mcause_val == 2, "mcounteren 未使能时读取 cycle 应触发 IllInstr"
 
     def test_mmode_can_read_write_mstatus(self, hart):
         """M 模式可以读写 mstatus."""
@@ -1150,7 +1187,7 @@ class TestMemoryAccessFaults:
         """LW 从奇地址读取 -> LdAddrMisaligned."""
         try:
             mem_read(hart, 0x80001001, 4)
-        except AlignmentFault:
+        except AlignmentError:
             pass
         assert hart.mcause_val == 4, f"应为 LdAddrMisaligned(4), 实际={hart.mcause_val}"
 
@@ -1158,7 +1195,7 @@ class TestMemoryAccessFaults:
         """LH 从奇地址读取 -> LdAddrMisaligned."""
         try:
             mem_read(hart, 0x80001001, 2)
-        except AlignmentFault:
+        except AlignmentError:
             pass
         assert hart.mcause_val == 4
 
@@ -1166,7 +1203,7 @@ class TestMemoryAccessFaults:
         """LD 从非 8 字节对齐地址读取 -> LdAddrMisaligned."""
         try:
             mem_read(hart, 0x80001004, 8)
-        except AlignmentFault:
+        except AlignmentError:
             pass
         assert hart.mcause_val == 4
 
@@ -1174,7 +1211,7 @@ class TestMemoryAccessFaults:
         """SW 到奇地址 -> StAddrMisaligned."""
         try:
             mem_write(hart, 0x80001001, b"\x00\x01\x02\x03")
-        except AlignmentFault:
+        except AlignmentError:
             pass
         assert hart.mcause_val == 6, f"应为 StAddrMisaligned(6), 实际={hart.mcause_val}"
 
@@ -1182,7 +1219,7 @@ class TestMemoryAccessFaults:
         """SD 到非 8 字节对齐地址 -> StAddrMisaligned."""
         try:
             mem_write(hart, 0x80001004, b"\x00" * 8)
-        except AlignmentFault:
+        except AlignmentError:
             pass
         assert hart.mcause_val == 6
 
@@ -1207,7 +1244,7 @@ class TestMemoryAccessFaults:
         """读取空洞地址 (非 RAM、非设备) -> LdAccessFault."""
         try:
             mem_read(hart, 0x0000_0000, 4)
-        except AccessFault:
+        except AccessFaultError:
             pass
         assert hart.mcause_val == 5, f"应为 LdAccessFault(5), 实际={hart.mcause_val}"
 
@@ -1215,7 +1252,7 @@ class TestMemoryAccessFaults:
         """写入空洞地址 -> StAccessFault."""
         try:
             mem_write(hart, 0x4000_0000, b"\xff")
-        except AccessFault:
+        except AccessFaultError:
             pass
         assert hart.mcause_val == 7, f"应为 StAccessFault(7), 实际={hart.mcause_val}"
 
@@ -1232,7 +1269,7 @@ class TestMemoryAccessFaults:
         """未对齐检测先于 MMU 翻译 (即使 PA 有效也不放过)."""
         try:
             mem_read(hart, 0x80000001, 4)
-        except AlignmentFault:
+        except AlignmentError:
             pass
         assert hart.mcause_val == 4, "应先触发对齐错误而非页错误或访问错误"
 
@@ -1376,7 +1413,7 @@ class TestPageFault:
         self._enable_sv39(hart)
         try:
             mem_read(hart, 0x0, 4)
-        except PageFault:
+        except PageFaultError:
             pass
         assert hart.mcause_val == 13, f"应为 LdPageFault(13), 实际={hart.mcause_val}"
 
@@ -1388,7 +1425,7 @@ class TestPageFault:
         self._enable_sv39(hart)
         try:
             mem_read(hart, 0x0, 4)
-        except PageFault:
+        except PageFaultError:
             pass
         assert hart.mcause_val == 13, f"应为 LdPageFault(13), 实际={hart.mcause_val}"
 
@@ -1402,7 +1439,7 @@ class TestPageFault:
         self._enable_sv39(hart)
         try:
             mem_read(hart, 0x0, 4)
-        except PageFault:
+        except PageFaultError:
             pass
         assert hart.mcause_val == 13, f"应为 LdPageFault(13), 实际={hart.mcause_val}"
 
@@ -1413,7 +1450,7 @@ class TestPageFault:
         hart.satp_val = (9 << 60) | 1
         try:
             mem_read(hart, 0x0, 4)
-        except PageFault:
+        except PageFaultError:
             pass
         assert hart.mcause_val == 13, f"应为 LdPageFault(13), 实际={hart.mcause_val}"
 
@@ -1425,7 +1462,7 @@ class TestPageFault:
         self._enable_sv39(hart)
         try:
             mem_write(hart, 0x1000, b"\x01\x02\x03\x04")
-        except PageFault:
+        except PageFaultError:
             pass
         assert hart.mcause_val == 15, f"应为 StPageFault(15), 实际={hart.mcause_val}"
 
@@ -1496,7 +1533,7 @@ class TestPageFault:
         self._enable_sv39(hart)
         try:
             mem_read(hart, 0x80000000, 4)
-        except PageFault:
+        except PageFaultError:
             pass
         assert hart.mcause_val == 13, (
             f"应为 LdPageFault(13), 翻译失败不应转为 LdAccessFault, 实际={hart.mcause_val}"
@@ -1515,7 +1552,7 @@ class TestPageFault:
 
         try:
             mem_read(hart, 0x1000, 4)
-        except PageFault:
+        except PageFaultError:
             pass
         assert hart.mcause_val == 13, (
             f"TLB miss 后无效 PTE 应触发 LdPageFault, 实际={hart.mcause_val}"
@@ -1576,7 +1613,7 @@ class TestPtePermissionEnforcement(TestPageFault):
         ram, _read_fn, _write_fn = ram_ctx
         self._map_leaf(ram, x=True)
         self._enable_sv39(hart)
-        with pytest.raises(PageFault):
+        with pytest.raises(PageFaultError):
             mem_read(hart, 0x0, 4)
         assert hart.mcause_val == 13, f"应为 LdPageFault(13), 实际={hart.mcause_val}"
 
@@ -1597,7 +1634,7 @@ class TestPtePermissionEnforcement(TestPageFault):
         ram, _read_fn, _write_fn = ram_ctx
         self._map_leaf(ram, r=True, x=True)
         self._enable_sv39(hart)
-        with pytest.raises(PageFault):
+        with pytest.raises(PageFaultError):
             mem_write(hart, 0x0, b"\x01\x02\x03\x04")
         assert hart.mcause_val == 15, f"应为 StPageFault(15), 实际={hart.mcause_val}"
 
@@ -1617,7 +1654,7 @@ class TestPtePermissionEnforcement(TestPageFault):
         ram, _read_fn, _write_fn = ram_ctx
         self._map_leaf(ram, r=True, u=True)
         self._enable_sv39(hart)
-        with pytest.raises(PageFault):
+        with pytest.raises(PageFaultError):
             mem_read(hart, 0x0, 4)
         assert hart.mcause_val == 13, f"应为 LdPageFault(13), 实际={hart.mcause_val}"
 
@@ -2482,12 +2519,12 @@ class TestStackOverflowMmode:
         if is_write:
             try:
                 mem_write(hart, addr, b"\x00" * size)
-            except MemoryAccessFault:
+            except MemoryAccessError:
                 pass
         else:
             try:
                 result = mem_read(hart, addr, size)
-            except MemoryAccessFault:
+            except MemoryAccessError:
                 result = None
             if expected_cause == 0:
                 assert result is not None
@@ -2640,12 +2677,12 @@ class TestStackOverflowSmode:
         if is_write:
             try:
                 mem_write(hart, va, b"\x00" * size)
-            except MemoryAccessFault:
+            except MemoryAccessError:
                 pass
         else:
             try:
                 mem_read(hart, va, size)
-            except MemoryAccessFault:
+            except MemoryAccessError:
                 pass
 
         assert hart.mcause_val == expected_cause, (
@@ -3536,7 +3573,7 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
 
     修复前 ``mem_read`` / ``mem_write`` 在触发 trap 后返回假数据
     (b\"\\x00\" * size), handler 继续执行并将 0 写入 rd ->寄存器损坏.
-    修复后 ``mem_read`` / ``mem_write`` 抛出 ``MemoryAccessFault``,
+    修复后 ``mem_read`` / ``mem_write`` 抛出 ``MemoryAccessError``,
     ``exec_instr`` 捕获并返回 0, 内核 trap handler 看到故障前的寄存器状态.
 
     覆盖: LD / SD / C.LD / C.SD / AMO LR.W
@@ -3544,7 +3581,7 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
 
     # 以下七项不再覆写 TestPageFault 的同名用例: 覆写版本是空函数体且被标记跳过,
     # 既未断言任何内容, 又遮蔽了父类中可直接通过的真实实现。父类实现现已与
-    # mem_read/mem_write 抛出 MemoryAccessFault 的行为一致, 故直接继承。
+    # mem_read/mem_write 抛出 MemoryAccessError 的行为一致, 故直接继承。
 
     def _setup_sv39_for(
         self, hart, ram: bytearray, valid_va: int, valid_pa: int,
@@ -3563,6 +3600,9 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         ))
         hart.satp_val = (8 << 60) | root_ppn  # Sv39
         hart.mode = RiscvMode.S
+        # PMP: 1 条 NAPOT 规则覆盖全部地址空间 R+W+X, 否则 S 模式下页表遍历被拒绝
+        hart.csrs["pmpcfg0"].val = 0x1F
+        hart.csrs["pmpaddr0"].val = 0x003F_FFFF_FFFF_FFFF
         # 委派页错误到 S 模式, 使 trap 保持在 S 模式
         hart.csrs["medeleg"].val = (1 << 12) | (1 << 13) | (1 << 15)
 

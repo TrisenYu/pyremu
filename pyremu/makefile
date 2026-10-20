@@ -14,6 +14,7 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo '' >> $@.tmp
 	@echo '# arguments for emulator' >> $@.tmp
 	@echo 'TLB_ENTRIES = $(TLB_ENTRIES)' >> $@.tmp
+	@echo 'PMP_ENTRIES = $(PMP_ENTRIES)' >> $@.tmp
 # mcycle 计数频率
 	@echo 'CPU_FREQ_HZ = $(CPU_FREQ_HZ)' >> $@.tmp
 	@echo 'DEFAULT_TIMEOUT = $(DEFAULT_TIMEOUT)' >> $@.tmp
@@ -22,13 +23,6 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo 'FAST_LOAD_THRESHOLD = $(FAST_LOAD_THRESHOLD)' >> $@.tmp
 	@echo 'NS_PER_INSTR = $(NS_PER_INSTR)' >> $@.tmp
 	@echo '' >> $@.tmp
-# 诊断用相关定义
-	@echo 'PYREMU_DIAG_LOG = "$(PYREMU_DIAG_LOG)"' >> $@.tmp
-	@echo 'PYREMU_DIAG_VERBOSE = $(PYREMU_DIAG_VERBOSE)' >> $@.tmp
-	@echo 'PYREMU_TRACE_SRET = $(PYREMU_TRACE_SRET)' >> $@.tmp
-	@echo 'PYREMU_TRACE_TRAPS = $(PYREMU_TRACE_TRAPS)' >> $@.tmp
-	@echo 'PYREMU_TRACE_PMP = $(PYREMU_TRACE_PMP)' >> $@.tmp
-	@echo 'PYREMU_AIA_DIAG_INTERVAL = $(PYREMU_AIA_DIAG_INTERVAL)' >> $@.tmp
 # 中断子系统与虚拟机扩展相关
 	@echo '' >> $@.tmp
 	@echo 'PYREMU_AIA = $(PYREMU_AIA)' >> $@.tmp
@@ -40,6 +34,7 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo 'PYREMU_H_EXT = $(PYREMU_H_EXT)' >> $@.tmp
 	@echo 'PYREMU_NO_L2 = $(PYREMU_NO_L2)' >> $@.tmp
 	@echo 'PYREMU_NO_TLB = $(PYREMU_NO_TLB)' >> $@.tmp
+	@echo 'PYREMU_HAS_SEMIHOSTING = $(PYREMU_HAS_SEMIHOSTING)' >> $@.tmp
 # 启动所需二进制相关路径
 	@echo '' >> $@.tmp
 	@echo 'BINS_DIR = "$(bins_dir)"' >> $@.tmp

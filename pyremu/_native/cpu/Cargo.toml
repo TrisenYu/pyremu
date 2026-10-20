@@ -9,7 +9,6 @@ name = "decode"
 
 [features]
 default = []
-diagnostic = []
 
 [dependencies]
 libc = "0.2"

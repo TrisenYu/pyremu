@@ -1,7 +1,6 @@
 //! 已取入模块的登记表。
 //!
-//! 表内存放取用器而非模块接口: 与 ref-impl/emod 的 `emodule_table` 相同。调用方
-//! 以取用器取得接口, 故接口在登记之后才被访问。
+//! 表内存放取用器而非模块接口: 调用方取用器取得接口, 故接口在登记之后才被访问。
 //!
 //! 除取用之外, 本表还回答两个问题: 某一次故障属于哪个模块, 以及某个模块的映像在窗口内
 //! 占用了什么范围, 分别见 [`module_of`] 与 [`image_window`]。前者供故障归属使用: 模块取入
@@ -44,9 +43,20 @@ enum Slot {
 		/// 使用; 本字段是其中被这一个模块用掉的长度, 即映像取整后的长度。
 		win_size: u64,
 	},
+	/// 运行中出错: 该模块的取用器不再交出, 映像窗口保留。
+	///
+	/// 取用器不再交出使该模块的下一次调用重新请求宿主交付映像, 出错的那份映像因而不再被
+	/// 调入。窗口保留的依据是模块窗口内的地址只增不减: 该范围内的地址不会属于别的模块,
+	/// 记下它使落在其中的故障仍归属到本模块。
+	Failed {
+		/// 映像在模块窗口内的起始虚拟地址。
+		va: u64,
+		/// 映像在模块窗口内占用的字节数。
+		win_size: u64,
+	},
 }
 
-/// 模块登记表。容量与 ref-impl/emod 的 `emodule_table` 相同。
+/// 模块登记表。
 static REGISTRY: SpinLock<[Slot; MAX_MODULES]> = SpinLock::new([Slot::Empty; MAX_MODULES]);
 
 /// 取回已登记模块的取用器。
@@ -64,13 +74,17 @@ pub fn lookup(module_id: u32) -> Option<GetterFn> {
 ///
 /// 该范围在登记时随取用器一同写入, 此后不再改动, 直到该模块重新取入。正在取入的槽位在
 /// 选定地址之前不给出范围, 见 [`note_image_window`]; 槽位空闲或编号越界时返回 None。
+/// 运行中出错的槽位仍给出范围: 出错的那份映像不再被调入, 而它占据的地址范围照旧,
+/// 见 [`Slot::Failed`]。
 ///
 /// 接口中的操作表由模块自行给出, 加载器在登记时不知道它的尺寸, 故取用方按本范围再判一次
 /// 整张表的位置。
 pub fn image_window(module_id: u32) -> Option<(u64, u64)> {
 	let registry = REGISTRY.lock();
 	match registry.get(module_id as usize) {
-		Some(Slot::LoadedModule { va, win_size, .. }) => Some((*va, *win_size)),
+		Some(Slot::LoadedModule { va, win_size, .. }) | Some(Slot::Failed { va, win_size }) => {
+			Some((*va, *win_size))
+		}
 		_ => None,
 	}
 }
@@ -87,9 +101,9 @@ pub fn module_of(sepc: u64, stval: u64) -> Option<u32> {
 
 /// 判定地址 *addr* 落在哪个模块的映像窗口之内, 返回该模块的编号。
 ///
-/// 两类槽位都参与判定: 已登记的模块, 以及正在取入的模块。正在取入的模块必须参与: 取入过程
-/// 会在映像之内取指并调用模块的入口, 也会写入映像的字节, 它在这期间出错时槽位正处在取入
-/// 状态。
+/// 已选定窗口的槽位都参与判定: 已登记的模块、正在取入的模块, 以及运行中出错的模块。正在
+/// 取入的模块必须参与: 取入过程会在映像之内取指并调用模块的入口, 也会写入映像的字节, 它
+/// 在这期间出错时槽位正处在取入状态。
 ///
 /// 窗口互不重叠, 故至多命中一个槽位; 都不命中时返回 None。
 fn owner_of_address(addr: u64) -> Option<u32> {
@@ -108,20 +122,21 @@ fn owner_of_address(addr: u64) -> Option<u32> {
 /// 槽位已登记的映像窗口范围; 尚未选定窗口的槽位与空闲槽位返回 None。
 fn slot_window(slot: &Slot) -> Option<(u64, u64)> {
 	match slot {
-		Slot::Loading { va, win_size } | Slot::LoadedModule { va, win_size, .. } => {
-			Some((*va, *win_size))
-		}
 		Slot::Empty => None,
+		Slot::Loading { va, win_size } => Some((*va, *win_size)),
+		Slot::LoadedModule { va, win_size, .. } => Some((*va, *win_size)),
+		Slot::Failed { va, win_size } => Some((*va, *win_size)),
 	}
 }
 
-/// 占据登记表的空槽位, 表示该模块开始取入。
+/// 占据槽位, 表示该模块开始取入。
 ///
-/// 返回该槽位先前是否为空。该模块已在取入过程中或已登记时返回 false。
+/// 返回该槽位是否可被占据。该模块已在取入过程中或已登记时返回 false; 空闲与运行中出错的
+/// 槽位都可被占据, 后者使该模块能够重新取入。
 pub fn begin_load(module_id: u32) -> bool {
 	let mut registry = REGISTRY.lock();
 	match registry.get_mut(module_id as usize) {
-		Some(slot) if matches!(slot, Slot::Empty) => {
+		Some(slot) if matches!(slot, Slot::Empty | Slot::Failed { .. }) => {
 			*slot = Slot::Loading { va: 0, win_size: 0 };
 			true
 		}
@@ -158,6 +173,26 @@ pub fn abort_load(module_id: u32) {
 	}
 }
 
+/// 登记该模块在运行中出错: 取入过程中的槽位回到空闲, 已登记的槽位转为失败态。
+///
+/// 取入过程中的故障由陷态路径处置, 请求交付的那个调用不会再返回, [`abort_load`] 因而不会
+/// 被执行到。本函数是这一情形下唯一的释放点: 没有它, 该槽位永久停在取入状态, 该模块此后
+/// 的每一次调用都只能得到"正在取入"。
+///
+/// 已登记的槽位转为 [`Slot::Failed`], 该模块的取用器不再交出, 下一次调用重新请求宿主交付
+/// 映像。编号越界与空闲的槽位不作改动。
+pub fn mark_failed(module_id: u32) {
+	let mut registry = REGISTRY.lock();
+	if let Some(slot) = registry.get_mut(module_id as usize) {
+		*slot = match *slot {
+			Slot::LoadedModule { va, win_size, .. } | Slot::Failed { va, win_size } => {
+				Slot::Failed { va, win_size }
+			}
+			Slot::Loading { .. } | Slot::Empty => Slot::Empty,
+		};
+	}
+}
+
 /// 把取用器与其映像的窗口范围登入取入过程中占据的槽位。
 ///
 /// 返回该槽位先前是否处于取入状态; 该模块不在取入过程中时返回 false 且不登记。
@@ -172,9 +207,7 @@ pub fn commit_load(module_id: u32, getter: GetterFn, va: u64, win_size: u64) -> 
 	}
 }
 
-// ---------------------------------------------------------------
-//  测试
-// ---------------------------------------------------------------
+
 
 /// 把编号 *module_id* 的槽位归还为空闲。
 ///
@@ -191,8 +224,8 @@ pub fn reset_slot(module_id: u32) {
 #[cfg(test)]
 mod tests {
 	use super::{
-		abort_load, begin_load, commit_load, image_window, lookup, module_of, note_image_window,
-		owner_of_address, reset_slot,
+		abort_load, begin_load, commit_load, image_window, lookup, mark_failed, module_of,
+		note_image_window, owner_of_address, reset_slot,
 	};
 	use crate::ext_mod::abi::{GetterFn, ModuleDesc, ModuleInterface, MODULE_NAME_LEN, MAX_MODULES};
 	use crate::ext_mod::man::Manager;
@@ -226,6 +259,10 @@ mod tests {
 
 	/// 落在全部用例的映像窗口之外的地址, 即管理器自身窗口内的地址。
 	const OUTSIDE_VA: u64 = 0xFFFF_FFE0_0000_0000;
+
+	/// 运行中出错与重新取入两个用例各自的窗口起始地址。
+	const FAILED_VA: u64 = 0xFFFF_FFF0_1000_0000;
+	const RELOAD_VA: u64 = 0xFFFF_FFF0_1400_0000;
 
 	/// 编号越界的模块与未登记的模块一律查不到取用器。
 	#[test]
@@ -345,19 +382,62 @@ mod tests {
 		assert_eq!(image_window(0x12), Some((IMAGE_VA, IMAGE_WIN_SIZE)));
 	}
 
-	/// 已登记的模块只能由一次新的取入取代: 取用失败不改动登记, 取用器与映像窗口照旧交出。
+	/// 取入过程中的故障使槽位回到空闲: 该模块可以重新取入, 而不是永久停在取入状态。
 	///
-	/// 模块因自身的缺陷而在调用中出错时, 故障处理路径只清除该模块的操作表缓存, 不触动登记
-	/// 表。故出错的模块在后续调用中仍被取用并再次调用 —— 本次调用失败, 后续调用可以重试。
+	/// 触发条件是模块入口自身的故障。此后请求交付的那个调用不会再返回, 取入方没有机会释放
+	/// 槽位, 释放只能由故障处理路径完成。
 	#[test]
-	fn test_a_registered_module_survives_repeated_failed_calls() {
+	fn test_mark_failed_releases_a_loading_slot() {
+		reset_slot(0x15);
+		assert!(begin_load(0x15));
+		assert!(note_image_window(0x15, FAILED_VA, IMAGE_WIN_SIZE));
+		assert!(lookup(0x15).is_none());
+
+		mark_failed(0x15);
+		// 槽位回到空闲: 该模块可以重新取入, 出错那份映像的窗口不再登记。
+		assert!(image_window(0x15).is_none());
+		assert!(owner_of_address(FAILED_VA).is_none());
+		assert!(begin_load(0x15));
+		abort_load(0x15);
+	}
+
+	/// 运行中出错的模块不再交出取用器, 出错那份映像的窗口保留。
+	///
+	/// 窗口保留使落在其中的故障仍归属到该模块; 取用器不再交出使该模块的下一次调用重新请求
+	/// 宿主交付映像, 重新取入之后取得新的窗口。
+	#[test]
+	fn test_mark_failed_hides_the_getter_and_keeps_the_window() {
+		reset_slot(0x16);
+		assert!(begin_load(0x16));
+		assert!(commit_load(0x16, OTHER_GETTER, FAILED_VA, IMAGE_WIN_SIZE));
+
+		mark_failed(0x16);
+		assert!(lookup(0x16).is_none());
+		assert_eq!(image_window(0x16), Some((FAILED_VA, IMAGE_WIN_SIZE)));
+		assert_eq!(module_of(FAILED_VA + 0x1000, OUTSIDE_VA), Some(0x16));
+
+		// 重新取入: 槽位可被占据, 新的窗口取代出错那份。
+		assert!(begin_load(0x16));
+		assert!(commit_load(0x16, OTHER_GETTER, RELOAD_VA, IMAGE_WIN_SIZE));
+		assert!(lookup(0x16).is_some());
+		assert_eq!(module_of(RELOAD_VA + 0x1000, OUTSIDE_VA), Some(0x16));
+		reset_slot(0x16);
+	}
+
+	/// 出错之后的模块在重新取入之前不再被取用。
+	///
+	/// 模块因自身的缺陷而在调用中出错时, 故障处理路径把槽位转为失败态。故出错的模块在随后
+	/// 的调用中重新请求宿主交付映像, 而不是继续使用出错那份映像登记的表。
+	#[test]
+	fn test_a_failed_module_is_not_handed_out_until_it_is_loaded_again() {
 		reset_slot(0x13);
 		assert!(begin_load(0x13));
 		assert!(commit_load(0x13, OTHER_GETTER, IMAGE_VA, IMAGE_WIN_SIZE));
 
-		// 三次失败的调用之后: 槽位不被占据, 窗口不被改写, 取用器与窗口照旧交出。
+		// 反复出错: 取用器取不到, 窗口不被改写。
 		for _ in 0..3 {
-			assert!(!begin_load(0x13));
+			mark_failed(0x13);
+			assert!(lookup(0x13).is_none());
 			assert!(!note_image_window(0x13, OWNED_VA_BY_SEPC, IMAGE_WIN_SIZE));
 			assert_eq!(image_window(0x13), Some((IMAGE_VA, IMAGE_WIN_SIZE)));
 		}

@@ -2,7 +2,7 @@
 //!
 //! 与用户侧并发系统调用接口 (crate::syscall::concurrency) 无关: 本模块保护的是
 //! 可信内核自身的共享状态, 当前唯一使用者是文件系统状态 (见 syscall::fs)。
-//! 实现紧跟 ref-emod lock/lock.c 的 AMOSWAP。
+//! 实现 lock/lock.c 的 AMOSWAP。
 
 use core::cell::UnsafeCell;
 use core::ops::{ Deref, DerefMut };
@@ -60,7 +60,7 @@ impl<T> SpinLock<T> {
 		SpinGuard { lock: self }
 	}
 
-	/// 尝试获取锁，不阻塞。
+	/// 尝试获取锁而不阻塞。
 	#[allow(unused)]
 	pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
 		if self.lock.swap(1, Ordering::Acquire) == 0 { Some(SpinGuard { lock: self }) } else { None }

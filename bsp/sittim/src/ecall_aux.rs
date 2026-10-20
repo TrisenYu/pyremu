@@ -1,17 +1,14 @@
-//! All ecall wrappers — enclave extension calls and standard SBI calls.
-//! Mirrors the pattern in smode_entry/trap_handler.c + ref-emod/enclave_ops.h.
-
+//! ecall aux interface
 use core::arch::asm;
 
 use crate::constants::*;
 use crate::context;
 use crate::paging;
-
+use crate::hang::fault_halt;
 // ---------------------------------------------------------------
-//  Low-level ecall primitives
+//  ecall调用原语
 // ---------------------------------------------------------------
 
-/// Execute an ecall with ext_id, func_id, and three args.  Returns (a0, a1).
 #[inline(always)]
 unsafe fn ecall_3(ext_id: u64, func_id: u64, a0: u64, a1: u64, a2: u64) -> (u64, u64) {
 	let ret0: u64;
@@ -32,7 +29,7 @@ unsafe fn ecall_3(ext_id: u64, func_id: u64, a0: u64, a1: u64, a2: u64) -> (u64,
 }
 
 // ---------------------------------------------------------------
-//  Enclave extension calls  (ext_id = 0x2022_1222)
+//  Enclave 扩展调用  (ext_id = 0x2022_1222)
 // ---------------------------------------------------------------
 
 /// Yield to M-mode.  M-mode returns `(a0, a1, a2)` — typically
@@ -116,7 +113,7 @@ pub fn enclave_call_set_mem_attr(paddr: u64, partition_num: u64, attr: u64) -> u
 	).0
 }
 
-/// Query remaining pool capacity from M-mode.
+/// 向M模式查询可信应用剩余可用内存容量.
 /// Returns `(free_total, max_contiguous)` in units of 2 MiB partitions.
 #[inline]
 #[allow(dead_code)]
@@ -161,7 +158,7 @@ pub fn enclave_call_exit(code: u64) -> ! {
 	unsafe {
 		ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_SHUTDOWN, code, 0, 0);
 	}
-	crate::hang::fault_halt("enclave_call_exit: ecall returned\n")
+	fault_halt("enclave_call_exit: ecall returned\n")
 }
 
 /// Query M-mode for pending host requests.
@@ -197,18 +194,26 @@ pub fn enclave_call_get_rand_num(buf: &mut [u8]) -> u64 {
 	).0
 }
 
+/// 请求 M 模式加载 *stval* 所属的区域节点, 使本次访问故障的指令可以重试.
+///
+/// 返回 0 表示 M 模式已加载该区域并刷新本域翻译缓存, 调用方重试原访问即可;
+/// 返回 M 模式 enclave_types.h 的 SBI_ERR_ENCLAVE_ACCESS_UNRECOVERABLE 表示该次访问
+/// 不可恢复, 加载无法使它成立, 重试不会成功.
 #[inline]
-pub fn enclave_call_unmatched_acc_fault(stval: u64, scause: u64) {
-	unsafe {
-		ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_UNMATCHED_ACC_FAULT, stval, scause, 0);
-	}
+pub fn enclave_call_unmatched_acc_fault(stval: u64, scause: u64) -> u64 {
+	(
+		unsafe {
+			ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_UNMATCHED_ACC_FAULT, stval, scause, 0)
+		}
+	)
+	.0
 }
 
 // ---------------------------------------------------------------
-//  Standard SBI calls
+//  标准SBI调用
 // ---------------------------------------------------------------
 
-/// Output a single character via the legacy SBI console putchar interface.
+/// 使用ecall通过传统SBI控制台输出接口输出单个字符
 #[inline]
 #[allow(dead_code)]
 pub fn sbi_putchar(c: u8) {

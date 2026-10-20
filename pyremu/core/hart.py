@@ -14,12 +14,13 @@ Hart (硬件线程) 的寄存器文件定义，包含:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 import ctypes
 from enum import Enum
 from typing import TYPE_CHECKING
+import weakref
 
-from pyremu.core.diag import HartDiag
+from pyremu.configs_gen import PMP_ENTRIES
 from pyremu.core.registers import (
     check_csr,
     csr_addr_from_name,
@@ -27,7 +28,8 @@ from pyremu.core.registers import (
     register_csr,
     register_fpr,
 )
-from pyremu.memory.cache import TLB_SIZE
+from pyremu.interrupt.controller import IntStateVersion
+from pyremu.memory import TLB_SIZE
 from pyremu.memory.pmp import Pmp
 from pyremu.memory.tlb import TLB
 from pyremu.utils.mask import mask16, mask32, mask64
@@ -37,6 +39,30 @@ if TYPE_CHECKING:
     from pyremu.interrupt.imsic import IMSIC
     from pyremu.interrupt.plic import PLIC
     from pyremu.memory.bus import Bus
+
+
+class HartGroup:
+    """一组 hart 的弱引用视图, 供广播操作 (如 mfence.did, SFENCE.VMA) 遍历.
+
+    模拟器持有的 hart 列表若原样交给每个 hart, 列表与其中的 hart 互相引用, 该环使
+    hart 与 hart 持有的总线不经引用计数释放. 本对象只保存弱引用, 已终止的成员在
+    遍历时跳过, 成员数不随构造之后列表的增长而变化.
+    """
+
+    __slots__ = ("_refs",)
+
+    def __init__(self, harts: Iterable[HartWithRegs]) -> None:
+        self._refs = [weakref.ref(h) for h in harts]
+
+    def __iter__(self) -> Iterator[HartWithRegs]:
+        for ref in self._refs:
+            hart = ref()
+            if hart is not None:
+                yield hart
+
+    def __bool__(self) -> bool:
+        """是否有成员仍然存活."""
+        return any(ref() is not None for ref in self._refs)
 
 
 class GprFile:
@@ -90,7 +116,10 @@ class RiscvMode(Enum):
 
 # u8 privilege value -> RiscvMode (for unmarshalling from FFI / wire formats).
 _MODE_FROM_U8: dict[int, RiscvMode] = {
-    0: RiscvMode.U, 1: RiscvMode.S, 2: RiscvMode.H, 3: RiscvMode.M,
+    0: RiscvMode.U,
+    1: RiscvMode.S,
+    2: RiscvMode.H,
+    3: RiscvMode.M,
 }
 
 
@@ -158,7 +187,7 @@ class HartWithRegs:
     快捷属性访问。
     """
 
-    def __init__(self, id: int, pmp_entries: int = 64):
+    def __init__(self, id: int, pmp_entries: int = PMP_ENTRIES):
         self.id = id
         self.gprs = GprFile()
         self.fprs = register_fpr()
@@ -175,15 +204,15 @@ class HartWithRegs:
         # misa: MXL=2 (RV64) | I | M | A | F | D | C | S | U
         #    (与 DTB riscv,isa 字段一致: rv64imafdc, 加 S/U 支持)
         self.csrs["misa"].val = (
-            (2 << 62)               # MXL=2 (RV64)
-            | (1 << 8)              # I — base integer
-            | (1 << 12)             # M — integer multiply/divide
-            | (1 << 0)              # A — atomic
-            | (1 << 5)              # F — single-precision float
-            | (1 << 3)              # D — double-precision float
-            | (1 << 2)              # C — compressed
-            | (1 << 18)             # S — supervisor mode
-            | (1 << 20)             # U — user mode
+            (2 << 62)  # MXL=2 (RV64)
+            | (1 << 8)  # I — base integer
+            | (1 << 12)  # M — integer multiply/divide
+            | (1 << 0)  # A — atomic
+            | (1 << 5)  # F — single-precision float
+            | (1 << 3)  # D — double-precision float
+            | (1 << 2)  # C — compressed
+            | (1 << 18)  # S — supervisor mode
+            | (1 << 20)  # U — user mode
         )
 
         self.pc = 0
@@ -209,7 +238,7 @@ class HartWithRegs:
         self._bus: Bus | None = None
 
         # 全 hart 引用 — 用于 mfence.did 等需要广播到所有 hart 的操作
-        self._all_harts: list[HartWithRegs] | None = None
+        self._all_harts: HartGroup | None = None
 
         # 中断控制器引用 — 每条指令执行后在指令边界检查是否有待处理中断
         self._interrupt_ctrl: InterruptController | None = None
@@ -266,15 +295,20 @@ class HartWithRegs:
         self._stip_deadline: int = 0
         self._mtip_deadline: int = 0
 
-        # CLINT MSIP 边沿诊断 (并发路径 sync_msip 更新)
-        self.diag = HartDiag()
+        # 加速执行引擎的 TLB 计数 — 由引擎在地址翻译时累加, 从不清零, 跨批处理保留.
+        # 与 Python 侧 itlb/dtlb 的计数互不相干: 后者只统计本解释器完成的翻译.
+        self._speedup_itlb_hits: int = 0
+        self._speedup_itlb_misses: int = 0
+        self._speedup_dtlb_hits: int = 0
+        self._speedup_dtlb_misses: int = 0
 
         # 中断状态缓存 — 避免每条指令都做完整的 CLINT+CSR+PLIC 遍历 (~1272 ns).
-        # _int_state_version 在软件写 CSR / CLINT 变化 / 特权级切换时递增.
+        # int_state_version 在本 hart 写入敏感 CSR 与中断控制器状态变化时递增, 中断
+        # 控制器与本 hart 持有的是同一个版本号对象.
         # check_pending_interrupts 发现版本未变且 timer 未到期时直接返回 False.
-        self._int_state_version: int = 0
-        self._int_cache_version: int = -1  # -1 = 首次调用强制全量检查
-        self._int_cache_next_timer: int = 0  # 最近 timer 唤醒时间 (0 = 无 timer 使能)
+        self.int_state_version = IntStateVersion()
+        self.int_cache_version: int = -1  # -1 = 首次调用强制全量检查
+        self.int_cache_next_timer: int = 0  # 最近 timer 唤醒时间 (0 = 无 timer 使能)
 
     # ----------------------------------------------------------
     #  寄存器读写
@@ -314,34 +348,50 @@ class HartWithRegs:
         if csr_name == "siselect":
             return self._imsic_select_s
         if csr_name == "mireg":
-            return self._imsic.csr_read(self.id, 'M', self._imsic_select_m)
+            return self._imsic.csr_read(self.id, "M", self._imsic_select_m)
         if csr_name == "sireg":
-            return self._imsic.csr_read(self.id, 'S', self._imsic_select_s)
+            return self._imsic.csr_read(self.id, "S", self._imsic_select_s)
         if csr_name == "mtopi":
             return self._read_mtopi()
         if csr_name == "stopi":
             return self._read_stopi()
         if csr_name == "mtopei":
-            val = self._imsic.read_topei(self.id, 'M')
+            val = self._imsic.read_topei(self.id, "M")
             # Clear MSIP for IID=3 (mirrors Rust MTOPEI read handler).
             if val != 0 and mask16(val >> 16) == 3:
                 self.mip_val &= ~(1 << 3)
             return val
         if csr_name == "stopei":
-            val = self._imsic.read_topei(self.id, 'S')
+            val = self._imsic.read_topei(self.id, "S")
             if val != 0 and mask16(val >> 16) == 1:
                 self.mip_val &= ~(1 << 1)
             return val
-        if csr_name in ("mireg2", "mireg3", "mireg4", "mireg5", "mireg6",
-                        "sireg2", "sireg3", "sireg4", "sireg5", "sireg6"):
+        if csr_name in (
+            "mireg2",
+            "mireg3",
+            "mireg4",
+            "mireg5",
+            "mireg6",
+            "sireg2",
+            "sireg3",
+            "sireg4",
+            "sireg5",
+            "sireg6",
+        ):
             return 0
         return self._csr_read_raw(csr_name)
 
     # CSR names whose writes affect interrupt state and must invalidate the
     # check_pending_interrupts cache.
-    _INT_SENSITIVE_CSRS: frozenset[str] = frozenset({
-        "mip", "mie", "mideleg", "mstatus", "stimecmp",
-    })
+    _INT_SENSITIVE_CSRS: frozenset[str] = frozenset(
+        {
+            "mip",
+            "mie",
+            "mideleg",
+            "mstatus",
+            "stimecmp",
+        }
+    )
 
     def _csr_write_raw(self, csr_name: str, val: int) -> None:
         """Write CSR value bypassing pydantic ``BaseModel.__setattr__``.
@@ -352,9 +402,9 @@ class HartWithRegs:
         """
         csr = self.csrs[csr_name]
         assert csr, f"CSR {csr_name!r} not found in hart {self.id}"
-        csr.__dict__["val"] = mask64(val)# type: ignore[index]  # pydantic MappingProxyType vs runtime dict
+        csr.__dict__["val"] = mask64(val)  # type: ignore[index]  # pydantic MappingProxyType vs runtime dict
         if csr_name in self._INT_SENSITIVE_CSRS:
-            self._int_state_version += 1
+            self.int_state_version.bump()
 
     def write_csr(self, csr_id: int, val: int):
         check, csr_name = check_csr(csr_id)
@@ -363,6 +413,9 @@ class HartWithRegs:
         # 有副作用的 CSR 必须通过 property setter 写入以同步缓存
         if csr_name == "satp":
             self.satp_val = val
+            # satp 改写使投递到物理地址的映射全部改变, 加速执行引擎内既有的翻译
+            # 条目随之作废. 计入刷新计数, 由引擎在下一轮开始处比较.
+            self.note_tlb_flush()
         elif csr_name == "mdid":
             self.mdid_val = val
         elif csr_name == "pmpsplit":
@@ -373,7 +426,7 @@ class HartWithRegs:
             self._pmp.invalidate_cache()
             # 同步 PMP 到其他 hart — OpenSBI 冷启动 hart 可能不是 hart 0,
             # 而 _speedup_for_cmd_step 始终使用 active[0]._pmp 构建传给 Rust 的扁平数组
-            for h in (self._all_harts or ()):
+            for h in self._all_harts or ():
                 if h is not self:
                     h._csr_write_raw(csr_name, val)
                     h._pmp.invalidate_cache()
@@ -430,20 +483,20 @@ class HartWithRegs:
             self._imsic_select_s = mask32(val)
             self._csr_write_raw(csr_name, self._imsic_select_s)
         elif self._imsic and csr_name == "mireg":
-            self._imsic.csr_write(self.id, 'M', self._imsic_select_m, val)
+            self._imsic.csr_write(self.id, "M", self._imsic_select_m, val)
         elif self._imsic and csr_name == "sireg":
-            self._imsic.csr_write(self.id, 'S', self._imsic_select_s, val)
+            self._imsic.csr_write(self.id, "S", self._imsic_select_s, val)
         elif self._imsic and csr_name in ("stopei", "mtopei"):
             # Writing to stopei/mtopei claims the specified IID per AIA spec.
             iid = (val >> 16) & 0x7FF
             if iid == 0:
                 return
-            priv = 'S' if csr_name == "stopei" else 'M'
+            priv = "S" if csr_name == "stopei" else "M"
             self._imsic.clear_ip_number(self.id, priv, iid)
             # Clear MSIP/SSIP for IPI IIDs (same rationale as _read_mtopi).
-            if csr_name == "mtopei": #  and iid == 3
+            if csr_name == "mtopei":  #  and iid == 3
                 self.mip_val &= ~(1 << iid)
-            elif csr_name == "stopei": # and iid == 1
+            elif csr_name == "stopei":  # and iid == 1
                 self.mip_val &= ~(1 << iid)
         elif self._imsic and csr_name in ("stopi", "mtopi"):
             # Writing to stopi/mtopi claims the specified IID per AIA spec.
@@ -705,6 +758,15 @@ class HartWithRegs:
     def bus(self, b):
         self._bus = b
 
+    def note_tlb_flush(self) -> None:
+        """登记一次 TLB 刷新, 使加速执行引擎内既有的翻译条目作废.
+
+        调用方须先刷新本 hart 在 Python 侧的两个 TLB; 本方法只负责让引擎在下一轮
+        开始处判定条目已陈旧.
+        """
+        if self._bus is not None:
+            self._bus.note_tlb_flush()
+
     @property
     def interrupt_ctrl(self):
         """中断控制器 (CLINT / 未来 IMSIC 等)."""
@@ -713,9 +775,10 @@ class HartWithRegs:
     @interrupt_ctrl.setter
     def interrupt_ctrl(self, ctrl):
         self._interrupt_ctrl = ctrl
-        # 自动注册中断状态变化回调 — 即使外部替换 CLINT 也不漏通知
+        # 把本 hart 的中断状态版本号交给控制器 — 即使外部替换 CLINT 也不漏登记.
+        # 交出对象而非本 hart 的通知方法, 以免控制器持有本 hart, 见 IntStateVersion.
         if ctrl:
-            ctrl.set_int_state_change_callback(self.notify_int_state_change)
+            ctrl.attach_int_state(self.int_state_version)
 
     @property
     def plic(self):
@@ -735,22 +798,14 @@ class HartWithRegs:
     def imsic(self, im):
         self._imsic = im
 
-    def notify_int_state_change(self) -> None:
-        """通知中断状态可能已改变 (CSR 写入 / CLINT 更新 / 特权级切换).
-
-        递增版本号使 check_pending_interrupts 的缓存失效,
-        触发下一条指令的全量中断检查.
-        """
-        self._int_state_version += 1
-
     @property
-    def all_harts(self):
-        """所有 hart 的引用 (用于广播操作, 如 mfence.did)."""
+    def all_harts(self) -> HartGroup | None:
+        """所有 hart 的弱引用视图 (用于广播操作, 如 mfence.did)."""
         return self._all_harts
 
     @all_harts.setter
-    def all_harts(self, harts):
-        self._all_harts = harts
+    def all_harts(self, harts: Iterable[HartWithRegs]):
+        self._all_harts = HartGroup(harts)
 
     # ----------------------------------------------------------
     #  mtopi / stopi — AIA Top Interrupt CSR read
@@ -802,7 +857,7 @@ class HartWithRegs:
         identity is read from MTOPEI.
         """
         if self._imsic:
-            topei = self._imsic.peek_topei(self.id, 'M')
+            topei = self._imsic.peek_topei(self.id, "M")
             if topei != 0:
                 # All IMSIC M-file interrupts (IPI + external) -> MEI=11.
                 # The IPI minor identity (1) is NOT a major identity — the
@@ -835,7 +890,7 @@ class HartWithRegs:
         identity is read from STOPEI.
         """
         if self._imsic:
-            topei = self._imsic.peek_topei(self.id, 'S')
+            topei = self._imsic.peek_topei(self.id, "S")
             if topei != 0:
                 # All IMSIC S-file interrupts (IPI + external) -> SEI=9.
                 # The IPI minor identity (1) is NOT a major identity — the
@@ -884,6 +939,20 @@ class HartWithRegs:
         val = mask64(v)
         self._pmpsplit_val = val
         self.csrs["pmpsplit"].val = val
+
+    # ----------------------------------------------------------
+    #  加速执行引擎的 TLB 计数 (只读)
+    # ----------------------------------------------------------
+
+    @property
+    def speedup_itlb_counts(self) -> tuple[int, int]:
+        """指令 TLB 的 (命中次数, 未命中次数) — 由加速执行引擎累计."""
+        return self._speedup_itlb_hits, self._speedup_itlb_misses
+
+    @property
+    def speedup_dtlb_counts(self) -> tuple[int, int]:
+        """数据 TLB 的 (命中次数, 未命中次数) — 由加速执行引擎累计."""
+        return self._speedup_dtlb_hits, self._speedup_dtlb_misses
 
     # ----------------------------------------------------------
     #  mip 快捷属性 (中断挂起位)
@@ -939,9 +1008,9 @@ class HartWithRegs:
 # ============================================================
 
 
-
 class TlbEntry(ctypes.Structure):
     """Single TLB entry — must match Rust ``state::TlbEntry`` exactly (40 bytes)."""
+
     _fields_ = [
         ("vpn", ctypes.c_uint64),
         ("ppn", ctypes.c_uint64),
@@ -956,38 +1025,9 @@ class TlbEntry(ctypes.Structure):
     ]
 
 
-class HartDiagC(ctypes.Structure):
-    """Diagnostic counters — matches Rust ``HartDiag`` exactly."""
-    _fields_ = [
-        ("clint_msip_set", ctypes.c_uint64),
-        ("clint_msip_clr", ctypes.c_uint64),
-        ("clint_mtc_wr", ctypes.c_uint64),
-        ("clint_msip_wr0", ctypes.c_uint64),
-        ("clint_msip_wr1", ctypes.c_uint64),
-        ("clint_wr1_remote", ctypes.c_uint64),
-        ("clint_wr1_self", ctypes.c_uint64),
-        ("cooldown_start", ctypes.c_uint64),
-        ("wfi_wake_msip", ctypes.c_uint64),
-        ("wfi_wake_mtip", ctypes.c_uint64),
-        ("wfi_wake_other", ctypes.c_uint64),
-        ("trap_msip_total", ctypes.c_uint64),
-        ("trap_msip_delegated", ctypes.c_uint64),
-        ("msip_last_seen", ctypes.c_uint64),
-        ("msip_masked_by_msie", ctypes.c_uint64),
-        ("msip_pending_no_trap", ctypes.c_uint64),
-        ("nt_mip_snapshot", ctypes.c_uint64),
-        ("nt_mie_snapshot", ctypes.c_uint64),
-        ("msie_cleared_at_pc", ctypes.c_uint64),
-        ("wfi_wake_no_msip_trap", ctypes.c_uint64),
-        ("nt_mode", ctypes.c_uint8),
-        ("nt_clint_raw", ctypes.c_uint8),
-        ("_pad2", ctypes.c_uint8 * 6),
-        ("nt_pending", ctypes.c_uint64),
-    ]
-
-
 class ImsicFileC(ctypes.Structure):
     """Single IMSIC interrupt file — must match Rust ``ImsicFile`` exactly."""
+
     _fields_ = [
         ("eip", ctypes.c_uint32 * 64),
         ("eie", ctypes.c_uint32 * 64),
@@ -1054,8 +1094,6 @@ class HartState(ctypes.Structure):
         ("_mmu_mode_pad", ctypes.c_uint64),
         # ---- Phase F: per-hart instruction counter ----
         ("total_instrs", ctypes.c_uint64),
-        # ---- Diagnostic sub-struct (matches Rust HartDiag) ----
-        ("diag", HartDiagC),
         # ---- Phase G: F/D floating point ----
         ("fprs", ctypes.c_uint64 * 32),
         ("fcsr", ctypes.c_uint32),
@@ -1068,6 +1106,12 @@ class HartState(ctypes.Structure):
         # 见 Rust write_mtimecmp/write_stimecmp + sync_mtip, 与 state.rs 同步.
         ("stip_deadline", ctypes.c_uint64),
         ("mtip_deadline", ctypes.c_uint64),
+        # ---- 加速执行引擎的 TLB 计数 ----
+        # 只由引擎累加, marshal_hart 不写入, unmarshal_hart 读出.
+        ("itlb_hits", ctypes.c_uint64),
+        ("itlb_misses", ctypes.c_uint64),
+        ("dtlb_hits", ctypes.c_uint64),
+        ("dtlb_misses", ctypes.c_uint64),
     ]
 
 
@@ -1145,6 +1189,8 @@ def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
     # Skip TLB marshalling for now — Rust handles TLB internally during acceleration.
     # Python TLB stays as ground truth; before each acceleration, Rust TLB is cold
     # but refills from page walks.
+    # 同一原因使引擎的 TLB 计数也不写入: 它是引擎侧的累计值, 只能由引擎递增,
+    # 由 unmarshal_hart 读出作为调试器展示的取值.
 
     # ---- Phase C: Extra CSRs ----
     state.mscratch = hart.csrs["mscratch"].val
@@ -1162,10 +1208,6 @@ def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
 
     # ---- Phase F: per-hart instruction counter ----
     state.total_instrs = hart._total_instrs
-
-    # ---- Phase F2: MSIP edge counter — must survive round-trips so
-    # Rust sync_msip doesn't re-detect stale edges at acceleration start ----
-    state.diag.msip_last_seen = hart.diag.msip_last_seen
 
     # ---- Phase G: F/D floating point ----
     for i in range(32):
@@ -1214,6 +1256,12 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
     # ---- Phase B: TLB — Rust TLB is cold after acceleration, don't write back ----
     # Python TLB is ground truth.
 
+    # ---- 加速执行引擎的 TLB 计数 — 只读出, 由引擎自身累加 ----
+    hart._speedup_itlb_hits = state.itlb_hits
+    hart._speedup_itlb_misses = state.itlb_misses
+    hart._speedup_dtlb_hits = state.dtlb_hits
+    hart._speedup_dtlb_misses = state.dtlb_misses
+
     # ---- Phase C: Extra CSRs ----
     hart.csrs["mscratch"].val = state.mscratch
     hart.csrs["sscratch"].val = state.sscratch
@@ -1231,9 +1279,6 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
 
     # ---- Phase F: per-hart instruction counter ----
     hart._total_instrs = state.total_instrs
-
-    # ---- Diagnostic: CLINT MSIP edge counters ----
-    hart.diag.load_ctypes(state.diag)
 
     # ---- Phase G: F/D floating point ----
     for i in range(32):
@@ -1316,8 +1361,8 @@ def _unmarshal_imsic(hart: HartWithRegs, state: HartState) -> None:
         # Compute daemon-added bits: bits set in Python between marshal
         # and now that were NOT in the snapshot.  These must survive the
         # Rust->Python copy.
-        pre_m = getattr(hart, '_imsic_pre_m_eip', None)
-        pre_s = getattr(hart, '_imsic_pre_s_eip', None)
+        pre_m = getattr(hart, "_imsic_pre_m_eip", None)
+        pre_s = getattr(hart, "_imsic_pre_s_eip", None)
         for j in range(64):
             daemon_m = mf.eip[j] & ~pre_m[j] if pre_m else 0
             daemon_s = sf.eip[j] & ~pre_s[j] if pre_s else 0

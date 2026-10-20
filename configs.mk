@@ -22,14 +22,6 @@ NATIVE_SRC = $(shell find $(NATIVE_DIR)/cpu $(NATIVE_DIR)/termio -type f -name '
 # ---- 模拟器硬件特性 (隔离到 emu-configs.mk) ----
 include emu-configs.mk
 
-# 任一诊断布尔开关置 1 即启用 _native 的 diagnostic feature.
-# 必须放在 include emu-configs.mk 之后: ?= 默认值到那时才可见 (旧实现于
-# include 之前判定, 导致 DIAG_* 变量永远不影响构建). PYREMU_DIAG_LOG 只作
-# 日志路径, 不参与本判定 (它默认非空, 纳入会退化为始终开启).
-ifneq ($(filter 1,$(PYREMU_TRACE_SRET) $(PYREMU_TRACE_TRAPS) $(PYREMU_TRACE_PMP)),)
-  CARGO_FLAGS += --features diagnostic
-endif
-
 # ---- 路径配置 ----
 hart_num = 3
 kei-sav = $(firm_dir)/kei.sav
@@ -68,30 +60,10 @@ fw_basic_flag += PLATFORM_RISCV_XLEN=64
 fw_basic_flag += PLATFORM_RISCV_ABI=lp64
 fw_basic_flag += FW_SKIP_BSS_ZERO=1
 
-DBG_ENCLAVE_STATS ?= 0
-DBG_MEM_INTERACT ?= 0
-DBG_PMP_CACHE ?= 0
-
 # 以下取值经 bsp/custom-opensbi/Makefile 并入固件的 .config, 命令行上的 CONFIG_* 变量即覆盖项.
 # 池的起始与大小在 pyremu 侧读同一对变量, 见 emu-configs.mk.
 fw_basic_flag += CONFIG_POOL_BASE=$(RESERVED_MEM_BASE)
 fw_basic_flag += CONFIG_POOL_SIZE=$(RESERVED_MEM_SIZE)
-
-# 调试统计开关 (见 bsp/custom-opensbi/lib/enclave_ext/Kconfig). 伞项为 0 时不写入这三项,
-# 取值由 Kconfig 默认值决定; 伞项为 1 时两个分项都显式给出, 使开关的取值不受默认值影响.
-ifeq ($(DBG_ENCLAVE_STATS),1)
-	fw_basic_flag += CONFIG_DBG_ENCLAVE_STATS=y
-	ifeq ($(DBG_MEM_INTERACT),1)
-		fw_basic_flag += CONFIG_DBG_MEM_INTERACT=y
-	else
-		fw_basic_flag += CONFIG_DBG_MEM_INTERACT=n
-	endif
-	ifeq ($(DBG_PMP_CACHE),1)
-		fw_basic_flag += CONFIG_DBG_PMP_CACHE=y
-	else
-		fw_basic_flag += CONFIG_DBG_PMP_CACHE=n
-	endif
-endif
 
 ## ---- fw_payload 构建 (内嵌 payload) ----
 FW_MAKE_FLAGS := $(fw_basic_flag)

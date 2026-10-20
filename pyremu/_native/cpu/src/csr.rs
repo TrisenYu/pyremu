@@ -6,15 +6,15 @@
 
 use std::sync::atomic::Ordering;
 
-use crate::concurrent::ConcurrentClintCtx;
+use crate::concurrent::{ConcurrentClintCtx, NS_PER_INSTR};
+use crate::ffi::InstrToBeExec;
 use crate::handlers::PmpCtx;
 use crate::interrupt::clint::write_stimecmp;
 use crate::interrupt::{
 	compute_mtopi, compute_stopi, imsic_reg_read, imsic_reg_write, imsic_topei_claim_iid,
 	imsic_topei_peek, sync_imsic_one, IID_M_IPI, IID_S_IPI,
 };
-use crate::ffi::InstrToBeExec;
-use crate::state::{exit_reason, riscv_mode, HartState, CFG_AIA};
+use crate::state::{exit_reason, riscv_mode, HartState, CFG_AIA, CPU_FREQ_HZ};
 use crate::trap::deliver_illegal_instruction;
 
 // ============================================================
@@ -119,6 +119,36 @@ pub const FFLAGS: u16 = 0x001;
 pub const FRM: u16 = 0x002;
 pub const FCSR: u16 = 0x003;
 
+// Machine-level counters
+pub const MCYCLE: u16 = 0xB00;
+pub const MINSTRET: u16 = 0xB02;
+pub const MCYCLEH: u16 = 0xB80;
+pub const MINSTRETH: u16 = 0xB82;
+
+// User-level counters
+pub const CYCLE: u16 = 0xC00;
+pub const TIME: u16 = 0xC01;
+pub const INSTRET: u16 = 0xC02;
+pub const CYCLEH: u16 = 0xC80;
+pub const TIMEH: u16 = 0xC81;
+pub const INSTRETH: u16 = 0xC82;
+
+/// 每条已执行完成的指令折算的时钟周期数.
+///
+/// 指令计数与时钟周期数的换算取 NS_PER_INSTR 与 CPU_FREQ_HZ 两个生成常量:
+///
+///     cycles = instrs * NS_PER_INSTR * CPU_FREQ_HZ / 1e9
+pub const CYCLES_PER_INSTR: u64 = NS_PER_INSTR * CPU_FREQ_HZ / 1_000_000_000;
+
+/// 本 hart 的 `mcycle` 值, 由该 hart 已执行完成的指令数折算.
+///
+/// 计数按 hart 独立推进, 故同一个 hart 上两次采样之差只包含该 hart 自身
+/// 执行的指令, 与其它 hart 是否运行无关.
+#[inline]
+pub fn cycles_of(state: &HartState) -> u64 {
+	state.total_instrs.wrapping_mul(CYCLES_PER_INSTR)
+}
+
 // ============================================================
 //  mstatus / sstatus field masks
 // ============================================================
@@ -164,6 +194,18 @@ pub const CSR_OK: u8 = 0;
 pub const CSR_ILL: u8 = 1;
 pub const CSR_EXIT: u8 = 2;
 
+/// 用户级计数器 CSR 在 counteren 寄存器中对应的位; 非此类 CSR 返回 ``None``.
+///
+/// 0xC00-0xC1F 为 cycle / time / instret / hpmcounter3-31,
+/// 0xC80-0xC9F 为它们的高半; 高半与低半共用同一位.
+fn counter_enable_bit(addr: u16) -> Option<u64> {
+	match addr {
+		0xC00..=0xC1F => Some(1 << (addr - 0xC00)),
+		0xC80..=0xC9F => Some(1 << (addr - 0xC80)),
+		_ => None,
+	}
+}
+
 /// Read a CSR value. Returns ``(value, status)``.
 /// status == CSR_OK: value is valid, caller writes to rd.
 /// status == CSR_ILL: deliver IllInstr.
@@ -175,41 +217,20 @@ pub fn csr_read(ctx: &mut CsrContext, addr: u16) -> (u64, u8) {
 		return (0, CSR_ILL);
 	}
 
-	// Counter enable checks for S-mode reading M-mode counters
-	if priv_req == 0 && ctx.state.mode == riscv_mode::S {
-		match addr {
-			0xC00 | 0xC80 => {
-				if ctx.state.mcounteren & 1 == 0 {
+	// 计数器使能检查. 用户级计数器 CSR (0xC00-0xC1F, 0xC80-0xC9F) 的特权
+	// 编码为 0, 上一步的特权检查不会拒绝它们, 可读性由 counteren 寄存器决定:
+	//   S 模式: mcounteren 的对应位
+	//   U 模式: mcounteren 与 scounteren 的对应位同时置位
+	// 高半 CSR 与低半共用同一位.
+	if let Some(bit) = counter_enable_bit(addr) {
+		match ctx.state.mode {
+			riscv_mode::S => {
+				if ctx.state.mcounteren & bit == 0 {
 					return (0, CSR_ILL);
 				}
 			}
-			0xC01 | 0xC81 => {
-				if ctx.state.mcounteren & 2 == 0 {
-					return (0, CSR_ILL);
-				}
-			}
-			0xC02 | 0xC82 => {
-				if ctx.state.mcounteren & 4 == 0 {
-					return (0, CSR_ILL);
-				}
-			}
-			_ => {}
-		}
-	}
-	if priv_req == 1 && ctx.state.mode == riscv_mode::U {
-		match addr {
-			0xC00 | 0xC80 => {
-				if ctx.state.scounteren & 1 == 0 {
-					return (0, CSR_ILL);
-				}
-			}
-			0xC01 | 0xC81 => {
-				if ctx.state.scounteren & 2 == 0 {
-					return (0, CSR_ILL);
-				}
-			}
-			0xC02 | 0xC82 => {
-				if ctx.state.scounteren & 4 == 0 {
+			riscv_mode::U => {
+				if ctx.state.mcounteren & bit == 0 || ctx.state.scounteren & bit == 0 {
 					return (0, CSR_ILL);
 				}
 			}
@@ -259,13 +280,16 @@ pub fn csr_read(ctx: &mut CsrContext, addr: u16) -> (u64, u8) {
         MISA => (0x800000000014112Du64, CSR_OK),
 
         // time (from CLINT mtime)
-        0xC01 => (ctx.mtime(), CSR_OK),
+        TIME => (ctx.mtime(), CSR_OK),
         // timeh
-        0xC81 => (ctx.mtime() >> 32, CSR_OK),
+        TIMEH => (ctx.mtime() >> 32, CSR_OK),
 
-        // cycle/instret — we don't track these,
-        // but reading them should not trap. Return 0.
-        0xC00 | 0xC02 | 0xC80 | 0xC82 => (0, CSR_OK),
+        // 机器级与用户级计数器, 按本 hart 已执行完成的指令数折算.
+        // 高半 CSR 返回同一计数的 bits[63:32].
+        MCYCLE | CYCLE => (cycles_of(ctx.state), CSR_OK),
+        MINSTRET | INSTRET => (ctx.state.total_instrs, CSR_OK),
+        MCYCLEH | CYCLEH => ((cycles_of(ctx.state) >> 32) & 0xFFFF_FFFF, CSR_OK),
+        MINSTRETH | INSTRETH => ((ctx.state.total_instrs >> 32) & 0xFFFF_FFFF, CSR_OK),
 
         0x5C0 => (ctx.state.mdid, CSR_OK),
         0x5C1 => (ctx.state.pmpsplit as u64, CSR_OK),
@@ -470,11 +494,16 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
         // 静默忽略 (WARL). 否则落入 _ => CSR_EXIT -> 每条 rdtime 都退出
         // (~1.4ms/条) -> 内核吞吐崩溃 -> STI 处理尾部长于 tick 周期
         // -> 永久 STI 活锁, 启动阻塞在 vgaarb: loaded.
-        0xC01 | 0xC81 => CSR_OK,
+        TIME | TIMEH => CSR_OK,
+
+        // mcycle/minstret (0xB00/0xB02/0xB80/0xB82) — 计数由本 hart 的
+        // 指令数导出, 写入被忽略. csrrs rd, mcycle, x0 会把读到的值回写,
+        // 故写路径返回成功, 该指令不退出加速执行.
+        MCYCLE | MINSTRET | MCYCLEH | MINSTRETH => CSR_OK,
 
         // cycle/instret (0xC00/0xC02/0xC80/0xC82) — 同为只读计数器,
         // csrrs 读惯用法回写原值, 同样静默忽略.
-        0xC00 | 0xC02 | 0xC80 | 0xC82 => CSR_OK,
+        CYCLE | INSTRET | CYCLEH | INSTRETH => CSR_OK,
 
         // Sstc stimecmp (0x14D) — S-mode timer compare value.
         // QEMU 一次性定时器语义 (riscv_aclint_mtimer_write_timecmp):
@@ -832,11 +861,6 @@ pub fn handle_csr(
 	// sync_mtip 仍在下一指令边界运行, 但 stopi 在此之前读到的 mip.STIP
 	// 已是最新值 (write_stimecmp 在写指令内同步置/清位)。
 
-	// stopi / mtopi claim is now handled entirely within csr_write
-	// (see the 0xDB0 / 0xFB0 match arms), which has access to mtime
-	// and mtimecmp via CsrContext.  No duplicated claim needed here.
-
-	// Write old value to rd (skip for x0)
 	if rd != 0 {
 		write_gpr(ctx.state, rd, old_val);
 	}
@@ -1011,7 +1035,7 @@ mod tests {
 		let mut s = test_state();
 		let clint = test_clint(0);
 		let mut ctx = test_csr_ctx(&mut s, &clint);
-		let st = csr_write(&mut ctx, 0xB00, 0); // mcycle
+		let st = csr_write(&mut ctx, 0x7C0, 0); // 自定义 CSR, 加速引擎未实现
 		assert_eq!(st, CSR_EXIT);
 	}
 
@@ -1172,6 +1196,173 @@ mod tests {
 		assert_eq!(st, CSR_OK);
 		// 0x123456789AB >> 32 -> upper bits = 0x123 = 291
 		assert_eq!(v, 0x123);
+	}
+
+	/// mcycle 与 cycle 由本 hart 已执行完成的指令数折算.
+	#[test]
+	fn read_mcycle_from_per_hart_instr_count() {
+		let mut s = test_state();
+		s.total_instrs = 5;
+		let clint = test_clint(0);
+		let mut ctx = test_csr_ctx(&mut s, &clint);
+		let (v, st) = csr_read(&mut ctx, MCYCLE);
+		assert_eq!(st, CSR_OK);
+		assert_eq!(v, 5 * CYCLES_PER_INSTR);
+		let (v, st) = csr_read(&mut ctx, CYCLE);
+		assert_eq!(st, CSR_OK);
+		assert_eq!(v, 5 * CYCLES_PER_INSTR);
+	}
+
+	/// minstret 与 instret 直接给出本 hart 已执行完成的指令数.
+	#[test]
+	fn read_minstret_from_per_hart_instr_count() {
+		let mut s = test_state();
+		s.total_instrs = 0x1_2345_6789;
+		let clint = test_clint(0);
+		let mut ctx = test_csr_ctx(&mut s, &clint);
+		let (v, st) = csr_read(&mut ctx, MINSTRET);
+		assert_eq!(st, CSR_OK);
+		assert_eq!(v, 0x1_2345_6789);
+		let (v, st) = csr_read(&mut ctx, INSTRET);
+		assert_eq!(st, CSR_OK);
+		assert_eq!(v, 0x1_2345_6789);
+	}
+
+	/// 高半 CSR 返回同一计数的 bits[63:32].
+	#[test]
+	fn read_counter_high_halves() {
+		let mut s = test_state();
+		s.total_instrs = 0x1_2345_6789;
+		let cycles = 0x1_2345_6789u64.wrapping_mul(CYCLES_PER_INSTR);
+		let clint = test_clint(0);
+		let mut ctx = test_csr_ctx(&mut s, &clint);
+		let (v, st) = csr_read(&mut ctx, MCYCLEH);
+		assert_eq!(st, CSR_OK);
+		assert_eq!(v, (cycles >> 32) & 0xFFFF_FFFF);
+		let (v, st) = csr_read(&mut ctx, CYCLEH);
+		assert_eq!(st, CSR_OK);
+		assert_eq!(v, (cycles >> 32) & 0xFFFF_FFFF);
+		let (v, st) = csr_read(&mut ctx, MINSTRETH);
+		assert_eq!(st, CSR_OK);
+		assert_eq!(v, 0x1);
+		let (v, st) = csr_read(&mut ctx, INSTRETH);
+		assert_eq!(st, CSR_OK);
+		assert_eq!(v, 0x1);
+	}
+
+	/// 两个 hart 的计数器互不影响: 各自的读数只由自身的指令数给出.
+	#[test]
+	fn counter_reads_are_independent_between_harts() {
+		let mut s0 = test_state();
+		let mut s1 = test_state();
+		s0.total_instrs = 3;
+		s1.total_instrs = 7;
+		let clint = test_clint(0);
+		let (v0, st0) = {
+			let mut ctx = test_csr_ctx(&mut s0, &clint);
+			csr_read(&mut ctx, MCYCLE)
+		};
+		let (v1, st1) = {
+			let mut ctx = test_csr_ctx(&mut s1, &clint);
+			csr_read(&mut ctx, MCYCLE)
+		};
+		assert_eq!((v0, st0), (3 * CYCLES_PER_INSTR, CSR_OK));
+		assert_eq!((v1, st1), (7 * CYCLES_PER_INSTR, CSR_OK));
+	}
+
+	/// U 模式读计数器要求 mcounteren 与 scounteren 的对应位同时置位.
+	///
+	/// 修复前 U 模式分支按特权编码 1 判定, 而计数器 CSR 的编码为 0,
+	/// 该分支从不命中, 于是一位未置位也读到计数.
+	#[test]
+	fn counter_read_in_u_mode_requires_both_counteren() {
+		let clint = test_clint(0);
+
+		// mcounteren 置位而 scounteren 未置位: 拒绝.
+		let mut s = test_state();
+		s.mode = riscv_mode::U;
+		s.mcounteren = 0b111;
+		s.scounteren = 0;
+		{
+			let mut ctx = test_csr_ctx(&mut s, &clint);
+			assert_eq!(csr_read(&mut ctx, CYCLE).1, CSR_ILL);
+		}
+
+		// mcounteren 未置位而 scounteren 置位: 拒绝.
+		let mut s = test_state();
+		s.mode = riscv_mode::U;
+		s.mcounteren = 0;
+		s.scounteren = 0b111;
+		{
+			let mut ctx = test_csr_ctx(&mut s, &clint);
+			assert_eq!(csr_read(&mut ctx, CYCLE).1, CSR_ILL);
+		}
+
+		// 二者同时置位: 允许.
+		let mut s = test_state();
+		s.mode = riscv_mode::U;
+		s.mcounteren = 0b111;
+		s.scounteren = 0b111;
+		{
+			let mut ctx = test_csr_ctx(&mut s, &clint);
+			assert_eq!(csr_read(&mut ctx, CYCLE).1, CSR_OK);
+		}
+	}
+
+	/// 高半计数器与低半共用 counteren 的同一位.
+	#[test]
+	fn counter_high_half_shares_enable_bit() {
+		let clint = test_clint(0);
+		let mut s = test_state();
+		s.mode = riscv_mode::U;
+		s.mcounteren = 0b001;
+		s.scounteren = 0b001;
+		let mut ctx = test_csr_ctx(&mut s, &clint);
+		assert_eq!(csr_read(&mut ctx, CYCLE).1, CSR_OK);
+		assert_eq!(csr_read(&mut ctx, CYCLEH).1, CSR_OK);
+		assert_eq!(csr_read(&mut ctx, INSTRET).1, CSR_ILL);
+		assert_eq!(csr_read(&mut ctx, INSTRETH).1, CSR_ILL);
+	}
+
+	/// S 模式读计数器只由 mcounteren 门控, 不读取 scounteren.
+	#[test]
+	fn counter_read_in_s_mode_uses_mcounteren_only() {
+		let clint = test_clint(0);
+		let mut s = test_state();
+		s.mode = riscv_mode::S;
+		s.mcounteren = 0b010;
+		s.scounteren = 0;
+		let mut ctx = test_csr_ctx(&mut s, &clint);
+		assert_eq!(csr_read(&mut ctx, TIME).1, CSR_OK);
+		assert_eq!(csr_read(&mut ctx, TIMEH).1, CSR_OK);
+		assert_eq!(csr_read(&mut ctx, CYCLE).1, CSR_ILL);
+	}
+
+	/// M 模式读计数器不受 counteren 限制.
+	#[test]
+	fn counter_read_in_m_mode_ignores_counteren() {
+		let clint = test_clint(0);
+		let mut s = test_state();
+		s.mcounteren = 0;
+		s.scounteren = 0;
+		let mut ctx = test_csr_ctx(&mut s, &clint);
+		assert_eq!(csr_read(&mut ctx, CYCLE).1, CSR_OK);
+		assert_eq!(csr_read(&mut ctx, INSTRET).1, CSR_OK);
+	}
+
+	/// ``csrrs a0, mcycle, x0`` 必须在一轮加速执行内完成:
+	/// 读路径给出计数, 回写路径返回成功, 不退出到 Python.
+	#[test]
+	fn csrrs_mcycle_stays_in_acceleration() {
+		let mut s = test_state();
+		s.total_instrs = 123;
+		let mut r = make_instr_group();
+		let clint = test_clint(0);
+		let mut ctx = test_csr_ctx(&mut s, &clint);
+		let adv = handle_csr(&mut ctx, 10, 0, MCYCLE, 0b010, 0xB000_2573, &mut r);
+		assert_eq!(adv, 4, "rdmcycle 必须在一轮加速执行中完成");
+		assert_eq!(r.exit_reason, 0, "rdmcycle 不得设置退出原因");
+		assert_eq!(ctx.state.gprs[10], 123 * CYCLES_PER_INSTR);
 	}
 
 	#[test]

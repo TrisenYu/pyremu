@@ -1,6 +1,6 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved.
-# 	Author: <jajune257@gmail.com> in 2026
+# Author: <jajune257@gmail.com> in 2026
 # 遍く奇跡の始発点
 
 CLANG   ?= clang

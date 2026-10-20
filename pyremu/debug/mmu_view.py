@@ -20,7 +20,6 @@ from pyremu.memory.pmp import (
     PMP_A_NAPOT,
     PMP_A_OFF,
     PMP_A_TOR,
-    PMP_L,
     PMP_R,
     PMP_W,
     PMP_X,
@@ -42,17 +41,33 @@ class MmuViewMixin(SharedMixinAttrs):
         shift = (entry_idx & 0x7) * 8
         return (cfg_val >> shift) & 0xFF
 
+    @staticmethod
+    def _pmp_rwx_cell(cfg: int) -> str:
+        """把权限位编成 RWX 单元格: 依序为 R、W、X, 未置位的位置写 ``-``."""
+        return "".join(
+            f"[{style}]{char}[/]" if cfg & mask else "[dim]-[/]"
+            for mask, char, style in (
+                (PMP_R, "r", "green"),
+                (PMP_W, "w", "yellow"),
+                (PMP_X, "x", "red"),
+            )
+        )
+
     # ----------------------------------------------------------
     #  PMP 命令
     # ----------------------------------------------------------
 
     def cmd_pmp(self) -> None:
-        """显示所有 PMP 条目的保护地址范围与权限 (含原始寄存器值)."""
+        """显示所有 PMP 条目的保护地址范围与权限 (含原始寄存器值).
+
+        RWX 列的三个字符依序对应 R、W、X, 未置位的位置写 ``-``; 锁定位可由 cfg
+        列的原始字节直接读出.
+        """
         h = self.hart
         num = h._pmp.num_entries if h._pmp else 0
 
         if num == 0:
-            self._console.print("[dim]PMP 未配置 (num_entries=0)[/]")
+            self._console.print("[dim]PMP num_entries=0[/]")
             return
 
         mode_names = {
@@ -63,14 +78,11 @@ class MmuViewMixin(SharedMixinAttrs):
         }
 
         tbl = Table(
-            title=f"Hart {self._hart_id}  PMP 条目 ({num} total)",
+            title=f"Hart {self._hart_id} PMP({num})配置情况",
             border_style="blue",
         )
         tbl.add_column("#", style="cyan", justify="right")
-        tbl.add_column("L", style="magenta", width=2)
-        tbl.add_column("R", style="green", width=2)
-        tbl.add_column("W", style="yellow", width=2)
-        tbl.add_column("X", style="red", width=2)
+        tbl.add_column("RWX", width=3)
         tbl.add_column("Mode", style="cyan", width=6)
         tbl.add_column("Base", style="green")
         tbl.add_column("End", style="yellow")
@@ -108,10 +120,7 @@ class MmuViewMixin(SharedMixinAttrs):
             elif a_mode == PMP_A_NAPOT:
                 base, size = decode_napot(addr_field)
 
-            locked = "l" if cfg & PMP_L else "-"
-            r = "r" if cfg & PMP_R else "-"
-            w = "w" if cfg & PMP_W else "-"
-            x = "x" if cfg & PMP_X else "-"
+            rwx = self._pmp_rwx_cell(cfg)
             mode = mode_names.get(a_mode, f"?{a_mode >> 3}?")
             addr_s = f"0x{addr_field:016x}"
             cfg_s = f"0x{cfg:02x}"
@@ -127,8 +136,14 @@ class MmuViewMixin(SharedMixinAttrs):
                     size_s = fmt_size(size)
 
             tbl.add_row(
-                str(i), locked, r, w, x, mode,
-                base_s, end_s, size_s, addr_s, cfg_s,
+                str(i),
+                rwx,
+                mode,
+                base_s,
+                end_s,
+                size_s,
+                addr_s,
+                cfg_s,
             )
 
         self._console.print(tbl)
@@ -196,13 +211,12 @@ class MmuViewMixin(SharedMixinAttrs):
         mn = mode_names.get(mode_s, f"MODE={mode_s}")
 
         vpn2, vpn1, vpn0, page_off = sv39_decompose_va(va)
-
+        vpn2 <<= 3
         out: list[str] = [
             f"[bold]VA[/] [cyan]0x{va:016x}[/]",
-            f"  VPN[2]={vpn2:#05x}  VPN[1]={vpn1:#05x}  VPN[0]={vpn0:#05x}  "
+            f"  VPN[2]={vpn2>>3:#05x}  VPN[1]={vpn1:#05x}  VPN[0]={vpn0:#05x}  "
             f"offset={page_off:#05x}",
             f"  satp = {mn}, root PPN=0x{root_ppn:09x} -> PA=0x{root_pa:016x}",
-            "",
         ]
 
         # L1 页表, 即根页表
@@ -212,9 +226,9 @@ class MmuViewMixin(SharedMixinAttrs):
             self._console.print("\n".join(out))
             return
         l1_pte = int.from_bytes(
-            l1_raw[vpn2 * 8:vpn2 * 8 + 8], "little", signed=False
+            l1_raw[vpn2:vpn2 + 8], "little", signed=False
         )
-        self._pt_append_level(out, 1, vpn2, l1_pte)
+        self._pt_append_level(out, 1, vpn2 >> 3, l1_pte)
         if not (l1_pte & 1):
             self._console.print("\n".join(out))
             return

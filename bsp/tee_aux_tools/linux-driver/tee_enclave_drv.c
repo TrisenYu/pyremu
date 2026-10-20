@@ -48,9 +48,9 @@
 #define SBI_ENCLAVE_REQUEST_SHUTDOWN 410
 /* 503 至 505: 宿主应答飞地挂起的模块请求, 三者均以 "飞地编号 + 管理令牌" 鉴权
  * (见 enclave_api/ext_mod/). */
-#define SBI_ENCLAVE_MODULE_REQ	 503
-#define SBI_ENCLAVE_MODULE_SIZE	 504
-#define SBI_ENCLAVE_MODULE_IMG 505
+#define SBI_ENCLAVE_MODULE_REQ	503
+#define SBI_ENCLAVE_MODULE_SIZE 504
+#define SBI_ENCLAVE_MODULE_IMG	505
 
 /* ---- ioctl command codes (must match userspace tee_enclave.h) ---- */
 
@@ -66,7 +66,7 @@
 #define TEE_IOC_CREATE_EX		 _IOWR(TEE_IOC_MAGIC, 8, struct tee_enclave_token_args)
 #define TEE_IOC_MODULE_REQ		 _IOWR(TEE_IOC_MAGIC, 9, struct tee_enclave_args)
 #define TEE_IOC_MODULE_SIZE		 _IOWR(TEE_IOC_MAGIC, 10, struct tee_enclave_args)
-#define TEE_IOC_MODULE_IMG	 _IOWR(TEE_IOC_MAGIC, 11, struct tee_enclave_args)
+#define TEE_IOC_MODULE_IMG		 _IOWR(TEE_IOC_MAGIC, 11, struct tee_enclave_args)
 
 /* argv 序列化上限: 防御恶意超大 argc 或超长字符串导致内核过量分配. */
 #define TEE_MAX_ARGC	  128
@@ -145,7 +145,13 @@ struct tee_enclave_args {
  * "在线且在内核上下文". 于是 RCU 在 stall 阈值过半后开始等待本 hart 报静止态,
  * 而它永远不报 (dmesg 出现 rcu self-detected stall).
  *
- * 按 KVM 处理客户机态的做法, 在这四个 ecall 前后成对标记: tee_guest_enter 让 RCU
+ * 该区间可能先包含 M 模式内的等待: 目标飞地已被另一个 hart 承载, 或 CREATE
+ * 所争用的空闲槽位与空闲分区尚未同时具备时, 请求方 hart 入队后在本区间内等待,
+ * 条件成立才继续把这次请求做完, 见固件的 enclave_ext/req_queue.h. SHUTDOWN 的
+ * 等待也属这一类: 它不转入飞地, 但同样在 M 模式内驻留到目标飞地消失. 故本区间
+ * 的长度不由本飞地的一次运行决定, 而由其它 hart 的进度决定, 无上界.
+ *
+ * 按 KVM 处理客户机态的做法, 在这五个 ecall 前后成对标记: tee_guest_enter 让 RCU
  * 不再等待本 hart (进入 RCU 扩展静默态), tee_guest_exit 在控制交还后恢复.
  * 两者要求关中断 (context_tracking.c 的 __ct_user_enter 带
  * lockdep_assert_irqs_disabled) 且 current->mm 非空 (ioctl 调用方满足).
@@ -320,6 +326,11 @@ out:
 	return rc;
 }
 
+/* 飞地扩展专用的两个 SBI 错误码, 取值与固件的 enclave_types.h 一致. 两者都不在
+ * asm/sbi.h 内, 故在此登记. */
+#define SBI_ERR_ENCLAVE_QUEUE_FULL (-15)
+#define SBI_ERR_ENCLAVE_GONE	   (-16)
+
 /* SBI 错误码 (a0, 负值) 与 errno 是两套独立编号: 直接把 SBI 码当 ioctl 返回值,
  * 用户态看到的 errno 会是 -SBI码 这个巧合值 (如 DENIED(-4) 被读成 EINTR), 与真实
  * 失败原因无关. 统一在此换算, 用户态 errno 才与原因对应; 未知码按 EIO 兜底,
@@ -348,6 +359,12 @@ static int sbi_err_to_errno(long err) {
 		return -ERANGE;
 	case SBI_ERR_TIMEOUT:
 		return -ETIMEDOUT;
+	case SBI_ERR_ENCLAVE_QUEUE_FULL:
+		/* 请求队列已存满: 本次请求未被受理, 已排队的请求不受影响, 稍后重试可被受理. */
+		return -EBUSY;
+	case SBI_ERR_ENCLAVE_GONE:
+		/* 等待期内该编号的飞地已被终止: 该对象不再存在, 重试同一编号不会成功. */
+		return -ENOENT;
 	case SBI_ERR_IO:
 	default:
 		return -EIO;
@@ -510,7 +527,13 @@ static long tee_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 		if (copy_from_user(&kargs, (void __user *)arg, sizeof(kargs))) {
 			return -EFAULT;
 		}
+		/* 目标飞地仍被另一个 hart 承载时本 ecall 不立即返回: M 模式向该 hart 发出
+		 * 终止通知, 随后在本飞地的请求队列上等待到该编号的飞地消失为止, 见固件的
+		 * enclave_ext/req_queue.h. 故本调用返回即该飞地已不存在, 驱动不需要重试.
+		 * 该等待与本驱动其余四个转入飞地的调用同型, 故同样标记 RCU 静默态. */
+		unsigned long ct_flags = tee_guest_enter();
 		ret = sbi_enclave_ecall_2(SBI_ENCLAVE_SHUTDOWN, kargs.enclave_id, kargs.token);
+		tee_guest_exit(ct_flags);
 		if ((long)ret.error < 0) {
 			pr_err(
 				"tee_enclave: SHUTDOWN(403) id=%llu failed, error=%ld\n",

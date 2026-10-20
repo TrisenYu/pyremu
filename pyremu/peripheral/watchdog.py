@@ -9,7 +9,7 @@ MMIO 寄存器布局 (每个 hart 独立, stride=0x10):
 
 当任一 hart 的计数器归零时, 设备自动对全体 WFI hart 注入 MSIP=1,
 利用现有中断路径打破可能的跨核死锁.  同时也拉高中断线供 PLIC/APLIC 使用
-(暂未实现 — 当前仅直接操作 CLINT MSIP).
+(暂未实现 — 当前仅操作 CLINT MSIP).
 
 DTB 绑定:
   compatible = "pyremu,hart-watchdog-1.0"
@@ -20,12 +20,14 @@ DTB 绑定:
 from __future__ import annotations
 
 import struct
+import threading
 from typing import TYPE_CHECKING
 
 from pyremu.memory.bus import Device
 
 if TYPE_CHECKING:
-    from pyremu.emulator import Emulator
+    from pyremu.core.hart import HartWithRegs
+    from pyremu.interrupt.clint import CLINT
 
 # 寄存器偏移 & 位定义
 _WDOG_CTRL = 0x00
@@ -42,7 +44,8 @@ class HartWatchdog(Device):
 
     def __init__(
         self,
-        emu: Emulator,
+        clint: CLINT,
+        wake_event: threading.Event,
         base: int = 0x1000_4000,
         num_harts: int = 2,
         timeout: int = 500,  # 默认 500 单轮加速执行超时
@@ -50,7 +53,10 @@ class HartWatchdog(Device):
         self.base_addr = base
         self._num_harts = num_harts
         self._timeout = timeout
-        self._emu = emu
+        self._clint = clint
+        # 被唤醒的 hart 列表每次恢复操作时随参数传入, 不由本设备持有: Emulator 持有本
+        # 设备, 本设备再持有 hart 列表会使 hart 与 Emulator 之间形成环形引用.
+        self._wake_event = wake_event
 
         # 每 hart: [ctrl, timeout_val, count, _reserved]
         self._ctrl: list[int] = [0] * num_harts
@@ -112,8 +118,11 @@ class HartWatchdog(Device):
         if hart_id < self._num_harts and self._ctrl[hart_id] & _CTRL_ENABLE:
             self._count[hart_id] = self._timeout_val[hart_id]
 
-    def tick(self) -> bool:
+    def tick(self, harts: list[HartWithRegs]) -> bool:
         """推进所有 hart 的计数器; 若任一归零则触发恢复操作.
+
+        Args:
+            harts: 本次恢复操作要唤醒的 hart 列表.
 
         Returns:
             True 若执行了恢复操作.
@@ -126,23 +135,19 @@ class HartWatchdog(Device):
                 self._count[i] -= 1
             if self._count[i] == 0:
                 # 计数器归零 — 触发恢复
-                self._do_recover()
+                self._do_recover(harts)
                 self._count[i] = self._timeout_val[i]
                 fired = True
         return fired
 
-    def _do_recover(self) -> None:
+    def _do_recover(self, harts: list[HartWithRegs]) -> None:
         """恢复操作: 对全体 WFI hart 注入 MSIP.
 
         沿用现有路径, 即 CLINT MSIP 触发 WFI 唤醒, 随后进入 M-mode trap, 最终由
         sbi_ipi_process 处理, 让空闲 hart 重新处理可能排队的 IPI 事件.
-        同时通知状态变化, 使中断缓存失效并触发 try_wfi_wakeup.
+        send_ipi 一并通知状态变化, 使中断缓存失效并触发 try_wfi_wakeup.
         """
-        clint = self._emu.clint
-        for h in self._emu.harts:
+        for h in harts:
             if h._waiting and not h._halted:
-                hid = h.id
-                if hid < len(clint._msip):
-                    clint._msip[hid] = 1
-        clint._notify_state_change()
-        self._emu._wake_event.set()
+                self._clint.send_ipi(h.id)
+        self._wake_event.set()

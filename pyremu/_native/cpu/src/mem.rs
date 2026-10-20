@@ -226,10 +226,10 @@ mod tests {
 		assert_eq!(ok, 0);
 	}
 
-	/// 地址加长度按模 2^64 回卷时不得判为窗口内命中.
+	/// 地址加长度按模 2^64 取余时不得判为窗口内命中.
 	///
 	/// 触发值 `u64::MAX` 即 Python 侧负数地址 (如 fp-16 得到 -1) 经 ctypes
-	/// 转换后的取值: 加 8 回卷为 7, 落在 [ram_base, ram_base + ram_size) 之内,
+	/// 转换后的取值: 加 8 取余为 7, 落在 [ram_base, ram_base + ram_size) 之内,
 	/// 修复前会据此算出 0xFFFF_FFFF_7FFF_FFFF 的偏移并越界拷贝.
 	#[test]
 	fn test_read_addr_wraparound_rejected() {

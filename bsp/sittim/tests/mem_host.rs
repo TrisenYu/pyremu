@@ -101,9 +101,24 @@ mod ecall_aux {
 	pub static SET_ATTR_PARTITIONS: AtomicU64 = AtomicU64::new(0);
 	pub static SET_ATTR_ATTR: AtomicU64 = AtomicU64::new(0);
 
-	/// 本入口内的用例不申请分区。
-	pub fn enclave_call_mem_alloc(_chunk_nums: u64, _attr: u64) -> (u64, u64) {
-		(0, !0u64)
+	/// 分区申请的次数, 以及最近一次请求的分区块数。
+	pub static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
+	pub static ALLOC_CHUNK_NUMS: AtomicU64 = AtomicU64::new(0);
+	/// 分区申请授予的分区块数。取 0 表示拒绝, 即池中无可用分区。
+	pub static ALLOC_GRANTED: AtomicU64 = AtomicU64::new(0);
+	/// 授予分区的物理起始地址。
+	pub static ALLOC_PA: AtomicU64 = AtomicU64::new(0);
+
+	/// 记录一次分区申请。授予的块数取 [`ALLOC_GRANTED`], 请求多于授予时只授予请求的块数。
+	pub fn enclave_call_mem_alloc(chunk_nums: u64, _attr: u64) -> (u64, u64) {
+		ALLOC_CALLS.fetch_add(1, Ordering::SeqCst);
+		ALLOC_CHUNK_NUMS.store(chunk_nums, Ordering::SeqCst);
+		let granted = ALLOC_GRANTED.load(Ordering::SeqCst);
+		if granted == 0 {
+			return (0, !0u64);
+		}
+		let granted = if granted < chunk_nums { granted } else { chunk_nums };
+		(granted, ALLOC_PA.load(Ordering::SeqCst))
 	}
 
 	/// 记录一次类别改判请求并报告成功。
@@ -160,7 +175,16 @@ fn world() {
 		);
 	});
 	ecall_aux::SET_ATTR_CALLS.store(0, Ordering::SeqCst);
+	ecall_aux::ALLOC_CALLS.store(0, Ordering::SeqCst);
+	ecall_aux::ALLOC_GRANTED.store(0, Ordering::SeqCst);
+	ecall_aux::ALLOC_PA.store(0, Ordering::SeqCst);
 	paging::MAP_CALLS.store(0, Ordering::SeqCst);
+}
+
+/// 让下一次分区申请授予 *chunk_nums* 块分区, 物理起始地址取 `ALLOC_PA`。
+fn grant_alloc(chunk_nums: u64, pa: u64) {
+	ecall_aux::ALLOC_GRANTED.store(chunk_nums, Ordering::SeqCst);
+	ecall_aux::ALLOC_PA.store(pa, Ordering::SeqCst);
 }
 
 /// 类别改判请求的次数, 以及最近一次请求的物理基址、分区数与类别。
@@ -482,4 +506,177 @@ fn test_mmap_shrink_after_a_shrink_to_a_block_boundary_is_refused() {
 	let boundary_end = UMODE_MMAP_BASE + 512 * PAGE_SIZE;
 	assert!(!resize_mmap_at_region_end(boundary_end, boundary_end - 412 * PAGE_SIZE));
 	assert_eq!(context::ctx().umode_mmap_pages_used, 512);
+}
+
+// ---------------------------------------------------------------
+//  mmap 映射区的页计数: 交付后的增量与块边界取整
+// ---------------------------------------------------------------
+
+/// mmap 映射区可交付的页数。
+fn mmap_region_pages() -> u64 {
+	(UMODE_VA_LIMIT - UMODE_MMAP_BASE) >> PAGE_SHIFT
+}
+
+/// 指令类请求交付一块之后, 页计数推进一整块的页数。
+///
+/// 页计数以 4 KiB 页为单位, 一块 2 MiB 分区对应 `CHUNK_2M_PAGES` 页。增量若按块移位的
+/// 位数计算, 每块会推进 2^21 页即 8 GiB 虚拟地址; 映射区因此很快越过用户空间上界,
+/// 而其后的 VA 与低半区的 VA 共用根表项。
+#[test]
+fn test_take_mmap_region_advances_one_block_of_pages_for_an_instr_request() {
+	let _ = set_mmap_state(0, 0);
+	grant_alloc(1, SPLIT_PA);
+
+	assert_eq!(
+		mem::take_mmap_region(PAGE_SIZE, PTE_U | PTE_R | PTE_X),
+		UMODE_MMAP_BASE
+	);
+	assert_eq!(context::ctx().umode_mmap_pages_used, CHUNK_2M_PAGES);
+}
+
+/// 达到一整块的请求先把页计数推进到块边界, 再按块推进, 两者都以 4 KiB 页计数。
+///
+/// 页计数为 100 时请求 512 页: 块内余量作废, 新块自页 512 起, 交付后页计数为 1024。
+/// 边界取整若按块移位的位数计算, 页计数直接跳到 2^21; 增量若按同一移位计算, 交付后
+/// 页计数为 2^22。
+#[test]
+fn test_take_mmap_region_rounds_to_the_block_boundary_in_pages() {
+	let _ = set_mmap_state(100, SPLIT_PA);
+	grant_alloc(1, 0x9000_0000);
+
+	assert_eq!(
+		mem::take_mmap_region(CHUNK_2M_SIZE, PTE_U | PTE_R | PTE_W),
+		UMODE_MMAP_BASE + CHUNK_2M_PAGES * PAGE_SIZE
+	);
+	assert_eq!(context::ctx().umode_mmap_pages_used, 2 * CHUNK_2M_PAGES);
+}
+
+/// 任意长度的请求都落在块边界上, 页计数按交付的块数推进。
+///
+/// 四组取值覆盖块内交付与跨越整数个块: 3 KiB 不足一块, 按 4 KiB 页交付一页; 3 MiB 与
+/// 7 MiB 与 11 MiB 各按 2 MiB 取整为 2 与 4 与 6 块, 块内余量作废。交付后的页计数分别
+/// 为 1 与 1024 与 2048 与 3072。
+#[test]
+fn test_take_mmap_region_places_requests_of_various_lengths() {
+	// (请求字节数, 交付的页数, 建立映射的次数, 交付后的页计数)
+	let cases = [
+		(3 * 1024u64, 1u64, 1u64, 1u64),
+		(3u64 << 20, 768, 2, 1024),
+		(7u64 << 20, 1792, 4, 2048),
+		(11u64 << 20, 2816, 6, 3072),
+	];
+
+	for (bytes, pages, map_calls, expected_used) in cases {
+		let _ = set_mmap_state(0, 0);
+		grant_alloc(1, SPLIT_PA);
+
+		assert_eq!(
+			mem::take_mmap_region(bytes, PTE_U | PTE_R | PTE_W),
+			UMODE_MMAP_BASE,
+			"bytes={bytes}"
+		);
+		assert_eq!(
+			align_up(bytes, PAGE_SIZE) >> PAGE_SHIFT,
+			pages,
+			"bytes={bytes}"
+		);
+		assert_eq!(
+			paging::MAP_CALLS.load(Ordering::SeqCst),
+			map_calls,
+			"bytes={bytes}"
+		);
+		assert_eq!(
+			context::ctx().umode_mmap_pages_used,
+			expected_used,
+			"bytes={bytes}"
+		);
+	}
+}
+
+/// 请求越过映射区容量时拒绝交付, 且不申请分区也不建立映射。
+#[test]
+fn test_take_mmap_region_rejects_a_request_past_the_region_capacity() {
+	let region_pages = mmap_region_pages();
+	let _ = set_mmap_state(region_pages - 1, SPLIT_PA);
+	grant_alloc(1, SPLIT_PA);
+
+	assert_eq!(mem::take_mmap_region(2 * PAGE_SIZE, PTE_U | PTE_R | PTE_W), 0);
+	assert_eq!(ecall_aux::ALLOC_CALLS.load(Ordering::SeqCst), 0);
+	assert_eq!(paging::MAP_CALLS.load(Ordering::SeqCst), 0);
+	assert_eq!(context::ctx().umode_mmap_pages_used, region_pages - 1);
+}
+
+/// 请求长度为 0 或不小于用户空间上界时拒绝, 且不申请分区。
+///
+/// 长度不小于上界时按页取整会向上溢出而给出一个小值, 后续算式因此接受一个远大于映射区
+/// 的区间。
+#[test]
+fn test_take_mmap_region_rejects_a_length_outside_the_window() {
+	let _ = set_mmap_state(0, 0);
+	grant_alloc(1, SPLIT_PA);
+
+	assert_eq!(mem::take_mmap_region(0, PTE_U | PTE_R | PTE_W), 0);
+	assert_eq!(
+		mem::take_mmap_region(UMODE_VA_LIMIT + PAGE_SIZE, PTE_U | PTE_R | PTE_W),
+		0
+	);
+	assert_eq!(ecall_aux::ALLOC_CALLS.load(Ordering::SeqCst), 0);
+}
+
+/// 固定地址映射落在用户空间之外时拒绝, 且不申请分区也不建立映射。
+#[test]
+fn test_map_umode_pages_rejects_a_range_past_the_user_window() {
+	world();
+	grant_alloc(1, DEDICATED_PA);
+
+	assert!(!mem::map_umode_pages(
+		UMODE_VA_LIMIT - PAGE_SIZE,
+		2,
+		PTE_U | PTE_R | PTE_W
+	));
+	assert_eq!(ecall_aux::ALLOC_CALLS.load(Ordering::SeqCst), 0);
+	assert_eq!(paging::MAP_CALLS.load(Ordering::SeqCst), 0);
+}
+
+/// 按块增长止于用户空间上界: 请求越过上界时只映射到上界, 返回的上界即上界。
+#[test]
+fn test_grow_umode_va_stops_at_the_user_window() {
+	world();
+	grant_alloc(1, DEDICATED_PA);
+
+	let from = UMODE_VA_LIMIT - CHUNK_2M_SIZE;
+	assert_eq!(
+		mem::grow_umode_va(from, UMODE_VA_LIMIT + CHUNK_2M_SIZE, PTE_U | PTE_R | PTE_W),
+		UMODE_VA_LIMIT
+	);
+	assert_eq!(paging::MAP_CALLS.load(Ordering::SeqCst), 1);
+}
+
+/// 堆顶越过用户空间上界时拒绝增长, 返回旧值, 且不申请分区。
+#[test]
+fn test_sys_brk_handler_rejects_a_top_past_the_user_window() {
+	world();
+	context::ctx_mut().umode_heap_top = UMODE_HEAP_START_ALIGNED;
+	context::ctx_mut().umode_heap_mapped_end = UMODE_HEAP_START_ALIGNED;
+
+	assert_eq!(
+		mem::sys_brk_handler(UMODE_VA_LIMIT + 1),
+		UMODE_HEAP_START_ALIGNED
+	);
+	assert_eq!(ecall_aux::ALLOC_CALLS.load(Ordering::SeqCst), 0);
+	assert_eq!(context::ctx().umode_heap_top, UMODE_HEAP_START_ALIGNED);
+}
+
+/// 新长度使末址向上溢出时拒绝原地长度变化。
+///
+/// 溢出后的末址落在映射区基址之前, 页计数由它减出基址得到的是一个远大于容量的值;
+/// 收缩分支据该值回退页计数, 随后的一次不足一块的请求在新的块边界上取下后备物理内存
+/// 并按块内偏移算出物理地址, 与已交付的页重名。
+#[test]
+fn test_mmap_resize_with_an_overflowing_end_is_refused() {
+	let _ = set_mmap_state(700, SPLIT_PA);
+	let new_size = u64::MAX - UMODE_MMAP_BASE + 1;
+
+	assert!(!mem::grow_mmap_in_place(UMODE_MMAP_BASE, 700 * PAGE_SIZE, new_size));
+	assert_eq!(context::ctx().umode_mmap_pages_used, 700);
 }

@@ -1,16 +1,15 @@
 //! 模块与运行时之间的二进制接口。
 //!
 //! 模块以映像交付: 无 ELF 头, 无重定位, 映像偏移 0 处是映像描述块, 模块入口在映像内
-//! 的偏移由该描述块给出, 见 [`img_descriptor`](super::img_descriptor)。模块的入口经
-//! [`InitFn`] 交付自己的取用器, 运行时经取用器取得 [`ModuleInterface`]。
-//! 形态与 ref-impl/emod 的取用器一致。
+//! 的偏移由该描述块给出。模块的入口经 [`InitFn`] 交付自己的取用器,
+//! 运行时经取用器取得 [`ModuleInterface`]。
 
 use super::man::Manager;
 
 /// 模块名的字节数。
 pub const MODULE_NAME_LEN: usize = 32;
 
-/// 登记表的容量, 与 ref-impl/emod 的 `emodule_table` 同容量。
+/// 登记表的容量。
 pub const MAX_MODULES: usize = 0x20;
 
 /// 单个模块导出的系统调用处理函数槽位数。
@@ -56,7 +55,7 @@ pub struct ModuleInterface {
 	/// 未定义行为。`ext_mod::loader` 在验签并确认该指针落在本模块的窗口之内之后
 	/// 才登记接口, 调用方在此之前不得解引用。
 	pub syscalls: *const SyscallTable,
-	/// 该模块导出的操作表, 形态与 ref-impl/emod 的 `emod_net_api_t` 一致。
+	/// 该模块导出的操作表。
 	///
 	/// 系统调用处理函数表承载载荷发起的调用, 本字段承载运行时自身的调用点 (fd 层的
 	/// 套接字读写、调度器对协议栈的推进)。表的类型由运行时与该模块共同约定, 故本
@@ -92,9 +91,7 @@ pub fn is_region_in_image(ptr: *const u8, size: usize, align: usize, va: u64, wi
 	}
 }
 
-// ---------------------------------------------------------------
-//  测试
-// ---------------------------------------------------------------
+
 
 #[cfg(test)]
 mod tests {

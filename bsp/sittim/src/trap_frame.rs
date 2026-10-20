@@ -45,9 +45,9 @@ pub const T6: usize = 31;
 #[repr(C)]
 pub struct TrapGprs {
 	/// x0..x31
-	/// x0 槽位由 SAVE_CONTEXT 写入 0
+	/// x0 由 SAVE_CONTEXT 写入 0
 	pub regs: [u64; 32],
-	/// 陷入前的 sp：陷态来自 U 模式时为用户 sp，来自 S 模式时为该模式的 sp。
+	/// 陷入前的 sp：来自 U 模式时为用户 sp，来自 S 模式时为该模式的 sp。
 	pub sp_before_trap: u64,
 }
 

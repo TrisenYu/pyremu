@@ -21,6 +21,7 @@ SPI 主模式控制器.
 """
 
 from pyremu.memory.bus import Device
+from pyremu.utils.mask import mask64
 
 
 class SPI(Device):
@@ -80,7 +81,7 @@ class SPI(Device):
                 st |= self.STATUS_RX_AVAIL
             return st
         if offset == self.REG_RXDATA:
-            return self._rxdata & 0xFF_FFFF_FFFF_FFFF
+            return mask64(self._rxdata)
         if offset == self.REG_DIV:
             return self._div
         return 0

@@ -13,9 +13,7 @@ Pyremu is a RISC-V emulator written in Python (CPython 3.14). It models a multi-
 ## Commands
 
 ```bash
-# Run all tests (2011 tests; tests/test_multihart_diff.py 在整套运行时因共享
-# 状态失败, 故排除, 单独运行时通过)
-# in project directory.
+# Run all tests in project directory.
 make test
 
 # Run a single test file
@@ -420,8 +418,7 @@ feature 集合、配置空间与请求或帧处理。描述符链遍历的步数
 ## Testing
 
 共 2011 个用例, 分布于 14 个顶层测试文件与 6 个测试子目录, 计数取自
-`pytest --collect-only`。`tests/test_multihart_diff.py` 的 39 个用例不计入 `make test`
-的执行范围: 该文件在整套运行时因共享状态而结果依赖执行顺序, 单独运行时通过。
+`pytest --collect-only`。
 
 顶层文件:
 
@@ -441,7 +438,6 @@ feature 集合、配置空间与请求或帧处理。描述符链遍历的步数
 | test_wfi_wakeup.py | 3 | WFI 被跨核 MSIP 唤醒 |
 | test_native_fallback.py | 2 | 无 Rust 动态库时纯 Python 路径仍然正确 |
 | test_dtb_memory.py | 2 | `/memory` 与 `/reserved-memory` 节点的 reg 编码 |
-| test_multihart_diff.py | 39 | 未纳入 `make test`, 见上 |
 
 子目录:
 

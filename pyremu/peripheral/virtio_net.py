@@ -22,11 +22,11 @@ from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable
 
-from pyremu.core.diag import diag
 from pyremu.memory.bus import Device
 from pyremu.peripheral.virtio_mmio import (
     VIRTIO_F_VERSION_1,
     VIRTIO_MMIO_INT_VRING,
+    VIRTIO_MMIO_QUEUE_NOTIFY,
     VIRTIO_MMIO_SIZE,
     VirtioMMIO,
     VirtqDesc,
@@ -141,41 +141,43 @@ class NetBackend(ABC):
 
     设备只把待发帧交给后端, 并从后端接收到达帧; 帧的走向 (回环、tap 设备、
     双端口互联) 全由后端决定。本轮唯一实现是 LoopbackBackend。
+
+    后端由设备持有, 故后端不得强引用设备: 二者互相持有, 该环使设备及其持有的主存
+    不经引用计数释放。
     """
 
-    @abstractmethod
     def bind(self, device: VirtIONet) -> None:
-        """绑定收发帧的设备. 设备构造时调用一次."""
+        """绑定收发帧的设备. 设备构造时调用一次.
+
+        默认实现为空操作: 同步回环的帧经 transmit 的返回值交回调用方, 后端不必保存
+        设备. 帧从宿主异步到达的后端覆写本方法, 覆写实现只能保存设备的弱引用.
+        """
 
     @abstractmethod
-    def transmit(self, frame: bytes) -> None:
-        """发送一个以太帧.
+    def transmit(self, tx_frame: bytes) -> bytes | None:
+        """发送一个以太帧, 并给出应交给本设备接收路径的帧.
 
         Args:
-            frame: 完整的以太帧, 不含 virtio_net_hdr.
+            tx_frame: 待发送的完整以太帧, 不含 virtio_net_hdr.
+
+        Returns:
+            待交给本设备接收路径的帧; 不回环的后端返回 None.
         """
 
 
 class LoopbackBackend(NetBackend):
-    """回环后端 — 帧原样送回所绑定设备的接收路径, 不做任何首部改写.
+    """回环后端 — 帧原样送回调用方的接收路径, 不做任何首部改写.
 
     由此 "飞地内 UDP 自收自发" 无需特例即可成立: 发往本机 IP 的报文先触发 ARP
     请求, 该请求回环回来后由本机协议栈应答, 应答再回环回来填入 ARP 表, 之后 UDP
-    报文以本机 MAC 为目的发出并回环到已绑定的接收套接字。
+    报文以本机 MAC 为目的发出并回环到本机的接收路径。
 
     终止性: 接收路径不发送帧, 故回环不会自我增殖; 协议栈对 ARP 应答不再回以应答。
     """
 
-    def __init__(self) -> None:
-        self._device: VirtIONet | None = None
-
-    def bind(self, device: VirtIONet) -> None:
-        self._device = device
-
-    def transmit(self, frame: bytes) -> None:
-        if self._device is None:
-            return
-        self._device.deliver_frame(frame)
+    def transmit(self, tx_frame: bytes) -> bytes | None:
+        """把待发帧原样作为待投递到接收路径的帧交回调用方."""
+        return tx_frame
 
 
 class VirtIONet(Device):
@@ -190,7 +192,7 @@ class VirtIONet(Device):
             mac=DEFAULT_VIRTIO_NET_S_MAC,
             mem_read=bus.read,
             mem_write=bus.write,
-            on_irq=raise_device_irq,
+            on_irq=irq_sink,
             irq=VIRTIO_NET_S_IRQ,
         )
         bus.add_device(0x1000_7000, net)
@@ -212,19 +214,20 @@ class VirtIONet(Device):
         self.base_addr = 0
         self.size = VIRTIO_MMIO_SIZE
 
-        # 中断投递: 完成中断经 on_irq(irq, level) 上报 (irq=0 或未给出 on_irq 时
-        # 不投递)。调用方应传 Emulator.raise_device_irq, 理由见 virtio_blk.py。
-        self._on_irq = on_irq
-        self._irq = irq
-
         # 待收帧队列: 帧到达时若无空闲缓冲区则在此暂存, 待驱动挂上缓冲区后补投。
         self._rx_frames: deque[bytes] = deque()
         # 因缓冲区不足或队列已满而丢弃的帧数
         self._rx_dropped = 0
 
+        # MAC 与链路状态在 mmio 构造时使用, 故两个字段都先于它赋值
+        self._mac = bytes(mac)
+        self._link_up = True
+
         self._backend = backend if backend is not None else LoopbackBackend()
         self._backend.bind(self)
 
+        # 中断投递: 完成中断经 on_irq(irq, level) 上报 (irq=0 或未给出 on_irq 时
+        # 不投递)。调用方应传设备中断投递目标 DeviceIrqSink, 理由见 virtio_blk.py。
         self.mmio = VirtioMMIO(
             device_id=VIRTIO_NET_DEVICE_ID,
             device_features=_DEVICE_FEATURES,
@@ -232,16 +235,11 @@ class VirtIONet(Device):
             queue_num_max=queue_size_max,
             mem_read=mem_read,
             mem_write=mem_write,
-            config_read=self._config_read,
-            handle_request=self._handle_request,
-            on_irq=self._set_irq_level,
-            on_notify=self._handle_notify,
+            irq=irq,
+            on_irq=on_irq,
+            cfg_space_data=self._build_config_space(),
             chain_max_desc=VIRTIO_NET_CHAIN_MAX_DESC,
         )
-        # MAC 在 mmio 构造前使用, 故两个字段都先于它赋值; 配置空间按字节寻址,
-        # 由 _build_config_space 在每次读取时按当前链路状态重建。
-        self._mac = bytes(mac)
-        self._link_up = True
 
     # ---- Device 接口 ----
 
@@ -249,11 +247,15 @@ class VirtIONet(Device):
         return self.mmio.read(offset, size)
 
     def write(self, offset: int, data: bytes) -> None:
+        """写入 MMIO. QueueNotify 交给本设备, 其余交给传输层."""
+        if offset == VIRTIO_MMIO_QUEUE_NOTIFY and len(data) in (1, 2, 4):
+            self._notify_queue(int.from_bytes(data, "little"))
+            return
         self.mmio.write(offset, data)
 
     def process_queue(self, index: int, max_descriptors: int = 0) -> bool:
         """处理第 *index* 条队列中待处理的请求. 语义见 VirtioMMIO.process_queue."""
-        return self.mmio.process_queue(index, max_descriptors)
+        return self.mmio.process_queue(index, self._handle_request, max_descriptors)
 
     # ---- 后端接入 ----
 
@@ -286,11 +288,6 @@ class VirtIONet(Device):
 
     # ---- 中断 ----
 
-    def _set_irq_level(self, level: bool) -> None:
-        """按中断线电平操作中断源. irq=0 或未给出 on_irq 时为空操作."""
-        if self._on_irq is not None and self._irq:
-            self._on_irq(self._irq, level)
-
     def raise_irq(self) -> None:
         """拉高本设备中断源."""
         self.mmio.raise_irq()
@@ -313,32 +310,22 @@ class VirtIONet(Device):
         cfg[VIRTIO_NET_CFG_MTU : VIRTIO_NET_CFG_MTU + 2] = ETHERNET_MTU.to_bytes(2, "little")
         return cfg
 
-    def _config_read(self, local: int) -> int:
-        """读取 virtio-net 设备特定配置. 参数为配置空间内的字节偏移.
-
-        返回以 *local* 为起始的 4 字节小端字。驱动读 MAC 走的是逐字节拷贝
-        (memcpy_fromio), 读 status 与 mtu 走 2 字节读, 起始偏移不保证 4 字节对齐,
-        故按字节映像取字, 而不是按对齐的 32 位字取。
-        """
-        cfg = self._build_config_space()
-        if local < 0 or local >= len(cfg):
-            return 0
-        word = bytes(cfg[local : local + 4])
-        return int.from_bytes(word.ljust(4, b"\x00"), "little")
-
     # ---- 队列处理 ----
 
-    def _handle_notify(self, index: int) -> bool:
-        """队列通知的入口. 返回真表示本设备已自行处理该队列.
+    def _notify_queue(self, index: int) -> None:
+        """队列通知的入口. 队列存在且已就绪时按队列方向分派.
 
         接收队列不能走传输层的通用遍历: 通用遍历会把驱动挂上的每个缓冲区都当作
         一条待处理的请求消费掉, 而没有到达帧时该缓冲区必须留在可用环里。故接收
         队列的通知只用来触发补投, 由本设备把待收帧写进缓冲区。
         """
+        queue = self.mmio.queue_at(index)
+        if queue is None or not queue.ready:
+            return
         if index == VIRTIO_NET_RX_QUEUE:
             self._fill_rx_buffers()
-            return True
-        return False
+            return
+        self.process_queue(index)
 
     def _handle_request(self, queue: VirtQueue, chain: list[VirtqDesc]) -> tuple[bool, int]:
         """处理一个描述符链. 只有发送队列经此路径.
@@ -363,9 +350,11 @@ class VirtIONet(Device):
             or len(buf[VIRTIO_NET_HDR_SIZE:]) < ETHERNET_HEADER_SIZE
         ):
             return False, 0
-        frame = buf[VIRTIO_NET_HDR_SIZE:]
-        if self._backend is not None:
-            self._backend.transmit(frame)
+        tx_frame = buf[VIRTIO_NET_HDR_SIZE:]
+        # 回环的帧由后端经返回值交回, 投递到本设备的接收路径
+        rx_frame = self._backend.transmit(tx_frame)
+        if rx_frame is not None:
+            self.deliver_frame(rx_frame)
         return True, 0
 
     def _fill_rx_buffers(self) -> None:

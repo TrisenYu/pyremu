@@ -46,6 +46,38 @@ INT_SOURCE_MIP_MASK: dict[IntSource, int] = {
 }
 
 
+class IntStateVersion:
+    """中断状态版本号 — 一个 hart 与中断控制器共持同一个对象.
+
+    hart 用相等性判定自己缓存的"无待处理中断"这一结论是否仍然成立, 控制器在状态
+    变化时递增它. 控制器持有 hart 的通知方法则使 hart 被控制器引用, 而 hart 持有
+    总线, 总线把控制器登记为设备, 三者构成环形引用, 该环上的 RAM 缓冲区因此不由
+    引用计数释放. 控制器改持本对象, 读写由 hart 与控制器各自完成, 本对象不引用
+    任何一方, 该环不存在.
+
+    版本号以 MODULUS 作为取模对象, 落在 0 到 MODULUS - 1 的区间内. 递增只发生在
+    敏感的 CSR 写入与核间中断投递处, 两次读取之间的递增次数远小于 MODULUS, 故取模
+    不影响判定的结果; 即便取模使两次取值相等, 后果也只是那一条指令少做一次全量
+    检查, 中断的投递推后一条指令.
+    """
+
+    MODULUS = 1 << 16
+
+    __slots__ = ("_value",)
+
+    def __init__(self) -> None:
+        self._value = 0
+
+    @property
+    def value(self) -> int:
+        """当前版本号, 落在 0 到 MODULUS - 1 的区间内."""
+        return self._value
+
+    def bump(self) -> None:
+        """以 MODULUS 作为取模对象递增版本号."""
+        self._value = (self._value + 1) % self.MODULUS
+
+
 class InterruptController(ABC):
     """中断控制器抽象基类.
 

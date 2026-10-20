@@ -190,9 +190,6 @@ pub struct HartState {
 	/// Used to provide per-hart ``minstret`` and debugger display.
 	pub total_instrs: u64,
 
-	// ---- Diagnostic counters & MSIP edge tracking ----
-	pub diag: HartDiag,
-
 	// ---- Phase G: F/D floating point ----
 	/// 32 个浮点寄存器, 存原始 bits (NaN-boxed), 非 f64 —
 	/// 保留 sNaN/qNaN payload 与单精度 NaN-boxing 语义。
@@ -220,79 +217,17 @@ pub struct HartState {
 	// 的活锁。0 = 未设定 deadline (写入即到期/禁用时置 0)。
 	pub stip_deadline: u64,
 	pub mtip_deadline: u64,
-}
 
-// ============================================================
-//  Diagnostic / MSIP-edge sub-struct (always present, FFI-stable)
-// ============================================================
-
-/// Diagnostic counters and MSIP edge-detection state.
-///
-/// Kept as a sub-struct so all diag fields are namespaced under
-/// ``state.diag.*``.  The layout is ``#[repr(C)]`` and every field is
-/// always present — the ``diagnostic`` feature only gates the code that
-/// *writes* to the counters, not the counters themselves.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct HartDiag {
-	// ---- CLINT inline handler call counters ----
-	pub clint_msip_set: u64, // sync_msip observed edge transitions
-	pub clint_msip_clr: u64, // (unused, reserved)
-	pub clint_mtc_wr: u64, // direct CLINT MSIP writes seen in WFI
-	pub clint_msip_wr0: u64, // MMIO write-0 to MSIP
-	pub clint_msip_wr1: u64, // MMIO write-1 to MSIP
-	pub clint_wr1_remote: u64, // write-1 to another hart
-	pub clint_wr1_self: u64, // write-1 to self
-	pub cooldown_start: u64, // MRET/SRET with CLINT MSIP=1
-	pub wfi_wake_msip: u64, // WFI woke due to MSIP
-	pub wfi_wake_mtip: u64, // WFI woke due to timer
-	pub wfi_wake_other: u64, // WFI woke due to other interrupt
-	pub trap_msip_total: u64, // MSIP traps delivered
-	pub trap_msip_delegated: u64, // MSIP traps delegated to S-mode
-	/// Last CLINT MSIP edge-counter value.  ``sync_msip`` compares the
-	/// current edge counter against this to detect new MSIP edges.
-	pub msip_last_seen: u64,
-	pub msip_masked_by_msie: u64, // MSIP pending but MSIE=0
-	pub msip_pending_no_trap: u64, // MSIP pending but no trap delivered
-	pub nt_mip_snapshot: u64, // mip at first no_trap
-	pub nt_mie_snapshot: u64, // mie at first no_trap
-	pub msie_cleared_at_pc: u64, // PC where MSIE was explicitly cleared
-	pub wfi_wake_no_msip_trap: u64, // WFI woke by MSIP edge but no trap
-	pub nt_mode: u8, // mode at first no_trap
-	pub nt_clint_raw: u8, // CLINT MSIP raw byte at first no_trap
-	pub _pad2: [u8; 6],
-	pub nt_pending: u64, // mip & mie at first no_trap
-}
-
-impl HartDiag {
-	pub const fn zeroed() -> Self {
-		HartDiag {
-			clint_msip_set: 0,
-			clint_msip_clr: 0,
-			clint_mtc_wr: 0,
-			clint_msip_wr0: 0,
-			clint_msip_wr1: 0,
-			clint_wr1_remote: 0,
-			clint_wr1_self: 0,
-			cooldown_start: 0,
-			wfi_wake_msip: 0,
-			wfi_wake_mtip: 0,
-			wfi_wake_other: 0,
-			trap_msip_total: 0,
-			trap_msip_delegated: 0,
-			msip_last_seen: 0,
-			msip_masked_by_msie: 0,
-			msip_pending_no_trap: 0,
-			nt_mip_snapshot: 0,
-			nt_mie_snapshot: 0,
-			msie_cleared_at_pc: 0,
-			wfi_wake_no_msip_trap: 0,
-			nt_mode: 0,
-			nt_clint_raw: 0,
-			_pad2: [0; 6],
-			nt_pending: 0,
-		}
-	}
+	// ---- 加速执行引擎的 TLB 计数 ----
+	//
+	// 由属主 hart 在 translate_va 的翻译点上累加, 从不清零, 跨批处理保留;
+	// Python 侧只读取不回写, 故其取值覆盖该引擎此前记录的全部翻译活动.
+	// 权限检查未通过而返回故障的命中计入命中数: 该情形下 TLB 已给出翻译,
+	// 与未命中不同.
+	pub itlb_hits: u64,
+	pub itlb_misses: u64,
+	pub dtlb_hits: u64,
+	pub dtlb_misses: u64,
 }
 
 // ============================================================
@@ -414,7 +349,6 @@ mod tests {
 			stimecmp: 0,
 			_mmu_mode_pad: 0,
 			total_instrs: 0,
-			diag: HartDiag::zeroed(),
 			fprs: [0u64; 32],
 			fcsr: 0,
 			_fpad: [0; 4],
@@ -422,6 +356,10 @@ mod tests {
 			imsic_s: ImsicFile::empty(),
 			stip_deadline: 0,
 			mtip_deadline: 0,
+			itlb_hits: 0,
+			itlb_misses: 0,
+			dtlb_hits: 0,
+			dtlb_misses: 0,
 		};
 		// Enable IMSIC state tracking when AIA is active so that
 		// sync_imsic() and imsic_topei_peek() see eip/eie state.

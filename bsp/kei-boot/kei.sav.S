@@ -1,4 +1,7 @@
 /*
+	SPDX-LICENSE-IDENTIFIER: MIT
+	(C) All rights reserved.
+	Author: <jajune257@gmail.com> in 2026
 	----------------<< Dedicated to AL-1S >>----------------
 	kei.sav: RISC-V Zero/First Stage Boot Loader (ZSBL/FSBL)
 

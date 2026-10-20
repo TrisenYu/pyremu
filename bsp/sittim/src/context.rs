@@ -1,14 +1,9 @@
-//! 全局 EnclaveContext —— 替代 ref-emod 中分散在 8+ 个 .c 文件里的 ~30 个 file-static 全局变量。
-//! 启动阶段一次写入，此后任意读取。
+//! 全局 EnclaveContext 启动阶段一次写入，此后任意读取。
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 
 use crate::paging::Pte;
-
-// ---------------------------------------------------------------
-//  PoolDesc
-// ---------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub struct PoolDesc {
@@ -28,10 +23,6 @@ impl PoolDesc {
 	}
 }
 
-// ---------------------------------------------------------------
-//  SharedBuf
-// ---------------------------------------------------------------
-
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct SharedBuf {
@@ -46,7 +37,7 @@ pub struct SharedBuf {
 /// 页表根, 512 项, 必须 4 KiB 对齐。
 ///
 /// 独立 wrapper 结构体以 `#[repr(align(4096))]` 强制对齐,
-/// **不依赖 BSS 布局**: BSS 中其他零初始化静态可能破坏
+/// 不依赖 BSS 布局: BSS 中其他零初始化静态可能破坏
 /// `EnclaveContext` 内嵌字段的 4 KiB 对齐约束, 导致
 /// satp.PPN 指向错误物理页, MMU 开启后全部取指页错误,
 /// trap loop, hart halt.
@@ -63,33 +54,42 @@ static mut PAGE_TABLE_ROOT: PageTableRoot = PageTableRoot([Pte(0); 512]);
 pub struct EnclaveContext {
 	/// 飞地管理器物理起始地址。
 	pub manager_pa_start: u64,
+
 	/// 模块窗口内下一个空闲 VA, 即下一个模块映像的加载地址。
 	///
 	/// 自窗口基址起单调推进, 已交付的 VA 不回收; 加上下一个模块所需的窗口容量
 	/// 之后越过窗口上界时, 取入失败。
 	pub enclave_module_load_va: u64,
+
 	/// U-mode 堆顶 (brk 返回值, 字节粒度)。
 	pub umode_heap_top: u64,
+
 	/// U-mode 堆已映射到的 VA 上界, 恒为 2 MiB 对齐。
 	pub umode_heap_mapped_end: u64,
+
 	/// mmap 匿名映射已交付的 4 KiB 页计数 (自 UMODE_MMAP_BASE 起)。
-	/// 右移 CHUNK_2M_SHIFT 位是已彻底写满的 2 MiB 块数, 即该计数落在的块的序号;
-	/// 与块内页数掩码按位与是同一个块内已交付的页数。
+	/// 以 CHUNK_2M_PAGES 为除数作整除, 商为已彻底写满的 2 MiB 块数, 即该计数落在的
+	/// 块的序号; 以 CHUNK_2M_PAGES 为取模对象, 余数为同一个块内已交付的页数。
 	/// 例: 511 表示 0 块写满、当前块已用 511 页, 下一页仍在本块内; 512 表示 1 块
 	/// 写满、当前块自 0 起用。映射 VA 与块边界都由该计数导出
 	pub umode_mmap_pages_used: u64,
+
 	/// 当前 2 MiB 块的物理基址; 它非零时描述的必是末页 (页计数减一) 所在的块, 块内
 	/// 交付按它加块内偏移算出物理地址。0 表示没有正在切分的块, 下一个不足一块的请求
 	/// 为它所在的块另行取得后备内存。
 	/// 每块的后备物理内存是独立一次 M-mode 分区申请, 块间不保证连续,
 	/// 无法由页计数导出; 已交付页的物理地址另有页表记录, 故只保留当前块。
 	pub umode_curr_mmap_pa: u64,
+
 	/// S-mode 页池 (页表与内核栈): 自管理器镜像末尾起的一段分区。
 	pub smode_pool: PoolDesc,
+
 	#[allow(dead_code)]
 	pub shared_buffer: Option<SharedBuf>,
+
 	/// 飞地时间配额 (timer interrupt 次数), 0=不限.
 	pub time_quota: u64,
+
 	/// 当前时间片内已消耗的 timer interrupt 次数.
 	pub ticks_consumed: u64,
 }
@@ -169,7 +169,7 @@ pub fn init_context(man_pa_start: u64, enclave_module_load_va: u64) {
 		(*ptr).enclave_module_load_va = enclave_module_load_va;
 		(*ptr).time_quota = crate::constants::TIME_QUOTA;
 		// 其余字段 = 0 (umode_heap_top, smode_pool, ticks_consumed, shared_buffer, ...)
-		// BSS 已保证全零, 无需显式赋值
+		// BSS 已保证全零, 无需显式清零
 	});
 }
 
@@ -178,7 +178,7 @@ pub fn ctx() -> &'static EnclaveContext {
 	CTX.get()
 }
 
-/// 返回页表根的**当前映射地址** (始终 4 KiB 对齐).
+/// 返回页表根的当前映射地址 (始终 4 KiB 对齐).
 ///
 /// 运行时按 PIE 链接, 代码以 PC 相对方式引用 `PAGE_TABLE_ROOT`:
 /// 物理恒等主流程 (MMU 关闭阶段与 MMU 开启后的 after_mmu) 取到 PA,

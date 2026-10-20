@@ -1,11 +1,13 @@
+# 需要 clang-format 20 及以上.
+
 Language: Cpp
 
-AlignConsecutiveAssignments: true
+AlignConsecutiveAssignments: Consecutive
 AlignEscapedNewlines: Right # 宏换行 \ 对齐
 AlignTrailingComments: true
 AlignConsecutiveMacros: Consecutive
 AllowShortFunctionsOnASingleLine: Empty
-AllowShortBlocksOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
 AlignAfterOpenBracket: AlwaysBreak
 AlignArrayOfStructures: None
 
@@ -17,6 +19,7 @@ BraceWrapping:
   AfterFunction: false
   IndentBraces: false
 BreakBeforeBinaryOperators: NonAssignment
+BreakStringLiterals: true
 
 ContinuationIndentWidth: 4 # 宏续行缩进宽度
 Cpp11BracedListStyle: true
@@ -29,7 +32,7 @@ InsertBraces: true
 
 AllowAllParametersOfDeclarationOnNextLine: true
 AllowAllArgumentsOnNextLine: true
-BinPackParameters: false
+BinPackParameters: AlwaysOnePerLine
 BinPackArguments: false
 
 PenaltyReturnTypeOnItsOwnLine: 1000000
@@ -41,8 +44,10 @@ PackConstructorInitializers: Never
 BreakInheritanceList: BeforeColon
 ConstructorInitializerIndentWidth: 0
 
-ReflowComments: false
-SortIncludes: true
+ReflowComments: Never
+SortIncludes:
+  Enabled: true
+  IgnoreCase: false
 SpacesInContainerLiterals: false
 
 IndentAccessModifiers: false

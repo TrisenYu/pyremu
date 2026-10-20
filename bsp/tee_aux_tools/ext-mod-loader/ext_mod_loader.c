@@ -76,9 +76,9 @@ int main(int argc, char **argv) {
 	const char *modules_dir	 = argv[2];
 
 	struct tee_ext_mod_table modules;
-	int n = tee_ext_mod_table_load(&modules, modules_dir);
+	int n = tee_ext_mod_table_init(&modules, modules_dir);
 	if (n < 0) {
-		fprintf(stderr, "load module table from '%s' failed (%d)\n", modules_dir, n);
+		fprintf(stderr, "module table for '%s' failed (%d)\n", modules_dir, n);
 		return 1;
 	}
 	printf(

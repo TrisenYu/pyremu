@@ -9,7 +9,7 @@ Physical Memory Protection (PMP) — RISC-V Privileged Spec §3.7.
 PMP 在物理地址翻译完成后检查每次访存的合法性.
 支持三种地址匹配模式: OFF (禁用), TOR (地址范围), NA4 (4 字节), NAPOT (2 的幂).
 
-入口数可配置 (默认 16, 最大 64).
+入口数由 emu-configs.mk 的 PMP_ENTRIES 给出, 上限 64.
 RV64 编码: pmpcfgN 覆盖 8 个条目, 仅偶数编号的 pmpcfg 可用.
 """
 
@@ -20,13 +20,11 @@ from collections.abc import MutableMapping
 from dataclasses import dataclass
 from typing import Any
 
-from loguru import logger
-
 from pyremu._native import (
     native_available,
     pmp_check,
 )
-from pyremu.configs_aux import cfg_bool
+from pyremu.configs_gen import PMP_ENTRIES
 from pyremu.utils.mask import mask64
 
 # PMP 配置位 (每 8-bit 条目中的位偏移)
@@ -142,7 +140,7 @@ class Pmp:
     def __init__(
         self,
         csrs: MutableMapping[str, Any],
-        num_entries: int = 16,
+        num_entries: int = PMP_ENTRIES,
     ) -> None:
         self._csrs = csrs
         if num_entries < 0 or num_entries > 64:
@@ -218,11 +216,6 @@ class Pmp:
 
         # 飞地 split 超限预检 (在所有路径前, 避免无谓的缓存重建)
         if mdid != 0 and pmpsplit > 0 and pmpsplit >= self._num_entries:
-            if cfg_bool("PYREMU_TRACE_PMP"):
-                logger.debug(
-                    f"[pmp] DENY enclave mdid={mdid} "
-                    f"pmpsplit={pmpsplit} >= num_entries={self._num_entries}"
-                )
             return False
 
         # Rust native 加速路径 (处理全部 PMP 逻辑: M-mode bypass, MPRV, pmpsplit, etc.)
@@ -283,12 +276,6 @@ class Pmp:
                 continue
 
             ok = _check_perm(cfg, is_write, is_execute)
-            if not ok and cfg_bool("PYREMU_TRACE_PMP"):
-                logger.debug(
-                    f"[pmp] DENY pa={pa:#018x} size={size} "
-                    f"eff_mode={eff_mode} is_write={is_write} "
-                    f"matched_entry={i} cfg={cfg:#04x} addr_field={addr_field:#018x}"
-                )
             return ok
 
         return eff_mode == _MODE_M

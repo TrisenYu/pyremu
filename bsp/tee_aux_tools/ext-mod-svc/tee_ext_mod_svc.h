@@ -6,9 +6,10 @@
  * 供回归工具 (cache-probe-exploit/tee_ecall_regress.c) 与最小装载器
  * (ext-mod-loader/) 共用.
  *
- * 模块表来自模块目录下的 modules.list, 每行为 "<模块编号> <映像文件名>",
- * 映像文件名相对该目录给出. 模块编号须与模块映像自身声明的编号一致, 不一致时取入
- * 在飞地内以编号不符失败 (见 sittim 的 ext_mod::LoadError::IdMismatch).
+ * 模块表在编译期由同目录的 ext_mod_table.inc 给出, 每项为模块编号与映像文件名,
+ * 映像文件名相对模块目录给出. 该文件由 bsp/sittim/modules 的 mod-tbl 目标生成:
+ * 编号取自各模块源码中声明的 MODULE_ID. 映像声明的编号与请求的编号不一致时,
+ * 取入在飞地内以编号不符而失败.
  *
  * 模块表只登记编号与路径, 映像文件本身按需读取: 飞地请求某个模块时,
  * tee_ext_mod_serve 才打开该映像并报告其字节数或交付其字节.
@@ -38,17 +39,18 @@ struct tee_ext_mod_table {
 	int count;
 };
 
-/* 读取 dir/modules.list 并登记各项. 返回登记的模块数; 清单不可读或某行格式有误时
- * 返回负 errno, 不做部分登记. 本函数不访问清单所列的映像文件. */
-int tee_ext_mod_table_load(struct tee_ext_mod_table *table, const char *dir);
+/* 以 *dir* 为模块目录填写 *table*, 返回登记的模块数. 各项的路径由 *dir* 与编译期登记
+ * 的映像文件名拼接得到; 拼接结果超出 TEE_EXT_MOD_PATH_MAX 时返回 -ENAMETOOLONG, 不做
+ * 部分登记. 本函数不访问映像文件. */
+int tee_ext_mod_table_init(struct tee_ext_mod_table *table, const char *dir);
 
 /* 服务一次挂起的模块请求. 返回 1 表示已应答一项请求, 0 表示当前无挂起请求,
  * 负 errno 表示调用期失败. */
 int tee_ext_mod_serve(
 	int fd,
-	const struct tee_ext_mod_table *table,
-	uint64_t enclave_id,
-	uint64_t token
+    const struct tee_ext_mod_table *table,
+    uint64_t enclave_id,
+    uint64_t token
 );
 
 #endif /* TEE_EXT_MOD_SVC_H */

@@ -21,7 +21,6 @@ from __future__ import annotations
 from collections.abc import Callable
 import os
 
-from pyremu.core.diag import diag
 from pyremu.memory.bus import Device
 from pyremu.peripheral.virtio_mmio import (
     VIRTIO_F_RING_EVENT_IDX,
@@ -217,12 +216,9 @@ class VirtIOBlock(Device):
         self._disk_size = os.lseek(self._fd, 0, os.SEEK_END)
 
         # 中断投递: 完成中断经 on_irq(irq, level) 上报 (irq=0 或未给出 on_irq 时不投递)。
-        # 调用方应传 Emulator.raise_device_irq, 该入口除置位中断控制器外还通知加速执行
-        # 引擎并唤醒 WFI 阻塞的 hart; 直接调 plic.set_irq 会略过这两步, 使设备中断在
-        # 引擎的单轮加速执行内不可见, 且无法唤醒已进入 WFI 的 hart。
-        self._on_irq = on_irq
-        self._irq = irq
-
+        # 调用方应传设备中断投递目标 DeviceIrqSink, 该目标除置位中断控制器外还通知
+        # 加速执行引擎并唤醒 WFI 阻塞的 hart; 直接调 plic.set_irq 会略过这两步, 使设备
+        # 中断在引擎的单轮加速执行内不可见, 且无法唤醒已进入 WFI 的 hart。
         self.mmio = VirtioMMIO(
             device_id=0x2,  # block device
             device_features=_DEVICE_FEATURES,
@@ -230,9 +226,9 @@ class VirtIOBlock(Device):
             queue_num_max=queue_size_max,
             mem_read=mem_read,
             mem_write=mem_write,
-            config_read=self._config_read,
-            handle_request=self._handle_request,
-            on_irq=self._set_irq_level,
+            irq=irq,
+            on_irq=on_irq,
+            cfg_space_data=self._build_config_space(),
             chain_max_desc=_BLK_CHAIN_DESC_NUM,
         )
 
@@ -247,18 +243,23 @@ class VirtIOBlock(Device):
         return self.mmio.read(offset, size)
 
     def write(self, offset: int, data: bytes) -> None:
+        """写入 MMIO. QueueNotify 交给本设备, 其余交给传输层."""
+        if offset == VIRTIO_MMIO_QUEUE_NOTIFY and len(data) in (1, 2, 4):
+            self._notify_queue(int.from_bytes(data, "little"))
+            return
         self.mmio.write(offset, data)
+
+    def _notify_queue(self, index: int) -> None:
+        """队列通知: 队列存在且已就绪时处理其中的请求."""
+        queue = self.mmio.queue_at(index)
+        if queue is not None and queue.ready:
+            self.process_queue()
 
     def process_queue(self, max_descriptors: int = 0) -> bool:
         """处理队列 0 中待处理的请求. 语义见 VirtioMMIO.process_queue."""
-        return self.mmio.process_queue(0, max_descriptors)
+        return self.mmio.process_queue(0, self._handle_request, max_descriptors)
 
     # ---- 中断 ----
-
-    def _set_irq_level(self, level: bool) -> None:
-        """按中断线电平操作中断源. irq=0 或未给出 on_irq 时为空操作."""
-        if self._on_irq is not None and self._irq:
-            self._on_irq(self._irq, level)
 
     def raise_irq(self) -> None:
         """拉高本设备中断源 (完成通知)."""
@@ -275,14 +276,12 @@ class VirtIOBlock(Device):
         """磁盘容量, 以扇区计. 即 virtio-blk 配置空间的首个字段."""
         return self._disk_size // SECTOR_SIZE
 
-    def _config_read(self, local: int) -> int:
-        """读取 virtio-blk 设备特定配置. 参数为配置空间内的偏移."""
+    def _build_config_space(self) -> bytes:
+        """按当前容量构造配置空间的字节映像: 容量以扇区计, 小端 64 位."""
         sectors = self.capacity_sectors
-        if local == VIRTIO_BLK_CFG_CAPACITY:
-            return mask32(sectors)
-        if local == VIRTIO_BLK_CFG_CAPACITY + 4:
-            return mask32(sectors >> 32)
-        return 0
+        low = mask32(sectors).to_bytes(4, "little")
+        high = mask32(sectors >> 32).to_bytes(4, "little")
+        return low + high
 
     # ---- 请求处理 ----
 
@@ -310,10 +309,8 @@ class VirtIOBlock(Device):
         sector = int.from_bytes(hdr_data[8:16], "little")
 
         if req_type == VIRTIO_BLK_T_IN:
-            diag("virtio", f"REQ read  sector={sector} len={data_desc.length}")
             ok = self._do_read(sector, data_desc.addr, data_desc.length)
         elif req_type == VIRTIO_BLK_T_OUT:
-            diag("virtio", f"REQ write sector={sector} len={data_desc.length}")
             ok = self._do_write(sector, data_desc.addr, data_desc.length)
         elif req_type == VIRTIO_BLK_T_FLUSH:
             ok = self._do_flush()
@@ -355,7 +352,10 @@ class VirtIOBlock(Device):
         os.pwrite(self._fd, data, offset)
         # 更新磁盘大小 (如果写到了文件末尾之后)
         end = offset + len(data)
-        self._disk_size = max(self._disk_size, end)
+        if end > self._disk_size:
+            self._disk_size = end
+            # 容量是配置空间的字段, 随磁盘大小一并更新
+            self.mmio.cfg_space_data = self._build_config_space()
         return True
 
     def _do_flush(self) -> bool:

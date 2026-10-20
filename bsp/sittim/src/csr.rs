@@ -7,11 +7,6 @@
 //! 此文件为完整的 S-mode CSR 参考定义，未使用的常量与包装函数有意保留。
 
 #![allow(dead_code)]
-
-// ---------------------------------------------------------------
-//  S-mode CSR 地址常量, 供文档与引用使用；宏使用小写寄存器名
-// ---------------------------------------------------------------
-
 pub const SSTATUS: u16 = 0x100;
 pub const SIE: u16 = 0x104;
 pub const STVEC: u16 = 0x105;
@@ -23,7 +18,7 @@ pub const SCAUSE: u16 = 0x142;
 pub const STVAL: u16 = 0x143;
 
 // ---------------------------------------------------------------
-//  Bit masks  (per smode_entry/csr_aux.h)
+//  位掩码字段
 // ---------------------------------------------------------------
 
 // sstatus 字段
@@ -45,7 +40,8 @@ pub const SEI: u64 = 0x200;
 // ---------------------------------------------------------------
 
 macro_rules! read_csr {
-    ($csr:ident) => {{
+	($csr:ident) => {
+		{
         let val: u64;
         unsafe {
             core::arch::asm!(
@@ -54,41 +50,48 @@ macro_rules! read_csr {
             );
         }
         val
-    }};
+		}
+	};
 }
 
 macro_rules! write_csr {
-    ($csr:ident, $val:expr) => {{
+	($csr:ident, $val:expr) => {
+		{
         unsafe {
             core::arch::asm!(
                 concat!("csrw ", stringify!($csr), ", {0}"),
                 in(reg) $val,
             );
         }
-    }};
+		}
+	};
 }
 
 #[allow(unused_macros)]
 macro_rules! set_csr {
-    ($csr:ident, $mask:expr) => {{
+	($csr:ident, $mask:expr) => {
+		{
         unsafe {
             core::arch::asm!(
                 concat!("csrs ", stringify!($csr), ", {0}"),
                 in(reg) $mask,
             );
         }
-    }};
+		}
+	};
 }
 
 macro_rules! clear_csr {
-    ($csr:ident, $mask:expr) => {{
+	($csr:ident, $mask:expr) => {
+		{
         unsafe {
             core::arch::asm!(
                 concat!("csrc ", stringify!($csr), ", {0}"),
                 in(reg) $mask,
             );
         }
-    }};
+		}
+	};
 }
 
 pub(crate) use clear_csr;
@@ -161,6 +164,7 @@ pub fn read_sscratch() -> u64 {
 pub fn write_sscratch(v: u64) {
 	write_csr!(sscratch, v)
 }
+
 /// 设定 S 模式定时器比较值 (Sstc, CSR 0x14D)。
 ///
 /// 硬件语义: mtime >= stimecmp > 0 时置位 mip.STIP。
@@ -168,11 +172,13 @@ pub fn write_sscratch(v: u64) {
 pub fn write_stimecmp(v: u64) {
 	write_csr!(stimecmp, v)
 }
+
 /// 读取 S 模式定时器比较值 (Sstc, CSR 0x14D)。
 #[inline]
 pub fn read_stimecmp() -> u64 {
 	read_csr!(stimecmp)
 }
+
 /// 读取时钟源计数值 (CSR 0xC01), 单位为一个 TIMER_FREQ 周期。
 #[inline]
 pub fn read_time() -> u64 {

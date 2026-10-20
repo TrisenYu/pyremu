@@ -22,9 +22,12 @@ CLINT 提供:
 同时实现 InterruptController 和 Device 接口, 以便 Bus 和 Emulator 使用。
 """
 
-from collections.abc import Callable
-
-from pyremu.interrupt.controller import INT_SOURCE_MIP_MASK, InterruptController, IntSource
+from pyremu.interrupt.controller import (
+    INT_SOURCE_MIP_MASK,
+    InterruptController,
+    IntSource,
+    IntStateVersion,
+)
 from pyremu.memory.bus import Device
 from pyremu.utils.mask import mask64
 
@@ -72,8 +75,9 @@ class CLINT(InterruptController, Device):
         # 全局 MTIME (单调计数器): 64-bit
         self._mtime = 0
 
-        # 中断状态变化回调列表 — 每个 hart 注册自己的 notify_int_state_change
-        self._int_state_cbs: list[Callable[[], None]] = []
+        # 中断状态版本号列表 — 每个 hart 登记自己在绑定 interrupt_ctrl 时持有的
+        # 版本号对象, 本设备不持有 hart 本身
+        self._int_states: list[IntStateVersion] = []
 
     # ----------------------------------------------------------
     #  InterruptController 接口
@@ -109,17 +113,17 @@ class CLINT(InterruptController, Device):
         has_pending = mip != 0 and highest is not None
         return has_pending, mip, highest
 
-    def set_int_state_change_callback(self, cb: Callable[[], None]) -> None:
-        """注册中断状态变化回调 (每个 hart 在绑定 interrupt_ctrl 时调用).
+    def attach_int_state(self, state: IntStateVersion) -> None:
+        """登记一个 hart 的中断状态版本号 (该 hart 在绑定 interrupt_ctrl 时调用).
 
-        支持多次注册 — CLINT 状态变化时所有回调均被调用.
+        支持多次登记 — CLINT 状态变化时所有版本号均递增.
         """
-        self._int_state_cbs.append(cb)
+        self._int_states.append(state)
 
     def _notify_state_change(self) -> None:
-        """通知所有 hart 中断状态可能已改变."""
-        for cb in self._int_state_cbs:
-            cb()
+        """递增所有 hart 的中断状态版本号."""
+        for state in self._int_states:
+            state.bump()
 
     def send_ipi(self, target_hart_id: int) -> None:
         """向目标 hart 发送 IPI (置位 MSIP)."""

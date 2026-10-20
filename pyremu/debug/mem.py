@@ -80,7 +80,7 @@ class MemoryMixin(SharedMixinAttrs):
         while remain > 0:
             page_off = cur & 0xFFF
             chunk = min(remain, 0x1000 - page_off)
-            ok, pa = translate_addr(hart, cur)
+            ok, pa = translate_addr(hart, cur, is_hart_access=False)
             if not ok:
                 return None
             data = self._emu.bus.try_read(pa, chunk)
@@ -114,7 +114,7 @@ class MemoryMixin(SharedMixinAttrs):
         if hart.mmu_mode == 0 or hart.mode == RiscvMode.M:
             data = self._emu.bus.try_read(va, size)
             return (va, data) if data is not None else None
-        ok, pa = translate_addr(hart, va)
+        ok, pa = translate_addr(hart, va, is_hart_access=False)
         if not ok:
             return None
         data = self._emu.bus.try_read(pa, size)
@@ -312,20 +312,14 @@ class MemoryMixin(SharedMixinAttrs):
 
         if h.mode in (RiscvMode.M, RiscvMode.D):
             m_style, s_style = "bold cyan", "dim"
-            stale_note = ""
         elif h.mode == RiscvMode.S:
             m_style, s_style = "dim", "bold cyan"
-            stale_note = (
-                "" if _scause != 0
-                else " [dim](M-mode 陈旧)[/]"
-            )
         else:
             m_style, s_style = "cyan", "cyan"
-            stale_note = " [dim](陈旧)[/]"
 
         tbl = Table(
-            title=f"Hart {self._hart_id}  Trap 上下文"
-                  f" ({'中断' if is_intr else '异常'}){stale_note}",
+            title=f"Hart {self._hart_id}  Trap 上下文 "
+                  f"{'中断' if is_intr else '异常'}",
             border_style="red",
             show_header=True,
         )

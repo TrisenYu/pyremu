@@ -1,12 +1,10 @@
 //! 陷态分发。
-use core::ptr;
 
 use crate::constants::*;
 use crate::csr;
 use crate::ecall_aux;
 use crate::ext_mod::table;
 use crate::hang;
-use crate::println;
 use crate::syscall;
 use crate::syscall::concurrency::{ proc, sched, thread, timer };
 use crate::trap_frame::TrapGprs;
@@ -71,9 +69,8 @@ pub unsafe extern "C" fn trap_dispatch(
 				sepc + 4
 			}
 		};
-		// 投递信号: 有用户处理函数则改为以处理函数地址恢复, 使返回时先进入处理
-		// 函数; 默认处置为终止时本进程就此终结并登记切换目标, 故投递先于切换
-		// 检查.
+		// 有用户处理函数则改为以处理函数地址恢复, 使返回时先进入处理
+		// 函数; 默认处置为终止时本进程就此终结并登记切换目标, 故投递先于切换检查.
 		let next_sepc = proc::deliver_pending(gprs, resume_sepc).unwrap_or(resume_sepc);
 		// syscall 与信号投递都可能已登记线程切换 (clone / futex 阻塞 / exit /
 		// 让出 / 信号终止): 有则记录当前线程现场并激活目标线程.
@@ -85,11 +82,15 @@ pub unsafe extern "C" fn trap_dispatch(
 	}
 
 	if is_unmatched_access_fault(scause) {
-		ecall_aux::enclave_call_unmatched_acc_fault(stval, scause);
-		return 0;
+		// M 模式加载该地址所属的区域之后方可重试原访问. 加载无法使该次访问成立时
+		// 返回非 0, 落到下方按故障来源处置: U 模式的故障终止该进程, 其余按模块归属
+		// 或管理程序自身的缺陷处置.
+		if ecall_aux::enclave_call_unmatched_acc_fault(stval, scause) == 0 {
+			return 0;
+		}
 	}
 
-	// 用户态 不可恢复的同步异常: 载荷自身的缺陷。退出码取 128+sig
+	// 用户态 不可恢复的同步异常: 终止该进程, 退出码取 128+sig
 	if is_from_user {
 		proc::exit_process(proc::current_slot(), 128 + user_fault_signal(scause));
 		// 进程层已登记切换目标;
@@ -112,8 +113,7 @@ pub unsafe extern "C" fn trap_dispatch(
 
 	// 管理程序自身的同步缺陷, 或无法归属到任何模块的同步异常 —— 输出原因、scause / stval /
 	// sepc 与本次陷态携带的陷态栈帧后冻结挂起, 但仍响应宿主发来的终止请求。
-	report_trap_frame(gprs, sepc);
-	hang::fault_halt_exc(scause, stval, sepc, get_trap_reason(scause));
+	hang::fault_halt_exc(gprs, scause, stval, sepc);
 }
 
 /// 将 U 模式同步异常 scause 折算为进程收到该异常时的默认信号编号 (Linux 语义),
@@ -135,7 +135,7 @@ fn user_fault_signal(cause: u64) -> u64 {
 /// 根据 scause 返回可读原因字符串
 ///
 /// 独立成函数便于 fault_halt 现场打印与后续诊断复用。
-fn get_trap_reason(cause: u64) -> &'static str {
+pub fn get_trap_reason(cause: u64) -> &'static str {
 	match cause {
 		0x0 => "instruction address misaligned",
 		0x1 => "instruction access fault",
@@ -150,64 +150,6 @@ fn get_trap_reason(cause: u64) -> &'static str {
 		0xf => "store/amo page fault",
 		_ => "unknown exception",
 	}
-}
-
-/// 报告本次陷态详情: 来源特权级、陷态栈帧的地址、帧内的 32 个通用寄存器、陷态入口读到的
-/// sepc 与当前的 satp。
-///
-/// `is_from_user` 取真表示本次陷态来自 U 模式, 取值由调用方按陷态入口读到的 sstatus.SPP
-/// 给出; 到达本处的分发路径可能已改写该 CSR, 此处重读得到的不再是陷态发生时的来源。
-///
-/// 寄存器一栏按 x0 至 x31 的次序排列, 每行四个, 名称取 ABI 名。x2 即 sp 的槽位在陷态入口
-/// 不被写入, 该栏改为取帧末尾的独立槽位: 陷态入口自 sscratch 取出被中断的 sp 后写入该
-/// 槽位, 该栏因而给出被中断的那段代码当时所用的栈指针。x0 槽位恒为陷态入口写入的 0。
-fn report_trap_frame(gprs: &TrapGprs, sepc: u64) {
-	println!(
-		"\n!!!!!!!!!!sittim-trap!!!!!!!!!!\n\
-		ctx-addr,sepc: {:016x} {:016x}\n\
-		ra,sp,gp,tp: {:016x} {:016x} {:016x} {:016x}\n\
-		t0,t1,t2   : {:016x} {:016x} {:016x}\n\
-		s0,s1,a0,a1: {:016x} {:016x} {:016x} {:016x}\n\
-		a2,a3,a4,a5: {:016x} {:016x} {:016x} {:016x}\n\
-		a6,a7,s2,s3: {:016x} {:016x} {:016x} {:016x}\n\
-		s4,s5,s6,s7: {:016x} {:016x} {:016x} {:016x}\n\
-		s8,s9,sa,sb: {:016x} {:016x} {:016x} {:016x}\n\
-		t3,t4,t5,t6: {:016x} {:016x} {:016x} {:016x}\n\
-		!!!!!!!!!!sittim-trap!!!!!!!!!!\n\n",
-		ptr::from_ref(gprs) as u64,
-		sepc,
-		gprs.ra(),
-		gprs.sp_before_trap,
-		gprs.gp(),
-		gprs.tp(),
-		gprs.t0(),
-		gprs.t1(),
-		gprs.t2(),
-		gprs.s0(),
-		gprs.s1(),
-		gprs.a0(),
-		gprs.a1(),
-		gprs.a2(),
-		gprs.a3(),
-		gprs.a4(),
-		gprs.a5(),
-		gprs.a6(),
-		gprs.a7(),
-		gprs.s2(),
-		gprs.s3(),
-		gprs.s4(),
-		gprs.s5(),
-		gprs.s6(),
-		gprs.s7(),
-		gprs.s8(),
-		gprs.s9(),
-		gprs.s10(),
-		gprs.s11(),
-		gprs.t3(),
-		gprs.t4(),
-		gprs.t5(),
-		gprs.t6()
-	);
 }
 
 // ---------------------------------------------------------------

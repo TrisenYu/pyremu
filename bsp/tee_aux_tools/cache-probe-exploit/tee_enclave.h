@@ -64,9 +64,9 @@
  * 入参为 struct tee_enclave_token_args: 目标飞地编号 + 管理令牌.
  *
  * 目标飞地正跑在别的 hart 上时不做同步终止: M 模式会代为置位终止请求并向该
- * hart 发定向 IPI, 本调用返回 -EACCES, 终止结果由那条 hart 上阻塞中的
- * ENTER/RESUME 回传. 需要主动发起该请求而不等待终止结果时用
- * TEE_IOC_REQUEST_SHUTDOWN. */
+ * hart 发定向 IPI, 随后本调用在 M 模式内等待到该编号的飞地不再存在, 故返回即
+ * 该飞地已不存在. 终止结果由那条 hart 上阻塞中的 ENTER/RESUME 回传. 需要请求
+ * 终止而不等待其结果时用 TEE_IOC_REQUEST_SHUTDOWN. */
 #define TEE_IOC_SHUTDOWN _IOW(TEE_IOC_MAGIC, 6, struct tee_enclave_token_args)
 
 /* 请求持有该飞地的 hart 自行终止它. 与 TEE_IOC_SHUTDOWN 的分工: 本命令只表示
@@ -97,12 +97,21 @@
  * 调用方据此决定继续 RESUME、判成功或判失败.
  *
  *   数值须与 bsp/custom-opensbi/include/enclave_ext/enclave_api.h 的
- *   ENCLAVE_RUN_* 枚举保持一致, 修改需两侧同步. */
+ *   ENCLAVE_RUN_* 枚举保持一致, 修改需两侧同步.
+ *
+ * 调用期失败的错误码中有两个为本扩展专有, 调用方须与本飞地的运行状态区分开:
+ *   EBUSY  该编号飞地的请求队列已存满. M 模式对这一情形回
+ *          SBI_ERR_ENCLAVE_QUEUE_FULL, 驱动折算为 EBUSY. 本次请求未被受理,
+ *          已排队的请求不受影响, 稍后重试可被受理;
+ *   ENOENT 等待期间该编号的飞地已被终止. M 模式对这一情形回
+ *          SBI_ERR_ENCLAVE_GONE, 驱动折算为 ENOENT. 重试同一编号不会成功.
+ * 资源暂不可得本身不构成失败: 请求方 hart 在 M 模式内按到达顺序等待, 条件成立
+ * 才继续把这次请求做完, 故返回之时结果已在手中, 调用方不需要重试循环. */
 enum tee_run_state {
 	TEE_RUN_SUSPENDED  = 0, /* 时间片配额让出: 载荷存活挂起, 应 RESUME 继续 (非终止) */
 	TEE_RUN_EXITED	   = 1, /* 载荷自行结束 (SHUTDOWN), 退出码 0: 自然跑完 */
 	TEE_RUN_EXITED_ERR = 2, /* 载荷自行结束 (SHUTDOWN), 退出码非 0: 载荷自报出错 */
-	TEE_RUN_ABORTED	   = 3, /* 载荷违规访问, 被 M 模式强制终止, 非自行退出 */
+	TEE_RUN_ABORTED	   = 3, /* 仅在终止类别落在枚举之外时写入, 当前不可达 */
 	TEE_RUN_HOST_KILL  = 4, /* host 请求终止, 载荷未运行到退出 */
 };
 

@@ -32,11 +32,11 @@ from pyremu._native import (
     fp_exec_op,
     native_available,
 )
-from pyremu.core.hart import HartWithRegs
+from pyremu.core.hart import HartGroup, HartWithRegs
 from pyremu.core.mem_check_aux import (
     mem_read,
     mem_write,
-    MemoryAccessFault,
+    MemoryAccessError,
     validate_csr,
 )
 from pyremu.core.registers import CsrAccessError
@@ -289,14 +289,15 @@ def _zbb_alu32(
     )
 
 
-def _flush_tlbs(origin, vpn: int | None, all_harts: list | None) -> None:
-    """SFENCE.VMA helper: broadcast TLB flush across all harts.
+def _flush_tlbs(origin, vpn: int | None, all_harts: HartGroup | None) -> None:
+    """SFENCE.VMA 辅助函数: 把刷新广播到全部 hart.
 
-    Args:
-        origin: 发起 SFENCE.VMA 的 hart (本身也参与刷新).
-        vpn: None = flush_all; 否则为 VA>>12 的 VPN.
-        all_harts: 全部 hart 列表, 由调用方传入以避免每 hart 持有重复引用.
+    origin 为发起 SFENCE.VMA 的 hart, 本身也参与刷新; vpn 为 None 时刷新全部条目,
+    否则为 VA>>12 的页号; all_harts 为全部 hart 的弱引用视图, 由调用方传入以避免
+    每 hart 持有重复引用. 本次刷新另计入 TLB 刷新计数, 使加速执行引擎内既有的
+    条目作废.
     """
+    origin.note_tlb_flush()
     if vpn is None:
         origin.itlb.flush_all()
         origin.dtlb.flush_all()
@@ -366,7 +367,6 @@ class Hart(HartWithRegs):
                 f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
             )
 
-        # -- 纯 Python 路径, 加速执行引擎动态库缺失或调试时使用 --
         part1, part2 = f.func3, f.func7
         if part1 == 0b000:
             if part2 == 0:
@@ -468,7 +468,6 @@ class Hart(HartWithRegs):
                 self.gprs[f.rd] = result
             return 4
 
-        # -- 纯 Python 路径 --
         part1 = f.func3
         part6 = f.func7 >> 1
         imm = f.imm12_se
@@ -538,7 +537,6 @@ class Hart(HartWithRegs):
                 f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
             )
 
-        # -- 纯 Python 路径 --
         part1, part2 = f.func3, f.func7
         v1 = mask32(v1)
         v2 = mask32(v2)
@@ -657,7 +655,6 @@ class Hart(HartWithRegs):
                 self.gprs[f.rd] = result
             return 4
 
-        # -- 纯 Python 路径 --
         part1, part7 = f.func3, f.func7
         imm = f.imm12_se
         shamt = f.imm12_se & 0x1F
@@ -1089,7 +1086,8 @@ class Hart(HartWithRegs):
             elif funct12 == 0x120 or (0x121 <= funct12 <= 0x13F):
                 # SFENCE.VMA: funct7=0b0001001, funct12 = 0x120 | rs2.
                 # RISC-V spec: rs1=x0 时刷新全部 TLB; rs1≠x0 时仅刷新该 VA 对应条目.
-                # 同步广播到全部 hart — 匹配 Rust 引擎 tlb_gen 语义, 确保多核 TLB 一致性.
+                # 刷新同步到全部 hart. RISC-V 只要求刷新本 hart, 扩大范围不影响
+                # 正确性, 且省去核间中断.
                 vpn = None if rs1 == 0 else (self.gprs[rs1] >> 12)
                 _flush_tlbs(self, vpn, self._all_harts)
             elif funct12 == 0x5A0:  # MFENCE.DID — 按内存域刷新全部 hart TLB + L2
@@ -1098,6 +1096,8 @@ class Hart(HartWithRegs):
                 for h in self._all_harts or [self]:
                     h.itlb.flush_by_mdid(mdid_val)
                     h.dtlb.flush_by_mdid(mdid_val)
+                # 加速执行引擎按页号与内存域查询条目, 无按域刷新的入口, 故整表作废.
+                self.note_tlb_flush()
                 # 刷新共享 L2 缓存中匹配的条目
                 if self._bus is not None:
                     l2 = getattr(self._bus, "_l2", None)
@@ -1611,7 +1611,7 @@ class Hart(HartWithRegs):
         if f.is_compressed:
             try:
                 return self.handle_compressed(mask16(instr))
-            except MemoryAccessFault:
+            except MemoryAccessError:
                 pass
             except (ValueError, NotImplementedError, CsrAccessError):
                 deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
@@ -1627,7 +1627,7 @@ class Hart(HartWithRegs):
 
         try:
             return getattr(self, method_name)(instr)
-        except MemoryAccessFault:
+        except MemoryAccessError:
             pass
         except (ValueError, NotImplementedError, CsrAccessError):
             # 操作码合法但编码字段无效 (如非法 funct3/funct12/nzuimm=0 等)

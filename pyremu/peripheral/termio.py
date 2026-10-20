@@ -74,8 +74,8 @@ class TerminalIO:
         self._stdin_fd = stdin_fd
         self._stdout_fd = stdout_fd
         self._ext_irq = ext_irq  # FfiExtIrqCtx or None
-        # 设备中断注入回调 (``Emulator.raise_device_irq``): 同步 PLIC 挂起状态并
-        # 写穿持久数组, 使 batch 内 Rust 内联仲裁能立即看到新到达的 UART 数据。
+        # 设备中断注入回调 (``DeviceIrqSink``): 同步 PLIC 挂起状态并写穿持久数组,
+        # 使 batch 内 Rust 内联仲裁能立即看到新到达的 UART 数据。
         # 为 None 时退化为仅置 ext_irq 通知位, 供独立使用场景。
         self._on_irq = on_irq
 
@@ -146,6 +146,11 @@ class TerminalIO:
     def tx_wr(self):
         """TX 写索引 ctypes 对象 (供 Emulator._native_marshal_uart 使用)."""
         return self._tx_wr
+
+    @property
+    def rx_notify(self):
+        """接收通知标志 ctypes 对象 (供 Emulator._native_marshal_uart 使用)."""
+        return self._rx_notify
 
     @property
     def tx_drain(self):
@@ -362,7 +367,7 @@ class TerminalIO:
         # 清零由空闲轮询路径在确认环形缓冲区为空后负责.
         if had_input:
             if self._on_irq is not None and self._uart._irq > 0:
-                # 走 Emulator.raise_device_irq: 按当前 UART 电平同步 PLIC 挂起
+                # 走设备中断投递目标: 按当前 UART 电平同步 PLIC 挂起
                 # 状态, 把该状态写入持久数组并置 ext_irq 通知位。若仅置
                 # _ext_irq.pending 而不写持久数组, batch 内 Rust 的
                 # plic_recompute_mip 会用 batch 起始的旧数组覆盖 SEIP,
@@ -702,11 +707,11 @@ class TerminalIO:
         h = TermIoHandle()
         h.stdin_fd = self._stdin_fd
         h.stdout_fd = self._stdout_fd
-        h.rx_buf = ctypes.cast(self._rx_buf, ctypes.c_void_p).value or 0
+        h.rx_buf = ctypes.addressof(self._rx_buf) or 0
         h.rx_cap = self.RX_CAP  # Rust termio 线程读取 stdin -> ring buffer
         h.rx_wr = ctypes.addressof(self._rx_wr)
         h.rx_rd = ctypes.addressof(self._rx_rd)
-        h.tx_buf = ctypes.cast(self._tx_buf, ctypes.c_void_p).value or 0
+        h.tx_buf = ctypes.addressof(self._tx_buf) or 0
         h.tx_cap = self.TX_CAP // 2  # 条目容量 (非字节容量)
         h.tx_wr = ctypes.addressof(self._tx_wr)
         h.tx_drain = ctypes.addressof(self._tx_drain)

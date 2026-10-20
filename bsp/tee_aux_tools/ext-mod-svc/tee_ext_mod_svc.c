@@ -36,61 +36,39 @@ static const struct tee_ext_mod_entry *module_lookup(
 	return NULL;
 }
 
-int tee_ext_mod_table_load(struct tee_ext_mod_table *table, const char *dir) {
-	char list_path[TEE_EXT_MOD_PATH_MAX];
-	int n = snprintf(list_path, sizeof(list_path), "%s/modules.list", dir);
-	if (n < 0 || (size_t)n >= sizeof(list_path)) {
-		fprintf(stderr, "module list path too long: '%s'\n", dir);
-		return -ENAMETOOLONG;
-	}
+/* 模块映像在模块目录中的名称. 完整路径由 tee_ext_mod_table_init 拼接. */
+struct module_image {
+	uint32_t module_id;
+	const char *name;
+};
 
-	FILE *fp = fopen(list_path, "r");
-	if (!fp) {
-		fprintf(stderr, "open '%s' failed (errno=%d)\n", list_path, errno);
-		return -errno;
-	}
+/* 模块表, 各项由 ext_mod_table.inc 给出. */
+static const struct module_image MODULE_IMAGES[] = {
+#include "ext_mod_table.inc"
+};
+
+_Static_assert(
+	sizeof(MODULE_IMAGES) / sizeof(MODULE_IMAGES[0]) <= TEE_EXT_MOD_TABLE_MAX,
+	"module count exceeds TEE_EXT_MOD_TABLE_MAX");
+
+int tee_ext_mod_table_init(struct tee_ext_mod_table *table, const char *dir) {
+	const size_t count = sizeof(MODULE_IMAGES) / sizeof(MODULE_IMAGES[0]);
 
 	table->count = 0;
-	char line[2 * TEE_EXT_MOD_PATH_MAX];
-	while (fgets(line, sizeof(line), fp) != NULL) {
-		char *p = line;
-		while (*p == ' ' || *p == '\t') {
-			p++;
-		}
-		if (*p == '\0' || *p == '\n' || *p == '#') {
-			continue;
-		}
-
-		unsigned int module_id = 0;
-		char name[TEE_EXT_MOD_PATH_MAX];
-		if (sscanf(p, "%u %511s", &module_id, name) != 2) {
-			fprintf(stderr, "bad line in '%s': %s", list_path, line);
-			fclose(fp);
-			return -EINVAL;
-		}
-		if (table->count >= TEE_EXT_MOD_TABLE_MAX) {
-			fprintf(
-				stderr,
-				"more than %d modules in '%s'\n",
-				TEE_EXT_MOD_TABLE_MAX,
-				list_path);
-			fclose(fp);
-			return -E2BIG;
-		}
-
-		struct tee_ext_mod_entry *entry = &table->entries[table->count];
-		entry->module_id				= (uint32_t)module_id;
-		n = snprintf(entry->path, sizeof(entry->path), "%s/%s", dir, name);
+	for (size_t i = 0; i < count; i++) {
+		const char *name				= MODULE_IMAGES[i].name;
+		struct tee_ext_mod_entry *entry = &table->entries[i];
+		int n = snprintf(entry->path, sizeof(entry->path), "%s/%s", dir, name);
 		if (n < 0 || (size_t)n >= sizeof(entry->path)) {
 			fprintf(stderr, "module image path too long: '%s/%s'\n", dir, name);
-			fclose(fp);
+			table->count = 0;
 			return -ENAMETOOLONG;
 		}
 
+		entry->module_id = MODULE_IMAGES[i].module_id;
 		table->count++;
 	}
 
-	fclose(fp);
 	return table->count;
 }
 
@@ -149,7 +127,7 @@ int tee_ext_mod_serve(
 
 	if (kind == TEE_MODULE_KIND_SIZE) {
 		uint64_t size = entry ? image_size(entry->path) : 0;
-		printf("req enclave=%lu id=%u kind=size -> %llu\n", enclave_id, module_id, size);
+		printf("req enclave=%lu id=%u kind=size -> %lu\n", enclave_id, module_id, size);
 		return report_size(fd, enclave_id, token, size) < 0 ? -1 : 1;
 	}
 

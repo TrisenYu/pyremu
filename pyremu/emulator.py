@@ -67,13 +67,14 @@ from pyremu.core.hart import (
 from pyremu.core.mem_check_aux import (
     check_instruction_fetch,
     inject_memory_backend,
-    MemoryAccessFault,
+    MemoryAccessError,
 )
 from pyremu.core.trap_def import TrapType
 from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap, try_wfi_wakeup
 from pyremu.interrupt.aplic import APLIC
 from pyremu.interrupt.clint import CLINT
 from pyremu.interrupt.imsic import IID_EXT_MIN, IMSIC
+from pyremu.interrupt.irq_sink import DeviceIrqSink
 from pyremu.interrupt.plic import PLIC
 from pyremu.memory.bus import Bus
 from pyremu.memory.l2cache import L2Cache
@@ -103,6 +104,13 @@ from pyremu.utils.parse_bin import FirmwareImage
 from pyremu.utils.tick import yield_cpu
 
 _WFI_MAX_SLEEP = cfg_float("WFI_MAX_SLEEP")  # 单次最大睡眠秒数, 降低 CPU 占用
+# 每条已执行完成的指令折算的时钟周期数. 与 Rust 加速引擎的 CYCLES_PER_INSTR 同源:
+#     cycles = instrs * NS_PER_INSTR * CPU_FREQ_HZ / 1e9
+# 真实核心的 CPI 随指令类别、流水线停顿、缓存未命中与访存延迟分别取值, 本模型
+# 不逐类还原, 固定按上式的同一个值折算. 因此由 mcycle 得到的绝对周期数只是
+# 可复现的指令数折算; 该值仍满足测量所需的一条性质: 同一 hart 上两次采样之差
+# 只由该 hart 执行的指令决定, 与其它 hart 是否同时运行无关.
+CYCLES_PER_INSTR = cfg_int("NS_PER_INSTR") * CPU_FREQ_HZ // 1_000_000_000
 # 阈值判断: <=2 MiB 的段走 L2 缓存, 更大的段 (如 Linux 内核 Image)
 # 绕过 L2 直写 RAM, 避免 cache-line 级逐片处理膨胀到数十秒.
 _FAST_LOAD_THRESHOLD = cfg_int("FAST_LOAD_THRESHOLD")  # 2 MiB
@@ -214,17 +222,18 @@ class Emulator:
             )
         )
 
-        # 全局性参考时钟周期数
+        # 全局性参考时钟周期数: 按真实流逝记录, 供 run() 返回值与 cycle 属性
+        # 使用, 不写入 mcycle.
         self._cycle = 0
         self._total_instrs = 0
         # mtime 在 native 加速路径按每 hart 指令增量推进 (Rust advance_clock_source,
         # 每指令 20ns — 见 NS_PER_INSTR; 低速模拟下若跟随真实流逝, 内核 HZ=250 tick
         # 无充足指令预算会活锁), 纯 Python 单步路径同样按指令计数推进
-        # (每指令 20ns, 见 _advance_mtime_instr); mcycle 按真实流逝推进
-        # (_advance_mcycle).  mtime 速率 = cfg.timebase_freq (与 DTB
-        # timebase-frequency 同源), 换算比 = timebase_freq * 20 / 1e9
-        # (10 MHz -> 5 指令 / tick).
-        self._last_clock_sync: float = time.monotonic()  # mcycle 的时钟源基准
+        # (每指令 20ns, 见 _advance_mtime_instr). mcycle 与 minstret 都按各 hart
+        # 的指令数折算 (见 sync_counters), 与上面两条路径无关.  mtime 速率 =
+        # cfg.timebase_freq (与 DTB timebase-frequency 同源), 换算比 =
+        # timebase_freq * 20 / 1e9 (10 MHz -> 5 指令 / tick).
+        self._last_clock_sync: float = time.monotonic()  # _cycle 的时钟源基准
         self._mtime_instr_frac: int = 0  # 指令计数推进 mtime 的亚 tick 余数
         self._prev_all_exec_cnt: int = 0  # 上一轮加速执行 Rust 累积 total_instrs
         # initramfs 物理范围 (load_initrd 设置; None=未挂载)。
@@ -269,9 +278,10 @@ class Emulator:
         self.plic: PLIC | None = None
         self.imsic: IMSIC | None = None
         self.aplic: APLIC | None = None
-        # 中断源编号与中断控制器的对应关系, 未登记的中断源交给 self.aplic.
-        # 飞地侧设备的控制器只经本表持有, 不另设字段.
-        self.irq_route: dict[int, APLIC | PLIC] = {}
+        # 设备中断投递目标 — 设备经 on_irq 持有本对象, 不持有 Emulator 的绑定方法,
+        # 理由见 DeviceIrqSink. 中断源编号与中断控制器的对应关系由
+        # _setup_interrupt_controllers 经 set_fallback / bind 登记.
+        self._irq_sink = DeviceIrqSink(self._native_ext_irq, self._wake_event)
         # 外设 + 看门狗 — 外设按配置创建 (base=0 跳过, 保持 None);
         # 看门狗恒创建 (非 None), 二者均由 _setup_peripherals 填充.
         self.uart: UART | None = None
@@ -284,15 +294,18 @@ class Emulator:
         self.watchdog: HartWatchdog  # 恒创建, 类型非 Optional
         self.crng: CRNG | None = None
         self._peripherals: dict[str, object] = {}
+        # 全部 hart — 在 _create_harts 中原地填充. 本列表先于 hart 创建而存在,
+        # 使早于 hart 创建的外设 (看门狗) 可直接持有它.
+        self.harts: list[Hart] = []
 
         self._setup_interrupt_controllers(config)
         self._setup_peripherals(config)
-        self.harts = self._create_harts(config)
+        self._create_harts(config)
 
         # ---- Phase A: speedup execution state ----
         self._speedup_hart_states: Any = None  # ctypes HartState array
         self._speedup_instr_group: Any = None  # ctypes InstrToBeExec
-        self._native_ram_buf: Any = None  # ctypes array from_buffer(bytearray)
+        self._native_ram_ptr: int = 0  # RAM 缓冲区首地址
         self._bp_addrs: list[int] = []  # breakpoint PCs
         self._warned_infinite_virtio = False  # 防止 virtio 异常循环时重复告警
         # WFI 空闲轮询回调: debugger 设为其 stdin 转发函数, 确保用户输入
@@ -309,7 +322,7 @@ class Emulator:
 
         - legacy: PLIC, 承担外部中断与外设有线路由
         - AIA:    IMSIC 承担 MSI 中断, APLIC S 域与 APLIC M 域把有线中断转成 MSI;
-                  M 域实例登记在 self.irq_route 下
+                  M 域实例登记在设备中断投递目标的中断源表下
         """
         if config.interrupt_mode == InterruptMode.AIA:
             p = config.periph
@@ -327,6 +340,8 @@ class Emulator:
                 num_sources=128,
             )
             self.bus.add_device(self.aplic.base_addr, self.aplic)
+            # 未登记的中断源交给 S 域 APLIC.
+            self._irq_sink.set_fallback(self.aplic)
 
             if p.aplic_m_base:
                 aplic_m = APLIC(
@@ -342,7 +357,7 @@ class Emulator:
                 # M 文件上的软件中断 identity 相同, 该 identity 的 pending 位由
                 # IPI 快路径不经使能位直接投递, 网卡置位会被当作 IPI 认领.
                 aplic_m.bind_source(VIRTIO_NET_M_IRQ, 0, IID_EXT_MIN)
-                self.irq_route[VIRTIO_NET_M_IRQ] = aplic_m
+                self._irq_sink.bind(VIRTIO_NET_M_IRQ, aplic_m)
             return
         self.plic = PLIC(
             base_addr=config.periph.plic_base,
@@ -350,6 +365,8 @@ class Emulator:
             num_contexts=2 * config.num_harts,
         )
         self.bus.add_device(self.plic.base_addr, self.plic)
+        # legacy 模式下全部中断源交给 PLIC.
+        self._irq_sink.set_fallback(self.plic)
 
     def _setup_peripherals(self, config: PlatformConfig) -> None:
         """按配置创建并注册外设 (base=0 时跳过) + 看门狗设备.
@@ -385,11 +402,15 @@ class Emulator:
         if p.virtio_blk_base and config.disk_image:
             self.virtio_blk = VirtIOBlock(
                 image_path=config.disk_image,
-                mem_read=self.bus.read,
-                mem_write=self.bus.write,
-                # 经文档化入口投递: raise_device_irq 除置位中断控制器外还通知加速执行
-                # 引擎并唤醒 WFI 阻塞的 hart, 直接调 plic.set_irq 会略过这两步。
-                on_irq=self.raise_device_irq,
+                # 主存访问路径取自 MainMem 而不取 Bus: Bus 持有本设备, 设备再持有 Bus
+                # 的绑定方法会使二者之间形成环形引用, 见 Bus.main_mem.
+                mem_read=self.bus.main_mem.read,
+                mem_write=self.bus.main_mem.write,
+                # 经设备中断投递目标投递: 除置位中断控制器外还通知加速执行引擎并唤醒
+                # WFI 阻塞的 hart, 直接调 plic.set_irq 会略过这两步。此处不得改传
+                # raise_device_irq: 绑定方法持有 Emulator, 会与 Emulator 对设备的
+                # 持有构成环形引用, 见 DeviceIrqSink.
+                on_irq=self._irq_sink,
                 irq=VIRTIO_BLK_IRQ,
             )
             self.bus.add_device(p.virtio_blk_base, self.virtio_blk)
@@ -409,10 +430,13 @@ class Emulator:
             )
             self._peripherals["virtio_net_m"] = self.virtio_net_m
 
-        # 看门狗设备 — 多 hart 停滞检测, DTB 可见
+        # 看门狗设备 — 多 hart 停滞检测, DTB 可见. 经 clint 与 wake_event 两个对象
+        # 构造, 不传 Emulator, 也不传 hart 列表: 本设备持有其中任何一个都会与
+        # Emulator 对设备的持有构成环形引用. hart 列表在每次 tick 时随参数传入.
         _wdog_base = p.watchdog_base or 0x1000_4000
         self.watchdog = HartWatchdog(
-            self,
+            clint=self.clint,
+            wake_event=self._wake_event,
             base=_wdog_base,
             num_harts=config.num_harts,
         )
@@ -433,26 +457,29 @@ class Emulator:
     ) -> VirtIONet:
         """按 MMIO 基址、中断源编号与 MAC 创建一个 virtio-net 实例并注册到总线.
 
-        中断经文档化入口 ``raise_device_irq`` 投递: 该入口除置位中断控制器外还通知
-        加速执行引擎并唤醒 WFI 阻塞的 hart, 直接调控制器 set_irq 会略过这两步.
+        中断经设备中断投递目标投递: 该目标除置位中断控制器外还通知加速执行引擎并
+        唤醒 WFI 阻塞的 hart, 直接调控制器 set_irq 会略过这两步.
+
+        主存访问路径取自 MainMem 而不取 Bus: Bus 持有本设备, 设备再持有 Bus 的绑定
+        方法会使二者之间形成环形引用, 见 Bus.main_mem.
         """
         net = VirtIONet(
-            mem_read=self.bus.read,
-            mem_write=self.bus.write,
+            mem_read=self.bus.main_mem.read,
+            mem_write=self.bus.main_mem.write,
             mac=mac,
-            on_irq=self.raise_device_irq,
+            on_irq=self._irq_sink,
             irq=irq,
         )
         self.bus.add_device(base, net)
         return net
 
-    def _create_harts(self, config: PlatformConfig) -> list[Hart]:
-        """按配置创建全部 hart, 注入内存后端与中断控制器, 并建立互引用后返回.
+    def _create_harts(self, config: PlatformConfig) -> None:
+        """按配置创建全部 hart, 注入内存后端与中断控制器, 并原地填入 ``self.harts``.
 
         前置: ``self.bus`` / ``self.clint`` / ``self.uart`` 与
-        ``_setup_interrupt_controllers`` 填充的控制器字段均已就绪.
+        ``_setup_interrupt_controllers`` 填充的控制器字段均已就绪;
+        ``self.harts`` 已声明为空列表, 本函数只向其追加, 不另建列表.
         """
-        harts: list[Hart] = []
         for i in range(config.num_harts):
             h = Hart(id=i, pmp_entries=config.pmp_entries)
             h.pc = config.prog_cnt
@@ -465,12 +492,11 @@ class Emulator:
             h.interrupt_ctrl = self.clint
             h.plic = self.plic
             h.imsic = self.imsic
-            harts.append(h)
+            self.harts.append(h)
 
         # 互引用: 每个 hart 持有全 hart 列表, 供 mfence.did 等广播操作
-        for h in harts:
-            h.all_harts = harts
-        return harts
+        for h in self.harts:
+            h.all_harts = self.harts
 
     def _init_termio(self) -> None:
         """初始化终端 I/O 管理器 (Terminal I/O).
@@ -492,10 +518,10 @@ class Emulator:
             stdin_fd=stdin_fd,
             stdout_fd=stdout_fd,
             ext_irq=self._native_ext_irq,
-            # RX 排空路径经 raise_device_irq 同步 PLIC: 设备线程必须 write-through
+            # RX 排空路径经设备中断投递目标同步 PLIC: 设备线程必须 write-through
             # 持久 PLIC 数组, 否则 batch 内 Rust 内联仲裁看不到新到达的 UART
             # 数据, plic_recompute_mip 覆盖 SEIP -> UART 中断丢失 -> 输入冻结.
-            on_irq=self.raise_device_irq,
+            on_irq=self._irq_sink,
         )
         self.uart.termio = self._termio
         # 把 CPU 引擎停止标志地址注入 termio 线程 — Ctrl+Q 时由 termio 直接
@@ -528,9 +554,11 @@ class Emulator:
         # 延迟以百毫秒计).
         if self.imsic is not None:
             self.imsic.bind_ffi_states(self._speedup_hart_states)
-        self._tlb_gen = ctypes.c_uint64(0)
-        self._tlb_gen_per_hart = (ctypes.c_uint64 * num_harts)()
-        self._tlb_gen_before: int = 0
+        # TLB 刷新计数的两处存放位置: 全局计数由总线持有, 各 hart 上次见到的取值
+        # 由本数组持有. 两者跨 FFI 调用保留, 引擎据此在两次调用之间沿用既有的翻译
+        # 条目; 使条目失效的动作无论发生在哪一侧都计入该计数.
+        self._tlb_flush_cnt_per_hart = (ctypes.c_uint64 * num_harts)()
+        self._tlb_flush_cnt_before: int = self.bus.tlb_flush_cnt.value
 
         self._clint_msip_edge: list[int] = [0] * num_harts
         self._clint_msip_prev: list[int] = [0] * num_harts
@@ -538,7 +566,9 @@ class Emulator:
         self._clint_msip_arr = (ctypes.c_uint8 * 0)()
 
         ram = self.bus._ram  # bytearray
-        self._native_ram_buf = (ctypes.c_uint8 * len(ram)).from_buffer(ram)  # type: ignore[attr-defined]
+        # 首地址用 ctypes.addressof 取得; 取地址不用 ctypes.cast, 后者会与所转换的缓冲区
+        # 构成引用环.
+        self._native_ram_ptr = ctypes.addressof(ctypes.c_uint8.from_buffer(ram))
 
         self._pmp_num: int = 0
         self._pmp_cfg_buf = (ctypes.c_uint8 * 0)()
@@ -740,19 +770,26 @@ class Emulator:
         for seg in image.segments:
             self._write_segment(seg, load_offset, _FAST_LOAD_THRESHOLD)
 
-        # 若 load_offset ≠ 0, 开放 VMA 影子映射:
+        # 若 load_offset ≠ 0, 施加 PIE 装载偏移:
         # 固件链接在低地址 (VMA), 但 RAM 在高地址.
         # S-mode mret 用 VMA 作为目标地址, 需要 VMA 也能访问同一 RAM.
         if load_offset != 0 and image.segments:
             for seg in image.segments:
                 self._write_segment(seg, 0, _FAST_LOAD_THRESHOLD)
-            vma_min = min(seg.vaddr for seg in image.segments)
-            vma_max = max(seg.vaddr + seg.memsz for seg in image.segments)
-            self.bus.set_ram_shadow(vma_min, vma_max - vma_min)
+            link_min = min(seg.vaddr for seg in image.segments)
+            link_max = max(seg.vaddr + seg.memsz for seg in image.segments)
+            self.bus.apply_pie_ofs(link_min, link_max - link_min)
 
         # 将所有 hart 的 PC 设置为入口地址
         for hart in self.harts:
             hart.pc = image.entry_point + load_offset
+
+        # 装入的段覆盖了既有的内存内容, 两个 TLB 中既有的翻译一律作废: 页表本身
+        # 可能就在被覆盖的范围内.
+        for hart in self.harts:
+            hart.itlb.flush_all()
+            hart.dtlb.flush_all()
+        self.bus.note_tlb_flush()
 
     # ----------------------------------------------------------
     #  执行
@@ -770,7 +807,7 @@ class Emulator:
         saved_pc = hart.pc
         try:
             advance = hart.exec_instr(instr)
-        except (NotImplementedError, MemoryAccessFault):
+        except (NotImplementedError, MemoryAccessError):
             deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
             advance = 0
         if advance != 0 and hart.pc == saved_pc:
@@ -794,23 +831,19 @@ class Emulator:
         self._native_stop_flag.value = 1
         self._wake_event.set()
 
-    def raise_device_irq(self, source: int, pending: bool = True) -> None:
-        """设备中断注入接口 — 外部设备 (磁盘/串口/网卡/看门狗) 修改中断线电平.
+    @property
+    def irq_route(self) -> dict[int, APLIC | PLIC]:
+        """中断源编号与中断控制器的对应关系, 由 _setup_interrupt_controllers 填充."""
+        return self._irq_sink.irq_route
 
-        等价于 QEMU 设备模型的 ``qemu_irq_raise``: 按中断源编号选中处理该中断源的
-        控制器, 未登记的中断源交给 self.aplic 或 self.plic, 随后写该控制器的挂起
-        状态并置 ext_irq 通知位, 使引擎在单轮加速执行内即时拉起 MEIP/SEIP、唤醒
-        WFI hart; 单轮加速执行边界 _native_sync_plic_mip 保证 mip 与控制器状态
-        最终一致.
+    def raise_device_irq(self, source: int, pending: bool = True) -> None:
+        """设备中断注入接口 — 外部调用方 (磁盘/串口/网卡/看门狗) 修改中断线电平.
+
+        转交设备中断投递目标处理, 后者按中断源编号选中处理该中断源的控制器, 写其
+        挂起状态并置 ext_irq 通知位. 设备自身持有的是 ``self._irq_sink``, 理由见
+        DeviceIrqSink; 本方法供 Emulator 之外的调用方使用.
         """
-        ctrl = self.irq_route.get(source)
-        if ctrl is None:
-            ctrl = self.aplic if self.aplic is not None else self.plic
-        if ctrl is None:
-            return
-        ctrl.set_irq(source, pending)
-        self._native_ext_irq.pending = 1
-        self._wake_event.set()
+        self._irq_sink(source, pending)
 
     def _speedup_for_cmd_step(self, active: list[Hart]) -> int:
         # 将 L2 缓存的脏行回写到 bytearray, 使加速执行引擎直接读取 bytearray 中的指令
@@ -834,15 +867,18 @@ class Emulator:
         virtio_info = self._native_marshal_virtio()
         plic_info = self._native_marshal_plic()
 
+        # PIE 链接地址区间随本轮回传给加速执行引擎, 引擎按同一换算访问 RAM.
+        pie_ofs_base, pie_ofs_size = self.bus.pie_ofs_pair()
+
         # 统一使用 run_parallel (thread-per-hart 并发引擎)。
         virtio_ffi = run_parallel(
             self._speedup_hart_states,
             len(self.harts),
-            self._native_ram_buf,
+            self._native_ram_ptr,
             self.bus.ram_size,
             self.bus.ram_base,
-            self.bus._shadow_base or 0,
-            self.bus._shadow_size or 0,
+            pie_ofs_base,
+            pie_ofs_size,
             self._speedup_instr_group,
             pmp=pmp_info,
             clint=clint_info,
@@ -854,8 +890,8 @@ class Emulator:
             bp_addrs=self._bp_addrs if self._bp_addrs else None,
             stop_flag=self._native_stop_flag,
             ext_irq=self._native_ext_irq,
-            tlb_gen=self._tlb_gen,
-            tlb_gen_per_hart=self._tlb_gen_per_hart,
+            flush_cnt=self.bus.tlb_flush_cnt,
+            flush_cnt_per_hart=self._tlb_flush_cnt_per_hart,
         )
 
         result = self._speedup_instr_group
@@ -882,15 +918,15 @@ class Emulator:
         for hid in range(len(self.harts)):
             unmarshal_hart(self._speedup_hart_states[hid], self.harts[hid])
 
-        # Rust 批量执行期间内核可能修改页表并执行 SFENCE.VMA,
-        # tlb_gen 会递增. 仅在 gen 实际变化时才刷新 Python TLB —
-        # 若单轮加速执行内无 SFENCE.VMA, 保留已有 TLB 条目 (QEMU-style).
-        tlb_gen_after = self._tlb_gen.value
-        if tlb_gen_after != self._tlb_gen_before:
+        # 本轮引擎内可能执行了使翻译条目失效的动作: 受调试程序执行 SFENCE.VMA
+        # 或改写 satp. 计数发生变化时把 Python 侧的两个 TLB 全部作废, 否则沿用
+        # 既有条目.
+        flush_cnt_after = self.bus.tlb_flush_cnt.value
+        if flush_cnt_after != self._tlb_flush_cnt_before:
             for hart in self.harts:
                 hart.itlb.flush_all()
                 hart.dtlb.flush_all()
-        self._tlb_gen_before = tlb_gen_after
+        self._tlb_flush_cnt_before = flush_cnt_after
 
         # Rust 加速执行期间可能直接修改了 bytearray; 使 L2 缓存全部失效,
         # 强制 Python 侧后续读取从 bytearray 重新加载.
@@ -903,7 +939,8 @@ class Emulator:
         self._native_unmarshal_plic(plic_info)
 
         # mtime 已由 Rust 引擎执行期间按指令增量推进 (advance_clock_source),
-        # 此处不再重复推进; 仅推进 mcycle (_cycle, 按真实流逝).
+        # 此处不再重复推进; _cycle 记录时钟源流逝, 供 run() 返回值与 cycle
+        # 属性使用, 不写入 mcycle.
         self._advance_mcycle()
 
         # CLINT._msip 的电平回写由 _native_unmarshal_clint 完成: 受调试程序的 handler
@@ -952,7 +989,7 @@ class Emulator:
         pending/level 由 PLIC 对象持有 (``_ffi_pending``/``_ffi_level``),
         ``set_irq`` 每次改线实时写穿, 故此处无需复制。priority/enable/
         threshold/claimed 由本处 marshal — 与 ClintInfo 每轮重新分配不同,
-        数组跨 batch 持久 (尺寸不变时不重分配), 设备线程 ``raise_device_irq``
+        数组跨 batch 持久 (尺寸不变时不重分配), 设备中断投递目标
         经 ``plic.set_irq`` 写穿的是同一批数组, batch 内新到达的设备中断对
         Rust inline 仲裁可见. 仅在 num_sources/num_contexts 变化 (配置切换)
         时重分配.
@@ -1192,14 +1229,12 @@ class Emulator:
         # 此处刷新 termio 持有的字段与 UART 基址; 寄存器字段由下一行的
         # uart._publish_native_regs() 写入.
         ctx.base = uart.base_addr
-        ctx.tx_buf = ctypes.cast(self._termio.tx_buf, ctypes.c_void_p).value
+        ctx.tx_buf = ctypes.addressof(self._termio.tx_buf)
         ctx.tx_cap = len(self._termio.tx_buf)
         ctx.tx_wr = ctypes.addressof(self._termio.tx_wr)
         ctx.tx_notify_fd = self._termio.tx_notify_w
         ctx.no_stdout = 0
-        ctx.rx_notify = ctypes.cast(
-            ctypes.pointer(self._termio._rx_notify), ctypes.c_void_p
-        ).value
+        ctx.rx_notify = ctypes.addressof(self._termio.rx_notify)
         uart._publish_native_regs()
         return UartInfo(base=uart.base_addr, ffi=ctx)
 
@@ -1366,7 +1401,7 @@ class Emulator:
         if instr_delta > 0:
             self.watchdog.kick_all()
         else:
-            self.watchdog.tick()
+            self.watchdog.tick(self.harts)
 
         for hart in self.harts:
             if not hart._waiting or hart._halted:
@@ -1377,7 +1412,11 @@ class Emulator:
         return all_exec_cnt
 
     def _advance_mcycle(self) -> None:
-        """mcycle 按 CPU_FREQ_HZ (~1 GHz 内核) 推进, 按时钟源流逝为准."""
+        """记录时钟源流逝对应的周期数到 ``_cycle``, 提供 ``run()`` 的返回值与
+        ``Emulator.cycle`` 属性.
+
+        该值不写入 mcycle: mcycle 由各 hart 的指令数折算, 见 ``sync_counters``.
+        """
         now = time.monotonic()
         elapsed = now - self._last_clock_sync
         self._last_clock_sync = now
@@ -1492,19 +1531,26 @@ class Emulator:
     # ----------------------------------------------------------
 
     def sync_counters(self, instr_delta: int = 0) -> None:
-        """同步硬件计数器 CSR (cycle/time/instret).
+        """同步硬件计数器 CSR 镜像 (mcycle/cycle/minstret/instret/time).
 
-        mtime 按指令计数、mcycle 按时钟源推进 (见 _advance_mtime_instr /
-        _advance_mcycle); 本函数仅把当前值写入各 hart 的 CSR 镜像.
+        mcycle 与 cycle 按本 hart 已执行完成的指令数折算, 与 Rust 加速引擎的
+        ``csr_read`` 给出同一取值; mtime 由 CLINT 当前值给出. 本函数仅把当前
+        值写入各 hart 的 CSR 镜像, 不推进任何计数.
+
+        Args:
+            instr_delta: 自上次调用以来全部 hart 合计新增的指令数, 累加到
+                全局 ``_total_instrs``; 各 hart 的 ``_total_instrs`` 由执行路径
+                自行递增.
         """
         self._total_instrs += instr_delta
-        cycle_val = mask64(self._cycle)
         time_val = mask64(self.clint.get_mtime())
         for h in self.harts:
+            # 各 hart 的 mcycle 只由该 hart 的指令数给出, 不受其它 hart 与
+            # 时钟源流逝影响. 处于 WFI 等待状态的 hart 不执行指令, 两个计数
+            # 都不变.
+            cycle_val = mask64(h._total_instrs * CYCLES_PER_INSTR)
             h._csr_write_raw("mcycle", cycle_val)
             h._csr_write_raw("cycle", cycle_val)
-            # Per-hart instruction count — harts in WFI waiting state
-            # don't execute, so their count doesn't advance.
             h._csr_write_raw("minstret", mask64(h._total_instrs))
             h._csr_write_raw("instret", mask64(h._total_instrs))
             h._csr_write_raw("time", time_val)
@@ -1563,7 +1609,7 @@ class Emulator:
 
             try:
                 advance = hart.exec_instr(instr)
-            except (NotImplementedError, MemoryAccessFault):
+            except (NotImplementedError, MemoryAccessError):
                 deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
                 advance = 0
 
@@ -1604,7 +1650,7 @@ class Emulator:
         return False
 
     def _semihosting_exit_py(self) -> bool:
-        """纯 Python 路径: 消费 semihosting SYS_EXIT 停机标记.
+        """消费 semihosting SYS_EXIT 停机标记.
 
         ``trap_ebreak`` 检测到停机序列 (a0=0x18 + slli/ebreak/srai marker)
         时置 ``hart._semihosting_sys_exit``; 此处消费并返回 True, 由 ``run()``
@@ -1645,7 +1691,8 @@ class Emulator:
             yield_interval: 每次让出等待秒数, 默认 0.001 (1ms).
 
         Returns:
-            实际流逝的时钟周期数 (self._cycle, mcycle 按真实流逝推进).
+            实际流逝的时钟周期数 (self._cycle, 按真实流逝记录; 各 hart 的
+            mcycle 另由该 hart 的指令数折算, 见 sync_counters).
 
         Raises:
             TimeoutError: 当 *timeout* 秒数被超过.
@@ -1695,7 +1742,6 @@ class Emulator:
                 ):
                     break
             else:
-                # 纯 Python 路径 (native 不可用) — 逐指令, 无看门狗线程
                 if self._check_bp_hit_py():
                     self._run_stop_reason = RunStopReason.BREAKPOINT
                     break

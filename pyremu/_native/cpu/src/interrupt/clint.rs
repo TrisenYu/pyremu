@@ -244,7 +244,6 @@ pub(crate) fn sync_msip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 
 	if level_set {
 		state.mip.fetch_or(1 << 3, Ordering::AcqRel);
-		state.diag.msip_last_seen = (state.diag.msip_last_seen & !1) | (1u64);
 	}
 }
 
@@ -405,11 +404,9 @@ pub(crate) fn clint_write_msip(clint: &ClintCtx, target: usize, current: usize, 
 	let ts = unsafe { &mut *clint.states.add(target) };
 	if val == 0 {
 		ts.mip.fetch_and(!(1 << 3), Ordering::AcqRel);
-		ts.diag.clint_msip_clr = ts.diag.clint_msip_clr.wrapping_add(1);
 		return;
 	}
 	ts.mip.fetch_or(1 << 3, Ordering::AcqRel);
-	ts.diag.clint_msip_set = ts.diag.clint_msip_set.wrapping_add(1);
 	if target != current {
 		clint.yield_for_ipi.set(true);
 		clint.ipi_sender_hart.set(current as u8);
@@ -461,7 +458,6 @@ pub(crate) fn try_handle_clint(
 		}
 		if hart_id < clint.num_harts as usize && !clint.states.is_null() {
 			let t = unsafe { &mut *clint.states.add(hart_id) };
-			t.diag.clint_mtc_wr = t.diag.clint_mtc_wr.wrapping_add(1);
 			// QEMU 一次性定时器语义: 写入后为目标 hart 的 MTIP 设定 deadline.
 			write_mtimecmp(t, unsafe { *clint.mtime }, write_data, clint.timebase_hz);
 		}

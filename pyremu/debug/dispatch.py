@@ -31,6 +31,7 @@ class DispatchMixin(SharedMixinAttrs):
         "sie": "cmd_sie",
         "medeleg": "cmd_medeleg",
         "mideleg": "cmd_mideleg",
+        "pmp": "cmd_pmp",
         "pmps": "cmd_pmp",
         "tlb": "cmd_tlb",
     }
@@ -199,7 +200,7 @@ class DispatchMixin(SharedMixinAttrs):
                 f"Harts: [bold cyan]{self._emu.num_harts}[/]   "
                 f"Active hart: [bold cyan]{self._hart_id}[/]",
                 f"Prog Cnt: [bold yellow]{self._emu.prog_cnt:#018x}[/]  "
-                f"RAM: [dim]{fmt_size(self._emu.bus._ram_size)}"
+                f"RAM: [dim]{fmt_size(self._emu.bus.ram_size)}"
                 f" @ 0x{self._emu.bus.ram_base:x}[/]  "
                 f"FDT: [dim]{f'0x{self._fdt_addr:x}' if self._fdt_addr else '—'}[/]",
                 "",
@@ -307,7 +308,7 @@ class DispatchMixin(SharedMixinAttrs):
                 ("cache [set] [way]", "显示 L2 缓存状态及数据"),
                 ("satp", "显示 satp 解码 (MODE/ASID/PPN)"),
                 ("pt [va]", "Sv39 页表遍历: 逐级显示 PTE 与权限"),
-                ("show-pmp", "显示全部 PMP 条目的保护范围与权限"),
+                ("show pmps", "显示全部 PMP 条目的保护范围与权限"),
             ]),
             self._section("写寄存器命令", [
                 ("set/w <name> <val>", "写入 GPR (例: set sp 0x8000)"),

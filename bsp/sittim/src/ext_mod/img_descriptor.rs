@@ -1,13 +1,12 @@
 //! 模块映像的描述块。
 //!
 //! 映像自偏移 0 起声明自己的布局: 入口在映像内的偏移、映像本体的字节数、可写静态数据的
-//! 起始偏移与字节数。取入方在映像取得可执行权限之前逐项核对, 不符即拒绝, 映像的入口一次
-//! 也不会被调用。
+//! 起始偏移与字节数。取入方在映像取得可执行权限之前逐项核对, 不符则拒绝载入以及后续的执行
 //!
 //! 描述块由模块的链接脚本以段内数据命令生成, 见 `modules/module.ld`; 各字段是同一份链接
 //! 内各段地址的差值, 故不产生重定位项, 映像在模块窗口内的任何地址都给出相同取值。
 
-use crate::constants::{PAGE_SIZE, SIG_LEN};
+use crate::constants::{ PAGE_SIZE, SIG_LEN };
 use crate::mem_prim::align::align_up;
 
 /// 描述块的字节数, 也是模块入口偏移的下界。
@@ -80,7 +79,10 @@ pub enum DescError {
 /// 各字段按小端读出。核对通过时返回的 `data_class_off` 等于取入方按交付字节数算出的可执
 /// 行部分长度: 映像本体字节数与交付字节数的等式、`data_class_off` 与映像本体按页取整的
 /// 等式, 两项合起来给出这一结论。
-pub fn parse_image_desc(bytes: &[u8], slot_size: u64) -> Result<ModuleImageDesc, DescError> {
+pub fn parse_image_desc(
+	bytes: &[u8],
+	slot_size: u64
+) -> Result<ModuleImageDesc, DescError> {
 	if bytes.len() < IMAGE_DESC_LEN {
 		return Err(DescError::BadMagic);
 	}
@@ -115,20 +117,23 @@ pub fn parse_image_desc(bytes: &[u8], slot_size: u64) -> Result<ModuleImageDesc,
 	if desc.abi_version != IMAGE_DESC_ABI_VERSION {
 		return Err(DescError::BadAbiVersion);
 	}
-	if desc.body_len as usize + SIG_LEN != bytes.len() {
+	if (desc.body_len as usize) + SIG_LEN != bytes.len() {
 		return Err(DescError::BodyLenMismatch);
 	}
 	let data_class_off = align_up(desc.body_len as u64, PAGE_SIZE);
-	if desc.data_class_off as u64 != data_class_off {
+	if (desc.data_class_off as u64) != data_class_off {
 		return Err(DescError::DataClassOffMismatch);
 	}
 	if desc.entry % 4 != 0 {
 		return Err(DescError::EntryMisaligned);
 	}
-	if (desc.entry as u64) < IMAGE_DESC_LEN as u64 || (desc.entry as u64) >= data_class_off {
+	if
+		(desc.entry as u64) < (IMAGE_DESC_LEN as u64) ||
+		(desc.entry as u64) >= data_class_off
+	{
 		return Err(DescError::EntryOutOfRange);
 	}
-	if data_class_off + desc.bss_size as u64 > slot_size {
+	if data_class_off + (desc.bss_size as u64) > slot_size {
 		return Err(DescError::StaticDataTooLarge);
 	}
 	if desc.flags != 0 || desc.reserved.iter().any(|value| *value != 0) {
@@ -137,9 +142,7 @@ pub fn parse_image_desc(bytes: &[u8], slot_size: u64) -> Result<ModuleImageDesc,
 	Ok(desc)
 }
 
-// ---------------------------------------------------------------
-//  测试
-// ---------------------------------------------------------------
+
 
 #[cfg(test)]
 mod tests {
@@ -152,7 +155,12 @@ mod tests {
 	const ENTRY: u32 = IMAGE_DESC_LEN as u32;
 
 	/// 按给定的字段取值组装一份映像。描述块以外的字节为 0, 不影响核对。
-	fn image_with(entry: u32, body_len: u32, data_class_off: u32, bss_size: u32) -> [u8; IMAGE_LEN] {
+	fn image_with(
+		entry: u32,
+		body_len: u32,
+		data_class_off: u32,
+		bss_size: u32
+	) -> [u8; IMAGE_LEN] {
 		let mut bytes = [0u8; IMAGE_LEN];
 		let mut put = |index: usize, value: u32| {
 			let at = index * 4;
@@ -199,17 +207,11 @@ mod tests {
 	#[test]
 	fn test_parse_rejects_a_foreign_magic() {
 		let mut bytes = image_with(ENTRY, BODY_LEN, PAGE_SIZE as u32, 0);
-		bytes[0] ^= 0xFF;
-		assert_eq!(
-			parse_image_desc(&bytes, CHUNK_2M_SIZE),
-			Err(DescError::BadMagic)
-		);
+		bytes[0] ^= 0xff;
+		assert_eq!(parse_image_desc(&bytes, CHUNK_2M_SIZE), Err(DescError::BadMagic));
 
 		let short = [0u8; IMAGE_DESC_LEN - 4];
-		assert_eq!(
-			parse_image_desc(&short, CHUNK_2M_SIZE),
-			Err(DescError::BadMagic)
-		);
+		assert_eq!(parse_image_desc(&short, CHUNK_2M_SIZE), Err(DescError::BadMagic));
 	}
 
 	/// 布局版本不同即拒绝: 该映像按另一版约定构建。
@@ -244,7 +246,7 @@ mod tests {
 	/// 可写静态数据的起始偏移须等于映像本体按页取整的结果, 差一个页即拒绝。
 	#[test]
 	fn test_parse_rejects_a_data_class_offset_off_the_page_boundary() {
-		let bytes = image_with(ENTRY, BODY_LEN, PAGE_SIZE as u32 * 2, 0);
+		let bytes = image_with(ENTRY, BODY_LEN, (PAGE_SIZE as u32) * 2, 0);
 		assert_eq!(
 			parse_image_desc(&bytes, CHUNK_2M_SIZE),
 			Err(DescError::DataClassOffMismatch)
@@ -290,7 +292,7 @@ mod tests {
 			ENTRY,
 			BODY_LEN,
 			PAGE_SIZE as u32,
-			(CHUNK_2M_SIZE - PAGE_SIZE) as u32,
+			(CHUNK_2M_SIZE - PAGE_SIZE) as u32
 		);
 		assert!(parse_image_desc(&bytes, CHUNK_2M_SIZE).is_ok());
 	}
@@ -299,14 +301,14 @@ mod tests {
 	#[test]
 	fn test_parse_rejects_a_non_zero_reserved_field() {
 		let mut bytes = image_with(ENTRY, BODY_LEN, PAGE_SIZE as u32, 0);
-		bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
+		bytes[24..28].copy_from_slice(&(1u32).to_le_bytes());
 		assert_eq!(
 			parse_image_desc(&bytes, CHUNK_2M_SIZE),
 			Err(DescError::ReservedNotZero)
 		);
 
 		let mut bytes = image_with(ENTRY, BODY_LEN, PAGE_SIZE as u32, 0);
-		bytes[60..64].copy_from_slice(&1u32.to_le_bytes());
+		bytes[60..64].copy_from_slice(&(1u32).to_le_bytes());
 		assert_eq!(
 			parse_image_desc(&bytes, CHUNK_2M_SIZE),
 			Err(DescError::ReservedNotZero)
