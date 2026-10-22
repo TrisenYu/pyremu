@@ -14,6 +14,7 @@ Usage::
     result = mask64(v1 + v2)   # 等价于 (v1 + v2) & 0xFFFF_FFFF_FFFF_FFFF
     lo = mask32(value)         # 等价于 value & 0xFFFF_FFFF
 """
+
 MASK04: int = 0xF
 MASK08: int = (MASK04 << 4) | MASK04
 MASK12: int = (MASK08 << 4) | MASK04
@@ -25,20 +26,59 @@ MASK64: int = (MASK32 << 32) | MASK32
 def mask64(val: int) -> int:
     return val & MASK64
 
+
 def mask32(val: int) -> int:
     return val & MASK32
+
 
 def mask16(val: int) -> int:
     return val & MASK16
 
+
 def mask12(val: int) -> int:
     return val & MASK12
+
 
 def mask08(val: int) -> int:
     return val & MASK08
 
+
 def mask04(val: int) -> int:
     return val & MASK04
+
+
+# ---------------------------------------------------------------
+#  循环移位 — 移位量取以位宽为模的余数
+# ---------------------------------------------------------------
+
+
+def rol64(val: int, shamt: int) -> int:
+    """64 位循环左移, 移位量为 shamt 以 64 为模的余数."""
+    v = mask64(val)
+    s = shamt & 0x3F
+    return mask64((v << s) | (v >> (64 - s))) if s else v
+
+
+def ror64(val: int, shamt: int) -> int:
+    """64 位循环右移, 移位量为 shamt 以 64 为模的余数."""
+    v = mask64(val)
+    s = shamt & 0x3F
+    return mask64((v >> s) | (v << (64 - s))) if s else v
+
+
+def rol32(val: int, shamt: int) -> int:
+    """32 位循环左移, 移位量为 shamt 以 32 为模的余数, 结果截断为 32 位."""
+    v = mask32(val)
+    s = shamt & 0x1F
+    return mask32((v << s) | (v >> (32 - s))) if s else v
+
+
+def ror32(val: int, shamt: int) -> int:
+    """32 位循环右移, 移位量为 shamt 以 32 为模的余数, 结果截断为 32 位."""
+    v = mask32(val)
+    s = shamt & 0x1F
+    return mask32((v >> s) | (v << (32 - s))) if s else v
+
 
 # ---------------------------------------------------------------
 #  Sign-extend helpers (moved from disassem.py to break circular import)

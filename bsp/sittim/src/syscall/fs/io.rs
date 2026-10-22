@@ -4,19 +4,19 @@
 //! 每个入口先按描述绑定的对象分流: 控制台走 [console_write_bytes] 与 [read_stdin], 套接字
 //! 转交 [net](super::super::net), 文件系统节点经模块的操作表调用。三个分支的模块调用都不
 //! 在描述符表的锁之内: 控制台与套接字两条路径可能阻塞当前线程, 文件系统模块的取入与调用
-//! 会经 ecall 让出到宿主, 见 [fd_vfs_ops]。
+//! 会经 ecall 让出到宿主。
 //!
 //! 偏移的推进、O_APPEND 的取值与 iovec 的逐段推进都在本层完成: 模块只按下标与偏移读写,
 //! 不持有描述符一级的状态。
 
 use crate::ext_mod::vfs_ops::{VfsStatus, mode_readable, mode_writable};
 
-use super::consts::{IOV_MAX, O_APPEND, SEEK_CUR, SEEK_END, SEEK_SET};
 use super::super::fdtable::{FdTarget, fd_entry, write_back_open_file};
 use super::super::io::{console_write_bytes, read_stdin};
 use super::super::net;
 use super::super::types::IoVec;
 use super::super::{EBADF, EFAULT, EINVAL, ENOTDIR, EOPNOTSUPP, ESPIPE};
+use super::consts::{IOV_MAX, O_APPEND, SEEK_CUR, SEEK_END, SEEK_SET};
 use super::{fd_vfs_ops, node_size, vfs_errno};
 
 /// read(63): 从 fd 读入 *len* 字节到 *buf*, 返回实际读取字节数。

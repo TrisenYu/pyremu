@@ -4,74 +4,14 @@
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """反汇编器测试: 覆盖 RV64 I + M + Zicsr + AMO 各指令格式."""
+
 from typing import Callable
 
 import pytest
 
+from pyremu.core.decoder import decode_sd_sp
 from pyremu.utils.disassem import disasm
-
-# ============================================================
-#  指令构造辅助
-# ============================================================
-
-
-def _r_type(funct7: int, rs2: int, rs1: int, funct3: int, rd: int, opcode: int) -> int:
-    return (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
-
-
-def _i_type(imm12: int, rs1: int, funct3: int, rd: int, opcode: int) -> int:
-    return ((imm12 & 0xFFF) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
-
-
-def _s_type(imm7: int, rs2: int, rs1: int, funct3: int, imm5: int, opcode: int) -> int:
-    return (
-        ((imm7 & 0x7F) << 25)
-        | (rs2 << 20)
-        | (rs1 << 15)
-        | (funct3 << 12)
-        | ((imm5 & 0x1F) << 7)
-        | opcode
-    )
-
-
-def _b_type(
-    imm12: int,
-    imm10_5: int,
-    rs2: int,
-    rs1: int,
-    funct3: int,
-    imm4_1: int,
-    imm11: int,
-    opcode: int,
-) -> int:
-    return (
-        (imm12 << 31)
-        | (imm10_5 << 25)
-        | (rs2 << 20)
-        | (rs1 << 15)
-        | (funct3 << 12)
-        | (imm4_1 << 8)
-        | (imm11 << 7)
-        | opcode
-    )
-
-
-def _u_type(imm20: int, rd: int, opcode: int) -> int:
-    return ((imm20 & 0xFFFFF) << 12) | (rd << 7) | opcode
-
-
-def _j_type(
-    imm20: int,
-    imm10_1: int,
-    imm11: int,
-    imm19_12: int,
-    rd: int,
-    opcode: int,
-) -> int:
-    return (
-        (imm20 << 31) | (imm10_1 << 21) | (imm11 << 20) | (imm19_12 << 12) | (rd << 7) | opcode
-    )
-
+from tests.instr_encode import b_type, i_type, j_type, r_type, s_type, u_type
 
 # Opcodes
 OP = 0b0110011
@@ -97,27 +37,27 @@ AMO = 0b0101111
 
 class TestRType:
     def test_add(self):
-        instr = _r_type(funct7=0, rs2=12, rs1=11, funct3=0, rd=10, opcode=OP)
+        instr = r_type(OP, 10, 0b0000000_000, 0b01011_01100)
         assert disasm(instr, 0) == "add          x10, x11, x12"
 
     def test_sub(self):
-        instr = _r_type(funct7=0x20, rs2=6, rs1=5, funct3=0, rd=7, opcode=OP)
+        instr = r_type(OP, 7, 0b0100000_000, 0b00101_00110)
         assert disasm(instr, 0) == "sub          x7, x5, x6"
 
     def test_mul(self):
-        instr = _r_type(funct7=1, rs2=12, rs1=11, funct3=0, rd=10, opcode=OP)
+        instr = r_type(OP, 10, 0b0000001_000, 0b01011_01100)
         assert disasm(instr, 0) == "mul          x10, x11, x12"
 
     def test_divu(self):
-        instr = _r_type(funct7=1, rs2=12, rs1=11, funct3=5, rd=10, opcode=OP)
+        instr = r_type(OP, 10, 0b0000001_101, 0b01011_01100)
         assert disasm(instr, 0) == "divu         x10, x11, x12"
 
     def test_srl(self):
-        instr = _r_type(funct7=0, rs2=2, rs1=1, funct3=5, rd=3, opcode=OP)
+        instr = r_type(OP, 3, 0b0000000_101, 0b00001_00010)
         assert disasm(instr, 0) == "srl          x3, x1, x2"
 
     def test_unknown_rtype(self):
-        instr = _r_type(funct7=0x7F, rs2=0, rs1=0, funct3=7, rd=0, opcode=OP)
+        instr = r_type(OP, 0, 0b1111111_111, 0b00000_00000)
         assert disasm(instr, 0) == "<unk-op>"
 
 
@@ -128,20 +68,20 @@ class TestRType:
 
 class TestITypeALU:
     def test_addi(self):
-        instr = _i_type(imm12=42, rs1=1, funct3=0, rd=2, opcode=OP_IMM)
+        instr = i_type(imm12=42, rs1=1, funct3=0, rd=2, opcode=OP_IMM)
         assert disasm(instr, 0) == "addi         x2, x1, 42"
 
     def test_addi_negative(self):
-        instr = _i_type(imm12=(-16 & 0xFFF), rs1=2, funct3=0, rd=3, opcode=OP_IMM)
+        instr = i_type(imm12=(-16 & 0xFFF), rs1=2, funct3=0, rd=3, opcode=OP_IMM)
         assert disasm(instr, 0) == "addi         x3, x2, -16"
 
     def test_slti(self):
-        instr = _i_type(imm12=0, rs1=10, funct3=2, rd=11, opcode=OP_IMM)
+        instr = i_type(imm12=0, rs1=10, funct3=2, rd=11, opcode=OP_IMM)
         assert disasm(instr, 0) == "slti         x11, x10, 0"
 
     def test_slli(self):
         # SLLI: funct3=001, shamt in bits [25:20], funct7=0
-        instr = _i_type(imm12=0, rs1=1, funct3=1, rd=2, opcode=OP_IMM)
+        instr = i_type(imm12=0, rs1=1, funct3=1, rd=2, opcode=OP_IMM)
         # imm12=0 means shamt=0; let's set shamt=3
         instr = (0 << 25) | (3 << 20) | (1 << 15) | (1 << 12) | (2 << 7) | OP_IMM
         assert disasm(instr, 0) == "slli         x2, x1, 3"
@@ -152,7 +92,7 @@ class TestITypeALU:
         assert disasm(instr, 0) == "srai         x4, x3, 4"
 
     def test_andi(self):
-        instr = _i_type(imm12=0xFF, rs1=5, funct3=7, rd=6, opcode=OP_IMM)
+        instr = i_type(imm12=0xFF, rs1=5, funct3=7, rd=6, opcode=OP_IMM)
         assert disasm(instr, 0) == "andi         x6, x5, 255"
 
 
@@ -163,15 +103,15 @@ class TestITypeALU:
 
 class TestRV64In32Bit:
     def test_addw(self):
-        instr = _r_type(funct7=0, rs2=12, rs1=11, funct3=0, rd=10, opcode=OP32)
+        instr = r_type(OP32, 10, 0b0000000_000, 0b01011_01100)
         assert disasm(instr, 0) == "addw         x10, x11, x12"
 
     def test_subw(self):
-        instr = _r_type(funct7=0x20, rs2=6, rs1=5, funct3=0, rd=7, opcode=OP32)
+        instr = r_type(OP32, 7, 0b0100000_000, 0b00101_00110)
         assert disasm(instr, 0) == "subw         x7, x5, x6"
 
     def test_addiw(self):
-        instr = _i_type(imm12=8, rs1=1, funct3=0, rd=2, opcode=OP_IMM32)
+        instr = i_type(imm12=8, rs1=1, funct3=0, rd=2, opcode=OP_IMM32)
         assert disasm(instr, 0) == "addiw        x2, x1, 8"
 
     def test_slliw(self):
@@ -186,28 +126,28 @@ class TestRV64In32Bit:
 
 class TestLoadStore:
     def test_lw(self):
-        instr = _i_type(imm12=16, rs1=10, funct3=2, rd=5, opcode=LD)
+        instr = i_type(imm12=16, rs1=10, funct3=2, rd=5, opcode=LD)
         assert disasm(instr, 0) == "lw           x5, 16(x10)"
 
     def test_lw_negative_offset(self):
-        instr = _i_type(imm12=(-8 & 0xFFF), rs1=2, funct3=2, rd=3, opcode=LD)
+        instr = i_type(imm12=(-8 & 0xFFF), rs1=2, funct3=2, rd=3, opcode=LD)
         assert disasm(instr, 0) == "lw           x3, -8(x2)"
 
     def test_ld(self):
-        instr = _i_type(imm12=0, rs1=8, funct3=3, rd=9, opcode=LD)
+        instr = i_type(imm12=0, rs1=8, funct3=3, rd=9, opcode=LD)
         assert disasm(instr, 0) == "ld           x9, 0(x8)"
 
     def test_lbu(self):
-        instr = _i_type(imm12=1, rs1=1, funct3=4, rd=2, opcode=LD)
+        instr = i_type(imm12=1, rs1=1, funct3=4, rd=2, opcode=LD)
         assert disasm(instr, 0) == "lbu          x2, 1(x1)"
 
     def test_sw(self):
         # S-type: imm[11:5] | rs2 | rs1 | funct3 | imm[4:0]
-        instr = _s_type(imm7=0, rs2=5, rs1=10, funct3=2, imm5=16, opcode=ST)
+        instr = s_type(ST, 2, 10, 5, 16)
         assert disasm(instr, 0) == "sw           x5, 16(x10)"
 
     def test_sd(self):
-        instr = _s_type(imm7=0, rs2=5, rs1=10, funct3=3, imm5=0, opcode=ST)
+        instr = s_type(ST, 3, 10, 5, 0)
         assert disasm(instr, 0) == "sd           x5, 0(x10)"
 
 
@@ -217,34 +157,17 @@ class TestLoadStore:
 
 
 @pytest.mark.parametrize(
-    "inp, addr, check_fn", [
-        (
-            # B-type: imm[12|10:5] | rs2 | rs1 | funct3 | imm[4:1|11]
-            # offset = 16: imm[12]=0, imm[10:5]=0, imm[4:1]=1000(8), imm[11]=0
-            [0, 0, 12, 11, 0, 8, 0, BR], 0x80000000,
-            lambda x: "beq" in x and "0x80000010" in x
-        ), (
-            # offset = -8: sign-extend to 13-bit -> 0x1FF8
-            # B-type encoding: imm[12]=1, imm[10:5]=0x3F(all1s), imm[4:1]=0xC(12), imm[11]=1
-            # offset=-8 -> imm12=1, imm10_5=0x3F, imm4_1=0xC, imm11=1
-            [1, 0x3F, 0, 1, 1, 0xC, 1, BR], 0x80000010,
-            lambda x: "bne" in x and "0x80000008" in x
-        ), (
-            [0, 0, 12, 11, 5, 8, 0, BR], 0x8000_0000,
-            lambda x: "bge" in x
-        )
-    ]
+    "inp, addr, check_fn",
+    [
+        # offset = 16, beq x11, x12, 16
+        ([BR, 0, 11, 12, 16], 0x80000000, lambda x: "beq" in x and "0x80000010" in x),
+        # offset = -8, bne x1, x0, -8
+        ([BR, 1, 1, 0, -8], 0x80000010, lambda x: "bne" in x and "0x80000008" in x),
+        ([BR, 5, 11, 12, 16], 0x8000_0000, lambda x: "bge" in x),
+    ],
 )
-def test_br_instr(
-    inp: list[int],
-    addr: int,
-    check_fn: Callable[[str], bool]
-):
-    assert len(inp) == 8
-    instr = _b_type(
-        inp[0], inp[1], inp[2], inp[3],
-        inp[4], inp[5], inp[6], inp[7]
-    )
+def test_br_instr(inp: list[int], addr: int, check_fn: Callable[[str], bool]):
+    instr = b_type(*inp)
     res = disasm(instr, addr)
     assert check_fn(res)
 
@@ -258,26 +181,21 @@ class TestJumps:
     def test_jal(self):
         # J-type: imm[20|10:1|11|19:12]  rd  JAL
         # offset = 16: imm20=0, imm10_1=8, imm11=0, imm19_12=0
-        instr = _j_type(0, 8, 0, 0, 1, JAL)
+        instr = j_type(JAL, 1, 16)
         result = disasm(instr, 0x80000000)
         assert result == "jal          x1, 0x80000010"
 
     def test_jalr(self):
-        instr = _i_type(imm12=16, rs1=1, funct3=0, rd=1, opcode=JALR)
+        instr = i_type(imm12=16, rs1=1, funct3=0, rd=1, opcode=JALR)
         assert disasm(instr, 0) == "jalr         x1, 16(x1)"
 
     def test_lui(self):
-        instr = _u_type(imm20=0x12345, rd=5, opcode=LUI)
+        instr = u_type(imm20=0x12345, rd=5, opcode=LUI)
         assert disasm(instr, 0) == "lui          x5, 0x12345"
 
     def test_auipc(self):
-        instr = _u_type(imm20=0x21000, rd=10, opcode=AUIPC)
+        instr = u_type(imm20=0x21000, rd=10, opcode=AUIPC)
         assert disasm(instr, 0) == "auipc        x10, 0x21000"
-
-
-# ============================================================
-#  System (CSR + privileged)
-# ============================================================
 
 
 class TestSystem:
@@ -628,3 +546,33 @@ class TestCompressedLargeOffset:
         result = disasm(instr, 0x80000000)
         assert "c.addi4spn" in result, f"期望 C.ADDI4SPN, 得到: {result}"
         assert "716" in result, f"期望偏移 716, 得到: {result}"
+
+
+# ============================================================
+#  栈帧记录解码
+# ============================================================
+
+
+class TestDecodeSdSp:
+    """decode_sd_sp — ``sd rs2, imm(sp)`` 的编码识别."""
+
+    @staticmethod
+    def _sd(rs2: int, imm: int, rs1: int = 2) -> int:
+        u = imm & 0xFFF
+        return s_type(ST, 0b011, rs1, rs2, u)
+
+    def test_positive_offset(self):
+        assert decode_sd_sp(self._sd(5, 8)) == (5, 8)
+
+    def test_negative_offset_is_sign_extended(self):
+        assert decode_sd_sp(self._sd(1, -16)) == (1, -16)
+
+    def test_non_store_opcode_returns_none(self):
+        assert decode_sd_sp(0x00000013) is None
+
+    def test_non_doubleword_store_returns_none(self):
+        """SW 的 funct3 为 010, 不是栈帧记录所用的双字存储."""
+        assert decode_sd_sp(s_type(ST, 0b010, 2, 5, 8)) is None
+
+    def test_other_base_register_returns_none(self):
+        assert decode_sd_sp(self._sd(5, 8, rs1=3)) is None

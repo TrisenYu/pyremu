@@ -120,14 +120,29 @@ class DirectRam:
         self._use_native: bool = native_available()
         self._ram_native_ptr: int = 0
         self._read_out_ptr: int = 0
+        # RAM 直读窗口, 供 bus_read_ram / bus_write_ram 一次性传入:
+        # (缓冲区首地址, 字节数, 基址, 影子窗口基址, 影子窗口字节数).
+        # 影子窗口由 apply_pie_ofs 登记, 故该元组在彼处重建.
+        self._ram_win: tuple[int, int, int, int, int] = (
+            0,
+            self._ram_size,
+            self._ram_base,
+            0,
+            0,
+        )
         if self._use_native:
             # 两处地址用 ctypes.addressof 取得;
             # 取地址不用 ctypes.cast, 后者会与所转换的对象构成引用环.
-            self._ram_native_ptr = ctypes.addressof(
-                ctypes.c_uint8.from_buffer(self._ram)
-            )
+            self._ram_native_ptr = ctypes.addressof(ctypes.c_uint8.from_buffer(self._ram))
             self._read_out = ctypes.c_uint64(0)
             self._read_out_ptr = ctypes.addressof(self._read_out)
+            self._ram_win = (
+                self._ram_native_ptr,
+                self._ram_size,
+                self._ram_base,
+                0,
+                0,
+            )
 
     def apply_pie_ofs(self, link_base: int, link_size: int) -> None:
         """登记 PIE 固件的链接地址区间 [link_base, link_base + link_size).
@@ -140,6 +155,13 @@ class DirectRam:
         """
         self._pie_ofs_base = link_base
         self._pie_ofs_size = link_size
+        self._ram_win = (
+            self._ram_native_ptr,
+            self._ram_size,
+            self._ram_base,
+            link_base,
+            link_size,
+        )
 
     def _pie_ofs_to_ram(self, addr: int, size: int) -> int | None:
         """把落在 PIE 链接地址区间内的 [addr, addr + size) 换算为 RAM 偏移.
@@ -185,13 +207,16 @@ class DirectRam:
 
         # Rust native fast path: only for regular access sizes (1/2/4/8).
         # L2 cache line fills (64 B) would overflow the 8-byte read-out buffer.
-        if self._use_native and self._ram_native_ptr and size in (1, 2, 4, 8) and \
-        bus_read_ram(
-            self._ram_native_ptr,
-            self._ram_size, self._ram_base,
-            self._pie_ofs_base,
-            self._pie_ofs_size,
-            addr, size, self._read_out_ptr,
+        if (
+            self._use_native
+            and self._ram_native_ptr
+            and size in (1, 2, 4, 8)
+            and bus_read_ram(
+                self._ram_win,
+                addr,
+                size,
+                self._read_out_ptr,
+            )
         ):
             return ctypes.string_at(self._read_out_ptr, size)
 
@@ -210,13 +235,16 @@ class DirectRam:
 
         # Rust native fast path: only for regular access sizes (1/2/4/8).
         # L2 cache line fills produce larger writes via the Python path.
-        if self._use_native and self._ram_native_ptr and data_len in (1, 2, 4, 8) and \
-        bus_write_ram(
-            self._ram_native_ptr,
-            self._ram_size, self._ram_base,
-            self._pie_ofs_base,
-            self._pie_ofs_size,
-            addr, data, data_len,
+        if (
+            self._use_native
+            and self._ram_native_ptr
+            and data_len in (1, 2, 4, 8)
+            and bus_write_ram(
+                self._ram_win,
+                addr,
+                data,
+                data_len,
+            )
         ):
             return
 
@@ -287,9 +315,10 @@ class Bus:
     - 由调用方 mem_check_aux.translate_addr 保证这些地址不插入 TLB
     - 通过 is_device_addr() 供外部判断
     """
+
     def read_ulen(self, addr: int, len: int) -> int | None:
         ret = self.try_read(addr, len)
-        return int.from_bytes(ret, 'little', signed=False) if ret else None
+        return int.from_bytes(ret, "little", signed=False) if ret else None
 
     read_u64 = partialmethod(read_ulen, len=8)
     read_u32 = partialmethod(read_ulen, len=4)
@@ -352,8 +381,7 @@ class Bus:
         """二分查找地址对应的设备及设备内偏移"""
         if self._device_cache is None:
             self._device_cache = sorted(
-                (base, base + dev.size, dev)
-                for base, dev in self._devices.items()
+                (base, base + dev.size, dev) for base, dev in self._devices.items()
             )
         cache = self._device_cache
 
@@ -495,9 +523,6 @@ class Bus:
 
         self._mem.write(addr, data)
 
-    # ----------------------------------------------------------
-    #  安全读写 (不抛异常, 供调试器等外部调用方使用)
-    # ----------------------------------------------------------
     def try_read(self, addr: int, size: int) -> bytes:
         """安全读取物理内存 — 读取不产生异常.
 

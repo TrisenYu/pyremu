@@ -17,8 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-import pyremu.configs_gen
-import pyremu.emulator
+from pyremu import configs_gen
 from pyremu.emulator import Emulator
 from pyremu.interrupt.plic import (
     PLIC_CONTEXT_BASE,
@@ -33,7 +32,7 @@ from pyremu.platform import PeripheralConfig, PlatformConfig
 @pytest.fixture(autouse=True)
 def _disable_aia_compile_override(monkeypatch):
     """Disable PYREMU_AIA compile-time override."""
-    monkeypatch.setattr(pyremu.configs_gen, "PYREMU_AIA", False)
+    monkeypatch.setattr(configs_gen, "PYREMU_AIA", False)
 
 
 _SRC = 1  # 中断源号 (对齐 virtio-blk)

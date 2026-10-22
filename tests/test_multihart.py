@@ -19,6 +19,8 @@ def multi_hart_emu():
     """2-hart emulator with kernel loaded."""
     cfg = PlatformConfig.qemu_virt()
     cfg.num_harts = 2
+    # 时钟源取固定值, 使 mtime 的推进量与 emu-configs.mk 的编译选项无关.
+    cfg.timebase_freq = 10_000_000
     emu = Emulator(cfg)
     kernel = parse_firmware(path_join(examed_elf_dir(), "kernel.elf"))
     assert kernel is not None, "kernel.elf 解析失败"
@@ -68,9 +70,7 @@ class TestMultiHartTimer:
         for _ in range(100):
             emu.step()
         mtime_after = emu.clint.get_mtime()
-        assert mtime_after > mtime_before, (
-            f"mtime 应推进，但 {mtime_before} >= {mtime_after}"
-        )
+        assert mtime_after > mtime_before, f"mtime 应推进，但 {mtime_before} >= {mtime_after}"
 
     def test_mtimecmp_writable(self, multi_hart_emu):
         """mtimecmp 可通过总线写入."""
@@ -97,4 +97,3 @@ class TestMultiHartTimer:
         emu.step()
         mip = emu.harts[0].csrs["mip"].val
         assert mip & (1 << 7), f"MTIP 未置位, mip=0x{mip:x}"
-

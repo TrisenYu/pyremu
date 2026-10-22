@@ -1,8 +1,6 @@
 // use std::time::Instant;
+use crate::concurrent::{ConcurrentClintCtx, ModuleState, StopInfo, WATCHDOG_POLL_US};
 use crate::ffi::FfiExtIrqCtx;
-use crate::concurrent::{
-	ConcurrentClintCtx, ModuleState, StopInfo, WATCHDOG_POLL_US,
-};
 use crate::interrupt::{clint::sync_msip, clint::sync_mtip, imsic_topei_peek, sync_imsic};
 use crate::state::{exit_reason, riscv_mode, HartState};
 use std::sync::atomic::Ordering;
@@ -10,9 +8,8 @@ use std::sync::atomic::Ordering;
 /// Check whether any interrupt is pending (including MSIP via level-triggered
 /// CLINT).  Returns ``(woke, msip_pending)``.
 /// Check all interrupt sources and sync into ``mip`` before potential park.
-/// QEMU equivalent: ``qemu_mutex_lock & qemu_cond_wait`` — the I/O thread
-/// updates interrupt state and signals the vCPU thread.  Here the Python
-/// daemon writes ``ext_irq.pending`` and we synchronise it into ``mip``.
+/// the I/O thread updates interrupt state and signals the vCPU thread.
+/// the daemon writes ``ext_irq.pending`` and we synchronise it into ``mip``.
 #[inline]
 pub(crate) fn wfi_sync_and_check(
 	state: &mut HartState,
@@ -24,13 +21,6 @@ pub(crate) fn wfi_sync_and_check(
 	sync_msip(state, clint);
 	sync_imsic(state);
 
-	// Drain ext_irq into mip — but only for lines NOT already managed by
-	// IMSIC.  When eidelivery=1 the IMSIC file owns that external interrupt
-	// line; sync_imsic drives it from eip & eie.  If we set it here too,
-	// step_interrupts' sync_imsic call would clear it (no IMSIC pending),
-	// silently losing the legacy-raised device interrupt.
-	// Must run BEFORE the force-enable below so the newly-set MEIP/SEIP
-	// bits are visible when we check whether to force-enable MEIE/SEIE.
 	let ext_irq_pending = !ext_irq.is_null() && unsafe { (*ext_irq).pending != 0 };
 	if ext_irq_pending {
 		let mfile_owns = state.imsic_m.present != 0 && state.imsic_m.eidelivery != 0;
@@ -43,19 +33,6 @@ pub(crate) fn wfi_sync_and_check(
 		}
 	}
 
-	// Force-enable MEIE/SEIE so that IMSIC/PLIC interrupts (which route
-	// through MEIP/SEIP) are visible to the wake check below.
-	// step_interrupts does the same force-enable for the non-WFI path,
-	// but wfi_sync_and_check runs outside step_interrupts and must be
-	// self-contained.  Without this, a hart in WFI never wakes for an
-	// IMSIC IPI because OpenSBI sets mie.MSIE (not mie.MEIE) and
-	// (mip & mie) evaluates to 0 even though MEIP=1.
-	//
-	// Gate on IMSIC presence — in legacy PLIC mode (imsic not present)
-	// OpenSBI's PLIC irqchip has no process_hwirqs and never sets MEIE;
-	// a force-enabled MEIP would fire an M-mode external trap into an
-	// unprocessable irqchip (sbi_irqchip_process -> SBI_ENODEV) and hang
-	// the boot.  The guest's mie is authoritative there.
 	if state.imsic_m.present != 0
 		&& (state.mip.load(Ordering::Acquire) & (1 << 11)) != 0
 		&& (state.mie & (1 << 11)) == 0
@@ -83,8 +60,7 @@ pub(crate) fn wfi_sync_and_check(
 	//
 	// 故此处与 trap 分发路径 compute_mtopi 一致, 不采信 mip.MEIP, 改为直接查询
 	// IMSIC 是否仍有待处理的身份.
-	let mfile_pending =
-		state.imsic_m.present != 0 && imsic_topei_peek(&state.imsic_m).0 != 0;
+	let mfile_pending = state.imsic_m.present != 0 && imsic_topei_peek(&state.imsic_m).0 != 0;
 	let mut wake_mask = state.mie;
 	if state.imsic_m.present != 0 {
 		wake_mask &= !(1 << 11); // MEIP 排除, 改由上面的 IMSIC 直查承担
@@ -126,7 +102,7 @@ pub(crate) fn wfi_check_all_idle(
 	}
 
 	// Also scan stimecmp (SSTC) deadlines.  stimecmp is managed independently
-	// of mtimecmp (matching QEMU / real hardware), so we must check both.
+	// of mtimecmp, so we must check both.
 	let hart_states_ptr = clint.hart_states.get();
 	if !hart_states_ptr.is_null() {
 		for hid in 0..(clint.num_harts as usize) {
@@ -146,10 +122,7 @@ pub(crate) fn wfi_check_all_idle(
 
 	if earliest != u64::MAX {
 		// 全部 hart WFI 且有定时器截止时间。
-		// 不得在此把 mtime 快进到截止时间
-		// 仅退出加速执行 (WFI_WAIT), 由 Python 侧休眠 (remaining/timebase, 上限
-		// _WFI_MAX_SLEEP), 睡眠期间按真实流逝时间推进 mtime (clint.tick),
-		// 定时器因而按真实节奏触发. 此处保持 mtime 不变, 让 Python 计算真实剩余.
+		// 不得在此把 mtime 快进到截止时间，仅退出加速执行
 		module.request_stop(StopInfo {
 			reason: exit_reason::WFI_WAIT,
 			hart_id: hart_id as u8,
@@ -163,26 +136,19 @@ pub(crate) fn wfi_check_all_idle(
 
 	let mut any_hart_msip = false;
 	for hid in 0..(clint.num_harts as usize) {
-		// 仅检查电平位 (bit 0). 该字节还携带 Python 侧 edge counter (bits 7:1),
-		// 一旦首个 IPI 过后 edge counter 恒非零, ``byte != 0`` 会永远误判为
-		// 有挂起 MSIP -> 所有 WFI hart 永远无法退出加速执行 (活锁).
 		if unsafe { (*clint.msip.add(hid)).load(Ordering::Relaxed) } & 1 != 0 {
 			any_hart_msip = true;
 			break;
 		}
 	}
 	if any_hart_msip {
-		return None; // wake in flight for another hart — keep spinning
+		return None; // wake in flight for another hart, keep spinning
 	}
-	// After sync_msip, re-check: an MSIP may have arrived between
-	// the caller's wfi_sync_and_check and this point.
-	// Exit the speedup would discard the trap and leave the sender spinning in
-	// OpenSBI waiting for acknowledgment ->TLB-shootdown deadlock.
 	sync_msip(state, clint);
 	if (state.mip.load(Ordering::Acquire) & (1 << 3)) != 0 {
 		state.waiting = 0;
 		state.wfi_woken = 1;
-		return Some(true); // wake — trap will be delivered on re-entry
+		return Some(true); // trap will be delivered on re-entry
 	}
 	module.request_stop(StopInfo {
 		reason: exit_reason::WFI_WAIT,
@@ -340,7 +306,15 @@ mod tests {
 		// active_hart_num=4 > wfi_count=1 -> all_in_wfi() 为 false, 本 hart 不会走
 		// all-idle 快速退出 (WFI_WAIT) 分支, 而是真正 park 等待 -> 恰好落入
 		// park_timeout 自醒路径.
-		let module = Arc::new(ModuleState::new(1, 4, 0, vec![0].into_boxed_slice(), false, 0, Box::new([])));
+		let module = Arc::new(ModuleState::new(
+			1,
+			4,
+			0,
+			vec![0].into_boxed_slice(),
+			false,
+			0,
+			Box::new([]),
+		));
 		let module2 = Arc::clone(&module);
 		let (tx, rx) = mpsc::channel();
 
@@ -409,20 +383,6 @@ mod tests {
 		}
 	}
 
-	/// 回归: M 文件 eidelivery=0 时, 一个已被认领的软件中断不得让 MEIP 残留,
-	/// 否则 WFI 永远判定为有中断待处理而无法停驻.
-	///
-	/// 修复前行为: ``sync_imsic`` 在 eidelivery=0 分支里对挂起的 M 文件 IPI 置
-	/// MEIP, 且注释声明该位不在此处清除, 理由是 legacy PLIC 可能同时在驱动 MEIP.
-	/// 但 AIA 模式下 ``self.plic`` 为 None, 没有任何 PLIC, 无人清除该位: 受调试
-	/// 程序经 mtopei 认领 eip 之后 MEIP 仍为 1, 而 ``wfi_sync_and_check`` 又把
-	/// MEIE 强制使能, 于是 ``mip & mie`` 恒非零, ``woke`` 恒为 true, hart 每次
-	/// 执行 WFI 都立即醒来, 永不进入停驻.
-	///
-	/// 后果: 全部 hart 停驻这一前提永不成立, Python 侧唯一的墙钟补偿
-	/// ``Emulator._wfi_sleep_if_idle`` 永不执行, 而受调试程序时钟是纯指令计数,
-	/// 即 ``NS_PER_INSTR``, 于是该时钟相对墙钟塌陷, AIA 实测约 0.21 倍, legacy
-	/// PLIC 约 0.9 倍, 且每个 hart 在 WFI 自旋中占满一个宿主核心.
 	#[test]
 	fn wfi_meip_not_stale_after_mfile_ipi_claim_without_eidelivery() {
 		let (mut state, clint) = make_state_aia_no_mfile_delivery();

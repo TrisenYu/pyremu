@@ -41,32 +41,31 @@ from pyremu import configs_gen
 
 class InterruptMode(Enum):
     """中断子系统模式."""
+
     LEGACY = "legacy"  # CLINT (MSIP+MTIP) + PLIC (MEIP+SEIP)
-    AIA = "aia"        # CLINT (MTIP only) + IMSIC (MSIP+MEIP+SEIP) + APLIC (wired->MSI)
+    AIA = "aia"  # CLINT (MTIP only) + IMSIC (MSIP+MEIP+SEIP) + APLIC (wired->MSI)
 
-
-COMPILE_OPTS: str = "rv64imacfd_sstc_zicsr_zifencei"
 
 @dataclass
 class PeripheralConfig:
-    """外设 MMIO 基址 (0 = 禁用)."""
+    """外设 MMIO 基址 (0 = 禁用). 默认值由 emu-configs.mk 生成并注入 configs_gen."""
 
-    uart_base: int = 0x1000_0000
-    spi_base: int = 0x1000_1000
-    i2c_base: int = 0x1000_2000
-    gpio_base: int = 0x1000_3000
-    clint_base: int = 0x0200_0000
-    plic_base: int = 0x0C00_0000  # PLIC 基址 (SiFive standard)
-    virtio_blk_base: int = 0  # 0 = 禁用
-    virtio_net_s_base: int = 0  # 宿主侧网卡, 中断由 S 模式接受, 0 = 禁用
-    virtio_net_m_base: int = 0  # 飞地侧网卡, 中断由 M 模式接受, 0 = 禁用
-    watchdog_base: int = 0x1000_4000
-    crng_base: int = 0x1000_6000  # 模拟随机数生成器 (0 = 禁用)
-    imsic_m_base: int = 0  # IMSIC M-file MMIO 基址 (0=禁用, AIA 标准 0x2400_0000)
-    imsic_s_base: int = 0  # IMSIC S-file MMIO 基址 (0=禁用, AIA 标准 0x2800_0000)
-    aplic_s_base: int = 0  # APLIC S 域 (0=禁用, AIA 标准 0x0C00_0000)
-    # APLIC M 域 (0=禁用). M 文件的 eidelivery/eie/eithreshold 归 M 模式所有
-    aplic_m_base: int = 0
+    uart_base: int = configs_gen.UART_BASE
+    spi_base: int = configs_gen.SPI_BASE
+    i2c_base: int = configs_gen.I2C_BASE
+    gpio_base: int = configs_gen.GPIO_BASE
+    clint_base: int = configs_gen.CLINT_BASE
+    plic_base: int = configs_gen.PLIC_BASE
+    virtio_blk_base: int = configs_gen.VIRTIO_BLK_BASE  # 0 = 禁用
+    virtio_net_s_base: int = configs_gen.VIRTIO_NET_S_BASE  # 宿主侧网卡, 中断由 S 模式接受
+    virtio_net_m_base: int = configs_gen.VIRTIO_NET_M_BASE  # 飞地侧网卡, 中断由 M 模式接受
+    watchdog_base: int = configs_gen.WATCHDOG_BASE
+    crng_base: int = configs_gen.CRNG_BASE  # 模拟随机数生成器，0 = 禁用
+    # AIA 设备的基址由 emu-configs.mk 给出; legacy 模式不注册这些设备.
+    imsic_m_base: int = configs_gen.IMSIC_M_BASE
+    imsic_s_base: int = configs_gen.IMSIC_S_BASE
+    aplic_s_base: int = configs_gen.APLIC_S_BASE
+    aplic_m_base: int = configs_gen.APLIC_M_BASE
 
 
 @dataclass
@@ -84,17 +83,17 @@ class PlatformConfig:
         periph: 外设基址配置.
     """
 
-    num_harts: int = 1
-    ram_size: int = 128 * 1024 * 1024  # 128 MiB
-    ram_base: int = 0x8000_0000
-    prog_cnt: int = 0x8000_0000
-    l2_size: int = 256 * 1024  # 256 KiB
+    num_harts: int = configs_gen.NUM_HARTS
+    ram_size: int = configs_gen.RAM_SIZE
+    ram_base: int = configs_gen.RAM_BASE
+    prog_cnt: int = configs_gen.PROG_CNT
+    l2_size: int = configs_gen.L2_SIZE
 
-    isa: str = COMPILE_OPTS
-    timebase_freq: int = 10_000_000  # 10 MHz
-    pmp_entries: int = configs_gen.PMP_ENTRIES  # PMP 条目数 (0 = 禁用), 由 emu-configs.mk 给出
+    isa: str = configs_gen.ISA
+    timebase_freq: int = configs_gen.TIMER_FREQ
+    pmp_entries: int = configs_gen.PMP_ENTRIES
     interrupt_mode: InterruptMode = InterruptMode.LEGACY
-    disk_image: str | None = None  # virtio-blk 磁盘镜像路径, None=不挂载
+    disk_image: str | None = None
 
     # DTB /reserved-memory no-map 区域列表 (base, size).
     # 默认值由 emu-configs.mk 生成 pyremu/configs_gen.py 注入. 第一项为固件
@@ -114,7 +113,7 @@ class PlatformConfig:
         """编译期 AIA 开关: PYREMU_AIA=1 时强制启用 IMSIC+APLIC.
 
         基址从 configs_gen (由 emu-configs.mk 生成) 读取. 仅在 legacy 模式下
-        覆盖, 显式指定 AIA 的预设 (qemu_virt_aia) 不受影响. 任何构造路径
+        覆盖, 显式指定 AIA 的预设不受影响. 任何构造路径
         (预设工厂 / from_dict / 直接实例化) 均经由此处统一解析, 故 Emulator
         无需再对 interrupt_mode 做二次判断.
         """
@@ -124,6 +123,8 @@ class PlatformConfig:
             self.periph.imsic_s_base = configs_gen.IMSIC_S_BASE
             self.periph.aplic_s_base = configs_gen.APLIC_S_BASE
             self.periph.aplic_m_base = configs_gen.APLIC_M_BASE
+        # 低于 1000 Hz 时 1 ms 内不足一个计数, 固件无法按毫秒配置定时器.
+        assert self.timebase_freq >= 1_000, f"timebase_freq={self.timebase_freq} < 1000 Hz!"
 
     @classmethod
     def from_dict(
@@ -185,7 +186,6 @@ class PlatformConfig:
         """
         return cls(
             num_harts=4,
-            isa=COMPILE_OPTS,
             periph=PeripheralConfig(
                 uart_base=0x1000_0000,
                 spi_base=0x1001_0000,
@@ -197,18 +197,8 @@ class PlatformConfig:
 
     @classmethod
     def qemu_virt(cls) -> PlatformConfig:
-        """QEMU RISC-V virt 风格布局."""
-        return cls(
-            num_harts=1,
-            isa=COMPILE_OPTS,
-            periph=PeripheralConfig(
-                uart_base=0x1000_0000,
-                spi_base=0x1000_1000,
-                i2c_base=0x1000_2000,
-                gpio_base=0x1000_3000,
-                clint_base=0x0200_0000,
-            ),
-        )
+        """QEMU RISC-V virt 风格布局; 各字段取 emu-configs.mk 给出的平台默认值."""
+        return cls()
 
     @classmethod
     def minimal(cls) -> PlatformConfig:
@@ -234,15 +224,12 @@ class PlatformConfig:
     def qemu_virt_aia(cls) -> PlatformConfig:
         """QEMU virt AIA 平台 — 使用 IMSIC+APLIC 替代 PLIC.
 
-        IMSIC 基址 0x2400_0000, 每 hart stride 0x1000.
-        APLIC S 域基址 0x0C00_0000 (复用 PLIC 地址空间), M 域紧随其后取 0x0C00_8000
+        IMSIC 与 APLIC 的基址由 emu-configs.mk 给出, 默认取 AIA 标准布局:
+        IMSIC M 文件 0x2400_0000, S 文件 0x2800_0000, 每 hart stride 0x1000;
+        APLIC S 域 0x0C00_0000 (复用 PLIC 地址空间), M 域 0x0C00_8000
         (S 域实例的 MMIO 覆盖为 0x6000).
         定时器仍由 CLINT mtimecmp 提供.
         """
         cfg = cls.qemu_virt()
         cfg.interrupt_mode = InterruptMode.AIA
-        cfg.periph.imsic_m_base = 0x2400_0000
-        cfg.periph.imsic_s_base = 0x2800_0000
-        cfg.periph.aplic_s_base = 0x0C00_0000
-        cfg.periph.aplic_m_base = 0x0C00_8000
         return cfg

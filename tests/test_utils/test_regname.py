@@ -9,7 +9,6 @@
 再核对查询结果与编号越界时的回退取值.
 """
 
-import pyremu.core.registers
 from pyremu.utils.regname import check_csr, gpr_alias, gpr_name
 
 GPR_COUNT = 32

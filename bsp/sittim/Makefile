@@ -3,9 +3,6 @@
 #
 # Rust S-mode Runtime
 # Uses custom LLVM toolchain at /opt/custom-llvm/bin/
-#
-# configuration: edit config.mk or pass arguments via command line, e.g.
-#   make TIMER_INTERVAL=50000 UART_BASE=0x10011000
 
 CUSTOM_LLVM ?= /opt/custom-llvm/bin
 OBJCOPY    := $(CUSTOM_LLVM)/llvm-objcopy
@@ -30,25 +27,20 @@ phony = all
 
 all: build
 
-# 无条件执行的目标. 引用它的规则每次调用都重新求值, 内容不变时不改动产物的时间戳.
+# unconditional refresh
 FORCE:
 phony += FORCE
 
-# link.ld 由 link.ld.S 经预处理生成. LINK_BASE 可经命令行覆盖, 该来源不改变
-# link.ld.S 的时间戳, 故每次都重新生成, 内容不变时不改动 link.ld 的时间戳.
 link.ld: FORCE
 	$(CLANG) -E -P -x c -DLINK_BASE=$(LINK_BASE) link.ld.S -o $@.tmp
 	@cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@
 
 phony += link.ld
 
-# configs_gen.rs 由 config.mk 生成. 各变量的取值有两个来源: config.mk 的文件内容,
-# 与命令行上的同名变量; 后者不改变任何文件的时间戳, 故每次都重新生成, 内容不变时
-# 不改动文件时间戳, 由 cargo 判定是否重编.
 src/configs_gen.rs: FORCE
 	@rm -f $@.tmp
 	@echo '// generated from config.mk by Makefile — do not edit' > $@.tmp
-	@echo 'pub const TIMER_INTERVAL: u64 = $(TIMER_INTERVAL);' >> $@.tmp
+	@echo 'pub const SCHED_FREQ: u64 = $(SCHED_FREQ);' >> $@.tmp
 	@echo 'pub const TIMER_FREQ: u64 = $(TIMER_FREQ);' >> $@.tmp
 	@echo 'pub const TIME_QUOTA: u64 = $(TIME_QUOTA);' >> $@.tmp
 	@echo 'pub const UART_BASE: u64 = $(UART_BASE);' >> $@.tmp
@@ -78,7 +70,6 @@ phony += src/configs_gen.rs
 gen-config: src/configs_gen.rs
 phony += gen-config
 
-# 测试侧的公钥由私钥文件生成, 取值的来源与上一目标相同.
 tests/configs_gen.rs: FORCE
 	@python3 ../../tools/gen_attest_key.py $(ATTEST_PRIV_KEY_PATH) > $@.tmp
 	@cmp -s $@.tmp $@ 2>/dev/null && rm -f $@.tmp || mv -f $@.tmp $@

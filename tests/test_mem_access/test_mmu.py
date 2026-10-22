@@ -7,6 +7,7 @@
 
 import pytest
 
+from pyremu.core.decoder import Hart
 from pyremu.core.hart import HartWithRegs, RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend, translate_addr
 from pyremu.memory.bus import Bus
@@ -26,10 +27,6 @@ from pyremu.memory.mmu import (
     sv39_vpn,
     translate_va,
 )
-
-# ============================================================
-#  辅助: 构造简单的物理内存
-# ============================================================
 
 
 def _make_ram(size_bytes: int = 2 * 1024 * 1024) -> tuple:
@@ -57,8 +54,7 @@ class TestPTEFlags:
     def test_default_zero(self):
         pte = PTE()
         assert pte.raw == 0
-        assert not pte.v and not pte.r and \
-        not pte.w and not pte.x
+        assert not pte.v and not pte.r and not pte.w and not pte.x
 
     def test_set_v(self):
         pte = PTE()
@@ -127,7 +123,6 @@ class TestPTEPPN:
         pte = PTE()
         pte.ppn = max_ppn
         assert pte.ppn == max_ppn
-
 
     def test_ppn0_field(self):
         """PPN[0] 占 bits 19:10 (10 bits)."""
@@ -257,7 +252,6 @@ class TestVpnDecomposition:
     def test_sv39_zero_va(self):
         vpn2, vpn1, vpn0 = sv39_vpn(0)
         assert vpn2 == 0 and vpn1 == 0 and vpn0 == 0
-
 
     def test_sv39_vpn0_field(self):
         """VA[20:12] -> vpn0, 测试边界."""
@@ -448,7 +442,6 @@ class TestSv39Walk:
         # 正确: PPN bit 9 保留, PPN[8:0] -> vpn[0]=0x1
         expected_pa = ((mega_ppn & 0xFFFFFFFFFFFE00) | 0x1) << 12 | 0x4C
         assert pa == expected_pa, f"PA=0x{pa:x}, expected=0x{expected_pa:x}"
-        # 回归: 确保旧掩码产生的错误值不等于当前结果
         old_buggy_pa = ((mega_ppn & 0xFFFFFFFFFFFC00) | 0x1) << 12 | 0x4C
         assert pa != old_buggy_pa, (
             f"掩码仍然错用 10-bit (~0x3FF)! PA=0x{pa:x} 不应等于旧值 0x{old_buggy_pa:x}"
@@ -519,6 +512,10 @@ class TestHartMMUIntegration:
         h.bus = bus
         h.pc = self.RAM_BASE
         h.mode = RiscvMode.S  # S-mode: 走 MMU 翻译 (非 M 模式)
+        # 页表遍历的隐式读同样经过 PMP 检查, S 模式没有匹配条目时一律拒绝.
+        # 条目 0 取 NAPOT 覆盖整个地址空间, 权限为 R/W/X.
+        h.csrs["pmpcfg0"].val = 0x1F
+        h.csrs["pmpaddr0"].val = 0x003F_FFFF_FFFF_FFFF
         return h
 
     # ---- 辅助: 构建页表 ----
@@ -527,8 +524,8 @@ class TestHartMMUIntegration:
     def _encode_ppn(ppn: int) -> int:
         """RISC-V 标准连续 PPN 编码: PTE[53:10] = PPN[43:0]."""
         val = 0
-        val |= (ppn & 0x3FF) << 10           # PPN[9:0] -> bits[19:10]
-        val |= ((ppn >> 10) & 0x1FF) << 20   # PPN[18:10] -> bits[28:20]
+        val |= (ppn & 0x3FF) << 10  # PPN[9:0] -> bits[19:10]
+        val |= ((ppn >> 10) & 0x1FF) << 20  # PPN[18:10] -> bits[28:20]
         val |= ((ppn >> 19) & 0x1FFFFFFF) << 29  # PPN[43:19] -> bits[53:29]
         return val
 
@@ -570,12 +567,13 @@ class TestHartMMUIntegration:
         # VPN[0]=0 时三级页表[0] 为叶, identity: VA=0x80000000 映射到 PA=0x80000000
         ram_ppn = self.RAM_BASE >> 12
         self._write_pte(
-            hart, l3_pa + 0 * 8,
+            hart,
+            l3_pa + 0 * 8,
             self._make_4kib_pte(PTE_R | PTE_W | PTE_X, ram_ppn),
         )
 
         # 写入魔数到物理地址
-        magic = b"\xDE\xAD\xBE\xEF\xCA\xFE\xBA\xBE"
+        magic = b"\xde\xad\xbe\xef\xca\xfe\xba\xbe"
         hart._mem_write_phy(self.RAM_BASE, magic)
 
         # 使能 Sv39
@@ -608,7 +606,8 @@ class TestHartMMUIntegration:
         self._write_pte(hart, root_pa + 0 * 8, self._make_pointer_pte(l3_ppn))
         # L3[0] -> PA=0x80000000
         self._write_pte(
-            hart, l3_pa + 0 * 8,
+            hart,
+            l3_pa + 0 * 8,
             self._make_4kib_pte(PTE_R | PTE_W, 0x80000),
         )
 
@@ -632,7 +631,8 @@ class TestHartMMUIntegration:
         # L2[0] mega page: identity VA=0x80000000 -> PA=0x80000000
         # PPN 的高位部分: 0x80000000 >> 12 = 0x80000
         self._write_pte(
-            hart, l2_pa + 0 * 8,
+            hart,
+            l2_pa + 0 * 8,
             self._make_2mib_megapage_pte(PTE_R | PTE_W | PTE_X, 0x80000),
         )
 
@@ -654,7 +654,8 @@ class TestHartMMUIntegration:
         self._write_pte(hart, root_pa + 0 * 8, self._make_pointer_pte(l2_ppn))
         # 二级页表大页把 VA[0, 2MiB) 映射到 PA[0x10000, 0x30000)
         self._write_pte(
-            hart, l2_pa + 0 * 8,
+            hart,
+            l2_pa + 0 * 8,
             self._make_2mib_megapage_pte(PTE_R | PTE_W, 0x10),
         )
 
@@ -676,7 +677,8 @@ class TestHartMMUIntegration:
 
         self._write_pte(hart, root_pa + 0 * 8, self._make_pointer_pte(l2_ppn))
         self._write_pte(
-            hart, l2_pa + 0 * 8,
+            hart,
+            l2_pa + 0 * 8,
             self._make_2mib_megapage_pte(PTE_R | PTE_W, 0x10),
         )
 
@@ -689,7 +691,6 @@ class TestHartMMUIntegration:
         assert ok
         assert len(hart.dtlb) == 1, "首次翻译后 TLB 应有 1 条"
 
-        # 再次: hit
         ok2, _ = translate_addr(hart, 0x1000)
         assert ok2
         assert len(hart.dtlb) == 1, "TLB 命中不应增加条目"
@@ -703,7 +704,8 @@ class TestHartMMUIntegration:
 
         self._write_pte(hart, root_pa + 0 * 8, self._make_pointer_pte(l2_ppn))
         self._write_pte(
-            hart, l2_pa + 0 * 8,
+            hart,
+            l2_pa + 0 * 8,
             self._make_2mib_megapage_pte(PTE_R | PTE_W | PTE_X, 0x10),
         )
 
@@ -769,7 +771,6 @@ class TestHartMMUIntegration:
 
         # root[0] 指向二级页表, 有效指针
         self._write_pte(hart, root_pa + 0 * 8, self._make_pointer_pte(l2_ppn))
-        # 二级页表[0] = 0, 页表遍历中途断裂
         self._write_pte(hart, l2_pa + 0 * 8, 0)
 
         hart.satp_val = (SATP_MODE_SV39 << 60) | root_ppn
@@ -789,17 +790,71 @@ class TestHartMMUIntegration:
         self._write_pte(hart, root_pa + 0 * 8, self._make_pointer_pte(l2_ppn))
         # 2 MiB mega: PPN=0x800 -> PPN[43:9]=4, PA base=0x800000
         self._write_pte(
-            hart, l2_pa + 0 * 8,
+            hart,
+            l2_pa + 0 * 8,
             self._make_2mib_megapage_pte(PTE_R | PTE_W, 0x800),
         )
 
-        # ASID = 0xAB
         hart.satp_val = (SATP_MODE_SV39 << 60) | (0xAB << 44) | root_ppn
         assert hart.mmu_mode == SATP_MODE_SV39
 
         # VA=0x0 -> vpn[0]=0, mega PPN[9:0]=0 -> PA=0x800000
         ok, pa = translate_addr(hart, 0x0)
         assert ok and pa == 0x800000, f"PA=0x{pa:x}, ASID 不影响页表遍历"
+
+
+# ============================================================
+#  SFENCE.VMA 跨 hart 广播
+# ============================================================
+
+
+def _sfence_vma(rs1: int, rs2: int = 0) -> int:
+    """编码 SFENCE.VMA x0, x0 形式, rs1 / rs2 为操作数寄存器号."""
+    return (0b0001001 << 25) | (rs2 << 20) | (rs1 << 15) | 0x73
+
+
+class TestSfenceBroadcast:
+    """SFENCE.VMA 刷新再次发起 hart 以及全部 hart 的 TLB."""
+
+    @staticmethod
+    def _make_pair():
+        h0 = Hart(id=0)
+        h1 = Hart(id=1)
+        h0.all_harts = [h0, h1]
+        return h0, h1
+
+    @staticmethod
+    def _fill(hart, vpns: tuple[int, ...]) -> None:
+        for vpn in vpns:
+            hart.itlb.insert(vpn, 0x1000, PTE_R | PTE_W | PTE_X)
+            hart.dtlb.insert(vpn, 0x1000, PTE_R | PTE_W | PTE_X)
+
+    def test_flush_all_reaches_every_hart(self):
+        """rs1=x0 时清空全部 hart 的全部条目."""
+        h0, h1 = self._make_pair()
+        self._fill(h0, (1, 2))
+        self._fill(h1, (1, 2))
+
+        h0.exec_instr(_sfence_vma(0))
+
+        for h in (h0, h1):
+            assert len(h.itlb) == 0
+            assert len(h.dtlb) == 0
+
+    def test_single_vpn_flush_keeps_other_entries(self):
+        """rs1 非零时仅清除该 VA 对应页号, 其余条目保留."""
+        h0, h1 = self._make_pair()
+        self._fill(h0, (2, 3))
+        self._fill(h1, (2, 3))
+
+        h0.gprs[5] = 0x2000  # 页号 2
+        h0.exec_instr(_sfence_vma(5))
+
+        for h in (h0, h1):
+            assert not h.itlb.lookup(2)[0]
+            assert not h.dtlb.lookup(2)[0]
+            assert h.itlb.lookup(3)[0]
+            assert h.dtlb.lookup(3)[0]
 
 
 # ============================================================

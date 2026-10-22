@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Terminal I/O 后台线程 — QEMU chardev-stdio 模型, 由 Rust libtermio.so 实现.
+"""Terminal I/O 后台线程.
 
 独立于 CPU 模拟单轮加速执行循环, 以 Rust 后台线程持续把 stdin 转发到 RX 环形缓冲
-并把 TX 环形缓冲转发到 stdout。对照 QEMU ``vendor/qemu-10.2.0/chardev/char-stdio.c``:
+并把 TX 环形缓冲转发到 stdout。:
 
 - **单一所有者**: 线程运行期间, Rust 线程是唯一的控制台写者, 对照
   ``fd_chr_write`` 是唯一 TX 出口。UART 行缓冲仅归档 hart 日志文件,
@@ -18,7 +18,7 @@ libtermio.so 不可用时降级为 Python ``select`` 轮询线程, 此时不设�
 cbreak 由 Debugger 负责。
 
 Usage:
-    term = TerminalIO(uart, wake_event, stdin_fd, stdout_fd)
+    term = TerminalIO(uart, wake_event, stdio_fds=(stdin_fd, stdout_fd))
     native = term.start()  # True: Rust 线程接管终端; False: Python 回退
     term.drain_rx()        # 把 RX 环形缓冲的字节写入 UART RX buffer, 每单轮加速执行前调用
     term.drain_tx_logs()   # 把 TX 环形缓冲的条目写入 UART 行缓冲/日志, 每单轮加速执行后调用
@@ -64,15 +64,14 @@ class TerminalIO:
         self,
         uart: UART,
         wake_event: threading.Event,
-        stdin_fd: int = 0,
-        stdout_fd: int = 1,
+        stdio_fds: tuple[int, int] = (0, 1),
         ext_irq: Any = None,
         on_irq: Callable[[int, bool], None] | None = None,
     ) -> None:
+        """stdio_fds 为 (stdin 文件描述符, stdout 文件描述符)."""
         self._uart = uart
         self._wake_event = wake_event
-        self._stdin_fd = stdin_fd
-        self._stdout_fd = stdout_fd
+        self._stdin_fd, self._stdout_fd = stdio_fds
         self._ext_irq = ext_irq  # FfiExtIrqCtx or None
         # 设备中断注入回调 (``DeviceIrqSink``): 同步 PLIC 挂起状态并写穿持久数组,
         # 使 batch 内 Rust 内联仲裁能立即看到新到达的 UART 数据。
@@ -83,9 +82,9 @@ class TerminalIO:
         # [hart_id, byte]; Rust termio 线程经 tx_drain 读出后写入 stdout, Python 经
         # _tx_log_rd 归档日志。
         self._tx_buf = (ctypes.c_uint8 * self.TX_CAP)()
-        self._tx_wr = ctypes.c_uint32(0)     # 写索引, 由 CPU 引擎独占, 按 u32 单调递增
+        self._tx_wr = ctypes.c_uint32(0)  # 写索引, 由 CPU 引擎独占, 按 u32 单调递增
         self._tx_drain = ctypes.c_uint32(0)  # 读出索引, 由 Rust termio 线程独占
-        self._tx_log_rd: int = 0             # 日志消费者读索引, 由 Python 独占
+        self._tx_log_rd: int = 0  # 日志消费者读索引, 由 Python 独占
 
         # 接收环形缓冲区 — Rust termio 线程读取 stdin 后写入, Python drain_rx 读出。
         self._rx_buf = (ctypes.c_uint8 * self.RX_CAP)()
@@ -98,10 +97,10 @@ class TerminalIO:
         # 共享停止标志 — Python 置 1 后 Rust 线程退出
         self._stop_flag = ctypes.c_uint8(0)
         self._pause_flag = ctypes.c_uint8(0)  # 调试器暂停/恢复
-        self._rx_notify = ctypes.c_uint8(0)   # TermIO daemon 写 ring buffer 后置 1
+        self._rx_notify = ctypes.c_uint8(0)  # TermIO daemon 写 ring buffer 后置 1
 
         # 运行状态
-        self._native_active = False           # Rust 线程是否接管了终端
+        self._native_active = False  # Rust 线程是否接管了终端
         self._atexit_registered = False
 
         # Python 轮询回退 (libtermio.so 不可用时启用)
@@ -195,14 +194,14 @@ class TerminalIO:
             # 单一 owner: Rust 线程独占 stdout, Python 不重复输出
             self._uart.set_console_echo(False)
             if not self._atexit_registered:
-                # 进程异常退出时恢复终端 (对照 QEMU atexit(term_exit))
+                # 进程异常退出时恢复终端
                 atexit.register(self.stop)
                 self._atexit_registered = True
             self.start_tx_archive_thread()
             self.start_rx_daemon()
             return True
 
-        # native 启动失败 (库缺失 / stdin 非 TTY) — 回退 Python 轮询
+        # native 启动失败 — 回退 Python 轮询
         self._start_fallback()
         return False
 
@@ -258,9 +257,12 @@ class TerminalIO:
         关闭 Python 侧 fd 不会影响已退出线程.
         """
         for name in (
-            "_tx_notify_r", "_tx_notify_w",
-            "_rx_notify_r", "_rx_notify_w",
-            "_rx_drain_r", "_rx_drain_w",
+            "_tx_notify_r",
+            "_tx_notify_w",
+            "_rx_notify_r",
+            "_rx_notify_w",
+            "_rx_drain_r",
+            "_rx_drain_w",
         ):
             fd = getattr(self, name, -1)
             if fd < 0:
@@ -324,20 +326,20 @@ class TerminalIO:
 
     def drain_rx(self) -> bool:
         """将 Rust 线程写入的 RX 环形缓冲数据转移到 Python UART 模型.
-        - 先查 ``uart.can_rx()`` (FIFO 有空位才接收)
+        - 先查 ``uart.can_rx()``
         - 逐字节 preload, 每字节检查 can_rx; FIFO 满即停止
-        - 未被消费的字节保留在 ring buffer 中 (rd 不推进),
+        - 未被消费的字节保留在 ring buffer 中,
           且因 rx_rd 未更新, Rust 端 ``free = cap - (wr - rd)`` 变小
-          ->termio 线程自然容量控制停止读 stdin (对照 QEMU fd_chr_read_poll)
+          ->termio 线程自然容量控制停止读 stdin
 
         Returns:
-            True 若有新数据被 preload (可触发 WFI 唤醒).
+            True 若有新数据被 preload.
         """
         with self._rx_drain_lock:
             return self._drain_rx_locked()
 
     def _drain_rx_locked(self) -> bool:
-        """drain_rx 的锁内实现 (调用方须持有 _rx_drain_lock)."""
+        """drain_rx 的锁内实现."""
         if self._uart is None:
             return False
         if not self._uart.can_rx():
@@ -491,7 +493,8 @@ class TerminalIO:
             return
         self._tx_archive_running = True
         self._tx_archive_thread = threading.Thread(
-            target=self._tx_archive_loop, daemon=True,
+            target=self._tx_archive_loop,
+            daemon=True,
         )
         self._tx_archive_thread.start()
 
@@ -550,7 +553,7 @@ class TerminalIO:
         while self._tx_archive_running:
             try:
                 ready = poll.poll(200)  # 0.2s 轮询周期 (毫秒)
-            except (ValueError, OSError):
+            except ValueError, OSError:
                 break
             if not self._tx_archive_running:
                 break
@@ -576,7 +579,8 @@ class TerminalIO:
             return
         self._tx_drain_running = True
         self._tx_drain_thread = threading.Thread(
-            target=self._tx_drain_loop, daemon=True,
+            target=self._tx_drain_loop,
+            daemon=True,
         )
         self._tx_drain_thread.start()
 
@@ -586,7 +590,6 @@ class TerminalIO:
         if self._tx_drain_thread is not None:
             self._tx_drain_thread.join(timeout=1.0)
             self._tx_drain_thread = None
-        # 最终读出: 线程停止后可能还有残留
         self.drain_tx_logs()
 
     def _tx_drain_loop(self) -> None:
@@ -608,7 +611,7 @@ class TerminalIO:
                 # 只会因注册 fd 就绪/POLLHUP 返回, 不会返回空列表; 就绪后
                 # 无论事件类型一律走下方排空.
                 poll.poll(-1)
-            except (ValueError, OSError):
+            except ValueError, OSError:
                 break
             if not self._tx_drain_running:
                 break
@@ -633,7 +636,8 @@ class TerminalIO:
             return
         self._rx_daemon_running = True
         self._rx_daemon_thread = threading.Thread(
-            target=self._rx_daemon_loop, daemon=True,
+            target=self._rx_daemon_loop,
+            daemon=True,
         )
         self._rx_daemon_thread.start()
 
@@ -667,7 +671,7 @@ class TerminalIO:
         """
         try:
             ready = poll.poll(timeout_ms)
-        except (ValueError, OSError):
+        except ValueError, OSError:
             return False
         if ready:
             if not self._drain_notify_pipe(notify_r):
@@ -734,7 +738,7 @@ class TerminalIO:
         """
         try:
             data = os.read(self._stdin_fd, 4096)
-        except (OSError, ValueError):
+        except OSError, ValueError:
             return False
         if not data:
             return False
@@ -754,7 +758,7 @@ class TerminalIO:
             try:
                 # 20ms 超时轮询 stdin; poll 无 fd>=1024 上限 (见 _tx_archive_loop).
                 ready = poll.poll(20)
-            except (ValueError, OSError):
+            except ValueError, OSError:
                 break
             if not self._fallback_running:
                 break
@@ -770,7 +774,8 @@ class TerminalIO:
         """
         self._fallback_running = True
         self._fallback_thread = threading.Thread(
-            target=self._fallback_poll_loop, daemon=True,
+            target=self._fallback_poll_loop,
+            daemon=True,
         )
         self._fallback_thread.start()
 

@@ -6,7 +6,7 @@
 
 import pytest
 
-import pyremu.configs_gen
+from pyremu import configs_gen
 from pyremu.core.trap_handler import check_pending_interrupts, try_wfi_wakeup
 from pyremu.emulator import Emulator
 from pyremu.interrupt.aplic import APLIC
@@ -21,7 +21,7 @@ def _disable_aia_compile_override(monkeypatch):
 
     Tests use explicit configs: qemu_virt() for legacy, qemu_virt_aia() for AIA.
     """
-    monkeypatch.setattr(pyremu.configs_gen, "PYREMU_AIA", False)
+    monkeypatch.setattr(configs_gen, "PYREMU_AIA", False)
 
 
 # ============================================================
@@ -105,8 +105,8 @@ class TestAiaInterruptDelivery:
         emu = _make_aia_emu()
         assert emu.imsic is not None and emu.aplic is not None
         # 使能 IMSIC S-file eie for IID=20 (UART via APLIC)
-        emu.imsic.csr_write(0, 'S', 0x70, 1)  # eidelivery=1
-        emu.imsic.csr_write(0, 'S', 0xC0, 1 << 20)  # eie: enable identity 20
+        emu.imsic.csr_write(0, "S", 0x70, 1)  # eidelivery=1
+        emu.imsic.csr_write(0, "S", 0xC0, 1 << 20)  # eie: enable identity 20
         # 配置 APLIC source 10 映射到 hart 0 S-file IID 20, 该配置经 MMIO 写入以模拟内核流程
         emu.aplic.write(0x3004 + (10 - 1) * 4, (20).to_bytes(4, "little"))  # target[10]
         emu.aplic.write(0x0004 + (10 - 1) * 4, (0x6).to_bytes(4, "little"))
@@ -124,9 +124,9 @@ class TestAiaInterruptDelivery:
         hart = emu.harts[0]
         imsic = emu.imsic
         assert imsic is not None
-        imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)  # eie bit 10
-        imsic.set_ip_number(0, 'M', 10)  # 注入 MSI
+        imsic.csr_write(0, "M", 0x70, 1)  # eidelivery=1
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)  # eie bit 10
+        imsic.set_ip_number(0, "M", 10)  # 注入 MSI
         emu._native_sync_plic_mip()  # IMSIC path: get_pending_mip -> mip
         hart.mie = True  # 全局 MIE=1
         hart.csrs["mie"].val = 1 << 11  # MEIE=1
@@ -139,10 +139,10 @@ class TestAiaInterruptDelivery:
         imsic = emu.imsic
         assert imsic is not None
         for i in range(4):
-            imsic.csr_write(i, 'M', 0x70, 1)
-            imsic.csr_write(i, 'M', 0xC0, 1 << 10)
+            imsic.csr_write(i, "M", 0x70, 1)
+            imsic.csr_write(i, "M", 0xC0, 1 << 10)
         # 仅向 hart 2 注入
-        imsic.set_ip_number(2, 'M', 10)
+        imsic.set_ip_number(2, "M", 10)
         emu._native_sync_plic_mip()
         assert imsic.get_pending_mip(2) & (1 << 11)
         assert imsic.get_pending_mip(0) == 0
@@ -164,14 +164,14 @@ class TestAiaWfiWakeup:
         hart = emu.harts[0]
         imsic = emu.imsic
         assert imsic is not None
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)
         hart.mie = True  # 全局 MIE=1
         hart.csrs["mie"].val = 1 << 11  # MEIE=1 (WFI requires source-level enable)
         # WFI: 无 pending 中断, 进入等待
         hart._waiting = True
         # IMSIC 注入中断
-        imsic.set_ip_number(0, 'M', 10)
+        imsic.set_ip_number(0, "M", 10)
         emu._native_sync_plic_mip()
         # try_wfi_wakeup 应唤醒 hart
         result = try_wfi_wakeup(hart)
@@ -192,10 +192,10 @@ class TestAiaTopei:
         emu = _make_aia_emu()
         imsic = emu.imsic
         assert imsic is not None
-        imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
-        imsic.csr_write(0, 'M', 0xC0, 1 << 20)  # eie bit 20
-        imsic.set_ip_number(0, 'M', 20)
-        topei = imsic.read_topei(0, 'M')
+        imsic.csr_write(0, "M", 0x70, 1)  # eidelivery=1
+        imsic.csr_write(0, "M", 0xC0, 1 << 20)  # eie bit 20
+        imsic.set_ip_number(0, "M", 20)
+        topei = imsic.read_topei(0, "M")
         assert topei != 0, "should return non-zero topei"
         iid = (topei >> 16) & 0xFFFF
         assert iid == 20, f"expected IID=20, got {iid}"
@@ -205,12 +205,12 @@ class TestAiaTopei:
         emu = _make_aia_emu()
         imsic = emu.imsic
         assert imsic is not None
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'M', 0xC0, 1 << 15)
-        imsic.set_ip_number(0, 'M', 15)
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "M", 0xC0, 1 << 15)
+        imsic.set_ip_number(0, "M", 15)
         assert imsic.get_pending_mip(0) & (1 << 11), "MEIP before claim"
         # read topei -> claim
-        imsic.read_topei(0, 'M')
+        imsic.read_topei(0, "M")
         assert imsic.get_pending_mip(0) == 0, "MEIP should be clear after claim"
 
 
@@ -260,9 +260,9 @@ class TestEideliveryGate:
         emu = _make_aia_emu()
         imsic = emu.imsic
         assert imsic is not None
-        imsic.csr_write(0, 'M', 0x70, 0)  # eidelivery=0
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)
-        imsic.set_ip_number(0, 'M', 10)
+        imsic.csr_write(0, "M", 0x70, 0)  # eidelivery=0
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)
+        imsic.set_ip_number(0, "M", 10)
         assert imsic.get_pending_mip(0) == 0, "eidelivery=0 should block MEIP"
 
 
@@ -275,10 +275,10 @@ class TestInterruptModeConfig:
     """interrupt_mode 配置控制中断子系统."""
 
     def test_default_config_is_legacy(self):
-        """默认配置为 legacy 模式."""
+        """默认配置为 legacy 模式, 不创建 IMSIC."""
         cfg = PlatformConfig.qemu_virt()
         assert cfg.interrupt_mode == InterruptMode.LEGACY
-        assert cfg.periph.imsic_m_base == 0  # 默认禁用
+        assert Emulator(cfg).imsic is None
 
     def test_aia_config_has_imsic_base(self):
         """AIA 预设含 IMSIC/APLIC 基址."""
@@ -331,27 +331,27 @@ class TestEnclaveNetRouting:
         emu = _make_aia_emu_with_nics()
         imsic = emu.imsic
         assert imsic is not None
-        imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
-        imsic.csr_write(0, 'M', 0xC0, 1 << IID_EXT_MIN)  # eie: 使能该 identity
+        imsic.csr_write(0, "M", 0x70, 1)  # eidelivery=1
+        imsic.csr_write(0, "M", 0xC0, 1 << IID_EXT_MIN)  # eie: 使能该 identity
 
         emu.raise_device_irq(VIRTIO_NET_M_IRQ, True)
 
         mip = imsic.get_pending_mip(0)
         assert mip & _MEIP, f"MEIP expected, got mip={mip:#x}"
         assert not mip & _SEIP, "S 文件不得被置位"
-        assert imsic.peek_topei(0, 'S') == 0
+        assert imsic.peek_topei(0, "S") == 0
 
     def test_mtopei_reports_the_eiid(self):
         """MTOPI 读到的 identity 是外部中断 identity, 认领后 pending 清除."""
         emu = _make_aia_emu_with_nics()
         imsic = emu.imsic
         assert imsic is not None
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'M', 0xC0, 1 << IID_EXT_MIN)
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "M", 0xC0, 1 << IID_EXT_MIN)
         emu.raise_device_irq(VIRTIO_NET_M_IRQ, True)
 
-        assert (imsic.peek_topei(0, 'M') >> 16) == IID_EXT_MIN
-        assert (imsic.read_topei(0, 'M') >> 16) == IID_EXT_MIN
+        assert (imsic.peek_topei(0, "M") >> 16) == IID_EXT_MIN
+        assert (imsic.read_topei(0, "M") >> 16) == IID_EXT_MIN
         assert imsic.get_pending_mip(0) == 0, "认领后 pending 应清除"
 
     def test_unenabled_nic_irq_produces_no_meip(self):
@@ -368,7 +368,7 @@ class TestEnclaveNetRouting:
         emu.raise_device_irq(VIRTIO_NET_M_IRQ, True)
 
         assert imsic.get_pending_mip(0) == 0, "未使能时不得产出 MEIP"
-        assert imsic.peek_topei(0, 'M') == 0, "不得被当作软件中断"
+        assert imsic.peek_topei(0, "M") == 0, "不得被当作软件中断"
 
     def test_two_nics_do_not_cross(self):
         """两张网卡各投各的域: S 侧进 S 文件, M 侧进 M 文件."""
@@ -376,10 +376,10 @@ class TestEnclaveNetRouting:
         imsic = emu.imsic
         aplic_s = emu.aplic
         assert imsic is not None and aplic_s is not None
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.csr_write(0, 'S', 0xC0, 1 << 20)
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'M', 0xC0, 1 << IID_EXT_MIN)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.csr_write(0, "S", 0xC0, 1 << 20)
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "M", 0xC0, 1 << IID_EXT_MIN)
         # 受调试程序的内核写 S 域 APLIC 的 sourcecfg 与 target 得到同一结果
         aplic_s.bind_source(VIRTIO_NET_S_IRQ, 0, 20)
 
@@ -388,9 +388,9 @@ class TestEnclaveNetRouting:
         mip = imsic.get_pending_mip(0)
         assert mip & _SEIP, "宿主侧实例应产出 SEIP"
         assert not mip & _MEIP, "宿主侧实例不得产出 MEIP"
-        assert imsic.peek_topei(0, 'M') == 0
+        assert imsic.peek_topei(0, "M") == 0
 
-        imsic.read_topei(0, 'S')  # 认领 SEIP, 避免与下一次断言混淆
+        imsic.read_topei(0, "S")  # 认领 SEIP, 避免与下一次断言混淆
         emu.raise_device_irq(VIRTIO_NET_M_IRQ, True)
 
         mip = imsic.get_pending_mip(0)

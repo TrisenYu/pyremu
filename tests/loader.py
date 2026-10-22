@@ -120,7 +120,6 @@ class MultiProgramLoader:
 
         # 分配 U 栈: STACK_BASE_U + pid * 2 * PAGE_SIZE 为栈页基址.
         #   栈页上方 = 保护页 (未映射), 栈页 = 实际可用页.
-        #   栈顶 = 栈页顶部 = STACK_BASE_U + (pid * 2 + 1) * PAGE_SIZE
         stack_top = STACK_BASE_U + (pid * 2 + 1) * PAGE_SIZE
 
         # 写 PCB
@@ -169,7 +168,6 @@ class MultiProgramLoader:
         """向物理地址 *base* 写入一个 PCB 条目."""
         bus = self._emu.bus
 
-        # state = READY
         bus.write(base + PCB_STATE_OFF, struct.pack("<I", PS_READY))
         # entry_pc
         bus.write(base + PCB_ENTRY_OFF, struct.pack("<Q", entry_pc))
@@ -179,7 +177,6 @@ class MultiProgramLoader:
         bus.write(base + PCB_SEPC_OFF, struct.pack("<Q", 0))
         # saved_sp = 0 (首次启动用 stack_top)
         bus.write(base + PCB_SP_OFF, struct.pack("<Q", 0))
-        # exit_code = 0
         bus.write(base + PCB_EXIT_OFF, struct.pack("<I", 0))
         # GPR area: x2/sp = stack_top (fresh process needs valid sp)
         bus.write(base + PCB_GPR_OFF + 1 * 8, struct.pack("<Q", stack_top))

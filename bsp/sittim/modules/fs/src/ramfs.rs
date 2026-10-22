@@ -14,16 +14,8 @@ use core::cmp;
 
 use crate::sync_aux::SpinLock;
 use crate::vfs_ops::{
-	AT_REMOVEDIR,
-	O_CREAT,
-	O_DIRECTORY,
-	O_EXCL,
-	O_TRUNC,
-	VFS_KIND_DIR,
-	VFS_KIND_FILE,
-	VfsStat,
-	VfsStatus,
-	mode_writable,
+	AT_REMOVEDIR, O_CREAT, O_DIRECTORY, O_EXCL, O_TRUNC, VFS_KIND_DIR, VFS_KIND_FILE, VfsStat,
+	VfsStatus, mode_writable,
 };
 
 // ---------------------------------------------------------------
@@ -129,7 +121,7 @@ fn ino_of(node_idx: i16) -> u64 {
 	(node_idx as u64) + 1
 }
 
-/// 节点类型折算为目录项 d_type。
+/// 节点类型换算为目录项 d_type。
 #[inline]
 fn dtype_of(kind: u8) -> u8 {
 	if kind == VFS_KIND_DIR { DT_DIR } else { DT_REG }
@@ -266,10 +258,7 @@ fn as_dir(fs: &VfsState, node: i16) -> Result<i16, VfsStatus> {
 ///
 /// 路径中间的名字没有命中返回 [`NoEntry`](VfsStatus::NoEntry), 命中的节点不是目录返回
 /// [`NotDir`](VfsStatus::NotDir)。
-fn split_target<'a>(
-	fs: &mut VfsState,
-	path: &'a [u8]
-) -> Result<PathTarget<'a>, VfsStatus> {
+fn split_target<'a>(fs: &mut VfsState, path: &'a [u8]) -> Result<PathTarget<'a>, VfsStatus> {
 	let (dir_path, name) = split_path(path)?;
 	let dir = resolve(fs, dir_path, false)?;
 	let dir = as_dir(fs, dir)?;
@@ -408,7 +397,7 @@ unsafe fn write_file(
 	idx: i16,
 	offset: u64,
 	buf: *const u8,
-	len: u64
+	len: u64,
 ) -> Result<u64, VfsStatus> {
 	if len == 0 {
 		return Ok(0);
@@ -530,12 +519,7 @@ pub fn inject_file(path: &[u8], data: &[u8]) -> bool {
 /// 节点用尽时返回 [`NoMemory`](VfsStatus::NoMemory)。
 ///
 /// 本函数只取节点, 不按节点类别校验访问方向, 也不截断: 这两项由 [`open`] 完成。
-fn open_node(
-	fs: &mut VfsState,
-	path: &[u8],
-	flags: u32,
-	mode: u32
-) -> Result<i16, VfsStatus> {
+fn open_node(fs: &mut VfsState, path: &[u8], flags: u32, mode: u32) -> Result<i16, VfsStatus> {
 	match split_target(fs, path)? {
 		// 最后一个名字只指代目录: O_CREAT 与 O_EXCL 判为已存在
 		PathTarget::Dir(dir, _) => {
@@ -544,30 +528,29 @@ fn open_node(
 			}
 			Ok(dir)
 		}
-		PathTarget::Child(dir, name) =>
-			match find_child(fs, dir, name) {
-				NIL => {
-					if (flags & O_CREAT) == 0 {
-						return Err(VfsStatus::NoEntry);
-					}
-					let kind = if (flags & O_DIRECTORY) != 0 {
-						VFS_KIND_DIR
-					} else {
-						VFS_KIND_FILE
-					};
-					let created = create_child(fs, dir, name, kind, mode);
-					if created == NIL {
-						return Err(VfsStatus::NoMemory);
-					}
-					Ok(created)
+		PathTarget::Child(dir, name) => match find_child(fs, dir, name) {
+			NIL => {
+				if (flags & O_CREAT) == 0 {
+					return Err(VfsStatus::NoEntry);
 				}
-				existing => {
-					if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
-						return Err(VfsStatus::Exists);
-					}
-					Ok(existing)
+				let kind = if (flags & O_DIRECTORY) != 0 {
+					VFS_KIND_DIR
+				} else {
+					VFS_KIND_FILE
+				};
+				let created = create_child(fs, dir, name, kind, mode);
+				if created == NIL {
+					return Err(VfsStatus::NoMemory);
 				}
+				Ok(created)
 			}
+			existing => {
+				if (flags & O_CREAT) != 0 && (flags & O_EXCL) != 0 {
+					return Err(VfsStatus::Exists);
+				}
+				Ok(existing)
+			}
+		},
 	}
 }
 
@@ -603,11 +586,10 @@ pub fn resolve_path(path: &[u8]) -> Result<i16, VfsStatus> {
 	let mut fs = VFS.lock();
 	match split_target(&mut fs, path)? {
 		PathTarget::Dir(dir, _) => Ok(dir),
-		PathTarget::Child(dir, name) =>
-			match find_child(&fs, dir, name) {
-				NIL => Err(VfsStatus::NoEntry),
-				node => Ok(node),
-			}
+		PathTarget::Child(dir, name) => match find_child(&fs, dir, name) {
+			NIL => Err(VfsStatus::NoEntry),
+			node => Ok(node),
+		},
 	}
 }
 
@@ -686,12 +668,7 @@ pub fn truncate(node: i16, len: u64) -> VfsStatus {
 /// 节点不是目录时返回 [`NotDir`](VfsStatus::NotDir)。下标无效时返回
 /// [`Invalid`](VfsStatus::Invalid); 缓冲区容纳不下一个条目时同样返回 [`Invalid`], 使调用方
 /// 能够区分目录已读完与缓冲区过小。
-pub fn getdents(
-	node: i16,
-	pos: &mut u64,
-	buf: *mut u8,
-	count: u64
-) -> Result<u64, VfsStatus> {
+pub fn getdents(node: i16, pos: &mut u64, buf: *mut u8, count: u64) -> Result<u64, VfsStatus> {
 	if !is_node_valid(node) {
 		return Err(VfsStatus::Invalid);
 	}
@@ -792,13 +769,12 @@ pub fn mkdir(path: &[u8], mode: u32) -> VfsStatus {
 pub fn unlink(path: &[u8], flags: u32) -> VfsStatus {
 	let mut fs = VFS.lock();
 	let target = match split_target(&mut fs, path) {
-		Ok(PathTarget::Child(dir, name)) =>
-			match find_child(&fs, dir, name) {
-				NIL => {
-					return VfsStatus::NoEntry;
-				}
-				target => target,
+		Ok(PathTarget::Child(dir, name)) => match find_child(&fs, dir, name) {
+			NIL => {
+				return VfsStatus::NoEntry;
 			}
+			target => target,
+		},
 		Ok(PathTarget::Dir(node, name)) if name.is_empty() => node,
 		Ok(PathTarget::Dir(_, name)) => {
 			return if (flags & AT_REMOVEDIR) == 0 {
@@ -815,7 +791,11 @@ pub fn unlink(path: &[u8], flags: u32) -> VfsStatus {
 	};
 	let is_dir = fs.nodes[target as usize].kind == VFS_KIND_DIR;
 	if is_dir != ((flags & AT_REMOVEDIR) != 0) {
-		return if is_dir { VfsStatus::IsDir } else { VfsStatus::NotDir };
+		return if is_dir {
+			VfsStatus::IsDir
+		} else {
+			VfsStatus::NotDir
+		};
 	}
 	let parent = fs.nodes[target as usize].parent;
 	if parent == NIL {
@@ -838,42 +818,15 @@ pub fn access(path: &[u8]) -> VfsStatus {
 
 #[cfg(test)]
 pub(crate) mod tests {
-	use std::sync::{ Mutex, MutexGuard };
+	use std::sync::{Mutex, MutexGuard};
 
 	use super::{
-		DATA_ARENA,
-		DT_DIR,
-		DT_REG,
-		MAX_NODES,
-		NAME_MAX,
-		VFS,
-		VfsState,
-		access,
-		getdents,
-		init,
-		inject_file,
-		mkdir,
-		open,
-		read,
-		resolve_path,
-		stat,
-		truncate,
-		unlink,
-		write,
+		DATA_ARENA, DT_DIR, DT_REG, MAX_NODES, NAME_MAX, VFS, VfsState, access, getdents, init,
+		inject_file, mkdir, open, read, resolve_path, stat, truncate, unlink, write,
 	};
 	use crate::vfs_ops::{
-		AT_REMOVEDIR,
-		O_CREAT,
-		O_DIRECTORY,
-		O_EXCL,
-		O_RDONLY,
-		O_RDWR,
-		O_TRUNC,
-		O_WRONLY,
-		VFS_KIND_DIR,
-		VFS_KIND_FILE,
-		VfsStat,
-		VfsStatus,
+		AT_REMOVEDIR, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+		VFS_KIND_DIR, VFS_KIND_FILE, VfsStat, VfsStatus,
 	};
 
 	/// 目录树与文件数据区是全局量, 用例依次取用。
@@ -965,12 +918,8 @@ pub(crate) mod tests {
 		while at < buf.len() {
 			let base = buf.as_ptr();
 			let ino = unsafe { core::ptr::read_unaligned(base.add(at) as *const u64) };
-			let off = unsafe {
-				core::ptr::read_unaligned(base.add(at + 8) as *const i64)
-			};
-			let reclen = unsafe {
-				core::ptr::read_unaligned(base.add(at + 16) as *const u16)
-			};
+			let off = unsafe { core::ptr::read_unaligned(base.add(at + 8) as *const i64) };
+			let reclen = unsafe { core::ptr::read_unaligned(base.add(at + 16) as *const u16) };
 			let dtype = buf[at + 18];
 			assert!((reclen as usize) >= 20, "目录项长度放不下名称");
 			assert!((reclen as usize) % 8 == 0, "目录项长度未按 8 字节对齐");
@@ -983,7 +932,12 @@ pub(crate) mod tests {
 				i += 1;
 			}
 			assert!(i < end, "名称没有结尾空字节");
-			out.push(Dirent { ino, off, dtype, name });
+			out.push(Dirent {
+				ino,
+				off,
+				dtype,
+				name,
+			});
 			at = end;
 		}
 		out
@@ -995,7 +949,11 @@ pub(crate) mod tests {
 		let _guard = setup();
 
 		assert_eq!(ok_node(resolve_path(b"/")), 0);
-		assert_eq!(ok_node(resolve_path(b"//")), 0, "整个路径只由 '/' 组成时给出根目录");
+		assert_eq!(
+			ok_node(resolve_path(b"//")),
+			0,
+			"整个路径只由 '/' 组成时给出根目录"
+		);
 		assert_status(access(b"/"), VfsStatus::Ok);
 
 		let st = stat_of(0);
@@ -1018,7 +976,10 @@ pub(crate) mod tests {
 		assert_status(mkdir(b"", 0o755), VfsStatus::NoEntry);
 		assert_status(unlink(b"", 0), VfsStatus::NoEntry);
 		assert_status(unlink(b"", AT_REMOVEDIR), VfsStatus::NoEntry);
-		assert!(matches!(open(b"", O_CREAT | O_RDWR, 0o644), Err(VfsStatus::NoEntry)));
+		assert!(matches!(
+			open(b"", O_CREAT | O_RDWR, 0o644),
+			Err(VfsStatus::NoEntry)
+		));
 		assert!(!inject_file(b"", b"x"));
 	}
 
@@ -1038,9 +999,17 @@ pub(crate) mod tests {
 		assert_eq!(ok_node(resolve_path(b"/a/b/..")), a);
 		assert_eq!(ok_node(resolve_path(b"/a/b/../..")), 0);
 		assert_eq!(ok_node(resolve_path(b"/..")), 0, "根目录的父目录仍是根目录");
-		assert_eq!(ok_node(resolve_path(b"a/b")), b, "名字前缺斜杠时仍从根目录开始");
+		assert_eq!(
+			ok_node(resolve_path(b"a/b")),
+			b,
+			"名字前缺斜杠时仍从根目录开始"
+		);
 		assert_eq!(ok_node(resolve_path(b"/a///b")), b, "连续斜杠不引入空名字");
-		assert_eq!(ok_node(resolve_path(b"/a/b/")), b, "末尾的 '/' 不引入空名字");
+		assert_eq!(
+			ok_node(resolve_path(b"/a/b/")),
+			b,
+			"末尾的 '/' 不引入空名字"
+		);
 	}
 
 	/// 路径的某一级不存在时返回 `NoEntry`; 某一级不是目录, 或最后一个名字只指代目录而
@@ -1049,7 +1018,10 @@ pub(crate) mod tests {
 	fn test_resolve_path_reports_a_missing_component() {
 		let _guard = setup();
 		assert!(matches!(resolve_path(b"/nope"), Err(VfsStatus::NoEntry)));
-		assert!(matches!(resolve_path(b"/nope/child"), Err(VfsStatus::NoEntry)));
+		assert!(matches!(
+			resolve_path(b"/nope/child"),
+			Err(VfsStatus::NoEntry)
+		));
 		assert!(matches!(resolve_path(b"/nope/.."), Err(VfsStatus::NoEntry)));
 
 		create_file(b"/f");
@@ -1091,16 +1063,17 @@ pub(crate) mod tests {
 		assert!(matches!(open(b"/x", O_RDONLY, 0), Err(VfsStatus::NoEntry)));
 		let created = ok_node(open(b"/x", O_CREAT | O_RDWR, 0o640));
 		assert_eq!(stat_of(created).mode, 0o640);
-		assert!(
-			matches!(
-				open(b"/x", O_CREAT | O_EXCL | O_RDWR, 0o644),
-				Err(VfsStatus::Exists)
-			)
-		);
+		assert!(matches!(
+			open(b"/x", O_CREAT | O_EXCL | O_RDWR, 0o644),
+			Err(VfsStatus::Exists)
+		));
 		assert_eq!(ok_node(open(b"/x", O_CREAT | O_RDWR, 0o644)), created);
 
 		assert!(
-			matches!(open(b"/nodir/x", O_CREAT | O_RDWR, 0o644), Err(VfsStatus::NoEntry)),
+			matches!(
+				open(b"/nodir/x", O_CREAT | O_RDWR, 0o644),
+				Err(VfsStatus::NoEntry)
+			),
 			"路径的某一级不存在时 `O_CREAT` 不创建中间的目录"
 		);
 	}
@@ -1111,7 +1084,10 @@ pub(crate) mod tests {
 		let _guard = setup();
 		create_file(b"/f");
 
-		assert!(matches!(open(b"/f", O_DIRECTORY | O_RDONLY, 0), Err(VfsStatus::NotDir)));
+		assert!(matches!(
+			open(b"/f", O_DIRECTORY | O_RDONLY, 0),
+			Err(VfsStatus::NotDir)
+		));
 		assert_eq!(ok_node(open(b"/", O_DIRECTORY | O_RDONLY, 0)), 0);
 	}
 
@@ -1131,7 +1107,10 @@ pub(crate) mod tests {
 
 		assert_status(mkdir(b"/d", 0o755), VfsStatus::Ok);
 		let d = ok_node(resolve_path(b"/d"));
-		assert!(matches!(open(b"/d", O_RDWR | O_TRUNC, 0), Err(VfsStatus::IsDir)));
+		assert!(matches!(
+			open(b"/d", O_RDWR | O_TRUNC, 0),
+			Err(VfsStatus::IsDir)
+		));
 		assert_eq!(ok_node(open(b"/d", O_RDONLY, 0)), d);
 		assert_eq!(stat_of(d).kind, VFS_KIND_DIR);
 	}
@@ -1143,7 +1122,10 @@ pub(crate) mod tests {
 		let node = create_file(b"/f");
 		let src = b"abcdefgh";
 
-		assert_eq!(ok_written(write(node, 0, src.as_ptr(), src.len() as u64)), 8);
+		assert_eq!(
+			ok_written(write(node, 0, src.as_ptr(), src.len() as u64)),
+			8
+		);
 		let mut buf = [0u8; 16];
 		assert_eq!(ok_written(read(node, 0, buf.as_mut_ptr(), 16)), 8);
 		assert_eq!(&buf[..8], src);
@@ -1205,12 +1187,10 @@ pub(crate) mod tests {
 		let node = create_file(b"/f");
 
 		let mut data = vec![0x5au8; DATA_ARENA + 1];
-		assert!(
-			matches!(
-				write(node, 0, data.as_ptr(), data.len() as u64),
-				Err(VfsStatus::NoSpace)
-			)
-		);
+		assert!(matches!(
+			write(node, 0, data.as_ptr(), data.len() as u64),
+			Err(VfsStatus::NoSpace)
+		));
 		assert_eq!(stat_of(node).size, 0, "被拒的写入不改变文件");
 
 		data.truncate(DATA_ARENA);
@@ -1227,9 +1207,10 @@ pub(crate) mod tests {
 		let node = create_file(b"/f");
 		assert_eq!(ok_written(write(node, 0, b"head".as_ptr(), 4)), 4);
 
-		assert!(
-			matches!(write(node, u64::MAX, b"x".as_ptr(), 1), Err(VfsStatus::NoSpace))
-		);
+		assert!(matches!(
+			write(node, u64::MAX, b"x".as_ptr(), 1),
+			Err(VfsStatus::NoSpace)
+		));
 		assert_eq!(stat_of(node).size, 4, "被拒的写入不改变文件");
 		assert_eq!(read_all(node), b"head");
 	}
@@ -1241,10 +1222,22 @@ pub(crate) mod tests {
 		let mut buf = [0u8; 4];
 		let invalid = MAX_NODES as i16;
 
-		assert!(matches!(read(-1, 0, buf.as_mut_ptr(), 4), Err(VfsStatus::Invalid)));
-		assert!(matches!(read(invalid, 0, buf.as_mut_ptr(), 4), Err(VfsStatus::Invalid)));
-		assert!(matches!(write(-1, 0, buf.as_ptr(), 4), Err(VfsStatus::Invalid)));
-		assert!(matches!(write(invalid, 0, buf.as_ptr(), 4), Err(VfsStatus::Invalid)));
+		assert!(matches!(
+			read(-1, 0, buf.as_mut_ptr(), 4),
+			Err(VfsStatus::Invalid)
+		));
+		assert!(matches!(
+			read(invalid, 0, buf.as_mut_ptr(), 4),
+			Err(VfsStatus::Invalid)
+		));
+		assert!(matches!(
+			write(-1, 0, buf.as_ptr(), 4),
+			Err(VfsStatus::Invalid)
+		));
+		assert!(matches!(
+			write(invalid, 0, buf.as_ptr(), 4),
+			Err(VfsStatus::Invalid)
+		));
 		assert_status(truncate(-1, 0), VfsStatus::Invalid);
 		assert_status(truncate(invalid, 0), VfsStatus::Invalid);
 		assert!(!stat(-1, &mut VfsStat::zero()));
@@ -1258,8 +1251,14 @@ pub(crate) mod tests {
 		let d = ok_node(resolve_path(b"/d"));
 		let mut buf = [0u8; 4];
 
-		assert!(matches!(read(d, 0, buf.as_mut_ptr(), 4), Err(VfsStatus::IsDir)));
-		assert!(matches!(write(d, 0, buf.as_ptr(), 4), Err(VfsStatus::IsDir)));
+		assert!(matches!(
+			read(d, 0, buf.as_mut_ptr(), 4),
+			Err(VfsStatus::IsDir)
+		));
+		assert!(matches!(
+			write(d, 0, buf.as_ptr(), 4),
+			Err(VfsStatus::IsDir)
+		));
 	}
 
 	/// stat 的 ino 取节点下标加 1, 文件的 blocks 按 512 字节向上取整。
@@ -1322,10 +1321,7 @@ pub(crate) mod tests {
 		assert_eq!(entries[1].dtype, DT_DIR);
 		assert_eq!(entries[1].off, 2);
 
-		let mut children: Vec<u64> = entries[2..]
-			.iter()
-			.map(|entry| entry.ino)
-			.collect();
+		let mut children: Vec<u64> = entries[2..].iter().map(|entry| entry.ino).collect();
 		children.sort();
 		let mut expected = vec![(f1 as u64) + 1, (f2 as u64) + 1];
 		expected.sort();
@@ -1378,12 +1374,14 @@ pub(crate) mod tests {
 		let mut buf = [0u8; 64];
 		let mut pos = 0u64;
 		// "." 的条目长 24 字节, 23 字节与 0 字节都容纳不下
-		assert!(
-			matches!(getdents(d, &mut pos, buf.as_mut_ptr(), 23), Err(VfsStatus::Invalid))
-		);
-		assert!(
-			matches!(getdents(d, &mut pos, buf.as_mut_ptr(), 0), Err(VfsStatus::Invalid))
-		);
+		assert!(matches!(
+			getdents(d, &mut pos, buf.as_mut_ptr(), 23),
+			Err(VfsStatus::Invalid)
+		));
+		assert!(matches!(
+			getdents(d, &mut pos, buf.as_mut_ptr(), 0),
+			Err(VfsStatus::Invalid)
+		));
 		assert_eq!(pos, 0, "未写入任何条目时读取位置不推进");
 		// 刚好容纳一个条目
 		assert_eq!(ok_written(getdents(d, &mut pos, buf.as_mut_ptr(), 24)), 24);
@@ -1398,18 +1396,14 @@ pub(crate) mod tests {
 		let mut buf = [0u8; 64];
 		let mut pos = 0u64;
 
-		assert!(
-			matches!(
-				getdents(node, &mut pos, buf.as_mut_ptr(), 64),
-				Err(VfsStatus::NotDir)
-			)
-		);
-		assert!(
-			matches!(
-				getdents(-1, &mut pos, buf.as_mut_ptr(), 64),
-				Err(VfsStatus::Invalid)
-			)
-		);
+		assert!(matches!(
+			getdents(node, &mut pos, buf.as_mut_ptr(), 64),
+			Err(VfsStatus::NotDir)
+		));
+		assert!(matches!(
+			getdents(-1, &mut pos, buf.as_mut_ptr(), 64),
+			Err(VfsStatus::Invalid)
+		));
 		assert_eq!(pos, 0);
 	}
 
@@ -1511,7 +1505,12 @@ pub(crate) mod tests {
 		names.sort();
 		assert_eq!(
 			names,
-			vec![b".".to_vec(), b"..".to_vec(), b"f1".to_vec(), b"f3".to_vec()]
+			vec![
+				b".".to_vec(),
+				b"..".to_vec(),
+				b"f1".to_vec(),
+				b"f3".to_vec()
+			]
 		);
 		assert!(matches!(resolve_path(b"/d/f2"), Err(VfsStatus::NoEntry)));
 
@@ -1542,12 +1541,10 @@ pub(crate) mod tests {
 			let path = format!("/n{i}");
 			ok_node(open(path.as_bytes(), O_CREAT | O_RDWR, 0o644));
 		}
-		assert!(
-			matches!(
-				open(b"/overflow", O_CREAT | O_RDWR, 0o644),
-				Err(VfsStatus::NoMemory)
-			)
-		);
+		assert!(matches!(
+			open(b"/overflow", O_CREAT | O_RDWR, 0o644),
+			Err(VfsStatus::NoMemory)
+		));
 		assert_status(mkdir(b"/overflow_dir", 0o755), VfsStatus::NoMemory);
 		assert!(!inject_file(b"/overflow_file", b"x"));
 

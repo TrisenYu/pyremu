@@ -9,8 +9,6 @@ RISC-V AIA Incoming MSI Controller (IMSIC).
 每个 hart 有 M-mode 和 S-mode 两个 interrupt file，分别管理 2048 个
 外部 + 软件中断 MSI 身份 (identity 1-2047)。
 
-QEMU 兼容内存布局 (两个独立地址范围, 每 hart stride 0x1000):
-
     M-file 范围 (base = 0x2400_0000):
         base + hart_id * 0x1000 + 0x0000  M-file seteipnum (写即设 eip[val])
         base + hart_id * 0x1000 + 0x0008  M-file clreipnum (写即清 eip[val])
@@ -49,7 +47,7 @@ _EIPNUM_CLR_OFF = 0x0008  # clreipnum — 写入 eip_num 即清 pending
 # CSR select 索引 (RISC-V AIA 规范 v1.0, 与 Linux/OpenSBI 一致)
 _SEL_EIDELIVERY = 0x70
 _SEL_EITHRESHOLD = 0x72
-_SEL_EIP_BASE = 0x80   # eip0 .. eip63
+_SEL_EIP_BASE = 0x80  # eip0 .. eip63
 _SEL_EIP_END = 0xBF
 # Per-bit eip/eie CSR indirect access (AI 规范, siselect=0x58 等)
 # 写入 minor IID 到 sireg 时 set/clear 对应 eip/eie 位.
@@ -58,7 +56,7 @@ _SEL_CLREIPNUM = 0x59
 _SEL_SETEIENUM = 0x5A
 _SEL_CLREIENUM = 0x5B
 
-_SEL_EIE_BASE = 0xC0   # eie0 .. eie63
+_SEL_EIE_BASE = 0xC0  # eie0 .. eie63
 _SEL_EIE_END = 0xFF
 
 # 中断文件总数 (per hart: M + S)
@@ -245,13 +243,9 @@ class _ImsicFile:
         for i in range(_EIP_WORDS - 1, -1, -1):
             pending_enabled = self.eip[i] & self.eie[i]
             if i == 0:
-                pending_enabled = (
-                    (self.eip[i] & sw_mask)
-                    | (pending_enabled & ext_mask)
-                )
+                pending_enabled = (self.eip[i] & sw_mask) | (pending_enabled & ext_mask)
             if pending_enabled == 0:
                 continue
-            # 找到最高置位 (bit_length - 1)
             bit = pending_enabled.bit_length() - 1
             iid = (i << 5) + bit
             # claim: 清除 pending 位
@@ -285,49 +279,45 @@ class _ImsicFile:
         """根据 miselect/siselect 索引写入寄存器."""
         if select == _SEL_EIDELIVERY:
             self.eidelivery = val & 1
-            return
-        if select == _SEL_EITHRESHOLD:
+        elif select == _SEL_EITHRESHOLD:
             self.eithreshold = val & 0x3FF
+        elif _SEL_EIP_BASE <= select <= _SEL_EIP_END:
+            self._write_eip_word(select - _SEL_EIP_BASE, val)
+        elif _SEL_EIE_BASE <= select <= _SEL_EIE_END:
+            self._write_eie_word(select - _SEL_EIE_BASE, val)
+        else:
+            self._write_numbered_bit(select, val)
+
+    def _write_eip_word(self, idx: int, val: int) -> None:
+        """写入 eip 的两个 32 位字, 并更新外部中断挂起状态."""
+        self.eip[idx] = mask32(val)
+        if idx + 1 < _EIP_WORDS:
+            self.eip[idx + 1] = mask32(val >> 32)
+        self._update_any_ext()
+
+    def _write_eie_word(self, idx: int, val: int) -> None:
+        """写入 eie 的两个 32 位字."""
+        self.eie[idx] = mask32(val)
+        if idx + 1 < _EIP_WORDS:
+            self.eie[idx + 1] = mask32(val >> 32)
+
+    def _write_numbered_bit(self, select: int, val: int) -> None:
+        """按中断号置位或清除 eip/eie 的单个比特."""
+        eip_num = val & 0x7FF
+        if eip_num >= _MAX_INTERRUPT_IDS:
             return
-        if _SEL_EIP_BASE <= select <= _SEL_EIP_END:
-            idx = select - _SEL_EIP_BASE
-            self.eip[idx] = mask32(val)
-            if idx + 1 < _EIP_WORDS:
-                self.eip[idx + 1] = mask32(val >> 32)
-            self._update_any_ext()
-            return
-        # Per-bit eip/eie manipulation: write minor IID -> set/clear bit.
+        word = eip_num >> 5
+        bit = 1 << (eip_num & 31)
         if select == _SEL_SETEIPNUM:
-            eip_num = val & 0x7FF
-            if eip_num < _MAX_INTERRUPT_IDS:
-                word = eip_num >> 5
-                self.eip[word] |= 1 << (eip_num & 31)
-                self._update_any_ext()
-            return
-        if select == _SEL_CLREIPNUM:
-            eip_num = val & 0x7FF
-            if eip_num < _MAX_INTERRUPT_IDS:
-                word = eip_num >> 5
-                self.eip[word] &= ~(1 << (eip_num & 31))
-                self._update_any_ext()
-            return
-        if select == _SEL_SETEIENUM:
-            eip_num = val & 0x7FF
-            if eip_num < _MAX_INTERRUPT_IDS:
-                word = eip_num >> 5
-                self.eie[word] |= 1 << (eip_num & 31)
-            return
-        if select == _SEL_CLREIENUM:
-            eip_num = val & 0x7FF
-            if eip_num < _MAX_INTERRUPT_IDS:
-                word = eip_num >> 5
-                self.eie[word] &= ~(1 << (eip_num & 31))
-            return
-        if _SEL_EIE_BASE <= select <= _SEL_EIE_END:
-            idx = select - _SEL_EIE_BASE
-            self.eie[idx] = mask32(val)
-            if idx + 1 < _EIP_WORDS:
-                self.eie[idx + 1] = mask32(val >> 32)
+            self.eip[word] |= bit
+            self._update_any_ext()
+        elif select == _SEL_CLREIPNUM:
+            self.eip[word] &= ~bit
+            self._update_any_ext()
+        elif select == _SEL_SETEIENUM:
+            self.eie[word] |= bit
+        elif select == _SEL_CLREIENUM:
+            self.eie[word] &= ~bit
 
 
 class IMSIC(Device):
@@ -337,7 +327,7 @@ class IMSIC(Device):
     (MEIP/SEIP) 投递，符合 AIA 规范。get_pending_mip() 将 eip 映射到
     mip.MEIP/mip.SEIP，M-mode handler 通过 MTOPEI/STOPEI 读取 IID。
 
-    QEMU 兼容布局: M-file 和 S-file 使用独立地址范围, 每 hart stride 0x1000.
+    M-file 和 S-file 使用独立地址范围, 每 hart stride 0x1000.
     """
 
     def __init__(
@@ -345,7 +335,7 @@ class IMSIC(Device):
         num_harts: int,
         m_base_addr: int = 0x2400_0000,
         s_base_addr: int = 0x2800_0000,
-        ipi_target = None,  # callable(hart_id) — CLINT.send_ipi 或兼容接口
+        ipi_target=None,  # callable(hart_id) — CLINT.send_ipi 或兼容接口
     ) -> None:
         self.num_harts = num_harts
         self.m_base_addr = m_base_addr
@@ -387,7 +377,7 @@ class IMSIC(Device):
     def _resolve(self, offset: int) -> tuple[int, _ImsicFile, int] | None:
         """根据 MMIO 偏移解析 (hart_id, file, offset_within_file).
 
-        QEMU-compatible contiguous layout (padded to power-of-2):
+        contiguous layout (padded to power-of-2):
           - M-files: offset [0,              padded_region)
           - S-files: offset [padded_region,  2*padded_region)
         padded_region = 2^ceil(log2(num_harts)) * 0x1000.
@@ -422,9 +412,9 @@ class IMSIC(Device):
         if not (0 <= hart_id < self.num_harts):
             return None
         mf, sf = self._files[hart_id]
-        if priv == 'M':
+        if priv == "M":
             return mf
-        if priv == 'S':
+        if priv == "S":
             return sf
         return None
 
@@ -495,7 +485,7 @@ class IMSIC(Device):
             if mf.peek_topei() != 0:
                 mip |= 1 << 11  # MEIP
             if sf.peek_topei() != 0:
-                mip |= 1 << 9   # SEIP
+                mip |= 1 << 9  # SEIP
 
             return mip
 
@@ -506,14 +496,14 @@ class IMSIC(Device):
         managed by the legacy PLIC path and IMSIC should not gate MEIP/SEIP.
         """
         with self._lock:
-            mf = self._file_for(hart_id, 'M')
-            sf = self._file_for(hart_id, 'S')
+            mf = self._file_for(hart_id, "M")
+            sf = self._file_for(hart_id, "S")
             return (mf is not None and mf.eidelivery != 0) or (
                 sf is not None and sf.eidelivery != 0
             )
 
     # ----------------------------------------------------------
-    #  MSI 注入 (供 Phase 2 APLIC 使用)
+    #  MSI 注入
     # ----------------------------------------------------------
 
     def bind_ffi_states(self, states) -> None:
@@ -542,7 +532,7 @@ class IMSIC(Device):
         file = self._file_for(hart_id, priv)
         if file is None:
             return
-        mirror = states[hart_id].imsic_m if priv == 'M' else states[hart_id].imsic_s
+        mirror = states[hart_id].imsic_m if priv == "M" else states[hart_id].imsic_s
         for i in range(_EIP_WORDS):
             mirror.eip[i] = file.eip[i]
         # 仅外部中断门控位; 软件中断 (IID 1/3) 由 Rust 侧 IPI 快路径覆盖,
@@ -606,7 +596,7 @@ class IMSIC(Device):
         with self._lock:
             if iid == 0:
                 return 0
-            mf = self._file_for(hart_id, 'M')
+            mf = self._file_for(hart_id, "M")
             if iid == 7 or mf is None:
                 return 1 << iid
             if iid == 11:
@@ -631,7 +621,7 @@ class IMSIC(Device):
         with self._lock:
             if iid == 0:
                 return 0
-            sf = self._file_for(hart_id, 'S')
+            sf = self._file_for(hart_id, "S")
             if iid == 5 or sf is None:
                 return 1 << iid
             if iid == 9:

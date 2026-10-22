@@ -16,8 +16,8 @@ use core::sync::atomic::Ordering;
 #[path = "../src/constants.rs"]
 mod constants;
 
-#[path = "../src/mem_prim/mod.rs"]
-mod mem_prim;
+#[path = "../src/prim/mod.rs"]
+mod prim;
 
 #[path = "../src/syscall/errno.rs"]
 mod errno;
@@ -26,9 +26,9 @@ pub use errno::*;
 
 /// 主机侧的 `paging`, 只声明 `mem` 与 `context` 引用到的符号, 并记录每一次页表操作。
 mod paging {
-	use core::sync::atomic::{ AtomicU64, Ordering };
+	use core::sync::atomic::{AtomicU64, Ordering};
 
-	use crate::constants::{ LEVEL_PAGE, PTE_R, PTE_W };
+	use crate::constants::{LEVEL_PAGE, PTE_R, PTE_W};
 
 	/// 页表项。`context` 以它声明 4 KiB 对齐的页表根。
 	#[derive(Clone, Copy)]
@@ -95,7 +95,7 @@ mod hang {
 
 /// 主机侧的 `ecall_aux`, 记录分区申请。
 mod ecall_aux {
-	use core::sync::atomic::{ AtomicU64, Ordering };
+	use core::sync::atomic::{AtomicU64, Ordering};
 
 	/// 分区申请的次数与授予的分区块数。授予为 0 时按池中无可用分区处理。
 	pub static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -110,7 +110,11 @@ mod ecall_aux {
 		if granted == 0 {
 			return (0, !0u64);
 		}
-		let granted = if granted < chunk_nums { granted } else { chunk_nums };
+		let granted = if granted < chunk_nums {
+			granted
+		} else {
+			chunk_nums
+		};
 		(granted, ALLOC_PA.load(Ordering::SeqCst))
 	}
 
@@ -271,7 +275,10 @@ fn test_munmap_rejects_malformed_arguments() {
 fn test_munmap_rejects_a_range_past_the_user_window() {
 	world();
 
-	assert_eq!(mmap::munmap_handler(LINEAR_MAP_OFFSET, CHUNK_2M_SIZE), EINVAL);
+	assert_eq!(
+		mmap::munmap_handler(LINEAR_MAP_OFFSET, CHUNK_2M_SIZE),
+		EINVAL
+	);
 	assert_eq!(paging::VA_LEVEL_CALLS.load(Ordering::SeqCst), 0);
 	assert_eq!(paging::UNMAP_CALLS.load(Ordering::SeqCst), 0);
 }
@@ -326,13 +333,7 @@ fn test_mremap_rejects_an_old_range_past_the_user_window() {
 	world();
 
 	assert_eq!(
-		mmap::mremap_handler(
-			UMODE_VA_LIMIT - PAGE_SIZE,
-			2 * PAGE_SIZE,
-			PAGE_SIZE,
-			0,
-			0
-		),
+		mmap::mremap_handler(UMODE_VA_LIMIT - PAGE_SIZE, 2 * PAGE_SIZE, PAGE_SIZE, 0, 0),
 		EINVAL
 	);
 	assert_eq!(ecall_aux::ALLOC_CALLS.load(Ordering::SeqCst), 0);

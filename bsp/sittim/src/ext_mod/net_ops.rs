@@ -15,7 +15,7 @@ pub const NET_ADDR_MAX: usize = 16;
 
 /// 地址族未指定。端点取该族时地址缓冲区无意义, 表示本地地址不作限定。
 pub const NET_AF_UNSPEC: u16 = 0;
-/// 地址族为 IPv4, 取 AF_INET 的编号, 与载荷侧的取值一致, 无需折算。
+/// 地址族为 IPv4, 取 AF_INET 的编号, 与载荷侧的取值一致, 无需换算。
 pub const NET_AF_INET: u16 = 2;
 
 /// 绑定成功。
@@ -73,7 +73,7 @@ impl NetEndpoint {
 /// 会把函数地址作为绝对常量写进映像, 而映像在链接时不知道自己的加载基址。
 #[repr(C)]
 pub struct NetOps {
-	/// 协议栈的套接字槽位数。运行时的接收等待地址按本项逐槽位折算。
+	/// 协议栈的套接字槽位数。运行时的接收等待地址按本项逐槽位换算。
 	pub socket_slots: u64,
 	/// 单个槽位一次可收发的最大字节数。
 	pub payload_bytes: u64,
@@ -118,8 +118,6 @@ pub struct NetOps {
 	/// 与 [`NetOps::recv`] 相同, 但不把报文从接收队列中移除。
 	pub peek: unsafe extern "C" fn(u64, *mut u8, u64, *mut NetEndpoint) -> i64,
 }
-
-
 
 #[cfg(test)]
 mod tests {

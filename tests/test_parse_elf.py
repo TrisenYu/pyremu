@@ -22,10 +22,6 @@ from pyremu.utils.parse_bin import (
     parse_firmware,
 )
 
-# helper
-__reloc_path = lambda x: str(Path(__file__).parent / x)
-
-
 # ============================================================
 #  detect_format — 魔数检测
 # ============================================================

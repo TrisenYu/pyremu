@@ -182,7 +182,6 @@ class Pmp:
         逐字节写回 pmpcfg 寄存器: 先读 CSR 当前值, 替换目标字节,
         写回, 确保同一寄存器内其他条目不受影响.
         """
-        # Phase 1: write config bytes (pmpcfg registers).
         for i in range(self._num_entries):
             cfg_reg = (i // 8) * 2
             reg_name = f"pmpcfg{cfg_reg}"
@@ -194,7 +193,6 @@ class Pmp:
             byte_mask = 0xFF << shift
             cfg_val = (cfg_val & ~byte_mask) | (self._flat_cfg[i] << shift)
             self._csrs[reg_name].val = cfg_val
-        # Phase 2: write address values (pmpaddr registers).
         for i in range(self._num_entries):
             reg_name = f"pmpaddr{i}"
             if reg_name in self._csrs:
@@ -205,9 +203,7 @@ class Pmp:
 
     def check(self, info: PmpAccessInfo) -> bool:
         """检查物理地址访问是否允许. 返回 True 表示通过."""
-        pa, size = info.pa, info.size
         mode_val, mstatus_val = info.mode_val, info.mstatus_val
-        is_write, is_execute = info.is_write, info.is_execute
         pmpsplit, mdid = info.pmpsplit, info.mdid
 
         # M-mode MPRV=0 — PMP 不检查 (RISC-V spec §3.7.1)
@@ -226,14 +222,7 @@ class Pmp:
                 bytes(self._flat_cfg),
                 self._flat_addr,
                 self._num_entries,
-                pa,
-                size,
-                is_write=is_write,
-                is_execute=is_execute,
-                mode_val=mode_val,
-                mstatus_val=mstatus_val,
-                pmpsplit=pmpsplit,
-                mdid=mdid,
+                info,
             )
 
         # 纯 Python fallback

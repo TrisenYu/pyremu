@@ -1,36 +1,27 @@
-//! Instruction handlers for Phases B-D: Load/Store, System, AMO, Compressed.
+//! Instruction handlers for: Load/Store, System, AMO, Compressed.
 //!
 //! Each handler receives ``&mut HartState``, decoded fields, and memory access
 //! context; it returns the PC advance (0, 2, or 4) or ``EXIT_SENTINEL`` to
 //! signal that Python must take over.
-use std::sync::atomic::{ AtomicU32, AtomicU64, Ordering };
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::csr;
-use crate::decode::{ decode_compressed, CompressedFields, DecodedFields };
+use crate::decode::{decode_compressed, CompressedFields, DecodedFields};
 use crate::ffi::InstrToBeExec;
-use crate::state::{ exit_reason, riscv_mode, HartState, CFG_HAS_SEMIHOSTING };
+use crate::state::{exit_reason, riscv_mode, HartState, CFG_HAS_SEMIHOSTING};
 pub(crate) use crate::translate::{
-	lr_check,
-	lr_clear_all,
-	lr_set,
-	ram_read,
-	ram_write,
-	rwx_read,
-	rwx_write,
-	translate_va,
-	TranslateFault,
-	TranslateResult,
-	WalkCtx,
+	lr_check, lr_clear_all, lr_set, ram_read, ram_write, rwx_read, rwx_write, translate_va,
+	TranslateFault, TranslateResult, WalkCtx,
 };
-use crate::trap::{ deliver_illegal_instruction, deliver_trap, exc_code, mcause_val };
+use crate::trap::{deliver_illegal_instruction, deliver_trap, exc_code, mcause_val};
 
 // Re-export moved items for backward compatibility
 pub use crate::interrupt::clint::ClintCtx;
-pub(crate) use crate::interrupt::clint::{ clint_write_msip, try_handle_clint };
+pub(crate) use crate::interrupt::clint::{clint_write_msip, try_handle_clint};
 use crate::peripheral::plic::try_handle_plic_concurrent;
-pub use crate::peripheral::{ is_device_addr, virtio::try_handle_virtio, DevCtx };
-pub use crate::pmp::{ pmp_ok, PmpCtx };
+pub use crate::peripheral::{is_device_addr, virtio::try_handle_virtio, DevCtx};
+pub use crate::pmp::{pmp_ok, PmpCtx};
 
 // Re-export from csr.rs
 pub use crate::csr::EXIT_SENTINEL;
@@ -60,7 +51,11 @@ mod sbi_fid_ipi {
 
 #[inline]
 fn read_gpr(state: &HartState, rs: u8) -> u64 {
-	if rs == 0 { 0 } else { state.gprs[rs as usize] }
+	if rs == 0 {
+		0
+	} else {
+		state.gprs[rs as usize]
+	}
 }
 
 #[inline]
@@ -208,7 +203,7 @@ fn try_handle_imsic_serial(pa: u64, val: u64, clint: &ClintCtx) -> bool {
 				clint.num_harts,
 				addr.hart,
 				file_tag,
-				eip_num
+				eip_num,
 			);
 			handled
 		}
@@ -217,7 +212,7 @@ fn try_handle_imsic_serial(pa: u64, val: u64, clint: &ClintCtx) -> bool {
 				clint.hart_states.get(),
 				addr.hart,
 				file_tag,
-				eip_num
+				eip_num,
 			);
 			true
 		}
@@ -241,14 +236,14 @@ pub fn handle_load(
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> u64 {
 	let base = read_gpr(state, f.rs1);
 	let va = base.wrapping_add(f.imm12_se);
 	let (size, signed) = match f.func3 {
-		0b000 => (1, true), // LB
-		0b001 => (2, true), // LH
-		0b010 => (4, true), // LW
+		0b000 => (1, true),  // LB
+		0b001 => (2, true),  // LH
+		0b010 => (4, true),  // LW
 		0b011 => (8, false), // LD
 		0b100 => (1, false), // LBU
 		0b101 => (2, false), // LHU
@@ -380,7 +375,7 @@ pub fn handle_store(
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> u64 {
 	let base = read_gpr(state, f.rs1);
 	let va = base.wrapping_add(f.imm_s);
@@ -480,7 +475,7 @@ pub fn handle_fp_load(
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> u64 {
 	if (state.mstatus & MSTATUS_FS_LS) == 0 {
 		deliver_illegal_instruction(state, instr as u64);
@@ -553,7 +548,7 @@ pub fn handle_fp_store(
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> u64 {
 	if (state.mstatus & MSTATUS_FS_LS) == 0 {
 		deliver_illegal_instruction(state, instr as u64);
@@ -641,7 +636,7 @@ fn try_sbi_ipi_send_ipi(
 	state: &mut HartState,
 	instr: u32,
 	result: &mut InstrToBeExec,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> Option<u64> {
 	if read_gpr(state, 17) != sbi_eid::IPI || read_gpr(state, 16) != sbi_fid_ipi::SEND_IPI {
 		return None;
@@ -680,7 +675,7 @@ fn handle_ecall_inline(
 	state: &mut HartState,
 	instr: u32,
 	instr_group: &mut InstrToBeExec,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> u64 {
 	if state.mode != riscv_mode::S {
 		let ecall_cause = match state.mode {
@@ -713,7 +708,7 @@ fn dispatch_privileged(
 	instr: u32,
 	instr_group: &mut InstrToBeExec,
 	clint: &ClintCtx,
-	ctx: &WalkCtx
+	ctx: &WalkCtx,
 ) -> u64 {
 	match func12 {
 		0 => handle_ecall_inline(state, instr, instr_group, clint),
@@ -760,7 +755,11 @@ fn dispatch_privileged(
 			}
 			let spp = (state.mstatus >> 8) & 1;
 			let spie = (state.mstatus >> 5) & 1;
-			state.mode = if spp == 0 { riscv_mode::U } else { riscv_mode::S };
+			state.mode = if spp == 0 {
+				riscv_mode::U
+			} else {
+				riscv_mode::S
+			};
 			// SIE <- SPIE, SPIE <- 1
 			state.mstatus &= !(1 << 1); // clear SIE
 			if spie != 0 {
@@ -839,7 +838,7 @@ pub fn handle_system(
 	ctx: &WalkCtx,
 	hart_id: u8,
 	clint: &ClintCtx,
-	pmp: &PmpCtx
+	pmp: &PmpCtx,
 ) -> u64 {
 	match f.func3 {
 		0b000 => dispatch_privileged(state, f.func12, instr, instr_group, clint, ctx),
@@ -861,7 +860,15 @@ pub fn handle_system(
 				timebase_hz: 0,
 			};
 			let mut csr_ctx = csr::CsrContext::new(state, hart_id as u32, pmp, &conc_clint);
-			let advance = csr::handle_csr(&mut csr_ctx, f.rd, f.rs1, f.func12, f.func3, instr, instr_group);
+			let advance = csr::handle_csr(
+				&mut csr_ctx,
+				f.rd,
+				f.rs1,
+				f.func12,
+				f.func3,
+				instr,
+				instr_group,
+			);
 			// Sync MIP.MSIP -> CLINT msip: if software cleared MSIP via CSR
 			// write, also clear the CLINT MSIP register so that ``build_mip``
 			// doesn't re-assert it on the next speedup entry.
@@ -906,20 +913,18 @@ fn amo_fetch_u32(a: &AtomicU32, funct5: u8, rs2_val: u64) -> u32 {
 		0b00100 => a.fetch_xor(rs2_u32, Ordering::AcqRel),
 		0b01100 => a.fetch_and(rs2_u32, Ordering::AcqRel),
 		0b01000 => a.fetch_or(rs2_u32, Ordering::AcqRel),
-		0b10000 =>
-			a
-				.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
-					let s = (prev as i32).min(rs2_val as i32);
-					Some(s as u32)
-				})
-				.unwrap(),
-		0b10100 =>
-			a
-				.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
-					let s = (prev as i32).max(rs2_val as i32);
-					Some(s as u32)
-				})
-				.unwrap(),
+		0b10000 => a
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+				let s = (prev as i32).min(rs2_val as i32);
+				Some(s as u32)
+			})
+			.unwrap(),
+		0b10100 => a
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+				let s = (prev as i32).max(rs2_val as i32);
+				Some(s as u32)
+			})
+			.unwrap(),
 		0b11000 => a.fetch_min(rs2_u32, Ordering::AcqRel),
 		0b11100 => a.fetch_max(rs2_u32, Ordering::AcqRel),
 		_ => unreachable!(),
@@ -935,18 +940,16 @@ fn amo_fetch_u64(a: &AtomicU64, funct5: u8, rs2_val: u64) -> u64 {
 		0b00100 => a.fetch_xor(rs2_val, Ordering::AcqRel),
 		0b01100 => a.fetch_and(rs2_val, Ordering::AcqRel),
 		0b01000 => a.fetch_or(rs2_val, Ordering::AcqRel),
-		0b10000 =>
-			a
-				.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
-					Some((prev as i64).min(rs2_val as i64) as u64)
-				})
-				.unwrap(),
-		0b10100 =>
-			a
-				.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
-					Some((prev as i64).max(rs2_val as i64) as u64)
-				})
-				.unwrap(),
+		0b10000 => a
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+				Some((prev as i64).min(rs2_val as i64) as u64)
+			})
+			.unwrap(),
+		0b10100 => a
+			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
+				Some((prev as i64).max(rs2_val as i64) as u64)
+			})
+			.unwrap(),
 		0b11000 => a.fetch_min(rs2_val, Ordering::AcqRel),
 		0b11100 => a.fetch_max(rs2_val, Ordering::AcqRel),
 		_ => unreachable!(),
@@ -965,7 +968,7 @@ fn handle_amo_arithmetic(
 	width: u8,
 	va: u64,
 	tr: &TranslateResult,
-	ctx: &WalkCtx
+	ctx: &WalkCtx,
 ) -> u64 {
 	let off = super::mem::ram_offset_inline(
 		tr.pa,
@@ -973,7 +976,7 @@ fn handle_amo_arithmetic(
 		ctx.ram_base,
 		ctx.ram_size,
 		ctx.shadow_base,
-		ctx.shadow_size
+		ctx.shadow_size,
 	);
 	if off.is_none() {
 		deliver_trap(state, mcause_val(exc_code::LD_ACCESS_FAULT, false), va);
@@ -997,7 +1000,7 @@ fn handle_amo_arithmetic(
 }
 
 // ============================================================
-//  AMO handler (Phase D)
+//  AMO handler
 // ============================================================
 
 pub fn handle_amo(
@@ -1007,7 +1010,7 @@ pub fn handle_amo(
 	instr_group: &mut InstrToBeExec,
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
-	dev: &DevCtx
+	dev: &DevCtx,
 ) -> u64 {
 	let _aq = (instr >> 26) & 1;
 	let _rl = (instr >> 25) & 1;
@@ -1076,9 +1079,8 @@ pub fn handle_amo(
 		}
 		0b00011 => {
 			// SC.W / SC.D
-			let has_reservation =
-				lr_check(ctx, state.mhartid as u8, tr.pa) ||
-				(state.reservation_valid != 0 && state.reservation_addr == tr.pa);
+			let has_reservation = lr_check(ctx, state.mhartid as u8, tr.pa)
+				|| (state.reservation_valid != 0 && state.reservation_addr == tr.pa);
 			if !has_reservation {
 				write_gpr(state, rd, 1);
 			} else {
@@ -1099,7 +1101,7 @@ pub fn handle_amo(
 }
 
 // ============================================================
-//  Compressed instruction handlers (Phase D)
+//  Compressed instruction handlers
 // ============================================================
 
 pub fn handle_compressed(
@@ -1110,7 +1112,7 @@ pub fn handle_compressed(
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> u64 {
 	let cf = decode_compressed(half);
 
@@ -1134,7 +1136,7 @@ fn handle_c0(
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> u64 {
 	match cf.funct3 {
 		0b000 => {
@@ -1151,9 +1153,18 @@ fn handle_c0(
 			// C.FLD: fpr[rd'] = mem[rs1' + uimm] (RV64DC)
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = match
-				load_mem_compressed(state, ctx, addr, 8, false, instr_word, instr_group, pmp, dev, clint)
-			{
+			let val = match load_mem_compressed(
+				state,
+				ctx,
+				addr,
+				8,
+				false,
+				instr_word,
+				instr_group,
+				pmp,
+				dev,
+				clint,
+			) {
 				Some(v) => v,
 				None => {
 					return EXIT_SENTINEL;
@@ -1170,9 +1181,18 @@ fn handle_c0(
 			// C.LW: rd' = mem[rs1' + uimm]
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = match
-				load_mem_compressed(state, ctx, addr, 4, false, instr_word, instr_group, pmp, dev, clint)
-			{
+			let val = match load_mem_compressed(
+				state,
+				ctx,
+				addr,
+				4,
+				false,
+				instr_word,
+				instr_group,
+				pmp,
+				dev,
+				clint,
+			) {
 				Some(v) => v,
 				None => {
 					return EXIT_SENTINEL;
@@ -1189,9 +1209,18 @@ fn handle_c0(
 			// C.LD: rd' = mem[rs1' + uimm]
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = match
-				load_mem_compressed(state, ctx, addr, 8, false, instr_word, instr_group, pmp, dev, clint)
-			{
+			let val = match load_mem_compressed(
+				state,
+				ctx,
+				addr,
+				8,
+				false,
+				instr_word,
+				instr_group,
+				pmp,
+				dev,
+				clint,
+			) {
 				Some(v) => v,
 				None => {
 					return EXIT_SENTINEL;
@@ -1217,7 +1246,7 @@ fn handle_c0(
 				instr_group,
 				pmp,
 				dev,
-				clint
+				clint,
 			);
 			if ret == EXIT_SENTINEL {
 				return EXIT_SENTINEL;
@@ -1239,7 +1268,7 @@ fn handle_c0(
 				instr_group,
 				pmp,
 				dev,
-				clint
+				clint,
 			);
 			if ret == EXIT_SENTINEL {
 				return EXIT_SENTINEL;
@@ -1260,7 +1289,7 @@ fn handle_c0(
 				instr_group,
 				pmp,
 				dev,
-				clint
+				clint,
 			);
 			if ret == EXIT_SENTINEL {
 				return EXIT_SENTINEL;
@@ -1358,7 +1387,7 @@ fn handle_c2(
 	ctx: &WalkCtx,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> u64 {
 	match cf.funct3 {
 		0b000 => {
@@ -1375,9 +1404,18 @@ fn handle_c2(
 			}
 			let addr = state.gprs[2].wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = match
-				load_mem_compressed(state, ctx, addr, 8, false, instr_word, instr_group, pmp, dev, clint)
-			{
+			let val = match load_mem_compressed(
+				state,
+				ctx,
+				addr,
+				8,
+				false,
+				instr_word,
+				instr_group,
+				pmp,
+				dev,
+				clint,
+			) {
 				Some(v) => v,
 				None => {
 					return EXIT_SENTINEL;
@@ -1398,9 +1436,18 @@ fn handle_c2(
 			}
 			let addr = state.gprs[2].wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = match
-				load_mem_compressed(state, ctx, addr, 4, false, instr_word, instr_group, pmp, dev, clint)
-			{
+			let val = match load_mem_compressed(
+				state,
+				ctx,
+				addr,
+				4,
+				false,
+				instr_word,
+				instr_group,
+				pmp,
+				dev,
+				clint,
+			) {
 				Some(v) => v,
 				None => {
 					return EXIT_SENTINEL;
@@ -1421,9 +1468,18 @@ fn handle_c2(
 			}
 			let addr = state.gprs[2].wrapping_add(cf.imm);
 			let prev_mode = state.mode;
-			let val = match
-				load_mem_compressed(state, ctx, addr, 8, false, instr_word, instr_group, pmp, dev, clint)
-			{
+			let val = match load_mem_compressed(
+				state,
+				ctx,
+				addr,
+				8,
+				false,
+				instr_word,
+				instr_group,
+				pmp,
+				dev,
+				clint,
+			) {
 				Some(v) => v,
 				None => {
 					return EXIT_SENTINEL;
@@ -1485,7 +1541,7 @@ fn handle_c2(
 				instr_group,
 				pmp,
 				dev,
-				clint
+				clint,
 			);
 			if ret == EXIT_SENTINEL {
 				return EXIT_SENTINEL;
@@ -1507,7 +1563,7 @@ fn handle_c2(
 				instr_group,
 				pmp,
 				dev,
-				clint
+				clint,
 			);
 			if ret == EXIT_SENTINEL {
 				return EXIT_SENTINEL;
@@ -1528,7 +1584,7 @@ fn handle_c2(
 				instr_group,
 				pmp,
 				dev,
-				clint
+				clint,
 			);
 			if ret == EXIT_SENTINEL {
 				return EXIT_SENTINEL;
@@ -1562,7 +1618,7 @@ fn load_mem_compressed(
 	instr_group: &mut InstrToBeExec,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> Option<u64> {
 	let tr = match translate_va(state, ctx, va, rwx_read(), pmp) {
 		Ok(t) => t,
@@ -1621,7 +1677,7 @@ fn store_mem_compressed(
 	instr_group: &mut InstrToBeExec,
 	pmp: &PmpCtx,
 	dev: &DevCtx,
-	clint: &ClintCtx
+	clint: &ClintCtx,
 ) -> u64 {
 	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
@@ -1936,10 +1992,24 @@ mod tests {
 		let result = try_handle_clint(&access, &states[0], &ctx);
 		assert_eq!(result, Some(0));
 		assert_eq!(msip[1], 1, "direct: MSIP[1] must be 1");
-		assert!((states[1].mip.load(Ordering::Acquire) & (1 << 3)) != 0, "direct: hart 1 mip must have MSIP");
-		assert!(ctx.yield_for_ipi.get(), "direct: cross-hart must set yield flag");
-		assert_eq!(ctx.ipi_sender_hart.get(), 0, "direct: sender hart must be tracked for short-slice");
-		assert_eq!(ctx.ipi_sender_rounds.get(), 16, "direct: short-slice rounds must be initialised");
+		assert!(
+			(states[1].mip.load(Ordering::Acquire) & (1 << 3)) != 0,
+			"direct: hart 1 mip must have MSIP"
+		);
+		assert!(
+			ctx.yield_for_ipi.get(),
+			"direct: cross-hart must set yield flag"
+		);
+		assert_eq!(
+			ctx.ipi_sender_hart.get(),
+			0,
+			"direct: sender hart must be tracked for short-slice"
+		);
+		assert_eq!(
+			ctx.ipi_sender_rounds.get(),
+			16,
+			"direct: short-slice rounds must be initialised"
+		);
 
 		// Write MSIP[0] (self-IPI should NOT set yield or sender tracking)
 		ctx.yield_for_ipi.set(false);
@@ -1948,8 +2018,15 @@ mod tests {
 		let result2 = try_handle_clint(&access_self, &states[0], &ctx);
 		assert_eq!(result2, Some(0));
 		assert_eq!(msip[0], 1, "direct: MSIP[0] must be 1 after self-IPI");
-		assert!(!ctx.yield_for_ipi.get(), "direct: self-IPI must NOT set yield flag");
-		assert_eq!(ctx.ipi_sender_rounds.get(), 0, "direct: self-IPI must NOT set short-slice rounds");
+		assert!(
+			!ctx.yield_for_ipi.get(),
+			"direct: self-IPI must NOT set yield flag"
+		);
+		assert_eq!(
+			ctx.ipi_sender_rounds.get(),
+			0,
+			"direct: self-IPI must NOT set short-slice rounds"
+		);
 	}
 
 	/// MSIP clear also goes through ``clint_write_msip`` and clears the
@@ -1986,10 +2063,18 @@ mod tests {
 		let result = try_handle_clint(&access, &states[0], &ctx);
 		assert_eq!(result, Some(0));
 		assert_eq!(msip[0], 0, "MSIP[0] should be cleared");
-		assert_eq!(states[0].mip.load(Ordering::Acquire) & (1 << 3), 0, "mip.MSIP must be 0 after clear");
+		assert_eq!(
+			states[0].mip.load(Ordering::Acquire) & (1 << 3),
+			0,
+			"mip.MSIP must be 0 after clear"
+		);
 		// Self-clear should NOT set yield or sender tracking
 		assert!(!ctx.yield_for_ipi.get(), "MSIP clear should not set yield");
-		assert_eq!(ctx.ipi_sender_rounds.get(), 0, "MSIP clear should not set short-slice rounds");
+		assert_eq!(
+			ctx.ipi_sender_rounds.get(),
+			0,
+			"MSIP clear should not set short-slice rounds"
+		);
 	}
 
 	// ============================================================
@@ -2208,14 +2293,25 @@ mod tests {
 
 		// C.LDSP x5, 0(sp)
 		let mut group: InstrToBeExec = unsafe { mem::zeroed() };
-		let advance = handle_compressed(&mut state, 0x6282, 0x6282, &mut group, &ctx, &pmp, &dev, &clint);
+		let advance = handle_compressed(
+			&mut state, 0x6282, 0x6282, &mut group, &ctx, &pmp, &dev, &clint,
+		);
 		assert_eq!(advance, 2, "读到全 1 的普通内存不得被判为设备退出");
 		assert_eq!(state.gprs[5], u64::MAX, "寄存器应拿到内存里真实的全 1 数据");
 		assert_eq!(group.exit_reason, exit_reason::NORMAL);
 
 		// C.LD x10, 0(s1)
 		let mut group2: InstrToBeExec = unsafe { mem::zeroed() };
-		let advance2 = handle_compressed(&mut state, 0x6088, 0x6088, &mut group2, &ctx, &pmp, &dev, &clint);
+		let advance2 = handle_compressed(
+			&mut state,
+			0x6088,
+			0x6088,
+			&mut group2,
+			&ctx,
+			&pmp,
+			&dev,
+			&clint,
+		);
 		assert_eq!(advance2, 2, "C.LD 同样不得误判为设备退出");
 		assert_eq!(state.gprs[10], u64::MAX);
 	}
@@ -2256,13 +2352,24 @@ mod tests {
 
 		// C.SDSP x5, 0(sp)
 		let mut group: InstrToBeExec = unsafe { mem::zeroed() };
-		let advance = handle_compressed(&mut state, 0xe016, 0xe016, &mut group, &ctx, &pmp, &dev, &clint);
+		let advance = handle_compressed(
+			&mut state, 0xe016, 0xe016, &mut group, &ctx, &pmp, &dev, &clint,
+		);
 		assert_eq!(advance, EXIT_SENTINEL, "设备存储必须退出到 Python");
 		assert_eq!(group.exit_reason, exit_reason::MMIO, "退出原因必须为 MMIO");
 
 		// C.LDSP x5, 0(sp)
 		let mut group2: InstrToBeExec = unsafe { mem::zeroed() };
-		let advance2 = handle_compressed(&mut state, 0x6282, 0x6282, &mut group2, &ctx, &pmp, &dev, &clint);
+		let advance2 = handle_compressed(
+			&mut state,
+			0x6282,
+			0x6282,
+			&mut group2,
+			&ctx,
+			&pmp,
+			&dev,
+			&clint,
+		);
 		assert_eq!(advance2, EXIT_SENTINEL, "设备读取必须退出到 Python");
 		assert_eq!(group2.exit_reason, exit_reason::MMIO, "退出原因必须为 MMIO");
 	}

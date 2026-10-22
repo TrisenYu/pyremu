@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""acceleration layer by pre-compiled dynamic library — Rust cdylib via ctypes, with pure Python fallback.
+"""
+acceleration layer by pre-compiled dynamic library.
+Rust cdylib via ctypes, with pure Python fallback
 
 Loads the pre-compiled Rust shared library.  If it is missing or the platform
 is unsupported, ``loguru`` emits a warning and the module degrades to pure
@@ -10,14 +12,20 @@ Python equivalents transparently.
 from __future__ import annotations
 
 import atexit
+from collections.abc import Callable
 import ctypes
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import shutil
 import sys
 import tempfile
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from pyremu.memory.pmp import PmpAccessInfo
 
 # ============================================================
 #  Platform detection
@@ -25,7 +33,7 @@ from loguru import logger
 
 _EXT = {"linux": ".so", "darwin": ".dylib", "win32": ".dll"}.get(sys.platform, ".so")
 _NATIVE_DIR = Path(__file__).resolve().parent
-_LIB_PATH = _NATIVE_DIR / f"libdecode{_EXT}" # 单独留在外部，好减少SIGBUS/SIGSEGM一类的错误
+_LIB_PATH = _NATIVE_DIR / f"libdecode{_EXT}"  # 单独留在外部，好减少SIGBUS/SIGSEGM一类的错误
 
 # ============================================================
 #  ctypes type definitions (must match Rust #[repr(C)] layout)
@@ -46,6 +54,7 @@ from pyremu._native._ctypes import (  # noqa: E402, F401 — re-export
 
 _lib = None
 _tmp_so_path: str | None = None
+
 
 def _load_lib_safe(lib_path: Path) -> ctypes.CDLL | None:
     """Load the native shared library from a temporary copy.
@@ -89,13 +98,13 @@ try:
     if _lib is None:
         raise OSError(f"无法加载 {_LIB_PATH.name}")
 
-    # Phase 1: instruction decode
+    # instruction decode
     _lib.decode_fields.argtypes = [ctypes.c_uint32]
     _lib.decode_fields.restype = DecodedFields
     _lib.decode_compressed.argtypes = [ctypes.c_uint16]
     _lib.decode_compressed.restype = CompressedFields
 
-    # Phase 2a: PMP check
+    # PMP check
     _lib.pmp_check.argtypes = [
         ctypes.c_void_p,  # cfg: *const u8
         ctypes.c_void_p,  # addr: *const u64
@@ -111,7 +120,7 @@ try:
     ]
     _lib.pmp_check.restype = ctypes.c_uint8
 
-    # Phase 2b: Sv39 MMU helpers
+    # Sv39 MMU helpers
     _lib.sv39_decompose_va.argtypes = [ctypes.c_uint64]
     _lib.sv39_decompose_va.restype = Sv39Vpn
     _lib.pte_parse.argtypes = [ctypes.c_uint64]
@@ -125,7 +134,7 @@ try:
     _lib.sv39_page_size.argtypes = [ctypes.c_uint8]
     _lib.sv39_page_size.restype = ctypes.c_uint64
 
-    # Phase 2c: ALU pure-compute ops (return Alu64 with trap flag)
+    # ALU pure-compute ops (return Alu64 with trap flag)
     _lib.exec_alu_op.argtypes = [
         ctypes.c_uint8,
         ctypes.c_uint8,
@@ -157,26 +166,26 @@ try:
 
     # F/D floating point compute (return FpOut)
     _lib.fp_exec_op.argtypes = [
-        ctypes.c_uint8,   # funct7
-        ctypes.c_uint8,   # funct3
-        ctypes.c_uint8,   # rs2
+        ctypes.c_uint8,  # funct7
+        ctypes.c_uint8,  # funct3
+        ctypes.c_uint8,  # rs2
         ctypes.c_uint64,  # rs1_bits
         ctypes.c_uint64,  # rs2_bits
-        ctypes.c_uint8,   # frm
+        ctypes.c_uint8,  # frm
     ]
     _lib.fp_exec_op.restype = FpOut
     _lib.fp_exec_fma.argtypes = [
-        ctypes.c_uint8,   # opcode
-        ctypes.c_uint8,   # rm (funct3)
-        ctypes.c_uint8,   # fmt
+        ctypes.c_uint8,  # opcode
+        ctypes.c_uint8,  # rm (funct3)
+        ctypes.c_uint8,  # fmt
         ctypes.c_uint64,  # rs1
         ctypes.c_uint64,  # rs2
         ctypes.c_uint64,  # rs3
-        ctypes.c_uint8,   # frm
+        ctypes.c_uint8,  # frm
     ]
     _lib.fp_exec_fma.restype = FpOut
 
-    # Phase 3: RAM direct read/write (zero-allocation fast path)
+    # RAM direct read/write (zero-allocation fast path)
     _lib.bus_read_ram.argtypes = [
         ctypes.c_void_p,  # ram_ptr: *const u8
         ctypes.c_uint64,  # ram_size
@@ -200,14 +209,14 @@ try:
     ]
     _lib.bus_write_ram.restype = ctypes.c_uint8
 
-    # Phase 5: concurrent thread-per-hart execution engine
+    # concurrent thread-per-hart execution engine
     _lib.run_parallel.argtypes = [
-        ctypes.c_void_p,   # hart: *const FfiHartCtx
-        ctypes.c_void_p,   # mem_ctx: *const FfiMemCtx
-        ctypes.c_void_p,   # intr_ctx: *const FfiInterruptCtx
-        ctypes.c_void_p,   # dev_ctx: *const FfiDevicesCtx
-        ctypes.c_void_p,   # bp: *const FfiBpCtx
-        ctypes.c_void_p,   # tlb: *mut FfiTlbCtx
+        ctypes.c_void_p,  # hart: *const FfiHartCtx
+        ctypes.c_void_p,  # mem_ctx: *const FfiMemCtx
+        ctypes.c_void_p,  # intr_ctx: *const FfiInterruptCtx
+        ctypes.c_void_p,  # dev_ctx: *const FfiDevicesCtx
+        ctypes.c_void_p,  # bp: *const FfiBpCtx
+        ctypes.c_void_p,  # tlb: *mut FfiTlbCtx
     ]
     _lib.run_parallel.restype = None
 
@@ -227,8 +236,6 @@ except OSError as exc:
 def native_available() -> bool:
     """Return ``True`` if the acceleration library is loaded."""
     return _lib is not None
-
-
 
 
 # ============================================================
@@ -270,14 +277,12 @@ def _decode_fields_py(instr: int) -> DecodedFields:
     imm_b |= ((instr >> 25) & 0x3F) << 5
     imm_b |= ((instr >> 8) & 0xF) << 1
     imm_b |= ((instr >> 7) & 1) << 11
-    # _sext(imm_b, 13)
     f.imm_b = (imm_b & 0xFFF) - (imm_b & 0x1000) & 0xFFFF_FFFF_FFFF_FFFF
 
     imm_j = ((instr >> 31) & 1) << 20
     imm_j |= ((instr >> 21) & 0x3FF) << 1
     imm_j |= ((instr >> 20) & 1) << 11
     imm_j |= ((instr >> 12) & 0xFF) << 12
-    # _sext(imm_j, 21)
     f.imm_j = (imm_j & 0xF_FFFF) - (imm_j & 0x10_0000) & 0xFFFF_FFFF_FFFF_FFFF
 
     return f
@@ -334,82 +339,108 @@ def _decode_compressed_py(half: int) -> CompressedFields:
         cf.rs2 = bits_6_2
 
     # ---- immediates ----
-    imm: int = 0
-    imm2: int = 0
-
-    if cf.quadrant == 0:
-        if cf.funct3 == 0:
-            # C.ADDI4SPN: nzuimm[5:4|9:6|2|3]
-            imm = ((h >> 6) & 0x1) << 2
-            imm |= ((h >> 5) & 0x1) << 3
-            imm |= ((h >> 11) & 0x1) << 4
-            imm |= ((h >> 12) & 0x1) << 5
-            imm |= ((h >> 7) & 0xF) << 6
-        elif cf.funct3 in (2, 6):
-            # C.LW / C.SW: uimm[5:3|2|6]
-            imm = ((h >> 6) & 0x1) << 2 | ((h >> 10) & 0x7) << 3 | ((h >> 5) & 0x1) << 6
-        elif cf.funct3 in (1, 3, 5, 7):
-            # C.FLD / C.LD / C.FSD / C.SD: uimm[5:3|6|7]
-            imm = ((h >> 5) & 0x3) << 6 | ((h >> 10) & 0x7) << 3
-
-    elif cf.quadrant == 1:
-        if cf.funct3 in (0, 1, 2):
-            # C.ADDI / C.ADDIW / C.LI: 6-bit signed imm
-            raw = (bit12 << 5) | bits_6_2
-            imm = (raw & 0x1F) - (raw & 0x20) & 0xFFFF_FFFF_FFFF_FFFF
-        elif cf.funct3 == 3:
-            if bits_11_7 == 2:
-                # C.ADDI16SP: 10-bit signed nzimm
-                nz = ((h >> 6) & 0x1) << 4
-                nz |= ((h >> 2) & 0x1) << 5
-                nz |= ((h >> 5) & 0x1) << 6
-                nz |= ((h >> 3) & 0x3) << 7
-                nz |= ((h >> 12) & 0x1) << 9
-                imm = (nz & 0x1FF) - (nz & 0x200) & 0xFFFF_FFFF_FFFF_FFFF
-            else:
-                # C.LUI: 6-bit signed nzimm (shift-left-12 in caller)
-                nz = (bit12 << 5) | bits_6_2
-                imm = (nz & 0x1F) - (nz & 0x20) & 0xFFFF_FFFF_FFFF_FFFF
-        elif cf.funct3 == 5:
-            # C.J: 11-bit signed offset
-            off = bit12 << 11
-            off |= ((h >> 8) & 0x1) << 10
-            off |= ((h >> 9) & 0x3) << 8
-            off |= ((h >> 6) & 0x1) << 7
-            off |= ((h >> 7) & 0x1) << 6
-            off |= ((h >> 2) & 0x1) << 5
-            off |= ((h >> 11) & 0x1) << 4
-            off |= ((h >> 3) & 0x7) << 1
-            imm = (off & 0x7FF) - (off & 0x800) & 0xFFFF_FFFF_FFFF_FFFF
-        elif cf.funct3 in (6, 7):
-            # C.BEQZ / C.BNEZ: 9-bit signed offset
-            off = bit12 << 8
-            off |= ((h >> 10) & 0x3) << 3  # offset[4:3]
-            off |= ((h >> 5) & 0x3) << 6  # offset[7:6]
-            off |= ((h >> 2) & 0x1) << 5  # offset[5]
-            off |= ((h >> 3) & 0x3) << 1  # offset[2:1]
-            imm = (off & 0xFF) - (off & 0x100) & 0xFFFF_FFFF_FFFF_FFFF
-
-    elif cf.quadrant == 2:
-        if cf.funct3 == 0:
-            # C.SLLI: shamt[5:0] = {bit12, bits[6:2]}
-            imm = (bit12 << 5) | bits_6_2
-        elif cf.funct3 == 2:
-            # C.LWSP: uimm[7:6|5|4:2]
-            imm = ((h >> 2) & 0x3) << 6 | ((h >> 12) & 0x1) << 5 | ((h >> 4) & 0x7) << 2
-        elif cf.funct3 in (1, 3):
-            # C.FLDSP / C.LDSP: uimm[5|4:3|8:6]
-            imm = ((h >> 2) & 0x7) << 6 | ((h >> 12) & 0x1) << 5 | ((h >> 5) & 0x3) << 3
-        elif cf.funct3 == 6:
-            # C.SWSP: uimm[5:2|7:6]
-            imm2 = ((h >> 9) & 0xF) << 2 | ((h >> 7) & 0x3) << 6
-        elif cf.funct3 in (5, 7):
-            # C.FSDSP / C.SDSP: uimm[5:3|8:6]
-            imm2 = ((h >> 7) & 0x7) << 6 | ((h >> 10) & 0x7) << 3
+    imm, imm2 = _dc_immediates(h, cf.funct3, cf.quadrant)
 
     cf.imm = imm & 0xFFFF_FFFF_FFFF_FFFF
     cf.imm2 = imm2 & 0xFFFF_FFFF_FFFF_FFFF
     return cf
+
+
+def _dc_immediates(h: int, funct3: int, quadrant: int) -> tuple[int, int]:
+    """按象限解码立即数; 第二个分量只用于象限 2 的存储类指令."""
+    if quadrant == 0:
+        return _dc_imm_q0(h, funct3), 0
+    if quadrant == 1:
+        return _dc_imm_q1(h, funct3), 0
+    if quadrant == 2:
+        return _dc_imm_q2(h, funct3)
+    return 0, 0
+
+
+def _dc_imm_q0(h: int, funct3: int) -> int:
+    """象限 0 的立即数: C.ADDI4SPN / C.LW / C.SW / C.FLD / C.LD / C.FSD / C.SD."""
+    if funct3 == 0:
+        return (
+            ((h >> 6) & 0x1) << 2
+            | ((h >> 5) & 0x1) << 3
+            | ((h >> 11) & 0x1) << 4
+            | ((h >> 12) & 0x1) << 5
+            | ((h >> 7) & 0xF) << 6
+        )
+    if funct3 in (2, 6):
+        # C.LW / C.SW: uimm[5:3|2|6]
+        return ((h >> 6) & 0x1) << 2 | ((h >> 10) & 0x7) << 3 | ((h >> 5) & 0x1) << 6
+    if funct3 in (1, 3, 5, 7):
+        # C.FLD / C.LD / C.FSD / C.SD: uimm[5:3|6|7]
+        return ((h >> 5) & 0x3) << 6 | ((h >> 10) & 0x7) << 3
+    return 0
+
+
+def _dc_imm_q1_lui(h: int, bit12: int, bits_6_2: int) -> int:
+    """funct3=011: C.ADDI16SP (rd=2) 的 10 位 nzimm, 否则 C.LUI 的 6 位 nzimm."""
+    bits_11_7 = (h >> 7) & 0x1F
+    if bits_11_7 == 2:
+        # C.ADDI16SP: 10-bit signed nzimm
+        nz = ((h >> 6) & 0x1) << 4
+        nz |= ((h >> 2) & 0x1) << 5
+        nz |= ((h >> 5) & 0x1) << 6
+        nz |= ((h >> 3) & 0x3) << 7
+        nz |= bit12 << 9
+        return (nz & 0x1FF) - (nz & 0x200) & 0xFFFF_FFFF_FFFF_FFFF
+    # C.LUI: 6-bit signed nzimm (shift-left-12 in caller)
+    nz = (bit12 << 5) | bits_6_2
+    return (nz & 0x1F) - (nz & 0x20) & 0xFFFF_FFFF_FFFF_FFFF
+
+
+def _dc_imm_q1(h: int, funct3: int) -> int:
+    """象限 1 的立即数: 立即数算术、C.ADDI16SP / C.LUI、跳转与分支."""
+    bit12 = (h >> 12) & 0x1
+    bits_6_2 = (h >> 2) & 0x1F
+    if funct3 in (0, 1, 2):
+        # C.ADDI / C.ADDIW / C.LI: 6-bit signed imm
+        raw = (bit12 << 5) | bits_6_2
+        return (raw & 0x1F) - (raw & 0x20) & 0xFFFF_FFFF_FFFF_FFFF
+    if funct3 == 3:
+        return _dc_imm_q1_lui(h, bit12, bits_6_2)
+    if funct3 == 5:
+        # C.J: 11-bit signed offset
+        off = bit12 << 11
+        off |= ((h >> 8) & 0x1) << 10
+        off |= ((h >> 9) & 0x3) << 8
+        off |= ((h >> 6) & 0x1) << 7
+        off |= ((h >> 7) & 0x1) << 6
+        off |= ((h >> 2) & 0x1) << 5
+        off |= ((h >> 11) & 0x1) << 4
+        off |= ((h >> 3) & 0x7) << 1
+        return (off & 0x7FF) - (off & 0x800) & 0xFFFF_FFFF_FFFF_FFFF
+    if funct3 in (6, 7):
+        # C.BEQZ / C.BNEZ: 9-bit signed offset
+        off = bit12 << 8
+        off |= ((h >> 10) & 0x3) << 3  # offset[4:3]
+        off |= ((h >> 5) & 0x3) << 6  # offset[7:6]
+        off |= ((h >> 2) & 0x1) << 5  # offset[5]
+        off |= ((h >> 3) & 0x3) << 1  # offset[2:1]
+        return (off & 0xFF) - (off & 0x100) & 0xFFFF_FFFF_FFFF_FFFF
+    return 0
+
+
+def _dc_imm_q2(h: int, funct3: int) -> tuple[int, int]:
+    """象限 2 的立即数: 载入类的偏移写入第一个分量, 存储类的偏移写入第二个."""
+    bit12 = (h >> 12) & 0x1
+    bits_6_2 = (h >> 2) & 0x1F
+    if funct3 == 0:
+        return (bit12 << 5) | bits_6_2, 0
+    if funct3 == 2:
+        return ((h >> 2) & 0x3) << 6 | bit12 << 5 | ((h >> 4) & 0x7) << 2, 0
+    if funct3 in (1, 3):
+        # C.FLDSP / C.LDSP: uimm[5|4:3|8:6]
+        return ((h >> 2) & 0x7) << 6 | bit12 << 5 | ((h >> 5) & 0x3) << 3, 0
+    if funct3 == 6:
+        return 0, ((h >> 9) & 0xF) << 2 | ((h >> 7) & 0x3) << 6
+    if funct3 in (5, 7):
+        # C.FSDSP / C.SDSP: uimm[5:3|8:6]
+        return 0, ((h >> 7) & 0x7) << 6 | ((h >> 10) & 0x7) << 3
+    return 0, 0
 
 
 def decode_compressed(half: int) -> CompressedFields:
@@ -424,8 +455,7 @@ def decode_compressed(half: int) -> CompressedFields:
 
 
 # ============================================================
-#  Phase 2a: PMP check (Rust wrapper — no pure-Python fallback;
-#            the existing pmp.py::Pmp.check() IS the fallback)
+# PMP check
 # ============================================================
 
 
@@ -433,20 +463,13 @@ def pmp_check(
     cfg_bytes: bytes,
     addr_array,
     num_entries: int,
-    pa: int,
-    size: int,
-    *,
-    is_write: bool = False,
-    is_execute: bool = False,
-    mode_val: int = 1,
-    mstatus_val: int = 0,
-    pmpsplit: int = 0,
-    mdid: int = 0,
+    access: PmpAccessInfo,
 ) -> bool:
     """Check PMP access via Rust — all state passed as parameters.
 
     *cfg_bytes* is a ``bytes`` object (64 bytes, one per entry).
     *addr_array* is an ``array('Q')`` or list of 64 u64 raw pmpaddr values.
+    *access* 给出物理地址、访问宽度与访问属性.
 
     Returns True if the access is allowed.
     """
@@ -460,20 +483,20 @@ def pmp_check(
             ctypes.addressof(cfg_buf),
             ctypes.addressof(addr_buf),
             num_entries,
-            pa,
-            size,
-            1 if is_write else 0,
-            1 if is_execute else 0,
-            mode_val,
-            mstatus_val,
-            pmpsplit,
-            mdid,
+            access.pa,
+            access.size,
+            1 if access.is_write else 0,
+            1 if access.is_execute else 0,
+            access.mode_val,
+            access.mstatus_val,
+            access.pmpsplit,
+            access.mdid,
         )
     )
 
 
 # ============================================================
-#  Phase 2b: Sv39 MMU helpers (with pure Python fallback)
+# Sv39 MMU helpers
 # ============================================================
 
 
@@ -495,12 +518,12 @@ def pte_parse(raw: int) -> PteFields:
     if _lib:
         return _lib.pte_parse(raw)
     raw &= 0xFFFF_FFFF_FFFF_FFFF
-    PTE_V = 1 << 0
-    PTE_R = 1 << 1
-    PTE_X = 1 << 3
+    pte_v = 1 << 0
+    pte_r = 1 << 1
+    pte_x = 1 << 3
     ppn = (raw >> 10) & 0xFFF_FFFF_FFFF
-    v = 1 if raw & PTE_V else 0
-    r_or_x = raw & (PTE_R | PTE_X)
+    v = 1 if raw & pte_v else 0
+    r_or_x = raw & (pte_r | pte_x)
     f = PteFields()
     f.ppn = ppn
     f.perm = raw & 0x1E  # R|W|X|U = bits 4:1
@@ -530,7 +553,7 @@ def sv39_page_size(level: int) -> int:
 
 
 # ============================================================
-#  Phase 2c: ALU pure-compute ops (with pure Python fallback)
+# ALU pure-compute ops
 # ============================================================
 
 _sint64 = ctypes.c_int64
@@ -585,183 +608,289 @@ def exec_alu_op(funct3: int, funct7: int, v1: int, v2: int) -> Alu64:
     if _lib:
         return _lib.exec_alu_op(funct3, funct7, v1, v2)
     # Pure Python fallback
-    if funct3 == 0b000:
-        if funct7 == 0:
-            return _alu_ok((v1 + v2) & 0xFFFF_FFFF_FFFF_FFFF)
-        elif funct7 == 1:
-            return _alu_ok((v1 * v2) & 0xFFFF_FFFF_FFFF_FFFF)
-        elif funct7 == 0x20:
-            return _alu_ok((v1 - v2) & 0xFFFF_FFFF_FFFF_FFFF)
-        else:
-            return _alu_ill()
-    elif funct3 == 0b001:
-        if funct7 == 0:
-            return _alu_ok((v1 << (v2 & 0x3F)) & 0xFFFF_FFFF_FFFF_FFFF)
-        elif funct7 == 1:
-            s1 = _sint64(v1).value
-            s2 = _sint64(v2).value
-            return _alu_ok(_sint64((s1 * s2) >> 64).value & 0xFFFF_FFFF_FFFF_FFFF)
-        else:
-            return _alu_ill()
-    elif funct3 == 0b010:
-        if funct7 == 0:
-            return _alu_ok(1 if _sint64(v1).value < _sint64(v2).value else 0)
-        elif funct7 == 1:
-            s1 = _sint64(v1).value
-            u2 = _uint64(v2).value
-            return _alu_ok(_sint64((s1 * u2) >> 64).value & 0xFFFF_FFFF_FFFF_FFFF)
-        else:
-            return _alu_ill()
-    elif funct3 == 0b011:
-        if funct7 == 0:
-            return _alu_ok(1 if _uint64(v1).value < _uint64(v2).value else 0)
-        elif funct7 == 1:
-            u1 = _uint64(v1).value
-            u2 = _uint64(v2).value
-            return _alu_ok((u1 * u2) >> 64)
-        else:
-            return _alu_ill()
-    elif funct3 == 0b100:
-        if funct7 == 0:
-            return _alu_ok(v1 ^ v2)
-        elif funct7 == 1:
-            return _alu_ok(
-                _trunc_div(_sint64(v1).value, _sint64(v2).value) & 0xFFFF_FFFF_FFFF_FFFF
-            )
-        else:
-            return _alu_ill()
-    elif funct3 == 0b101:
-        if funct7 == 0:
-            return _alu_ok(_uint64(v1).value >> (v2 & 0x3F))
-        elif funct7 == 1:
-            return _alu_ok(_trunc_div(_uint64(v1).value, _uint64(v2).value))
-        elif funct7 == 0x20:
-            return _alu_ok(
-                _sint64(_sint64(v1).value >> (v2 & 0x3F)).value & 0xFFFF_FFFF_FFFF_FFFF
-            )
-        else:
-            return _alu_ill()
-    elif funct3 == 0b110:
-        if funct7 == 0:
-            return _alu_ok(v1 | v2)
-        elif funct7 == 1:
-            return _alu_ok(
-                _trunc_rem(_sint64(v1).value, _sint64(v2).value) & 0xFFFF_FFFF_FFFF_FFFF
-            )
-        else:
-            return _alu_ill()
-    elif funct3 == 0b111:
-        if funct7 == 0:
-            return _alu_ok(v1 & v2)
-        elif funct7 == 1:
-            return _alu_ok(
-                _trunc_rem(_uint64(v1).value, _uint64(v2).value) & 0xFFFF_FFFF_FFFF_FFFF
-            )
-        else:
-            return _alu_ill()
+    handler = _ALU_FUNCT3.get(funct3)
+    if handler is None:
+        return _alu_ill()
+    return handler(funct7, v1, v2)
+
+
+def _alu_add_sub_mul(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=000: add / mul / sub."""
+    if funct7 == 0:
+        return _alu_ok((v1 + v2) & 0xFFFF_FFFF_FFFF_FFFF)
+    if funct7 == 1:
+        return _alu_ok((v1 * v2) & 0xFFFF_FFFF_FFFF_FFFF)
+    if funct7 == 0x20:
+        return _alu_ok((v1 - v2) & 0xFFFF_FFFF_FFFF_FFFF)
     return _alu_ill()
+
+
+def _alu_sll_mulh(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=001: sll / mulh."""
+    if funct7 == 0:
+        return _alu_ok((v1 << (v2 & 0x3F)) & 0xFFFF_FFFF_FFFF_FFFF)
+    if funct7 == 1:
+        s1 = _sint64(v1).value
+        s2 = _sint64(v2).value
+        return _alu_ok(_sint64((s1 * s2) >> 64).value & 0xFFFF_FFFF_FFFF_FFFF)
+    return _alu_ill()
+
+
+def _alu_slt_mulhsu(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=010: slt / mulhsu."""
+    if funct7 == 0:
+        return _alu_ok(1 if _sint64(v1).value < _sint64(v2).value else 0)
+    if funct7 == 1:
+        s1 = _sint64(v1).value
+        u2 = _uint64(v2).value
+        return _alu_ok(_sint64((s1 * u2) >> 64).value & 0xFFFF_FFFF_FFFF_FFFF)
+    return _alu_ill()
+
+
+def _alu_sltu_mulhu(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=011: sltu / mulhu."""
+    if funct7 == 0:
+        return _alu_ok(1 if _uint64(v1).value < _uint64(v2).value else 0)
+    if funct7 == 1:
+        u1 = _uint64(v1).value
+        u2 = _uint64(v2).value
+        return _alu_ok((u1 * u2) >> 64)
+    return _alu_ill()
+
+
+def _alu_xor_div(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=100: xor / div."""
+    if funct7 == 0:
+        return _alu_ok(v1 ^ v2)
+    if funct7 == 1:
+        return _alu_ok(
+            _trunc_div(_sint64(v1).value, _sint64(v2).value) & 0xFFFF_FFFF_FFFF_FFFF
+        )
+    return _alu_ill()
+
+
+def _alu_srl_sra_divu(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=101: srl / divu / sra."""
+    if funct7 == 0:
+        return _alu_ok(_uint64(v1).value >> (v2 & 0x3F))
+    if funct7 == 1:
+        return _alu_ok(_trunc_div(_uint64(v1).value, _uint64(v2).value))
+    if funct7 == 0x20:
+        return _alu_ok(_sint64(_sint64(v1).value >> (v2 & 0x3F)).value & 0xFFFF_FFFF_FFFF_FFFF)
+    return _alu_ill()
+
+
+def _alu_or_rem(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=110: or / rem."""
+    if funct7 == 0:
+        return _alu_ok(v1 | v2)
+    if funct7 == 1:
+        return _alu_ok(
+            _trunc_rem(_sint64(v1).value, _sint64(v2).value) & 0xFFFF_FFFF_FFFF_FFFF
+        )
+    return _alu_ill()
+
+
+def _alu_and_remu(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=111: and / remu."""
+    if funct7 == 0:
+        return _alu_ok(v1 & v2)
+    if funct7 == 1:
+        return _alu_ok(
+            _trunc_rem(_uint64(v1).value, _uint64(v2).value) & 0xFFFF_FFFF_FFFF_FFFF
+        )
+    return _alu_ill()
+
+
+_ALU_FUNCT3: dict[int, Callable[[int, int, int], Alu64]] = {
+    0b000: _alu_add_sub_mul,
+    0b001: _alu_sll_mulh,
+    0b010: _alu_slt_mulhsu,
+    0b011: _alu_sltu_mulhu,
+    0b100: _alu_xor_div,
+    0b101: _alu_srl_sra_divu,
+    0b110: _alu_or_rem,
+    0b111: _alu_and_remu,
+}
 
 
 def exec_op_imm(funct3: int, funct7: int, v1: int, imm: int) -> Alu64:
     """RISC-V I-type ALU: returns Alu64(value, trap)."""
     if _lib:
         return _lib.exec_op_imm(funct3, funct7, v1, imm)
+    handler = _OP_IMM_FUNCT3.get(funct3)
+    if handler is None:
+        return _alu_ill()
+    return handler(funct7, v1, imm)
+
+
+def _opimm_addi(funct7: int, v1: int, imm: int) -> Alu64:
+    return _alu_ok((v1 + imm) & 0xFFFF_FFFF_FFFF_FFFF)
+
+
+def _opimm_slli(funct7: int, v1: int, imm: int) -> Alu64:
+    if funct7 >> 1 != 0:
+        return _alu_ill()
+    return _alu_ok((v1 << (imm & 0x3F)) & 0xFFFF_FFFF_FFFF_FFFF)
+
+
+def _opimm_slti(funct7: int, v1: int, imm: int) -> Alu64:
+    # SLTI 的两个操作数都按有符号数比较: imm 已规范到 [0, 2**64), 不能直接参与比较
+    return _alu_ok(1 if _sint64(v1).value < _sint64(imm).value else 0)
+
+
+def _opimm_sltiu(funct7: int, v1: int, imm: int) -> Alu64:
+    return _alu_ok(1 if _uint64(v1).value < _uint64(imm).value else 0)
+
+
+def _opimm_xori(funct7: int, v1: int, imm: int) -> Alu64:
+    return _alu_ok(v1 ^ imm)
+
+
+def _opimm_srli_srai(funct7: int, v1: int, imm: int) -> Alu64:
+    """funct6 区分 SRLI 与 SRAI, 移位量为 imm 的低 6 位."""
     shamt = imm & 0x3F
     funct6 = funct7 >> 1
-    if funct3 == 0b000:
-        return _alu_ok((v1 + imm) & 0xFFFF_FFFF_FFFF_FFFF)
-    elif funct3 == 0b001:
-        if funct6 != 0:
-            return _alu_ill()
-        return _alu_ok((v1 << shamt) & 0xFFFF_FFFF_FFFF_FFFF)
-    elif funct3 == 0b010:
-        # SLTI 的两个操作数都按有符号数比较: imm 已规范到 [0, 2**64), 不能直接参与比较
-        return _alu_ok(1 if _sint64(v1).value < _sint64(imm).value else 0)
-    elif funct3 == 0b011:
-        return _alu_ok(1 if _uint64(v1).value < _uint64(imm).value else 0)
-    elif funct3 == 0b100:
-        return _alu_ok(v1 ^ imm)
-    elif funct3 == 0b101:
-        if funct6 == 0:
-            return _alu_ok(_uint64(v1).value >> shamt)
-        elif funct6 == 0x10:
-            return _alu_ok(_sint64(_sint64(v1).value >> shamt).value & 0xFFFF_FFFF_FFFF_FFFF)
-        else:
-            return _alu_ill()
-    elif funct3 == 0b110:
-        return _alu_ok(v1 | imm)
-    elif funct3 == 0b111:
-        return _alu_ok(v1 & imm)
+    if funct6 == 0:
+        return _alu_ok(_uint64(v1).value >> shamt)
+    if funct6 == 0x10:
+        return _alu_ok(_sint64(_sint64(v1).value >> shamt).value & 0xFFFF_FFFF_FFFF_FFFF)
     return _alu_ill()
+
+
+def _opimm_ori(funct7: int, v1: int, imm: int) -> Alu64:
+    return _alu_ok(v1 | imm)
+
+
+def _opimm_andi(funct7: int, v1: int, imm: int) -> Alu64:
+    return _alu_ok(v1 & imm)
+
+
+_OP_IMM_FUNCT3: dict[int, Callable[[int, int, int], Alu64]] = {
+    0b000: _opimm_addi,
+    0b001: _opimm_slli,
+    0b010: _opimm_slti,
+    0b011: _opimm_sltiu,
+    0b100: _opimm_xori,
+    0b101: _opimm_srli_srai,
+    0b110: _opimm_ori,
+    0b111: _opimm_andi,
+}
 
 
 def exec_op32(funct3: int, funct7: int, v1: int, v2: int) -> Alu64:
     """RISC-V RV64 32-bit word ALU: returns Alu64(value, trap)."""
     if _lib:
         return _lib.exec_op32(funct3, funct7, v1, v2)
-    # 32 位运算的操作数一律按有符号数解释 (DIVW/REMW/SRAW 依赖这一点)
+    handler = _OP32_FUNCT3.get(funct3)
+    if handler is None:
+        return _alu_ill()
+    return handler(funct7, v1, v2)
+
+
+def _op32_add_sub_mul(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=000: addw / mulw / subw."""
     w1 = v1 & 0xFFFF_FFFF
     w2 = v2 & 0xFFFF_FFFF
-    s1 = _sint32(w1)
-    s2 = _sint32(w2)
-    if funct3 == 0b000:
-        if funct7 == 0:
-            return _alu_ok(_sext32((w1 + w2) & 0xFFFF_FFFF))
-        elif funct7 == 1:
-            return _alu_ok(_sext32((w1 * w2) & 0xFFFF_FFFF))
-        elif funct7 == 0x20:
-            return _alu_ok(_sext32((w1 - w2) & 0xFFFF_FFFF))
-        else:
-            return _alu_ill()
-    elif funct3 == 0b001:
-        if funct7 != 0:
-            return _alu_ill()
-        return _alu_ok(_sext32((w1 << (w2 & 0x1F)) & 0xFFFF_FFFF))
-    elif funct3 == 0b100:
-        if funct7 != 1:
-            return _alu_ill()
-        return _alu_ok(_sext32(_trunc_div(s1, s2) & 0xFFFF_FFFF))
-    elif funct3 == 0b101:
-        if funct7 == 0:
-            return _alu_ok(_sext32((w1 >> (w2 & 0x1F)) & 0xFFFF_FFFF))
-        elif funct7 == 1:
-            return _alu_ok(_sext32(_trunc_div(w1, w2) & 0xFFFF_FFFF))
-        elif funct7 == 0x20:
-            return _alu_ok(_sext32((s1 >> (w2 & 0x1F)) & 0xFFFF_FFFF))
-        else:
-            return _alu_ill()
-    elif funct3 == 0b110:
-        if funct7 != 1:
-            return _alu_ill()
-        return _alu_ok(_sext32(_trunc_rem(s1, s2) & 0xFFFF_FFFF))
-    elif funct3 == 0b111:
-        if funct7 != 1:
-            return _alu_ill()
-        return _alu_ok(_sext32(_trunc_rem(w1, w2) & 0xFFFF_FFFF))
+    if funct7 == 0:
+        return _alu_ok(_sext32((w1 + w2) & 0xFFFF_FFFF))
+    if funct7 == 1:
+        return _alu_ok(_sext32((w1 * w2) & 0xFFFF_FFFF))
+    if funct7 == 0x20:
+        return _alu_ok(_sext32((w1 - w2) & 0xFFFF_FFFF))
     return _alu_ill()
+
+
+def _op32_sllw(funct7: int, v1: int, v2: int) -> Alu64:
+    if funct7 != 0:
+        return _alu_ill()
+    return _alu_ok(_sext32(((v1 & 0xFFFF_FFFF) << (v2 & 0x1F)) & 0xFFFF_FFFF))
+
+
+def _op32_divw(funct7: int, v1: int, v2: int) -> Alu64:
+    if funct7 != 1:
+        return _alu_ill()
+    s1 = _sint32(v1 & 0xFFFF_FFFF)
+    s2 = _sint32(v2 & 0xFFFF_FFFF)
+    return _alu_ok(_sext32(_trunc_div(s1, s2) & 0xFFFF_FFFF))
+
+
+def _op32_srl_sra_divuw(funct7: int, v1: int, v2: int) -> Alu64:
+    """funct3=101: srlw / divuw / sraw, 操作数一律按有符号数解释."""
+    w1 = v1 & 0xFFFF_FFFF
+    w2 = v2 & 0xFFFF_FFFF
+    if funct7 == 0:
+        return _alu_ok(_sext32((w1 >> (w2 & 0x1F)) & 0xFFFF_FFFF))
+    if funct7 == 1:
+        return _alu_ok(_sext32(_trunc_div(w1, w2) & 0xFFFF_FFFF))
+    if funct7 == 0x20:
+        return _alu_ok(_sext32((_sint32(w1) >> (w2 & 0x1F)) & 0xFFFF_FFFF))
+    return _alu_ill()
+
+
+def _op32_remw(funct7: int, v1: int, v2: int) -> Alu64:
+    if funct7 != 1:
+        return _alu_ill()
+    s1 = _sint32(v1 & 0xFFFF_FFFF)
+    s2 = _sint32(v2 & 0xFFFF_FFFF)
+    return _alu_ok(_sext32(_trunc_rem(s1, s2) & 0xFFFF_FFFF))
+
+
+def _op32_remuw(funct7: int, v1: int, v2: int) -> Alu64:
+    if funct7 != 1:
+        return _alu_ill()
+    w1 = v1 & 0xFFFF_FFFF
+    w2 = v2 & 0xFFFF_FFFF
+    return _alu_ok(_sext32(_trunc_rem(w1, w2) & 0xFFFF_FFFF))
+
+
+_OP32_FUNCT3: dict[int, Callable[[int, int, int], Alu64]] = {
+    0b000: _op32_add_sub_mul,
+    0b001: _op32_sllw,
+    0b100: _op32_divw,
+    0b101: _op32_srl_sra_divuw,
+    0b110: _op32_remw,
+    0b111: _op32_remuw,
+}
 
 
 def exec_op_imm32(funct3: int, funct7: int, v1: int, imm: int) -> Alu64:
     """RISC-V RV64 32-bit immediate ALU: returns Alu64(value, trap)."""
     if _lib:
         return _lib.exec_op_imm32(funct3, funct7, v1, imm)
+    handler = _OP_IMM32_FUNCT3.get(funct3)
+    if handler is None:
+        return _alu_ill()
+    return handler(funct7, v1, imm)
+
+
+def _opimm32_addiw(funct7: int, v1: int, imm: int) -> Alu64:
+    return _alu_ok(_sext32(((v1 & 0xFFFF_FFFF) + (imm & 0xFFFF_FFFF)) & 0xFFFF_FFFF))
+
+
+def _opimm32_slliw(funct7: int, v1: int, imm: int) -> Alu64:
+    if funct7 != 0:
+        return _alu_ill()
+    return _alu_ok(_sext32(((v1 & 0xFFFF_FFFF) << (imm & 0x1F)) & 0xFFFF_FFFF))
+
+
+def _opimm32_srliw_sraiw(funct7: int, v1: int, imm: int) -> Alu64:
+    """funct6 区分 SRLIW 与 SRAIW."""
     w1 = v1 & 0xFFFF_FFFF
     shamt = imm & 0x1F
-    if funct3 == 0b000:
-        return _alu_ok(_sext32((w1 + (imm & 0xFFFF_FFFF)) & 0xFFFF_FFFF))
-    elif funct3 == 0b001:
-        if funct7 != 0:
-            return _alu_ill()
-        return _alu_ok(_sext32((w1 << shamt) & 0xFFFF_FFFF))
-    elif funct3 == 0b101:
-        funct6 = funct7 >> 1
-        if funct6 == 0:
-            return _alu_ok(_sext32((w1 >> shamt) & 0xFFFF_FFFF))
-        elif funct6 == 0x10:
-            return _alu_ok(_sext32((_sint32(w1) >> shamt) & 0xFFFF_FFFF))
-        else:
-            return _alu_ill()
+    funct6 = funct7 >> 1
+    if funct6 == 0:
+        return _alu_ok(_sext32((w1 >> shamt) & 0xFFFF_FFFF))
+    if funct6 == 0x10:
+        return _alu_ok(_sext32((_sint32(w1) >> shamt) & 0xFFFF_FFFF))
     return _alu_ill()
+
+
+_OP_IMM32_FUNCT3: dict[int, Callable[[int, int, int], Alu64]] = {
+    0b000: _opimm32_addiw,
+    0b001: _opimm32_slliw,
+    0b101: _opimm32_srliw_sraiw,
+}
 
 
 # ============================================================
@@ -770,86 +899,81 @@ def exec_op_imm32(funct3: int, funct7: int, v1: int, imm: int) -> Alu64:
 
 
 def fp_exec_op(
-    funct7: int, funct3: int, rs2: int, rs1_bits: int, rs2_bits: int, frm: int
+    funct7: int,
+    funct3: int,
+    rs2: int,
+    src_bits: tuple[int, int],
+    frm: int,
 ) -> FpOut:
     """OP-FP compute via native softfloat.  Requires the native library.
+
+    *src_bits* 为 (rs1 的位模式, rs2 的位模式); 整数源与浮点源都由调用方按
+    指令语义取好.
 
     Raises NotImplementedError if ``.so`` is unavailable (caller converts
     to IllInstr) — there is no pure-Python floating-point fallback.
     """
     if _lib is None:
         raise NotImplementedError("FPU requires native library (libdecode.so)")
+    rs1_bits, rs2_bits = src_bits
     return _lib.fp_exec_op(funct7, funct3, rs2, rs1_bits, rs2_bits, frm)
 
 
 def fp_exec_fma(
-    opcode: int, rm: int, fmt: int, rs1: int, rs2: int, rs3: int, frm: int
+    opcode: int,
+    rm: int,
+    fmt: int,
+    src_bits: tuple[int, int, int],
+    frm: int,
 ) -> FpOut:
-    """FMA compute via native softfloat.  Requires the native library."""
+    """FMA compute via native softfloat.  Requires the native library.
+
+    *src_bits* 为 (rs1, rs2, rs3) 三个浮点源操作数的位模式.
+    """
     if _lib is None:
         raise NotImplementedError("FPU requires native library (libdecode.so)")
+    rs1, rs2, rs3 = src_bits
     return _lib.fp_exec_fma(opcode, rm, fmt, rs1, rs2, rs3, frm)
 
 
 # ============================================================
-#  Phase 3: RAM direct read/write (zero-allocation fast path)
+# RAM direct read/write (zero-allocation fast path)
 # ============================================================
 
 
 def bus_read_ram(
-    ram_ptr: int,  # RAM 缓冲区首地址
-    ram_size: int,
-    ram_base: int,
-    shadow_base: int,
-    shadow_size: int,
+    ram_win: tuple[int, int, int, int, int],
     pa: int,
     size: int,
     out_buf,  # ctypes array for output (pre-allocated 8 bytes)
 ) -> int:
     """Read *size* bytes from physical address *pa* directly into *out_buf*.
 
+    *ram_win* 为 RAM 直读窗口: (RAM 缓冲区首地址, 字节数, 基址, 影子窗口基址,
+    影子窗口字节数).
+
     Returns 1 if the address falls within RAM (primary or shadow); 0 otherwise.
     Caller falls back to device / L2-cache / error logic on failure.
     """
     if _lib:
-        return _lib.bus_read_ram(
-            ram_ptr,
-            ram_size,
-            ram_base,
-            shadow_base,
-            shadow_size,
-            pa,
-            size,
-            out_buf,
-        )
+        return _lib.bus_read_ram(*ram_win, pa, size, out_buf)
     return 0  # no native lib — caller uses pure-Python path
 
 
 def bus_write_ram(
-    ram_ptr: int,  # RAM 缓冲区首地址
-    ram_size: int,
-    ram_base: int,
-    shadow_base: int,
-    shadow_size: int,
+    ram_win: tuple[int, int, int, int, int],
     pa: int,
     data,  # bytes to write
     size: int,
 ) -> int:
     """Write *size* bytes from *data* to physical address *pa*.
 
+    *ram_win* 的含义同 :func:`bus_read_ram`.
+
     Returns 1 if the address falls within RAM; 0 otherwise.
     """
     if _lib:
-        return _lib.bus_write_ram(
-            ram_ptr,
-            ram_size,
-            ram_base,
-            shadow_base,
-            shadow_size,
-            pa,
-            data,
-            size,
-        )
+        return _lib.bus_write_ram(*ram_win, pa, data, size)
     return 0  # no native lib — caller uses pure-Python path
 
 
@@ -860,6 +984,7 @@ def bus_write_ram(
 
 class MemCtx(ctypes.Structure):
     """Memory context — matches Rust ``MemCtx``."""
+
     _fields_ = [
         ("ram", ctypes.c_void_p),
         ("ram_size", ctypes.c_uint64),
@@ -871,6 +996,7 @@ class MemCtx(ctypes.Structure):
 
 class FfiPmpCtx(ctypes.Structure):
     """PMP context — matches Rust ``FfiPmpCtx``."""
+
     _fields_ = [
         ("cfg", ctypes.c_void_p),
         ("addr", ctypes.c_void_p),
@@ -881,6 +1007,7 @@ class FfiPmpCtx(ctypes.Structure):
 
 class FfiClintCtx(ctypes.Structure):
     """CLINT context — matches Rust ``FfiClintCtx``."""
+
     _fields_ = [
         ("mtime", ctypes.c_void_p),
         ("mtimecmp", ctypes.c_void_p),
@@ -892,6 +1019,7 @@ class FfiClintCtx(ctypes.Structure):
 
 class DevMMIOAddrInfo(ctypes.Structure):
     """Device MMIO address ranges — matches Rust ``DevMMIOAddrInfo``."""
+
     _fields_ = [
         ("bases", ctypes.c_void_p),
         ("ends", ctypes.c_void_p),
@@ -906,6 +1034,7 @@ class FfiPlicCtx(ctypes.Structure):
     (claim/complete/priority/enable/threshold), 设备中断投递目标经 ``set_irq``
     直接 write-through pending/level, 保证 batch 内新设备中断对 Rust 可见.
     """
+
     _fields_ = [
         ("base", ctypes.c_uint64),
         ("num_sources", ctypes.c_uint32),
@@ -924,6 +1053,7 @@ class FfiWatchdogCtx(ctypes.Structure):
 
     携带一次加速执行的时钟源超时时间 ``timeout_ns`` (纳秒, 0 = 禁用).
     """
+
     _fields_ = [
         ("timeout_ns", ctypes.c_uint64),
     ]
@@ -931,23 +1061,25 @@ class FfiWatchdogCtx(ctypes.Structure):
 
 class FfiUartCtx(ctypes.Structure):
     """UART context — matches Rust ``FfiUartCtx``."""
+
     _fields_ = [
         ("base", ctypes.c_uint64),
         ("tx_buf", ctypes.c_void_p),
         ("tx_cap", ctypes.c_uint32),
         ("tx_wr", ctypes.c_void_p),
-        ("ie", ctypes.c_uint32),          # IE 寄存器影子 (offset 0x10)
-        ("txctrl", ctypes.c_uint32),      # TXCTRL 影子 (offset 0x08)
-        ("rxctrl", ctypes.c_uint32),      # RXCTRL 影子 (offset 0x0C)
-        ("rx_fifo_len", ctypes.c_uint32), # RX FIFO 近似填充量
-        ("tx_notify_fd", ctypes.c_int32), # pipe write-end: Rust 通知 TX 线程
-        ("no_stdout", ctypes.c_uint8),    # 1=Rust 不写 stdout, Python TX 统一输出
-        ("rx_notify", ctypes.c_void_p),   # *mut u8 — TermIO 有新 RX 数据标志
+        ("ie", ctypes.c_uint32),  # IE 寄存器影子 (offset 0x10)
+        ("txctrl", ctypes.c_uint32),  # TXCTRL 影子 (offset 0x08)
+        ("rxctrl", ctypes.c_uint32),  # RXCTRL 影子 (offset 0x0C)
+        ("rx_fifo_len", ctypes.c_uint32),  # RX FIFO 近似填充量
+        ("tx_notify_fd", ctypes.c_int32),  # pipe write-end: Rust 通知 TX 线程
+        ("no_stdout", ctypes.c_uint8),  # 1=Rust 不写 stdout, Python TX 统一输出
+        ("rx_notify", ctypes.c_void_p),  # *mut u8 — TermIO 有新 RX 数据标志
     ]
 
 
 class FfiVirtIOCtx(ctypes.Structure):
     """virtio-blk MMIO inline context — matches Rust ``FfiVirtIoCtx``."""
+
     _fields_ = [
         ("base", ctypes.c_uint64),
         ("capacity", ctypes.c_uint64),
@@ -971,6 +1103,7 @@ class FfiVirtIOCtx(ctypes.Structure):
 
 class FfiExtIrqCtx(ctypes.Structure):
     """Shared external-interrupt context — matches Rust ``FfiExtIrqCtx``."""
+
     _fields_ = [
         ("pending", ctypes.c_uint8),
         ("sources", ctypes.c_uint32),
@@ -981,6 +1114,7 @@ class FfiExtIrqCtx(ctypes.Structure):
 
 class FfiHartCtx(ctypes.Structure):
     """Grouped hart execution context — matches Rust ``FfiHartCtx``."""
+
     _fields_ = [
         ("states", ctypes.c_void_p),
         ("num_harts", ctypes.c_uint32),
@@ -992,6 +1126,7 @@ class FfiHartCtx(ctypes.Structure):
 
 class FfiMemCtx(ctypes.Structure):
     """内存与保护上下文 — matches Rust ``FfiMemCtx``."""
+
     _fields_ = [
         ("mem", ctypes.c_void_p),
         ("pmp", ctypes.c_void_p),
@@ -1000,6 +1135,7 @@ class FfiMemCtx(ctypes.Structure):
 
 class FfiInterruptCtx(ctypes.Structure):
     """中断控制器上下文 — matches Rust ``FfiInterruptCtx``."""
+
     _fields_ = [
         ("clint", ctypes.c_void_p),
         ("plic", ctypes.c_void_p),
@@ -1008,6 +1144,7 @@ class FfiInterruptCtx(ctypes.Structure):
 
 class FfiDevicesCtx(ctypes.Structure):
     """设备上下文 — matches Rust ``FfiDevicesCtx``."""
+
     _fields_ = [
         ("dev", ctypes.c_void_p),
         ("uart", ctypes.c_void_p),
@@ -1018,6 +1155,7 @@ class FfiDevicesCtx(ctypes.Structure):
 
 class FfiBpCtx(ctypes.Structure):
     """Grouped breakpoint context — matches Rust ``FfiBpCtx``."""
+
     _fields_ = [
         ("addrs", ctypes.c_void_p),
         ("count", ctypes.c_uint32),
@@ -1026,6 +1164,7 @@ class FfiBpCtx(ctypes.Structure):
 
 class FfiTlbCtx(ctypes.Structure):
     """TLB 刷新计数跨 FFI 边界传递的两处存放位置, 与 Rust ``FfiTlbCtx`` 一致."""
+
     _fields_ = [
         ("flush_cnt", ctypes.c_void_p),
         ("flush_cnt_per_hart", ctypes.c_void_p),
@@ -1044,6 +1183,7 @@ class PmpInfo:
     ctypes arrays) or pre-built ctypes arrays (used directly, enabling
     Rust to mutate the underlying memory).
     """
+
     __slots__ = ("cfg", "addr", "num", "pmpsplit")
 
     def __init__(self, cfg=None, addr=None, pmpsplit: int = 0, hart_num: int = 1):
@@ -1079,40 +1219,29 @@ class PmpInfo:
         hn = hart_num if hart_num > 0 else 1
         self.num = total // hn
         if self.num > 0xFF:
-            raise ValueError(
-                f"per-hart PMP num={self.num} 超出 FfiPmpCtx.num (u8) 范围"
-            )
+            raise ValueError(f"per-hart PMP num={self.num} 超出 FfiPmpCtx.num (u8) 范围")
 
 
+@dataclass(slots=True)
 class ClintInfo:
     """CLINT state"""
-    __slots__ = ("mtime", "mtimecmp", "msip", "base", "timebase_hz")
 
-    def __init__(
-        self,
-        mtime: int = 0,
-        mtimecmp=None,
-        msip=None,
-        base: int = 0,
-        timebase_hz: int = 10_000_000,
-    ):
-        self.mtime = mtime
-        self.mtimecmp = mtimecmp        # list or ctypes array
-        self.msip = msip                # list or ctypes array (level + edge counter)
-        self.base = base
-        # mtime 时钟源频率
-        self.timebase_hz = timebase_hz
+    mtime: int = 0
+    mtimecmp: Any = None  # list or ctypes array
+    msip: Any = None  # list or ctypes array (level + edge counter)
+    base: int = 0
+    timebase_hz: int = 10_000_000  # mtime 时钟源频率
 
 
+@dataclass(slots=True)
 class DevInfo:
     """Device MMIO ranges"""
-    __slots__ = ("bases", "ends")
 
-    def __init__(self, bases=None, ends=None):
-        self.bases = bases  # ctypes array of uint64
-        self.ends = ends    # ctypes array of uint64
+    bases: Any = None  # ctypes array of uint64
+    ends: Any = None  # ctypes array of uint64
 
 
+@dataclass(slots=True)
 class PlicInfo:
     """PLIC inline context — 持久 ctypes 数组, Rust 在加速执行内联读写.
 
@@ -1121,59 +1250,39 @@ class PlicInfo:
     新到达的设备中断对 Rust inline 仲裁可见. Emulator 持有这些数组, marshal
     仅复制 Python PLIC 状态入数组, unmarshal 反向复制.
     """
-    __slots__ = (
-        "base", "num_sources", "num_contexts",
-        "priority", "pending", "level", "enable", "threshold", "claimed",
-    )
 
-    def __init__(
-        self,
-        base: int = 0,
-        num_sources: int = 0,
-        num_contexts: int = 0,
-        priority=None,
-        pending=None,
-        level=None,
-        enable=None,
-        threshold=None,
-        claimed=None,
-    ):
-        self.base = base
-        self.num_sources = num_sources
-        self.num_contexts = num_contexts
-        self.priority = priority      # ctypes array of uint8 (num_sources+1)
-        self.pending = pending        # ctypes array of uint8 (num_sources+1)
-        self.level = level            # ctypes array of uint8 (num_sources+1)
-        self.enable = enable          # ctypes array of uint32 (num_contexts * num_words)
-        self.threshold = threshold    # ctypes array of uint8 (num_contexts)
-        self.claimed = claimed        # ctypes array of uint32 (num_contexts)
+    base: int = 0
+    num_sources: int = 0
+    num_contexts: int = 0
+    priority: Any = None  # ctypes array of uint8 (num_sources+1)
+    pending: Any = None  # ctypes array of uint8 (num_sources+1)
+    level: Any = None  # ctypes array of uint8 (num_sources+1)
+    enable: Any = None  # ctypes array of uint32 (num_contexts * num_words)
+    threshold: Any = None  # ctypes array of uint8 (num_contexts)
+    claimed: Any = None  # ctypes array of uint32 (num_contexts)
 
 
+@dataclass(slots=True)
 class UartInfo:
     """UART context — lets Rust buffer sbi_printf output inline
     and handle IE/IP/TXCTRL register reads without exiting from speedup lib"""
-    __slots__ = ("base", "tx_buf", "tx_wr", "ie", "txctrl", "rxctrl",
-                 "rx_fifo_len", "tx_notify_fd", "no_stdout", "rx_notify", "ffi")
 
-    def __init__(self, base: int = 0, tx_buf=None, tx_wr=None,
-                 ie: int = 0, txctrl: int = 0, rxctrl: int = 0, rx_fifo_len: int = 0,
-                 tx_notify_fd: int = -1, no_stdout: int = 0,
-                 rx_notify=None, ffi=None):
-        self.base = base
-        self.tx_buf = tx_buf
-        self.tx_wr = tx_wr
-        self.ie = ie
-        self.txctrl = txctrl
-        self.rxctrl = rxctrl
-        self.rx_fifo_len = rx_fifo_len
-        self.tx_notify_fd = tx_notify_fd
-        self.no_stdout = no_stdout
-        self.rx_notify = rx_notify
-        # 持久 ctypes FfiUartCtx — 由 Emulator 持有并注入 UART 设备, 设备侧
-        # 状态变化时直接改写其寄存器字段; 提供时不再每轮重建快照.
-        self.ffi = ffi
+    base: int = 0
+    tx_buf: Any = None
+    tx_wr: Any = None
+    ie: int = 0
+    txctrl: int = 0
+    rxctrl: int = 0
+    rx_fifo_len: int = 0
+    tx_notify_fd: int = -1
+    no_stdout: int = 0
+    rx_notify: Any = None
+    # 持久 ctypes FfiUartCtx — 由 Emulator 持有并注入 UART 设备, 设备侧
+    # 状态变化时直接改写其寄存器字段; 提供时不再每轮重建快照.
+    ffi: Any = None
 
 
+@dataclass(slots=True)
 class VirtIOInfo:
     """virtio-blk inline context — Rust handles all MMIO register
     accesses inline; only QueueNotify exits to Python.
@@ -1183,68 +1292,234 @@ class VirtIOInfo:
     (queue descriptors, feature negotiation, InterruptStatus, etc.) is
     silently reset to zero, and the guest sees a dead device.
     """
-    __slots__ = (
-        "base", "capacity", "queue_num_max",
-        "device_features_sel", "driver_features_sel", "driver_features",
-        "queue_sel", "queue_num", "queue_ready",
-        "queue_desc", "queue_driver", "queue_device",
-        "status", "interrupt_status",
-    )
 
-    def __init__(
-        self,
-        base: int = 0,
-        capacity: int = 0,
-        queue_num_max: int = 256,
-        device_features_sel: int = 0,
-        driver_features_sel: int = 0,
-        driver_features: int = 0,
-        queue_sel: int = 0,
-        queue_num: int = 0,
-        queue_ready: bool = False,
-        queue_desc: int = 0,
-        queue_driver: int = 0,
-        queue_device: int = 0,
-        status: int = 0,
-        interrupt_status: int = 0,
-    ):
-        self.base = base
-        self.capacity = capacity
-        self.queue_num_max = queue_num_max
-        self.device_features_sel = device_features_sel
-        self.driver_features_sel = driver_features_sel
-        self.driver_features = driver_features
-        self.queue_sel = queue_sel
-        self.queue_num = queue_num
-        self.queue_ready = queue_ready
-        self.queue_desc = queue_desc
-        self.queue_driver = queue_driver
-        self.queue_device = queue_device
-        self.status = status
-        self.interrupt_status = interrupt_status
+    base: int = 0
+    capacity: int = 0
+    queue_num_max: int = 256
+    device_features_sel: int = 0
+    driver_features_sel: int = 0
+    driver_features: int = 0
+    queue_sel: int = 0
+    queue_num: int = 0
+    queue_ready: bool = False
+    queue_desc: int = 0
+    queue_driver: int = 0
+    queue_device: int = 0
+    status: int = 0
+    interrupt_status: int = 0
 
-def run_parallel(
-    states,  # ctypes array of HartState
-    num_harts: int,
-    ram_ptr: int,
-    ram_size: int,
-    ram_base: int,
-    shadow_base: int,
-    shadow_size: int,
-    result,
-    pmp: PmpInfo | None = None,
-    clint: ClintInfo | None = None,
-    dev: DevInfo | None = None,
-    uart: UartInfo | None = None,
-    virtio: VirtIOInfo | None = None,
-    plic: PlicInfo | None = None,
-    watchdog_timeout_ns: int = 0,  # 时钟源超时时间 (纳秒); 0 = 禁用
-    bp_addrs: list[int] | None = None,
-    stop_flag=None,  # ctypes.c_uint8 or None — shared stop flag for Ctrl+Q
-    ext_irq=None,  # FfiExtIrqCtx or None — external interrupt context
-    flush_cnt=None,  # ctypes.c_uint64 — 已发生的 TLB 刷新次数
-    flush_cnt_per_hart=None,  # ctypes array of c_uint64 — 各 hart 上次见到的取值
-) -> FfiVirtIOCtx | None:
+
+@dataclass(slots=True)
+class RunConfig:
+    """一次 run_parallel 调用的输入: 必给的执行上下文与可选的设备状态."""
+
+    states: Any  # ctypes array of HartState
+    num_harts: int
+    ram_ptr: int
+    ram_size: int
+    ram_base: int
+    shadow_base: int
+    shadow_size: int
+    result: Any
+    pmp: PmpInfo | None = None
+    clint: ClintInfo | None = None
+    dev: DevInfo | None = None
+    uart: UartInfo | None = None
+    virtio: VirtIOInfo | None = None
+    plic: PlicInfo | None = None
+    watchdog_timeout_ns: int = 0  # 时钟源超时时间 (纳秒); 0 = 禁用
+    bp_addrs: list[int] | None = None
+    stop_flag: Any = None  # ctypes.c_uint8 — Ctrl+Q 与设备共用的停止标志
+    ext_irq: Any = None  # FfiExtIrqCtx — 外部中断上下文
+    flush_cnt: Any = None  # ctypes.c_uint64 — 已发生的 TLB 刷新次数
+    flush_cnt_per_hart: Any = None  # ctypes array of c_uint64 — 各 hart 上次见到的取值
+
+
+@dataclass(slots=True)
+class FfiParts:
+    """一个 FFI 结构与它指向的 ctypes 缓冲区.
+
+    FFI 结构内只存裸地址, 缓冲区由本对象的 buffers 持有, 存活至 run_parallel
+    返回; 缺少该引用时引擎会读到已释放的内存.
+    """
+
+    ctx: Any
+    buffers: tuple[Any, ...] = ()
+    is_present: bool = True
+
+
+def _addr_or_zero(obj) -> int:
+    """对象为 None 时返回 0, 否则返回其地址.
+
+    按"是否提供"判定, 不能用真值判定: ctypes 标量的真值取自它的当前取值
+    (c_uint8(0) 为假), 真值判定会把取值为 0 的停止标志与计数器当作未提供,
+    从而向引擎传空指针.
+    """
+    return ctypes.addressof(obj) if obj is not None else 0
+
+
+class ClintMarshal:
+    """CLINT 状态在调用期间的 ctypes 副本: 调用前写入, 返回后回读."""
+
+    def __init__(self, clint: ClintInfo | None, num_harts: int) -> None:
+        nh = self.num_harts = max(int(num_harts), 1)
+        self.mtime = ctypes.c_uint64(0)
+        self.mtimecmp = (ctypes.c_uint64 * nh)()
+        self.msip = (ctypes.c_uint8 * nh)()
+        if clint is None:
+            for i in range(nh):
+                self.mtimecmp[i] = 0xFFFF_FFFF_FFFF_FFFF
+        else:
+            self.mtime.value = clint.mtime
+            if clint.mtimecmp:
+                for i in range(min(nh, len(clint.mtimecmp))):
+                    self.mtimecmp[i] = int(clint.mtimecmp[i])
+            else:
+                for i in range(nh):
+                    self.mtimecmp[i] = 0xFFFF_FFFF_FFFF_FFFF
+            if clint.msip:
+                for i in range(min(nh, len(clint.msip))):
+                    self.msip[i] = int(clint.msip[i])
+
+        self.ctx = FfiClintCtx()
+        self.ctx.mtime = ctypes.addressof(self.mtime)
+        self.ctx.mtimecmp = ctypes.addressof(self.mtimecmp)
+        self.ctx.msip = ctypes.addressof(self.msip)
+        self.ctx.base = clint.base if clint is not None else 0
+        self.ctx.timebase_hz = clint.timebase_hz if clint is not None else 0
+
+    def sync_back(self, clint: ClintInfo | None) -> None:
+        """把引擎改写后的 mtime、mtimecmp 与 msip 复制回调用方的 ClintInfo.
+
+        mtime 由引擎逐指令按原子操作推进; mtimecmp 与 msip 可能被引擎内的
+        内联 CLINT 处理改写, 两者都要回读.
+        """
+        if clint is None:
+            return
+        clint.mtime = self.mtime.value
+        if clint.msip:
+            for i in range(min(self.num_harts, len(clint.msip))):
+                clint.msip[i] = int(self.msip[i])
+        if clint.mtimecmp:
+            for i in range(min(self.num_harts, len(clint.mtimecmp))):
+                clint.mtimecmp[i] = int(self.mtimecmp[i])
+
+
+def _build_pmp_ffi(pmp: PmpInfo | None) -> FfiParts:
+    ffi = FfiPmpCtx()
+    if pmp is None:
+        return FfiParts(ffi)
+    ffi.num = pmp.num
+    ffi.pmpsplit = pmp.pmpsplit
+    if pmp.num <= 0:
+        return FfiParts(ffi)
+    ffi.cfg = ctypes.addressof(pmp.cfg)
+    ffi.addr = ctypes.addressof(pmp.addr)
+    return FfiParts(ffi, (pmp.cfg, pmp.addr))
+
+
+def _build_dev_ffi(dev: DevInfo | None) -> DevMMIOAddrInfo:
+    ffi = DevMMIOAddrInfo()
+    if dev is not None and dev.bases and dev.ends:
+        ffi.bases = ctypes.addressof(dev.bases)
+        ffi.ends = ctypes.addressof(dev.ends)
+        ffi.num = len(dev.bases)
+    return ffi
+
+
+def _build_uart_ffi(uart: UartInfo | None) -> FfiParts:
+    # 调用方提供持久上下文时直接复用 (其寄存器字段由设备侧持续改写, 见
+    # UART._publish_native_regs); 否则按参数值构建一次性快照.
+    if uart is None:
+        return FfiParts(FfiUartCtx())
+    if uart.ffi is not None:
+        return FfiParts(uart.ffi)
+
+    ffi = FfiUartCtx()
+    ffi.base = uart.base
+    buffers: list[Any] = []
+    # 这三项按"是否提供"判定, 不能用真值判定: 它们可以是 ctypes 标量, 其真值
+    # 取自当前取值 (c_uint32(0) 与 c_uint8(0) 均为假), 真值判定会把取值为 0 的
+    # 写游标与接收通知标志当作未提供, 从而向引擎传空指针.
+    if uart.tx_buf is not None:
+        ffi.tx_buf = ctypes.addressof(uart.tx_buf)
+        ffi.tx_cap = len(uart.tx_buf)
+        buffers.append(uart.tx_buf)
+    if uart.tx_wr is not None:
+        ffi.tx_wr = ctypes.addressof(uart.tx_wr)
+        buffers.append(uart.tx_wr)
+    ffi.ie = uart.ie
+    ffi.txctrl = uart.txctrl
+    ffi.rxctrl = uart.rxctrl
+    ffi.rx_fifo_len = uart.rx_fifo_len
+    ffi.tx_notify_fd = uart.tx_notify_fd
+    ffi.no_stdout = uart.no_stdout
+    if uart.rx_notify is not None:
+        ffi.rx_notify = ctypes.addressof(uart.rx_notify)
+        buffers.append(uart.rx_notify)
+    return FfiParts(ffi, tuple(buffers))
+
+
+def _build_virtio_ffi(virtio: VirtIOInfo | None) -> FfiParts:
+    ffi = FfiVirtIOCtx()
+    if virtio is None or virtio.base == 0:
+        return FfiParts(ffi, is_present=False)
+    ffi.base = virtio.base
+    ffi.capacity = virtio.capacity
+    ffi.queue_num_max = virtio.queue_num_max
+    ffi.device_features_sel = virtio.device_features_sel
+    ffi.driver_features_sel = virtio.driver_features_sel
+    ffi.driver_features = virtio.driver_features
+    ffi.queue_sel = virtio.queue_sel
+    ffi.queue_num = virtio.queue_num if virtio.queue_num else virtio.queue_num_max
+    ffi.queue_ready = 1 if virtio.queue_ready else 0
+    ffi.queue_desc = virtio.queue_desc
+    ffi.queue_driver = virtio.queue_driver
+    ffi.queue_device = virtio.queue_device
+    ffi.status = virtio.status
+    ffi.interrupt_status = virtio.interrupt_status
+    return FfiParts(ffi)
+
+
+def _build_plic_ffi(plic: PlicInfo | None) -> FfiParts:
+    """持久数组指针直传, Rust 在连续执行内读写, 设备线程按同一数组写入."""
+    ffi = FfiPlicCtx()
+    if plic is None or plic.base == 0:
+        return FfiParts(ffi, is_present=False)
+    ffi.base = plic.base
+    ffi.num_sources = plic.num_sources
+    ffi.num_contexts = plic.num_contexts
+    ffi.priority = ctypes.addressof(plic.priority)
+    ffi.pending = ctypes.addressof(plic.pending)
+    ffi.level = ctypes.addressof(plic.level)
+    ffi.enable = ctypes.addressof(plic.enable)
+    ffi.threshold = ctypes.addressof(plic.threshold)
+    ffi.claimed = ctypes.addressof(plic.claimed)
+    return FfiParts(ffi)
+
+
+def _build_bp_ffi(bp_addrs: list[int] | None) -> FfiParts:
+    ffi = FfiBpCtx()
+    if not bp_addrs:
+        return FfiParts(ffi)
+    arr = (ctypes.c_uint64 * len(bp_addrs))()
+    for i, addr in enumerate(bp_addrs):
+        arr[i] = addr & 0xFFFF_FFFF_FFFF_FFFF
+    ffi.addrs = ctypes.addressof(arr)
+    ffi.count = len(bp_addrs)
+    return FfiParts(ffi, (arr,))
+
+
+def _build_watchdog_ffi(timeout_ns: int) -> tuple[FfiWatchdogCtx, bool]:
+    """时钟源超时时间的 FFI 结构与"是否提供"标志; 0 表示禁用, 不传指针."""
+    ffi = FfiWatchdogCtx()
+    if not timeout_ns:
+        return ffi, False
+    ffi.timeout_ns = int(timeout_ns) & 0xFFFF_FFFF_FFFF_FFFF
+    return ffi, True
+
+
+def run_parallel(cfg: RunConfig) -> FfiVirtIOCtx | None:
     """Execute instructions concurrently (thread-per-hart) in Rust.
 
     Each non-halted hart runs in its own OS thread with a full
@@ -1253,202 +1528,66 @@ def run_parallel(
     (stop_flag / all-idle WFI / halted / trap loop / breakpoint / MMIO).
     No instruction quota — execution is continuous.
 
-    *bp_addrs* is an optional list of PC addresses that trigger
+    *cfg.bp_addrs* is an optional list of PC addresses that trigger
     ``EXIT_BREAKPOINT`` when matched after instruction execution.
     """
     if _lib is None:
-        return
+        return None
 
-    # --- MemCtx ---
     mem = MemCtx()
-    mem.ram = int(ram_ptr) if ram_ptr else 0
-    mem.ram_size = ram_size
-    mem.ram_base = ram_base
-    mem.shadow_base = shadow_base
-    mem.shadow_size = shadow_size
+    mem.ram = int(cfg.ram_ptr) if cfg.ram_ptr else 0
+    mem.ram_size = cfg.ram_size
+    mem.ram_base = cfg.ram_base
+    mem.shadow_base = cfg.shadow_base
+    mem.shadow_size = cfg.shadow_size
 
-    # --- FfiPmpCtx ---
-    _pmp_cfg_buf = None
-    _pmp_addr_buf = None
-    if pmp and pmp.num > 0:
-        _pmp_cfg_buf = pmp.cfg
-        _pmp_addr_buf = pmp.addr
+    clint_state = ClintMarshal(cfg.clint, cfg.num_harts)
+    pmp_parts = _build_pmp_ffi(cfg.pmp)
+    dev_ffi = _build_dev_ffi(cfg.dev)
+    uart_parts = _build_uart_ffi(cfg.uart)
+    virtio_parts = _build_virtio_ffi(cfg.virtio)
+    plic_parts = _build_plic_ffi(cfg.plic)
+    watchdog_ffi, has_watchdog = _build_watchdog_ffi(cfg.watchdog_timeout_ns)
+    bp_parts = _build_bp_ffi(cfg.bp_addrs)
 
-    pmp_ffi = FfiPmpCtx()
-    pmp_ffi.cfg = ctypes.addressof(_pmp_cfg_buf) if _pmp_cfg_buf else 0
-    pmp_ffi.addr = ctypes.addressof(_pmp_addr_buf) if _pmp_addr_buf else 0
-    pmp_ffi.num = pmp.num if pmp else 0
-    pmp_ffi.pmpsplit = pmp.pmpsplit if pmp else 0
+    hart_ctx = FfiHartCtx()
+    hart_ctx.states = ctypes.addressof(cfg.states) if cfg.states is not None else 0
+    hart_ctx.num_harts = cfg.num_harts
+    hart_ctx.result = ctypes.addressof(cfg.result)
+    hart_ctx.stop_flag = _addr_or_zero(cfg.stop_flag)
+    hart_ctx.ext_irq = _addr_or_zero(cfg.ext_irq)
 
-    # --- FfiClintCtx ---
-    nh = max(int(num_harts), 1)
-    _mtc_buf = (ctypes.c_uint64 * nh)()
-    _msip_buf = (ctypes.c_uint8 * nh)()
-    _mtime_val = ctypes.c_uint64(0)
-    if clint:
-        _mtime_val.value = clint.mtime
-        if clint.mtimecmp:
-            for i in range(min(nh, len(clint.mtimecmp))):
-                _mtc_buf[i] = int(clint.mtimecmp[i])
-        else:
-            for i in range(nh):
-                _mtc_buf[i] = 0xFFFF_FFFF_FFFF_FFFF
-        if clint.msip:
-            for i in range(min(nh, len(clint.msip))):
-                _msip_buf[i] = int(clint.msip[i])
-    else:
-        for i in range(nh):
-            _mtc_buf[i] = 0xFFFF_FFFF_FFFF_FFFF
+    mem_ctx = FfiMemCtx()
+    mem_ctx.mem = ctypes.addressof(mem)
+    mem_ctx.pmp = ctypes.addressof(pmp_parts.ctx)
 
-    clint_ffi = FfiClintCtx()
-    clint_ffi.mtime = ctypes.addressof(_mtime_val)
-    clint_ffi.mtimecmp = ctypes.addressof(_mtc_buf)
-    clint_ffi.msip = ctypes.addressof(_msip_buf)
-    clint_ffi.base = clint.base if clint else 0
-    clint_ffi.timebase_hz = clint.timebase_hz if clint else 0
+    intr_ctx = FfiInterruptCtx()
+    intr_ctx.clint = ctypes.addressof(clint_state.ctx)
+    intr_ctx.plic = _addr_or_zero(plic_parts.ctx) if plic_parts.is_present else 0
 
-    # --- DevMMIOAddrInfo ---
-    dev_ffi = DevMMIOAddrInfo()
-    if dev and dev.bases and dev.ends:
-        dev_ffi.bases = ctypes.addressof(dev.bases)
-        dev_ffi.ends = ctypes.addressof(dev.ends)
-        dev_ffi.num = len(dev.bases)
+    dev_ctx = FfiDevicesCtx()
+    dev_ctx.dev = ctypes.addressof(dev_ffi)
+    dev_ctx.uart = ctypes.addressof(uart_parts.ctx)
+    dev_ctx.virtio = _addr_or_zero(virtio_parts.ctx) if virtio_parts.is_present else 0
+    dev_ctx.watchdog = _addr_or_zero(watchdog_ffi) if has_watchdog else 0
 
-    # --- FfiUartCtx ---
-    # 调用方提供持久上下文时直接复用 (其寄存器字段由设备侧持续改写, 见
-    # UART._publish_native_regs); 否则按参数值构建一次性快照.
-    uart_ffi = uart.ffi if uart and uart.ffi else FfiUartCtx()
-    _tx_buf = None
-    _tx_wr = None
-    if uart and uart.ffi is None:
-        uart_ffi.base = uart.base
-        # 这三项按"是否提供"判定, 不能用真值判定: 它们可以是 ctypes 标量, 其真值
-        # 取自当前取值 (c_uint32(0) 与 c_uint8(0) 均为假), 真值判定会把取值为 0 的
-        # 写游标与接收通知标志当作未提供, 从而向引擎传空指针.
-        if uart.tx_buf is not None:
-            _tx_buf = uart.tx_buf
-            uart_ffi.tx_buf = ctypes.addressof(_tx_buf)
-            uart_ffi.tx_cap = len(_tx_buf)
-        if uart.tx_wr is not None:
-            _tx_wr = uart.tx_wr
-            uart_ffi.tx_wr = ctypes.addressof(_tx_wr)
-        uart_ffi.ie = uart.ie
-        uart_ffi.txctrl = uart.txctrl
-        uart_ffi.rxctrl = uart.rxctrl
-        uart_ffi.rx_fifo_len = uart.rx_fifo_len
-        uart_ffi.tx_notify_fd = uart.tx_notify_fd
-        uart_ffi.no_stdout = uart.no_stdout
-        if uart.rx_notify is not None:
-            uart_ffi.rx_notify = ctypes.addressof(uart.rx_notify)
-
-    # --- FfiVirtIOCtx ---
-    _virtio_ffi = FfiVirtIOCtx()
-    is_virtio_present = False
-    if virtio and virtio.base != 0:
-        _virtio_ffi.base = virtio.base
-        _virtio_ffi.capacity = virtio.capacity
-        _virtio_ffi.queue_num_max = virtio.queue_num_max
-        _virtio_ffi.device_features_sel = virtio.device_features_sel
-        _virtio_ffi.driver_features_sel = virtio.driver_features_sel
-        _virtio_ffi.driver_features = virtio.driver_features
-        _virtio_ffi.queue_sel = virtio.queue_sel
-        _virtio_ffi.queue_num = virtio.queue_num if virtio.queue_num else virtio.queue_num_max
-        _virtio_ffi.queue_ready = 1 if virtio.queue_ready else 0
-        _virtio_ffi.queue_desc = virtio.queue_desc
-        _virtio_ffi.queue_driver = virtio.queue_driver
-        _virtio_ffi.queue_device = virtio.queue_device
-        _virtio_ffi.status = virtio.status
-        _virtio_ffi.interrupt_status = virtio.interrupt_status
-        is_virtio_present = True
-
-    # --- FfiPlicCtx --- 持久数组指针直传 (Rust inline 读写, 设备线程 write-through)
-    _plic_ffi = FfiPlicCtx()
-    is_plic_present = False
-    if plic and plic.base != 0:
-        _plic_ffi.base = plic.base
-        _plic_ffi.num_sources = plic.num_sources
-        _plic_ffi.num_contexts = plic.num_contexts
-        _plic_ffi.priority = ctypes.addressof(plic.priority)
-        _plic_ffi.pending = ctypes.addressof(plic.pending)
-        _plic_ffi.level = ctypes.addressof(plic.level)
-        _plic_ffi.enable = ctypes.addressof(plic.enable)
-        _plic_ffi.threshold = ctypes.addressof(plic.threshold)
-        _plic_ffi.claimed = ctypes.addressof(plic.claimed)
-        is_plic_present = True
-
-    # Breakpoint addresses — build a ctypes array if any provided
-    _bp_arr = None
-    if bp_addrs:
-        _bp_arr = (ctypes.c_uint64 * len(bp_addrs))()
-        for i, addr in enumerate(bp_addrs):
-            _bp_arr[i] = addr & 0xFFFF_FFFF_FFFF_FFFF
-
-    # --- Build grouped FFI structs ---
-    _hart_ctx = FfiHartCtx()
-    _hart_ctx.states = ctypes.addressof(states) if states is not None else 0
-    _hart_ctx.num_harts = num_harts
-    _hart_ctx.result = ctypes.addressof(result)
-    # 这几个参数按"是否提供"判定, 不能用真值判定: ctypes 标量的真值取自它的当前
-    # 取值 (c_uint8(0) 为假), 真值判定会把取值为 0 的停止标志与代数计数器当作
-    # 未提供, 从而向引擎传空指针.
-    _hart_ctx.stop_flag = ctypes.addressof(stop_flag) if stop_flag is not None else 0
-    _hart_ctx.ext_irq = ctypes.addressof(ext_irq) if ext_irq is not None else 0
-
-    _mem_ctx = FfiMemCtx()
-    _mem_ctx.mem = ctypes.addressof(mem)
-    _mem_ctx.pmp = ctypes.addressof(pmp_ffi)
-
-    _intr_ctx = FfiInterruptCtx()
-    _intr_ctx.clint = ctypes.addressof(clint_ffi)
-    _intr_ctx.plic = ctypes.addressof(_plic_ffi) if is_plic_present else 0
-
-    _dev_ctx = FfiDevicesCtx()
-    _dev_ctx.dev = ctypes.addressof(dev_ffi)
-    _dev_ctx.uart = ctypes.addressof(uart_ffi)
-    _dev_ctx.virtio = ctypes.addressof(_virtio_ffi) if is_virtio_present else 0
-
-    # --- FfiWatchdogCtx --- 时钟源超时时间 (纳秒; 0 = 禁用, 不传指针)
-    _watchdog_ffi = FfiWatchdogCtx()
-    is_watchdog_present = False
-    if watchdog_timeout_ns:
-        _watchdog_ffi.timeout_ns = int(watchdog_timeout_ns) & 0xFFFF_FFFF_FFFF_FFFF
-        is_watchdog_present = True
-    _dev_ctx.watchdog = ctypes.addressof(_watchdog_ffi) if is_watchdog_present else 0
-
-    _bp_ctx = FfiBpCtx()
-    _bp_ctx.addrs = ctypes.addressof(_bp_arr) if _bp_arr else 0
-    _bp_ctx.count = len(bp_addrs) if bp_addrs else 0
-
-    _tlb_ctx = FfiTlbCtx()
-    _tlb_ctx.flush_cnt = ctypes.addressof(flush_cnt) if flush_cnt is not None else 0
-    _tlb_ctx.flush_cnt_per_hart = (
-        ctypes.addressof(flush_cnt_per_hart) if flush_cnt_per_hart is not None else 0
-    )
+    tlb_ctx = FfiTlbCtx()
+    tlb_ctx.flush_cnt = _addr_or_zero(cfg.flush_cnt)
+    tlb_ctx.flush_cnt_per_hart = _addr_or_zero(cfg.flush_cnt_per_hart)
 
     _lib.run_parallel(
-        ctypes.byref(_hart_ctx),
-        ctypes.byref(_mem_ctx),
-        ctypes.byref(_intr_ctx),
-        ctypes.byref(_dev_ctx),
-        ctypes.byref(_bp_ctx),
-        ctypes.byref(_tlb_ctx),
+        ctypes.byref(hart_ctx),
+        ctypes.byref(mem_ctx),
+        ctypes.byref(intr_ctx),
+        ctypes.byref(dev_ctx),
+        ctypes.byref(bp_parts.ctx),
+        ctypes.byref(tlb_ctx),
     )
 
-    # Sync mtime back from Rust (advanced by per-instruction AtomicU64 ops).
-    # Also sync MSIP and MTIMECMP — concurrent CLINT inline handling may have
-    # modified the shared atomic arrays; copy modifications back to the
-    # caller's ClintInfo so the emulator's CLINT sync path picks them up.
-    if clint:
-        clint.mtime = _mtime_val.value
-        if clint.msip:
-            for i in range(min(nh, len(clint.msip))):
-                clint.msip[i] = int(_msip_buf[i])
-        if clint.mtimecmp:
-            for i in range(min(nh, len(clint.mtimecmp))):
-                clint.mtimecmp[i] = int(_mtc_buf[i])
+    clint_state.sync_back(cfg.clint)
 
     # Return the virtio FFI struct so the caller can read back changed fields.
-    return _virtio_ffi if virtio else None
+    return virtio_parts.ctx if cfg.virtio else None
 
 
 # ============================================================
@@ -1469,22 +1608,23 @@ class TermIoHandle(ctypes.Structure):
     其 ctypes 缓冲区。``terminal_io_start`` 在 Rust 侧复制全部字段后立即返回,
     结构体本身无需长期存活, 但指针指向的缓冲区必须存活至线程退出。
     """
+
     _fields_ = [
-        ("stdin_fd", ctypes.c_int32),      # RawFd for stdin
-        ("stdout_fd", ctypes.c_int32),     # RawFd for stdout
-        ("rx_buf", ctypes.c_void_p),       # *mut u8 — shared RX ring buffer
-        ("rx_cap", ctypes.c_uint32),       # capacity of rx_buf (power of two)
-        ("rx_wr", ctypes.c_void_p),        # *mut AtomicU32 — write index (I/O thread)
-        ("rx_rd", ctypes.c_void_p),        # *mut AtomicU32 — read index (Python, 容量控制)
-        ("tx_buf", ctypes.c_void_p),       # *mut u8 — shared TX ring buffer
-        ("tx_cap", ctypes.c_uint32),       # entry capacity (= byte capacity / 2)
-        ("tx_wr", ctypes.c_void_p),        # *mut AtomicU32 — write index (hart threads)
-        ("tx_drain", ctypes.c_void_p),     # *mut AtomicU32 — drain index (I/O thread 独占)
-        ("stop_flag", ctypes.c_void_p),    # *mut AtomicU8 — stop request flag
-        ("pause_flag", ctypes.c_void_p),   # *mut AtomicU8 — pause (debugger break)
-        ("rx_notify", ctypes.c_void_p),    # *mut AtomicU8 — new RX data notification
+        ("stdin_fd", ctypes.c_int32),  # RawFd for stdin
+        ("stdout_fd", ctypes.c_int32),  # RawFd for stdout
+        ("rx_buf", ctypes.c_void_p),  # *mut u8 — shared RX ring buffer
+        ("rx_cap", ctypes.c_uint32),  # capacity of rx_buf (power of two)
+        ("rx_wr", ctypes.c_void_p),  # *mut AtomicU32 — write index (I/O thread)
+        ("rx_rd", ctypes.c_void_p),  # *mut AtomicU32 — read index (Python, 容量控制)
+        ("tx_buf", ctypes.c_void_p),  # *mut u8 — shared TX ring buffer
+        ("tx_cap", ctypes.c_uint32),  # entry capacity (= byte capacity / 2)
+        ("tx_wr", ctypes.c_void_p),  # *mut AtomicU32 — write index (hart threads)
+        ("tx_drain", ctypes.c_void_p),  # *mut AtomicU32 — drain index (I/O thread 独占)
+        ("stop_flag", ctypes.c_void_p),  # *mut AtomicU8 — stop request flag
+        ("pause_flag", ctypes.c_void_p),  # *mut AtomicU8 — pause (debugger break)
+        ("rx_notify", ctypes.c_void_p),  # *mut AtomicU8 — new RX data notification
         ("rx_notify_fd", ctypes.c_int32),  # fd: Rust termio 写 1B 唤醒 RX daemon
-        ("rx_drain_fd", ctypes.c_int32),   # fd: Python 消费 ring 后写 1B 唤醒 termio 续传
+        ("rx_drain_fd", ctypes.c_int32),  # fd: Python 消费 ring 后写 1B 唤醒 termio 续传
     ]
 
 
@@ -1564,4 +1704,3 @@ def termio_set_emu_stop_flag(ptr: int) -> None:
     """
     if _termio_lib:
         _termio_lib.terminal_io_set_emu_stop_flag(ptr)
-

@@ -1,7 +1,7 @@
 //! `#[repr(C)]` state structures that cross the Python FFI boundary.
 
 use core::fmt;
-use core::sync::atomic::{ AtomicU32, AtomicU64, AtomicU8, Ordering };
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 include!("configs_gen.rs");
 
@@ -54,11 +54,7 @@ impl fmt::Debug for TlbEntry {
 		write!(
 			f,
 			"TlbEntry(vpn={:#x} ppn={:#x} perm={} level={} v={})",
-			self.vpn,
-			self.ppn,
-			self.perm,
-			self.level,
-			self.valid
+			self.vpn, self.ppn, self.perm, self.level, self.valid
 		)
 	}
 }
@@ -167,30 +163,30 @@ pub struct HartState {
 	pub pmpsplit: u8,
 	pub _pad: [u8; 7],
 
-	// ---- Phase B: TLB entries ----
+	// TLB entries ----
 	pub itlb: [TlbEntry; TLB_ENTRIES],
 	pub dtlb: [TlbEntry; TLB_ENTRIES],
 
-	// ---- Phase C: Additional CSRs ----
+	// Additional CSRs ----
 	pub mscratch: u64,
 	pub sscratch: u64,
 	pub mhartid: u64,
 	pub mcounteren: u64,
 	pub scounteren: u64,
 
-	// ---- Phase D: Sstc stimecmp ----
+	// Sstc stimecmp ----
 	pub stimecmp: u64,
 
-	// ---- Phase E: interrupt cache ----
+	// interrupt cache ----
 	pub _mmu_mode_pad: u64,
 
-	// ---- Phase F: per-hart instruction counter ----
+	// per-hart instruction counter ----
 	/// Number of instructions executed by this hart across all accelerationes.
 	/// Incremented after each slice; never reset.
 	/// Used to provide per-hart ``minstret`` and debugger display.
 	pub total_instrs: u64,
 
-	// ---- Phase G: F/D floating point ----
+	// F/D floating point ----
 	/// 32 个浮点寄存器, 存原始 bits (NaN-boxed), 非 f64 —
 	/// 保留 sNaN/qNaN payload 与单精度 NaN-boxing 语义。
 	pub fprs: [u64; 32],
@@ -198,23 +194,10 @@ pub struct HartState {
 	pub fcsr: u32,
 	pub _fpad: [u8; 4],
 
-	// ---- Phase H: AIA IMSIC register files (M + S per hart) ----
+	// AIA IMSIC register files (M + S per hart)
 	pub imsic_m: ImsicFile,
 	pub imsic_s: ImsicFile,
 
-	// ---- Phase I: per-hart one-shot timer deadlines (QEMU ACLINT 模型) ----
-	//
-	// QEMU 在 timecmp/stimecmp 写入时判定过去/未来: 过去立即置位, 未来清位并
-	// 设定一个一次性 deadline (``riscv_aclint_mtimer_write_timecmp``), 定时器到期
-	// 才再次置位; 电平保持到前向重设 deadline。本字段把"一次性定时器"翻译到当前 hart
-	// 的指令计数空间: 写入 future 值时, deadline = 写入时刻的 total_instrs +
-	// ceil(剩余 tick / (timebase × NS_PER_INSTR / 1e9)) (见 timer_deadline_own)。
-	// ``sync_mtip`` 对 ACTIVE hart 仅在 total_instrs >= deadline 时置位
-	// (永不清除 — 清除仅发生在 timecmp/stimecmp 写入: 未来值->清位, 0->禁用),
-	// 从而与其他活跃 hart 的共享 mtime 膨胀解耦。这是与"每指令持续比较
-	// cur_mtime >= cmp"模型的关键差异: 共享 mtime 由所有活跃 hart 以 fetch_max
-	// 推进, 快 hart 会过早触发慢 hart 刚重设 deadline 的定时器 -> mret 后立即再 trap
-	// 的活锁。0 = 未设定 deadline (写入即到期/禁用时置 0)。
 	pub stip_deadline: u64,
 	pub mtip_deadline: u64,
 
@@ -267,7 +250,7 @@ pub mod riscv_mode {
 mod tests {
 	use super::*;
 	use crate::ffi::InstrToBeExec;
-	use std::mem::{ align_of, size_of };
+	use std::mem::{align_of, size_of};
 
 	#[test]
 	fn tlb_entry_size() {

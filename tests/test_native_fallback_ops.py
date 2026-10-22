@@ -38,8 +38,7 @@ class TestDivisionPrecision:
         改前用 ``int(a / b)``, 双精度把商舍入到 3074457345618258432。
         """
         got = _native.exec_alu_op(0b100, 1, 0x7FFF_FFFF_FFFF_FFFF, 3).value
-        assert got == 3074457345618258602
-        assert got != 3074457345618258432
+        assert got == 3074457345618258602 and got != 3074457345618258432
 
     def test_rem_beyond_53_bit_significand(self, pure_python):
         """被除数取 2**60、除数为 7: 真余数 1。
@@ -47,8 +46,7 @@ class TestDivisionPrecision:
         改前余数由被舍入的商算出: 商少 9, 误差乘 7 使余数成为 64。
         """
         got = _native.exec_alu_op(0b110, 1, 1 << 60, 7).value
-        assert got == 1
-        assert got != 64
+        assert got == 1 and got != 64
 
     def test_quotient_truncates_toward_zero(self, pure_python):
         """商的取整方向是向零: DIV(-7, 2) 为 -3, REM(-7, 2) 为 -1。"""

@@ -139,8 +139,6 @@ pub(crate) struct ImsicAddr {
 
 /// Decode a physical address into an IMSIC target.
 ///
-/// QEMU-compatible contiguous layout with M-files first, then S-files:
-///
 ///   ============ ============================= ===================
 ///   Range        Offset                         Per-hart stride
 ///   ============ ============================= ===================
@@ -196,27 +194,22 @@ pub(crate) fn decode_imsic_addr(pa: u64, num_harts: u64) -> Option<ImsicAddr> {
 	None
 }
 
-// ============================================================
-//  Shared seteipnum / clreipnum
-// ============================================================
-
 /// Set an IMSIC eip bit for a write to ``seteipnum``.
 ///
 /// Direct mapping: ``seteipnum = N`` sets ``eip[N]`` in the file that was
-/// addressed, driving that file's external interrupt line (MEIP for the
-/// M-file, SEIP for the S-file).  There is **no cross-file routing** based
+/// addressed, driving that file's external interrupt line.
+/// There is no cross-file routing based
 /// on the interrupt identity — the value written to the doorbell is a
-/// MINOR identity (external interrupt number), never a MAJOR identity
-/// (interrupt cause).  This matches QEMU ``riscv_imsic`` and the AIA spec.
+/// MINOR identity , never a MAJOR identity.
 ///
-/// OpenSBI sends IPIs by writing minor identity 1 (``IMSIC_IPI_ID``) to the
-/// target hart's M-file (``targets_mmode``); the receiving hart's M-mode
+/// OpenSBI sends IPIs by writing minor identity 1to the
+/// target hart's M-file; the receiving hart's M-mode
 /// OpenSBI discovers it via ``MTOPEI`` and dispatches to ``sbi_ipi_process``.
 /// Routing IID=1 from the M-file to the S-file would drop M-mode IPIs and
 /// leave secondary harts asleep.
 ///
 /// Returns ``true`` when the write was handled inline; ``false`` to fall
-/// through to Python MMIO (e.g. unknown / reserved IID).
+/// through to Python MMIO.
 #[inline]
 pub(crate) fn imsic_handle_seteipnum(
 	hart_states: *const HartState,

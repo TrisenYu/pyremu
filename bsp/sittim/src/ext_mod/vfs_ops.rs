@@ -7,7 +7,7 @@
 //! 形态只在模块内, 故节点以不透明的 i16 下标跨越边界; fd 表由运行时持有, 控制台与
 //! 套接字也在运行时一侧实现, 故本表不含 fd 参数, 也不涉及这两类对象。
 //!
-//! 各项的结果取 [`VfsStatus`], 折算为 errno 由运行时完成; 模块内不出现 errno 编号, 两侧
+//! 各项的结果取 [`VfsStatus`], 换算为 errno 由运行时完成; 模块内不出现 errno 编号, 两侧
 //! 因此不必共用一套错误码。
 
 // ---------------------------------------------------------------
@@ -56,7 +56,7 @@ pub const VFS_KIND_DIR: u8 = 0;
 /// 节点是文件。
 pub const VFS_KIND_FILE: u8 = 1;
 
-/// 操作的结果。运行时按本枚举的取值折算为 errno。
+/// 操作的结果。运行时按本枚举的取值换算为 errno。
 ///
 /// 取值的编码跨模块映像与运行时的边界传递, 新增取值一律追加在末尾, 既有取值的编码保持不变。
 #[repr(u32)]
@@ -106,7 +106,14 @@ pub struct VfsStat {
 impl VfsStat {
 	/// 构建一个字段全零的 stat, 供调用方在传入 [`VfsOps::stat`] 之前初始化。
 	pub const fn zero() -> Self {
-		Self { ino: 0, kind: VFS_KIND_FILE, mode: 0, nlink: 0, size: 0, blocks: 0 }
+		Self {
+			ino: 0,
+			kind: VFS_KIND_FILE,
+			mode: 0,
+			nlink: 0,
+			size: 0,
+			blocks: 0,
+		}
 	}
 }
 
@@ -141,13 +148,7 @@ pub struct VfsOps {
 	/// 读取位置写回 *pos*; 成功时把写入的字节数写入 *out_written*。末级不是目录时返回
 	/// [`NotDir`](VfsStatus::NotDir), 下标无效或缓冲区容纳不下更多条目时返回
 	/// [`Invalid`](VfsStatus::Invalid)。
-	pub getdents: unsafe extern "C" fn(
-		i16,
-		*mut u64,
-		*mut u8,
-		u64,
-		*mut u64
-	) -> VfsStatus,
+	pub getdents: unsafe extern "C" fn(i16, *mut u64, *mut u8, u64, *mut u64) -> VfsStatus,
 	/// 创建目录 *path*, *mode* 为权限位。
 	pub mkdir: unsafe extern "C" fn(*const u8, u64, u32) -> VfsStatus,
 	/// 删除 *path* 所指的对象。*flags* 含 [`AT_REMOVEDIR`] 时目标须是目录, 不含时目标须是
@@ -156,8 +157,6 @@ pub struct VfsOps {
 	/// 检查 *path* 是否存在。
 	pub access: unsafe extern "C" fn(*const u8, u64) -> VfsStatus,
 }
-
-
 
 #[cfg(test)]
 mod tests {

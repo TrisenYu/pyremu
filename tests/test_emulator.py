@@ -28,8 +28,9 @@ from pyremu.emulator import Emulator, RunStopReason, TimeoutError
 from pyremu.memory.bus import Bus
 from pyremu.peripheral.termio import TerminalIO
 from pyremu.peripheral.uart import UART, UART_IRQ
-from pyremu.platform import PlatformConfig
+from pyremu.platform import PeripheralConfig, PlatformConfig
 from pyremu.utils.mask import mask64
+from tests.instr_encode import i_type, pack_funct, pack_src_regs, r_type
 
 
 @pytest.fixture
@@ -73,7 +74,6 @@ class TestEmulatorInit:
         emu = Emulator(num_harts=1)
         misa = emu.harts[0].csrs["misa"].val
         assert misa != 0, "misa 应为非零, 告知 OS 可用扩展"
-        # MXL = bits[63:62], RV64 = 2
         mxl = (misa >> 62) & 0x3
         assert mxl == 2, f"MXL 应为 2 (RV64), 实际 {mxl}"
         # I (bit 8), M (bit 12), A (bit 0), C (bit 2) 应置位
@@ -280,6 +280,7 @@ class TestEmulatorIPI:
             f"hart 0 不应 trap (num_harts={num_harts})"
         )
 
+
 class TestEmulatorAMOCompetition:
     """AMO 跨 hart 竞争 — 参数化 hart 数量, 验证预留清除与共享内存."""
 
@@ -358,6 +359,7 @@ class TestEmulatorAMOCompetition:
         assert result == expected, (
             f"AMO 累加结果: 期望 {expected}, 实际 {result} (num_harts={num_harts})"
         )
+
 
 class TestEmulatorState:
     """状态导出."""
@@ -473,76 +475,69 @@ class TestMDivideByZero:
     def emu(self) -> Emulator:
         return Emulator(num_harts=1, ram_base=0, prog_cnt=0x1000)
 
-    def _exec_rtype(self, emu, funct3: int, funct7: int, rd: int, rs1: int, rs2: int):
-        """执行一条 R-type 指令并返回目标寄存器结果."""
+    def _exec_rtype(self, emu, funct: int, rd: int, src_regs: int):
+        """执行一条 R-type 指令并返回目标寄存器结果.
+
+        funct 为 funct7 与 funct3 打包后的取值, src_regs 为 rs1 与 rs2 打包后的取值.
+        """
         h = emu.harts[0]
-        instr = (
-            (funct7 << 25)
-            | (rs2 << 20)
-            | (rs1 << 15)
-            | (funct3 << 12)
-            | (rd << 7)
-            | 0b01100_11
-        )
-        h.exec_instr(instr)
+        h.exec_instr(r_type(0b0110011, rd, funct, src_regs))
         return h.gprs[rd]
 
     def test_div_by_zero(self, emu):
         """DIV x5, x10, x0 (divisor=0) -> x5 = -1."""
         emu.harts[0].gprs[10] = 42
-        result = self._exec_rtype(emu, funct3=4, funct7=1, rd=5, rs1=10, rs2=0)
+        result = self._exec_rtype(emu, pack_funct(1, 4), 5, pack_src_regs(10, 0))
         assert result == 0xFFFF_FFFF_FFFF_FFFF, f"应为 -1, 实际 {result:#x}"
 
     def test_divu_by_zero(self, emu):
         """DIVU x5, x10, x0 -> x5 = -1 (all-1s)."""
         emu.harts[0].gprs[10] = 0x8000_0000_0000_0000
-        result = self._exec_rtype(emu, funct3=5, funct7=1, rd=5, rs1=10, rs2=0)
+        result = self._exec_rtype(emu, pack_funct(1, 5), 5, pack_src_regs(10, 0))
         assert result == 0xFFFF_FFFF_FFFF_FFFF
 
     def test_rem_by_zero(self, emu):
         """REM x5, x10, x0 -> x5 = x10 (dividend)."""
         emu.harts[0].gprs[10] = 42
-        result = self._exec_rtype(emu, funct3=6, funct7=1, rd=5, rs1=10, rs2=0)
+        result = self._exec_rtype(emu, pack_funct(1, 6), 5, pack_src_regs(10, 0))
         assert result == 42
 
     def test_remu_by_zero(self, emu):
         """REMU x5, x10, x0 -> x5 = x10."""
         emu.harts[0].gprs[10] = 0xDEAD
-        result = self._exec_rtype(emu, funct3=7, funct7=1, rd=5, rs1=10, rs2=0)
+        result = self._exec_rtype(emu, pack_funct(1, 7), 5, pack_src_regs(10, 0))
         assert result == 0xDEAD
 
     def test_div_normal(self, emu):
         """DIV x5, x10, x2 (10 / 3 = 3)."""
         emu.harts[0].gprs[10] = 10
         emu.harts[0].gprs[2] = 3
-        result = self._exec_rtype(emu, funct3=4, funct7=1, rd=5, rs1=10, rs2=2)
+        result = self._exec_rtype(emu, pack_funct(1, 4), 5, pack_src_regs(10, 2))
         assert result == 3
 
     def test_rem_normal(self, emu):
         """REM x5, x10, x2 (10 % 3 = 1)."""
         emu.harts[0].gprs[10] = 10
         emu.harts[0].gprs[2] = 3
-        result = self._exec_rtype(emu, funct3=6, funct7=1, rd=5, rs1=10, rs2=2)
+        result = self._exec_rtype(emu, pack_funct(1, 6), 5, pack_src_regs(10, 2))
         assert result == 1
 
 
-
 class TestAluEdgeCases:
-    """ALU boundary tests: shift truncation, INT64_MAX/MIN arithmetic, zero-sub, wrap, DIV overflow."""
+    """
+    ALU boundary tests:
+        shift truncation,
+        INT64_MAX/MIN arithmetic,
+        zero-sub,
+        wrap,
+        DIV overflow.
+    """
 
     INT64_MAX = 0x7FFF_FFFF_FFFF_FFFF
     INT64_MIN = 0x8000_0000_0000_0000
     UINT64_MAX = 0xFFFF_FFFF_FFFF_FFFF
 
     # -- helpers --
-
-    @staticmethod
-    def _r_type(funct7: int, rs2: int, rs1: int, funct3: int, rd: int) -> int:
-        return (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0b0110011
-
-    @staticmethod
-    def _i_shift(funct6: int, shamt: int, rs1: int, funct3: int, rd: int) -> int:
-        return (funct6 << 26) | (shamt << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0b0010011
 
     @pytest.fixture
     def h(self):
@@ -554,20 +549,18 @@ class TestAluEdgeCases:
         return hart
 
     @staticmethod
-    def _exec_r(hart, funct7, rs2, rs1, funct3, rd):
-        instr = TestAluEdgeCases._r_type(funct7, rs2, rs1, funct3, rd)
+    def _exec(hart, instr: int):
+        """执行一条指令并返回其目的寄存器的取值."""
         advance = hart.exec_instr(instr)
         if advance:
             hart.pc = mask64(hart.pc + advance)
-        return hart.gprs[rd]
+        return hart.gprs[(instr >> 7) & 0x1F]
 
     @staticmethod
-    def _exec_i_shift(hart, funct6, shamt, rs1, funct3, rd):
-        instr = TestAluEdgeCases._i_shift(funct6, shamt, rs1, funct3, rd)
-        advance = hart.exec_instr(instr)
-        if advance:
-            hart.pc = mask64(hart.pc + advance)
-        return hart.gprs[rd]
+    def _exec_r(hart, funct7: int, src_regs: int, funct3: int, rd: int):
+        """执行一条 R-type 指令; src_regs 为 rs1 与 rs2 打包后的取值."""
+        instr = r_type(0b0110011, rd, pack_funct(funct7, funct3), src_regs)
+        return TestAluEdgeCases._exec(hart, instr)
 
     # ============================================================
     #  shift by 64 -- shamt[5:0] = 0, same as shift by 0
@@ -584,7 +577,8 @@ class TestAluEdgeCases:
         """Shift by 64: shamt[5:0]=0, acts as NOP."""
         val = 0xABCD_0000_1234_5678
         h.gprs[10] = val
-        self._exec_i_shift(h, funct6, 64, 10, funct3, 10)
+        imm12 = (funct6 << 6) | 64
+        self._exec(h, i_type(0b0010011, 10, funct3, 10, imm12))
         assert h.gprs[10] == val, f"{desc} shamt=64 should be NOP"
 
     def test_sll_rtype_shift_by_64_is_nop(self, h):
@@ -592,7 +586,7 @@ class TestAluEdgeCases:
         val = 0xDEAD_BEEF_CAFE_BABE
         h.gprs[10] = val
         h.gprs[11] = 64
-        self._exec_r(h, 0, 11, 10, 0b001, 10)  # SLL
+        self._exec_r(h, 0, pack_src_regs(10, 11), 0b001, 10)  # SLL
         assert h.gprs[10] == val
 
     # ============================================================
@@ -603,14 +597,14 @@ class TestAluEdgeCases:
         """UINT64_MAX + 1 = 0 (wrap)."""
         h.gprs[10] = TestAluEdgeCases.UINT64_MAX
         h.gprs[11] = 1
-        result = self._exec_r(h, 0, 11, 10, 0b000, 10)  # ADD
+        result = self._exec_r(h, 0, pack_src_regs(10, 11), 0b000, 10)  # ADD
         assert result == 0, f"UINT64_MAX + 1 should be 0, got 0x{result:x}"
 
     def test_zero_sub_1_wraps_to_uint64_max(self, h):
         """0 - 1 = UINT64_MAX (SUB wrap)."""
         h.gprs[10] = 0
         h.gprs[11] = 1
-        result = self._exec_r(h, 0b0100000, 11, 10, 0b000, 10)  # SUB
+        result = self._exec_r(h, 0b0100000, pack_src_regs(10, 11), 0b000, 10)  # SUB
         assert result == TestAluEdgeCases.UINT64_MAX, (
             f"0 - 1 should be UINT64_MAX, got 0x{result:x}"
         )
@@ -624,7 +618,7 @@ class TestAluEdgeCases:
         val = TestAluEdgeCases.INT64_MAX
         h.gprs[10] = val
         h.gprs[11] = val
-        result = self._exec_r(h, 0, 11, 10, 0b000, 10)
+        result = self._exec_r(h, 0, pack_src_regs(10, 11), 0b000, 10)
         assert result == 0xFFFF_FFFF_FFFF_FFFE, (
             f"INT64_MAX + INT64_MAX expected 0xFFFFFFFFFFFFFFFE, got 0x{result:x}"
         )
@@ -633,7 +627,7 @@ class TestAluEdgeCases:
         """INT64_MAX + 1 = INT64_MIN (signed overflow wrap)."""
         h.gprs[10] = TestAluEdgeCases.INT64_MAX
         h.gprs[11] = 1
-        result = self._exec_r(h, 0, 11, 10, 0b000, 10)
+        result = self._exec_r(h, 0, pack_src_regs(10, 11), 0b000, 10)
         assert result == TestAluEdgeCases.INT64_MIN, (
             f"INT64_MAX + 1 should be INT64_MIN, got 0x{result:x}"
         )
@@ -643,10 +637,10 @@ class TestAluEdgeCases:
         val = TestAluEdgeCases.INT64_MAX
         h.gprs[10] = val
         h.gprs[11] = val
-        result_lo = self._exec_r(h, 1, 11, 10, 0b000, 10)  # MUL
+        result_lo = self._exec_r(h, 1, pack_src_regs(10, 11), 0b000, 10)  # MUL
         assert result_lo == 1, f"INT64_MAX^2 lo64 should be 1, got 0x{result_lo:x}"
         h.gprs[10] = val
-        result_hi = self._exec_r(h, 1, 11, 10, 0b001, 10)  # MULH
+        result_hi = self._exec_r(h, 1, pack_src_regs(10, 11), 0b001, 10)  # MULH
         assert result_hi == 0x3FFF_FFFF_FFFF_FFFF, (
             f"INT64_MAX^2 hi64 should be 0x3FFFFFFFFFFFFFFF, got 0x{result_hi:x}"
         )
@@ -660,14 +654,14 @@ class TestAluEdgeCases:
         val = TestAluEdgeCases.INT64_MIN
         h.gprs[10] = val
         h.gprs[11] = val
-        result = self._exec_r(h, 0, 11, 10, 0b000, 10)
+        result = self._exec_r(h, 0, pack_src_regs(10, 11), 0b000, 10)
         assert result == 0, f"INT64_MIN + INT64_MIN should be 0, got 0x{result:x}"
 
     def test_int64_min_sub_1(self, h):
         """INT64_MIN - 1 = INT64_MAX."""
         h.gprs[10] = TestAluEdgeCases.INT64_MIN
         h.gprs[11] = 1
-        result = self._exec_r(h, 0b0100000, 11, 10, 0b000, 10)
+        result = self._exec_r(h, 0b0100000, pack_src_regs(10, 11), 0b000, 10)
         assert result == TestAluEdgeCases.INT64_MAX, (
             f"INT64_MIN - 1 should be INT64_MAX, got 0x{result:x}"
         )
@@ -677,10 +671,10 @@ class TestAluEdgeCases:
         val = TestAluEdgeCases.INT64_MIN
         h.gprs[10] = val
         h.gprs[11] = val
-        result_lo = self._exec_r(h, 1, 11, 10, 0b000, 10)
+        result_lo = self._exec_r(h, 1, pack_src_regs(10, 11), 0b000, 10)
         assert result_lo == 0, f"INT64_MIN^2 lo64 should be 0, got 0x{result_lo:x}"
         h.gprs[10] = val
-        result_hi = self._exec_r(h, 1, 11, 10, 0b001, 10)
+        result_hi = self._exec_r(h, 1, pack_src_regs(10, 11), 0b001, 10)
         assert result_hi == 0x4000_0000_0000_0000, (
             f"INT64_MIN^2 hi64 should be 0x4000000000000000, got 0x{result_hi:x}"
         )
@@ -693,7 +687,7 @@ class TestAluEdgeCases:
         """INT64_MIN / -1 overflows; RISC-V spec returns dividend."""
         h.gprs[10] = TestAluEdgeCases.INT64_MIN
         h.gprs[11] = TestAluEdgeCases.UINT64_MAX  # -1
-        result = self._exec_r(h, 1, 11, 10, 0b100, 10)  # DIV
+        result = self._exec_r(h, 1, pack_src_regs(10, 11), 0b100, 10)  # DIV
         assert result == TestAluEdgeCases.INT64_MIN, (
             f"INT64_MIN / -1 overflow should return INT64_MIN, got 0x{result:x}"
         )
@@ -702,7 +696,7 @@ class TestAluEdgeCases:
         """INT64_MIN % -1 = 0 (remainder of overflow is 0 per spec)."""
         h.gprs[10] = TestAluEdgeCases.INT64_MIN
         h.gprs[11] = TestAluEdgeCases.UINT64_MAX  # -1
-        result = self._exec_r(h, 1, 11, 10, 0b110, 10)  # REM
+        result = self._exec_r(h, 1, pack_src_regs(10, 11), 0b110, 10)  # REM
         assert result == 0, f"INT64_MIN % -1 should be 0, got 0x{result:x}"
 
     # ============================================================
@@ -731,6 +725,7 @@ class TestAluEdgeCases:
         assert h.gprs[10] == expected, (
             f"SLLIW: expected 0x{expected:016x}, got 0x{h.gprs[10]:016x}"
         )
+
 
 class TestStoreImmediateOffset:
     """回归: parse_imm_s 的 imm[11:5] 缺少 <<5 位移导致 offset>=32 时错误."""
@@ -1173,7 +1168,6 @@ class TestRegValueCanonicalization:
 
     def test_bne_with_values_from_different_paths(self, h):
         """BNE 应正确判定不同路径构建的相等值 (不应分支)."""
-        # 构建同一值两次 (通过不同路径)
         h.gprs[11] = 0xD0
         self._exec(h, self._slliw(11, 11, 24))
         h.gprs[12] = 0x0D
@@ -1227,7 +1221,6 @@ class TestUartFlush:
         emu.uart._tx_callback = cap
         hart = emu.harts[0]
 
-        # x11 = 'A' (0x41)
         hart.gprs[11] = 0x41
         hart.pc = 0x80000000
         code = self._lui(10, 0x10000).to_bytes(4, "little") + self._sb(10, 11, 0).to_bytes(
@@ -1385,7 +1378,15 @@ class TestEmulatorProperties:
 
     def test_peripherals_dict(self):
         """peripherals 属性返回外设字典 (CLINT 为独立设备不在 dict 中)."""
-        emu = Emulator()
+        cfg = PlatformConfig(
+            periph=PeripheralConfig(
+                uart_base=0x1000_0000,
+                spi_base=0x1000_1000,
+                i2c_base=0x1000_2000,
+                gpio_base=0x1000_3000,
+            ),
+        )
+        emu = Emulator(cfg)
         periph = emu.peripherals
         assert "uart" in periph
         assert "spi" in periph
@@ -1413,7 +1414,6 @@ class TestEmulatorProperties:
         # 初始值取决于复位, 允许从 0 开始
         c0 = h.csrs["mcycle"].val
         i0 = h.csrs["minstret"].val
-        # t0 = h.csrs["time"].val
         emu.step()
         c1 = h.csrs["mcycle"].val
         i1 = h.csrs["minstret"].val
@@ -1440,9 +1440,18 @@ class TestEmulatorProperties:
         assert delta_i == 2, f"3 步后 minstret 差值应为 2, 实际 {delta_i}"
         # mtime 按指令计数推进, 2 条指令不足 1 tick, time 不递增.
         assert delta_t >= 0, f"time 差值不应为负: delta={delta_t}"
-        assert h.csrs["time"].val == emu.clint.get_mtime(), (
-            f"time CSR 应与 CLINT mtime 同步"
-        )
+        assert h.csrs["time"].val == emu.clint.get_mtime(), "time CSR 应与 CLINT mtime 同步"
+
+
+class TestPlatformConfigTimebase:
+    """平台配置的时钟源频率下限: 低于 1000 Hz 时 1 ms 内不足一个计数."""
+
+    def test_below_one_khz_rejected(self):
+        with pytest.raises(AssertionError):
+            PlatformConfig(timebase_freq=999)
+
+    def test_one_khz_accepted(self):
+        assert PlatformConfig(timebase_freq=1_000).timebase_freq == 1_000
 
 
 class TestWfiIdleSleep:
@@ -1672,23 +1681,27 @@ class TestL2SizeZero:
 
 
 class TestPeripheralInit:
-    """SPI / I2C / GPIO 外设均已在默认配置中注册到总线."""
+    """SPI / I2C / GPIO 外设在显式给出基址时注册到总线."""
+
+    @staticmethod
+    def _emu(**periph_kw: int) -> Emulator:
+        return Emulator(PlatformConfig(periph=PeripheralConfig(**periph_kw)))
 
     def test_spi_registered_on_bus(self):
-        """SPI 设备在总线默认地址 0x10001000."""
-        emu = Emulator()
+        """SPI 设备在 0x10001000."""
+        emu = self._emu(spi_base=0x1000_1000)
         assert emu.spi is not None
         assert emu.bus.is_device_addr(0x10001000)
 
     def test_i2c_registered_on_bus(self):
-        """I2C 设备在总线默认地址 0x10002000."""
-        emu = Emulator()
+        """I2C 设备在 0x10002000."""
+        emu = self._emu(i2c_base=0x1000_2000)
         assert emu.i2c is not None
         assert emu.bus.is_device_addr(0x10002000)
 
     def test_gpio_registered_on_bus(self):
-        """GPIO 设备在总线默认地址 0x10003000."""
-        emu = Emulator()
+        """GPIO 设备在 0x10003000."""
+        emu = self._emu(gpio_base=0x1000_3000)
         assert emu.gpio is not None
         assert emu.bus.is_device_addr(0x10003000)
 
@@ -1746,9 +1759,7 @@ class TestDeviceTree:
         """未指定 bootargs 时, 默认包含 earlycon=sbi console=ttySIF0."""
         emu = Emulator()
         dtb = emu.build_dtb()
-        assert b"earlycon=sbi" in dtb, (
-            "默认 bootargs 应包含 earlycon=sbi 以确保内核输出可见"
-        )
+        assert b"earlycon=sbi" in dtb, "默认 bootargs 应包含 earlycon=sbi 以确保内核输出可见"
         assert b"console=ttySIF0" in dtb, (
             "默认 bootargs 应包含 console=ttySIF0 以将 UART 设为首选控制台"
         )
@@ -1796,9 +1807,7 @@ class TestBusErrorOnUnmappedAccess:
         emu.step()
 
         # 应触发 LdAccessFault (mcause = 5)
-        assert h.mcause_val == 5, (
-            f"应为 LdAccessFault (5), 实际 mcause={h.mcause_val}"
-        )
+        assert h.mcause_val == 5, f"应为 LdAccessFault (5), 实际 mcause={h.mcause_val}"
         # PC 应跳转到 mtvec (默认 0x0), 而非停留在加载指令之后
         assert h.pc != self.RAM_BASE + 4, (
             f"PC 不应指向下一条指令, 应已跳转到 mtvec handler, 实际 pc={h.pc:#x}"
@@ -1818,12 +1827,8 @@ class TestBusErrorOnUnmappedAccess:
         emu.step()
 
         # 应触发 StAccessFault (mcause = 7)
-        assert h.mcause_val == 7, (
-            f"应为 StAccessFault (7), 实际 mcause={h.mcause_val}"
-        )
-        assert h.pc != self.RAM_BASE + 4, (
-            f"PC 应已跳转到 mtvec handler, 实际 pc={h.pc:#x}"
-        )
+        assert h.mcause_val == 7, f"应为 StAccessFault (7), 实际 mcause={h.mcause_val}"
+        assert h.pc != self.RAM_BASE + 4, f"PC 应已跳转到 mtvec handler, 实际 pc={h.pc:#x}"
 
     def test_device_addr_load_succeeds(self, emu):
         """从已注册设备 MMIO 地址读取不触发 Bus error (经过设备路径)."""
@@ -1873,6 +1878,7 @@ class TestNativeBatchLayout:
     会造成内存布局不匹配 -> SIGBUS (Bus error).
     这些用例在每次构建后锁死布局合约.
     """
+
     def test_tlb_entry_size_40(self) -> None:
         """TlbEntry 必须恰好 40 字节.
 
@@ -1937,9 +1943,9 @@ class TestPlicNativeInline:
         plic = emu.plic
         assert plic is not None
         plic._priority[10] = 5
-        plic._enable[0][10] = True      # word 0, bit 10
-        plic._enable[0][33] = True      # word 1, bit 1 (source 33)
-        plic._enable[1][7] = True       # context 1, word 0, bit 7
+        plic._enable[0][10] = True  # word 0, bit 10
+        plic._enable[0][33] = True  # word 1, bit 1 (source 33)
+        plic._enable[1][7] = True  # context 1, word 0, bit 7
         info = emu._native_marshal_plic()
         assert info is not None
         assert info.base == plic.base_addr
@@ -2009,8 +2015,11 @@ class TestClockDecoupling:
 
     @pytest.fixture
     def nop_emu(self) -> Emulator:
-        """单 hart 模拟器, 加载 4096 条 NOP — 无 WFI/ECALL/trap."""
-        emu = Emulator(num_harts=1)
+        """单 hart 模拟器, 加载 4096 条 NOP — 无 WFI/ECALL/trap.
+
+        时钟源频率固定为 10 MHz, 使换算结果不随 emu-configs.mk 的 TIMER_FREQ 变化.
+        """
+        emu = Emulator(num_harts=1, timebase_freq=10_000_000)
         nops = b"\x13\x00\x00\x00" * 4096  # addi x0, x0, 0
         emu.load_code(0x8000_0000, nops)
         return emu
@@ -2064,9 +2073,7 @@ class TestClockDecoupling:
 
         now_holder["t"] = 300.5
         info = emu._native_marshal_clint()
-        assert emu.clint.get_mtime() == mtime_before, (
-            "marshal_clint 不得再按时钟源推进 mtime"
-        )
+        assert emu.clint.get_mtime() == mtime_before, "marshal_clint 不得再按时钟源推进 mtime"
         assert info.mtime == mtime_before
 
     def test_native_batch_mtime_pure_instruction_count(self, nop_emu):
@@ -2087,19 +2094,15 @@ class TestClockDecoupling:
         assert emu._run_stop_reason == RunStopReason.BREAKPOINT, (
             f"应命中断点, 实际 reason={emu._run_stop_reason}"
         )
-        assert emu._total_instrs == 2000, (
-            f"应恰好执行 2000 条 NOP, 实际 {emu._total_instrs}"
-        )
+        assert emu._total_instrs == 2000, f"应恰好执行 2000 条 NOP, 实际 {emu._total_instrs}"
         mtime = emu.clint.get_mtime()
         # 5 条指令 = 1 tick (10 MHz × 20ns/instr / 1e9). 边界滞后 <=1 条
         # (advance_clock_source 在每条指令执行前的循环顶推进), 故期望落在
-        # [total//5 - 1, total//5]. 实时/混合模型在此刻会推进
         # elapsed*timebase ≈ 10^3~10^4+ tick, 远越上界 -> 复现修复前行为.
         lo = emu._total_instrs // 5 - 1
         hi = emu._total_instrs // 5
         assert lo <= mtime <= hi, (
-            f"native batch 2000 条指令 mtime 应为 [{lo}, {hi}] tick (纯指令源), "
-            f"实际 {mtime}"
+            f"native batch 2000 条指令 mtime 应为 [{lo}, {hi}] tick (纯指令源), 实际 {mtime}"
         )
         emu.close()
 
@@ -2160,7 +2163,6 @@ class TestMarshalUnmarshalRoundtrip:
         """每寄存器写入唯一值后往返不变."""
         hart = self._fresh_hart()
         for i in range(32):
-            # 用可识别模式: i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE
             hart.gprs[i] = mask64(i * 0x1111_1111_1111_1111 + 0xDEAD_BEEF_CAFE_BABE)
         # x0 写保护 — GprFile 应忽略写入
         hart.gprs[0] = 0  # explicitly ensure
@@ -2181,22 +2183,20 @@ class TestMarshalUnmarshalRoundtrip:
         hart = self._fresh_hart()
         hart.gprs[20] = 0xFFFF_FFFF_FFFF_FFFF  # s4 = -1
         out = self._roundtrip(hart)
-        assert out.gprs[20] == 0xFFFF_FFFF_FFFF_FFFF, (
-            f"s4 = {out.gprs[20]:#018x}, expected -1"
-        )
+        assert out.gprs[20] == 0xFFFF_FFFF_FFFF_FFFF, f"s4 = {out.gprs[20]:#018x}, expected -1"
 
     def test_gpr_edge_values_roundtrip(self) -> None:
         """GPR 极端值 (0, -1, MAX, 符号位, 交替 bits) 往返不变."""
         hart = self._fresh_hart()
         test_values = {
-            1: 0,                           # zero
-            2: 0xFFFF_FFFF_FFFF_FFFF,       # -1 (ld-linux s4 sentinel)
-            3: 0x7FFF_FFFF_FFFF_FFFF,       # max positive signed
-            4: 0x8000_0000_0000_0000,       # min negative signed
-            5: 0xAAAA_AAAA_AAAA_AAAA,       # alternating bits
-            6: 0x5555_5555_5555_5555,       # alternating bits (inverted)
-            7: 0x0000_0000_0000_0001,       # 1 (smallest non-zero)
-            8: 0x8000_0000_0000_0001,       # sign bit + 1
+            1: 0,  # zero
+            2: 0xFFFF_FFFF_FFFF_FFFF,  # -1 (ld-linux s4 sentinel)
+            3: 0x7FFF_FFFF_FFFF_FFFF,  # max positive signed
+            4: 0x8000_0000_0000_0000,  # min negative signed
+            5: 0xAAAA_AAAA_AAAA_AAAA,  # alternating bits
+            6: 0x5555_5555_5555_5555,  # alternating bits (inverted)
+            7: 0x0000_0000_0000_0001,  # 1 (smallest non-zero)
+            8: 0x8000_0000_0000_0001,  # sign bit + 1
         }
         for idx, val in test_values.items():
             hart.gprs[idx] = val
@@ -2207,22 +2207,25 @@ class TestMarshalUnmarshalRoundtrip:
             )
 
     # ---------- 关键 CSR 往返 ----------
-    @pytest.mark.parametrize("csr_name,val", [
-        ("mstatus", 0x0000000A00001800),  # MPP=M, SPP=S, FS=1, XS=1
-        ("mtvec", 0x80001000),            # vectored M-mode
-        ("stvec", 0x80200000),            # direct S-mode
-        ("mepc", 0x80001234),
-        ("sepc", 0x3FFF_FFFF_F000),
-        ("mcause", 0x8000_0000_0000_000D),  # LoadPageFault interrupt
-        ("scause", 0x0000_0000_0000_0008),  # EcallFromUmode
-        ("mtval", 0x0000_0033D),
-        ("stval", 0x3FFF_FFFF_F000),
-        ("satp", 0x8000_0000_0001_2345),  # Sv39, PPN=0x12345
-        ("mie", 0x888),                    # MEIE | SEIE | MTIE
-        ("mip", 0x080),                    # STIP
-        ("medeleg", 0xBEEF),
-        ("mideleg", 0xDEAD),
-    ])
+    @pytest.mark.parametrize(
+        "csr_name,val",
+        [
+            ("mstatus", 0x0000000A00001800),  # MPP=M, SPP=S, FS=1, XS=1
+            ("mtvec", 0x80001000),  # vectored M-mode
+            ("stvec", 0x80200000),  # direct S-mode
+            ("mepc", 0x80001234),
+            ("sepc", 0x3FFF_FFFF_F000),
+            ("mcause", 0x8000_0000_0000_000D),  # LoadPageFault interrupt
+            ("scause", 0x0000_0000_0000_0008),  # EcallFromUmode
+            ("mtval", 0x0000_0033D),
+            ("stval", 0x3FFF_FFFF_F000),
+            ("satp", 0x8000_0000_0001_2345),  # Sv39, PPN=0x12345
+            ("mie", 0x888),  # MEIE | SEIE | MTIE
+            ("mip", 0x080),  # STIP
+            ("medeleg", 0xBEEF),
+            ("mideleg", 0xDEAD),
+        ],
+    )
     def test_csr_roundtrip(self, csr_name: str, val: int) -> None:
         """关键 CSR 往返不变."""
         hart = self._fresh_hart()
@@ -2359,13 +2362,13 @@ class TestLdLinuxAddrChain:
     若任一指令结果错误则 s1 指向错误元素 -> ld a5,0(s1) 读到 DT_RELA=7.
     """
 
-    SLLI_S1_A5_2 = 0x00279493    # 4B: slli s1, a5, 2
-    C_ADD_S1_A5 = 0x94BE          # 2B: c.add s1, a5
-    C_SLLI_S1_5 = 0x0496          # 2B: c.slli s1, 5
+    SLLI_S1_A5_2 = 0x00279493  # 4B: slli s1, a5, 2
+    C_ADD_S1_A5 = 0x94BE  # 2B: c.add s1, a5
+    C_SLLI_S1_5 = 0x0496  # 2B: c.slli s1, 5
     ADDI_S1_NEG_A0 = 0xF6048493  # 4B: addi s1, s1, -0xa0
-    AUIPC_A5_1E = 0x0001E797     # 4B: auipc a5, 0x1e
+    AUIPC_A5_1E = 0x0001E797  # 4B: auipc a5, 0x1e
     ADDI_A5_A5_542 = 0x54278793  # 4B: addi a5, a5, 0x542
-    C_ADD_S1_A5_FINAL = 0x94BE   # 2B: c.add s1, a5
+    C_ADD_S1_A5_FINAL = 0x94BE  # 2B: c.add s1, a5
     PC_START = 0x3ABA
     PC_AT_AUIPC = 0x3AC6  # 0x3aba + 4 + 2 + 2 + 4
 
@@ -2382,9 +2385,15 @@ class TestLdLinuxAddrChain:
         hart.pc = self.PC_START
         hart.gprs[15] = counter  # a5
 
-        for instr in (self.SLLI_S1_A5_2, self.C_ADD_S1_A5, self.C_SLLI_S1_5,
-                      self.ADDI_S1_NEG_A0, self.AUIPC_A5_1E,
-                      self.ADDI_A5_A5_542, self.C_ADD_S1_A5_FINAL):
+        for instr in (
+            self.SLLI_S1_A5_2,
+            self.C_ADD_S1_A5,
+            self.C_SLLI_S1_5,
+            self.ADDI_S1_NEG_A0,
+            self.AUIPC_A5_1E,
+            self.ADDI_A5_A5_542,
+            self.C_ADD_S1_A5_FINAL,
+        ):
             hart.pc += hart.exec_instr(instr)
 
         expected = (counter - 1) * 0xA0 + self.PC_AT_AUIPC + 0x1E000 + 0x542
@@ -2392,10 +2401,13 @@ class TestLdLinuxAddrChain:
             f"counter={counter}: s1={hart.gprs[9]:#018x}, expected {expected:#018x}"
         )
 
-    @pytest.mark.parametrize("pc_base", [
-        0x3ABA,
-        0x3F_F7FD_cABA,  # ld-linux 运行时 VA
-    ])
+    @pytest.mark.parametrize(
+        "pc_base",
+        [
+            0x3ABA,
+            0x3F_F7FD_CABA,  # ld-linux 运行时 VA
+        ],
+    )
     @pytest.mark.parametrize("counter", [1, 2, 5])
     def test_auipc_pc_relative(self, counter: int, pc_base: int) -> None:
         """AUIPC 使用自身 PC 而非其他值."""
@@ -2403,9 +2415,15 @@ class TestLdLinuxAddrChain:
         hart.pc = pc_base
         hart.gprs[15] = counter
 
-        for instr in (self.SLLI_S1_A5_2, self.C_ADD_S1_A5, self.C_SLLI_S1_5,
-                      self.ADDI_S1_NEG_A0, self.AUIPC_A5_1E,
-                      self.ADDI_A5_A5_542, self.C_ADD_S1_A5_FINAL):
+        for instr in (
+            self.SLLI_S1_A5_2,
+            self.C_ADD_S1_A5,
+            self.C_SLLI_S1_5,
+            self.ADDI_S1_NEG_A0,
+            self.AUIPC_A5_1E,
+            self.ADDI_A5_A5_542,
+            self.C_ADD_S1_A5_FINAL,
+        ):
             hart.pc += hart.exec_instr(instr)
 
         pc_auipc = pc_base + (self.PC_AT_AUIPC - self.PC_START)
@@ -2427,12 +2445,15 @@ class TestBranchEdgeCases:
         return hart
 
     # ---- BLTZ (s2 < 0 -> branch) ----
-    @pytest.mark.parametrize("s2_val,taken", [
-        (-1, True),    # s2=-1 < 0 -> branch to skip loop
-        (0, False),    # s2=0 >= 0 -> fall through (enter loop)
-        (1, False),    # s2=1 >= 0 -> fall through
-        (-2, True),    # s2=-2 < 0 -> branch
-    ])
+    @pytest.mark.parametrize(
+        "s2_val,taken",
+        [
+            (-1, True),  # s2=-1 < 0 -> branch to skip loop
+            (0, False),  # s2=0 >= 0 -> fall through (enter loop)
+            (1, False),  # s2=1 >= 0 -> fall through
+            (-2, True),  # s2=-2 < 0 -> branch
+        ],
+    )
     def test_bltz_edge(self, s2_val: int, taken: bool) -> None:
         """BLTZ at 0x3ab6: branch taken iff s2 < 0."""
         hart = self._make_hart()
@@ -2450,12 +2471,15 @@ class TestBranchEdgeCases:
             assert hart.pc == 0x3ABA, f"s2={s2_val}: should fall through to 0x3aba"
 
     # ---- BNE (s2 != s4 -> branch back) ----
-    @pytest.mark.parametrize("s2_val,s4_val,taken", [
-        (-1, -1, False),  # s2 == s4 -> exit loop
-        (0, -1, True),    # s2 != s4 -> continue loop
-        (1, -1, True),    # continue
-        (-2, -1, True),   # s2=-2 != -1 -> continue
-    ])
+    @pytest.mark.parametrize(
+        "s2_val,s4_val,taken",
+        [
+            (-1, -1, False),  # s2 == s4 -> exit loop
+            (0, -1, True),  # s2 != s4 -> continue loop
+            (1, -1, True),  # continue
+            (-2, -1, True),  # s2=-2 != -1 -> continue
+        ],
+    )
     def test_bne_exit_edge(self, s2_val: int, s4_val: int, taken: bool) -> None:
         """BNE at 0x3b06: branch NOT taken when s2 == s4."""
         hart = self._make_hart()
@@ -2576,9 +2600,7 @@ class TestNativeXonlyFetch:
         assert h.pc == self.TRAP_VEC_VA + 4, (
             "trap_vector 首条指令应被取指+执行 (X-only 页取指成功)"
         )
-        assert h.mode == RiscvMode.S, (
-            f"不应陷入 M 模式 trap loop, 实际 mode={h.mode}"
-        )
+        assert h.mode == RiscvMode.S, f"不应陷入 M 模式 trap loop, 实际 mode={h.mode}"
         assert h.csrs["mcause"].val == 0, (
             f"不应投递任何异常, 实际 mcause=0x{h.csrs['mcause'].val:x}"
         )
@@ -2608,7 +2630,6 @@ class TestNativeXonlyFetch:
 
         # S 模式同步异常投递到 stvec, cause 存于 scause (非 mcause)
         assert h.csrs["scause"].val == 13, (  # LoadPageFault
-            f"X-only 页数据读应触发 LoadPageFault, 实际 scause=0x"
-            f"{h.csrs['scause'].val:x}"
+            f"X-only 页数据读应触发 LoadPageFault, 实际 scause=0x{h.csrs['scause'].val:x}"
         )
         assert h.csrs["stval"].val == self.TRAP_VEC_VA

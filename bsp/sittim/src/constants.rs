@@ -1,13 +1,57 @@
-//! 所有魔数集中定义。
-//!
 //! 平台可调常量由 Makefile 从 config.mk 生成 configs_gen.rs 注入。
-//!
-//! 此文件为完整常量参考，未使用的项目有意保留。
 
 #![allow(dead_code)]
 
+use core::num::NonZeroU64;
+
 // ---- 由 Makefile 从 config.mk 生成 ----
 include!("configs_gen.rs");
+
+// ---------------------------------------------------------------
+//  配置取值的检查
+//
+// 以下取值由 config.mk 注入, 不合法时编译失败, 不进入运行期。
+// ---------------------------------------------------------------
+
+/// 每秒的时钟源计数值。取值为 0 时任何计数值都换算不出秒, 故由 NonZeroU64 在编译期
+/// 排除该取值。
+pub const TIMER_FREQ_NONZERO: NonZeroU64 = match NonZeroU64::new(TIMER_FREQ) {
+	Some(v) => v,
+	None => panic!("TIMER_FREQ in config.mk must be greater than zero"),
+};
+
+/// 一次调度 tick 所用的时钟源计数: 调度定时器按该间隔请求中断。
+pub const TICKS_PER_SCHED_TICK: u64 = TIMER_FREQ / SCHED_FREQ;
+
+/// 调度频率取 0 时一次 tick 的计数长度没有定义。
+const _: () = assert!(
+	SCHED_FREQ > 0,
+	"SCHED_FREQ in config.mk must be greater than zero"
+);
+
+/// 时钟源频率低于 1000 Hz 时 1 ms 内不足一个计数, 时间片无法按毫秒计。
+const _: () = assert!(
+	TIMER_FREQ >= 1_000,
+	"TIMER_FREQ in config.mk must be at least 1000"
+);
+
+/// 计数长度须整除; 不整除时实际的中断频率偏离 SCHED_FREQ。
+const _: () = assert!(
+	TIMER_FREQ % SCHED_FREQ == 0,
+	"TIMER_FREQ must be a multiple of SCHED_FREQ"
+);
+
+/// 调度频率的区间: 167 ≤ SCHED_FREQ < TIMER_FREQ。
+///
+/// 下界取 Linux CFS 目标调度周期对应的频率: 该周期默认为 6 ms, 可运行任务数不超过 8 时
+/// 任务按该周期轮转; 周期 6 ms 对应的频率约为 166.7 Hz, 向上取整为 167 Hz. tick 慢于
+/// 该频率时, 时间片的消耗要等到下一个 tick 才能得到检查。
+/// 上界取时钟源频率: 一次 tick 至少包含两个时钟源计数, 否则截止时刻在中断返回时
+/// 已经到期, 定时器中断连续触发, 被中断的代码得不到执行。
+const _: () = assert!(
+	167 <= SCHED_FREQ && SCHED_FREQ < TIMER_FREQ,
+	"SCHED_FREQ in config.mk must be at least 167 and less than TIMER_FREQ"
+);
 
 // ---------------------------------------------------------------
 //  PTE 标志位
@@ -62,8 +106,8 @@ pub const SCAUSE_STORE_PAGE_FAULT: u64 = 0xf;
 /// 该陷态原因是否由 PMP 条目未覆盖访问的物理地址引起.
 ///
 /// 取指与读与写三类访问故障都属此列, 由 S 模式统一转发 M 模式按需加载该地址所属的区域;
-/// M 模式加载成功才重试原访问, 加载无法使该次访问成立时按故障的来源处置, 见 trap.rs 的
-/// 转发分支. 页错误的取值为 [`SCAUSE_INSTR_PAGE_FAULT`] 与 [`SCAUSE_LOAD_PAGE_FAULT`] 与
+/// M 模式加载成功才重试原访问, 加载无法使该次访问成立时按故障的来源处置
+/// 页错误的取值为 [`SCAUSE_INSTR_PAGE_FAULT`] 与 [`SCAUSE_LOAD_PAGE_FAULT`] 与
 /// [`SCAUSE_STORE_PAGE_FAULT`], 由页表项的权限位判定给出, 与 PMP 条目无关, 不在此列.
 pub const fn is_unmatched_access_fault(scause: u64) -> bool {
 	matches!(
@@ -79,7 +123,7 @@ pub const ENCLAVE_EXT_ID: u64 = 0x2022_1222;
 
 pub const ENCLAVE_CALL_SUSPEND: u64 = 404;
 pub const ENCLAVE_CALL_SHUTDOWN: u64 = 403;
-/// 申请内存: a1 = 分区数, a2 = 类别 (见 ENCLAVE_MEM_ATTR_*);
+/// 申请内存: a1 = 分区数, a2 = 类别;
 /// 返回 (已分配分区数, 物理起始地址).
 pub const ENCLAVE_CALL_MEM_ALLOC: u64 = 500;
 /// 设置一段内存的类别: a0 = 分区起始物理地址, a1 = 分区数, a2 = 新类别;

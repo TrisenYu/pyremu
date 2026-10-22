@@ -23,17 +23,17 @@ use std::sync::atomic::Ordering;
 #[path = "../src/constants.rs"]
 mod constants;
 
-#[path = "../src/mem_prim/mod.rs"]
-mod mem_prim;
+#[path = "../src/prim/mod.rs"]
+mod prim;
 
 /// 主机侧的 `paging`, 只声明 `mem` 与 `context` 引用到的符号。
 ///
 /// 页表项安装自身由 `tests/paging_host.rs` 与 `src/paging.rs` 的用例覆盖, 本入口内的用例
 /// 不建立页表: 映射请求只被记录。
 mod paging {
-	use core::sync::atomic::{ AtomicU64, Ordering };
+	use core::sync::atomic::{AtomicU64, Ordering};
 
-	use crate::constants::{ PTE_R, PTE_W };
+	use crate::constants::{PTE_R, PTE_W};
 
 	/// 页表项。`context` 以它声明 4 KiB 对齐的页表根。
 	#[derive(Clone, Copy)]
@@ -79,7 +79,7 @@ mod paging {
 
 /// 主机侧的 `hang`, 记录挂起请求。本入口内的用例不触发挂起。
 mod hang {
-	use core::sync::atomic::{ AtomicU64, Ordering };
+	use core::sync::atomic::{AtomicU64, Ordering};
 
 	/// 挂起请求的次数。
 	pub static HALT_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -93,7 +93,7 @@ mod hang {
 
 /// 主机侧的 `ecall_aux`, 记录发往 M 模式的类别改判请求。
 mod ecall_aux {
-	use core::sync::atomic::{ AtomicU64, Ordering };
+	use core::sync::atomic::{AtomicU64, Ordering};
 
 	/// 类别改判请求的次数, 以及最近一次请求的物理基址、分区数与类别。
 	pub static SET_ATTR_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -117,7 +117,11 @@ mod ecall_aux {
 		if granted == 0 {
 			return (0, !0u64);
 		}
-		let granted = if granted < chunk_nums { granted } else { chunk_nums };
+		let granted = if granted < chunk_nums {
+			granted
+		} else {
+			chunk_nums
+		};
 		(granted, ALLOC_PA.load(Ordering::SeqCst))
 	}
 
@@ -138,7 +142,7 @@ mod context;
 mod mem;
 
 use constants::*;
-use mem_prim::align::align_up;
+use prim::arith::align_up;
 
 // ---------------------------------------------------------------
 //  平台布局
@@ -215,7 +219,9 @@ fn test_is_dedicated_partition_accepts_a_granted_partition() {
 
 	assert!(mem::is_dedicated_partition(GRANTED_END));
 	assert!(mem::is_dedicated_partition(DEDICATED_PA));
-	assert!(mem::is_dedicated_partition(DEDICATED_PA + 7 * CHUNK_2M_SIZE));
+	assert!(mem::is_dedicated_partition(
+		DEDICATED_PA + 7 * CHUNK_2M_SIZE
+	));
 }
 
 /// 管理器镜像与 S 模式页池覆盖的分区一律不可改判, 首尾两块分区都在内。
@@ -237,8 +243,12 @@ fn test_is_dedicated_partition_rejects_the_image_and_the_smode_pool() {
 fn test_is_dedicated_partition_ignores_the_offset_inside_a_partition() {
 	world();
 
-	assert!(!mem::is_dedicated_partition(MAN_PA_START + CHUNK_2M_SIZE - 1));
-	assert!(mem::is_dedicated_partition(DEDICATED_PA + CHUNK_2M_SIZE - 1));
+	assert!(!mem::is_dedicated_partition(
+		MAN_PA_START + CHUNK_2M_SIZE - 1
+	));
+	assert!(mem::is_dedicated_partition(
+		DEDICATED_PA + CHUNK_2M_SIZE - 1
+	));
 }
 
 // ---------------------------------------------------------------
@@ -250,7 +260,11 @@ fn test_is_dedicated_partition_ignores_the_offset_inside_a_partition() {
 fn test_set_partition_attr_forwards_a_dedicated_range() {
 	world();
 
-	assert!(mem::set_partition_attr(DEDICATED_PA, CHUNK_2M_SIZE, ENCLAVE_MEM_ATTR_INSTR));
+	assert!(mem::set_partition_attr(
+		DEDICATED_PA,
+		CHUNK_2M_SIZE,
+		ENCLAVE_MEM_ATTR_INSTR
+	));
 	assert_eq!(set_attr_calls(), 1);
 	assert_eq!(set_attr_pa(), DEDICATED_PA);
 	assert_eq!(set_attr_partitions(), 1);
@@ -262,7 +276,11 @@ fn test_set_partition_attr_forwards_a_dedicated_range() {
 fn test_set_partition_attr_rounds_the_byte_count_up_to_partitions() {
 	world();
 
-	assert!(mem::set_partition_attr(DEDICATED_PA, CHUNK_2M_SIZE + 1, ENCLAVE_MEM_ATTR_INSTR));
+	assert!(mem::set_partition_attr(
+		DEDICATED_PA,
+		CHUNK_2M_SIZE + 1,
+		ENCLAVE_MEM_ATTR_INSTR
+	));
 	assert_eq!(set_attr_partitions(), 2);
 }
 
@@ -276,7 +294,11 @@ fn test_set_partition_attr_rejects_a_range_reaching_into_the_image() {
 	let start = MAN_PA_START - CHUNK_2M_SIZE;
 
 	// 上界落在管理器镜像的首个分区之内。
-	assert!(!mem::set_partition_attr(start, 2 * CHUNK_2M_SIZE, ENCLAVE_MEM_ATTR_INSTR));
+	assert!(!mem::set_partition_attr(
+		start,
+		2 * CHUNK_2M_SIZE,
+		ENCLAVE_MEM_ATTR_INSTR
+	));
 	assert_eq!(set_attr_calls(), 0);
 }
 
@@ -301,7 +323,11 @@ fn test_set_partition_attr_rejects_an_unaligned_start() {
 	world();
 	let unaligned = DEDICATED_PA + align_up(1, 8);
 
-	assert!(!mem::set_partition_attr(unaligned, CHUNK_2M_SIZE, ENCLAVE_MEM_ATTR_INSTR));
+	assert!(!mem::set_partition_attr(
+		unaligned,
+		CHUNK_2M_SIZE,
+		ENCLAVE_MEM_ATTR_INSTR
+	));
 	assert_eq!(set_attr_calls(), 0);
 }
 
@@ -310,7 +336,11 @@ fn test_set_partition_attr_rejects_an_unaligned_start() {
 fn test_set_partition_attr_rejects_a_zero_byte_count() {
 	world();
 
-	assert!(!mem::set_partition_attr(DEDICATED_PA, 0, ENCLAVE_MEM_ATTR_INSTR));
+	assert!(!mem::set_partition_attr(
+		DEDICATED_PA,
+		0,
+		ENCLAVE_MEM_ATTR_INSTR
+	));
 	assert_eq!(set_attr_calls(), 0);
 }
 
@@ -436,7 +466,10 @@ fn resize_mmap_at_region_end(old_end: u64, new_end: u64) -> bool {
 #[test]
 fn test_mmap_shrink_inside_one_block_succeeds() {
 	let old_end = set_mmap_state(700, SPLIT_PA);
-	assert!(resize_mmap_at_region_end(old_end, UMODE_MMAP_BASE + 600 * PAGE_SIZE));
+	assert!(resize_mmap_at_region_end(
+		old_end,
+		UMODE_MMAP_BASE + 600 * PAGE_SIZE
+	));
 	assert_eq!(context::ctx().umode_mmap_pages_used, 600);
 }
 
@@ -446,7 +479,10 @@ fn test_mmap_shrink_inside_one_block_succeeds() {
 #[test]
 fn test_mmap_shrink_across_a_block_boundary_is_refused() {
 	let old_end = set_mmap_state(700, SPLIT_PA);
-	assert!(!resize_mmap_at_region_end(old_end, UMODE_MMAP_BASE + 100 * PAGE_SIZE));
+	assert!(!resize_mmap_at_region_end(
+		old_end,
+		UMODE_MMAP_BASE + 100 * PAGE_SIZE
+	));
 	assert_eq!(context::ctx().umode_mmap_pages_used, 700);
 }
 
@@ -455,7 +491,10 @@ fn test_mmap_shrink_across_a_block_boundary_is_refused() {
 #[test]
 fn test_mmap_shrink_to_a_block_boundary_succeeds() {
 	let old_end = set_mmap_state(700, SPLIT_PA);
-	assert!(resize_mmap_at_region_end(old_end, UMODE_MMAP_BASE + 512 * PAGE_SIZE));
+	assert!(resize_mmap_at_region_end(
+		old_end,
+		UMODE_MMAP_BASE + 512 * PAGE_SIZE
+	));
 	assert_eq!(context::ctx().umode_mmap_pages_used, 512);
 }
 
@@ -464,7 +503,10 @@ fn test_mmap_shrink_to_a_block_boundary_succeeds() {
 #[test]
 fn test_mmap_shrink_at_a_block_boundary_without_a_split_block_is_refused() {
 	let old_end = set_mmap_state(512, 0);
-	assert!(!resize_mmap_at_region_end(old_end, UMODE_MMAP_BASE + 100 * PAGE_SIZE));
+	assert!(!resize_mmap_at_region_end(
+		old_end,
+		UMODE_MMAP_BASE + 100 * PAGE_SIZE
+	));
 	assert_eq!(context::ctx().umode_mmap_pages_used, 512);
 }
 
@@ -475,7 +517,10 @@ fn test_mmap_grow_inside_one_block_succeeds() {
 	assert!(resize_mmap_at_region_end(old_end, old_end + 10 * PAGE_SIZE));
 	assert_eq!(context::ctx().umode_mmap_pages_used, 610);
 	assert_eq!(paging::FIRST_VA.load(Ordering::SeqCst), old_end);
-	assert_eq!(paging::FIRST_PA.load(Ordering::SeqCst), SPLIT_PA + 88 * PAGE_SIZE);
+	assert_eq!(
+		paging::FIRST_PA.load(Ordering::SeqCst),
+		SPLIT_PA + 88 * PAGE_SIZE
+	);
 }
 
 /// 扩容跨越块边界时拒绝: 页计数落在块边界时正在切分的块的物理基址描述的是刚填满的
@@ -502,9 +547,15 @@ fn test_mmap_grow_at_a_block_boundary_without_a_split_block_is_refused() {
 #[test]
 fn test_mmap_shrink_after_a_shrink_to_a_block_boundary_is_refused() {
 	let old_end = set_mmap_state(700, SPLIT_PA);
-	assert!(resize_mmap_at_region_end(old_end, UMODE_MMAP_BASE + 512 * PAGE_SIZE));
+	assert!(resize_mmap_at_region_end(
+		old_end,
+		UMODE_MMAP_BASE + 512 * PAGE_SIZE
+	));
 	let boundary_end = UMODE_MMAP_BASE + 512 * PAGE_SIZE;
-	assert!(!resize_mmap_at_region_end(boundary_end, boundary_end - 412 * PAGE_SIZE));
+	assert!(!resize_mmap_at_region_end(
+		boundary_end,
+		boundary_end - 412 * PAGE_SIZE
+	));
 	assert_eq!(context::ctx().umode_mmap_pages_used, 512);
 }
 
@@ -600,7 +651,10 @@ fn test_take_mmap_region_rejects_a_request_past_the_region_capacity() {
 	let _ = set_mmap_state(region_pages - 1, SPLIT_PA);
 	grant_alloc(1, SPLIT_PA);
 
-	assert_eq!(mem::take_mmap_region(2 * PAGE_SIZE, PTE_U | PTE_R | PTE_W), 0);
+	assert_eq!(
+		mem::take_mmap_region(2 * PAGE_SIZE, PTE_U | PTE_R | PTE_W),
+		0
+	);
 	assert_eq!(ecall_aux::ALLOC_CALLS.load(Ordering::SeqCst), 0);
 	assert_eq!(paging::MAP_CALLS.load(Ordering::SeqCst), 0);
 	assert_eq!(context::ctx().umode_mmap_pages_used, region_pages - 1);
@@ -677,6 +731,10 @@ fn test_mmap_resize_with_an_overflowing_end_is_refused() {
 	let _ = set_mmap_state(700, SPLIT_PA);
 	let new_size = u64::MAX - UMODE_MMAP_BASE + 1;
 
-	assert!(!mem::grow_mmap_in_place(UMODE_MMAP_BASE, 700 * PAGE_SIZE, new_size));
+	assert!(!mem::grow_mmap_in_place(
+		UMODE_MMAP_BASE,
+		700 * PAGE_SIZE,
+		new_size
+	));
 	assert_eq!(context::ctx().umode_mmap_pages_used, 700);
 }

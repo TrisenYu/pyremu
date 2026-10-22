@@ -17,8 +17,6 @@ from copy import deepcopy
 from enum import Enum
 from functools import partial
 
-from pydantic import BaseModel
-
 from pyremu.configs_gen import PYREMU_AIA, PYREMU_H_EXT
 from pyremu.utils.regname import init_csr_map, init_gpr_map
 
@@ -27,22 +25,22 @@ from pyremu.utils.regname import init_csr_map, init_gpr_map
 # ============================================================
 
 
-class Reg(BaseModel):
+class Reg:
     """通用整数寄存器."""
 
-    name: str
-    alias: str = ""
-    restricts: list = []
-    val: int = 0
+    def __init__(self, name: str, alias: str = "", val: int = 0):
+        self.name: str = name
+        self.alias: str = alias
+        self.val: int = val
 
 
-class FPR(BaseModel):
+class FPR:
     """浮点寄存器."""
 
-    name: str
-    alias: str = ""
-    restricts: list = []
-    val: float = 0.0
+    def __init__(self, name: str, alias: str = "", val: int = 0):
+        self.name: str = name
+        self.alias: str = alias
+        self.val: int = val
 
 
 # ============================================================
@@ -156,9 +154,13 @@ _csr_access_mask = 0b1111_10  # 清除 LSB (rw -> ro)
 class CSR(Reg):
     """控制和状态寄存器."""
 
-    access: CsrAccess
-    xlen: int = 64
-    implemented: bool = True
+    def __init__(
+        self, access: CsrAccess, xlen: int = 64, implemented: bool = True, *args, **kwargs
+    ):
+        self.access = access
+        self.xlen = xlen
+        self.implemented = implemented
+        super().__init__(*args, **kwargs)
 
     def strip_w(self) -> "CSR":
         """设为只读 (低 2 位 = 10)."""
@@ -353,7 +355,6 @@ csr_bank: dict[int, CSR] = {
     0xB80: _MmodeCSR(name="mcycleh", xlen=32),
     0xB81: _MmodeCSR(name="mtimeh", xlen=32),
     0xB82: _MmodeCSR(name="minstreth", xlen=32),
-    # 用户级计数器 (只读)
     0xC00: _UmodeCSR(name="cycle").strip_w(),
     0xC01: _UmodeCSR(name="time").strip_w(),
     0xC02: _UmodeCSR(name="instret").strip_w(),
@@ -367,7 +368,6 @@ csr_bank: dict[int, CSR] = {
     0xDB0: _SmodeCSR(name="stopi").strip_w(),
     0xE12: _HmodeCSR(name="hgeip").strip_w(),
     0xEB0: _HmodeCSR(name="vstopi").strip_w(),
-    # 机器信息 (只读)
     0xF11: _MmodeCSR(name="mvendorid", xlen=32).strip_w(),
     0xF12: _MmodeCSR(name="marchid").strip_w(),
     0xF13: _MmodeCSR(name="mimpid").strip_w(),

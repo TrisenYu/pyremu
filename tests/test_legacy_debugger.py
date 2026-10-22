@@ -4,6 +4,7 @@
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """调试器 (rvdb) 测试: 状态快照, 指令回滚, 命令方法, REPL 分发."""
+
 import io
 import sys
 
@@ -345,7 +346,6 @@ class TestStepOne:
     def test_ebreak_sets_mcause(self):
         """EBREAK 指令应触发陷态, 但不应导致 halted."""
         dbg = _make_dbg()
-        # EBREAK = 0x00100073
         dbg._emu.load_code(0x1000, b"\x73\x00\x10\x00")
         h = dbg.hart
         h.pc = 0x1000
@@ -803,7 +803,6 @@ class TestCmdDisasm:
         # 奇数地址
         dbg.cmd_disasm("0x80000ff1", "16")
         # 不应挂死, 且 _disasm_next_addr 应从对齐后的地址计算
-        # (没有异常即通过)
         assert dbg._disasm_next_addr is not None
         # 对齐后应从 0x80000FF0 开始, next_addr >= 0x80000FF0 + 4*nop
         assert dbg._disasm_next_addr >= 0x80000FF0 + 4, (
@@ -842,8 +841,7 @@ class TestCmdDisasm:
         # 验证下一条地址: 两条 4 字节指令 = 8 字节后
         assert dbg._disasm_next_addr is not None
         assert dbg._disasm_next_addr == target_pa + 8, (
-            f"disasm PA: next_addr=0x{dbg._disasm_next_addr:x}, "
-            f"期望 0x{target_pa + 8:x}"
+            f"disasm PA: next_addr=0x{dbg._disasm_next_addr:x}, 期望 0x{target_pa + 8:x}"
         )
 
     def test_disasm_mmu_bare_falls_back_to_physical(self):
@@ -900,8 +898,7 @@ class TestCmdDisasm:
         # 验证 next_addr 正确 (两条 4 字节指令, 共 8 字节)
         assert dbg._vdisasm_next_addr is not None
         assert dbg._vdisasm_next_addr == target_va_2m + 8, (
-            f"vdisasm 2M: next_addr=0x{dbg._vdisasm_next_addr:x}, "
-            f"期望 0x{target_va_2m + 8:x}"
+            f"vdisasm 2M: next_addr=0x{dbg._vdisasm_next_addr:x}, 期望 0x{target_va_2m + 8:x}"
         )
 
     def test_vdisasm_ppn_not_pa(self):
@@ -933,8 +930,12 @@ class TestCmdDisasm:
         _write_pte(L1_BASE + vpn2 * 8, L2_BASE >> 12, v=True)
         _write_pte(L2_BASE + vpn1 * 8, L3_BASE >> 12, v=True)
         _write_pte(
-            L3_BASE + vpn0 * 8, target_pa >> 12,
-            v=True, r=True, w=True, x=True,
+            L3_BASE + vpn0 * 8,
+            target_pa >> 12,
+            v=True,
+            r=True,
+            w=True,
+            x=True,
         )
 
         hart.mode = RiscvMode.S
@@ -945,9 +946,7 @@ class TestCmdDisasm:
         # 直接调 sv39_walk: 返回 PPN, 不是 PA
         root_ppn = satp_root_ppn(hart.satp_val)
         assert hart._mem_read_phy is not None
-        ok, ppn, _perm, _ps = sv39_walk(
-            root_ppn, target_va_4k, hart._mem_read_phy
-        )
+        ok, ppn, _perm, _ps = sv39_walk(root_ppn, target_va_4k, hart._mem_read_phy)
         assert ok, "sv39_walk 应成功"
         # PPN != PA: 若调用方把 PPN 当 PA 用, 会读到错误地址
         page_off = target_va_4k & 0xFFF
@@ -1150,10 +1149,7 @@ class TestCmdSymbols:
             format="elf",
             segments=[
                 FirmwareSegment(vaddr=0x0, data=b"", memsz=0x3F260, name=".text"),
-                FirmwareSegment(
-                    vaddr=0x180000, data=b"",
-                    memsz=0xE225, name=".sittim"
-                ),
+                FirmwareSegment(vaddr=0x180000, data=b"", memsz=0xE225, name=".sittim"),
             ],
             symbols={},
         )
@@ -1162,9 +1158,7 @@ class TestCmdSymbols:
         dbg._load_offset = 0x80000000
         # 内核 Image 区域 (fw_jump): VA 0x200000 起, 无对应段
         seg = dbg._find_segment(0x201048)
-        assert seg is None, (
-            f"段间空隙地址不应匹配任何段, 但返回了 {seg.name if seg else None}"
-        )
+        assert seg is None, f"段间空隙地址不应匹配任何段, 但返回了 {seg.name if seg else None}"
 
     def test_find_segment_gap_just_after_segment_returns_none(self):
         """紧接段末尾之后的地址返回 None.
@@ -1486,7 +1480,6 @@ class TestCmdBreakpoint:
         dbg = _make_dbg()
         dbg.cmd_bp_set("0x1000")
         dbg.hart.pc = 0x1000
-        # 第一遍: 命中
         assert dbg._check_breakpoints(dbg.hart, 0x1000, 0x00000013)
         assert ("addr", 0x1000) in dbg._bp_hit_this_run
         # 模拟 c 后回到 REPL, 再 c 一次: 同一地址应被跳过
@@ -1676,7 +1669,6 @@ class TestCmdBreakpoint:
         result = dbg._try_set_symbol_bp("_start")
         assert result is True
         assert len(dbg._breakpoints) == 1
-        # 应命中固件符号 (0x1000 + 0), 而非内核符号
         bp = dbg._breakpoints[0]
         assert bp.value == 0x1000, f"应使用固件符号地址 0x1000, 实际 {bp.value:#x}"
 
@@ -1786,9 +1778,7 @@ class TestDispatch:
     def test_sym_empty_symbols(self):
         """空符号表不应崩溃."""
         dbg = _make_dbg()
-        dbg._image = FirmwareImage(
-            format="elf", entry_point=0x1000, segments=[], symbols={}
-        )
+        dbg._image = FirmwareImage(format="elf", entry_point=0x1000, segments=[], symbols={})
         assert dbg._dispatch(["sym"]) is True
 
     def test_sym_no_image(self):
@@ -1945,9 +1935,7 @@ class TestStackWalk:
         h.gprs[8] = 0  # fp = 0
         h.gprs[2] = 0x80001000  # sp
         # 设置 mstatus: SPP=S (bit 8), MPP=S
-        h.csrs["mstatus"].val = (
-            h.csrs["mstatus"].val | (1 << 8)
-        )  # SPP=1
+        h.csrs["mstatus"].val = h.csrs["mstatus"].val | (1 << 8)  # SPP=1
         # 启用 Sv39 (satp MODE=8) — 必须经 satp_val setter 更新 _mmu_mode
         root_ppn = 0x80000
         h.satp_val = (8 << 60) | root_ppn
@@ -2107,9 +2095,7 @@ class TestUmodeBacktrace:
         h.gprs[8] = 0  # fp = 0 ->FP 链不可达
 
         frames = dbg._walk_frame_chain()
-        assert len(frames) == 2, (
-            f"RA 推断应产生 1 个调用者帧 (共 2 帧), 但只有 {len(frames)}"
-        )
+        assert len(frames) == 2, f"RA 推断应产生 1 个调用者帧 (共 2 帧), 但只有 {len(frames)}"
         assert frames[0].mode == "U"
         assert frames[1].mode == "U"
         assert frames[1].pc == 0x80001FFC  # ra - 4
@@ -2138,25 +2124,35 @@ class TestUmodeBacktrace:
         # Trap CSRs: S-mode 捕获 U-mode 异常
         h.csrs["sepc"].val = 0x80003AE8  # U-mode PC (fault site, valid PA)
         h.csrs["scause"].val = 0xD  # LoadPageFault
-        # mstatus.SPP = U
         h.csrs["mstatus"].val = h.csrs["mstatus"].val & ~(1 << 8)
 
         # stvec 指向含 RA/FP 保存的 trap 入口
         # addi sp,sp,-240; sd x1,0(sp); sd x8,8(sp)
         tvec_addr = 0x80018000
         h.csrs["stvec"].val = tvec_addr
-        trap_entry = bytes([
-            0x13, 0x01, 0x01, 0xF1,  # addi sp, sp, -240
-            0x23, 0x30, 0x11, 0x00,  # sd   x1, 0(sp)
-            0x23, 0x34, 0x81, 0x00,  # sd   x8, 8(sp)
-        ])
+        trap_entry = bytes(
+            [
+                0x13,
+                0x01,
+                0x01,
+                0xF1,  # addi sp, sp, -240
+                0x23,
+                0x30,
+                0x11,
+                0x00,  # sd   x1, 0(sp)
+                0x23,
+                0x34,
+                0x81,
+                0x00,  # sd   x8, 8(sp)
+            ]
+        )
         bus.write(tvec_addr, trap_entry)
 
         # S-mode 内核栈上的 trap 帧 — 由栈扫描找到
         trap_sp = 0x8001E000
         bus.write(trap_sp, (0x80003AE8).to_bytes(8, "little"))  # trapped PC
-        bus.write(trap_sp + 0, (0).to_bytes(8, "little"))        # zero verify (sp+0)
-        bus.write(trap_sp + 8, (0x80002000).to_bytes(8, "little"))   # saved_ra @ ra_off=8
+        bus.write(trap_sp + 0, (0).to_bytes(8, "little"))  # zero verify (sp+0)
+        bus.write(trap_sp + 8, (0x80002000).to_bytes(8, "little"))  # saved_ra @ ra_off=8
         bus.write(trap_sp + 16, (0x8000F080).to_bytes(8, "little"))  # saved_fp @ fp_off=16
 
         # U-mode FP 链 (位于 saved_fp=0x8000F080)
@@ -2168,9 +2164,7 @@ class TestUmodeBacktrace:
         frames = dbg._walk_frame_chain()
 
         umode_frames = [f for f in frames if f.mode == "U"]
-        assert len(umode_frames) >= 1, (
-            f"{[(f.idx, f.mode, hex(f.pc)) for f in frames]}"
-        )
+        assert len(umode_frames) >= 1, f"{[(f.idx, f.mode, hex(f.pc)) for f in frames]}"
 
     # ---------- Fallback trap offsets ----------
 
@@ -2198,11 +2192,11 @@ class TestUmodeBacktrace:
 
         trap_sp = 0x8001E000
         bus.write(trap_sp, (0x80001000).to_bytes(8, "little"))  # trapped PC
-        bus.write(trap_sp + 0, (0).to_bytes(8, "little"))        # zero verify
+        bus.write(trap_sp + 0, (0).to_bytes(8, "little"))  # zero verify
         # saved_ra @ ra_off=0 — 但 zero verify 在同一个位置, 所以 ra_off=0 布局无法通过
         # 用 ra_off=8, fp_off=64 (Linux pt_regs) 布局
         # 在 trap_sp 上方找位置放 saved_ra
-        bus.write(trap_sp + 8, (0x80002000).to_bytes(8, "little"))   # saved_ra @ ra_off=8
+        bus.write(trap_sp + 8, (0x80002000).to_bytes(8, "little"))  # saved_ra @ ra_off=8
         bus.write(trap_sp + 64, (0x8000F080).to_bytes(8, "little"))  # saved_fp @ fp_off=64
 
         # U-mode FP 链
@@ -2363,11 +2357,6 @@ class TestPrintHelp:
         dbg._print_help()  # 不抛异常
 
 
-# ============================================================
-#  集成: 多步执行 + 状态检查
-# ============================================================
-
-
 class TestDebuggerIntegration:
     """端到端集成."""
 
@@ -2514,8 +2503,9 @@ class TestDisasmCompressed:
         result = dbg._fetch_and_disasm(0x1000)
         assert result is not None
         raw_hex, _ = result
-        assert len(raw_hex) == 8, \
+        assert len(raw_hex) == 8, (
             f"32-bit 指令 hex 应为 8 位, 实际 {len(raw_hex)} 位: {raw_hex}"
+        )
         assert raw_hex == "f9010113", f"应为 f9010113, 实际: {raw_hex}"
 
 
@@ -2676,8 +2666,9 @@ class TestParseTrapSaveOffsets:
     def _encode_sd(rs2: int, rs1: int, imm: int) -> int:
         imm_4_0 = imm & 0x1F
         imm_11_5 = (imm >> 5) & 0x7F
-        return (imm_11_5 << 25) | (rs2 << 20) | (rs1 << 15) | \
-            (0x3 << 12) | (imm_4_0 << 7) | 0x23
+        return (
+            (imm_11_5 << 25) | (rs2 << 20) | (rs1 << 15) | (0x3 << 12) | (imm_4_0 << 7) | 0x23
+        )
 
     @staticmethod
     def _encode_c_sdsp(rs2: int, uimm: int) -> int:
@@ -2711,20 +2702,18 @@ class TestParseTrapSaveOffsets:
 
     def test_c_sdsp_both_ra_and_fp(self):
         """c.sdsp x1,8(sp) + c.sdsp x8,64(sp) -> (8, 64)"""
-        code = (
-            self._encode_c_sdsp(1, 8).to_bytes(2, "little")
-            + self._encode_c_sdsp(8, 64).to_bytes(2, "little")
-        )
+        code = self._encode_c_sdsp(1, 8).to_bytes(2, "little") + self._encode_c_sdsp(
+            8, 64
+        ).to_bytes(2, "little")
         dbg, tvec = self._make_dbg_with_tvec(code)
         result = dbg._parse_trap_save_offsets(tvec)
         assert result == (8, 64), f"expected (8, 64), got {result}"
 
     def test_c_sdsp_fp_first_then_ra(self):
         """先保存 fp 后 ra 的顺序也应正确识别"""
-        code = (
-            self._encode_c_sdsp(8, 64).to_bytes(2, "little")
-            + self._encode_c_sdsp(1, 8).to_bytes(2, "little")
-        )
+        code = self._encode_c_sdsp(8, 64).to_bytes(2, "little") + self._encode_c_sdsp(
+            1, 8
+        ).to_bytes(2, "little")
         dbg, tvec = self._make_dbg_with_tvec(code)
         result = dbg._parse_trap_save_offsets(tvec)
         assert result == (8, 64), f"expected (8, 64), got {result}"
@@ -2747,10 +2736,9 @@ class TestParseTrapSaveOffsets:
 
     def test_sd_both_ra_and_fp(self):
         """sd x1,8(sp) + sd x8,64(sp) -> (8, 64)"""
-        code = (
-            self._encode_sd(1, 2, 8).to_bytes(4, "little")
-            + self._encode_sd(8, 2, 64).to_bytes(4, "little")
-        )
+        code = self._encode_sd(1, 2, 8).to_bytes(4, "little") + self._encode_sd(
+            8, 2, 64
+        ).to_bytes(4, "little")
         dbg, tvec = self._make_dbg_with_tvec(code)
         result = dbg._parse_trap_save_offsets(tvec)
         assert result == (8, 64), f"expected (8, 64), got {result}"
@@ -2769,14 +2757,12 @@ class TestParseTrapSaveOffsets:
 
     def test_equivalent_fp_offset(self):
         """c.sdsp 和 sd 对 fp 产生相同偏移 (需同时有 ra)"""
-        c_code = (
-            self._encode_c_sdsp(1, 8).to_bytes(2, "little")
-            + self._encode_c_sdsp(8, 64).to_bytes(2, "little")
-        )
-        sd_code = (
-            self._encode_sd(1, 2, 8).to_bytes(4, "little")
-            + self._encode_sd(8, 2, 64).to_bytes(4, "little")
-        )
+        c_code = self._encode_c_sdsp(1, 8).to_bytes(2, "little") + self._encode_c_sdsp(
+            8, 64
+        ).to_bytes(2, "little")
+        sd_code = self._encode_sd(1, 2, 8).to_bytes(4, "little") + self._encode_sd(
+            8, 2, 64
+        ).to_bytes(4, "little")
 
         dbg_c, tv_c = self._make_dbg_with_tvec(c_code)
         dbg_sd, tv_sd = self._make_dbg_with_tvec(sd_code)
@@ -3171,8 +3157,10 @@ class TestPrivilegeBoundary:
         img = _make_image()
         img.segments = [
             FirmwareSegment(
-                vaddr=0x80000000, memsz=0x10000,
-                data=b"\x00" * 0x10000, name=".text",
+                vaddr=0x80000000,
+                memsz=0x10000,
+                data=b"\x00" * 0x10000,
+                name=".text",
             )
         ]
         dbg._image = img

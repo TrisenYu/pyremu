@@ -42,6 +42,7 @@ from pyremu._native import (
     PlicInfo,
     PmpInfo,
     run_parallel,
+    RunConfig,
     termio_set_emu_stop_flag,
     UartInfo,
     VirtIOInfo,
@@ -104,16 +105,10 @@ from pyremu.utils.parse_bin import FirmwareImage
 from pyremu.utils.tick import yield_cpu
 
 _WFI_MAX_SLEEP = cfg_float("WFI_MAX_SLEEP")  # 单次最大睡眠秒数, 降低 CPU 占用
-# 每条已执行完成的指令折算的时钟周期数. 与 Rust 加速引擎的 CYCLES_PER_INSTR 同源:
-#     cycles = instrs * NS_PER_INSTR * CPU_FREQ_HZ / 1e9
-# 真实核心的 CPI 随指令类别、流水线停顿、缓存未命中与访存延迟分别取值, 本模型
-# 不逐类还原, 固定按上式的同一个值折算. 因此由 mcycle 得到的绝对周期数只是
-# 可复现的指令数折算; 该值仍满足测量所需的一条性质: 同一 hart 上两次采样之差
-# 只由该 hart 执行的指令决定, 与其它 hart 是否同时运行无关.
 CYCLES_PER_INSTR = cfg_int("NS_PER_INSTR") * CPU_FREQ_HZ // 1_000_000_000
 # 阈值判断: <=2 MiB 的段走 L2 缓存, 更大的段 (如 Linux 内核 Image)
 # 绕过 L2 直写 RAM, 避免 cache-line 级逐片处理膨胀到数十秒.
-_FAST_LOAD_THRESHOLD = cfg_int("FAST_LOAD_THRESHOLD")  # 2 MiB
+_FAST_LOAD_THRESHOLD = cfg_int("FAST_LOAD_THRESHOLD")
 
 
 def _wrap_phy_write_for_uart(
@@ -209,8 +204,6 @@ class Emulator:
         # 默认 bootargs: 内核控制台输出 + 信任 bootloader 随机数种子.
         # 用户可通过 bootargs=None 显式禁用或传入自定义 bootargs 覆盖.
         # 调试用途 (日后需要详细内核日志时取消下面注释即可):
-        #   "printk.devkmsg=on loglevel=8 debug ignore_loglevel "
-        #   "dyndbg=\"file *sbi* +p; file *smp* +p; file *tlb* +p; file *cpu* +p\""
         self._dtb_addr: int | None = None  # 最近一次 load_dtb 的地址
         self._bootargs = (
             bootargs
@@ -302,7 +295,7 @@ class Emulator:
         self._setup_peripherals(config)
         self._create_harts(config)
 
-        # ---- Phase A: speedup execution state ----
+        # speedup execution state
         self._speedup_hart_states: Any = None  # ctypes HartState array
         self._speedup_instr_group: Any = None  # ctypes InstrToBeExec
         self._native_ram_ptr: int = 0  # RAM 缓冲区首地址
@@ -406,12 +399,10 @@ class Emulator:
                 # 的绑定方法会使二者之间形成环形引用, 见 Bus.main_mem.
                 mem_read=self.bus.main_mem.read,
                 mem_write=self.bus.main_mem.write,
-                # 经设备中断投递目标投递: 除置位中断控制器外还通知加速执行引擎并唤醒
                 # WFI 阻塞的 hart, 直接调 plic.set_irq 会略过这两步。此处不得改传
                 # raise_device_irq: 绑定方法持有 Emulator, 会与 Emulator 对设备的
                 # 持有构成环形引用, 见 DeviceIrqSink.
-                on_irq=self._irq_sink,
-                irq=VIRTIO_BLK_IRQ,
+                irq_sink=(VIRTIO_BLK_IRQ, self._irq_sink),
             )
             self.bus.add_device(p.virtio_blk_base, self.virtio_blk)
             self._peripherals["virtio_blk"] = self.virtio_blk
@@ -510,13 +501,12 @@ class Emulator:
         try:
             stdin_fd = sys.stdin.fileno()
             stdout_fd = sys.stdout.fileno()
-        except (OSError, ValueError):
+        except OSError, ValueError:
             return
         self._termio = TerminalIO(
             uart=self.uart,
             wake_event=self._wake_event,
-            stdin_fd=stdin_fd,
-            stdout_fd=stdout_fd,
+            stdio_fds=(stdin_fd, stdout_fd),
             ext_irq=self._native_ext_irq,
             # RX 排空路径经设备中断投递目标同步 PLIC: 设备线程必须 write-through
             # 持久 PLIC 数组, 否则 batch 内 Rust 内联仲裁看不到新到达的 UART
@@ -630,17 +620,12 @@ class Emulator:
         except Exception:
             pass
 
-    # ----------------------------------------------------------
-    #  设备树 (FDT/DTB)
-    # ----------------------------------------------------------
-
     def build_dtb(self) -> bytes:
         """基于当前平台配置, 通过 libfdt 构建 DTB blob.
 
         固件可将此 blob 加载到 RAM 并通过 a1 寄存器接收其地址.
         """
-        return dtb.build_dtb(
-            self._cfg,
+        devices = dtb.DtbDevices(
             uart=self.uart,
             spi=self.spi,
             i2c_gen=self.i2c,
@@ -652,6 +637,10 @@ class Emulator:
             plic=self.plic,
             imsic=self.imsic,
             aplic_s=self.aplic,
+        )
+        return dtb.build_dtb(
+            self._cfg,
+            devices=devices,
             bootargs=self._bootargs,
             initrd=self._initrd,
             reserved_ranges=self._cfg.reserved_memory_ranges,
@@ -807,7 +796,7 @@ class Emulator:
         saved_pc = hart.pc
         try:
             advance = hart.exec_instr(instr)
-        except (NotImplementedError, MemoryAccessError):
+        except NotImplementedError, MemoryAccessError:
             deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
             advance = 0
         if advance != 0 and hart.pc == saved_pc:
@@ -817,7 +806,7 @@ class Emulator:
         return 0 if hart._wfi_woken else 1
 
     # ----------------------------------------------------------
-    #  acceleration fast path (Phase A)
+    #  acceleration fast path
     # ----------------------------------------------------------
 
     def notify_processor(self) -> None:
@@ -830,6 +819,15 @@ class Emulator:
         """
         self._native_stop_flag.value = 1
         self._wake_event.set()
+
+    def add_breakpoint(self, addr: int) -> None:
+        """登记连续执行的停止地址.
+
+        地址命中时 ``run()`` 以 ``BREAKPOINT`` 停止. 地址表与调试器注入的断点相同:
+        纯 Python 循环在每步之前比对, 加速执行引擎在每条指令执行之前比对.
+        """
+        if addr not in self._bp_addrs:
+            self._bp_addrs.append(addr)
 
     @property
     def irq_route(self) -> dict[int, APLIC | PLIC]:
@@ -872,26 +870,28 @@ class Emulator:
 
         # 统一使用 run_parallel (thread-per-hart 并发引擎)。
         virtio_ffi = run_parallel(
-            self._speedup_hart_states,
-            len(self.harts),
-            self._native_ram_ptr,
-            self.bus.ram_size,
-            self.bus.ram_base,
-            pie_ofs_base,
-            pie_ofs_size,
-            self._speedup_instr_group,
-            pmp=pmp_info,
-            clint=clint_info,
-            dev=dev_info,
-            uart=uart_info,
-            virtio=virtio_info,
-            plic=plic_info,
-            watchdog_timeout_ns=self._watchdog_timeout_ns(),
-            bp_addrs=self._bp_addrs if self._bp_addrs else None,
-            stop_flag=self._native_stop_flag,
-            ext_irq=self._native_ext_irq,
-            flush_cnt=self.bus.tlb_flush_cnt,
-            flush_cnt_per_hart=self._tlb_flush_cnt_per_hart,
+            RunConfig(
+                states=self._speedup_hart_states,
+                num_harts=len(self.harts),
+                ram_ptr=self._native_ram_ptr,
+                ram_size=self.bus.ram_size,
+                ram_base=self.bus.ram_base,
+                shadow_base=pie_ofs_base,
+                shadow_size=pie_ofs_size,
+                result=self._speedup_instr_group,
+                pmp=pmp_info,
+                clint=clint_info,
+                dev=dev_info,
+                uart=uart_info,
+                virtio=virtio_info,
+                plic=plic_info,
+                watchdog_timeout_ns=self._watchdog_timeout_ns(),
+                bp_addrs=self._bp_addrs if self._bp_addrs else None,
+                stop_flag=self._native_stop_flag,
+                ext_irq=self._native_ext_irq,
+                flush_cnt=self.bus.tlb_flush_cnt,
+                flush_cnt_per_hart=self._tlb_flush_cnt_per_hart,
+            )
         )
 
         result = self._speedup_instr_group
@@ -1378,12 +1378,6 @@ class Emulator:
                 wfi_waiting += 1
 
         self._wfi_sleep_if_idle(self.harts, wfi_waiting)
-
-        # 上文 _wfi_sleep_if_idle 可能在 WFI 轮询期间通过 _stdin_forward_callback
-        # 把 stdin 字节 preload 到了 UART RX 并置位了 PLIC 中断, 但此时
-        # hart.mip 尚未同步 (SEIP/MEIP 仍为 0)。立即同步 PLIC 并重试
-        # WFI 唤醒, 避免等待到下轮 _speedup_for_cmd_step() ->_native_sync_plic_mip(),
-        # 匹配 QEMU 的事件驱动模型: stdin ->UART RX ->中断 ->即时唤醒。
         self._native_sync_plic_mip()
         _recheck = 0
         for hart in self.harts:
@@ -1395,9 +1389,6 @@ class Emulator:
             wfi_waiting = max(0, wfi_waiting - _recheck)
             self._wake_event.clear()
 
-        # 看门狗: 本轮有指令执行则重置, 否则递减; 归零时向 WFI hart 注入 MSIP.
-        # 使用 instr_delta (增量) 而非 all_exec_cnt (累计) — 后者永远 > 0,
-        # 导致看门狗被每轮重置从不触发, 全 hart WFI 时死锁无法打破.
         if instr_delta > 0:
             self.watchdog.kick_all()
         else:
@@ -1480,27 +1471,22 @@ class Emulator:
         return best
 
     def _wfi_sleep_if_idle(self, active: list, waiting_count: int) -> None:
-        """全部 hart WFI 时阻塞等待, 避免 CPU 100% 空转.
+        """全部 hart 处于 WFI 等待时阻塞本线程, 避免处理器空转.
 
-        事件驱动: 键盘输入由独立 daemon 线程经 select(stdin) 分发 — 先判断
-        Ctrl+Q 是否暂停 (调试器), 其余转发到 UART RX 并置外部中断
-        (legacy: PLIC; AIA: APLIC->IMSIC。两者经 UART 的 set_irq 统一接口路由),
-        然后 set(_wake_event) 唤醒本线程; native termio 路径亦经 drain_rx ->
-        _wake_event.set() 唤醒。故此处仅等待 _wake_event, 无需 select(stdin)
-        (stdin 由 daemon 独占, 避免与主线程竞争)。
-        mtime 由 Rust advance_clock_source 按指令增量推进; 全 hart WFI 空闲
-        时无 batch 运行, mtime 停滞。Rust 侧 wfi_check_all_idle 不再快进 mtime
-        (快进会令 remaining=0 使本函数永不睡眠), 故本函数在睡眠后按真实流逝时间
-        补偿推进 mtime (clint.tick), 定时器按真实节奏触发。
+        等待对象为 ``_wake_event``. 键盘输入由守护线程经 select(stdin) 分发:
+        Ctrl+Q 交调试器暂停, 其余字节写入 UART 接收路径并触发外部中断, legacy
+        模式由 PLIC 投递, AIA 模式由 APLIC 转为 MSI 后交 IMSIC, 随后置位该事件;
+        termio 的接收排空路径同样置位该事件. stdin 由守护线程独占, 本函数不读取.
 
-        等待前必须先 clear()。_wake_event 是电平信号: 任何外设活动 — UART RX
-        daemon 的 drain_rx (termio.py)、ext_irq 置位、看门狗 MSIP 注入 — 都会
-        set() 它, 但只有中断真正唤醒 hart 的窄路径才 clear() (见 _native_finalize)。
-        若不在此 clear, 事件在首次活动后永久处于已置位状态, wait(timeout) 每次
-        立即返回, 全 hart WFI 空闲退化为 ~100% CPU 忙转 — 宿主被拖满, 键盘输入
-        看似"无响应"。clear-then-wait 的微小竞态 (clear 与 wait 之间到达的事件)
-        至多让本轮回合多睡一个 timeout, 数据不丢失: RX daemon 持续 drain, 下轮
-        batch 必然处理 ring 中的数据, 输入延迟上界 = sleep_sec (<= _WFI_MAX_SLEEP)。
+        mtime 由加速执行引擎按已执行的指令数推进. 全部 hart 等待时引擎没有批次
+        运行, mtime 停滞; 引擎的空闲判定不推进 mtime, 故本函数在睡眠结束后按
+        真实流逝时间推进 mtime, 使定时器按真实时间触发.
+
+        ``_wake_event`` 为电平信号: 任何外设活动都会置位它, 只有中断唤醒 hart 的
+        路径会清除它. 等待前必须清除, 否则首次活动之后该事件一直处于置位状态,
+        wait 每次立即返回, 空闲退化为忙转. 清除与等待之间到达的事件至多使本轮
+        多等待一个 wait 超时, 数据不会丢失: 接收守护线程持续排空, 下一轮批次
+        处理已到达的字节, 输入延迟不超过本次 sleep_sec.
         """
         if waiting_count < len(active) or waiting_count == 0:
             return
@@ -1557,8 +1543,8 @@ class Emulator:
 
     def step(self) -> int:
         """
-        QEMU-style per-instruction execution: 每个周期让所有 hart 各
-        执行一条指令, 每条指令前转发 stdin->UART RX、每条指令后检查中断,
+        每个周期让所有 hart 各执行一条指令,
+        每条指令前转发 stdin->UART RX、每条指令后检查中断,
         CLINT 时钟按指令计数推进 (与时钟源解耦).
 
         指令单轮加速执行设计已去除 — step() 恒为精确单指令 (纯 Python 路径);
@@ -1609,7 +1595,7 @@ class Emulator:
 
             try:
                 advance = hart.exec_instr(instr)
-            except (NotImplementedError, MemoryAccessError):
+            except NotImplementedError, MemoryAccessError:
                 deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
                 advance = 0
 
@@ -1702,67 +1688,61 @@ class Emulator:
         self._run_stop_reason = RunStopReason.NONE
 
         # 超时直接基于时钟源 (time.monotonic()), 不依赖 mtime 推进率.
-        if timeout > 0:
-            self._timeout_deadline = time.monotonic() + timeout
-        else:
-            self._timeout_deadline = 0.0
+        self._timeout_deadline = time.monotonic() + timeout if timeout > 0 else 0.0
         do_yield = yield_every > 0
         instr_start = self._total_instrs
-        use_native = self._speedup_hart_states is not None
         last_yield = instr_start
 
         while True:
             active = [h for h in self.harts if not h._halted]
             if not active:
                 break
-            # 时钟源超时检查
-            if self._timeout_deadline and time.monotonic() >= self._timeout_deadline:
-                self._run_stop_reason = RunStopReason.TIMEOUT
+            self._check_run_timeout(timeout, instr_start)
+            if self._stdin_forward_callback is not None:
+                self._stdin_forward_callback()
+            if self._run_one_round(active, timeout, instr_start):
+                break
+            if do_yield and self._total_instrs - last_yield >= yield_every:
+                yield_cpu(yield_interval)
+                last_yield = self._total_instrs
+
+        self._native_flush_uart()
+        return self._cycle
+
+    def _check_run_timeout(self, timeout: float, instr_start: int) -> None:
+        """达到时钟源超时则置停止原因并抛出 TimeoutError."""
+        if self._timeout_deadline and time.monotonic() >= self._timeout_deadline:
+            self._run_stop_reason = RunStopReason.TIMEOUT
+            raise TimeoutError(
+                timeout,
+                self._total_instrs - instr_start,
+                self.harts[0].pc if self.harts else None,
+            )
+
+    def _run_one_round(self, active, timeout: float, instr_start: int) -> bool:
+        """执行一轮; 返回 True 表示应结束连续执行."""
+        if self._speedup_hart_states is not None:
+            self._speedup_for_cmd_step(active)
+            if self._run_stop_reason == RunStopReason.TIMEOUT:
                 raise TimeoutError(
                     timeout,
                     self._total_instrs - instr_start,
                     self.harts[0].pc if self.harts else None,
                 )
-            if self._stdin_forward_callback is not None:
-                self._stdin_forward_callback()
-
-            if use_native:
-                self._speedup_for_cmd_step(active)
-                if self._run_stop_reason == RunStopReason.TIMEOUT:
-                    raise TimeoutError(
-                        timeout,
-                        self._total_instrs - instr_start,
-                        self.harts[0].pc if self.harts else None,
-                    )
-                # 设备暂停事件 — 标志保留给调用方消费; 断点/停机 — 重入
-                # 单轮加速执行会立即再命中, 必须在此返回.
-                if self._native_stop_flag.value != 0 or self._run_stop_reason in (
-                    RunStopReason.BREAKPOINT,
-                    RunStopReason.EBREAK,
-                ):
-                    break
-            else:
-                if self._check_bp_hit_py():
-                    self._run_stop_reason = RunStopReason.BREAKPOINT
-                    break
-                self.step()
-                if self._semihosting_exit_py():
-                    self._run_stop_reason = RunStopReason.EBREAK
-                    break
-
-            if do_yield and self._total_instrs - last_yield >= yield_every:
-                yield_cpu(yield_interval)
-                last_yield = self._total_instrs
-
-        # 同步排空 TX ring buffer -> UART 行缓冲/hart 日志.
-        # 异步归档 daemon 以 0.2s 周期消费, 若此处不补一次, run() 返回后
-        # tx_data() 读到的 _tx_buf 可能缺少最近周期内的输出 (native 路径).
-        self._native_flush_uart()
-        return self._cycle
-
-    # ----------------------------------------------------------
-    #  状态检查辅助 (调试用)
-    # ----------------------------------------------------------
+            # 设备暂停事件 — 标志保留给调用方消费; 断点/停机 — 重入
+            # 单轮加速执行会立即再命中, 必须在此返回.
+            return self._native_stop_flag.value != 0 or self._run_stop_reason in (
+                RunStopReason.BREAKPOINT,
+                RunStopReason.EBREAK,
+            )
+        if self._check_bp_hit_py():
+            self._run_stop_reason = RunStopReason.BREAKPOINT
+            return True
+        self.step()
+        if self._semihosting_exit_py():
+            self._run_stop_reason = RunStopReason.EBREAK
+            return True
+        return False
 
     def dump_hart_regs(self, hart_id: int = 0) -> dict:
         """导出指定 hart 的关键寄存器状态."""

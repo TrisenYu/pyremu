@@ -1,19 +1,19 @@
 //! musl riscv64 `struct stat` 的布局与填充, 以及 stat 类系统调用: fstat/fstatat。
 //!
-//! 布局属载荷侧的 ABI, 只在 [Stat] 一处声明; 模块交出的字段经 [fill_stat_from_vfs] 折算
+//! 布局属载荷侧的 ABI, 只在 [Stat] 一处声明; 模块交出的字段经 [fill_stat_from_vfs] 换算
 //! 到该布局, 其中文件类型的编码属 ABI 而非模块的表示, 由本层按节点类别补齐。
 
 use core::ptr;
 
 use crate::ext_mod::vfs_ops::{VFS_KIND_DIR, VfsStat, VfsStatus};
 
+use super::super::fdtable::{FDS, FdTarget, fd_target};
+use super::super::types::Timespec;
+use super::super::{EBADF, EFAULT, EINVAL, ENOENT};
 use super::consts::{
 	AT_EMPTY_PATH, NIL, PATH_MAX, S_IFCHR, S_IFDIR, S_IFREG, S_IFSOCK, STAT_FLAG_BITS,
 };
 use super::mount;
-use super::super::fdtable::{FDS, FdTarget, fd_target};
-use super::super::types::Timespec;
-use super::super::{EBADF, EFAULT, EINVAL, ENOENT};
 use super::{fd_node, read_path, vfs_errno};
 
 // ---------------------------------------------------------------
@@ -65,9 +65,18 @@ impl Stat {
 			st_blksize: 4096,
 			__pad2: 0,
 			st_blocks: 0,
-			st_atim: Timespec { tv_sec: 0, tv_nsec: 0 },
-			st_mtim: Timespec { tv_sec: 0, tv_nsec: 0 },
-			st_ctim: Timespec { tv_sec: 0, tv_nsec: 0 },
+			st_atim: Timespec {
+				tv_sec: 0,
+				tv_nsec: 0,
+			},
+			st_mtim: Timespec {
+				tv_sec: 0,
+				tv_nsec: 0,
+			},
+			st_ctim: Timespec {
+				tv_sec: 0,
+				tv_nsec: 0,
+			},
 			__unused: [0; 2],
 		}
 	}
@@ -77,7 +86,11 @@ impl Stat {
 /// 节点类别补齐。
 fn fill_stat_from_vfs(vstat: &VfsStat, st: &mut Stat) {
 	st.st_ino = vstat.ino;
-	let kind_bits = if vstat.kind == VFS_KIND_DIR { S_IFDIR } else { S_IFREG };
+	let kind_bits = if vstat.kind == VFS_KIND_DIR {
+		S_IFDIR
+	} else {
+		S_IFREG
+	};
 	st.st_mode = kind_bits | (vstat.mode & 0o777);
 	st.st_nlink = vstat.nlink;
 	st.st_size = vstat.size;
@@ -145,7 +158,7 @@ pub fn fstat_handler(fd: u64, stat_ptr: u64) -> u64 {
 /// *flags* 只接受 [`STAT_FLAG_BITS`] 覆盖的位, 出现其余位返回 EINVAL。*flags* 含
 /// [`AT_EMPTY_PATH`] 而路径取空时, 目标取 *dirfd* 自身绑定的节点; *dirfd* 无效或绑定的
 /// 不是文件系统节点时返回 EBADF。路径经 [mount] 分派给它所属的文件系统; 该文件系统尚未
-/// 交付时返回取入失败给出的错误码, 见 [mount::resolve]。
+/// 交付时返回取入失败给出的错误码。
 pub fn fstatat_handler(dirfd: u64, pathname: u64, stat_ptr: u64, flags: u64) -> u64 {
 	if flags & !STAT_FLAG_BITS != 0 {
 		return EINVAL;

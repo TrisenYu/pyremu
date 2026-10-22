@@ -1,12 +1,12 @@
 //! 内核使用的并发控制工具
 //!
 //! 与用户侧并发系统调用接口 (crate::syscall::concurrency) 无关: 本模块保护的是
-//! 可信内核自身的共享状态, 当前唯一使用者是文件系统状态 (见 syscall::fs)。
+//! 可信内核自身的共享状态, 当前唯一使用者是文件系统状态。
 //! 实现 lock/lock.c 的 AMOSWAP。
 
 use core::cell::UnsafeCell;
-use core::ops::{ Deref, DerefMut };
-use core::sync::atomic::{ AtomicI32, Ordering };
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicI32, Ordering};
 
 pub struct SpinGuard<'a, T> {
 	lock: &'a SpinLock<T>,
@@ -63,7 +63,11 @@ impl<T> SpinLock<T> {
 	/// 尝试获取锁而不阻塞。
 	#[allow(unused)]
 	pub fn try_lock(&self) -> Option<SpinGuard<'_, T>> {
-		if self.lock.swap(1, Ordering::Acquire) == 0 { Some(SpinGuard { lock: self }) } else { None }
+		if self.lock.swap(1, Ordering::Acquire) == 0 {
+			Some(SpinGuard { lock: self })
+		} else {
+			None
+		}
 	}
 
 	/// 检查锁是否被持有。
@@ -121,7 +125,9 @@ mod tests {
 		held_rx.recv().expect("");
 		assert!(lock.is_locked());
 		assert!(lock.try_lock().is_none());
-		release_tx.send(()).expect("notifying for releasing the lock");
+		release_tx
+			.send(())
+			.expect("notifying for releasing the lock");
 		holder.join().expect("end of the lock's lifetime");
 		assert!(!lock.is_locked());
 		let guard = lock.try_lock().expect("lock has been released");

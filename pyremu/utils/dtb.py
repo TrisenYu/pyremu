@@ -33,11 +33,10 @@ if TYPE_CHECKING:
     from pyremu.peripheral import CRNG, GPIO, I2C, SPI, UART, VirtIOBlock, VirtIONet
     from pyremu.peripheral.watchdog import HartWatchdog
 
-# APLIC 有线中断触发类型 (interrupts 第二 cell). 与 QEMU virt.c 对齐:
+# APLIC 有线中断触发类型:
 # UART0 / virtio 均为 IRQ_TYPE_LEVEL_HIGH (0x4), 非 0 (NONE).
 # 写 0 会让内核 aplic_irq_set_type 配成 SM_INACTIVE, 完成中断永不投递.
 _IRQ_TYPE_LEVEL_HIGH = 0x4
-
 
 
 @dataclass
@@ -311,9 +310,9 @@ def _dtb_plic(
 
 
 # ============================================================
-#  IMSIC 节点 — 拆分为 M/S 两个独立节点以匹配 QEMU virt DT 布局.
+#  IMSIC 节点 — 拆分为 M/S 两个独立节点
 #
-#  QEMU 针对每个特权级各创建一个 IMSIC 节点, 且
+#  针对每个特权级各创建一个 IMSIC 节点, 且
 #  interrupts-extended 仅含该特权级对应的中断号码, M 为 11, S 为 9。
 #
 #  为什么必须拆分:
@@ -328,25 +327,50 @@ def _dtb_plic(
 
 # M/S 模式对应的 CPU intc 中断号.
 _IMSIC_IRQ_M = 11  # MEIP
-_IMSIC_IRQ_S = 9   # SEIP
+_IMSIC_IRQ_S = 9  # SEIP
 
 _PAGE_STRIDE_DTB = 0x1000  # IMSIC_MMIO_PAGE_SZ
 
 
+@dataclass(slots=True)
+class DtbDevices:
+    """构建设备树时使用的设备实例集合; 未给出的成员对应的节点省略."""
+
+    uart: UART | None = None
+    spi: SPI | None = None
+    i2c_gen: I2C | None = None
+    gpio: GPIO | None = None
+    virtio_blk: VirtIOBlock | None = None
+    virtio_net_s: VirtIONet | None = None
+    watchdog: HartWatchdog | None = None
+    crng: CRNG | None = None
+    plic: PLIC | None = None
+    imsic: IMSIC | None = None
+    aplic_s: APLIC | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ImsicNodeSpec:
+    """单个 IMSIC 节点的中断号、基址与区域大小."""
+
+    cpu_intc_irq: int
+    base_addr: int
+    size: int
+
+
 def _dtb_imsic_file(
     sw: libfdt.FdtSw,
-    cfg: PlatformConfig,
-    imsic: IMSIC | None,
+    devices: DtbDevices,
     phandle: int | None,
     cpu_phandles: list[int],
-    *,
-    cpu_intc_irq: int,  # _IMSIC_IRQ_M or _IMSIC_IRQ_S
-    base_addr: int,
-    size: int,
+    spec: ImsicNodeSpec,
 ) -> None:
     """生成单个 IMSIC 节点 — 参数化 M/S 以消除重复."""
-    if imsic is None:
+    if devices.imsic is None:
         return
+    cpu_intc_irq = spec.cpu_intc_irq
+    base_addr = spec.base_addr
+    size = spec.size
     sw.begin_node(f"imsic@{base_addr:x}")
     sw.property_u32("phandle", phandle)
     sw.property_string("compatible", "riscv,imsics")
@@ -356,7 +380,7 @@ def _dtb_imsic_file(
     sw.property("msi-controller", b"")
     sw.property_u32("riscv,num-ids", 255)  # must satisfy (num_ids & 63) == 63
     sw.property_u32("riscv,guest-index-bits", 0)
-    # 不设 hart-index-bits — QEMU virt DT 同样省略此属性.
+    # 不设 hart-index-bits
     # 内核默认 stride = PAGE_SIZE << guest_index_bits = 0x1000,
     # 必须与 decode_imsic_addr 的实际布局一致, 即连续排列, 每个 hart 一页.
     # hart-index-bits != 0 会使内核算出更大的 stride, 如 0x2000、0x4000 等,
@@ -384,7 +408,6 @@ def _dtb_aplic(
 
     APLIC does NOT have interrupts-extended because all interrupts are
     delivered as MSIs through the IMSIC identified by msi-parent.
-    This matches QEMU's virt machine DT and the RISC-V AIA specification.
 
     本函数只建 S 域这一个节点。固件的 APLIC 驱动对树中每个 riscv,aplic 节点执行
     aplic_init, 该函数把 DOMAINCFG 清零, 并把全部 sourcecfg 与 target 复位; 树中
@@ -473,37 +496,33 @@ def _dtb_virtio_node(
 def _dtb_simple_devices(
     sw: libfdt.FdtSw,
     cfg: PlatformConfig,
-    spi: SPI | None,
-    i2c_gen: I2C | None,
-    gpio: GPIO | None,
-    virtio_blk: VirtIOBlock | None,
-    virtio_net_s: VirtIONet | None,
+    devices: DtbDevices,
 ) -> None:
     """spi/i2c/gpio 三个无中断的 MMIO 节点, 另加 virtio 设备节点.
 
     virtio 节点带 interrupts 属性, 形制由 _dtb_virtio_node 给出.
     """
     p = cfg.periph
-    if spi:
+    if devices.spi:
         sw.begin_node(f"spi@{p.spi_base:x}")
         sw.property_string("compatible", "pyremu,spi0")
         sw.property("reg", _encode_reg_4mib(p.spi_base, 0x1000))
         sw.end_node()  # spi
-    if i2c_gen:
+    if devices.i2c_gen:
         sw.begin_node(f"i2c@{p.i2c_base:x}")
         sw.property_string("compatible", "pyremu,i2c0")
         sw.property("reg", _encode_reg_4mib(p.i2c_base, 0x1000))
         sw.end_node()  # i2c
-    if gpio:
+    if devices.gpio:
         sw.begin_node(f"gpio@{p.gpio_base:x}")
         sw.property_string("compatible", "pyremu,gpio0")
         sw.property("reg", _encode_reg_4mib(p.gpio_base, 0x1000))
         sw.end_node()  # gpio
-    if virtio_blk:
+    if devices.virtio_blk:
         _dtb_virtio_node(sw, p.virtio_blk_base, VIRTIO_BLK_IRQ)
     # M 模式一侧的网卡实例不进设备树: 内核会为树中出现的中断源在自己的 S context
     # 上使能它, 该中断源一置位即产生 SEIP, 而 SEIP 由宿主 S 模式支配.
-    if virtio_net_s:
+    if devices.virtio_net_s:
         _dtb_virtio_node(sw, p.virtio_net_s_base, VIRTIO_NET_S_IRQ)
 
 
@@ -543,17 +562,7 @@ def _dtb_crng(
 def build_dtb(
     cfg: PlatformConfig,
     *,
-    uart: UART | None = None,
-    spi: SPI | None = None,
-    i2c_gen: I2C | None = None,
-    gpio: GPIO | None = None,
-    virtio_blk: VirtIOBlock | None = None,
-    virtio_net_s: VirtIONet | None = None,
-    watchdog: HartWatchdog | None = None,
-    crng: CRNG | None = None,
-    plic: PLIC | None = None,
-    imsic: IMSIC | None = None,
-    aplic_s: APLIC | None = None,
+    devices: DtbDevices | None = None,
     bootargs: str | None = None,
     initrd: Initrd | None = None,
     reserved_ranges: list[tuple[int, int]] | None = None,
@@ -562,17 +571,7 @@ def build_dtb(
 
     Args:
         cfg: 平台配置, 描述 CPU 拓扑、内存布局和 ISA 特性.
-        uart: UART 外设实例 (None 则跳过 UART 节点).
-        spi: SPI 外设实例.
-        i2c_gen: I2C 外设实例.
-        gpio: GPIO 外设实例.
-        virtio_blk: virtio-blk 外设实例.
-        virtio_net_s: S 模式一侧的 virtio-net 实例 (None 则跳过该节点).
-        watchdog: 多 hart 停滞检测实例.
-        crng: 模拟随机数生成器实例 (None 则跳过 crng 节点).
-        plic: PLIC 中断控制器实例 (legacy 模式).
-        imsic: IMSIC 中断控制器实例 (AIA 模式).
-        aplic_s: APLIC 实例 (AIA 模式), 把有线中断转成 MSI.
+        devices: 设备实例集合, 未给出的成员对应的节点省略.
         bootargs: 内核命令行参数, 写入 /chosen/bootargs.
         initrd: 初始内存盘 (None 则 /chosen 不写 initrd 相关属性).
         reserved_ranges: (base, size) 列表, 生成 /reserved-memory no-map 子节点.
@@ -580,6 +579,7 @@ def build_dtb(
     Returns:
         完整的 DTB blob 字节串, 可直接写入 RAM 供固件使用.
     """
+    devices = devices or DtbDevices()
     is_aia = cfg.interrupt_mode == InterruptMode.AIA
 
     sw = libfdt.FdtSw(8192)
@@ -592,32 +592,44 @@ def build_dtb(
     sw.property_string("compatible", "pyremu,riscv64")
     sw.property_string("model", f"pyremu,{cfg.isa}")
 
-    _dtb_chosen(sw, cfg, uart, bootargs, initrd)
-    _dtb_aliases(sw, cfg, uart)
+    _dtb_chosen(sw, cfg, devices.uart, bootargs, initrd)
+    _dtb_aliases(sw, cfg, devices.uart)
     cpu_phandles = _dtb_cpus(sw, cfg, is_aia=is_aia)
     _dtb_memory(sw, cfg)
     _dtb_reserved_memory(sw, reserved_ranges or [])
+    _dtb_soc(sw, cfg, devices, cpu_phandles, is_aia)
 
-    # ---- soc simple-bus — 挂载所有 MMIO 外设 ----
+    sw.end_node()  # root
+
+    return bytes(sw.as_fdt().as_bytearray())
+
+
+def _dtb_soc(
+    sw: libfdt.FdtSw,
+    cfg: PlatformConfig,
+    devices: DtbDevices,
+    cpu_phandles: list[int],
+    is_aia: bool,
+) -> None:
+    """生成 /soc 节点: 分配 intc phandle 并挂载全部 MMIO 外设."""
     # phandle 分配: CPU intc 占 [1..num_harts].
     # 随后 AIA 模式下 IMSIC_M、IMSIC_S、APLIC 各分配一个; legacy 模式下分配 PLIC.
-    page_stride = _PAGE_STRIDE_DTB
     next_phandle = len(cpu_phandles) + 1
     imsic_m_phandle: int | None = None
     imsic_s_phandle: int | None = None
     aplic_phandle: int | None = None
     ext_irq_handle_prop: int | None = None
     if is_aia:
-        if imsic is not None:
+        if devices.imsic is not None:
             imsic_m_phandle = next_phandle
             next_phandle += 1
             imsic_s_phandle = next_phandle
             next_phandle += 1
-        if aplic_s is not None:
+        if devices.aplic_s is not None:
             aplic_phandle = next_phandle
             next_phandle += 1
             ext_irq_handle_prop = aplic_phandle
-    elif plic is not None:
+    elif devices.plic is not None:
         ext_irq_handle_prop = next_phandle
         next_phandle += 1
 
@@ -631,36 +643,54 @@ def build_dtb(
 
     _dtb_clint(sw, cfg, cpu_phandles)
     if is_aia:
-        m_base = cfg.periph.imsic_m_base
-        # OpenSBI imsic_data_check 要求 reg size 对齐到
-        # 2^hart_index_bits * PAGE_SIZE.  hart_index_bits =
-        # ceil(log2(num_harts)), 即 (num_harts-1).bit_length().
-        # 非 2 的幂 hart 数, 如 3、5、6、7, 若不补齐,
-        # 则 OpenSBI imsic_cold_irqchip_init 失败, irqchip 未注册,
-        # 此后 sbi_irqchip_process 返回 SBI_ENODEV, 即 -1000.
-        if cfg.num_harts > 1:
-            hart_index_bits = (cfg.num_harts - 1).bit_length()
-        else:
-            hart_index_bits = 0
-        padded_count = 1 << hart_index_bits  # >= num_harts 的 2 的幂
-        m_size = padded_count * page_stride
-        # M 节点: M-files 范围, MEIP(11) 专用.
-        _dtb_imsic_file(sw, cfg, imsic, imsic_m_phandle, cpu_phandles,
-                        cpu_intc_irq=_IMSIC_IRQ_M, base_addr=m_base, size=m_size)
-        # S 节点: S-files 范围 (M-base + padded_count*0x1000), SEIP(9) 专用.
-        _dtb_imsic_file(sw, cfg, imsic, imsic_s_phandle, cpu_phandles,
-                        cpu_intc_irq=_IMSIC_IRQ_S,
-                        base_addr=m_base + padded_count * page_stride,
-                        size=m_size)
-        _dtb_aplic(sw, cfg, aplic_s, aplic_phandle, imsic_s_phandle)
+        _dtb_imsic_nodes(sw, cfg, devices, cpu_phandles, (imsic_m_phandle, imsic_s_phandle))
+        _dtb_aplic(sw, cfg, devices.aplic_s, aplic_phandle, imsic_s_phandle)
     else:
-        _dtb_plic(sw, cfg, plic, ext_irq_handle_prop, cpu_phandles)
-    _dtb_uart(sw, cfg, uart, ext_irq_handle_prop, next_phandle)
-    _dtb_simple_devices(sw, cfg, spi, i2c_gen, gpio, virtio_blk, virtio_net_s)
+        _dtb_plic(sw, cfg, devices.plic, ext_irq_handle_prop, cpu_phandles)
+    _dtb_uart(sw, cfg, devices.uart, ext_irq_handle_prop, next_phandle)
+    _dtb_simple_devices(sw, cfg, devices)
     _dtb_watchdog(sw, cfg)
-    _dtb_crng(sw, cfg, crng)
+    _dtb_crng(sw, cfg, devices.crng)
 
     sw.end_node()  # soc
-    sw.end_node()  # root
 
-    return bytes(sw.as_fdt().as_bytearray())
+
+def _dtb_imsic_nodes(
+    sw: libfdt.FdtSw,
+    cfg: PlatformConfig,
+    devices: DtbDevices,
+    cpu_phandles: list[int],
+    phandles: tuple[int | None, int | None],
+) -> None:
+    """生成 M 与 S 两个 IMSIC 节点."""
+    imsic_m_phandle, imsic_s_phandle = phandles
+    page_stride = _PAGE_STRIDE_DTB
+    m_base = cfg.periph.imsic_m_base
+    # OpenSBI imsic_data_check 要求 reg size 对齐到
+    # 2^hart_index_bits * PAGE_SIZE.  hart_index_bits =
+    # ceil(log2(num_harts)), 即 (num_harts-1).bit_length().
+    # 非 2 的幂 hart 数, 如 3、5、6、7, 若不补齐,
+    # 则 OpenSBI imsic_cold_irqchip_init 失败, irqchip 未注册,
+    # 此后 sbi_irqchip_process 返回 SBI_ENODEV, 即 -1000.
+    if cfg.num_harts > 1:
+        hart_index_bits = (cfg.num_harts - 1).bit_length()
+    else:
+        hart_index_bits = 0
+    padded_count = 1 << hart_index_bits  # >= num_harts 的 2 的幂
+    m_size = padded_count * page_stride
+    # M 节点: M-files 范围, MEIP(11) 专用.
+    _dtb_imsic_file(
+        sw,
+        devices,
+        imsic_m_phandle,
+        cpu_phandles,
+        ImsicNodeSpec(_IMSIC_IRQ_M, m_base, m_size),
+    )
+    # S 节点: S-files 范围 (M-base + padded_count*0x1000), SEIP(9) 专用.
+    _dtb_imsic_file(
+        sw,
+        devices,
+        imsic_s_phandle,
+        cpu_phandles,
+        ImsicNodeSpec(_IMSIC_IRQ_S, m_base + padded_count * page_stride, m_size),
+    )

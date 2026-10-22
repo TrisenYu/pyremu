@@ -52,9 +52,7 @@ pub struct TermIoHandle {
 // 各索引遵循上述单写者约定。
 unsafe impl Send for TermIoHandle {}
 
-/// 启动时保存的终端状态, 由线程在退出路径恢复 (对照 char-stdio.c term_exit:
-/// 恢复 termios 及 *两个* fd 的阻塞标志 — 遗留 O_NONBLOCK 会破坏同一 tty 上
-/// 的后续程序, 见 QEMU commit 6807403).
+/// 启动时保存的终端状态, 由线程在退出路径恢复.
 struct SavedTerm {
 	oldtty: libc::termios,
 	old_fl0: libc::c_int,
@@ -318,7 +316,7 @@ fn drain_fd(fd: RawFd) {
 }
 
 // ============================================================
-//  stdin -> RX ring buffer (QEMU fd_chr_read model)
+//  stdin -> RX ring buffer
 // ============================================================
 
 /// 将 stdin 当前可读的所有字节追加到 recv (fd 为 O_NONBLOCK, 读到 EAGAIN)。
@@ -407,9 +405,6 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
 				revents: 0,
 			},
 		];
-		// 事件驱动阻塞 (对照 qemu_cond_wait): drain 管道(缓冲区被消耗/停止) +
-		// stdin(等待被写入). 不再以 free>0 门控 stdin — 输入由 recv 吸收,
-		// Ctrl+Q 因而在 ring 满时仍可被即时检测.
 		let nfds: libc::nfds_t = if !stdin_eof && h.rx_cap > 0 { 2 } else { 1 };
 		let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, -1) };
 		if ret < 0 {
@@ -514,10 +509,6 @@ fn termio_thread_simple(h: TermIoHandle, old_stdin_fl: libc::c_int) {
 
 /// Start the terminal I/O background thread.
 ///
-/// 对照 `qemu_chr_open_stdio`: 保存 termios/fcntl ->stdin/stdout 非阻塞 ->
-/// raw-ish 模式 (关 ECHO/ICANON/IEXTEN + ICRNL/IXON, 保留 OPOST 与 ISIG) ->
-/// 安装 SIGCONT handler ->启动 I/O 线程。
-///
 /// Returns 0 on success, -1 if already running or stdin is not a TTY.
 /// Caller must ensure `handle` points to a valid `TermIoHandle` whose
 /// buffers stay alive for the lifetime of the thread.
@@ -528,14 +519,14 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 	}
 	/*
 	   ---- 显式作用域: 锁在此块结束时立即释放 ----
-	   MutexGuard 在 '}' 处 drop, 避免锁被持有到后续 FFI 操作 (unsafe 解引用
-	   handle 指针) 期间。若后续代码 panic, 锁仍可被其他路径获取；若省略外层
+	   MutexGuard 在 '}' 处 drop, 避免锁被持有到后续 FFI 操作期间。
+	   若后续代码 panic, 锁仍可被其他路径获取；若省略外层
 	   大括号, guard 存活到整个 if 分支结束才析构 —— 后续代码均持锁运行。
 	*/
 	{
 		let guard = THREAD_HANDLE.lock().unwrap();
 		if guard.is_some() {
-			return -1; // 已运行 (对照 QEMU stdio_in_use 单例守卫)
+			return -1;
 		}
 	}
 
@@ -581,13 +572,7 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 		}
 	}
 
-	// raw-ish 模式, 始终从 oldtty 副本重新计算 (幂等, 无漂移):
-	// 逐位对照 qemu_chr_set_echo_stdio(echo=false)。
 	let mut raw = oldtty;
-	// 清除 ICRNL , 但在 pyremu
-	// 受调试程序串口控制台可能未正确初始化 ICRNL (如 dash 作为 PID 1 运行且无
-	// devtmpfs 时), 导致 Enter 键的 \r 不被识别为行终止符 — 用户需按两次
-	// 回车才能触发命令执行。保留 ICRNL 由宿主机内核完成转换, 消除此问题。
 	raw.c_iflag &= !(libc::IGNBRK
         | libc::BRKINT
         | libc::PARMRK
@@ -597,8 +582,6 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
         // ICRNL 保留: 宿主终端把 \r 转换为 \n, 受调试程序收到 \n 即可结束一行
         | libc::IXON);
 	raw.c_oflag |= libc::OPOST; // 保留输出后处理: '\n' ->CRLF
-							 // 关闭 ISIG: Ctrl+C (0x03) 作为普通字节透传给受调试程序.
-							 // Ctrl+Q (0x11) 在 termio 线程中拦截并直连置位停止标志暂停.
 	raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::IEXTEN | libc::ISIG);
 	raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
 	raw.c_cflag |= libc::CS8;
@@ -660,13 +643,11 @@ pub extern "C" fn terminal_io_attach(handle: *const TermIoHandle) -> i32 {
 		rx_notify_fd: h.rx_notify_fd,
 		rx_drain_fd: h.rx_drain_fd,
 	};
-	// QEMU fd_chr_read model: stdin non-blocking so read() returns all
-	// currently buffered bytes (escape sequences arrive atomically).
 	let old_fl = unsafe { libc::fcntl(hc.stdin_fd, libc::F_GETFL) };
 	if old_fl >= 0 {
 		unsafe { libc::fcntl(hc.stdin_fd, libc::F_SETFL, old_fl | libc::O_NONBLOCK) };
 	}
-	// drain 管道读端非阻塞: drain_fd 循环读到 EAGAIN 即停.
+	// drain_fd 循环读到 EAGAIN 即停.
 	if hc.rx_drain_fd >= 0 {
 		let df = unsafe { libc::fcntl(hc.rx_drain_fd, libc::F_GETFL) };
 		if df >= 0 {

@@ -1,6 +1,6 @@
 [project]
 name = "pyremu"
-version = "2.0.0"
+version = "3.0.0"
 description = "a riscv emulator"
 readme = "docs/README.md"
 requires-python = ">=3.14.8"
@@ -15,8 +15,6 @@ dependencies = [
     "packaging==26.3",
     "pluggy==1.6.0",
     "prompt-toolkit==3.0.53",
-    "pydantic==2.14.1",
-    "pydantic-core==2.50.1",
     "pydevicetree==0.0.13",
     "pyfdt==0.3",
     "pygments==2.21.0",
@@ -27,7 +25,6 @@ dependencies = [
     "pyyaml==6.0.3",
     "rich==15.0.0",
     "pytest-timeout==2.4.0",
-    "ruff==0.17.0",
     "typing-extensions==4.16.0",
     "typing-inspection==0.4.4",
     "wcwidth==0.8.3",
@@ -38,11 +35,46 @@ dependencies = [
     "pandas==3.0.6",
     "python-dateutil==2.9.0.post0",
     "six==1.17.0",
+    "et-xmlfile==2.0.0",
+    "openpyxl==3.1.5",
+    "tomli==2.5.0",
+    "vulture==2.16",
+    "ruff==0.17.0",
 ]
+
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.0",
+    "vulture>=2.16",
+]
+
+[tool.setuptools]
+packages = ["pyremu"]
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+# https://setuptools.pypa.io/en/latest/build_meta.html
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+# setup for pytest
+pythonpath = "."
+timeout = 10
+# timeout_func_only = true
+testpaths = ["tests"]
+norecursedirs = [
+	"vendor",
+	".git",
+	"to-read",
+	"output",
+	"__pycache__",
+	".venv"
+]
 
 [tool.ruff]
 indent-width = 4
@@ -57,6 +89,7 @@ extend-exclude = [
 select = [
     "F",
     "E",
+	"ERA",
     "N",
     "I",
     "W",
@@ -85,25 +118,21 @@ split-on-trailing-comma = true
 [tool.ruff.format]
 skip-magic-trailing-comma = false
 
-[tool.pytest.ini_options]
-# setup for pytest
-pythonpath = "."
-timeout = 10
-# timeout_func_only = true
-testpaths = ["tests"]
-norecursedirs = [
-	"vendor",
-	".git",
-	"to-read",
+[tool.vulture]
+exclude = [
+    "venv",
+    ".venv",
+	".vscode",
+	".github",
+	".ruff_cache",
+	"bsp",
+    "build",
+	"dist",
+	"docs",
+	"examples",
 	"output",
-	"__pycache__",
-	".venv"
+	"fn_apps",
+	"vendor",
+	"to-read",
+    "migrations",
 ]
-
-[tool.setuptools]
-packages = ["pyremu"]
-
-# https://setuptools.pypa.io/en/latest/build_meta.html
-[build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.build_meta"

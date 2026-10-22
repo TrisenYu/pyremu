@@ -31,7 +31,7 @@ mod csr {
 /// 主机上没有 S 模式页池。以进程内一块 4 KiB 对齐的静态内存充当: 页表页只要求按
 /// 4 KiB 对齐、且能经页表项给出的物理地址寻址, 这两点静态数组同样满足。
 mod mem {
-	use std::sync::atomic::{ AtomicUsize, Ordering };
+	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	const POOL_PAGES: usize = 64;
 
@@ -71,8 +71,8 @@ mod mem {
 	}
 }
 
-#[path = "../src/mem_prim/mod.rs"]
-mod mem_prim;
+#[path = "../src/prim/mod.rs"]
+mod prim;
 
 #[path = "../src/paging.rs"]
 mod paging;

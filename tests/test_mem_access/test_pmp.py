@@ -5,6 +5,8 @@
 
 """PMP (Physical Memory Protection) 测试: 地址匹配、权限控制、CSR 范围."""
 
+from unittest import mock
+
 import pytest
 
 from pyremu.core.decoder import Hart
@@ -37,8 +39,6 @@ from pyremu.memory.pmp import (
 class TestNapotDecode:
     """验证 NAPOT 格式的 pmpaddr 解码得到 base 与 size."""
 
-    # es: expected_size
-    # eb: expected_base
     @pytest.mark.parametrize(
         "v, es, eb",
         [
@@ -66,9 +66,12 @@ class TestNapotDecode:
 class TestPmpCheck:
     """Pmp.check() 地址匹配与权限."""
 
-    @pytest.fixture
-    def pmp(self) -> Pmp:
-        """返回一个空的 Pmp (0 条目)."""
+    @pytest.fixture(params=["native", "pure_python"])
+    def pmp(self, request) -> Pmp:
+        """返回一个空的 Pmp (0 条目), 覆盖加速库与纯 Python 两条检查路径."""
+        if request.param == "pure_python":
+            with mock.patch("pyremu.memory.pmp.native_available", return_value=False):
+                return Pmp({}, num_entries=0)
         return Pmp({}, num_entries=0)
 
     def _set_csrs(self, pmp: Pmp, entries: list[tuple[int, int]]):
@@ -101,7 +104,9 @@ class TestPmpCheck:
     def test_m_mode_bypass(self, pmp):
         """M 模式 + MPRV=0: PMP 不检查, 直接放行."""
         # 无 PMP 条目 — S/U 会拒绝, M 放行
-        assert pmp.check(PmpAccessInfo(pa=0x1000, size=4, mode_val=3, mstatus_val=0, is_write=True))
+        assert pmp.check(
+            PmpAccessInfo(pa=0x1000, size=4, mode_val=3, mstatus_val=0, is_write=True)
+        )
 
     def test_m_mode_mprv_uses_mpp(self, pmp):
         """M 模式 + MPRV=1: 按 MPP 特权级检查."""
@@ -122,7 +127,9 @@ class TestPmpCheck:
         )
         # 0x1000 << 2 = 0x4000 -> range [0, 0x4000)
         assert pmp.check(PmpAccessInfo(0x0000, 4, mode_val=0, mstatus_val=0))  # inside
-        assert not pmp.check(PmpAccessInfo(0x4000, 1, mode_val=0, mstatus_val=0))  # at hi bound
+        assert not pmp.check(
+            PmpAccessInfo(0x4000, 1, mode_val=0, mstatus_val=0)
+        )  # at hi bound
 
     def test_tor_range_multi_entry(self, pmp):
         """TOR 多条目: [addr[0]<<2, addr[1]<<2)."""
@@ -191,7 +198,9 @@ class TestPmpCheck:
         )
         assert not pmp.check(PmpAccessInfo(0x8000_0000, 4, mode_val=0, mstatus_val=0))
         # R=0 时 W 也拒绝 (PMP 要求 R 必须置位)
-        assert not pmp.check(PmpAccessInfo(pa=0x8000_0000, size=4, mode_val=0, mstatus_val=0, is_write=True))
+        assert not pmp.check(
+            PmpAccessInfo(pa=0x8000_0000, size=4, mode_val=0, mstatus_val=0, is_write=True)
+        )
 
     def test_w_denied(self, pmp):
         """W=0 拒绝写."""
@@ -203,7 +212,9 @@ class TestPmpCheck:
             ],
         )
         assert pmp.check(PmpAccessInfo(0x8000_0000, 4, mode_val=0, mstatus_val=0))  # read OK
-        assert not pmp.check(PmpAccessInfo(pa=0x8000_0000, size=4, mode_val=0, mstatus_val=0, is_write=True))
+        assert not pmp.check(
+            PmpAccessInfo(pa=0x8000_0000, size=4, mode_val=0, mstatus_val=0, is_write=True)
+        )
 
     # ---- 无条目 ----
 
@@ -218,6 +229,63 @@ class TestPmpCheck:
         # 每条目都 OFF, 无匹配
         pmp._num_entries = 4
         assert not pmp.check(PmpAccessInfo(0x1000, 4, mode_val=1, mstatus_val=0))
+
+    # ---- 空范围 TOR ----
+
+    def test_tor_empty_range_rejected(self, pmp):
+        """两条 TOR 条目取同一上界时, 后一条目的范围为 0 字节, 不匹配任何访问."""
+        self._set_csrs(
+            pmp,
+            [
+                (0b1000 | 0b0001, 0x1000),  # entry 0: [0, 0x4000)
+                (0b1000 | 0b0001, 0x1000),  # entry 1: [0x4000, 0x4000)
+            ],
+        )
+        assert not pmp.check(PmpAccessInfo(0x4000, 4, mode_val=0, mstatus_val=0))
+
+    # ---- 执行权限 ----
+
+    def test_execute_denied_without_x(self, pmp):
+        """X 未置位的条目拒绝取指."""
+        val = (0x8000_0000 >> 2) | 0x1FF
+        self._set_csrs(pmp, [(0b11_000 | 0b0001, val)])  # NAPOT, R
+        assert pmp.check(PmpAccessInfo(0x8000_0000, 4, mode_val=0, mstatus_val=0))
+        assert not pmp.check(
+            PmpAccessInfo(0x8000_0000, 4, mode_val=0, mstatus_val=0, is_execute=True)
+        )
+
+    def test_enclave_mode_skips_entries_below_pmpsplit(self, pmp):
+        val = (0x8000_0000 >> 2) | 0x1FF
+        self._set_csrs(
+            pmp,
+            [
+                (0b11_000 | 0b0101, val),  # entry 0: NAPOT, R+W
+                (0, 0),  # entry 1: OFF
+            ],
+        )
+        info = PmpAccessInfo(
+            0x8000_0000,
+            4,
+            mode_val=0,
+            mstatus_val=0,
+            pmpsplit=1,
+            mdid=1,
+        )
+        assert not pmp.check(info)
+
+    # ---- 纯 Python 检查入口 ----
+
+    def test_check_py_m_mode_mprv_zero_bypasses(self, pmp):
+        assert pmp._check_py(PmpAccessInfo(0x1000, 4, mode_val=3, mstatus_val=0))
+
+
+class TestPmpConstruction:
+    """Pmp 构造参数校验."""
+
+    @pytest.mark.parametrize("count", [-1, 65])
+    def test_num_entries_out_of_range_rejected(self, count):
+        with pytest.raises(ValueError):
+            Pmp({}, num_entries=count)
 
 
 # ============================================================
@@ -379,27 +447,24 @@ class TestInstrFetchPmp:
         h.pc = 0x8000_1000
         return h
 
-    def _setup_napot(self, hart: Hart, base: int, size_log2: int,
-                     r: bool = True, w: bool = True, x: bool = True):
-        """配置 NAPOT PMP 条目 0."""
+    def _setup_napot(
+        self,
+        hart: Hart,
+        base: int,
+        size_log2: int,
+        perm: int = PMP_R | PMP_W | PMP_X,
+    ):
+        """配置 NAPOT PMP 条目 0; perm 为 PMP_R、PMP_W 与 PMP_X 的按位或."""
         k = size_log2 - 3
         mask = (1 << k) - 1
         val = (base >> 2) | mask
 
-        cfg = PMP_A_NAPOT
-        if r:
-            cfg |= PMP_R
-        if w:
-            cfg |= PMP_W
-        if x:
-            cfg |= PMP_X
-
         hart.csrs["pmpaddr0"].val = val
-        hart.csrs["pmpcfg0"].val = cfg
+        hart.csrs["pmpcfg0"].val = PMP_A_NAPOT | perm
 
     def test_bare_fetch_x_ok(self, hart):
         """Bare 模式, PMP X=1 时取指通过."""
-        self._setup_napot(hart, 0x8000_1000, 12, r=True, w=False, x=True)
+        self._setup_napot(hart, 0x8000_1000, 12, PMP_R | PMP_X)
         hart.mode = RiscvMode.S
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
         assert ok
@@ -407,13 +472,11 @@ class TestInstrFetchPmp:
 
     def test_bare_fetch_x_denied(self, hart):
         """Bare 模式, PMP X=0 -> InstrAccessFault."""
-        self._setup_napot(hart, 0x8000_1000, 12, r=True, w=True, x=False)
+        self._setup_napot(hart, 0x8000_1000, 12, PMP_R | PMP_W)
         hart.mode = RiscvMode.S
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
         assert not ok
-        assert hart.mcause_val == 1, (
-            f"应为 InstrAccessFault(1), 实际 {hart.mcause_val}"
-        )
+        assert hart.mcause_val == 1, f"应为 InstrAccessFault(1), 实际 {hart.mcause_val}"
 
     def test_bare_fetch_no_match_s_mode(self, hart):
         """S 模式无匹配 PMP 条目 -> InstrAccessFault."""
@@ -425,7 +488,7 @@ class TestInstrFetchPmp:
 
     def test_mmode_bypass_fetch(self, hart):
         """M 模式取指 (MPRV=0) 不受 PMP 限制."""
-        self._setup_napot(hart, 0x8000_1000, 12, r=True, w=True, x=False)
+        self._setup_napot(hart, 0x8000_1000, 12, PMP_R | PMP_W)
         hart.mode = RiscvMode.M
         # M 模式 MPRV=0 时不受 PMP 限制
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
@@ -439,14 +502,12 @@ class TestInstrFetchPmp:
         但取指始终用当前特权级 (M) 并绕过 PMP.
         回归: _do_claim 修复前 MPRV=1 导致 M 模式取指被 PMP 拒绝 -> halted.
         """
-        self._setup_napot(hart, 0x8000_1000, 12, r=True, w=True, x=False)
+        self._setup_napot(hart, 0x8000_1000, 12, PMP_R | PMP_W)
         hart.mode = RiscvMode.M
         # MPRV=1, MPP=S (bits[12:11]=01)
         hart.mstatus_val = (1 << 17) | (1 << 11)
         ok, pa = check_instruction_fetch(hart, 0x8000_1000)
-        assert ok, (
-            "MPRV=1 不应影响取指 — M 模式取指必须绕过 PMP"
-        )
+        assert ok, "MPRV=1 不应影响取指 — M 模式取指必须绕过 PMP"
         assert pa == 0x8000_1000
 
     def test_fetch_pma_invalid_addr(self, hart):
@@ -481,22 +542,16 @@ class TestNativeBatchPmpFetch:
             prog_cnt=0x8020_0000,
         )
 
-    def _setup_napot_entry(self, emu: Emulator, idx: int,
-                           base: int, size_log2: int,
-                           r: bool, w: bool, x: bool):
-        """直接在 hart 上配置 NAPOT PMP 条目."""
+    def _setup_napot_entry(
+        self, emu: Emulator, idx: int, base: int, size_log2: int, perm: int
+    ):
+        """直接在 hart 上配置 NAPOT PMP 条目; perm 为 PMP_R、PMP_W 与 PMP_X 的按位或."""
         hart = emu.harts[0]
         k = size_log2 - 3
         mask = (1 << k) - 1
         pmpaddr_val = (base >> 2) | mask
 
-        cfg = PMP_A_NAPOT
-        if r:
-            cfg |= PMP_R
-        if w:
-            cfg |= PMP_W
-        if x:
-            cfg |= PMP_X
+        cfg = PMP_A_NAPOT | perm
 
         hart.csrs[f"pmpaddr{idx}"].val = pmpaddr_val
         # pmpcfgN: 每个存 8 条目, RV64 仅偶数 cfg (pmpcfg0, pmpcfg2, ...)
@@ -505,7 +560,7 @@ class TestNativeBatchPmpFetch:
         shift = (idx % 8) * 8
         # 清除旧条目位
         existing &= ~(0xFF << shift)
-        existing |= (cfg << shift)
+        existing |= cfg << shift
         hart.csrs[f"pmpcfg{cfg_reg}"].val = existing
         # 使 PMP 缓存失效
         hart._pmp.invalidate_cache()
@@ -515,9 +570,9 @@ class TestNativeBatchPmpFetch:
         hart = emu.harts[0]
 
         # 配置 PMP 条目 0: NAPOT 覆盖 [0x8000_0000, 0x8200_0000) 32 MiB RWX
-        self._setup_napot_entry(emu, 0, 0x8000_0000, 25, r=True, w=True, x=True)
+        self._setup_napot_entry(emu, 0, 0x8000_0000, 25, PMP_R | PMP_W | PMP_X)
         # 配置 PMP 条目 1: NAPOT 覆盖 [0x0000_0000, 0x8000_0000) 2 GiB RWX
-        self._setup_napot_entry(emu, 1, 0x0000_0000, 31, r=True, w=True, x=True)
+        self._setup_napot_entry(emu, 1, 0x0000_0000, 31, PMP_R | PMP_W | PMP_X)
 
         # 在 0x8020_1108 放置一条 ADDI 指令: addi x5, x0, 42
         addi_instr = (42 << 20) | (5 << 7) | 0b0010011
@@ -540,7 +595,7 @@ class TestNativeBatchPmpFetch:
         hart = emu.harts[0]
 
         # 配置 PMP 条目 0: NAPOT 覆盖目标区域但 X=0 (仅 RW)
-        self._setup_napot_entry(emu, 0, 0x8000_0000, 25, r=True, w=True, x=False)
+        self._setup_napot_entry(emu, 0, 0x8000_0000, 25, PMP_R | PMP_W)
 
         # 在 0x8020_1108 放置指令
         addi_instr = (42 << 20) | (5 << 7) | 0b0010011
@@ -554,9 +609,7 @@ class TestNativeBatchPmpFetch:
         emu.step()
 
         # 应触发 InstrAccessFault (mcause=1)
-        assert hart.mcause_val == 1, (
-            f"应为 InstrAccessFault(1), 实际 mcause={hart.mcause_val}"
-        )
+        assert hart.mcause_val == 1, f"应为 InstrAccessFault(1), 实际 mcause={hart.mcause_val}"
 
     def test_native_batch_smode_no_match_denied(self, emu: Emulator):
         """S 模式取指 — 所有 PMP 条目 OFF 时拒绝."""
@@ -572,16 +625,14 @@ class TestNativeBatchPmpFetch:
         emu.step()
 
         # 无 PMP 条目匹配时 S 模式拒绝
-        assert hart.mcause_val == 1, (
-            f"应为 InstrAccessFault, 实际 mcause={hart.mcause_val}"
-        )
+        assert hart.mcause_val == 1, f"应为 InstrAccessFault, 实际 mcause={hart.mcause_val}"
 
     def test_native_batch_mmode_fetch_always_ok(self, emu: Emulator):
         """M 模式 (MPRV=0) 取指 — PMP 检查始终通过."""
         hart = emu.harts[0]
 
         # 配置 PMP 条目 0: X=0 (不应影响 M 模式取指)
-        self._setup_napot_entry(emu, 0, 0x8000_0000, 25, r=True, w=True, x=False)
+        self._setup_napot_entry(emu, 0, 0x8000_0000, 25, PMP_R | PMP_W)
 
         addi_instr = (42 << 20) | (5 << 7) | 0b0010011
         emu.load_code(0x8020_1108, addi_instr.to_bytes(4, "little"))
@@ -664,3 +715,11 @@ class TestSyncFromFlat:
         for i in range(12):
             assert pmp._flat_cfg[i] == (i * 17 + 3) & 0xFF, f"cfg[{i}] mismatch"
             assert pmp._flat_addr[i] == 0x8000_0000 + i * 0x1000, f"addr[{i}] mismatch"
+
+    def test_sync_without_cfg_registers_skips_entries(self):
+        """条目数非零但 CSR 字典缺失 pmpcfg 寄存器时跳过该条目."""
+        pmp = Pmp({}, 2)
+        pmp._flat_cfg[0] = 0x1F
+        pmp._flat_addr[0] = 0x400
+        pmp._sync_from_flat()
+        assert pmp._cache_dirty is False

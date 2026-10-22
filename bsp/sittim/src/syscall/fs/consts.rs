@@ -1,8 +1,7 @@
 //! 文件系统层的常量: 容量、打开标志、fcntl 命令、定位基准、文件类型编码与各调用共用的
 //! 标志位掩码。
 //!
-//! 执行时关闭位属描述符自身, 其值与掩码定义在描述符表层 (见 [super::super::fdtable] 的
-//! `O_CLOEXEC` 与 `FD_FLAG_MASK`), 本节只在打开标志的掩码中引用它。
+//! 执行时关闭位属描述符自身, 其值与掩码定义在描述符表层, 本节只在打开标志的掩码中引用它。
 
 use super::super::fdtable::O_CLOEXEC;
 use crate::ext_mod::vfs_ops::{O_CREAT, O_EXCL, O_TRUNC};
@@ -17,7 +16,7 @@ pub(super) const PATH_MAX: usize = 1024;
 pub(super) const IOV_MAX: u64 = 1024;
 
 /// ppoll 的阻塞地址。等待描述符就绪的线程都阻塞于同一个值: 就绪状态来自协议栈,
-/// 与描述符无关, 故网络模块在设备事件到达时按该地址整体唤醒 (见 concurrency/sched.rs)。
+/// 与描述符无关, 故网络模块在设备事件到达时按该地址整体唤醒
 pub const POLL_WAIT_ADDR: u64 = 0x7fff_2000_0000;
 
 /// 文件系统节点下标的空值, 由模块的操作表定义。

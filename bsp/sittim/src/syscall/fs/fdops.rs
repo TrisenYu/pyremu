@@ -8,50 +8,24 @@
 
 use crate::ext_mod::vfs_ops::VfsStatus;
 
+use super::super::fdtable::{
+	FD_FLAG_MASK, FDS, FdRelease, FdTarget, MAX_FD, O_CLOEXEC, alloc_fd, close_fd, dup_at,
+	fd_open_file_idx, fd_slot, fd_slot_mut, fd_target, open_file_of, release_replaced,
+	release_target, store_open_file, take_fd_slot, take_fd_slot_from,
+};
+use super::super::{EBADF, EINVAL, EMFILE};
 use super::consts::{
-	FD_CLOEXEC,
-	F_DUPFD,
-	F_DUPFD_CLOEXEC,
-	F_GETFD,
-	F_GETFL,
-	F_SETFD,
-	F_SETFL,
-	NIL,
-	OPEN_ONLY_FLAGS,
-	PATH_MAX,
-	SETFL_MASK,
+	F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, NIL, OPEN_ONLY_FLAGS,
+	PATH_MAX, SETFL_MASK,
 };
 use super::mount;
-use super::super::fdtable::{
-	FD_FLAG_MASK,
-	FDS,
-	FdRelease,
-	FdTarget,
-	MAX_FD,
-	O_CLOEXEC,
-	alloc_fd,
-	close_fd,
-	dup_at,
-	fd_open_file_idx,
-	fd_slot,
-	fd_slot_mut,
-	fd_target,
-	open_file_of,
-	release_replaced,
-	release_target,
-	store_open_file,
-	take_fd_slot,
-	take_fd_slot_from,
-};
-use super::super::{ EBADF, EINVAL, EMFILE };
-use super::{ read_path, vfs_errno };
+use super::{read_path, vfs_errno};
 
 /// openat(56): dirfd + pathname + flags + mode, 返回新 fd。
 ///
 /// 打开标志原样转交文件系统判定; 建立的描述只取其中的状态标志位, 执行时关闭位记在该描述
-/// 符自身的表项上, 见 [`OPEN_ONLY_FLAGS`] 与 [`FD_FLAG_MASK`]。路径经 [super::mount] 分派
-/// 给它所属的文件系统; 该文件系统尚未交付时返回取入失败给出的错误码, 见
-/// [super::mount::resolve]。
+/// 符自身的表项上。路径经 [super::mount] 分派
+/// 给它所属的文件系统; 该文件系统尚未交付时返回取入失败给出的错误码,。
 pub fn openat_handler(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> u64 {
 	let mut path_buf = [0u8; PATH_MAX];
 	let plen = match unsafe { read_path(pathname as *const u8, dirfd, &mut path_buf) } {
@@ -74,7 +48,7 @@ pub fn openat_handler(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> u64 {
 			sub.len() as u64,
 			flags as u32,
 			(mode & 0o777) as u32,
-			&mut node
+			&mut node,
 		)
 	};
 	if status != VfsStatus::Ok {
@@ -85,7 +59,7 @@ pub fn openat_handler(dirfd: u64, pathname: u64, flags: u64, mode: u64) -> u64 {
 		&mut tables,
 		FdTarget::Vfs(fs, node),
 		(flags as u32) & !OPEN_ONLY_FLAGS,
-		(flags as u32) & FD_FLAG_MASK
+		(flags as u32) & FD_FLAG_MASK,
 	)
 }
 

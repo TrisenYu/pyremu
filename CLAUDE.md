@@ -144,7 +144,7 @@ Hart 执行 WFI 指令时:
 ### Class hierarchy
 
 ```
-Reg (pydantic BaseModel, core/registers.py)
+Reg (core/registers.py)
 ├── CSR  — 加 access(CsrAccess), xlen, strip_w/strip_mmode/add_dmode
 └── FPR — 浮点寄存器 (val: float)
 
@@ -650,7 +650,7 @@ csrw medeleg, t0
 
 | 示例概念 | 规范用词 | 禁用 |
 |------|---------|------|
-| 飞地被执行完毕并回收 (host 发起或载荷自行结束) | 终止 | 拆除、拆掉、拆解、销毁、关停、停用 |
+| 飞地被执行完毕并回收 | 终止 | 拆除、拆掉、拆解、销毁、关停、停用 |
 | 载荷执行到退出 | 自行退出 | 自毁 |
 | 飞地时间片耗尽而让出 | 挂起 | — |
 | 进程或 hart 之间的同步点 | 同步屏障 | 栅栏 |
@@ -668,6 +668,7 @@ csrw medeleg, t0
 | 以中点与半径表示一个数及其误差界的算术 | 球算术 | 球体算术 |
 | 算得值与真值之差; 数值比较所用的判定阈值 | 误差、误差界; 判定阈值 | 容差、公差、容限、偏差 |
 |用于判定真或者假的变量|判定|门控|
+|代数上的变形、某种数值需要按单位来表示成对应的形式|换算|折算|
 
 ## Changelog
 
@@ -811,7 +812,6 @@ def foo():
 
 ## Dependencies
 
-- **pydantic** — 寄存器模型
 - **lief** — ELF/PE 解析
 - **libfdt** (pylibfdt) — 设备树 (FDT/DTB) 生成
 - **rich** — 调试器终端 UI (Table, Panel, Console)

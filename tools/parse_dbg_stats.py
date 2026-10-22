@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""解析飞地调试统计日志并生成 CSV。
+"""解析飞地调试统计日志并生成 xlsx 或 CSV。
 
 日志来自 ``CONFIG_DBG_ENCLAVE_STATS`` 之下的三项统计:
 
@@ -26,11 +26,27 @@ PMP 列按类别 (``data`` 或 ``instr``) 分开:
 ``auto`` 模式下只输出日志中实际出现的统计组; 某项统计整份日志都未出现时, 对应列留空,
 与"该统计已启用但本测试项的计数为零"区分开。
 
+输出格式:
+
+  默认生成 xlsx, 一份日志对应一张工作表。``--format csv`` 生成原先的 CSV, 可写标准输出;
+  xlsx 是二进制格式, 合并模式必须用 ``-o`` 指定路径。
+
+  xlsx 中全部数字写为数值单元格, 全部单元格水平与垂直居中; 某项统计整份日志都未出现时,
+  该单元格留空。
+
+测试项名称经 ``canonical_name`` 写为规范写法: 连续空白合并为单个空格, 再把
+``malloc_churn p=1`` 写作 ``malloc_churn-p1``、``malloc_churn p=2`` 写作
+``malloc_churn-p2``, 其余名称原样保留。
+规范写法为 chibicc、dsp、dune、fem、graphene、knots、malloc_churn-p1、malloc_churn-p2、
+modular_form、nc_udp、orbit、stress_ng 512M、stress_ng 1G、stress_ng 2G、dune-poisson。
+输出哪些行仍由日志中出现的飞地决定, 不按该清单筛选。
+
 用法:
 
-    uv run python tools/parse_dbg_stats.py output/rec.log -o build/dbg_stats.csv
+    uv run python tools/parse_dbg_stats.py output/rec.log -o build/dbg_stats.xlsx
     uv run python tools/parse_dbg_stats.py output/*.log --split --out-dir build/stats
-    uv run python tools/parse_dbg_stats.py output/rec.log --features cycle,mem,pmp
+    uv run python tools/parse_dbg_stats.py output/rec.log --format csv -o build/dbg_stats.csv
+    uv run python tools/parse_dbg_stats.py output/rec.log --format csv --features cycle,mem,pmp
 """
 
 import argparse
@@ -39,6 +55,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import sys
+
+from openpyxl import Workbook
+from openpyxl.styles import Alignment
+from openpyxl.utils import get_column_letter
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 ENCL_STAT_HINT = re.compile(r"encl_stat<")
@@ -77,10 +97,18 @@ LEGACY_PMP_PATTERN = re.compile(
 )
 
 DEFAULT_NAME_PATTERNS = (
+    r">>\s*regress-check\s+load\s+(?P<name>.+?)\s+\(exited(?:-err[^)]*)?\)\s*"
+    r":\s*(?P<status>PASS|FAIL)",
     r">>\s*regress-check\s+load\s+(?P<name>\S+)\s+\(exited\)\s*:\s*(?P<status>PASS|FAIL)",
     r">>\s*regress-check\s+(?P<name>[^:]+?)\s*:\s*(?P<status>PASS|FAIL)",
     r"\[regress\]\s+(?P<name>[^:]+?)\s*:\s*(?P<status>PASS|FAIL)",
 )
+
+# 日志中的原始写法与规范项目名的对应. 其余名称先合并连续空白, 之后即为规范写法。
+NAME_ALIASES = {
+    "malloc_churn p=1": "malloc_churn-p1",
+    "malloc_churn p=2": "malloc_churn-p2",
+}
 
 TERM_NAMES = {
     0: "SELF_EXIT",
@@ -167,12 +195,19 @@ def normalize_term(value: str) -> str:
     return value.replace("-", "_").upper()
 
 
+def canonical_name(name: str) -> str:
+    """把日志中的名称写为规范写法: 连续空白合并为单个空格, 再按别名表替换。"""
+    collapsed = " ".join(name.split())
+    return NAME_ALIASES.get(collapsed, collapsed)
+
+
 def match_cycle(line: str, line_no: int) -> Record | None:
     for pattern in CYCLE_PATTERNS:
         match = pattern.search(line)
-        if match:
-            values = {"cycles": int(match.group(2))}
-            return Record(line_no, int(match.group(1)), "cycle", values)
+        if not match:
+            continue
+        values = {"cycles": int(match.group(2))}
+        return Record(line_no, int(match.group(1)), "cycle", values)
     return None
 
 
@@ -225,10 +260,11 @@ def match_legacy_alloc(line: str, line_no: int) -> Record | None:
 def match_pmp(line: str, line_no: int) -> Record | None:
     for pattern in (PMP_PATTERN, PMP_PATTERN_WITH_HIT):
         match = pattern.search(line)
-        if match:
-            eid = int(match.group(2))
-            values = pmp_values(match.group(1), match.groups()[2:])
-            return Record(line_no, eid, "pmp", values)
+        if not match:
+            continue
+        eid = int(match.group(2))
+        values = pmp_values(match.group(1), match.groups()[2:])
+        return Record(line_no, eid, "pmp", values)
 
     match = LEGACY_PMP_PATTERN.search(line)
     if match:
@@ -320,7 +356,7 @@ def attach_names(items, names: list[NameHit], name_position: str) -> None:
             candidates = [hit for hit in names if hit.line_no > item.last_line]
             chosen = candidates[0] if candidates else None
         if chosen is not None:
-            item.name = chosen.name
+            item.name = canonical_name(chosen.name)
             item.status = chosen.status
 
 
@@ -395,7 +431,7 @@ def build_rows(
             "enclave_id": item.eid,
             "status": item.status,
             "term": item.term,
-            "exit_code": "" if item.exit_code is None else item.exit_code,
+            "exit_code": None if item.exit_code is None else item.exit_code,
             "source": str(parsed.path),
             "first_line": item.first_line,
         }
@@ -406,7 +442,7 @@ def build_rows(
                 if group in file_groups or group in forced:
                     row[column] = item.values.get(column, 0)
                 else:
-                    row[column] = ""
+                    row[column] = None
         rows.append(row)
     return rows
 
@@ -417,16 +453,68 @@ def write_csv(stream, rows: list[dict[str, object]], columns: list[str]) -> None
     writer.writerows(rows)
 
 
+def write_xlsx(
+    path: Path,
+    rows: list[dict[str, object]],
+    columns: list[str],
+) -> None:
+    """写一张工作表: 数字保持数值类型, 全部单元格居中, 缺失值写空单元格。"""
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "stats"
+    center = Alignment(horizontal="center", vertical="center")
+
+    sheet.append(list(columns))
+    for row in rows:
+        sheet.append([row.get(column) for column in columns])
+
+    for cells in sheet.iter_rows():
+        for cell in cells:
+            cell.alignment = center
+
+    for index, column in enumerate(columns, 1):
+        lengths = [len(column)]
+        lengths += [len(str(row[column])) for row in rows if row.get(column) is not None]
+        sheet.column_dimensions[get_column_letter(index)].width = min(max(lengths), 60)
+
+    workbook.save(path)
+
+
+def write_table(
+    destination: Path,
+    rows: list[dict[str, object]],
+    columns: list[str],
+    fmt: str,
+) -> None:
+    """按选定格式写出一份统计表。"""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "xlsx":
+        write_xlsx(destination, rows, columns)
+        return
+    with destination.open("w", encoding="utf-8", newline="") as stream:
+        write_csv(stream, rows, columns)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="解析飞地调试统计日志并生成 CSV, 每个飞地一行",
+        description="解析飞地调试统计日志并生成 xlsx 或 CSV, 每个飞地一行",
     )
     parser.add_argument("logs", nargs="+", help="日志文件或目录 (目录取其中的 *.log)")
-    parser.add_argument("-o", "--out", help="合并输出的 CSV 路径; 省略时写到标准输出")
+    parser.add_argument(
+        "--format",
+        choices=("xlsx", "csv"),
+        default="xlsx",
+        help="输出格式 (默认 xlsx); xlsx 是二进制格式, 必须用 --out 指定路径",
+    )
+    parser.add_argument(
+        "-o",
+        "--out",
+        help="合并输出的文件路径; xlsx 必填, csv 省略时写到标准输出",
+    )
     parser.add_argument(
         "--split",
         action="store_true",
-        help="每份日志各生成一份 CSV, 文件名为 <日志名>_stats.csv",
+        help="每份日志各生成一份文件, 文件名为 <日志名>_stats.<格式>",
     )
     parser.add_argument("--out-dir", help="--split 的输出目录; 默认为各日志所在目录")
     parser.add_argument(
@@ -462,6 +550,8 @@ def main() -> int:
         parser.error("--split 与 --out 不能同时使用")
     if args.out_dir and not args.split:
         parser.error("--out-dir 只与 --split 一起使用")
+    if not args.split and not args.out and args.format == "xlsx":
+        parser.error("xlsx 不能写到标准输出, 请用 --out 指定路径")
 
     paths = expand_inputs(args.logs)
     if not paths:
@@ -483,18 +573,16 @@ def main() -> int:
     if args.split:
         out_dir = Path(args.out_dir) if args.out_dir else None
         for parsed in probe:
-            destination = (out_dir or parsed.path.parent) / f"{parsed.path.stem}_stats.csv"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with destination.open("w", encoding="utf-8", newline="") as stream:
-                write_csv(stream, build_rows(parsed, enabled, forced), columns)
+            base = out_dir or parsed.path.parent
+            destination = base / f"{parsed.path.stem}_stats.{args.format}"
+            rows = build_rows(parsed, enabled, forced)
+            write_table(destination, rows, columns, args.format)
             print(f"  -> {destination}", file=sys.stderr)
     else:
         rows = [row for parsed in probe for row in build_rows(parsed, enabled, forced)]
         if args.out:
             destination = Path(args.out)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with destination.open("w", encoding="utf-8", newline="") as stream:
-                write_csv(stream, rows, columns)
+            write_table(destination, rows, columns, args.format)
             print(f"  -> {destination}", file=sys.stderr)
         else:
             write_csv(sys.stdout, rows, columns)
@@ -506,7 +594,7 @@ def main() -> int:
         file=sys.stderr,
     )
     if skipped:
-        print("提示: 未识别的行可能是格式变更, 用 --strict 可将其视为错误", file=sys.stderr)
+        print("未识别的行可能是格式变更, 用 --strict 可将其视为错误", file=sys.stderr)
     return 1 if args.strict and skipped else 0
 
 

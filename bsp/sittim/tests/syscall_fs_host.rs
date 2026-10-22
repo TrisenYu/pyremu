@@ -60,7 +60,9 @@ mod csr {
 	/// 取时钟源锁。用例在持有该锁期间重置定时器表并设定时钟源读数。
 	pub fn clock_lock() -> MutexGuard<'static, ()> {
 		let mutex = clock_mutex();
-		let guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		let guard = mutex
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		mutex.clear_poison();
 		guard
 	}
@@ -141,7 +143,7 @@ mod ext_mod {
 		/// 效果一致。
 		///
 		/// 宿主未提供该模块时返回 [`ENOENT`](crate::ENOENT), 与飞地内
-		/// `LoadError::NotFound` 的折算一致。
+		/// `LoadError::NotFound` 的换算一致。
 		pub fn acquire_vfs_ops() -> Result<&'static VfsOps, u64> {
 			if VFS_MISSING.load(Ordering::SeqCst) {
 				return Err(crate::ENOENT);
@@ -341,7 +343,9 @@ mod tests {
 	/// 表现为几十条失败。这些全局量在本入口被整体重置, 上一次 panic 不构成它们不可用的依据,
 	/// 故此处忽略毒化并清除标记, 使后续用例各自判定。
 	fn reset<T>(mutex: &'static std::sync::Mutex<T>) -> MutexGuard<'static, T> {
-		let guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		let guard = mutex
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		mutex.clear_poison();
 		guard
 	}
@@ -378,7 +382,10 @@ mod tests {
 	/// 相同的目录名。
 	fn make_root(tag: &str) -> String {
 		let root = format!("/{tag}");
-		assert_eq!(fs::mkdirat_handler(AT_FDCWD, cstr(&root).as_ptr() as u64, 0o755), 0);
+		assert_eq!(
+			fs::mkdirat_handler(AT_FDCWD, cstr(&root).as_ptr() as u64, 0o755),
+			0
+		);
 		root
 	}
 
@@ -389,7 +396,10 @@ mod tests {
 
 	/// 按路径建立目录。
 	fn mkdir(path: &str) {
-		assert_eq!(fs::mkdirat_handler(AT_FDCWD, cstr(path).as_ptr() as u64, 0o755), 0);
+		assert_eq!(
+			fs::mkdirat_handler(AT_FDCWD, cstr(path).as_ptr() as u64, 0o755),
+			0
+		);
 	}
 
 	/// 按路径打开并返回描述符。
@@ -411,7 +421,10 @@ mod tests {
 		let mut at = 0;
 		while at < end {
 			let reclen = u16::from_le_bytes([buf[at + 16], buf[at + 17]]) as usize;
-			assert!(reclen > HEAD && at + reclen <= end, "目录项长度 {reclen} 越界");
+			assert!(
+				reclen > HEAD && at + reclen <= end,
+				"目录项长度 {reclen} 越界"
+			);
 			let name_end = buf[at + HEAD..at + reclen]
 				.iter()
 				.position(|byte| *byte == 0)
@@ -432,11 +445,26 @@ mod tests {
 		let path = cstr("/unreachable");
 		let mut st = StatBuf([0u8; 128]);
 		let stat_ptr = st.0.as_mut_ptr() as u64;
-		assert_eq!(fs::openat_handler(AT_FDCWD, path.as_ptr() as u64, 0, 0), ENOENT);
-		assert_eq!(fs::mkdirat_handler(AT_FDCWD, path.as_ptr() as u64, 0o755), ENOENT);
-		assert_eq!(fs::unlinkat_handler(AT_FDCWD, path.as_ptr() as u64, 0), ENOENT);
-		assert_eq!(fs::faccessat_handler(AT_FDCWD, path.as_ptr() as u64, 0, 0), ENOENT);
-		assert_eq!(fs::fstatat_handler(AT_FDCWD, path.as_ptr() as u64, stat_ptr, 0), ENOENT);
+		assert_eq!(
+			fs::openat_handler(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+			ENOENT
+		);
+		assert_eq!(
+			fs::mkdirat_handler(AT_FDCWD, path.as_ptr() as u64, 0o755),
+			ENOENT
+		);
+		assert_eq!(
+			fs::unlinkat_handler(AT_FDCWD, path.as_ptr() as u64, 0),
+			ENOENT
+		);
+		assert_eq!(
+			fs::faccessat_handler(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+			ENOENT
+		);
+		assert_eq!(
+			fs::fstatat_handler(AT_FDCWD, path.as_ptr() as u64, stat_ptr, 0),
+			ENOENT
+		);
 	}
 
 	/// 相对路径只在 dirfd 取 AT_FDCWD 时可用; 绝对路径不受 dirfd 限制。
@@ -572,7 +600,10 @@ mod tests {
 		let written = fs::getdents_handler(fd, buf.as_mut_ptr(), buf.len() as u64);
 		let entries = dirents(&buf, written);
 		let names: Vec<&[u8]> = entries.iter().map(|(_, name)| name.as_slice()).collect();
-		assert_eq!(names, [b".".as_slice(), b"..".as_slice(), b"cpu0".as_slice()]);
+		assert_eq!(
+			names,
+			[b".".as_slice(), b"..".as_slice(), b"cpu0".as_slice()]
+		);
 		assert!(entries.iter().all(|(kind, _)| *kind == DT_DIR));
 		let processors = names
 			.iter()
@@ -588,7 +619,10 @@ mod tests {
 		let fd = open("/sys", O_RDONLY | O_DIRECTORY);
 		let mut buf = [0u8; 256];
 		let written = fs::getdents_handler(fd, buf.as_mut_ptr(), buf.len() as u64);
-		let names: Vec<Vec<u8>> = dirents(&buf, written).into_iter().map(|(_, name)| name).collect();
+		let names: Vec<Vec<u8>> = dirents(&buf, written)
+			.into_iter()
+			.map(|(_, name)| name)
+			.collect();
 		assert_eq!(names, [b".".to_vec(), b"..".to_vec(), b"devices".to_vec()]);
 		open("/sys/devices", O_RDONLY | O_DIRECTORY);
 	}
@@ -607,7 +641,10 @@ mod tests {
 		for flags in [0u64, AT_SYMLINK_NOFOLLOW, AT_EACCESS, AT_EMPTY_PATH, 0x1300] {
 			assert_eq!(fs::faccessat_handler(AT_FDCWD, ptr, 0, flags), ENOENT);
 		}
-		assert_eq!(fs::faccessat_handler(AT_FDCWD, ptr, 0, AT_NO_AUTOMOUNT), EINVAL);
+		assert_eq!(
+			fs::faccessat_handler(AT_FDCWD, ptr, 0, AT_NO_AUTOMOUNT),
+			EINVAL
+		);
 		assert_eq!(fs::faccessat_handler(AT_FDCWD, ptr, 0, 0x400), EINVAL);
 	}
 
@@ -634,9 +671,18 @@ mod tests {
 		for flags in accepted {
 			assert_eq!(fs::fstatat_handler(AT_FDCWD, path_ptr, stat_ptr, flags), 0);
 		}
-		assert_eq!(fs::fstatat_handler(AT_FDCWD, path_ptr, stat_ptr, AT_EACCESS), EINVAL);
-		assert_eq!(fs::fstatat_handler(AT_FDCWD, path_ptr, stat_ptr, 0x20000), EINVAL);
-		assert_eq!(fs::fstatat_handler(AT_FDCWD, path_ptr, 0, AT_EACCESS), EINVAL);
+		assert_eq!(
+			fs::fstatat_handler(AT_FDCWD, path_ptr, stat_ptr, AT_EACCESS),
+			EINVAL
+		);
+		assert_eq!(
+			fs::fstatat_handler(AT_FDCWD, path_ptr, stat_ptr, 0x20000),
+			EINVAL
+		);
+		assert_eq!(
+			fs::fstatat_handler(AT_FDCWD, path_ptr, 0, AT_EACCESS),
+			EINVAL
+		);
 	}
 
 	/// 路径取空而 flags 含 AT_EMPTY_PATH 时, fstatat 与 faccessat 以 dirfd 自身绑定的节点
@@ -664,7 +710,10 @@ mod tests {
 		assert_eq!(fs::faccessat_handler(fd, empty_ptr, R_OK, AT_EMPTY_PATH), 0);
 		// 空路径不带 AT_EMPTY_PATH 时不指代任何对象
 		assert_eq!(fs::faccessat_handler(fd, empty_ptr, 0, 0), ENOENT);
-		assert_eq!(fs::fstatat_handler(fd, empty_ptr, st.0.as_mut_ptr() as u64, 0), ENOENT);
+		assert_eq!(
+			fs::fstatat_handler(fd, empty_ptr, st.0.as_mut_ptr() as u64, 0),
+			ENOENT
+		);
 		// 控制台描述符绑定的不是文件系统节点
 		assert_eq!(fs::faccessat_handler(1, empty_ptr, 0, AT_EMPTY_PATH), EBADF);
 		assert_eq!(
@@ -681,7 +730,10 @@ mod tests {
 		let root = make_root("unlink");
 		let dir = under(&root, "d");
 		mkdir(&dir);
-		assert_eq!(fs::unlinkat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0), EISDIR);
+		assert_eq!(
+			fs::unlinkat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0),
+			EISDIR
+		);
 		mkdir(&under(&dir, "child"));
 		assert_eq!(
 			fs::unlinkat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, AT_REMOVEDIR as u64),
@@ -699,11 +751,20 @@ mod tests {
 			fs::unlinkat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, AT_REMOVEDIR as u64),
 			0
 		);
-		assert_eq!(fs::faccessat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0, 0), ENOENT);
+		assert_eq!(
+			fs::faccessat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0, 0),
+			ENOENT
+		);
 		// 目录上不带标志的删除不得被当作文本文件删除
 		mkdir(&dir);
-		assert_eq!(fs::unlinkat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0), EISDIR);
-		assert_eq!(fs::faccessat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0, 0), 0);
+		assert_eq!(
+			fs::unlinkat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0),
+			EISDIR
+		);
+		assert_eq!(
+			fs::faccessat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0, 0),
+			0
+		);
 	}
 
 	/// unlinkat 只接受 AT_REMOVEDIR 一位: 其余位一律返回 EINVAL, 且不落到模块。
@@ -714,7 +775,11 @@ mod tests {
 		let dir = under(&root, "d");
 		mkdir(&dir);
 		assert_eq!(
-			fs::unlinkat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, AT_REMOVEDIR as u64 | 4),
+			fs::unlinkat_handler(
+				AT_FDCWD,
+				cstr(&dir).as_ptr() as u64,
+				AT_REMOVEDIR as u64 | 4
+			),
 			EINVAL
 		);
 		// 高位同样不接受, 不得因截断到 32 位而被放行
@@ -723,15 +788,24 @@ mod tests {
 			EINVAL
 		);
 		// 被拒的调用不改动目录树
-		assert_eq!(fs::faccessat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0, 0), 0);
+		assert_eq!(
+			fs::faccessat_handler(AT_FDCWD, cstr(&dir).as_ptr() as u64, 0, 0),
+			0
+		);
 	}
 
 	/// 根目录不可删除, 按删除目录的请求返回 EBUSY。
 	#[test]
 	fn test_unlinkat_on_the_root_reports_busy() {
 		let _guard = world();
-		assert_eq!(fs::unlinkat_handler(AT_FDCWD, cstr("/").as_ptr() as u64, AT_REMOVEDIR as u64), EBUSY);
-		assert_eq!(fs::unlinkat_handler(AT_FDCWD, cstr("/").as_ptr() as u64, 0), EISDIR);
+		assert_eq!(
+			fs::unlinkat_handler(AT_FDCWD, cstr("/").as_ptr() as u64, AT_REMOVEDIR as u64),
+			EBUSY
+		);
+		assert_eq!(
+			fs::unlinkat_handler(AT_FDCWD, cstr("/").as_ptr() as u64, 0),
+			EISDIR
+		);
 	}
 
 	/// 控制台表项按打开标志的方向分流: fd 0 只可读, fd 1 与 fd 2 只可写。
@@ -757,9 +831,21 @@ mod tests {
 	fn test_ppoll_reports_console_directions() {
 		let _guard = world();
 		let mut pfds = [
-			PollFd { fd: 0, events: POLLIN | POLLOUT, revents: 0 },
-			PollFd { fd: 1, events: POLLIN | POLLOUT, revents: 0 },
-			PollFd { fd: 64, events: POLLIN, revents: 0 },
+			PollFd {
+				fd: 0,
+				events: POLLIN | POLLOUT,
+				revents: 0,
+			},
+			PollFd {
+				fd: 1,
+				events: POLLIN | POLLOUT,
+				revents: 0,
+			},
+			PollFd {
+				fd: 64,
+				events: POLLIN,
+				revents: 0,
+			},
 		];
 		assert_eq!(fs::ppoll_handler(pfds.as_mut_ptr() as u64, 3, 0), 3);
 		assert_eq!(pfds[0].revents, POLLIN);
@@ -932,12 +1018,18 @@ mod tests {
 
 		// 状态标志属描述: 一条描述符设置 O_APPEND, 另一条读到
 		assert_eq!(fs::fcntl_handler(fd, F_SETFL, O_APPEND as u64), 0);
-		assert_eq!(fs::fcntl_handler(dup_fd, F_GETFL, 0) & O_APPEND as u64, O_APPEND as u64);
+		assert_eq!(
+			fs::fcntl_handler(dup_fd, F_GETFL, 0) & O_APPEND as u64,
+			O_APPEND as u64
+		);
 
 		// dup3 同样共享描述, 执行时关闭标志按 flags 给出
 		assert_eq!(fs::dup3_handler(dup_fd, 10, O_CLOEXEC as u64), 10);
 		assert_eq!(fs::fcntl_handler(10, F_GETFD, 0), FD_CLOEXEC);
-		assert_eq!(fs::fcntl_handler(10, F_GETFL, 0) & O_APPEND as u64, O_APPEND as u64);
+		assert_eq!(
+			fs::fcntl_handler(10, F_GETFL, 0) & O_APPEND as u64,
+			O_APPEND as u64
+		);
 		assert_eq!(fs::dup3_handler(fd, 11, 0), 11);
 		assert_eq!(fs::fcntl_handler(11, F_GETFD, 0), 0);
 	}
@@ -948,7 +1040,10 @@ mod tests {
 	fn test_fgetfl_reports_only_status_flags() {
 		let _guard = world();
 		let root = make_root("getfl");
-		let fd = open(&under(&root, "f"), O_CREAT | O_EXCL | O_TRUNC | O_RDWR | O_CLOEXEC);
+		let fd = open(
+			&under(&root, "f"),
+			O_CREAT | O_EXCL | O_TRUNC | O_RDWR | O_CLOEXEC,
+		);
 		let flags = fs::fcntl_handler(fd, F_GETFL, 0);
 		assert_eq!(flags & 0o3, O_RDWR as u64);
 		assert_eq!(flags & (O_CREAT | O_EXCL | O_TRUNC) as u64, 0);
@@ -965,7 +1060,10 @@ mod tests {
 		let root = make_root("setfl");
 		let fd = open(&under(&root, "f"), O_CREAT | O_RDWR);
 		assert_eq!(fs::fcntl_handler(fd, F_SETFD, FD_CLOEXEC), 0);
-		assert_eq!(fs::fcntl_handler(fd, F_SETFL, (O_APPEND | O_CREAT | O_EXCL) as u64), 0);
+		assert_eq!(
+			fs::fcntl_handler(fd, F_SETFL, (O_APPEND | O_CREAT | O_EXCL) as u64),
+			0
+		);
 		let flags = fs::fcntl_handler(fd, F_GETFL, 0);
 		assert_eq!(flags & 0o3, O_RDWR as u64);
 		assert_eq!(flags & O_APPEND as u64, O_APPEND as u64);
@@ -1065,7 +1163,11 @@ mod tests {
 		assert_eq!(fs::ftruncate_handler(fd, 0), EBADF);
 		assert_eq!(fs::fsync_handler(fd), EBADF);
 		assert_eq!(fs::close_handler(fd), EBADF);
-		let mut pfds = [PollFd { fd: fd as i32, events: POLLIN, revents: 0 }];
+		let mut pfds = [PollFd {
+			fd: fd as i32,
+			events: POLLIN,
+			revents: 0,
+		}];
 		assert_eq!(fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, 0), 1);
 		assert_eq!(pfds[0].revents, POLLNVAL);
 	}
@@ -1092,12 +1194,19 @@ mod tests {
 	#[test]
 	fn test_ppoll_bounds_the_descriptor_count() {
 		let _guard = world();
-		let mut pfds = [PollFd { fd: 0, events: POLLIN, revents: 0 }];
+		let mut pfds = [PollFd {
+			fd: 0,
+			events: POLLIN,
+			revents: 0,
+		}];
 		assert_eq!(fs::ppoll_handler(pfds.as_mut_ptr() as u64, 65, 0), EINVAL);
 		assert_eq!(fs::ppoll_handler(0, 65, 0), EINVAL);
 		// 个数为 0 时不读取数组, 故数组指针取空也返回 0
 		let zero = timespec(0, 0);
-		assert_eq!(fs::ppoll_handler(0, 0, &zero as *const types::Timespec as u64), 0);
+		assert_eq!(
+			fs::ppoll_handler(0, 0, &zero as *const types::Timespec as u64),
+			0
+		);
 		// 个数非 0 而数组指针取空则返回 EFAULT
 		assert_eq!(fs::ppoll_handler(0, 1, 0), EFAULT);
 		assert_eq!(fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, 0), 1);
@@ -1105,10 +1214,13 @@ mod tests {
 
 	/// 造一个时限。返回的值的地址即系统调用收到的时限指针。
 	fn timespec(sec: i64, nsec: i64) -> types::Timespec {
-		types::Timespec { tv_sec: sec, tv_nsec: nsec }
+		types::Timespec {
+			tv_sec: sec,
+			tv_nsec: nsec,
+		}
 	}
 
-	/// 落在 [deadline, 期限] 之外且永不就绪的描述符: 编号为负, 就绪事件恒为 0。
+	/// 落在 [cutoff_tick, 期限] 之外且永不就绪的描述符: 编号为负, 就绪事件恒为 0。
 	const NEVER_READY_FD: i32 = -1;
 
 	/// ppoll 在描述符已就绪时不进入阻塞, 时限参数不影响该次扫描。
@@ -1117,35 +1229,55 @@ mod tests {
 	#[test]
 	fn test_ppoll_returns_ready_descriptors_without_waiting() {
 		let _guard = world();
-		let mut pfds = [PollFd { fd: 0, events: POLLIN, revents: 0 }];
+		let mut pfds = [PollFd {
+			fd: 0,
+			events: POLLIN,
+			revents: 0,
+		}];
 		let limit = timespec(5, 0);
-		let ready = fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, &limit as *const types::Timespec as u64);
+		let ready = fs::ppoll_handler(
+			pfds.as_mut_ptr() as u64,
+			1,
+			&limit as *const types::Timespec as u64,
+		);
 		assert_eq!(ready, 1);
 		assert_eq!(pfds[0].revents, POLLIN);
 		assert_eq!(thread::BLOCK_COUNT.load(Ordering::SeqCst), 0);
-		assert!(!timer::is_armed(thread::current_thread_id()));
+		assert!(!timer::has_wait_timer(thread::current_thread_id()));
 	}
 
 	/// 时长为 0 的 ppoll 只扫描一次: 无描述符就绪时返回 0, 不进入阻塞。
 	#[test]
 	fn test_ppoll_with_a_zero_timeout_does_not_block() {
 		let _guard = world();
-		let mut pfds = [PollFd { fd: NEVER_READY_FD, events: POLLIN, revents: 0 }];
+		let mut pfds = [PollFd {
+			fd: NEVER_READY_FD,
+			events: POLLIN,
+			revents: 0,
+		}];
 		let limit = timespec(0, 0);
 		assert_eq!(
-			fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, &limit as *const types::Timespec as u64),
+			fs::ppoll_handler(
+				pfds.as_mut_ptr() as u64,
+				1,
+				&limit as *const types::Timespec as u64
+			),
 			0
 		);
 		assert_eq!(pfds[0].revents, 0);
 		assert_eq!(thread::BLOCK_COUNT.load(Ordering::SeqCst), 0);
-		assert!(!timer::is_armed(thread::current_thread_id()));
+		assert!(!timer::has_wait_timer(thread::current_thread_id()));
 	}
 
 	/// 时限字段越界的 ppoll 返回 EINVAL 且不读取描述符数组。
 	#[test]
 	fn test_ppoll_rejects_an_invalid_timeout() {
 		let _guard = world();
-		let mut pfds = [PollFd { fd: 0, events: POLLIN, revents: 0 }];
+		let mut pfds = [PollFd {
+			fd: 0,
+			events: POLLIN,
+			revents: 0,
+		}];
 		let too_many_nsec = timespec(0, 1_000_000_000);
 		let negative_sec = timespec(-1, 0);
 		let negative_nsec = timespec(0, -1);
@@ -1161,24 +1293,30 @@ mod tests {
 		}
 		assert_eq!(pfds[0].revents, 0);
 		assert_eq!(thread::BLOCK_COUNT.load(Ordering::SeqCst), 0);
-		assert!(!timer::is_armed(thread::current_thread_id()));
+		assert!(!timer::has_wait_timer(thread::current_thread_id()));
 	}
 
 	/// 无描述符就绪时 ppoll 阻塞于 [`fs::POLL_WAIT_ADDR`], 并按已登记的截止时刻等待: 时钟源
 	/// 未到该时刻则再次阻塞, 到达该时刻即返回 0。
 	///
-	/// 等待时长取 5 ms, 即时间片周期 (config.mk 的 TIMER_INTERVAL 为 10000 个计数单位, 折合
-	/// 1 ms) 的 5 倍, 故超时判定只可能来自截止时刻本身。
+	/// 等待时长取 5 ms, 与调度定时器的触发间隔无关, 故超时判定只可能来自截止时刻本身。
 	#[test]
-	fn test_ppoll_waits_until_its_deadline() {
+	fn test_ppoll_waits_until_its_cutoff_tick() {
 		let _guard = world();
 		let me = thread::current_thread_id();
-		let mut pfds = [PollFd { fd: NEVER_READY_FD, events: POLLIN, revents: 0 }];
+		let mut pfds = [PollFd {
+			fd: NEVER_READY_FD,
+			events: POLLIN,
+			revents: 0,
+		}];
 		let limit = timespec(0, 5_000_000);
 		let limit_addr = &limit as *const types::Timespec as u64;
 
 		crate::csr::set_time(1_000);
-		assert_eq!(fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, limit_addr), 0);
+		assert_eq!(
+			fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, limit_addr),
+			0
+		);
 		assert_eq!(thread::BLOCK_COUNT.load(Ordering::SeqCst), 1);
 		assert_eq!(
 			thread::BLOCK_WAIT_ADDR.load(Ordering::SeqCst),
@@ -1186,22 +1324,28 @@ mod tests {
 		);
 		// 阻塞期间登记了切换目标, 故本次调用请求重启, 截止时刻留在表中。
 		assert_eq!(thread::RESTART_COUNT.load(Ordering::SeqCst), 1);
-		// 5 ms 折合 50_000 个计数单位 (一个计数单位为 100 ns)。
-		assert_eq!(timer::next_deadline(), Some(51_000));
+		// 截止计数值以计数单位表示: 起始时刻加 5 ms 折合的计数增量。
+		let cutoff_tick = 1_000 + timer::nsec_to_ticks(5_000_000);
+		assert_eq!(timer::next_deadline(), Some(cutoff_tick));
 
 		// 重新执行本次调用 (清除切换登记): 截止时刻未到, 沿用同一条目再次阻塞。
 		thread::SWITCH_PENDING.store(false, Ordering::SeqCst);
-		crate::csr::set_time(50_999);
-		assert_eq!(fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, limit_addr), 0);
+		crate::csr::set_time(cutoff_tick - 1);
+		assert_eq!(
+			fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, limit_addr),
+			0
+		);
 		assert_eq!(thread::BLOCK_COUNT.load(Ordering::SeqCst), 2);
-		assert_eq!(timer::next_deadline(), Some(51_000));
+		assert_eq!(timer::next_deadline(), Some(cutoff_tick));
 
 		// 到达截止时刻: 返回 0 且不再阻塞, 条目收起。
 		thread::SWITCH_PENDING.store(false, Ordering::SeqCst);
-		crate::csr::set_time(51_000);
-		assert_eq!(fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, limit_addr), 0);
+		crate::csr::set_time(cutoff_tick);
+		assert_eq!(
+			fs::ppoll_handler(pfds.as_mut_ptr() as u64, 1, limit_addr),
+			0
+		);
 		assert_eq!(thread::BLOCK_COUNT.load(Ordering::SeqCst), 2);
-		assert!(!timer::is_armed(me));
+		assert!(!timer::has_wait_timer(me));
 	}
-
 }

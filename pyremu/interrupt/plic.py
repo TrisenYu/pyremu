@@ -74,18 +74,16 @@ class PLIC(Device):
         self._num_contexts = num_contexts
 
         # 寄存器状态
-        # _priority[i]: source i 的优先级 (0=禁用, 1..7 有效)
+        # _priority[i]: source i 的优先级
         self._priority: list[int] = [0] * (num_sources + 1)
 
         # _pending[i]: source i 是否挂起
         self._pending: list[bool] = [False] * (num_sources + 1)
 
-        # _level[i]: source i 的电平状态 (设备侧最近一次 set_irq 的值)。
-        # PLIC gateway 语义 (对照 QEMU sifive_plic): claim 清除 pending,
+        # _level[i]: source i 的电平状态。
+        # PLIC gateway 语义: claim 清除 pending,
         # complete 时若电平仍为高则重新置位 pending — 否则电平中断在
-        # "claim 后无任何设备寄存器访问" 的窗口内会永久丢失 (如 UART TX
-        # watermark: ISR 每次仅发 FIFO 深度个字符, TXDATA 写由 Rust inline
-        # 处理不经 Python, complete 后无人再拉 set_irq).
+        # "claim 后无任何设备寄存器访问" 的窗口内会永久丢失.
         self._level: list[bool] = [False] * (num_sources + 1)
 
         # FFI 持久数组 — 经 ctypes 直接暴露给 Rust batch 引擎, set_irq 每次改线时
@@ -110,9 +108,7 @@ class PLIC(Device):
 
         # 计算设备区域大小 — 到最后一个 context + 4 KiB
         last_context_end = (
-            PLIC_CONTEXT_BASE
-            + (num_contexts - 1) * PLIC_CONTEXT_STRIDE
-            + 0x1000
+            PLIC_CONTEXT_BASE + (num_contexts - 1) * PLIC_CONTEXT_STRIDE + 0x1000
         )
         self.size = last_context_end
 
@@ -125,7 +121,7 @@ class PLIC(Device):
     def set_irq(self, source: int, pending: bool) -> None:
         """由设备模型调用: 设置中断源电平与挂起状态.
 
-        level-triggered 语义 (对照 QEMU sifive_plic): pending 镜像电平, 非
+        level-triggered 语义: pending 镜像电平, 非
         边沿锁存 — deassert 时同时清除挂起, 由驱动保持数据源电平直到消费完成.
         同时写穿 FFI 持久数组, 使 batch 内 Rust 内联仲裁实时看到电平变化.
         """
@@ -208,35 +204,32 @@ class PLIC(Device):
         # Source priorities (0x000000 - 0x000FFC)
         if offset < PLIC_PENDING_BASE:
             src = offset // PLIC_PRIORITY_STRIDE
-            if 1 <= src <= self._num_sources:
-                return self._priority[src] & 0x7  # 仅 bits [2:0] 有效
-            return 0
+            return self._priority[src] & 0x7 if 1 <= src <= self._num_sources else 0
 
         # Pending bits (0x001000 - 0x00107C)
         if offset < PLIC_ENABLE_BASE:
-            word_idx = (offset - PLIC_PENDING_BASE) // 4
-            return self._read_pending_word(word_idx)
+            return self._read_pending_word((offset - PLIC_PENDING_BASE) // 4)
 
         # Enable bits (0x002000 - ...)
         if offset < PLIC_CONTEXT_BASE:
             rel = offset - PLIC_ENABLE_BASE
-            context = rel // PLIC_ENABLE_STRIDE
-            word_idx = (rel % PLIC_ENABLE_STRIDE) // 4
-            return self._read_enable_word(context, word_idx)
+            return self._read_enable_word(
+                rel // PLIC_ENABLE_STRIDE, (rel % PLIC_ENABLE_STRIDE) // 4
+            )
 
         # Context registers (0x200000 - ...)
-        rel = offset - PLIC_CONTEXT_BASE
+        return self._read_context(offset - PLIC_CONTEXT_BASE)
+
+    def _read_context(self, rel: int) -> int:
+        """读取 context 段: 阈值寄存器与 claim 寄存器, 其余偏移读零."""
         context = rel // PLIC_CONTEXT_STRIDE
         ctx_off = rel % PLIC_CONTEXT_STRIDE
-
         if context >= self._num_contexts:
             return 0
-
         if ctx_off == PLIC_CONTEXT_THRESHOLD_OFF:
             return self._threshold[context] & 0x7
         if ctx_off == PLIC_CONTEXT_CLAIM_OFF:
             return self._do_claim(context)
-
         return 0
 
     def _mmio_write(self, offset: int, val: int) -> None:

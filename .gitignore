@@ -10,6 +10,7 @@
 *.py[cdo]
 *.o
 *.[ks]o
+*.inc
 
 **/bin/
 **/build/

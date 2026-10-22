@@ -10,7 +10,7 @@ import tempfile
 
 import pytest
 
-import pyremu.configs_gen
+from pyremu import configs_gen
 from pyremu.emulator import Emulator
 from pyremu.platform import InterruptMode, PeripheralConfig, PlatformConfig
 
@@ -21,8 +21,7 @@ def _disable_aia_compile_override(monkeypatch):
 
     Tests use explicit configs: qemu_virt() for legacy, qemu_virt_aia() for AIA.
     """
-    monkeypatch.setattr(pyremu.configs_gen, "PYREMU_AIA", False)
-
+    monkeypatch.setattr(configs_gen, "PYREMU_AIA", False)
 
 
 class TestInterruptModeEnum:
@@ -47,8 +46,8 @@ class TestQemuVirtAiaPreset:
     def test_creates_correct_mode(self):
         cfg = PlatformConfig.qemu_virt_aia()
         assert cfg.interrupt_mode == InterruptMode.AIA
-        assert cfg.periph.imsic_m_base == 0x2400_0000
-        assert cfg.periph.aplic_s_base == 0x0C00_0000
+        assert cfg.periph.imsic_m_base == configs_gen.IMSIC_M_BASE
+        assert cfg.periph.aplic_s_base == configs_gen.APLIC_S_BASE
 
     def test_emulator_creates_imsic(self):
         emu = Emulator(PlatformConfig.qemu_virt_aia())
@@ -67,18 +66,21 @@ class TestConfigSerialization:
     def test_json_roundtrip_legacy(self):
         cfg = PlatformConfig.qemu_virt()
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({
-                "num_harts": cfg.num_harts,
-                "ram_size": cfg.ram_size,
-                "ram_base": cfg.ram_base,
-                "interrupt_mode": cfg.interrupt_mode.value,
-                "periph": {
-                    "imsic_m_base": cfg.periph.imsic_m_base,
-                    "imsic_s_base": cfg.periph.imsic_s_base,
-                    "aplic_s_base": cfg.periph.aplic_s_base,
-                    "plic_base": cfg.periph.plic_base,
+            json.dump(
+                {
+                    "num_harts": cfg.num_harts,
+                    "ram_size": cfg.ram_size,
+                    "ram_base": cfg.ram_base,
+                    "interrupt_mode": cfg.interrupt_mode.value,
+                    "periph": {
+                        "imsic_m_base": 0,
+                        "imsic_s_base": 0,
+                        "aplic_s_base": 0,
+                        "plic_base": cfg.periph.plic_base,
+                    },
                 },
-            }, f)
+                f,
+            )
             path = f.name
 
         loaded = PlatformConfig.from_json(path)
@@ -89,34 +91,37 @@ class TestConfigSerialization:
     def test_json_roundtrip_aia(self):
         cfg = PlatformConfig.qemu_virt_aia()
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({
-                "num_harts": cfg.num_harts,
-                "interrupt_mode": cfg.interrupt_mode.value,
-                "periph": {
-                    "imsic_m_base": cfg.periph.imsic_m_base,
-                    "imsic_s_base": cfg.periph.imsic_s_base,
-                    "aplic_s_base": cfg.periph.aplic_s_base,
-                    "plic_base": cfg.periph.plic_base,
+            json.dump(
+                {
+                    "num_harts": cfg.num_harts,
+                    "interrupt_mode": cfg.interrupt_mode.value,
+                    "periph": {
+                        "imsic_m_base": cfg.periph.imsic_m_base,
+                        "imsic_s_base": cfg.periph.imsic_s_base,
+                        "aplic_s_base": cfg.periph.aplic_s_base,
+                        "plic_base": cfg.periph.plic_base,
+                    },
                 },
-            }, f)
+                f,
+            )
             path = f.name
 
         loaded = PlatformConfig.from_json(path)
         assert loaded.interrupt_mode == InterruptMode.AIA
-        assert loaded.periph.imsic_m_base == 0x2400_0000
+        assert loaded.periph.imsic_m_base == cfg.periph.imsic_m_base
         Path(path).unlink()
 
 
 class TestPeripheralConfigDefault:
     """PeripheralConfig 默认值向后兼容."""
 
-    def test_default_imsic_base_zero(self):
+    def test_default_imsic_base_follows_build_config(self):
+        """默认 IMSIC 与 APLIC 基址取自 emu-configs.mk 生成的常量."""
         p = PeripheralConfig()
-        assert p.imsic_m_base == 0
-        assert p.aplic_s_base == 0
+        assert p.imsic_m_base == configs_gen.IMSIC_M_BASE
+        assert p.aplic_s_base == configs_gen.APLIC_S_BASE
 
     def test_minimal_preset_no_imsic(self):
         cfg = PlatformConfig.minimal()
-        assert cfg.periph.imsic_m_base == 0
         emu = Emulator(cfg)
         assert emu.imsic is None

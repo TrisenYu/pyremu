@@ -12,17 +12,15 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::handlers::MemAccess;
 
-/// mtimecmp 写入处理 — 与 QEMU ``riscv_aclint_mtimer_write_timecmp``
-/// (vendor/qemu-10.2.0/hw/intc/riscv_aclint.c) 一次性定时器语义逐行一致:
+/// mtimecmp 写入处理
 ///
 /// - ``val == 0``: 禁用 — 清 MTIP, deadline 置 0 (codebase 既有 0=禁用约定,
 ///   见 test_trap.py:1641/2736/3050)。
-/// - ``val <= now_mtime`` (已到期): 立即置位 MTIP, deadline 置 0 (QEMU raise)。
+/// - ``val <= now_mtime`` (已到期): 立即置位 MTIP, deadline 置 0。
 /// - ``val > now_mtime`` (未来): 清 MTIP, deadline = 写入时刻本 hart 指令计数
-///   + 剩余 tick 的指令换算 (QEMU lower + ``timer_mod`` 一次性定时器)。
+///   + 剩余 tick 的指令换算。
 ///
-/// 清除仅发生在 mtimecmp 写入 (未来值/0); ``sync_mtip`` 的活跃分支永不清除,
-/// 保证电平语义与 QEMU 一致 (``qemu_irq_lower`` 仅在前向重设 deadline 时调用)。
+/// 清除仅发生在 mtimecmp 写入 (未来值/0); ``sync_mtip`` 的活跃分支永不清除。
 pub(crate) fn write_mtimecmp(state: &mut HartState, now_mtime: u64, val: u64, timebase_hz: u64) {
 	if val == 0 {
 		state.mip.fetch_and(!(1 << 7), Ordering::AcqRel);
@@ -37,8 +35,7 @@ pub(crate) fn write_mtimecmp(state: &mut HartState, now_mtime: u64, val: u64, ti
 }
 
 /// stimecmp 写入处理 — 与 ``write_mtimecmp`` 对称, 仅位号不同
-/// (对应 QEMU ``riscv_timer_write_timecmp``, target/riscv/time_helper.c)。
-/// stimecmp 仅由本 hart 自身写入 (per-hart CSR), 故只取 ``&mut HartState``。
+/// stimecmp 仅由本 hart 自身写入, 故只取 ``&mut HartState``。
 pub(crate) fn write_stimecmp(state: &mut HartState, now_mtime: u64, val: u64, timebase_hz: u64) {
 	if val == 0 {
 		state.mip.fetch_and(!(1 << 5), Ordering::AcqRel);
@@ -328,7 +325,7 @@ pub(crate) fn try_handle_clint_concurrent(
 		}
 		if is_write {
 			unsafe { &*clint.mtimecmp.add(target) }.store(write_data, Ordering::Release);
-			// QEMU 一次性定时器语义: 写入后为目标 hart 的 MTIP 设定 deadline.
+			// 无操作写入后为目标 hart 的 MTIP 设定 deadline.
 			write_mtimecmp_for_target(clint, target, write_data);
 			Some(0)
 		} else {
@@ -458,7 +455,7 @@ pub(crate) fn try_handle_clint(
 		}
 		if hart_id < clint.num_harts as usize && !clint.states.is_null() {
 			let t = unsafe { &mut *clint.states.add(hart_id) };
-			// QEMU 一次性定时器语义: 写入后为目标 hart 的 MTIP 设定 deadline.
+			// 无操作写入后为目标 hart 的 MTIP 设定 deadline.
 			write_mtimecmp(t, unsafe { *clint.mtime }, write_data, clint.timebase_hz);
 		}
 		return Some(0);
@@ -488,8 +485,7 @@ mod tests {
 			.map(|_| AtomicU64::new(0))
 			.collect();
 		let mtime = AtomicU64::new(0);
-		let mtimecmp: Vec<AtomicU64> =
-			(0..NUM_HARTS).map(|_| AtomicU64::new(0)).collect();
+		let mtimecmp: Vec<AtomicU64> = (0..NUM_HARTS).map(|_| AtomicU64::new(0)).collect();
 		let msip: Vec<AtomicU8> = (0..NUM_HARTS).map(|_| AtomicU8::new(0)).collect();
 
 		let clint = ConcurrentClintCtx {
@@ -529,16 +525,9 @@ mod tests {
 			sync_msip(&mut state, &clint);
 			let msip_set = state.mip.load(Ordering::Acquire) & (1 << 3);
 			if hid == 2 {
-				assert_eq!(
-					msip_set,
-					1 << 3,
-					"hart 2 必须读到发往自己的 IPI 边沿"
-				);
+				assert_eq!(msip_set, 1 << 3, "hart 2 必须读到发往自己的 IPI 边沿");
 			} else {
-				assert_eq!(
-					msip_set, 0,
-					"hart {hid} 不得读到发往 hart 2 的 IPI 边沿"
-				);
+				assert_eq!(msip_set, 0, "hart {hid} 不得读到发往 hart 2 的 IPI 边沿");
 			}
 		}
 	}
@@ -665,7 +654,7 @@ mod tests {
 	}
 
 	/// 回归: 跨 hart 共享 mtime 数值被其他 hart 异常推高时, 不得提前触发
-	/// 刚重新设置的定时器 (QEMU 一次性定时器语义)。
+	/// 刚重新设置的定时器。
 	///
 	/// 旧行为 (逐指令共享比较 ``cur_mtime >= stimecmp``): hart A 的进度经 fetch_max
 	/// 把共享 mtime 数值异常推高, 越过 hart B 刚写入的未来 stimecmp -> B 的

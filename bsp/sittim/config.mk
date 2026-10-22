@@ -1,10 +1,12 @@
 # Platform configuration for sittim
 # Override these in the Makefile or via environment, e.g.
-#   make TIMER_INTERVAL=50000 UART_BASE=0x10011000
+#   make SCHED_FREQ=500 UART_BASE=0x10011000
 
-## 定时中断配置
-TIMER_INTERVAL ?= 10000 # 10000 for QEMU, 50000 for VisionFive2
-TIMER_FREQ ?= 10000000  # mtime 递增频率 (Hz): 10 MHz for QEMU, 1 MHz for SiFive
+# 时钟源频率 (Hz). 模拟器按该频率推进 mtime, DTB 的 timebase-frequency 取同一值.
+TIMER_FREQ ?= 100000
+# 调度定时器的中断频率 (Hz), 即调度所依赖的最小触发频率. 运行时每 TIMER_FREQ / SCHED_FREQ
+# 个时钟源计数请求一次中断; 定时等待的截止时刻更早时, 中断随该时刻提前到来.
+SCHED_FREQ ?= 1000
 
 
 # 可信应用时间片.
@@ -14,7 +16,9 @@ TIMER_FREQ ?= 10000000  # mtime 递增频率 (Hz): 10 MHz for QEMU, 1 MHz for Si
 TIME_QUOTA ?= 1000
 
 ## UART 配置
-UART_BASE ?= 0x10000000      # MMIO base address
+# MMIO 基址, 与注册 UART 设备的地址相同.
+#   UART_BASE  — 在该地址注册 UART 设备.
+UART_BASE ?= 0x10000000
 UART_TXDATA ?= 0x00          # TX data register offset
 UART_RXDATA ?= 0x04          # RX data register offset
 UART_TXCTRL ?= 0x08          # TX control register offset
@@ -29,10 +33,9 @@ NET_BASE ?= 0 # 0x10008000
 NET_SIZE ?= 0 # 0x200
 
 ## 栈内存最大容量
-SMODE_STACK_SIZE ?= 0x10000  # S-mode stack in bytes (64 KiB default)
-
+SMODE_STACK_SIZE ?= 0x10000  # S-mode stack in bytes, 64 KiB default
 ## Linker base
-LINK_BASE ?= 0x0              # PIE: 链接基址为 0, 运行时重定位修正
+LINK_BASE ?= 0x0             # PIE: 链接基址为 0, 运行时重定位修正
 
 ## VA mem layout
 # 飞地运行时的虚拟地址空间分区. 各项之间存在约束, 改动须整组核对:
@@ -43,18 +46,19 @@ LINK_BASE ?= 0x0              # PIE: 链接基址为 0, 运行时重定位修正
 #     起的同一段 VA 区间;
 #   - U 模式区自 1 GiB 起向高地址排列: 堆自 UMODE_HEAP_START_ALIGNED 向上增长,
 #     栈顶取 UMODE_STACK_TOP_VA 并向下增长, mmap 自 UMODE_MMAP_BASE 向上增长.
-ENCLAVE_MAN_VA_START ?= 0xFFFF_FFE0_0000_0000
+ENCLAVE_MAN_VA_START        ?= 0xFFFF_FFE0_0000_0000
 ENCLAVE_MODULE_LOAD_VA_INIT ?= 0xFFFF_FFF0_0000_0000
-# 模块窗口可交付的 VA 上界与基址之差. 该值约束窗口内能容纳多少个 2 MiB 分区,
-# 不预留物理内存: 物理内存仍按需向 M 模式申请. 窗口耗尽即取入失败, 不复用已交付的地址.
-ENCLAVE_MODULE_WINDOW_SIZE ?= 0x400_0000
 
-LINEAR_MAP_START ?= 0x1_4000_0000
-LINEAR_MAP_SIZE ?= 0x3_4000_0000
+# 模块窗口可交付的 VA 上界与基址之差. 该值约束窗口内能容纳多少个 2 MiB 分区,
+ENCLAVE_MODULE_WINDOW_SIZE  ?= 0x400_0000
+
+LINEAR_MAP_START  ?= 0x1_4000_0000
+LINEAR_MAP_SIZE   ?= 0x3_4000_0000
 LINEAR_MAP_OFFSET ?= 0xFFFF_FFC0_0000_0000
 
 UMODE_HEAP_START_ALIGNED ?= 0x1_0000_0000
 UMODE_STACK_TOP_VA ?= 0x1_4000_0000
+
 # mmap 匿名映射起始 VA, 自此处向高地址增长, 避开堆与栈.
 UMODE_MMAP_BASE ?= 0x2_0000_0000
 
@@ -74,6 +78,6 @@ ATTEST_PRIV_KEY_PATH ?= ../attest-keys/attest_priv.pem
 
 
 ## 诊断输出
-# 编译时启用诊断输出，如 [map_sec]/[map_pool]/page_fault/syscall等.
+# 编译时启用诊断输出
 # 非 0 即开启, 作用到编译选项 cargo --features diagnostic.
 DIAGNOSTIC ?= 0

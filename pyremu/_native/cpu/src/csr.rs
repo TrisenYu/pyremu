@@ -1,4 +1,4 @@
-//! CSR read/write for the execution engine (Phase C).
+//! CSR read/write for the execution engine.
 //!
 //! Handles inline read/write for CSRs whose values are stored directly in
 //! ``HartState``.  Unknown or write-sensitive CSRs trigger an exit to Python
@@ -505,13 +505,6 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
         // csrrs 读惯用法回写原值, 同样静默忽略.
         CYCLE | INSTRET | CYCLEH | INSTRETH => CSR_OK,
 
-        // Sstc stimecmp (0x14D) — S-mode timer compare value.
-        // QEMU 一次性定时器语义 (riscv_aclint_mtimer_write_timecmp):
-        // 过去值立即置位 STIP, 未来值清位并设定本 hart 指令计数空间的
-        // deadline (sync_mtip 活跃分支据此判定, 与共享 mtime 跨 hart 膨胀解耦).
-        // Writing stimecmp also syncs to the CLINT mtimecmp array via the
-        // pointer stored in clint context; this happens in Python's
-        // ``_csr_write_raw("stimecmp", …)`` path during unmarshal.
         STIMECMP => {
             ctx.state.stimecmp = val;
             write_stimecmp(ctx.state, ctx.mtime(), val, ctx.clint.timebase_hz);
@@ -588,7 +581,7 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
             imsic_topei_claim_iid(file, iid);
             sync_imsic_one(ctx.state, addr == MTOPEI);
             // Clear MSIP/SSIP for IPI IIDs (same rationale as
-            // compute_mtopi — sbi_ipi_raw_clear is a no-op in AIA).
+            // compute_mtopi — sbi_ipi_raw_clear is a无操作 in AIA).
             if addr == MTOPEI && iid == IID_M_IPI {
                 ctx.state.mip.fetch_and(!(1 << 3), Ordering::AcqRel);
             } else if addr == STOPEI && iid == IID_S_IPI {
@@ -626,9 +619,8 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
                 }
             } else if iid == 11 {
                 // IID=11 (MEI) — major identity for machine external.
-                // MTOPI 在 QEMU 中为只读 CSR (CSR_MTOPI 无 write 函数),
-                // 回写必须为 no-op. 外部中断 (含 M-file IPI) 只能经 MTOPEI
-                // (csr_swap) 认领, 否则 `csrr mtopi` 的 read-modify-write
+                // MTOPI 回写必须为无操作. 外部中断只能经 MTOPEI
+                // 认领, 否则 `csrr mtopi` 的 read-modify-write
                 // 会提前清掉 top eip, 使 OpenSBI 的 csr_swap(MTOPEI) 读空.
             } else {
                 // IMSIC minor IID: claim specific eip bit + sync MEIP.
@@ -656,19 +648,18 @@ pub fn csr_write(ctx: &mut CsrContext, addr: u16, val: u64) -> u8 {
                 let now = ctx.mtime();
                 if ctx.state.stimecmp <= now {
                     ctx.state.stimecmp = now + 4;
-                    // bump 后 stimecmp 为未来值: 按 QEMU 语义设定一次性 deadline.
+                    // bump 后 stimecmp 为未来值:
                     // 不设定则 sync_mtip 活跃分支退化为共享 mtime 比较, 会被其他
-                    // 活跃 hart 的进度膨胀提前置位 -> mret 后立即再 trap 的活锁.
+                    // 活跃 hart 的进度膨胀提前置位
                     write_stimecmp(ctx.state, now, ctx.state.stimecmp, ctx.clint.timebase_hz);
                 }
             } else if iid == 9 {
                 // IID=9 (SEI) — major identity for supervisor external.
-                // STOPI 在 QEMU 中为只读 CSR (CSR_STOPI 无 write 函数),
-                // 回写原值必须是无副作用的 no-op. 外部中断 (含跨 hart IPI,
-                // minor IID=1) 只能通过 STOPEI (csr_swap) 认领. 若在此处
+                // STOPI为只读 CSR
+                // 回写原值必须是无副作用的无操作. 外部中断只能通过 STOPEI (csr_swap) 认领. 若在此处
                 // 于 `csrr stopi` 的 read-modify-write 中提前认领 top eip,
                 // 内核 imsic_handle_irq 的 csr_swap(STOPEI) 将读到空, 导致
-                // IPI 握手永远无法完成 (发送方在 flush_icache_all 自旋).
+                // IPI 握手永远无法完成.
             } else {
                 // IMSIC minor IID: claim specific eip bit + sync SEIP.
                 imsic_topei_claim_iid(&mut ctx.state.imsic_s, iid);
@@ -854,12 +845,10 @@ pub fn handle_csr(
 		return EXIT_SENTINEL;
 	}
 
-	// STIMECMP 写路径的 mip.STIP 立即更新已由 csr_write 内的 write_stimecmp
-	// 完成 (0->清, 过去->置位, 未来->清+设定 deadline), 与 QEMU 语义逐行一致;
-	// 此处不再重复基于共享 mtime 的重新比较 — 那会与 deadline 模型矛盾
-	// (跨 batch 边界的共享 mtime 膨胀会把刚设定的未来定时器重新推成"已到期").
+	// STIMECMP 写路径的 mip.STIP 立即更新
+	// 此处不再重复基于共享 mtime 的重新比较
 	// sync_mtip 仍在下一指令边界运行, 但 stopi 在此之前读到的 mip.STIP
-	// 已是最新值 (write_stimecmp 在写指令内同步置/清位)。
+	// 已是最新值。
 
 	if rd != 0 {
 		write_gpr(ctx.state, rd, old_val);
@@ -1606,7 +1595,7 @@ mod tests {
 		}
 	}
 
-	/// stopi (0xDB0) 回写必须 no-op (QEMU 中 STOPI 为只读 CSR).
+	/// stopi (0xDB0) 回写必须无操作
 	///
 	/// ``csrr stopi`` 读出 major identity SEI=9, 内核 read-modify-write 回写
 	/// 同一值时, 若在此处认领 top eip, 会提前清掉外部中断, 使后续 STOPEI
@@ -1637,7 +1626,7 @@ mod tests {
 			"stopi must report SEI major identity"
 		);
 
-		// 回写同一值 (read-modify-write) — 必须 no-op, eip 保持 pending.
+		// 回写同一值 (read-modify-write) — 必须无操作, eip 保持 pending.
 		let wst = csr_write(&mut ctx, 0xDB0, val);
 		assert_eq!(wst, CSR_OK);
 		assert_ne!(
@@ -1647,7 +1636,7 @@ mod tests {
 		);
 	}
 
-	/// mtopi (0xFB0) 回写必须 no-op (QEMU 中 MTOPI 为只读 CSR). 对称于 stopi.
+	/// mtopi (0xFB0) 回写必须无操作
 	#[test]
 	fn mtopi_write_back_does_not_claim_external_eip() {
 		if !CFG_AIA {

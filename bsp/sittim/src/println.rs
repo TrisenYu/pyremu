@@ -4,10 +4,10 @@
 //! 整条发出。M 模式的 `sbi_nputs` 持有 `console_out_lock`, 保证多 hart /
 //! 多飞地并发时不发生字符级交织。
 
-use core::fmt::{ self, Write };
+use core::fmt::{self, Write};
 
 /// 单条消息的格式化缓冲区字节数。长度须容得下最长的一条消息, 即陷态现场的记录,
-/// 它逐项列出陷态栈帧内的全部通用寄存器, 见 crate::trap 的 report_trap_frame。
+/// 它逐项列出陷态栈帧内的全部通用寄存器
 const BUF_SIZE: usize = 1024;
 
 pub struct FmtBuf {

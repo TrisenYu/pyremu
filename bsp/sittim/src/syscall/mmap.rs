@@ -2,27 +2,15 @@
 //! brk(214) 逻辑仍在 crate::mem::sys_brk_handler，此处仅 re-export。
 
 use crate::constants::{
-	CHUNK_2M_SIZE,
-	ENCLAVE_MEM_ATTR_DATA,
-	ENCLAVE_MEM_ATTR_INSTR,
-	LEVEL_GIGA,
-	LEVEL_MEGA,
-	LEVEL_PAGE,
-	PAGE_SHIFT,
-	PAGE_SIZE,
-	PTE_R,
-	PTE_RSW_SHARED,
-	PTE_U,
-	PTE_V,
-	PTE_W,
-	PTE_X,
+	CHUNK_2M_SIZE, ENCLAVE_MEM_ATTR_DATA, ENCLAVE_MEM_ATTR_INSTR, LEVEL_GIGA, LEVEL_MEGA,
+	LEVEL_PAGE, PAGE_SHIFT, PAGE_SIZE, PTE_R, PTE_RSW_SHARED, PTE_U, PTE_V, PTE_W, PTE_X,
 	UMODE_VA_LIMIT,
 };
 use crate::mem;
-use crate::mem_prim::align::align_up;
 use crate::paging;
+use crate::prim::arith::align_up;
 
-use super::{ EINVAL, ENOMEM, ENOSYS };
+use super::{EINVAL, ENOMEM, ENOSYS};
 
 // ---------------------------------------------------------------
 //  mmap 常量 (Linux rv64 ABI)
@@ -76,14 +64,7 @@ fn prot_to_pte(prot: u64) -> u64 {
 ///
 /// 请求同时带 PROT_WRITE 与 PROT_EXEC 时返回 EINVAL: 一个 2 MiB 分区整体属于一个
 /// 类别, 类别即该分区登记的 PMP 权限, 可写与可执行不能落在同一分区上。
-pub fn mmap_handler(
-	addr: u64,
-	len: u64,
-	prot: u64,
-	flags: u64,
-	_fd: u64,
-	_off: u64
-) -> u64 {
+pub fn mmap_handler(addr: u64, len: u64, prot: u64, flags: u64, _fd: u64, _off: u64) -> u64 {
 	// 仅支持匿名映射
 	if (flags & MAP_ANONYMOUS) == 0 {
 		return ENOSYS;
@@ -120,16 +101,14 @@ pub fn mmap_handler(
 		if !mem::is_umode_va_range(va, total_bytes) {
 			return ENOMEM;
 		}
-		if
-			!mem::map_umode_pages(va, pages, pte_flags) ||
-			!seal_instr_mapping(va, pages, pte_flags)
+		if !mem::map_umode_pages(va, pages, pte_flags) || !seal_instr_mapping(va, pages, pte_flags)
 		{
 			return ENOMEM;
 		}
 		return va;
 	}
 
-	// 常规路径: 由映射区的页计数决定放置与粒度 (见 mem::take_mmap_region)。
+	// 常规路径: 由映射区的页计数决定放置与粒度。
 	let va = mem::take_mmap_region(total_bytes, pte_flags);
 	if va == 0 || !seal_instr_mapping(va, pages, pte_flags) {
 		return ENOMEM;
@@ -186,8 +165,7 @@ pub fn munmap_handler(addr: u64, len: u64) -> u64 {
 			}
 			Some(_) => {
 				va += PAGE_SIZE;
-			}
-			// 未知层级不应出现, 保守跳过
+			} // 未知层级不应出现, 保守跳过
 		}
 	}
 
@@ -217,7 +195,11 @@ fn range_changes_exec(start: u64, end: u64, wants_exec: bool) -> bool {
 		if ((flags & PTE_X) != 0) != wants_exec {
 			return true;
 		}
-		va += if level == LEVEL_MEGA { CHUNK_2M_SIZE } else { PAGE_SIZE };
+		va += if level == LEVEL_MEGA {
+			CHUNK_2M_SIZE
+		} else {
+			PAGE_SIZE
+		};
 	}
 	false
 }
@@ -264,10 +246,7 @@ fn seal_instr_mapping(va: u64, pages: u64, flags: u64) -> bool {
 	if (flags & PTE_X) == 0 {
 		return true;
 	}
-	if
-		reclass_covered_partitions(va, va + pages * PAGE_SIZE, ENCLAVE_MEM_ATTR_INSTR) !=
-		0
-	{
+	if reclass_covered_partitions(va, va + pages * PAGE_SIZE, ENCLAVE_MEM_ATTR_INSTR) != 0 {
 		return false;
 	}
 	for i in 0..pages {
@@ -374,7 +353,7 @@ fn check_mremap_params(
 	old_size: u64,
 	new_size: u64,
 	flags: u64,
-	new_addr: u64
+	new_addr: u64,
 ) -> u64 {
 	if (flags & !MREMAP_KNOWN_FLAGS) != 0 {
 		return EINVAL;
@@ -419,7 +398,7 @@ pub fn mremap_handler(
 	old_size: u64,
 	new_size: u64,
 	flags: u64,
-	new_addr: u64
+	new_addr: u64,
 ) -> u64 {
 	let invalid = check_mremap_params(old_addr, old_size, new_size, flags, new_addr);
 	if invalid != 0 {
@@ -428,10 +407,7 @@ pub fn mremap_handler(
 
 	// 原地扩容/收缩: 判断条件与页映射都在 memory 侧 (需要映射区的页计数与后备
 	// 块物理基址)。
-	if
-		(flags & MREMAP_FIXED) == 0 &&
-		mem::grow_mmap_in_place(old_addr, old_size, new_size)
-	{
+	if (flags & MREMAP_FIXED) == 0 && mem::grow_mmap_in_place(old_addr, old_size, new_size) {
 		return old_addr;
 	}
 
@@ -471,13 +447,17 @@ pub fn mremap_handler(
 		va
 	};
 
-	let copy_len = if old_size < new_size { old_size } else { new_size };
+	let copy_len = if old_size < new_size {
+		old_size
+	} else {
+		new_size
+	};
 	if !is_shared {
 		unsafe {
 			core::ptr::copy_nonoverlapping(
 				old_addr as *const u8,
 				dst as *mut u8,
-				copy_len as usize
+				copy_len as usize,
 			);
 		}
 	}

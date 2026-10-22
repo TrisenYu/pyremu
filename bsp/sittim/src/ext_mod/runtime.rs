@@ -2,8 +2,7 @@
 //!
 //! 取入一个模块需要两样东西: 一条向宿主请求映像的通路, 与一份交给模块的管理器回调
 //! 集合。两者都取用平台设施 (ecall、S 模式页池、地址翻译、时钟源), 故本模块只在固件
-//! 构建内编译; 主机目标上的用例自带通路与管理器的实现, 见 `tests/ext_mod_host.rs`。
-//!
+//! 构建内编译; 主机目标上的用例自带通路与管理器的实现
 //! 每个模块一个取用入口: 已登记则直接返回登记的操作表, 未登记则向固件提出交付申请。
 //! 模块在首次用到时取入, 不在启动时取入: 平台的设备区间由 `NET_BASE` 决定是否存在,
 //! 而文件系统模块只被载荷的路径类系统调用用到, 二者都不必占用启动路径。
@@ -16,17 +15,17 @@
 //! 此在可信应用侧可以区分。
 
 use core::ptr;
-use core::sync::atomic::{ AtomicPtr, Ordering };
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use super::abi::GetterFn;
+use super::acquire_ops_table;
 use super::errno::ENODEV;
+use super::loader::load;
 use super::man::Manager;
 use super::net_ops::NetOps;
 use super::transport::EcallTransport;
 use super::vfs_ops::VfsOps;
-use super::loader::load;
-use super::{ acquire_ops_table };
-use crate::constants::{ LINEAR_MAP_OFFSET, NET_BASE, TIMER_FREQ };
+use crate::constants::{LINEAR_MAP_OFFSET, NET_BASE, TIMER_FREQ};
 use crate::csr;
 use crate::ecall_aux;
 use crate::mem;
@@ -103,7 +102,7 @@ static VFS_OPS: AtomicPtr<VfsOps> = AtomicPtr::new(ptr::null_mut());
 fn acquire<T>(
 	cell: &AtomicPtr<T>,
 	module_id: u32,
-	init: fn(&T) -> bool
+	init: fn(&T) -> bool,
 ) -> Result<&'static T, u64> {
 	let cached = cell.load(Ordering::Acquire);
 	if !cached.is_null() {

@@ -5,14 +5,10 @@
 
 use crate::ext_mod::vfs_ops::{AT_REMOVEDIR, VfsStat};
 
-use super::consts::{
-	ACCESS_FLAG_BITS, ACCESS_MODE_BITS, AT_EMPTY_PATH, AT_FDCWD, PATH_MAX,
-};
-use super::mount;
 use super::super::fdtable::FDS;
-use super::super::{
-	EBADF, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOTDIR, ERANGE,
-};
+use super::super::{EBADF, EFAULT, EINVAL, ENAMETOOLONG, ENOENT, ENOTDIR, ERANGE};
+use super::consts::{ACCESS_FLAG_BITS, ACCESS_MODE_BITS, AT_EMPTY_PATH, AT_FDCWD, PATH_MAX};
+use super::mount;
 use super::{fd_node, vfs_errno};
 
 /// 把载荷给出的路径参数读入 *out*, 返回路径的字节数 (不含结尾空字节)。
@@ -22,7 +18,9 @@ use super::{fd_node, vfs_errno};
 /// 结尾空字节返回 ENAMETOOLONG (该情形下路径被截断, 截断后的前缀可能指代另一个对象)。
 /// 空路径照常返回, 它是否指代对象由调用方按各自的约定判定。
 pub(super) unsafe fn read_path(
-	pathname: *const u8, dirfd: u64, out: &mut [u8; PATH_MAX],
+	pathname: *const u8,
+	dirfd: u64,
+	out: &mut [u8; PATH_MAX],
 ) -> Result<usize, u64> {
 	if pathname.is_null() {
 		return Err(EFAULT);
@@ -114,9 +112,9 @@ pub fn unlinkat_handler(dirfd: u64, pathname: u64, flags: u64) -> u64 {
 ///
 /// *mode* 只接受 [`ACCESS_MODE_BITS`] 覆盖的位, *flags* 只接受 [`ACCESS_FLAG_BITS`]
 /// 覆盖的位, 出现其余位返回 EINVAL。*flags* 含 [`AT_EMPTY_PATH`] 而路径取空时, 目标取
-/// *dirfd* 自身绑定的节点, 见 [empty_path_exists]; *dirfd* 无效或绑定的不是文件系统节点时
+/// *dirfd* 自身绑定的节点; *dirfd* 无效或绑定的不是文件系统节点时
 /// 返回 EBADF。路径经 [mount] 分派给它所属的文件系统; 该文件系统尚未交付时返回取入失败
-/// 给出的错误码, 见 [mount::resolve]。
+/// 给出的错误码。
 pub fn faccessat_handler(dirfd: u64, pathname: u64, mode: u64, flags: u64) -> u64 {
 	if mode & !ACCESS_MODE_BITS != 0 || flags & !ACCESS_FLAG_BITS != 0 {
 		return EINVAL;
@@ -142,7 +140,7 @@ pub fn faccessat_handler(dirfd: u64, pathname: u64, mode: u64, flags: u64) -> u6
 }
 
 /// 检查描述符 *dirfd* 绑定的节点是否存在。描述符无效或绑定的不是文件系统节点时返回
-/// EBADF, 该节点所属的文件系统尚未交付时返回取入失败给出的错误码, 见 [mount::ops_of]。
+/// EBADF, 该节点所属的文件系统尚未交付时返回取入失败给出的错误码。
 fn empty_path_exists(dirfd: u64) -> u64 {
 	let (fs, node) = {
 		let tables = FDS.lock();

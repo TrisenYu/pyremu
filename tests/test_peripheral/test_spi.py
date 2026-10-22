@@ -14,6 +14,7 @@ import struct
 import libfdt
 import pytest
 
+from pyremu import configs_gen
 from pyremu.emulator import Emulator
 from pyremu.memory.bus import Bus
 from pyremu.peripheral.spi import SPI
@@ -144,12 +145,12 @@ class TestSPIConfig:
             num_harts=1,
             ram_base=0x8000_0000,
             prog_cnt=0x8000_0000,
-            periph=PeripheralConfig(),
+            periph=PeripheralConfig(spi_base=SPI_BASE),
         )
 
-    def test_default_spi_base(self):
-        """默认 PeripheralConfig 启用 SPI."""
-        assert PeripheralConfig().spi_base == SPI_BASE
+    def test_default_spi_base_follows_build_config(self):
+        """默认 SPI 基址取自 emu-configs.mk 生成的常量."""
+        assert PeripheralConfig().spi_base == configs_gen.SPI_BASE
 
     def test_emulator_registers_device(self):
         """基址非零时 Emulator 创建 SPI 并挂到 Bus 上."""

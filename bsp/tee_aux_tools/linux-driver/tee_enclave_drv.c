@@ -1,24 +1,12 @@
-/* tee_enclave_drv.c — Linux enclave management driver
- *
- * Character device /dev/tee_enclave:
- *   Uses SBI ecall (ext_id=0x20221222) to communicate with the
- *   OpenSBI M-mode enclave extension (custom-opensbi-rs).
- *   Userspace ioctls manage the full enclave lifecycle.
- *
- * SBI register convention (from ext_ecall.c):
- *   a7 = 0x20221222 (ext_id)
- *   a6 = func_id
- *   a0..a4 = arguments (function-specific)
- *   Returns: a0 = error (0 = success), a1 = value
- *
- * ENTER / RESUME 把控制交还 host 属正常返回 (a0 >= 0): 飞地此刻的情形编码在 a1
- * (sbiret.value) 的运行状态枚举, 数值与用户态 tee_enclave.h 的 enum tee_run_state
- * 以及 M 侧 ext_ecall.c 的 ENCLAVE_RUN_* 一一对应. 本驱动的 ENTER/RESUME ioctl
- * 直接以该枚举作为返回值: rc >= 0 表示控制已交还 host, rc 即枚举值 (见
- * enum tee_run_state); rc < 0 为调用期失败 (errno), 载荷未被转入运行.
- * 其余 ioctl (CREATE/SUSPEND/SHUTDOWN) 保持 rc < 0 为错误、否则 0 的既有语义.
- *
- * SPDX-License-Identifier: MIT
+/*
+    tee_enclave_drv.c — Linux enclave management driver
+
+    本驱动的 ENTER/RESUME ioctl 直接以该枚举作为返回值:
+      rc >= 0 表示控制已交还 host, rc 即枚举值;
+      rc < 0 为调用期失败 (errno), 载荷未被转入运行.
+      其余 ioctl (CREATE/SUSPEND/SHUTDOWN) 保持 rc < 0 为错误否则 0 的既有语义.
+
+    SPDX-License-Identifier: MIT
  */
 
 #include <asm/sbi.h>
@@ -44,6 +32,7 @@
 #define SBI_ENCLAVE_RESUME	 405
 #define SBI_ENCLAVE_GET_ID	 407
 #define SBI_ENCLAVE_GET_MEM	 409
+
 /* 410 需两个参数 (enclave_id, mgmt_token), 见 request_shutdown.c. */
 #define SBI_ENCLAVE_REQUEST_SHUTDOWN 410
 /* 503 至 505: 宿主应答飞地挂起的模块请求, 三者均以 "飞地编号 + 管理令牌" 鉴权
@@ -77,20 +66,20 @@ struct tee_mem_info {
 	unsigned long long max_contiguous;
 };
 
-/* 以管理令牌鉴权的 host 侧命令参数: "飞地编号 + 创建时登记的管理令牌" 这一对
- * 参数为 CREATE_EX(400)、SHUTDOWN(403)、RESUME(405)、REQUEST_SHUTDOWN(410)
- * 四者共用, 令牌由 M 模式在锁内比对后才执行 (见 create.c / shutdown.c /
- * resume.c / request_shutdown.c).
+/* {enclave_id, tee_token}被 CREATE_EX(400)、SHUTDOWN(403)、RESUME(405)、REQUEST_SHUTDOWN(410)
+ * 共用, 令牌由M模式通过比对后才执行.
  *
- * 四处方向有别: CREATE_EX 的 enclave_id 是出参 (令牌入参), 其余三者两者皆入参;
- * 沿用 ABI 的 TEE_IOC_CREATE 只能登记令牌 0, 故需要真令牌时用 TEE_IOC_CREATE_EX. */
+ * CREATE_EX 的 enclave_id 是出参 (令牌入参), 其余三者两者皆入参;
+ * 沿用 ABI 的 TEE_IOC_CREATE 只能登记令牌 0,
+ * 故需要真令牌时用 TEE_IOC_CREATE_EX.
+ */
 struct tee_enclave_token_args {
 	unsigned long long enclave_id;
 	unsigned long long token;
 };
 
-/* 模块请求的类别, 与 M 模式 ENCLAVE_MODULE_KIND_* 及用户态 tee_module_kind
- * 一一对应. 宿主按类别决定是报告映像字节数还是交付映像. */
+/* 模块请求的类别, 与 M 模式 ENCLAVE_MODULE_KIND_ 及用户态 tee_module_kind 对应.
+ */
 #define TEE_MODULE_KIND_NONE 0
 #define TEE_MODULE_KIND_SIZE 1
 #define TEE_MODULE_KIND_LOAD 2
@@ -100,7 +89,7 @@ struct tee_enclave_token_args {
 
 /* ENTER 与模块三个命令 (MODULE_REQ / MODULE_SIZE / MODULE_IMG) 共用的参数结构体.
  * enclave_id 与 token 为四者共有的入参: token 是创建该飞地时登记的管理令牌,
- * M 模式在锁内比对后才载入飞地 (见 enclave_api/enter.c 的 claim_enclave_for_hart);
+ * M 模式在锁内比对后才载入飞地;
  * 各命令的专属字段在匿名 union 中按命令取用. 505 号调用交付的字节写入该飞地的
  * S 模式运行时经 509 号调用登记的接收缓冲区, 其物理地址按该运行时自己的页表查询
  * 得到, 宿主不指定. */
@@ -142,8 +131,7 @@ struct tee_enclave_args {
  *
  * CREATE / CREATE_EX / ENTER / RESUME 成功时把控制交给飞地, 直到飞地 SUSPEND
  * 或结束才回到本驱动, 期间该 hart 一直在 M 模式驻留, 而内核对它的视角仍是
- * "在线且在内核上下文". 于是 RCU 在 stall 阈值过半后开始等待本 hart 报静止态,
- * 而它永远不报 (dmesg 出现 rcu self-detected stall).
+ * "在线且在内核上下文". 于是 RCU 在 stall 阈值过半后开始等待本 hart 报静止态
  *
  * 该区间可能先包含 M 模式内的等待: 目标飞地已被另一个 hart 承载, 或 CREATE
  * 所争用的空闲槽位与空闲分区尚未同时具备时, 请求方 hart 入队后在本区间内等待,
@@ -152,14 +140,12 @@ struct tee_enclave_args {
  * 的长度不由本飞地的一次运行决定, 而由其它 hart 的进度决定, 无上界.
  *
  * 按 KVM 处理客户机态的做法, 在这五个 ecall 前后成对标记: tee_guest_enter 让 RCU
- * 不再等待本 hart (进入 RCU 扩展静默态), tee_guest_exit 在控制交还后恢复.
- * 两者要求关中断 (context_tracking.c 的 __ct_user_enter 带
- * lockdep_assert_irqs_disabled) 且 current->mm 非空 (ioctl 调用方满足).
- * 关中断同时使这期间到达的宿主 IPI 推迟到控制交还之后处理, M 模式侧另有延迟
- * 投递保证它不丢, 见 enclave_ext/ext_ipi.c 的 enclave_ext_defer_smode_ipi.
+ * 不再等待本 hart 进入 RCU 扩展静默态, tee_guest_exit 在控制交还后恢复.
+ * 两者要求关中断 且 current->mm 非空.
+ * 关中断同时使这期间到达的宿主 IPI 推迟到控制交还之后处理.
  *
- * 用 local_irq_save/restore 而非 disable/enable: 交还与进入时的中断状态一致,
- * 调用方若本就关着中断, 出飞地后不会被本驱动擅自打开. */
+ * 用 local_irq_save/restore 而非 disable/enable: 交还与进入时的中断状态一致.
+ */
 static inline unsigned long tee_guest_enter(void) {
 	unsigned long flags;
 
@@ -175,8 +161,6 @@ static inline void tee_guest_exit(unsigned long flags) {
 	preempt_enable();
 }
 
-/* ---- SBI ecall helpers (use kernel's standard sbi_ecall) ---- */
-
 static inline struct sbiret sbi_enclave_ecall_5(
 	unsigned long func_id,
 	unsigned long a0_val,
@@ -189,7 +173,7 @@ static inline struct sbiret sbi_enclave_ecall_5(
 }
 
 /* ENTER 需六个参数: a0..a4 为 enclave_id/argc/argv/payload/载荷长度,
- * a5 为管理令牌 (见 enclave_api/enter.c). */
+ * a5 为管理令牌. */
 static inline struct sbiret sbi_enclave_ecall_6(
 	unsigned long func_id,
 	unsigned long a0_val,
@@ -203,11 +187,13 @@ static inline struct sbiret sbi_enclave_ecall_6(
 }
 
 static inline struct sbiret sbi_enclave_ecall_2(
-	unsigned long func_id, unsigned long a0_val, unsigned long a1_val) {
+	unsigned long func_id,
+	unsigned long a0_val,
+	unsigned long a1_val) {
 	return sbi_ecall(SBI_ENCLAVE_EXT_ID, func_id, a0_val, a1_val, 0, 0, 0, 0);
 }
 
-/* MODULE_SIZE: a0..a2 为 enclave_id/token/映像字节数 (见 ext_mod/load.c). */
+/* MODULE_SIZE: a0..a2 为 enclave_id/token/映像字节数. */
 static inline struct sbiret sbi_enclave_ecall_3(
 	unsigned long func_id,
 	unsigned long a0_val,
@@ -231,19 +217,15 @@ static inline struct sbiret sbi_enclave_ecall_0(unsigned long func_id) {
 }
 
 static inline struct sbiret sbi_enclave_ecall_1(
-	unsigned long func_id, unsigned long a0_val) {
+	unsigned long func_id,
+	unsigned long a0_val) {
 	return sbi_ecall(SBI_ENCLAVE_EXT_ID, func_id, a0_val, 0, 0, 0, 0, 0);
 }
 
-/* Serialize a userspace argv (pointer array + every string) into one contiguous
- * kernel vmalloc buffer, laid out as [argc u64 slots][NUL-terminated strings]
- * with each slot rewritten to a kernel VA inside the same buffer.  M-mode reads
- * argv via sbi_load_u64/u8 under MPRV=S, so it must only see kernel (U=0) pages.
- *
- * Returns 0 and sets *out_buf on success (caller vfrees it), or a negative
- * errno on failure (in which case *out_buf is left NULL). */
 static int serialize_argv(
-	unsigned long long argv_ptr, unsigned long long argc, void **out_buf) {
+	unsigned long long argv_ptr,
+	unsigned long long argc,
+	void **out_buf) {
 	unsigned long *uargv = NULL;
 	size_t *lens		 = NULL;
 	void *buf			 = NULL;
@@ -259,8 +241,6 @@ static int serialize_argv(
 
 	size_t nargc = (size_t)argc;
 
-	/* Copy the pointer array once, so userspace cannot rewrite argv_ptr between
-	 * the measure pass and the copy pass. */
 	uargv = kmalloc_array(nargc, sizeof(unsigned long), GFP_KERNEL);
 	if (!uargv) {
 		return -ENOMEM;
@@ -273,8 +253,6 @@ static int serialize_argv(
 		goto out;
 	}
 
-	/* strnlen_user returns the byte count including the NUL terminator,
-	 * 0 on fault, and count+1 when the string is too long. */
 	lens = kmalloc_array(nargc, sizeof(size_t), GFP_KERNEL);
 	if (!lens) {
 		rc = -ENOMEM;
@@ -301,8 +279,6 @@ static int serialize_argv(
 		goto out;
 	}
 
-	/* Lay out [nargc u64 slots][NUL-terminated strings]; each slot holds a kernel
-	 * VA pointing into this same buffer. */
 	unsigned long *slots = buf;
 	char *strs			 = (char *)(slots + nargc);
 	size_t off			 = 0;
@@ -326,15 +302,12 @@ out:
 	return rc;
 }
 
-/* 飞地扩展专用的两个 SBI 错误码, 取值与固件的 enclave_types.h 一致. 两者都不在
- * asm/sbi.h 内, 故在此登记. */
+/* 飞地扩展专用的两个 SBI 错误码, 取值与固件的 enclave_types.h 一致.
+   两者都不在asm/sbi.h 内故需要在此定义. */
 #define SBI_ERR_ENCLAVE_QUEUE_FULL (-15)
 #define SBI_ERR_ENCLAVE_GONE	   (-16)
 
-/* SBI 错误码 (a0, 负值) 与 errno 是两套独立编号: 直接把 SBI 码当 ioctl 返回值,
- * 用户态看到的 errno 会是 -SBI码 这个巧合值 (如 DENIED(-4) 被读成 EINTR), 与真实
- * 失败原因无关. 统一在此换算, 用户态 errno 才与原因对应; 未知码按 EIO 兜底,
- * 与原 `?: -EIO` 的兜底一致 (dmesg 里仍打印原始 SBI 码便于定位). */
+/* SBI 错误码解释 */
 static int sbi_err_to_errno(long err) {
 	switch (err) {
 	case SBI_ERR_FAILURE:
@@ -373,13 +346,16 @@ static int sbi_err_to_errno(long err) {
 
 /* ---- ioctl dispatch ---- */
 
-static long tee_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
+static long tee_ioctl(
+	struct file *filp,
+	unsigned int cmd,
+	unsigned long arg) {
 	struct sbiret ret;
 	long rc = 0;
 
 	switch (cmd) {
 
-	/* ---- CREATE: spawn a new enclave (transfers control into it) ---- */
+	/* ---- CREATE: 创建新可信应用并移交控制权 ---- */
 	case TEE_IOC_CREATE: {
 		unsigned long ct_flags = tee_guest_enter();
 		ret					   = sbi_enclave_ecall_0(SBI_ENCLAVE_CREATE);
@@ -411,9 +387,7 @@ static long tee_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 			return -EINVAL;
 		}
 
-		/* Copy payload from userspace into kernel buffer.
-         * The SBI ENTER handler calls copy_from_user() M-mode side
-         * using the host virtual address; we pass the kernel buffer VA. */
+		/* 将载荷从用户空间复制到内核空间 */
 		payload_buf = vmalloc(kargs.enter.payload_size);
 		if (!payload_buf) {
 			return -ENOMEM;
@@ -427,23 +401,21 @@ static long tee_ioctl(struct file *filp, unsigned int cmd, unsigned long arg) {
 			goto out_free_payload;
 		}
 
-		/* Serialize argv into a kernel buffer (u64 slots + strings) so M-mode
-		 * reads only kernel pages; see serialize_argv() above. */
+		/* 序列化参数. */
 		rc = serialize_argv(kargs.enter.argv_ptr, kargs.enter.argc, &argv_buf);
 		if (rc < 0) {
 			goto out_free_payload;
 		}
 
-		/* SBI ENTER — on success, transfers into enclave (does not return). */
 		unsigned long ct_flags = tee_guest_enter();
 		ret					   = sbi_enclave_ecall_6(
-			   SBI_ENCLAVE_ENTER,
-			   kargs.enclave_id,
-			   kargs.enter.argc,
-			   (unsigned long)argv_buf,
-			   (unsigned long)payload_buf,
-			   kargs.enter.payload_size,
-			   kargs.token);
+			SBI_ENCLAVE_ENTER,
+			kargs.enclave_id,
+			kargs.enter.argc,
+			(unsigned long)argv_buf,
+			(unsigned long)payload_buf,
+			kargs.enter.payload_size,
+			kargs.token);
 		tee_guest_exit(ct_flags);
 
 		if ((long)ret.error < 0) {
@@ -745,5 +717,5 @@ module_init(tee_init);
 module_exit(tee_exit);
 
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_AUTHOR("pyremu project");
-MODULE_DESCRIPTION("TEE enclave lifecycle driver (bridge to OpenSBI via SBI ecall)");
+MODULE_AUTHOR("Abydos");
+MODULE_DESCRIPTION("TEE enclave driver interacting with sbi");

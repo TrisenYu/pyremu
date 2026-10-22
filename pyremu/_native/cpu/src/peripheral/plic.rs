@@ -1,4 +1,4 @@
-//! Inline PLIC MMIO handler for the concurrent (thread-per-hart) engine.
+//! Inline PLIC MMIO handler for the concurrent engine.
 //!
 //! 对照 Python ``pyremu/interrupt/plic.py`` 的寄存器布局与 claim/complete 语义:
 //! - Priority 区  0x000000 + 4*(src-1)      (u32, bits [2:0] 有效)
@@ -6,14 +6,14 @@
 //! - Enable 区    0x002000 + 0x80*ctx + 4*word
 //! - Context 区   0x200000 + 0x1000*ctx      (threshold +0x000, claim/complete +0x004)
 //!
-//! 状态全部放在 Python 侧分配的共享 ctypes 数组 (``FfiPlicCtx``) 中:
-//! Rust 内联读写 (claim 清 pending / complete 重挂 / enable 写), Python 在
+//! 状态全部放在 Python 侧分配的共享 ctypes 数组中:
+//! Rust 内联读写, Python 在
 //! 加速执行边界 marshal/unmarshal, 设备中断投递目标直接 write-through
 //! pending/level, 保证 batch 内新设备中断对 Rust 可见 (与 CLINT/virtio 模式一致).
 //!
-//! 中断仲裁后同步 mip.MEIP/SEIP: 仅在 IMSIC 缺席 (纯 legacy PLIC) 时由 Rust 内联
-//! 维护 (``plic_recompute_mip``); AIA 模式 (IMSIC present) 的 mip 由 IMSIC 驱动,
-//! IMSIC 无挂起时由 Python 侧 ``_native_sync_plic_mip`` 在边界处并入 PLIC 的挂起.
+//! 中断仲裁后同步 mip.MEIP/SEIP: 仅在缺乏 IMSIC 时由 Rust 内联维护;
+//! AIA 模式的 mip 由 IMSIC 驱动, IMSIC 无挂起时由 Python 侧 ``_native_sync_plic_mip``
+//! 在边界处并入 PLIC 的挂起.
 
 use crate::ffi::FfiPlicCtx;
 use crate::state::HartState;
@@ -35,7 +35,6 @@ pub(crate) const PLIC_CTX_CLAIM_OFF: u64 = 0x004;
 /// pending 是 per-source (非 per-context), 与 Python ``_find_highest`` 一致.
 ///
 /// enable 位图位映射与 Python ``_read/_write_enable_word`` 完全一致:
-/// word w bit i ↔ source (w*32 + i); source 0 保留恒为 0.
 #[inline]
 fn plic_find_highest(plic: &FfiPlicCtx, context: usize) -> u32 {
 	if context >= plic.num_contexts as usize {
@@ -67,7 +66,7 @@ fn plic_find_highest(plic: &FfiPlicCtx, context: usize) -> u32 {
 	best
 }
 
-/// 计算某 hart 的 PLIC 驱动 MEIP/SEIP 位 (M-context = 2*hart_id, S = +1).
+/// 计算某 hart 的 PLIC 驱动 MEIP/SEIP 位.
 pub(crate) fn plic_pending_mip(plic: &FfiPlicCtx, hart_id: u32) -> u64 {
 	let m_ctx = 2 * hart_id;
 	let s_ctx = m_ctx + 1;
@@ -85,8 +84,7 @@ pub(crate) fn plic_pending_mip(plic: &FfiPlicCtx, hart_id: u32) -> u64 {
 
 /// 将某 hart 的 mip.MEIP/SEIP 位重新同步到内联 PLIC 仲裁结果.
 ///
-/// 仅 IMSIC 缺席 (纯 legacy) 时有效 — AIA 模式 mip 由 IMSIC eip 驱动, IMSIC 无挂起
-/// 时由 Python 边界处的 ``_native_sync_plic_mip`` 并入 PLIC 的挂起, 此处不得覆盖.
+/// 仅含有纯 legacy中断设备时有效.
 #[inline]
 fn plic_recompute_mip(state: &mut HartState, plic: &FfiPlicCtx) {
 	if state.imsic_m.present != 0 || state.imsic_s.present != 0 {
@@ -101,14 +99,13 @@ fn plic_recompute_mip(state: &mut HartState, plic: &FfiPlicCtx) {
 }
 
 /// 与 M 模式无关的 MEIP/SEIP 同步 — 供 step_interrupts 在 ext_irq 置位后核对.
-/// 返回 true 表示已执行 (调用方无需再走其它路径).  ``plic`` 为原始指针,
-/// null 或 IMSIC 在场时视为未执行.
+/// 返回 true 表示已执行.
+/// null 或使能 IMSIC 时则不执行.
 pub(crate) fn plic_sync_mip_if_legacy(state: &mut HartState, plic: *mut FfiPlicCtx) -> bool {
 	if plic.is_null() {
 		return false;
 	}
 	let plic = unsafe { &*plic };
-	// 门控: 仅当 mip 外部位已置位才扫描 (零位时零开销).
 	if plic.base == 0
 		|| state.imsic_m.present != 0
 		|| state.imsic_s.present != 0
@@ -126,10 +123,11 @@ fn plic_read_pending_word(word_idx: u64, plic: &FfiPlicCtx) -> Option<u64> {
 	let base = (word_idx << 5) as usize;
 	for i in 0..32u64 {
 		let src = base + i as usize;
-		if src >= 1 && (src as u64) <= plic.num_sources as u64 {
-			if unsafe { *plic.pending.add(src) } != 0 {
-				result |= 1 << i;
-			}
+		if src < 1 || (src as u64) > plic.num_sources as u64 {
+			continue;
+		}
+		if unsafe { *plic.pending.add(src) } != 0 {
+			result |= 1 << i;
 		}
 	}
 	Some(result)
@@ -161,8 +159,6 @@ fn plic_write_enable_word(context: u64, word_idx: u64, val: u64, plic: &FfiPlicC
 	if (word_idx as usize) >= num_words {
 		return;
 	}
-	// 掩掉本 word 内超出 num_sources 的位, 与 Python _write_enable_word
-	// 的 ``src > num_sources: continue`` 一致; word 0 额外清 source 0 (保留位).
 	let src_base = (word_idx as usize) * 32;
 	let valid_bits = plic.num_sources as usize - src_base;
 	let mut mask: u32 = if valid_bits >= 32 {
@@ -171,7 +167,7 @@ fn plic_write_enable_word(context: u64, word_idx: u64, val: u64, plic: &FfiPlicC
 		(1u32 << valid_bits) - 1
 	};
 	if word_idx == 0 {
-		mask &= !1u32; // source 0 保留
+		mask &= !1u32;
 	}
 	unsafe {
 		*plic
@@ -193,15 +189,15 @@ fn plic_do_claim(context: usize, plic: &FfiPlicCtx) -> u32 {
 }
 
 /// Complete: 若 claimed[ctx] == src 则清除 claimed, 且设备电平仍高时重挂 pending
-/// (gateway 语义, 对照 Python ``_do_complete``).
 #[inline]
 fn plic_do_complete(context: usize, src: u32, plic: &FfiPlicCtx) {
-	if src > 0 && src <= plic.num_sources {
-		if unsafe { *plic.claimed.add(context) } == src {
-			unsafe { *plic.claimed.add(context) = 0 };
-			if unsafe { *plic.level.add(src as usize) } != 0 {
-				unsafe { *plic.pending.add(src as usize) = 1 };
-			}
+	if src <= 0 || src > plic.num_sources {
+		return;
+	}
+	if unsafe { *plic.claimed.add(context) } == src {
+		unsafe { *plic.claimed.add(context) = 0 };
+		if unsafe { *plic.level.add(src as usize) } != 0 {
+			unsafe { *plic.pending.add(src as usize) = 1 };
 		}
 	}
 }
@@ -473,7 +469,6 @@ mod tests {
 		let mut state = make_state();
 		state.imsic_m.present = 0;
 		state.imsic_s.present = 0;
-		// 模拟 Python 边界 sync 后 MEIP 置位
 		state.mip.store(1 << 11, Ordering::Release);
 
 		// claim
@@ -485,23 +480,11 @@ mod tests {
 			&mut state,
 			plic_ptr(&mut plic),
 		);
-		assert_eq!(
-			state.mip.load(Ordering::Acquire) & (1 << 11),
-			0,
-			"claim 后 MEIP 应立即清除"
-		);
+		assert_eq!(state.mip.load(Ordering::Acquire) & (1 << 11), 0);
 
-		// 重新挂起 source 3 (设备再次 raise) -> 下一 ext_irq 轮询置 MEIP, sync 核对保持
 		pending[3] = 1;
 		state.mip.store(1 << 11, Ordering::Release);
-		assert!(
-			plic_sync_mip_if_legacy(&mut state, plic_ptr(&mut plic)),
-			"legacy 且 mip 置位时应执行核对"
-		);
-		assert_ne!(
-			state.mip.load(Ordering::Acquire) & (1 << 11),
-			0,
-			"有 pending 时 MEIP 保持"
-		);
+		assert!(plic_sync_mip_if_legacy(&mut state, plic_ptr(&mut plic)));
+		assert_ne!(state.mip.load(Ordering::Acquire) & (1 << 11), 0);
 	}
 }

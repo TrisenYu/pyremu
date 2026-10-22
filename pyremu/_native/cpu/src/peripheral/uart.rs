@@ -22,7 +22,7 @@ fn try_write_fd(fd: i32, byte: u8) -> usize {
 	}
 }
 
-/// Inline read of UART shadow registers (参照 QEMU sifive_uart_read).
+/// Inline read of UART shadow registers.
 fn handle_uart_read(offset: u64, uart: &FfiUartCtx) -> Option<u64> {
 	match offset {
 		0 => Some(0), // TXDATA: bit31 = FIFO full; always 0
@@ -103,7 +103,7 @@ pub(crate) fn try_handle_uart_concurrent(
 		return handle_uart_read(offset, uart);
 	}
 
-	// TXDATA: ring buffer (log archive) + direct stdout (参照 QEMU fd_chr_write).
+	// TXDATA: ring buffer (log archive) + direct stdout
 	if !(offset == 0 && uart.tx_buf as usize != 0) {
 		return None;
 	}

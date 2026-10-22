@@ -2,34 +2,25 @@
 //!
 //! 取入分五步: 申请映像的字节数; 在模块窗口内取得一个槽位, 为它的可执行部分与可写部分各
 //! 建成映射; 登记映像的落点后请求宿主交付; 核对映像描述块并验签; 把可执行部分改判为指令
-//! 类, 调用模块入口并校验接口。每一步的失败原因见 [`LoadError`], 转成错误码的规则见
-//! [`LoadError::to_errno`]。
+//! 类, 调用模块入口并校验接口。
 
-use super::abi::{ is_region_in_image, GetterFn, InitFn, SyscallTable, MAX_MODULES };
-use super::errno::{ EAGAIN, EINVAL, ENOMEM, ENOENT };
-use super::img_descriptor::{ parse_image_desc, DescError };
+use super::abi::{GetterFn, InitFn, MAX_MODULES, SyscallTable, is_region_in_image};
+use super::errno::{EAGAIN, EINVAL, ENOENT, ENOMEM};
+use super::img_descriptor::{DescError, parse_image_desc};
 use super::man::Manager;
 use super::table;
 use super::transport::Transport;
 use crate::attest;
 use crate::constants::{
-	ATTEST_ENABLE,
-	CHUNK_2M_SIZE,
-	ENCLAVE_MEM_ATTR_DATA,
-	ENCLAVE_MEM_ATTR_INSTR,
-	ENCLAVE_MODULE_LOAD_VA_INIT,
-	ENCLAVE_MODULE_WINDOW_SIZE,
-	PAGE_SIZE,
-	PTE_R,
-	PTE_W,
-	PTE_X,
+	ATTEST_ENABLE, CHUNK_2M_SIZE, ENCLAVE_MEM_ATTR_DATA, ENCLAVE_MEM_ATTR_INSTR,
+	ENCLAVE_MODULE_LOAD_VA_INIT, ENCLAVE_MODULE_WINDOW_SIZE, PAGE_SIZE, PTE_R, PTE_W, PTE_X,
 	SIG_LEN,
 };
 use crate::context;
 use crate::mem;
-use crate::mem_prim::align::align_up;
-use crate::mem_prim::string::memset;
 use crate::paging;
+use crate::prim::arith::align_up;
+use crate::prim::string::memset;
 use crate::sync_aux::SpinLock;
 
 /// 模块取入失败的原因。
@@ -54,7 +45,7 @@ pub enum LoadError {
 	/// 映像验签失败。
 	AttestFailed,
 	/// 映像描述块不被接受: 映像声明的布局与本侧的约定不符, 或交付的映像与描述块自身的
-	/// 声明不符。具体的不符项见 [`DescError`]。
+	/// 声明不符。
 	BadImageDesc(DescError),
 	/// 接口中的模块编号与请求的编号不一致。
 	IdMismatch,
@@ -74,13 +65,13 @@ impl LoadError {
 		match self {
 			LoadError::NotFound => ENOENT,
 			LoadError::Loading => EAGAIN,
-			| LoadError::BadModuleId
+			LoadError::BadModuleId
 			| LoadError::BadImageDesc(_)
 			| LoadError::AttestFailed
 			| LoadError::IdMismatch
 			| LoadError::BadSyscallTable
 			| LoadError::BadOpsTable => EINVAL,
-			| LoadError::TooSmall
+			LoadError::TooSmall
 			| LoadError::TooLarge
 			| LoadError::ShortWrite
 			| LoadError::MapFailed
@@ -100,8 +91,7 @@ static LOAD_LOCK: SpinLock<()> = SpinLock::new(());
 /// 模块的可写静态数据全部落在 BSS 段, 且该段的起始地址须等于映像本体按页取整的结果: 映像
 /// 中初值非零的部分位于可执行部分之内, 装入后该部分只有读与执行权限。该等式由模块的链接
 /// 脚本保证 (把 BSS 段的起始地址对齐到页边界, 并拒绝初值非零的可写静态数据), 并由映像
-/// 描述块的 `data_class_off` 字段声明, 取入方在改判之前核对, 见 [`img_descriptor`]。
-///
+/// 描述块的 `data_class_off` 字段声明, 取入方在改判之前核对
 /// [`img_descriptor`]: super::img_descriptor
 const MODULE_SLOT_SIZE: u64 = CHUNK_2M_SIZE;
 
@@ -112,7 +102,7 @@ const MODULE_SLOT_SIZE: u64 = CHUNK_2M_SIZE;
 pub fn load(
 	module_id: u32,
 	transport: &dyn Transport,
-	manager: &Manager
+	manager: &Manager,
 ) -> Result<GetterFn, LoadError> {
 	if (module_id as usize) >= MAX_MODULES {
 		return Err(LoadError::BadModuleId);
@@ -152,10 +142,12 @@ pub fn load(
 fn load_image(
 	module_id: u32,
 	transport: &dyn Transport,
-	manager: &Manager
+	manager: &Manager,
 ) -> Result<(GetterFn, u64, u64), LoadError> {
 	// 映像的字节数由宿主报告: 飞地既无从推算它, 也不知道宿主侧模块文件的字节数。
-	let size = transport.request_size(module_id).ok_or(LoadError::NotFound)?;
+	let size = transport
+		.request_size(module_id)
+		.ok_or(LoadError::NotFound)?;
 	if size <= (SIG_LEN as u64) {
 		return Err(LoadError::TooSmall);
 	}
@@ -173,7 +165,9 @@ fn load_image(
 	if !transport.register_img_recv_buf(va, align_up(size, PAGE_SIZE)) {
 		return Err(LoadError::ImgRecvBufRejected);
 	}
-	let written = transport.fetch(module_id, size).ok_or(LoadError::NotFound)?;
+	let written = transport
+		.fetch(module_id, size)
+		.ok_or(LoadError::NotFound)?;
 	if written < size {
 		return Err(LoadError::ShortWrite);
 	}
@@ -188,12 +182,10 @@ fn load_image(
 	// 取得可执行权限, 它的入口一次也不会被调用。映像在核对之前已全部写入本飞地自己的
 	// 缓冲区, 故按字节读出不含未定义的读取。
 	let image = unsafe { core::slice::from_raw_parts(va as *const u8, size as usize) };
-	let desc = parse_image_desc(image, MODULE_SLOT_SIZE).map_err(
-		LoadError::BadImageDesc
-	)?;
+	let desc = parse_image_desc(image, MODULE_SLOT_SIZE).map_err(LoadError::BadImageDesc)?;
 
 	// 描述块声明的可写数据起始偏移即本飞地建映射时所用的可执行部分长度: 映像本体的
-	// 字节数与 `data_class_off` 两项核对合起来给出该等式, 见 [`parse_image_desc`]。
+	// 字节数与 `data_class_off` 两项核对合起来给出该等式
 	let exec_len = desc.data_class_off as u64;
 
 	if ATTEST_ENABLE && !attest::attest_image(va, size) {
@@ -210,9 +202,7 @@ fn load_image(
 		return Err(LoadError::MapFailed);
 	}
 
-	let init: InitFn = unsafe {
-		core::mem::transmute((va + (desc.entry as u64)) as *const ())
-	};
+	let init: InitFn = unsafe { core::mem::transmute((va + (desc.entry as u64)) as *const ()) };
 
 	let getter = unsafe { init(manager) };
 
@@ -225,18 +215,15 @@ fn load_image(
 	let in_image = |ptr: *const u8, size: usize, align: usize| {
 		is_region_in_image(ptr, size, align, va, MODULE_SLOT_SIZE)
 	};
-	if
-		!in_image(
-			interface.syscalls as *const u8,
-			core::mem::size_of::<SyscallTable>(),
-			core::mem::align_of::<SyscallTable>()
-		)
-	{
+	if !in_image(
+		interface.syscalls as *const u8,
+		core::mem::size_of::<SyscallTable>(),
+		core::mem::align_of::<SyscallTable>(),
+	) {
 		return Err(LoadError::BadSyscallTable);
 	}
 	// 操作表的类型由运行时与该模块共同约定, 本处不知道它的尺寸, 故只确认指针本身
-	// 落在槽位之内且对齐; 整张表的落点由取用方按表的类型再判一次, 见
-	// [`acquire_ops_table`](super::acquire_ops_table)。
+	// 落在槽位之内且对齐; 整张表的落点由取用方按表的类型再判一次
 	if !interface.ops.is_null() && !in_image(interface.ops, 0, 8) {
 		return Err(LoadError::BadOpsTable);
 	}
@@ -249,7 +236,7 @@ fn load_image(
 /// 槽位自起点起是可执行部分, 长 `align_up(size - SIG_LEN, PAGE_SIZE)` 字节; 其后是可写
 /// 部分, 占满槽位剩余的部分。可执行部分止于页边界, 故模块映像中初值非零的静态数据须落在
 /// 该边界之前, 初值为零的静态数据 (BSS 段) 落在其后, 由 [`load_image`] 填入零。BSS 段的
-/// 起始地址即该边界, 要求的取值与来源见 [`MODULE_SLOT_SIZE`]。
+/// 起始地址即该边界
 ///
 /// 可执行部分的字节数不作为返回值给出: 该长度须在取得映像之后由描述块核对确认, 而本函数
 /// 在请求交付之前就要定下映射, 只能按交付的字节数算出它。取入方在核对通过之后取用描述块
@@ -265,7 +252,7 @@ fn load_image(
 /// 失败。
 ///
 /// 分配与映射在 `LOAD_LOCK` 内完成: 该地址的读取与递增之间不得插入另一次取入。请求宿主
-/// 交付的调用不在此锁内, 见 [`load_image`]。
+/// 交付的调用不在此锁内
 fn open_img_recv_buf(size: u64) -> Result<(u64, u64), LoadError> {
 	// 映像本体不含末尾的签名字节, 可执行部分按映像本体的字节数取整到页。
 	let exec_len = align_up(size - (SIG_LEN as u64), PAGE_SIZE);
@@ -277,7 +264,9 @@ fn open_img_recv_buf(size: u64) -> Result<(u64, u64), LoadError> {
 
 	let _guard = LOAD_LOCK.lock();
 	let va = context::ctx().enclave_module_load_va;
-	let va_end = va.checked_add(MODULE_SLOT_SIZE).ok_or(LoadError::TooLarge)?;
+	let va_end = va
+		.checked_add(MODULE_SLOT_SIZE)
+		.ok_or(LoadError::TooLarge)?;
 	if va_end > ENCLAVE_MODULE_LOAD_VA_INIT + ENCLAVE_MODULE_WINDOW_SIZE {
 		return Err(LoadError::TooLarge);
 	}
@@ -289,10 +278,7 @@ fn open_img_recv_buf(size: u64) -> Result<(u64, u64), LoadError> {
 
 	if rw_pages != 0 {
 		let rw_pa = mem::alloc_adjacent_pages(rw_pages, ENCLAVE_MEM_ATTR_DATA);
-		if
-			rw_pa == !0u64 ||
-			!mem::map_pages_at(va + exec_len, rw_pa, rw_pages, PTE_R | PTE_W)
-		{
+		if rw_pa == !0u64 || !mem::map_pages_at(va + exec_len, rw_pa, rw_pages, PTE_R | PTE_W) {
 			return Err(LoadError::MapFailed);
 		}
 	}

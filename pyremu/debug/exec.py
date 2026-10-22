@@ -144,10 +144,7 @@ class ExecutionMixin(SharedMixinAttrs):
             # 读取指令, 该语义在此类页面上必定被拒.
             raw = read_code_bytes(self._emu.bus, h, h.pc, 4)
             if raw is None:
-                deliver_trap(
-                    h, TrapType.InstrPageFault,
-                    tval=h.pc, is_interrupt=False
-                )
+                deliver_trap(h, TrapType.InstrPageFault, tval=h.pc, is_interrupt=False)
                 return
             instr = int.from_bytes(raw, "little", signed=False)
 
@@ -309,9 +306,7 @@ class ExecutionMixin(SharedMixinAttrs):
             # 当前 PC 处没有可越过的断点, 继续运行会立即再次停下.
             self._warn("引擎以断点事件退出, 但当前 PC 未匹配任何断点")
         if reason == RunStopReason.EBREAK:
-            self._console.print(
-                "[dim]固件执行停机序列 (semihosting SYS_EXIT) — 全部 hart 停止[/]"
-            )
+            self._console.print("[dim]固件执行停机序列 — 全部 hart 停止[/]")
         elif all(h._halted for h in self._emu.harts):
             self._warn("所有 Hart 已暂停")
         return False
@@ -326,8 +321,6 @@ class ExecutionMixin(SharedMixinAttrs):
         step       — 执行 1 条指令, 显示 PC 及反汇编
         step <n>   — 执行 n 条指令, 仅显示最终状态.
 
-        恒为纯 Python 逐条执行 (step_one): 步进语义要求精确逐条
-        + 快照/回滚, 指令单轮加速执行设计已去除.
         """
         if count <= 0:
             self._err("步数须 > 0")
@@ -359,9 +352,7 @@ class ExecutionMixin(SharedMixinAttrs):
             if h._halted or h._waiting:
                 continue
             for bp in self._breakpoints:
-                if not (
-                    bp.kind == "addr" and self._bp_match_pc(h, h.pc, bp.value)
-                ):
+                if not (bp.kind == "addr" and self._bp_match_pc(h, h.pc, bp.value)):
                     continue
                 if bp not in bps_to_skip:
                     bps_to_skip.append(bp)
@@ -475,9 +466,7 @@ class ExecutionMixin(SharedMixinAttrs):
         if self._preload_path:
             preload_entry = Preloader(emu).inject_file(self._preload_path)
             for h in emu.harts:
-                h.csrs["misa"].val = (
-                    (2 << 62) | (1 << 18) | (1 << 20)
-                )  # MXL=RV64 + S + U
+                h.csrs["misa"].val = (2 << 62) | (1 << 18) | (1 << 20)  # MXL=RV64 + S + U
                 h.csrs["mscratch"].val = cfg.ram_base + cfg.ram_size - 0x100000
             if self._fdt_addr is not None:
                 emu.load_dtb_blob(cfg.ram_base + 0x2200000, emu.build_dtb())
@@ -532,11 +521,7 @@ class ExecutionMixin(SharedMixinAttrs):
                 return True
             f = decode_fields(instr_raw)
             if bp.kind == "instr":
-                hit = (
-                    f.opcode == 0x73
-                    and f.func3 == 0
-                    and f.func12 == bp.value
-                )
+                hit = f.opcode == 0x73 and f.func3 == 0 and f.func12 == bp.value
             elif not f.is_compressed:
                 hit = f.opcode == bp.value
             else:
@@ -545,9 +530,7 @@ class ExecutionMixin(SharedMixinAttrs):
             return True
         if not hit or not self._eval_bp_condition(h, bp):
             return True
-        bp_key = (
-            (bp.kind, h.pc) if bp.kind == "addr" else (bp.kind, bp.value)
-        )
+        bp_key = (bp.kind, h.pc) if bp.kind == "addr" else (bp.kind, bp.value)
         if bp_key in self._bp_hit_this_run:
             return True
         self._bp_hit_this_run.add(bp_key)

@@ -18,8 +18,8 @@ use std::sync::{
 use crate::hart_sched::*;
 
 use crate::ffi::{
-	FfiBpCtx, FfiClintCtx, FfiDevicesCtx, FfiExtIrqCtx, FfiHartCtx, FfiInterruptCtx,
-	FfiMemCtx, FfiPlicCtx, FfiTlbCtx, FfiUartCtx, FfiVirtIoCtx, InstrToBeExec, EMPTY_UART,
+	FfiBpCtx, FfiClintCtx, FfiDevicesCtx, FfiExtIrqCtx, FfiHartCtx, FfiInterruptCtx, FfiMemCtx,
+	FfiPlicCtx, FfiTlbCtx, FfiUartCtx, FfiVirtIoCtx, InstrToBeExec, EMPTY_UART,
 };
 use crate::state::{exit_reason, HartState};
 
@@ -254,7 +254,6 @@ pub struct ModuleState {
 	/// 本轮加速执行起点 Instant — 仅看门狗用它判定时钟源超时.
 	pub st_time_val: std::time::Instant,
 	/// marshal 时的 mtime 基准值. 指令推进的基准:
-	/// target = time_base_val + instr_delta * timebase_hz * NS_PER_INSTR / 1e9.
 	pub time_base_val: u64,
 	/// 每 hart 本轮加速执行起始时的指令计数, marshal 时快照.
 	/// ``advance_clock_source`` 用 ``state.total_instrs - instr_ref_num[hid]``
@@ -365,10 +364,9 @@ unsafe fn build_bps(bp: *const FfiBpCtx) -> &'static [u64] {
 	std::slice::from_raw_parts(bp.addrs, bp.count as usize)
 }
 
-/// 软件看门狗轮询周期 (µs) — 周期性向中断控制器发置位请求信号 (unpark 全部
-/// WFI hart) 的间隔, 兼作看门狗自身阻塞的周期.
-/// 与 Python 侧 ``WFI_WATCHDOG_MS`` (5 ms) 对齐, 亦为 ``wfi_spin`` 自醒周期:
-/// 停驻的 WFI hart 即使外部 unpark 全部消失, 也会按此周期自行醒来重查停止标志.
+/// 软件看门狗轮询周期 (us) — 周期性向中断控制器发置位请求信号的间隔, 兼作看门狗自身阻塞的周期.
+///
+/// 停驻的 WFI hart 按此周期自行醒来重查停止标志.
 pub(crate) const WATCHDOG_POLL_US: u64 = 5_000;
 
 /// 唤醒所有已注册 hart 线程 — WFI hart 现以 ``park()`` 无限阻塞,
@@ -587,8 +585,6 @@ pub const NS_PER_INSTR: u64 = 20;
 
 /// 按指令计数推进 mtime (纯指令源, 无实时分量).
 ///
-/// mtime = time_base_val + instr_delta * NS_PER_INSTR * tb / 1e9
-///
 /// - 单一时钟源
 /// - 单调
 pub(crate) fn advance_clock_source(
@@ -612,27 +608,11 @@ pub(crate) fn advance_clock_source(
 		/ NS_PER_SEC;
 	let target = module.time_base_val.wrapping_add(ticks);
 	// mtime 只增不减, 取最大值的目标不超过当前值时该操作不改变任何值.
-	// 本 hart 的指令增量在 tick 周期内重复时目标值不变, 以一次普通读取代替
-	// 取最大值, 避免每条指令都对共享行执行一次加锁的读改写.
 	if unsafe { &*clint.mtime }.load(Ordering::Relaxed) < target {
 		unsafe { &*clint.mtime }.fetch_max(target, Ordering::Relaxed);
 	}
 }
 
-/// QEMU 一次性定时器语义的指令计数换算: 计算 future ``timecmp`` 在
-/// "本 hart 指令计数空间" 的截止点 (0 = 未设定, 见 write_mtimecmp).
-///
-/// QEMU ``riscv_aclint_mtimer_write_timecmp`` 在写入时判定过去/未来:
-/// 过去立即置位, 未来清位并设定一个一次性 deadline, 到期才再次置位
-/// (``timer_mod`` + ``riscv_aclint_mtimer_cb``)。这里把该"一次性定时器"
-/// 翻译到当前 hart 的指令计数空间: ``deadline = own_total_instrs + offset``,
-/// 其中 ``offset`` 是把剩余 tick (``timecmp - now_mtime``) 按
-/// ``timebase * NS_PER_INSTR / 1e9`` (每指令推进的 tick 数) 换算成指令数,
-/// 向上取整保证 deadline 在 mtime 严格越过 timecmp 之后 (或同时) 才到达,
-/// 与 ``sync_mtip`` 的 ">=" 比较一致。
-///
-/// ``timecmp`` 为 0 (禁用) 或 <= 当前共享 mtime (已到期) 时返回 0 — 调用方
-/// 负责立即置位 (已到期) 或保持清除 (禁用), 与本函数解耦。
 #[inline]
 pub(crate) fn timer_deadline_own(
 	own_total_instrs: u64,
@@ -643,15 +623,13 @@ pub(crate) fn timer_deadline_own(
 	if timecmp == 0 || timecmp <= now_mtime {
 		return 0;
 	}
-	// 每指令推进 timebase * NS_PER_INSTR / 1e9 tick (20ns/instr @ 10MHz -> 0.2 tick/instr).
 	let ticks_per_instr_scale = timebase_hz.saturating_mul(NS_PER_INSTR);
 	if ticks_per_instr_scale == 0 {
 		return 0;
 	}
 	let ticks = timecmp - now_mtime;
-	// 向上取整: ceil(ticks * 1e9 / (timebase * NS_PER_INSTR)).
 	let offset = ticks
-		.saturating_mul(NS_PER_SEC)
+		.saturating_mul(NS_PER_SEC) // 向上取整
 		.saturating_add(ticks_per_instr_scale - 1)
 		.checked_div(ticks_per_instr_scale)
 		.unwrap_or(u64::MAX);
@@ -724,8 +702,6 @@ pub unsafe extern "C" fn run_parallel(
 	} else {
 		vec![0u64; num_harts as usize].into_boxed_slice()
 	};
-	// time_base_val = marshal 时的 mtime 值, instr_ref_num = 每 hart 起始指令计数,
-	// advance_clock_source 据此以指令增量推进 (见 NS_PER_INSTR).
 	let instr_ref_num: Box<[u64]> = (0..num_harts)
 		.map(|hid| unsafe { (*states.add(hid as usize)).total_instrs })
 		.collect();
@@ -740,7 +716,6 @@ pub unsafe extern "C" fn run_parallel(
 	));
 	cc_clint.msip_pending.set(module.msip_pending.as_ptr());
 
-	// 时钟源超时时间 (ns, 0 = 禁用) — 由 FfiWatchdogCtx 注入.
 	let timeout_ns = if dev_ctx.watchdog.is_null() {
 		0
 	} else {

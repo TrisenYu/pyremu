@@ -28,12 +28,12 @@
 #![allow(dead_code)]
 
 use core::cell::Cell;
-use core::{ ptr, slice };
-use core::sync::atomic::{ AtomicU32, AtomicU64, Ordering };
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::{ptr, slice};
 use p256::SecretKey;
 use p256::ecdsa::signature::hazmat::PrehashSigner;
-use p256::ecdsa::{ Signature, SigningKey };
-use std::sync::{ Mutex, MutexGuard, Once, OnceLock };
+use p256::ecdsa::{Signature, SigningKey};
+use std::sync::{Mutex, MutexGuard, Once, OnceLock};
 
 #[path = "../src/constants.rs"]
 mod constants;
@@ -54,9 +54,9 @@ mod attest_key {
 /// 时取入以 `LoadError::MapFailed` 结束, 且不建立任何映射; 映射按 4 KiB 页推进; 改判请求的
 /// 长度等于可执行部分的字节数; 改判失败时同样以 `LoadError::MapFailed` 结束。
 mod mem {
-	use super::constants::{ LEVEL_PAGE, PAGE_SIZE };
+	use super::constants::{LEVEL_PAGE, PAGE_SIZE};
 	use super::paging;
-	use core::sync::atomic::{ AtomicBool, AtomicU64, Ordering };
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 	/// 分配得到的分区物理起始地址。
 	pub const POOL_PA: u64 = 0x9000_0000;
@@ -92,10 +92,7 @@ mod mem {
 	/// 逐页建立映射, 与 `src/mem.rs` 的同名函数一致: 某一页失败即返回假, 已建立的页保留。
 	pub fn map_pages_at(va: u64, pa: u64, pages: u64, flags: u64) -> bool {
 		for i in 0..pages {
-			if
-				paging
-					::map_page(va + i * PAGE_SIZE, pa + i * PAGE_SIZE, flags, LEVEL_PAGE)
-					.is_err()
+			if paging::map_page(va + i * PAGE_SIZE, pa + i * PAGE_SIZE, flags, LEVEL_PAGE).is_err()
 			{
 				return false;
 			}
@@ -126,7 +123,7 @@ mod mem {
 ///
 /// `Pte` 只为 `context` 声明页表根而存在, 本入口不安装任何页表项。
 mod paging {
-	use core::sync::atomic::{ AtomicBool, AtomicU64, Ordering };
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 	/// 页表项。`context` 以它声明 4 KiB 对齐的页表根。
 	#[derive(Clone, Copy)]
@@ -155,12 +152,7 @@ mod paging {
 	pub static PAGE_TABLE_ALLOC_FAIL: AtomicBool = AtomicBool::new(false);
 
 	/// 记录一次映射请求, 按 `PAGE_TABLE_ALLOC_FAIL` 给出结果。
-	pub fn map_page(
-		vaddr: u64,
-		paddr: u64,
-		flags: u64,
-		level: u8
-	) -> Result<(), MapError> {
+	pub fn map_page(vaddr: u64, paddr: u64, flags: u64, level: u8) -> Result<(), MapError> {
 		if MAP_CALLS.load(Ordering::SeqCst) == 0 {
 			MAP_FIRST_VA.store(vaddr, Ordering::SeqCst);
 			MAP_FIRST_PA.store(paddr, Ordering::SeqCst);
@@ -196,20 +188,20 @@ mod paging {
 	}
 }
 
-/// 地址对齐原语, 取 `src/` 内的实现。本模块在顶层声明, 由 [`mem_prim`] 按原名转出:
-/// `#[path]` 若写在 [`mem_prim`] 之内, 其相对路径会以 `mem_prim` 追加为目录。
-#[path = "../src/mem_prim/align.rs"]
-mod align;
+/// 地址对齐原语, 取 `src/` 内的实现。本模块在顶层声明, 由 [`prim`] 按原名转出:
+/// `#[path]` 若写在 [`prim`] 之内, 其相对路径会以 `prim` 追加为目录。
+#[path = "../src/prim/arith.rs"]
+mod arith;
 
 /// 原始内存原语。
 ///
 /// 地址对齐取 `src/` 内的实现; 内存填充在本入口内只记录调用: 取入时模块槽位中超出映像的
 /// 部分整块以 0 填充, 该部分在主机上落在测试程序自身的内存之内, 实际写入会改坏测试程序。
-mod mem_prim {
-	pub(crate) use super::align;
+mod prim {
+	pub(crate) use super::arith;
 
 	pub mod string {
-		use core::sync::atomic::{ AtomicU64, Ordering };
+		use core::sync::atomic::{AtomicU64, Ordering};
 
 		/// 0 填充被请求的次数与最近一次的字节数。
 		pub static FILL_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -236,31 +228,14 @@ mod attest;
 mod ext_mod;
 
 use constants::{
-	CHUNK_2M_SIZE,
-	ENCLAVE_MEM_ATTR_DATA,
-	ENCLAVE_MEM_ATTR_INSTR,
-	ENCLAVE_MODULE_LOAD_VA_INIT,
-	ENCLAVE_MODULE_WINDOW_SIZE,
-	LEVEL_PAGE,
-	PAGE_SIZE,
-	PTE_R,
-	PTE_W,
-	PTE_X,
-	SIG_LEN,
+	CHUNK_2M_SIZE, ENCLAVE_MEM_ATTR_DATA, ENCLAVE_MEM_ATTR_INSTR, ENCLAVE_MODULE_LOAD_VA_INIT,
+	ENCLAVE_MODULE_WINDOW_SIZE, LEVEL_PAGE, PAGE_SIZE, PTE_R, PTE_W, PTE_X, SIG_LEN,
 };
 use ext_mod::abi::{
-	GetterFn,
-	ModuleDesc,
-	ModuleInterface,
-	SyscallTable,
-	MAX_MODULES,
-	MODULE_NAME_LEN,
+	GetterFn, MAX_MODULES, MODULE_NAME_LEN, ModuleDesc, ModuleInterface, SyscallTable,
 };
 use ext_mod::img_descriptor::{
-	DescError,
-	IMAGE_DESC_ABI_VERSION,
-	IMAGE_DESC_LEN,
-	IMAGE_DESC_MAGIC,
+	DescError, IMAGE_DESC_ABI_VERSION, IMAGE_DESC_LEN, IMAGE_DESC_MAGIC,
 };
 use ext_mod::loader::LoadError;
 use ext_mod::man::Manager;
@@ -274,8 +249,7 @@ const IMG_LEN: u64 = 2 * PAGE_SIZE;
 /// 可执行部分的字节数: 映像本体 (不含末尾的签名) 按页向上取整。
 ///
 /// `IMG_LEN` 取 2 页时该值同为 2 页, 故可写部分自映像末尾之后的第一个页边界开始。
-const EXEC_LEN: u64 =
-	((IMG_LEN - (SIG_LEN as u64) + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+const EXEC_LEN: u64 = ((IMG_LEN - (SIG_LEN as u64) + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 
 /// 一个模块在模块窗口内占用的字节数, 与 `src/ext_mod/loader.rs` 的 `MODULE_SLOT_SIZE` 取值
 /// 相同。
@@ -369,14 +343,7 @@ const MAP_ANONYMOUS: i32 = 0x20;
 
 unsafe extern "C" {
 	/// 建立或映射一段内存, 本入口只用它建立匿名映射。
-	fn mmap(
-		addr: *mut u8,
-		len: usize,
-		prot: i32,
-		flags: i32,
-		fd: i32,
-		offset: i64
-	) -> *mut u8;
+	fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
 }
 
 /// 建立映像缓冲区并返回其起始地址; 已建立时直接返回。
@@ -396,7 +363,7 @@ fn image_va() -> u64 {
 			PROT_READ | PROT_WRITE | PROT_EXEC,
 			MAP_PRIVATE | MAP_ANONYMOUS,
 			-1,
-			0
+			0,
 		)
 	};
 	assert!((mapped as usize) != !0usize, "映像缓冲区建立失败");
@@ -423,7 +390,7 @@ fn stage_image(size: u64) {
 	write_desc_field(1, IMAGE_DESC_ABI_VERSION);
 	write_desc_field(2, IMAGE_DESC_LEN as u32);
 	write_desc_field(3, body_len as u32);
-	write_desc_field(4, align::align_up(body_len, PAGE_SIZE) as u32);
+	write_desc_field(4, arith::align_up(body_len, PAGE_SIZE) as u32);
 	// 入口: 把 `dummy_img_init` 的地址装入 rax 并跳转 (`movabs rax, imm64; jmp rax`)。
 	let mut stub = [0u8; 12];
 	stub[0] = 0x48;
@@ -435,7 +402,7 @@ fn stage_image(size: u64) {
 		ptr::copy_nonoverlapping(
 			stub.as_ptr(),
 			(image_va() + (IMAGE_DESC_LEN as u64)) as *mut u8,
-			stub.len()
+			stub.len(),
 		);
 	}
 	write_image_bytes(size - (SIG_LEN as u64), &[0u8; SIG_LEN]);
@@ -461,13 +428,11 @@ fn signing_key() -> &'static SigningKey {
 	ATTEST_SIGNING_KEY.get_or_init(|| {
 		let mut scalar = attest_key::ATTEST_PRIV_KEY_ENCODED;
 		for (index, byte) in scalar.iter_mut().enumerate() {
-			*byte = (
-				*byte ^ ATTEST_PRIV_KEY_MASK[index % ATTEST_PRIV_KEY_MASK.len()]
-			).rotate_right(3);
+			*byte =
+				(*byte ^ ATTEST_PRIV_KEY_MASK[index % ATTEST_PRIV_KEY_MASK.len()]).rotate_right(3);
 		}
-		let secret = SecretKey::from_slice(&scalar).unwrap_or_else(|err| {
-			panic!("the restored private key is not a valid scalar: {err}")
-		});
+		let secret = SecretKey::from_slice(&scalar)
+			.unwrap_or_else(|err| panic!("the restored private key is not a valid scalar: {err}"));
 		SigningKey::from(secret)
 	})
 }
@@ -492,7 +457,7 @@ fn write_image_bytes(offset: u64, bytes: &[u8]) {
 		ptr::copy_nonoverlapping(
 			bytes.as_ptr(),
 			(image_va() + offset) as *mut u8,
-			bytes.len()
+			bytes.len(),
 		);
 	}
 }
@@ -642,7 +607,8 @@ impl Transport for HostTransport {
 
 	fn fetch(&self, _module_id: u32, size: u64) -> Option<u64> {
 		self.fetches.set(self.fetches.get() + 1);
-		self.registered_before_fetch.set(self.registrations.get() == 1);
+		self.registered_before_fetch
+			.set(self.registrations.get() == 1);
 		// 宿主把映像写入接收缓冲区, 在主机侧相当于把映像写入映像缓冲区。
 		stage_image(size);
 		if let Some((index, value)) = self.desc_patch.get() {
@@ -663,7 +629,7 @@ impl Transport for HostTransport {
 // ---------------------------------------------------------------
 
 /// 把模块窗口内下一个空闲 VA 置到映像的加载地址, 并设置模块映像的编号、处理函数表指针
-/// 与操作表指针, 同时清空 `mem`、`paging` 与 `mem_prim` 内各计数器的记录。
+/// 与操作表指针, 同时清空 `mem`、`paging` 与 `prim` 内各计数器的记录。
 ///
 /// 处理函数表指针取缓冲区内的一个 8 字节对齐地址; 操作表指针取空, 由需要它的用例另行设置。
 fn prepare(module_id: u32) -> (u64, Manager) {
@@ -682,8 +648,8 @@ fn prepare(module_id: u32) -> (u64, Manager) {
 	paging::PAGE_TABLE_ALLOC_FAIL.store(false, Ordering::SeqCst);
 	paging::SEAL_CALLS.store(0, Ordering::SeqCst);
 	paging::SEAL_FAIL.store(false, Ordering::SeqCst);
-	mem_prim::string::FILL_CALLS.store(0, Ordering::SeqCst);
-	mem_prim::string::FILL_BYTES.store(0, Ordering::SeqCst);
+	prim::string::FILL_CALLS.store(0, Ordering::SeqCst);
+	prim::string::FILL_BYTES.store(0, Ordering::SeqCst);
 	(va, manager())
 }
 
@@ -730,7 +696,7 @@ fn test_load_rejects_a_module_id_beyond_the_registry_capacity() {
 
 	assert_load_fails(
 		ext_mod::loader::load(MAX_MODULES as u32, &transport, &man),
-		LoadError::BadModuleId
+		LoadError::BadModuleId,
 	);
 	assert_eq!(transport.size_requests(), 0);
 	assert_eq!(transport.fetch_calls(), 0);
@@ -743,7 +709,10 @@ fn test_load_reports_not_found_when_the_host_has_no_such_module() {
 	let (_, man) = prepare(0x00);
 	let transport = HostTransport::new(None, None, true);
 
-	assert_load_fails(ext_mod::loader::load(0x00, &transport, &man), LoadError::NotFound);
+	assert_load_fails(
+		ext_mod::loader::load(0x00, &transport, &man),
+		LoadError::NotFound,
+	);
 	assert_eq!(transport.size_requests(), 1);
 	assert_eq!(alloc_calls(), 0);
 	assert_eq!(transport.registration_calls(), 0);
@@ -757,7 +726,10 @@ fn test_load_reports_not_found_when_the_host_refuses_delivery() {
 	let (va, man) = prepare(0x01);
 	let transport = HostTransport::refusing_delivery(IMG_LEN);
 
-	assert_load_fails(ext_mod::loader::load(0x01, &transport, &man), LoadError::NotFound);
+	assert_load_fails(
+		ext_mod::loader::load(0x01, &transport, &man),
+		LoadError::NotFound,
+	);
 	assert_eq!(alloc_calls(), 2);
 	assert_eq!(map_calls(), slot_pages());
 	assert_eq!(transport.registration_calls(), 1);
@@ -775,7 +747,7 @@ fn test_load_rejects_an_image_shorter_than_one_signature() {
 		let transport = HostTransport::writing(size);
 		assert_load_fails(
 			ext_mod::loader::load(0x02, &transport, &man),
-			LoadError::TooSmall
+			LoadError::TooSmall,
 		);
 		assert_eq!(transport.fetch_calls(), 0, "映像长度为 {size} 字节");
 		assert_eq!(alloc_calls(), 0, "映像长度为 {size} 字节");
@@ -791,7 +763,10 @@ fn test_load_rejects_an_image_that_overruns_the_module_window() {
 		ENCLAVE_MODULE_LOAD_VA_INIT + ENCLAVE_MODULE_WINDOW_SIZE;
 	let transport = HostTransport::writing(IMG_LEN);
 
-	assert_load_fails(ext_mod::loader::load(0x03, &transport, &man), LoadError::TooLarge);
+	assert_load_fails(
+		ext_mod::loader::load(0x03, &transport, &man),
+		LoadError::TooLarge,
+	);
 	assert_eq!(alloc_calls(), 0);
 	assert_eq!(map_calls(), 0);
 	assert_eq!(transport.fetch_calls(), 0);
@@ -808,7 +783,10 @@ fn test_load_rejects_a_slot_that_overruns_the_window() {
 		ENCLAVE_MODULE_LOAD_VA_INIT + ENCLAVE_MODULE_WINDOW_SIZE - SLOT_SIZE + 1;
 	let transport = HostTransport::writing(IMG_LEN);
 
-	assert_load_fails(ext_mod::loader::load(0x04, &transport, &man), LoadError::TooLarge);
+	assert_load_fails(
+		ext_mod::loader::load(0x04, &transport, &man),
+		LoadError::TooLarge,
+	);
 	assert_eq!(alloc_calls(), 0);
 	assert_eq!(map_calls(), 0);
 	assert_eq!(transport.fetch_calls(), 0);
@@ -827,10 +805,13 @@ fn test_load_admits_the_last_slot_of_the_window() {
 	// 该槽位落在窗口的最后一个槽位上, 故映射失败; 映射被调用即证明上界判定放行了这一槽位。
 	assert_load_fails(
 		ext_mod::loader::load(0x05, &transport, &man),
-		LoadError::MapFailed
+		LoadError::MapFailed,
 	);
 	assert_eq!(alloc_calls(), 1);
-	assert_eq!(mem::ALLOC_PAGES.load(Ordering::SeqCst), EXEC_LEN / PAGE_SIZE);
+	assert_eq!(
+		mem::ALLOC_PAGES.load(Ordering::SeqCst),
+		EXEC_LEN / PAGE_SIZE
+	);
 	assert_eq!(map_calls(), 1);
 	assert_eq!(transport.registration_calls(), 0);
 }
@@ -844,7 +825,7 @@ fn test_load_reports_a_short_write_from_the_host() {
 
 	assert_load_fails(
 		ext_mod::loader::load(0x06, &transport, &man),
-		LoadError::ShortWrite
+		LoadError::ShortWrite,
 	);
 	assert_eq!(transport.registration_calls(), 1);
 	assert_eq!(transport.fetch_calls(), 1);
@@ -862,10 +843,13 @@ fn test_load_reports_an_exhausted_page_pool_and_keeps_the_next_free_va() {
 
 	assert_load_fails(
 		ext_mod::loader::load(0x07, &transport, &man),
-		LoadError::MapFailed
+		LoadError::MapFailed,
 	);
 	assert_eq!(alloc_calls(), 1);
-	assert_eq!(mem::ALLOC_PAGES.load(Ordering::SeqCst), EXEC_LEN / PAGE_SIZE);
+	assert_eq!(
+		mem::ALLOC_PAGES.load(Ordering::SeqCst),
+		EXEC_LEN / PAGE_SIZE
+	);
 	assert_eq!(map_calls(), 0);
 	assert_eq!(transport.registration_calls(), 0);
 	assert_eq!(transport.fetch_calls(), 0);
@@ -882,7 +866,7 @@ fn test_load_reports_a_failed_page_table_allocation_and_keeps_the_next_free_va()
 
 	assert_load_fails(
 		ext_mod::loader::load(0x08, &transport, &man),
-		LoadError::MapFailed
+		LoadError::MapFailed,
 	);
 	assert_eq!(map_calls(), 1);
 	assert_eq!(paging::MAP_FIRST_VA.load(Ordering::SeqCst), va);
@@ -901,7 +885,7 @@ fn test_load_reports_a_rejected_receive_buffer_registration() {
 
 	assert_load_fails(
 		ext_mod::loader::load(0x09, &transport, &man),
-		LoadError::ImgRecvBufRejected
+		LoadError::ImgRecvBufRejected,
 	);
 	assert_eq!(transport.registration_calls(), 1);
 	assert_eq!(transport.fetch_calls(), 0);
@@ -921,7 +905,10 @@ fn test_load_registers_the_image_receive_buffer_before_the_delivery() {
 	ext_mod::loader::load(0x0a, &transport, &man).expect("取入应当成功");
 	assert_eq!(transport.registered_va.get(), va);
 	assert_eq!(transport.registered_len.get(), IMG_LEN);
-	assert!(transport.registered_before_fetch.get(), "交付被请求时接收缓冲区尚未登记");
+	assert!(
+		transport.registered_before_fetch.get(),
+		"交付被请求时接收缓冲区尚未登记"
+	);
 }
 
 /// 同一模块处于取入过程中时再次请求立即失败, 不请求宿主。
@@ -935,7 +922,10 @@ fn test_load_reports_loading_while_the_same_module_is_in_flight() {
 	assert!(ext_mod::table::begin_load(0x0b));
 	let transport = HostTransport::writing(IMG_LEN);
 
-	assert_load_fails(ext_mod::loader::load(0x0b, &transport, &man), LoadError::Loading);
+	assert_load_fails(
+		ext_mod::loader::load(0x0b, &transport, &man),
+		LoadError::Loading,
+	);
 	assert_eq!(transport.size_requests(), 0);
 	assert_eq!(transport.fetch_calls(), 0);
 	assert_eq!(map_calls(), 0);
@@ -974,7 +964,7 @@ fn test_load_rejects_an_interface_whose_module_id_differs() {
 
 	assert_load_fails(
 		ext_mod::loader::load(0x0d, &transport, &man),
-		LoadError::IdMismatch
+		LoadError::IdMismatch,
 	);
 	assert!(ext_mod::table::lookup(0x0d).is_none());
 	assert_eq!(next_free_va(), va + SLOT_SIZE);
@@ -994,7 +984,7 @@ fn test_load_rejects_a_syscall_table_outside_the_image() {
 	let transport = HostTransport::writing(IMG_LEN);
 	assert_load_fails(
 		ext_mod::loader::load(0x0e, &transport, &man),
-		LoadError::BadSyscallTable
+		LoadError::BadSyscallTable,
 	);
 	assert!(ext_mod::table::lookup(0x0e).is_none());
 	assert_eq!(next_free_va(), va + SLOT_SIZE);
@@ -1005,7 +995,7 @@ fn test_load_rejects_a_syscall_table_outside_the_image() {
 	let transport = HostTransport::writing(IMG_LEN);
 	assert_load_fails(
 		ext_mod::loader::load(0x0f, &transport, &man),
-		LoadError::BadSyscallTable
+		LoadError::BadSyscallTable,
 	);
 	assert!(ext_mod::table::lookup(0x0f).is_none());
 }
@@ -1023,11 +1013,17 @@ fn test_load_succeeds_and_advances_the_next_free_va() {
 	// 物理页的入参: 可执行部分与可写部分各申请一个分区, 两次的类别都取数据类; 建立映射时
 	// 权限取可读可写 (封口前的内容写入需要), 层级取 4 KiB 页。
 	assert_eq!(alloc_calls(), 2);
-	assert_eq!(mem::ALLOC_ATTR.load(Ordering::SeqCst), ENCLAVE_MEM_ATTR_DATA);
+	assert_eq!(
+		mem::ALLOC_ATTR.load(Ordering::SeqCst),
+		ENCLAVE_MEM_ATTR_DATA
+	);
 	assert_eq!(map_calls(), slot_pages());
 	assert_eq!(paging::MAP_FIRST_VA.load(Ordering::SeqCst), va);
 	assert_eq!(paging::MAP_FIRST_PA.load(Ordering::SeqCst), mem::POOL_PA);
-	assert_eq!(paging::MAP_FLAGS.load(Ordering::SeqCst), (PTE_R | PTE_W) as u64);
+	assert_eq!(
+		paging::MAP_FLAGS.load(Ordering::SeqCst),
+		(PTE_R | PTE_W) as u64
+	);
 	assert_eq!(paging::MAP_LEVEL.load(Ordering::SeqCst), LEVEL_PAGE as u64);
 	assert_eq!(next_free_va(), va + SLOT_SIZE);
 
@@ -1057,17 +1053,32 @@ fn test_seal_reclassifies_only_the_executable_part() {
 	assert_eq!(mem::SET_ATTR_CALLS.load(Ordering::SeqCst), 1);
 	assert_eq!(mem::SET_ATTR_PA.load(Ordering::SeqCst), mem::POOL_PA);
 	assert_eq!(mem::SET_ATTR_BYTES.load(Ordering::SeqCst), EXEC_LEN);
-	assert_eq!(mem::SET_ATTR_ATTR.load(Ordering::SeqCst), ENCLAVE_MEM_ATTR_INSTR);
+	assert_eq!(
+		mem::SET_ATTR_ATTR.load(Ordering::SeqCst),
+		ENCLAVE_MEM_ATTR_INSTR
+	);
 
 	// 页表项改写: 只改写可执行部分, 自映像的加载地址起共 EXEC_LEN 页。
-	assert_eq!(paging::SEAL_CALLS.load(Ordering::SeqCst), EXEC_LEN / PAGE_SIZE);
+	assert_eq!(
+		paging::SEAL_CALLS.load(Ordering::SeqCst),
+		EXEC_LEN / PAGE_SIZE
+	);
 	assert_eq!(paging::SEAL_FIRST_VA.load(Ordering::SeqCst), va);
-	assert_eq!(paging::SEAL_LAST_VA.load(Ordering::SeqCst), va + EXEC_LEN - PAGE_SIZE);
-	assert_eq!(paging::SEAL_FLAGS.load(Ordering::SeqCst), (PTE_R | PTE_X) as u64);
+	assert_eq!(
+		paging::SEAL_LAST_VA.load(Ordering::SeqCst),
+		va + EXEC_LEN - PAGE_SIZE
+	);
+	assert_eq!(
+		paging::SEAL_FLAGS.load(Ordering::SeqCst),
+		(PTE_R | PTE_X) as u64
+	);
 
 	// 槽位中超出映像的部分以 0 填充, 填入模块初值为零的静态数据。
-	assert_eq!(mem_prim::string::FILL_CALLS.load(Ordering::SeqCst), 1);
-	assert_eq!(mem_prim::string::FILL_BYTES.load(Ordering::SeqCst), SLOT_SIZE - IMG_LEN);
+	assert_eq!(prim::string::FILL_CALLS.load(Ordering::SeqCst), 1);
+	assert_eq!(
+		prim::string::FILL_BYTES.load(Ordering::SeqCst),
+		SLOT_SIZE - IMG_LEN
+	);
 }
 
 /// 映像长度越过可执行部分时, 该部分之后的字节同样以 0 填充。
@@ -1085,8 +1096,8 @@ fn test_load_fills_the_page_that_the_image_end_crosses() {
 
 	ext_mod::loader::load(0x1f, &transport, &man).expect("取入应当成功");
 	assert_eq!(mem::SET_ATTR_BYTES.load(Ordering::SeqCst), PAGE_SIZE);
-	assert_eq!(mem_prim::string::FILL_CALLS.load(Ordering::SeqCst), 2);
-	assert_eq!(mem_prim::string::FILL_BYTES.load(Ordering::SeqCst), 4);
+	assert_eq!(prim::string::FILL_CALLS.load(Ordering::SeqCst), 2);
+	assert_eq!(prim::string::FILL_BYTES.load(Ordering::SeqCst), 4);
 }
 
 /// 下一个空闲 VA 按槽位的字节数推进, 不按映像自身的字节数。
@@ -1113,7 +1124,7 @@ fn test_load_reports_a_failed_partition_reclass() {
 
 	assert_load_fails(
 		ext_mod::loader::load(0x1c, &transport, &man),
-		LoadError::MapFailed
+		LoadError::MapFailed,
 	);
 	// 改判在映射建立之后, 故映射已按页建成。
 	assert_eq!(mem::SET_ATTR_CALLS.load(Ordering::SeqCst), 1);
@@ -1131,7 +1142,7 @@ fn test_load_reports_a_failed_leaf_rewrite() {
 
 	assert_load_fails(
 		ext_mod::loader::load(0x1d, &transport, &man),
-		LoadError::MapFailed
+		LoadError::MapFailed,
 	);
 	assert_eq!(paging::SEAL_CALLS.load(Ordering::SeqCst), 1);
 }
@@ -1175,8 +1186,7 @@ fn test_acquire_ops_table_returns_a_table_inside_the_image() {
 	DUMMY_IMG_OPS.store(ops_va, Ordering::SeqCst);
 	let transport = HostTransport::writing(IMG_LEN);
 
-	let ops = ext_mod
-		::acquire_ops_table::<OpsFixture>(0x1b, &transport, &man)
+	let ops = ext_mod::acquire_ops_table::<OpsFixture>(0x1b, &transport, &man)
 		.expect("操作表落在缓冲区内, 取入应当成功");
 	assert_eq!(core::ptr::from_ref(ops) as u64, ops_va);
 	// 槽位的范围随取用器一同登记, 取用方据此判定整张表的落点。
@@ -1190,12 +1200,10 @@ fn test_acquire_ops_table_rejects_a_missing_table() {
 	let (_, man) = prepare(0x17);
 	let transport = HostTransport::writing(IMG_LEN);
 
-	assert!(
-		matches!(
-			ext_mod::acquire_ops_table::<OpsFixture>(0x17, &transport, &man),
-			Err(LoadError::BadOpsTable)
-		)
-	);
+	assert!(matches!(
+		ext_mod::acquire_ops_table::<OpsFixture>(0x17, &transport, &man),
+		Err(LoadError::BadOpsTable)
+	));
 	// 模块本身取入成功, 只是操作表不可用。
 	assert!(ext_mod::table::lookup(0x17).is_some());
 }
@@ -1208,12 +1216,10 @@ fn test_acquire_ops_table_rejects_a_table_before_the_image() {
 	DUMMY_IMG_OPS.store(va - 0x1000, Ordering::SeqCst);
 	let transport = HostTransport::writing(IMG_LEN);
 
-	assert!(
-		matches!(
-			ext_mod::acquire_ops_table::<OpsFixture>(0x18, &transport, &man),
-			Err(LoadError::BadOpsTable)
-		)
-	);
+	assert!(matches!(
+		ext_mod::acquire_ops_table::<OpsFixture>(0x18, &transport, &man),
+		Err(LoadError::BadOpsTable)
+	));
 }
 
 /// 操作表的起点落在槽位之内而末端越过槽位末尾时取入失败。
@@ -1227,12 +1233,10 @@ fn test_acquire_ops_table_rejects_a_table_overrunning_the_image() {
 	DUMMY_IMG_OPS.store(va + SLOT_SIZE - size + 1, Ordering::SeqCst);
 	let transport = HostTransport::writing(IMG_LEN);
 
-	assert!(
-		matches!(
-			ext_mod::acquire_ops_table::<OpsFixture>(0x19, &transport, &man),
-			Err(LoadError::BadOpsTable)
-		)
-	);
+	assert!(matches!(
+		ext_mod::acquire_ops_table::<OpsFixture>(0x19, &transport, &man),
+		Err(LoadError::BadOpsTable)
+	));
 }
 
 /// 操作表的起点不满足 8 字节对齐时取入失败。
@@ -1243,12 +1247,10 @@ fn test_acquire_ops_table_rejects_a_misaligned_table() {
 	DUMMY_IMG_OPS.store(va + 1, Ordering::SeqCst);
 	let transport = HostTransport::writing(IMG_LEN);
 
-	assert!(
-		matches!(
-			ext_mod::acquire_ops_table::<OpsFixture>(0x1a, &transport, &man),
-			Err(LoadError::BadOpsTable)
-		)
-	);
+	assert!(matches!(
+		ext_mod::acquire_ops_table::<OpsFixture>(0x1a, &transport, &man),
+		Err(LoadError::BadOpsTable)
+	));
 }
 
 // ---------------------------------------------------------------
@@ -1271,7 +1273,11 @@ fn test_load_rejects_an_image_whose_descriptor_is_not_accepted() {
 		// 魔数不符
 		(0usize, 0u32, DescError::BadMagic),
 		// 声明的映像本体字节数少于交付的字节数
-		(3, (IMG_LEN - (SIG_LEN as u64) - 4) as u32, DescError::BodyLenMismatch),
+		(
+			3,
+			(IMG_LEN - (SIG_LEN as u64) - 4) as u32,
+			DescError::BodyLenMismatch,
+		),
 	];
 	for (index, value, expected) in cases {
 		context::ctx_mut().enclave_module_load_va = va;
@@ -1280,7 +1286,7 @@ fn test_load_rejects_an_image_whose_descriptor_is_not_accepted() {
 
 		assert_load_fails(
 			ext_mod::loader::load(0x10, &transport, &man),
-			LoadError::BadImageDesc(expected)
+			LoadError::BadImageDesc(expected),
 		);
 		// 核对未通过即不改判为指令类, 也不调用映像的入口。
 		assert_eq!(mem::SET_ATTR_CALLS.load(Ordering::SeqCst), 0);
@@ -1304,7 +1310,7 @@ fn test_load_rejects_an_image_whose_trailer_holds_no_signature() {
 
 	assert_load_fails(
 		ext_mod::loader::load(0x00, &transport, &man),
-		LoadError::AttestFailed
+		LoadError::AttestFailed,
 	);
 	assert_eq!(mem::SET_ATTR_CALLS.load(Ordering::SeqCst), 0);
 	assert_eq!(paging::SEAL_CALLS.load(Ordering::SeqCst), 0);
@@ -1329,18 +1335,18 @@ fn test_load_rejects_an_image_whose_body_changed_after_signing() {
 
 	assert_load_fails(
 		ext_mod::loader::load(0x01, &transport, &man),
-		LoadError::AttestFailed
+		LoadError::AttestFailed,
 	);
 	assert_eq!(mem::SET_ATTR_CALLS.load(Ordering::SeqCst), 0);
 	assert_eq!(paging::SEAL_CALLS.load(Ordering::SeqCst), 0);
 	assert_eq!(entry_calls(), 0);
 }
 
-/// 各失败原因折算为上报给可信应用的错误码: 映像与接口的布局不符归 EINVAL, 资源不足归
+/// 各失败原因换算为上报给可信应用的错误码: 映像与接口的布局不符归 EINVAL, 资源不足归
 /// ENOMEM, 宿主未提供该模块归 ENOENT, 该模块正在取入归 EAGAIN。
 #[test]
 fn test_load_error_folds_into_an_errno() {
-	use ext_mod::errno::{ EAGAIN, EINVAL, ENOMEM, ENOENT };
+	use ext_mod::errno::{EAGAIN, EINVAL, ENOENT, ENOMEM};
 	use ext_mod::loader::LoadError::*;
 
 	let cases = [
@@ -1388,7 +1394,10 @@ fn test_load_asks_the_host_again_after_a_missing_module() {
 	// 第二次: 宿主报告了字节数, 而长度不足一个签名, 取入在新的核对处被拒 —— 该结果只在
 	// 重新提出申请之后才能得到。
 	let short = HostTransport::writing(SIG_LEN as u64);
-	assert_load_fails(ext_mod::loader::load(0x1c, &short, &man), LoadError::TooSmall);
+	assert_load_fails(
+		ext_mod::loader::load(0x1c, &short, &man),
+		LoadError::TooSmall,
+	);
 	assert_eq!(short.size_requests(), 1);
 	assert_eq!(short.fetch_calls(), 0);
 

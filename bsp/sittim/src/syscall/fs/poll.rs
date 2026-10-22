@@ -6,14 +6,14 @@
 
 use core::ptr;
 
-use crate::ext_mod::vfs_ops::{ mode_readable, mode_writable };
+use crate::ext_mod::vfs_ops::{mode_readable, mode_writable};
 
-use super::consts::POLL_WAIT_ADDR;
-use super::super::concurrency::{ thread, timer };
-use super::super::fdtable::{ FDS, FdTarget, MAX_FD, OpenFile, open_file_of };
+use super::super::concurrency::{thread, timer};
+use super::super::fdtable::{FDS, FdTarget, MAX_FD, OpenFile, open_file_of};
 use super::super::net;
-use super::super::types::{ PollFd, Timespec };
-use super::super::{ EFAULT, EINVAL };
+use super::super::types::{PollFd, Timespec};
+use super::super::{EFAULT, EINVAL};
+use super::consts::POLL_WAIT_ADDR;
 
 /// 取描述符 *fd* 绑定的描述。取一次描述符表的锁, 取值后立即释放: 就绪状态的求法含协议栈
 /// 调用, 该调用会经 ecall 让出到宿主, 锁不得跨越它。
@@ -83,7 +83,7 @@ fn scan_fds(fds: u64, nfds: u64) -> u64 {
 	ready
 }
 
-/// 读出 ppoll 的时限, 折算为纳秒时长。*timeout* 取空表示不限时, 返回 Ok(None)。
+/// 读出 ppoll 的时限, 换算为纳秒时长。*timeout* 取空表示不限时, 返回 Ok(None)。
 ///
 /// tv_sec 为负或 tv_nsec 不在 [0, 1_000_000_000) 内时返回 Err(EINVAL)。
 fn read_poll_timeout(timeout: u64) -> Result<Option<u64>, u64> {
@@ -94,26 +94,24 @@ fn read_poll_timeout(timeout: u64) -> Result<Option<u64>, u64> {
 	if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
 		return Err(EINVAL);
 	}
-	Ok(
-		Some(
-			(ts.tv_sec as u64)
-				.saturating_mul(1_000_000_000)
-				.saturating_add(ts.tv_nsec as u64)
-		)
-	)
+	Ok(Some(
+		(ts.tv_sec as u64)
+			.saturating_mul(1_000_000_000)
+			.saturating_add(ts.tv_nsec as u64),
+	))
 }
 
 /// ppoll(73): 逐个求出描述符就绪状态并写入 revents, 返回就绪的描述符个数; 无描述符
 /// 就绪时等待至多 *timeout* 指定的时长。
 ///
-/// 时限实现与 nanosleep 同: 时限交给等待定时器设施 (见 concurrency/timer.rs), 由定时器
+/// 时限实现与 nanosleep 同: 时限交给等待定时器设施, 由定时器
 /// 中断在截止时刻唤醒, 故等待 5 ms 的调用在 5 ms 后返回, 其精度不受时间片周期限制。
 /// 描述符就绪与时限到达是两个并列的唤醒来源, 前者由网络模块按 [`POLL_WAIT_ADDR`]
 /// 唤醒, 后者由中断按线程标识唤醒。
 ///
 /// *nfds* 超过 `RLIMIT_NOFILE` 时返回 EINVAL, 本层以 [`MAX_FD`] 为上界; *nfds* 为 0 且
 /// 有时限时睡眠该时长后返回 0, 不限时则一直等待; *timeout* 非空而 *fds* 取空返回 EFAULT。
-/// 载荷传入的第 4 个参数 (信号掩码) 不经本层: 派发只传前三个参数 (见 syscall/mod.rs)。
+/// 载荷传入的第 4 个参数信号掩码不经本层: 派发只传前三个参数。
 pub fn ppoll_handler(fds: u64, nfds: u64, timeout: u64) -> u64 {
 	if nfds > (MAX_FD as u64) {
 		return EINVAL;
@@ -131,8 +129,8 @@ pub fn ppoll_handler(fds: u64, nfds: u64, timeout: u64) -> u64 {
 	let me = thread::current_thread_id();
 	// 被中断后重新执行本调用时沿用表中已有的截止时刻, 不重新计一段完整的时长。
 	if let Some(nsec) = limit {
-		if !timer::is_armed(me) {
-			timer::arm_after(me, nsec);
+		if !timer::has_wait_timer(me) {
+			timer::set_wait_timer(me, nsec);
 		}
 	}
 	loop {

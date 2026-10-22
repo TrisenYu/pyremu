@@ -13,6 +13,7 @@ import struct
 import libfdt
 import pytest
 
+from pyremu import configs_gen
 from pyremu.emulator import Emulator
 from pyremu.memory.bus import Bus
 from pyremu.peripheral.crng import (
@@ -24,6 +25,8 @@ from pyremu.peripheral.crng import (
     STATUS_READY,
 )
 from pyremu.platform import PeripheralConfig, PlatformConfig
+
+CRNG_BASE = 0x1000_6000
 
 
 class TestCRNGEntropy:
@@ -116,12 +119,12 @@ class TestCRNGConfig:
             num_harts=1,
             ram_base=0x8000_0000,
             prog_cnt=0x8000_0000,
-            periph=PeripheralConfig(),
+            periph=PeripheralConfig(crng_base=CRNG_BASE),
         )
 
-    def test_default_crng_base(self):
-        """默认 PeripheralConfig 启用 CRNG (基址非零)."""
-        assert PeripheralConfig().crng_base == 0x1000_6000
+    def test_default_crng_base_follows_build_config(self):
+        """默认 CRNG 基址取自 emu-configs.mk 生成的常量."""
+        assert PeripheralConfig().crng_base == configs_gen.CRNG_BASE
 
     def test_crng_base_does_not_collide_with_virtio_blk(self):
         """CRNG 默认基址与 virtio-blk 基址不得重叠.
@@ -133,7 +136,7 @@ class TestCRNGConfig:
         # virtio-blk 基址来自 cli.py --disk 的硬编码 _VIRTIO_BLK_BASE (0x200 字节).
         virtio_base = 0x1000_5000
         virtio_size = 0x200
-        crng_base = PeripheralConfig().crng_base
+        crng_base = CRNG_BASE
         crng_size = 0x1000
         # 两段 MMIO 区间无交集 (CRNG 恒位于 virtio 之上或之下).
         assert crng_base + crng_size <= virtio_base or crng_base >= virtio_base + virtio_size

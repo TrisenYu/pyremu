@@ -3,8 +3,8 @@ use core::arch::asm;
 
 use crate::constants::*;
 use crate::context;
-use crate::paging;
 use crate::hang::fault_halt;
+use crate::paging;
 // ---------------------------------------------------------------
 //  ecall调用原语
 // ---------------------------------------------------------------
@@ -54,7 +54,7 @@ pub fn enclave_call_suspend(short_msg: u64) -> (u64, u64, u64) {
 }
 
 /// 取回本飞地模块请求的交付结果, 返回
-/// `(交付结果, 宿主报告的字节数, 接收窗口首字节的物理地址, 实际写入的字节数)`.
+/// `(交付结果, 宿主报告的字节数, 接收内存范围首字节的物理地址, 实际写入的字节数)`.
 ///
 /// 模块请求的每一次让出 (见 ENCLAVE_SUSPEND_MODULE_*) 都以一次本调用闭合: 飞地经
 /// RESUME 取回的是自己让出时的寄存器, 宿主无法经 RESUME 回传数据, 故结果只能另行取回.
@@ -100,17 +100,16 @@ pub fn enclave_call_mem_alloc(chunk_nums: u64, attr: u64) -> (u64, u64) {
 /// 返回 0 表示成功, 其余取值为 SBI 错误码。
 #[inline]
 pub fn enclave_call_set_mem_attr(paddr: u64, partition_num: u64, attr: u64) -> u64 {
-	(
-		unsafe {
-			ecall_3(
-				ENCLAVE_EXT_ID,
-				ENCLAVE_CALL_SET_MEM_CLASS,
-				paddr,
-				partition_num,
-				attr
-			)
-		}
-	).0
+	(unsafe {
+		ecall_3(
+			ENCLAVE_EXT_ID,
+			ENCLAVE_CALL_SET_MEM_CLASS,
+			paddr,
+			partition_num,
+			attr,
+		)
+	})
+	.0
 }
 
 /// 向M模式查询可信应用剩余可用内存容量.
@@ -181,31 +180,40 @@ pub fn enclave_call_query_requests() -> u64 {
 ///
 /// 缓冲区地址以物理地址形式交给 M-mode (与 DBCN 同理), 因此只可用于运行时
 /// 自身的内存; 载荷的缓冲区是 U 模式虚拟地址, 须先分块拷入本地缓冲.
-/// 地址折算失败时返回 0: 未写入任何字节.
+/// 地址换算失败时返回 0: 未写入任何字节.
 #[inline]
 pub fn enclave_call_get_rand_num(buf: &mut [u8]) -> u64 {
 	let Some(pa) = va_to_pa(buf.as_ptr() as u64) else {
 		return 0;
 	};
-	(
-		unsafe {
-			ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_GET_RAND_NUM, pa, buf.len() as u64, 0)
-		}
-	).0
+	(unsafe {
+		ecall_3(
+			ENCLAVE_EXT_ID,
+			ENCLAVE_CALL_GET_RAND_NUM,
+			pa,
+			buf.len() as u64,
+			0,
+		)
+	})
+	.0
 }
 
-/// 请求 M 模式加载 *stval* 所属的区域节点, 使本次访问故障的指令可以重试.
+/// 请求 M 模式加载 stval 所属的区域节点, 使本次访问故障的指令可以重试.
 ///
 /// 返回 0 表示 M 模式已加载该区域并刷新本域翻译缓存, 调用方重试原访问即可;
 /// 返回 M 模式 enclave_types.h 的 SBI_ERR_ENCLAVE_ACCESS_UNRECOVERABLE 表示该次访问
 /// 不可恢复, 加载无法使它成立, 重试不会成功.
 #[inline]
 pub fn enclave_call_unmatched_acc_fault(stval: u64, scause: u64) -> u64 {
-	(
-		unsafe {
-			ecall_3(ENCLAVE_EXT_ID, ENCLAVE_CALL_UNMATCHED_ACC_FAULT, stval, scause, 0)
-		}
-	)
+	(unsafe {
+		ecall_3(
+			ENCLAVE_EXT_ID,
+			ENCLAVE_CALL_UNMATCHED_ACC_FAULT,
+			stval,
+			scause,
+			0,
+		)
+	})
 	.0
 }
 
@@ -227,20 +235,14 @@ pub fn sbi_putchar(c: u8) {
 	}
 }
 
-/// 把运行时的虚拟地址折算为物理地址, 供 SBI DBCN 这类地址按物理地址解释的
+/// 把运行时的虚拟地址换算为物理地址, 供 SBI DBCN 这类地址按物理地址解释的
 /// ecall 使用. 缓冲区是栈上局部量, MMU 使能后其地址落入高 VA 空间
-/// (ENCLAVE_MAN_VA_START 区域), 直接传给 M-mode 会被当作 PA 而找不到域内存区域,
-/// 导致整条诊断输出被静默丢弃. 低地址 (MMU 未使能时的恒等 PA) 原样返回.
 ///
-/// 未建立映射时返回 None, 由调用方决定退化行为. 不得以 0 代替失败: 0 是合法
-/// 物理地址, 会把访问引向域内存之外而不报错.
-///
-/// 对外可见: 管理器把它作为 `va_to_pa` 回调交给模块, 模块据此折算自身静态存储与
-/// 设备缓冲区两处的物理地址 (见 `ext_mod::runtime`).
+/// 未建立映射时返回 None, 由调用方决定失败后的相应处理.
 #[inline]
 pub fn va_to_pa(va: u64) -> Option<u64> {
-	// 模块窗口的判定必须先于管理器窗口: 模块窗口基址高于管理器窗口基址, 不先
-	// 判定则模块地址落进按管理器窗口换算的分支并得到错误的物理地址。
+	// 模块内存范围的判定必须先于管理器内存范围: 模块内存基地址高于管理器内存基地址,
+	// 不先判定则模块地址落进按管理器内存范围换算的分支并得到错误的物理地址。
 	// 模块各块的物理地址由独立一次分配取得, 块间不保证连续, 无固定偏移可用,
 	// 故按页表查询。
 	if va >= ENCLAVE_MODULE_LOAD_VA_INIT {
@@ -252,21 +254,15 @@ pub fn va_to_pa(va: u64) -> Option<u64> {
 		let va_ofs = ENCLAVE_MAN_VA_START.wrapping_sub(context::ctx().manager_pa_start);
 		Some(va.wrapping_sub(va_ofs))
 	} else if va >= LINEAR_MAP_OFFSET {
-		// 载荷/argv 的线性映射别名: VA = PA + LINEAR_MAP_OFFSET.
+		// 载荷/argv 的线性映射所得地址 VA = PA + LINEAR_MAP_OFFSET.
 		Some(va.wrapping_sub(LINEAR_MAP_OFFSET))
 	} else {
-		// MMU 未使能时的恒等映射 (VA == PA), 无需折算.
+		// MMU 未使能时的恒等映射 (VA == PA), 无需换算.
 		Some(va)
 	}
 }
 
-/// Output a byte buffer via the SBI DBCN Console Write extension.
-/// The entire buffer is written atomically under M-mode's `console_out_lock`,
-/// preventing per-character interleaving with concurrent output from other harts.
-///
-/// Falls back to legacy `sbi_putchar` per byte if DBCN is not available, and also
-/// when the buffer address does not translate to a physical address (DBCN reads
-/// a1 as a physical address, so an untranslatable buffer leaves no target to name).
+/// 通过ecall请求向固件侧调用串口输出
 #[inline]
 pub fn sbi_console_write(buf: &[u8]) {
 	if let Some(pa) = va_to_pa(buf.as_ptr() as u64) {
@@ -283,7 +279,6 @@ pub fn sbi_console_write(buf: &[u8]) {
 				lateout("a0") ret,
 			);
 		}
-		// DBCN returns 0 on success, negative error code on failure.
 		if ret == 0 {
 			return;
 		}
@@ -293,7 +288,7 @@ pub fn sbi_console_write(buf: &[u8]) {
 	}
 }
 
-/// Schedule a timer interrupt at `stime_value` (absolute time in ticks).
+/// 请求设置定时器中断
 #[inline]
 #[allow(dead_code)]
 #[allow(unused)]

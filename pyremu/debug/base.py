@@ -52,6 +52,7 @@ class DebuggerBase(SharedMixinAttrs):
     各功能域作为独立 mixin 通过多重继承组合; 本类必须在 MRO 最后 (最右侧)
     以确保 ``__init__`` 优先初始化所有属性.
     """
+
     _MODE_COLORS = {"M": "red", "S": "cyan", "U": "green", "H": "yellow", "D": "magenta"}
 
     def __init__(
@@ -69,32 +70,15 @@ class DebuggerBase(SharedMixinAttrs):
         self._kernel_addr: int = 0
 
         # 外部调试符号
-        self._sym_symbols: dict[str, int] | None = {}
-        self._sym_symbols_pa: dict[str, int] = {}
-        self._sym_ranges: list[tuple[int, int, str]] = []
-        self._sym_ranges_pa: list[tuple[int, int, str]] = []
-        self._sym_load_offset: int = 0
-        self._sym_path: str | None = None
-        self._pa_to_va: dict[int, int] = {}
+        self._init_symbol_state()
 
         self._running: bool = False
         self._sigint_count: int = 0
         self._terminated: bool = False
 
-        # Pending stdin bytes — UART RX FIFO is only 8 bytes, so excess
-        # bytes from os.read() are buffered here and fed on subsequent
-        # _feed_uart_stdin calls.  Without this, fast typing / paste in
-        # rust lib will silently drop bytes beyond the 8th.
         self._stdin_pending: bytes = b""
-
-        # Stdin daemon thread — 独立于处理器执行循环, 持续将 stdin 转发到
-        # UART RX FIFO. 对照 QEMU chardev fd_chr_read_poll 模型:
-        #   stdin -> os.read -> uart.preload() -> _publish_state() -> PLIC 中断
-        #   -> _wake_event.set() -> 主线程 WFI 睡眠唤醒 -> try_wfi_wakeup()
-        # 处理器感知不到 daemon 的存在 — 它只看到 PLIC 中断信号.
         self._stdin_daemon_running: bool = False
         self._stdin_daemon_thread: threading.Thread | None = None
-
         # UART stdin 转发 — 终端 raw 模式管理
         self._stdin_forward: bool = True
         self._stdin_fd: int = sys.stdin.fileno()
@@ -117,20 +101,8 @@ class DebuggerBase(SharedMixinAttrs):
         self._trap_displayed_mcause: int | None = None
         self._last_command: str | None = None
 
-        # disasm 状态
-        self._disasm_next_addr: int | None = None
-        self._vdisasm_next_addr: int | None = None
-        self._disasm_ref_pc: int | None = None
-        self._disasm_base_step: int = 0
-        self._disasm_past_terminator: bool = False
-
-        # 断点
-        self._breakpoints: list[Breakpoint] = []
-        self._bp_mode: str = "sync"
-        self._hart_paused: set[int] = set()
-        self._bp_hit_this_run: set[tuple[str, int]] = set()
-        self._prev_instr_csr_addr: int = -1
-        self._has_non_addr_bps: bool = False  # 缓存: 是否有 Rust 不检查的 BP
+        self._init_disasm_state()
+        self._init_breakpoint_state()
 
         # 写监控
         self._watch_ranges: list[tuple[int, int]] = []
@@ -151,34 +123,47 @@ class DebuggerBase(SharedMixinAttrs):
             style=Style.from_dict(
                 {
                     "prompt": "#00aa00 bold",
-                    # 提示符前的时间戳 — 独立样式, 不与 rvdbg 提示符争色.
                     "clock": "#6c6c6c",
                     "": "#cccccc",
                 }
             ),
         )
 
-    # ----------------------------------------------------------
-    #  hart 访问
-    # ----------------------------------------------------------
+    def _init_symbol_state(self) -> None:
+        """外部调试符号、段范围与地址映射的初始状态."""
+        self._sym_symbols: dict[str, int] | None = {}
+        self._sym_symbols_pa: dict[str, int] = {}
+        self._sym_ranges: list[tuple[int, int, str]] = []
+        self._sym_ranges_pa: list[tuple[int, int, str]] = []
+        self._sym_load_offset: int = 0
+        self._sym_path: str | None = None
+        self._pa_to_va: dict[int, int] = {}
+
+    def _init_disasm_state(self) -> None:
+        self._disasm_next_addr: int | None = None
+        self._vdisasm_next_addr: int | None = None
+        self._disasm_ref_pc: int | None = None
+        self._disasm_base_step: int = 0
+        self._disasm_past_terminator: bool = False
+
+    def _init_breakpoint_state(self) -> None:
+        """断点表的初始状态."""
+        self._breakpoints: list[Breakpoint] = []
+        self._bp_mode: str = "sync"
+        self._hart_paused: set[int] = set()
+        self._bp_hit_this_run: set[tuple[str, int]] = set()
+        self._prev_instr_csr_addr: int = -1
+        self._has_non_addr_bps: bool = False  # 缓存: 是否有 Rust 不检查的 BP
 
     @property
     def hart(self) -> "Hart":
         return self._emu.harts[self._hart_id]
-
-    # ----------------------------------------------------------
-    #  输出
-    # ----------------------------------------------------------
 
     def _warn(self, msg: str) -> None:
         self._console.print(f"[yellow]警告:[/] {msg}")
 
     def _err(self, msg: str) -> None:
         self._console.print(f"[red bold]错误:[/] {msg}")
-
-    # ----------------------------------------------------------
-    #  信号处理
-    # ----------------------------------------------------------
 
     def _sigint_repl(self, _signum: int, _frame) -> None:
         raise KeyboardInterrupt
@@ -202,13 +187,11 @@ class DebuggerBase(SharedMixinAttrs):
     def _enter_run_mode(self) -> None:
         """切换到运行模式: Ctrl+Q 暂停, cbreak stdin 下 ISIG 关闭, Ctrl+C 透传.
 
-        ── TX: QEMU fd_chr_write 模型, 与单轮加速执行零耦合 ──
-        固件写 TXDATA, 随后经 Rust inline handler 调用 libc::write(1, &byte, 1).
-        每字节即时输出, _console_echo=False 抑制 Python 双重输出.
+        ── TX: 固件写 TXDATA, 随后经 Rust inline handler 调用 libc::write(1, &byte, 1).
+        每字节即时输出, _console_echo=False 抑制 Python重复输出.
 
-        ── RX: daemon 线程 select(stdin), 随后 uart.preload(), 随后 PLIC 中断 ──
-        stdin daemon 独立于处理器执行循环持续读取, 与 WFI 零耦合.
-        处理器仅看到 PLIC 外部中断信号, 由 try_wfi_wakeup() 自然唤醒.
+        ── RX: stdin daemon 独立于处理器执行循环持续读取.
+        处理器仅看到 PLIC 外部中断信号, 由 try_wfi_wakeup() 唤醒.
         """
         # 终端 ISIG 关闭后键盘 Ctrl+C (0x03) 作为普通字节透传给受调试程序, 不经信号
         # 路径; Ctrl+Q 停止由 termio 的 notify_emu_stop 直连置位 stop_flag, 同样
@@ -232,21 +215,24 @@ class DebuggerBase(SharedMixinAttrs):
             self._saved_term_attrs = termios.tcgetattr(self._stdin_fd)
             attrs = termios.tcgetattr(self._stdin_fd)
             # iflag: 清除输入转换; ICRNL 保留 (受调试程序控制台可能未初始化 \r->\n)
-            attrs[0] = (attrs[0] & ~(
-                termios.IGNBRK | termios.BRKINT | termios.PARMRK
-                | termios.ISTRIP | termios.INLCR | termios.IGNCR
-                | termios.IXON
-            )) | termios.ICRNL
-            # lflag: 清除行编辑/回显/信号生成
+            attrs[0] = (
+                attrs[0]
+                & ~(
+                    termios.IGNBRK
+                    | termios.BRKINT
+                    | termios.PARMRK
+                    | termios.ISTRIP
+                    | termios.INLCR
+                    | termios.IGNCR
+                    | termios.IXON
+                )
+            ) | termios.ICRNL
             attrs[3] &= ~(
-                termios.ECHO | termios.ECHONL | termios.ICANON
-                | termios.IEXTEN | termios.ISIG
+                termios.ECHO | termios.ECHONL | termios.ICANON | termios.IEXTEN | termios.ISIG
             )
             # cflag: 8-bit 字符
             attrs[2] = (attrs[2] & ~termios.CSIZE) | termios.CS8
-            # cflag: 关校验
             attrs[2] &= ~termios.PARENB
-            # cc: 每字节即时可读
             attrs[6][termios.VMIN] = 1
             attrs[6][termios.VTIME] = 0
             termios.tcsetattr(self._stdin_fd, termios.TCSANOW, attrs)
@@ -263,26 +249,16 @@ class DebuggerBase(SharedMixinAttrs):
         """恢复 _enter_run_mode 保存的终端属性."""
         try:
             if self._saved_term_attrs:
-                termios.tcsetattr(
-                    self._stdin_fd, termios.TCSANOW, self._saved_term_attrs
-                )
+                termios.tcsetattr(self._stdin_fd, termios.TCSANOW, self._saved_term_attrs)
                 self._saved_term_attrs = None
-        except (OSError, termios.error):
+        except OSError, termios.error:
             pass
-
-    # ----------------------------------------------------------
-    #  UART TX — REPL 模式回调 (运行模式由 Rust libc::write 直写 stdout)
-    # ----------------------------------------------------------
 
     @staticmethod
     def _uart_tx(text: str) -> None:
         """UART TX 回调: 写入 stdout 并立即刷新."""
         sys.stdout.write(text)
         sys.stdout.flush()
-
-    # ----------------------------------------------------------
-    #  Stdin daemon 线程 — 独立于处理器执行循环, 对照 QEMU fd_chr_read_poll
-    # ----------------------------------------------------------
 
     def _stdin_daemon_loop(self) -> None:
         """后台 daemon: 仅 Python 回退时使用 (termio 不可用).
@@ -298,7 +274,7 @@ class DebuggerBase(SharedMixinAttrs):
         while self._stdin_daemon_running:
             try:
                 ready, _, _ = select.select([stdin_fd], [], [], 0.02)
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 break
             if not self._stdin_daemon_running:
                 break
@@ -311,7 +287,7 @@ class DebuggerBase(SharedMixinAttrs):
             if not data:
                 break
             # Ctrl+Q -> 停止模拟, 返回 REPL
-            i = data.find(b'\x11')
+            i = data.find(b"\x11")
             if i >= 0:
                 stop_flag.value = 1
                 self._emu._wake_event.set()
@@ -332,7 +308,8 @@ class DebuggerBase(SharedMixinAttrs):
             return
         self._stdin_daemon_running = True
         self._stdin_daemon_thread = threading.Thread(
-            target=self._stdin_daemon_loop, daemon=True,
+            target=self._stdin_daemon_loop,
+            daemon=True,
         )
         self._stdin_daemon_thread.start()
 
@@ -343,10 +320,6 @@ class DebuggerBase(SharedMixinAttrs):
             self._emu._wake_event.set()  # 唤醒 select 使其检查 running 标志
             self._stdin_daemon_thread.join(timeout=1.0)
             self._stdin_daemon_thread = None
-
-    # ----------------------------------------------------------
-    #  UART stdin 转发 (主线程 select+os.read, 每单轮加速执行边界执行)
-    # ----------------------------------------------------------
 
     def _feed_uart_stdin(self) -> bool:
         """非阻塞读取 stdin 并转发到 UART RX FIFO.
@@ -366,38 +339,50 @@ class DebuggerBase(SharedMixinAttrs):
         uart = self._emu.uart
         if uart is None:
             return False
-        had_input = False
 
         # daemon 线程已在后台持续 select(stdin) -> os.read -> uart.preload;
         # 主线程不应再从同一 fd 读取, 否则产生竞争且此路径不设 ext_irq.
         # 仅处理 daemon 未完全消费的 _stdin_pending 残余.
         if self._stdin_daemon_running:
-            if not self._stdin_pending:
-                return had_input
-            try:
-                accepted = uart.preload(self._stdin_pending)
-            except (ValueError, OSError):
-                return had_input
-            if accepted > 0:
-                had_input = True
-                self._emu._native_ext_irq.pending = 1
-                self._stdin_pending = self._stdin_pending[accepted:]
-            if self._stdin_pending:
-                self._emu._wake_event.set()
-            return had_input
+            return self._feed_pending_daemon(uart)
 
+        had_input = self._feed_pending_uart(uart)
+        if had_input and self._stdin_pending:
+            return True
+        return self._read_stdin(uart, had_input)
+
+    def _feed_pending_daemon(self, uart) -> bool:
+        """守护线程运行中: 只把 _stdin_pending 残余写入 UART."""
+        if not self._stdin_pending:
+            return False
+        try:
+            accepted = uart.preload(self._stdin_pending)
+        except ValueError, OSError:
+            return False
+        if accepted > 0:
+            self._emu._native_ext_irq.pending = 1
+            self._stdin_pending = self._stdin_pending[accepted:]
         if self._stdin_pending:
-            try:
-                accepted = uart.preload(self._stdin_pending)
-            except (ValueError, OSError):
-                return had_input
-            if accepted > 0:
-                had_input = True
-                self._stdin_pending = self._stdin_pending[accepted:]
-            if self._stdin_pending:
-                self._emu._wake_event.set()
-                return True
+            self._emu._wake_event.set()
+        return accepted > 0
 
+    def _feed_pending_uart(self, uart) -> bool:
+        """把 _stdin_pending 写入 UART; 返回是否写入了字节."""
+        if not self._stdin_pending:
+            return False
+        try:
+            accepted = uart.preload(self._stdin_pending)
+        except ValueError, OSError:
+            return False
+        if accepted <= 0:
+            return False
+        self._stdin_pending = self._stdin_pending[accepted:]
+        if self._stdin_pending:
+            self._emu._wake_event.set()
+        return True
+
+    def _read_stdin(self, uart, had_input: bool) -> bool:
+        """非阻塞读一次 stdin 并写入 UART, had_input 为已写入字节的标记."""
         try:
             ready, _, _ = select.select([self._stdin_fd], [], [], 0)
         except OSError:
@@ -412,7 +397,7 @@ class DebuggerBase(SharedMixinAttrs):
             return had_input
         try:
             accepted = uart.preload(data)
-        except (ValueError, OSError):
+        except ValueError, OSError:
             return had_input
         if accepted > 0:
             had_input = True
@@ -465,20 +450,54 @@ class DebuggerBase(SharedMixinAttrs):
         self._flush_uart_if_present()
         return False
 
-    # ----------------------------------------------------------
-    #  Tab 补全
-    # ----------------------------------------------------------
-
     def _build_completer(self) -> WordCompleter:
         words: list[str] = [
-            "s", "step", "c", "continue", "r", "run",
-            "undo", "rollback", "restart", "b", "bp",
-            "regs", "gpr", "reg", "set", "w", "csr", "csrw",
-            "pc", "mode", "mstatus", "tlb", "tlbflush",
-            "cache", "satp", "pt", "mem", "vmem",
-            "status", "info", "symbols", "sym", "disasm", "vdisasm",
-            "stack", "show", "bt", "frame", "f",
-            "hart", "h", "help", "?", "q", "quit", "exit",
+            "s",
+            "step",
+            "c",
+            "continue",
+            "r",
+            "run",
+            "undo",
+            "rollback",
+            "restart",
+            "b",
+            "bp",
+            "regs",
+            "gpr",
+            "reg",
+            "set",
+            "w",
+            "csr",
+            "csrw",
+            "pc",
+            "mode",
+            "mstatus",
+            "tlb",
+            "tlbflush",
+            "cache",
+            "satp",
+            "pt",
+            "mem",
+            "vmem",
+            "status",
+            "info",
+            "symbols",
+            "sym",
+            "disasm",
+            "vdisasm",
+            "stack",
+            "show",
+            "bt",
+            "frame",
+            "f",
+            "hart",
+            "h",
+            "help",
+            "?",
+            "q",
+            "quit",
+            "exit",
         ]
         for r in register_gpr():
             words.append(r.name)
@@ -492,26 +511,17 @@ class DebuggerBase(SharedMixinAttrs):
         words.append("list")
         return WordCompleter(words, ignore_case=True, sentence=True)
 
-    # ----------------------------------------------------------
-    #  陷态上下文
-    # ----------------------------------------------------------
-
     def _show_trap_context(self, h) -> None:
         """hart trap后的上下文摘要."""
         cause = h.mcause_val
         name = trap_cause_name(cause)
         is_int = (cause >> 63) & 1
         tag = "中断" if is_int else "异常"
-        self._warn(f"Hart {h.id} 已暂停")
         self._console.print(
-            f"  [red bold]{tag}[/] {name}  "
+            f"[red bold]Hart {h.id} {tag}[/] {name}  "
             f"mcause=0x{cause:x}  mepc={hex_addr(h.mepc_val)}  "
             f"mtval={hex_addr(h.mtval_val)}"
         )
-
-    # ----------------------------------------------------------
-    #  REPL 主循环 (依赖 _dispatch — 由 DispatchMixin 提供)
-    # ----------------------------------------------------------
 
     def repl(self) -> None:
         """主交互循环."""
@@ -531,10 +541,12 @@ class DebuggerBase(SharedMixinAttrs):
         self._running = False
         while True:
             try:
-                prompt = f"[bold red]rvdb:{self._hart_id}[/]" + \
-                         f" ([cyan]{self.hart.mode.name}[/]) > "
+                prompt = (
+                    f"[bold red]rvdb:{self._hart_id}[/]"
+                    + f" ([cyan]{self.hart.mode.name}[/]) > "
+                )
                 user_input = self._session.prompt(prompt).strip()
-            except (KeyboardInterrupt, EOFError):
+            except KeyboardInterrupt, EOFError:
                 self._console.print("\n[dim]goodbye[/]")
                 break
 

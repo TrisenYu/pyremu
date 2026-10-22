@@ -22,7 +22,7 @@ mod csr {
 /// 主机上没有 S 模式页池。S 模式的页表页以进程内一块 4 KiB 对齐的静态内存充当;
 /// U 模式的物理内存由 M 模式按分区交付, 主机上没有该通路。
 mod mem {
-	use std::sync::atomic::{ AtomicU64, AtomicUsize, Ordering };
+	use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 	const POOL_PAGES: usize = 64;
 
@@ -90,7 +90,10 @@ mod println {
 
 	impl FmtBuf {
 		pub fn new() -> Self {
-			Self { buf: [0u8; 512], pos: 0 }
+			Self {
+				buf: [0u8; 512],
+				pos: 0,
+			}
 		}
 
 		pub fn as_written(&self) -> &[u8] {
@@ -118,8 +121,8 @@ macro_rules! println {
 	}};
 }
 
-#[path = "../src/mem_prim/mod.rs"]
-mod mem_prim;
+#[path = "../src/prim/mod.rs"]
+mod prim;
 
 #[path = "../src/paging.rs"]
 mod paging;
@@ -127,7 +130,7 @@ mod paging;
 #[path = "../src/elf.rs"]
 mod elf_src;
 
-use std::panic::{ catch_unwind, AssertUnwindSafe };
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::Ordering;
 
 use ecall_aux::EnclaveExited;
@@ -226,7 +229,7 @@ fn overlapping_segment_pages_terminate_enclave() {
 			vaddr: 0x2000,
 			filesz: 0x100,
 			memsz: 0x100,
-		}
+		},
 	);
 
 	assert_eq!(release_exit_code(image), Some(PAYLOAD_REJECT_EXIT_CODE));
@@ -249,7 +252,7 @@ fn touching_segment_pages_enter_the_load_path() {
 			vaddr: 0x2000,
 			filesz: 0x200,
 			memsz: 0x1000,
-		}
+		},
 	);
 
 	assert_eq!(release_exit_code(image), Some(PAYLOAD_REJECT_EXIT_CODE));

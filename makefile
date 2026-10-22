@@ -11,6 +11,7 @@ phony =
 #
 # make build-native — 编译 Rust cdylib 加速库 (pyremu/_native/libdecode.so)
 # make clean-native — 删除编译产物
+# make clean — 删除 sittim、pyremu/_native 与 custom-opensbi 的编译产物
 #
 
 # 全部变量定义集中在 configs.mk (路径/固件 flags/DISK/INITRD/ram 等)。
@@ -75,6 +76,15 @@ clean-native:
 	rm -rf $(NATIVE_DIR)/target
 phony += clean-native
 
+# 清理 sittim、pyremu/_native 与 custom-opensbi 的编译产物.
+# custom-opensbi 目录不存在时跳过该步.
+clean: clean-native
+	$(MAKE) -C $(SITTIM_DIR) clean
+ifneq ($(wildcard $(FW_SRC_DIR)),)
+	$(MAKE) -C $(FW_SRC_DIR) distclean
+endif
+phony += clean
+
 FORCE:
 phony += FORCE
 
@@ -104,8 +114,10 @@ SITTIM_SRC_DEPS := $(shell find $(SITTIM_DIR)/src -name '*.rs' 2>/dev/null)
 SITTIM_SRC_DEPS += $(SITTIM_DIR)/config.mk $(SITTIM_DIR)/Makefile $(SITTIM_DIR)/link.ld.S
 SITTIM_SRC_DEPS += $(SITTIM_DIR)/Cargo.toml $(SITTIM_DIR)/Cargo.lock
 
+# sittim 的 config.mk 不包含根目录的配置文件, 平台级取值在此经命令行传入: 经本文件构建
+# 时采用 configs.mk 的取值, 单独在 bsp/sittim 下构建时采用其 config.mk 的默认值.
 $(SITTIM_BIN): $(SITTIM_SRC_DEPS) $(SITTIM_CFG_STAMP)
-	$(MAKE) -C $(SITTIM_DIR) build
+	$(MAKE) -C $(SITTIM_DIR) build TIMER_FREQ=$(TIMER_FREQ) UART_BASE=$(UART_BASE)
 
 build-rust: $(SITTIM_BIN)
 phony += build-rust

@@ -3,7 +3,7 @@
 //! 表内存放取用器而非模块接口: 调用方取用器取得接口, 故接口在登记之后才被访问。
 //!
 //! 除取用之外, 本表还回答两个问题: 某一次故障属于哪个模块, 以及某个模块的映像在窗口内
-//! 占用了什么范围, 分别见 [`module_of`] 与 [`image_window`]。前者供故障归属使用: 模块取入
+//! 占用了什么范围。前者供故障归属使用: 模块取入
 //! 之后运行在本飞地的地址空间与栈上, 它在运行中出错时, 记录中只有故障指令地址与故障地址
 //! 两项, 归属只能按映像窗口判定。
 
@@ -154,7 +154,10 @@ pub fn begin_load(module_id: u32) -> bool {
 pub fn note_image_window(module_id: u32, va: u64, win_size: u64) -> bool {
 	let mut registry = REGISTRY.lock();
 	match registry.get_mut(module_id as usize) {
-		Some(Slot::Loading { va: slot_va, win_size: slot_win_size }) => {
+		Some(Slot::Loading {
+			va: slot_va,
+			win_size: slot_win_size,
+		}) => {
 			*slot_va = va;
 			*slot_win_size = win_size;
 			true
@@ -200,14 +203,16 @@ pub fn commit_load(module_id: u32, getter: GetterFn, va: u64, win_size: u64) -> 
 	let mut registry = REGISTRY.lock();
 	match registry.get_mut(module_id as usize) {
 		Some(slot) if matches!(slot, Slot::Loading { .. }) => {
-			*slot = Slot::LoadedModule { getter, va, win_size };
+			*slot = Slot::LoadedModule {
+				getter,
+				va,
+				win_size,
+			};
 			true
 		}
 		_ => false,
 	}
 }
-
-
 
 /// 把编号 *module_id* 的槽位归还为空闲。
 ///
@@ -227,7 +232,9 @@ mod tests {
 		abort_load, begin_load, commit_load, image_window, lookup, mark_failed, module_of,
 		note_image_window, owner_of_address, reset_slot,
 	};
-	use crate::ext_mod::abi::{GetterFn, ModuleDesc, ModuleInterface, MODULE_NAME_LEN, MAX_MODULES};
+	use crate::ext_mod::abi::{
+		GetterFn, MAX_MODULES, MODULE_NAME_LEN, ModuleDesc, ModuleInterface,
+	};
 	use crate::ext_mod::man::Manager;
 
 	/// 测试用取用器: 返回模块编号为 0、无系统调用表与操作表的接口。
@@ -352,9 +359,19 @@ mod tests {
 		reset_slot(0x13);
 		reset_slot(0x14);
 		assert!(begin_load(0x13));
-		assert!(commit_load(0x13, OTHER_GETTER, OWNED_VA_BY_SEPC, IMAGE_WIN_SIZE));
+		assert!(commit_load(
+			0x13,
+			OTHER_GETTER,
+			OWNED_VA_BY_SEPC,
+			IMAGE_WIN_SIZE
+		));
 		assert!(begin_load(0x14));
-		assert!(commit_load(0x14, OTHER_GETTER, OWNED_VA_BY_STVAL, IMAGE_WIN_SIZE));
+		assert!(commit_load(
+			0x14,
+			OTHER_GETTER,
+			OWNED_VA_BY_STVAL,
+			IMAGE_WIN_SIZE
+		));
 
 		// 两个地址分属两个模块: 取故障指令所属的模块。
 		assert_eq!(
@@ -362,7 +379,10 @@ mod tests {
 			Some(0x13)
 		);
 		// 故障指令不在任何窗口之内: 取故障地址所属的模块。
-		assert_eq!(module_of(OUTSIDE_VA, OWNED_VA_BY_STVAL + 0x1000), Some(0x14));
+		assert_eq!(
+			module_of(OUTSIDE_VA, OWNED_VA_BY_STVAL + 0x1000),
+			Some(0x14)
+		);
 		// 两个地址都不在窗口之内: 该次故障不由任何模块引起。
 		assert_eq!(module_of(OUTSIDE_VA, OUTSIDE_VA + 0x1000), None);
 	}
@@ -378,7 +398,11 @@ mod tests {
 		assert!(begin_load(0x12));
 		assert!(commit_load(0x12, OTHER_GETTER, IMAGE_VA, IMAGE_WIN_SIZE));
 		// 已登记的槽位不再接受窗口改动: 窗口由 commit_load 给出。
-		assert!(!note_image_window(0x12, IMAGE_VA + IMAGE_WIN_SIZE, IMAGE_WIN_SIZE));
+		assert!(!note_image_window(
+			0x12,
+			IMAGE_VA + IMAGE_WIN_SIZE,
+			IMAGE_WIN_SIZE
+		));
 		assert_eq!(image_window(0x12), Some((IMAGE_VA, IMAGE_WIN_SIZE)));
 	}
 

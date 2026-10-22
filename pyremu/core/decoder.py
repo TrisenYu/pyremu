@@ -54,17 +54,23 @@ from pyremu.utils.disassem import (
     AmoFunct5,
     AMOW_MAP,
     AmoWidth,
-    brFn3,
-    BRFN3_MAP,
-    ldFn3,
-    LDFN3_MAP,
-    stFn3,
-    STFN3_MAP,
+    BrFn3,
+    BrFn3_MAP,
+    LdFn3,
+    LdFn3_MAP,
+    StFn3,
+    StFn3_MAP,
 )
 from pyremu.utils.mask import (
     mask16,
+    MASK32,
     mask32,
+    MASK64,
     mask64,
+    rol32,
+    rol64,
+    ror32,
+    ror64,
     sext,
     sext8,
     sext16,
@@ -78,6 +84,7 @@ _uint64 = ctypes.c_uint64
 # Enum.__call__ 内部做线性搜索, dict.get 是 O(1) 哈希查找
 
 # 可能会有指令别名，不过那是反编译器关心的事情
+
 
 def decode_c_sdsp(half: int) -> tuple[int, int] | None:
     """If *half* is ``c.sdsp rs2, uimm(sp)``, return ``(rs2, uimm)``; else None.
@@ -94,7 +101,7 @@ def decode_c_sdsp(half: int) -> tuple[int, int] | None:
     if (half & 0xE003) != 0xE002:  # bits[15:13]=111, bits[1:0]=10
         return None
     rs2 = (half >> 2) & 0x1F
-    uimm = ((half >> 7) & 0x7) << 6   # bits[9:7]  -> uimm[8:6]
+    uimm = ((half >> 7) & 0x7) << 6  # bits[9:7]  -> uimm[8:6]
     uimm |= ((half >> 10) & 0x7) << 3  # bits[12:10] -> uimm[5:3]
     return rs2, uimm
 
@@ -113,11 +120,12 @@ def decode_sd_sp(instr: int) -> tuple[int, int] | None:
         return None
     if ((instr >> 12) & 0x7) != 0b011:  # funct3 = SD
         return None
-    if ((instr >> 15) & 0x1F) != 2:     # rs1 = sp
+    if ((instr >> 15) & 0x1F) != 2:  # rs1 = sp
         return None
     rs2 = (instr >> 20) & 0x1F
     imm = ((instr >> 25) << 5) | ((instr >> 7) & 0x1F)
-    imm = (imm << 52) >> 52  # sign-extend 12-bit
+    if imm & 0x800:  # 按有符号立即数返回, 供调用方与 sp 相加
+        imm -= 0x1000
     return rs2, imm
 
 
@@ -159,6 +167,7 @@ def _trunc_rem(a: int, b: int) -> int:
 #  Zbb (Basic bit-manipulation) 辅助函数
 # ============================================================
 
+
 def _zbb_imm(funct3: int, v: int, shamt: int) -> int:
     """Zbb OP-IMM 分发 (funct7=0x30, funct3=001 或 101).
 
@@ -172,7 +181,7 @@ def _zbb_imm(funct3: int, v: int, shamt: int) -> int:
         if shamt == 1:  # ctz
             return (v & -v).bit_length() - 1 if v else 64
         if shamt == 2:  # cpop
-            return bin(mask64(v)).count('1')
+            return bin(mask64(v)).count("1")
         if shamt == 4:  # sext.b
             byte = v & 0xFF
             return byte | (0xFFFF_FFFF_FFFF_FF00 if byte & 0x80 else 0)
@@ -181,9 +190,7 @@ def _zbb_imm(funct3: int, v: int, shamt: int) -> int:
             return hw | (0xFFFF_FFFF_FFFF_0000 if hw & 0x8000 else 0)
     elif funct3 == 0b101:
         # rori: rotate right immediate (64-bit)
-        s = shamt & 0x3F
-        v64 = mask64(v)
-        return mask64((v64 >> s) | (v64 << (64 - s))) if s else v64
+        return ror64(v, shamt)
     raise ValueError(f"invalid Zbb funct3={funct3:#b} shamt={shamt}")
 
 
@@ -202,12 +209,10 @@ def _zbb_imm32(funct3: int, v: int, shamt: int) -> int:
             r = (v32 & -v32).bit_length() - 1 if v32 else 32
             return r
         if shamt == 2:  # cpopw
-            return bin(v32).count('1')
+            return bin(v32).count("1")
     elif funct3 == 0b101:
         # roriw: rotate right 32-bit by immediate
-        s = shamt & 0x1F
-        r = mask32((v32 >> s) | (v32 << (32 - s))) if s else v32
-        return sext32(r)
+        return sext32(ror32(v32, shamt))
     raise ValueError(f"invalid Zbb imm32 funct3={funct3:#b} shamt={shamt}")
 
 
@@ -229,6 +234,20 @@ def _zbb_rev8(v: int) -> int:
     return result
 
 
+# Zbb R-type 子指令表: 键为 (funct7, funct3)
+_ZBB_ALU_OPS = {
+    (0x20, 0b111): lambda a, b: mask64(a & ~b),  # andn
+    (0x20, 0b110): lambda a, b: mask64(a | ~b),  # orn
+    (0x20, 0b100): lambda a, b: mask64(~(a ^ b)),  # xnor
+    (0x05, 0b100): lambda a, b: mask64(min(_sint64(a).value, _sint64(b).value)),  # min
+    (0x05, 0b110): lambda a, b: mask64(max(_sint64(a).value, _sint64(b).value)),  # max
+    (0x05, 0b101): lambda a, b: min(mask64(a), mask64(b)),  # minu
+    (0x05, 0b111): lambda a, b: max(mask64(a), mask64(b)),  # maxu
+    (0x30, 0b001): lambda a, b: rol64(a, _uint64(b).value),  # rol
+    (0x30, 0b101): lambda a, b: ror64(a, _uint64(b).value),  # ror
+}
+
+
 def _zbb_alu(
     funct3: int,
     funct7: int,
@@ -236,34 +255,10 @@ def _zbb_alu(
     v2: int,
 ) -> int:
     """Zbb R-type 分发 (funct7 ∈ {0x05, 0x20, 0x30})."""
-    if funct7 == 0x20:
-        if funct3 == 0b111:  # andn: rs1 & ~rs2
-            return mask64(v1 & ~v2)
-        if funct3 == 0b110:  # orn: rs1 | ~rs2
-            return mask64(v1 | ~v2)
-        if funct3 == 0b100:  # xnor: ~(rs1 ^ rs2)
-            return mask64(~(v1 ^ v2))
-    elif funct7 == 0x05:
-        s1 = _sint64(v1).value
-        s2 = _sint64(v2).value
-        if funct3 == 0b100:  # min
-            return mask64(min(s1, s2))
-        if funct3 == 0b110:  # max
-            return mask64(max(s1, s2))
-        if funct3 == 0b101:  # minu
-            return min(mask64(v1), mask64(v2))
-        if funct3 == 0b111:  # maxu
-            return max(mask64(v1), mask64(v2))
-    elif funct7 == 0x30:
-        s = _uint64(v2).value & 0x3F
-        v1m = mask64(v1)
-        if funct3 == 0b001:  # rol
-            return mask64((v1m << s) | (v1m >> (64 - s))) if s else v1m
-        if funct3 == 0b101:  # ror
-            return mask64((v1m >> s) | (v1m << (64 - s))) if s else v1m
-    raise ValueError(
-        f"invalid Zbb funct3={funct3:#b} funct7={funct7:#x}"
-    )
+    op = _ZBB_ALU_OPS.get((funct7, funct3))
+    if op is None:
+        raise ValueError(f"invalid Zbb funct3={funct3:#b} funct7={funct7:#x}")
+    return op(v1, v2)
 
 
 def _zbb_alu32(
@@ -276,17 +271,444 @@ def _zbb_alu32(
 
     结果 sign-extend 到 64-bit.
     """
-    s = _uint64(v2).value & 0x1F
-    v32 = mask32(v1)
+    s = _uint64(v2).value
     if funct3 == 0b001:  # rolw
-        r = mask32((v32 << s) | (v32 >> (32 - s))) if s else v32
-        return sext32(r)
+        return sext32(rol32(v1, s))
     if funct3 == 0b101:  # rorw
-        r = mask32((v32 >> s) | (v32 << (32 - s))) if s else v32
-        return sext32(r)
-    raise ValueError(
-        f"invalid Zbb op32 funct3={funct3:#b} funct7={funct7:#x}"
-    )
+        return sext32(ror32(v1, s))
+    raise ValueError(f"invalid Zbb op32 funct3={funct3:#b} funct7={funct7:#x}")
+
+
+# ============================================================
+#  R 型 ALU 的纯 Python 计算, 按 funct3 分组
+# ============================================================
+
+
+def _alu_py_000(funct7: int, v1: int, v2: int) -> int:
+    """funct3=000: add / mul / sub."""
+    if funct7 == 0:
+        return mask64(v1 + v2)
+    if funct7 == 1:
+        return mask64(v1 * v2)
+    if funct7 == 0x20:
+        return mask64(v1 - v2)
+    raise ValueError(f"invalid funct7={funct7:#x} for funct3=000")
+
+
+def _alu_py_001(funct7: int, v1: int, v2: int) -> int:
+    """funct3=001: sll / mulh / rol."""
+    if funct7 == 0:
+        return mask64(v1 << (v2 & 0x3F))
+    if funct7 == 1:
+        s1 = _sint64(v1).value
+        s2 = _sint64(v2).value
+        return mask64(_sint64((s1 * s2) >> 64).value)
+    if funct7 == 0x30:
+        return _zbb_alu(0b001, funct7, v1, v2)
+    raise ValueError(f"invalid funct7={funct7:#x} for funct3=001")
+
+
+def _alu_py_010(funct7: int, v1: int, v2: int) -> int:
+    """funct3=010: slt / mulhsu."""
+    if funct7 == 0:
+        return 1 if _sint64(v1).value < _sint64(v2).value else 0
+    if funct7 == 1:
+        s1 = _sint64(v1).value
+        u2 = _uint64(v2).value
+        return mask64(_sint64((s1 * u2) >> 64).value)
+    raise ValueError(f"invalid funct7={funct7:#x} for funct3=010")
+
+
+def _alu_py_011(funct7: int, v1: int, v2: int) -> int:
+    """funct3=011: sltu / mulhu."""
+    if funct7 == 0:
+        return 1 if _uint64(v1).value < _uint64(v2).value else 0
+    if funct7 == 1:
+        u1 = _uint64(v1).value
+        u2 = _uint64(v2).value
+        return mask64((u1 * u2) >> 64)
+    raise ValueError(f"invalid funct7={funct7:#x} for funct3=011")
+
+
+def _alu_py_100(funct7: int, v1: int, v2: int) -> int:
+    """funct3=100: xor / div / xnor / min."""
+    if funct7 == 0:
+        return v1 ^ v2
+    if funct7 == 1:
+        return mask64(_trunc_div(_sint64(v1).value, _sint64(v2).value))
+    return _zbb_alu(0b100, funct7, v1, v2)
+
+
+def _alu_py_101(funct7: int, v1: int, v2: int) -> int:
+    """funct3=101: srl / sra / divu / ror."""
+    if funct7 == 0:
+        return mask64(_uint64(v1).value >> (v2 & 0x3F))
+    if funct7 == 1:
+        return mask64(_trunc_div(_uint64(v1).value, _uint64(v2).value))
+    if funct7 == 0x20:
+        return mask64(_sint64(_sint64(v1).value >> (v2 & 0x3F)).value)
+    if funct7 == 0x30:
+        return _zbb_alu(0b101, funct7, v1, v2)
+    raise ValueError(f"invalid funct7={funct7:#x} for funct3=101")
+
+
+def _alu_py_110(funct7: int, v1: int, v2: int) -> int:
+    """funct3=110: or / rem / orn / max."""
+    if funct7 == 0:
+        return v1 | v2
+    if funct7 == 1:
+        return mask64(_trunc_rem(_sint64(v1).value, _sint64(v2).value))
+    return _zbb_alu(0b110, funct7, v1, v2)
+
+
+def _alu_py_111(funct7: int, v1: int, v2: int) -> int:
+    """funct3=111: and / remu / andn / maxu."""
+    if funct7 == 0:
+        return v1 & v2
+    if funct7 == 1:
+        return mask64(_trunc_rem(_uint64(v1).value, _uint64(v2).value))
+    return _zbb_alu(0b111, funct7, v1, v2)
+
+
+_ALU_PY_OPS = {
+    0b000: _alu_py_000,
+    0b001: _alu_py_001,
+    0b010: _alu_py_010,
+    0b011: _alu_py_011,
+    0b100: _alu_py_100,
+    0b101: _alu_py_101,
+    0b110: _alu_py_110,
+    0b111: _alu_py_111,
+}
+
+
+def _exec_alu_via_native(fields, v1: int, v2: int) -> int:
+    """经加速执行引擎计算 R 型 ALU 指令, Zbb 编码交由 _zbb_alu 计算."""
+    r = exec_alu_op(fields.func3, fields.func7, v1, v2)
+    if not r.trap:
+        return r.value
+    # funct7 属于 Zbb 扩展的 {0x05, 0x20, 0x30}: 加速执行引擎的 alu 辅助函数
+    # 对这些编码返回无效编码, 故在此交由 _zbb_alu 计算
+    if fields.func7 in (0x05, 0x20, 0x30):
+        return _zbb_alu(fields.func3, fields.func7, v1, v2)
+    raise ValueError(f"invalid funct3={fields.func3:#b} funct7={fields.func7:#x}")
+
+
+# ============================================================
+#  I 型立即数 ALU 的纯 Python 计算, 按 funct3 分组
+#
+#  各函数的 funct6 为 funct7 右移一位的结果; shamt 为立即数的低 6 位.
+# ============================================================
+
+
+def _op_imm_py_000(funct6: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=000: addi."""
+    return mask64(v1 + imm)
+
+
+def _op_imm_py_001(funct6: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=001: slli 与 Zbb 的 clz/ctz/cpop/sext.b/sext.h."""
+    if funct6 == 0:
+        return mask64(v1 << shamt)
+    if funct6 == 0x18:
+        # Zbb: 立即数的低 5 位选择子指令
+        return _zbb_imm(0b001, v1, shamt)
+    raise ValueError(f"invalid funct6={funct6:#x} for SLLI")
+
+
+def _op_imm_py_010(funct6: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=010: slti."""
+    return 1 if _sint64(v1).value < imm else 0
+
+
+def _op_imm_py_011(funct6: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=011: sltiu."""
+    return 1 if _uint64(v1).value < _uint64(imm).value else 0
+
+
+def _op_imm_py_100(funct6: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=100: xori."""
+    return v1 ^ imm
+
+
+def _op_imm_py_101(funct6: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=101: srli/srai 与 Zbb 的 rori/orc.b/rev8."""
+    if funct6 == 0:
+        return mask64(_uint64(v1).value >> shamt)
+    if funct6 == 0x10:
+        return mask64(_sint64(_sint64(v1).value >> shamt).value)
+    if funct6 == 0x18:
+        return _zbb_imm(0b101, v1, shamt)
+    if funct6 == 0x0A:
+        return _zbb_orc_b(v1)
+    if funct6 == 0x1A:
+        return _zbb_rev8(v1)
+    raise ValueError(f"invalid funct6={funct6:#x} for SRLI/SRAI")
+
+
+def _op_imm_py_110(funct6: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=110: ori."""
+    return v1 | imm
+
+
+def _op_imm_py_111(funct6: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=111: andi."""
+    return v1 & imm
+
+
+_OP_IMM_PY_OPS = {
+    0b000: _op_imm_py_000,
+    0b001: _op_imm_py_001,
+    0b010: _op_imm_py_010,
+    0b011: _op_imm_py_011,
+    0b100: _op_imm_py_100,
+    0b101: _op_imm_py_101,
+    0b110: _op_imm_py_110,
+    0b111: _op_imm_py_111,
+}
+
+
+def _exec_op_imm_via_native(fields, v1: int) -> int:
+    """经加速执行引擎计算 I 型立即数 ALU 指令, Zbb 编码交由 _zbb_imm 计算."""
+    r = exec_op_imm(fields.func3, fields.func7, v1, fields.imm12_se)
+    if not r.trap:
+        return r.value
+    # funct7 属于 Zbb 扩展的 0x30: 加速执行引擎的 alu 辅助函数对该编码返回
+    # 无效编码, 故在此交由 _zbb_imm 计算
+    if fields.func7 != 0x30:
+        raise ValueError(f"invalid funct3={fields.func3:#b} funct7={fields.func7:#x}")
+    return _zbb_imm(fields.func3, v1, fields.imm12_se & 0x3F)
+
+
+# ============================================================
+#  RV64 32 位字运算的纯 Python 计算, 按 funct3 分组
+#
+#  各函数收到的 v1 与 v2 已截断为 32 位.
+# ============================================================
+
+
+def _op32_py_000(funct7: int, v1: int, v2: int) -> int:
+    """funct3=000: addw / mulw / subw."""
+    if funct7 == 0:
+        return sext32(mask32(v1 + v2))
+    if funct7 == 1:
+        return sext32(mask32(v1 * v2))
+    if funct7 == 0x20:
+        return sext32(mask32(v1 - v2))
+    raise ValueError(f"invalid funct7={funct7:#x} for op32 funct3=000")
+
+
+def _op32_py_001(funct7: int, v1: int, v2: int) -> int:
+    """funct3=001: sllw / mulw 的高 32 位 / rolw."""
+    if funct7 == 0:
+        return sext32(mask32(v1 << (v2 & 0x1F)))
+    if funct7 == 1:
+        s1 = _sint64(sext32(v1)).value
+        s2 = _sint64(sext32(v2)).value
+        return mask64(_sint64((s1 * s2) >> 32).value)
+    if funct7 == 0x30:
+        return _zbb_alu32(0b001, funct7, v1, v2)
+    raise ValueError(f"invalid funct7={funct7:#x} for op32 funct3=001")
+
+
+def _op32_py_010(funct7: int, v1: int, v2: int) -> int:
+    """funct3=010: sltw / mulhsuw."""
+    if funct7 == 0:
+        return 1 if _sint64(sext32(v1)).value < _sint64(sext32(v2)).value else 0
+    if funct7 == 1:
+        s1 = _sint64(sext32(v1)).value
+        u2 = _uint64(v2).value
+        return mask64(_sint64((s1 * u2) >> 32).value)
+    raise ValueError(f"invalid funct7={funct7:#x} for op32 funct3=010")
+
+
+def _op32_py_011(funct7: int, v1: int, v2: int) -> int:
+    """funct3=011: sltuw / mulhuw."""
+    if funct7 == 0:
+        return 1 if v1 < v2 else 0
+    if funct7 == 1:
+        return mask64((v1 * v2) >> 32)
+    raise ValueError(f"invalid funct7={funct7:#x} for op32 funct3=011")
+
+
+def _op32_py_100(funct7: int, v1: int, v2: int) -> int:
+    """funct3=100: xorw / divw."""
+    if funct7 == 0:
+        return sext32(mask32(v1 ^ v2))
+    if funct7 == 1:
+        return sext32(mask32(_trunc_div(_sint64(sext32(v1)).value, _sint64(sext32(v2)).value)))
+    raise ValueError(f"invalid funct7={funct7:#x} for op32 funct3=100")
+
+
+def _op32_py_101(funct7: int, v1: int, v2: int) -> int:
+    """funct3=101: srlw / sraw / divuw / rorw."""
+    if funct7 == 0:
+        return sext32(mask32(v1 >> (v2 & 0x1F)))
+    if funct7 == 1:
+        return sext32(mask32(_trunc_div(v1, v2)))
+    if funct7 == 0x20:
+        return sext32(mask32(_sint64(sext32(v1) >> (v2 & 0x1F)).value))
+    if funct7 == 0x30:
+        return _zbb_alu32(0b101, funct7, v1, v2)
+    raise ValueError(f"invalid funct7={funct7:#x} for op32 funct3=101")
+
+
+def _op32_py_110(funct7: int, v1: int, v2: int) -> int:
+    """funct3=110: orw / remw."""
+    if funct7 == 0:
+        return sext32(mask32(v1 | v2))
+    if funct7 == 1:
+        return sext32(mask32(_trunc_rem(_sint64(sext32(v1)).value, _sint64(sext32(v2)).value)))
+    raise ValueError(f"invalid funct7={funct7:#x} for op32 funct3=110")
+
+
+def _op32_py_111(funct7: int, v1: int, v2: int) -> int:
+    """funct3=111: andw / remuw."""
+    if funct7 == 0:
+        return sext32(mask32(v1 & v2))
+    if funct7 == 1:
+        return sext32(mask32(_trunc_rem(v1, v2)))
+    raise ValueError(f"invalid funct7={funct7:#x} for op32 funct3=111")
+
+
+_OP32_PY_OPS = {
+    0b000: _op32_py_000,
+    0b001: _op32_py_001,
+    0b010: _op32_py_010,
+    0b011: _op32_py_011,
+    0b100: _op32_py_100,
+    0b101: _op32_py_101,
+    0b110: _op32_py_110,
+    0b111: _op32_py_111,
+}
+
+
+def _exec_op32_via_native(fields, v1: int, v2: int) -> int:
+    """经加速执行引擎计算 RV64 32 位字运算指令, Zbb 编码交由 _zbb_alu32 计算."""
+    r = exec_op32(fields.func3, fields.func7, v1, v2)
+    if not r.trap:
+        return r.value
+    # funct7 属于 Zbb 扩展的 0x30 且 funct3 为 001 或 101: 加速执行引擎的
+    # alu 辅助函数对这些编码返回无效编码, 故在此交由 _zbb_alu32 计算
+    if fields.func7 == 0x30 and fields.func3 in (0b001, 0b101):
+        return _zbb_alu32(fields.func3, fields.func7, v1, v2)
+    raise ValueError(f"invalid funct3={fields.func3:#b} funct7={fields.func7:#x}")
+
+
+# ============================================================
+#  I 型 32 位字立即数运算的纯 Python 计算, 按 funct3 分组
+# ============================================================
+
+
+def _op_imm32_py_000(funct7: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=000: addiw."""
+    return sext32(mask32(v1 + imm))
+
+
+def _op_imm32_py_001(funct7: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=001: slliw 与 Zbb 的 clzw/ctzw/cpopw."""
+    if funct7 == 0:
+        return sext32(mask32(mask32(v1) << shamt))
+    if funct7 == 0x30:
+        return _zbb_imm32(0b001, v1, shamt)
+    raise ValueError(f"invalid funct7={funct7:#x} for SLLIW")
+
+
+def _op_imm32_py_101(funct7: int, v1: int, imm: int, shamt: int) -> int:
+    """funct3=101: srliw/sraiw 与 Zbb 的 roriw."""
+    if funct7 == 0:
+        return sext32(mask32(mask32(v1) >> shamt))
+    if funct7 == 0x20:
+        return sext32(mask32(_sint64(sext32(mask32(v1)) >> shamt).value))
+    if funct7 == 0x30:
+        return _zbb_imm32(0b101, v1, shamt)
+    raise ValueError(f"invalid funct7={funct7:#x} for SRLIW/SRAIW")
+
+
+_OP_IMM32_PY_OPS = {
+    0b000: _op_imm32_py_000,
+    0b001: _op_imm32_py_001,
+    0b101: _op_imm32_py_101,
+}
+
+
+def _op_imm32_py(func3: int, funct7: int, v1: int, imm: int, shamt: int) -> int:
+    """按 funct3 分发 I 型 32 位字立即数运算."""
+    op = _OP_IMM32_PY_OPS.get(func3)
+    if op is None:
+        raise ValueError(f"invalid funct3={func3:#x} for op_imm32")
+    return op(funct7, v1, imm, shamt)
+
+
+def _exec_op_imm32_via_native(fields, v1: int) -> int:
+    """经加速执行引擎计算 I 型 32 位字立即数运算, Zbb 编码交由 _zbb_imm32 计算."""
+    r = exec_op_imm32(fields.func3, fields.func7, v1, fields.imm12_se)
+    if not r.trap:
+        return r.value
+    # funct7 属于 Zbb 扩展的 0x30: 加速执行引擎的 alu 辅助函数对该编码返回
+    # 无效编码, 故在此交由 _zbb_imm32 计算
+    if fields.func7 != 0x30:
+        raise ValueError(f"invalid funct3={fields.func3:#b} funct7={fields.func7:#x}")
+    return _zbb_imm32(fields.func3, v1, fields.imm12_se & 0x1F)
+
+
+_LD_READ_SIZE = {
+    LdFn3.lb: 1,
+    LdFn3.lbu: 1,
+    LdFn3.lh: 2,
+    LdFn3.lhu: 2,
+    LdFn3.lw: 4,
+    LdFn3.lwu: 4,
+    LdFn3.ld: 8,
+}
+
+_LD_SIGN_EXTEND = {
+    LdFn3.lb: sext8,
+    LdFn3.lh: sext16,
+    LdFn3.lw: sext32,
+}
+
+
+def _load_value(kind: LdFn3, mem: bytes) -> int:
+    """按加载指令的宽度解码内存字节, 有符号形式做符号扩展."""
+    raw = int.from_bytes(mem, "little")
+    extend = _LD_SIGN_EXTEND.get(kind)
+    return raw if extend is None else extend(raw)
+
+
+def _amo_width(width: AmoWidth) -> tuple[int, int]:
+    """返回该 AMO 宽度的字节数与位掩码."""
+    return (8, MASK64) if width == AmoWidth.D else (4, MASK32)
+
+
+def _amo_signed(val: int, width: AmoWidth) -> int:
+    """按 AMO 宽度做符号扩展后取有符号值."""
+    return _sint64(sext(val, 64 if width == AmoWidth.D else 32)).value
+
+
+def _amo_result(op: AmoFunct5, mem_val: int, op_val: int, width: AmoWidth, mask: int) -> int:
+    """按 AMO 子操作计算写回内存的新值."""
+    if op == AmoFunct5.SWAP:
+        result = op_val
+    elif op == AmoFunct5.ADD:
+        result = (mem_val + op_val) & mask
+    elif op == AmoFunct5.XOR:
+        result = mem_val ^ op_val
+    elif op == AmoFunct5.AND:
+        result = mem_val & op_val
+    elif op == AmoFunct5.OR:
+        result = mem_val | op_val
+    elif op == AmoFunct5.MIN:
+        result = min(op_val, mem_val, key=lambda v: _amo_signed(v, width))
+    elif op == AmoFunct5.MAX:
+        result = max(op_val, mem_val, key=lambda v: _amo_signed(v, width))
+    elif op == AmoFunct5.MINU:
+        result = op_val if op_val < mem_val else mem_val
+    elif op == AmoFunct5.MAXU:
+        result = op_val if op_val > mem_val else mem_val
+    else:
+        raise ValueError(f"unhandled AMO op: {op}")
+    return result & mask
 
 
 def _flush_tlbs(origin, vpn: int | None, all_harts: HartGroup | None) -> None:
@@ -301,7 +723,7 @@ def _flush_tlbs(origin, vpn: int | None, all_harts: HartGroup | None) -> None:
     if vpn is None:
         origin.itlb.flush_all()
         origin.dtlb.flush_all()
-        for h in (all_harts or []):
+        for h in all_harts or []:
             if h is origin:
                 continue
             h.itlb.flush_all()
@@ -309,38 +731,413 @@ def _flush_tlbs(origin, vpn: int | None, all_harts: HartGroup | None) -> None:
         return
     origin.itlb.flush(vpn)
     origin.dtlb.flush(vpn)
-    for h in (all_harts or []):
+    for h in all_harts or []:
         if h is origin:
             continue
         h.itlb.flush(vpn)
         h.dtlb.flush(vpn)
 
 
+# ---------------------------------------------------------------
+#  系统指令辅助
+# ---------------------------------------------------------------
+
+
+def _sys_ecall(hart: HartWithRegs, instr: int) -> None:
+    """ECALL."""
+    trap_ecall(hart)
+
+
+def _sys_ebreak(hart: HartWithRegs, instr: int) -> None:
+    """EBREAK."""
+    trap_ebreak(hart)
+
+
+def _sys_mret(hart: HartWithRegs, instr: int) -> None:
+    """MRET."""
+    trap_mret(hart)
+
+
+def _sys_sret(hart: HartWithRegs, instr: int) -> None:
+    """SRET."""
+    trap_sret(hart)
+
+
+def _sys_sfence_vma(hart: HartWithRegs, instr: int) -> None:
+    """SFENCE.VMA: rs1=x0 时刷新全部 TLB, 否则仅刷新该虚地址对应的条目.
+
+    刷新同步到全部 hart. RISC-V 只要求刷新本 hart, 扩大范围不影响正确性,
+    且省去核间中断.
+    """
+    rs1 = hart._f.rs1
+    vpn = None if rs1 == 0 else hart.gprs[rs1] >> 12
+    _flush_tlbs(hart, vpn, hart._all_harts)
+
+
+def _sys_mfence_did(hart: HartWithRegs, instr: int) -> None:
+    """MFENCE.DID: 按内存域刷新全部 hart 的 TLB 与共享 L2 缓存."""
+    mdid_val = hart.mdid_val
+    for h in hart._all_harts or [hart]:
+        h.itlb.flush_by_mdid(mdid_val)
+        h.dtlb.flush_by_mdid(mdid_val)
+    # 加速执行引擎按页号与内存域查询条目, 无按域刷新的入口, 故整表作废.
+    hart.note_tlb_flush()
+    # 刷新共享 L2 缓存中匹配的条目
+    if hart._bus is not None:
+        l2 = getattr(hart._bus, "_l2", None)
+        if l2 is not None:
+            l2.flush_by_mdid(mdid_val)
+
+
+_SYS_PRIV_OPS = {
+    0x000: _sys_ecall,
+    0x001: _sys_ebreak,
+    0x302: _sys_mret,
+    0x102: _sys_sret,
+    0x105: handle_wfi,
+    0x120: _sys_sfence_vma,
+    0x5A0: _sys_mfence_did,
+}
+
+# CSR 指令: funct3 -> (新值算法, 是否按源操作数是否为零决定写入)
+_CSR_OPS = {
+    0b001: (lambda old, src: src, False),  # CSRRW
+    0b010: (lambda old, src: old | src, True),  # CSRRS
+    0b011: (lambda old, src: old & ~src, True),  # CSRRC
+    0b101: (lambda old, src: src, False),  # CSRRWI
+    0b110: (lambda old, src: old | src, True),  # CSRRSI
+    0b111: (lambda old, src: old & ~src, True),  # CSRRCI
+}
+
+# ---------------------------------------------------------------
+#  压缩指令辅助
+# ---------------------------------------------------------------
+
+
+def _c0_addi4spn(hart: HartWithRegs, cf, instr: int) -> int:
+    """C.ADDI4SPN: rd' = sp + nzuimm, nzuimm 为 0 属保留编码."""
+    if cf.imm == 0:
+        deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
+        return 0
+    hart.gprs[cf.rd] = mask64(hart.gprs[2] + cf.imm)
+    return 2
+
+
+def _c0_mem_addr(hart: HartWithRegs, cf) -> int:
+    """C0 访存地址: rs1' + uimm."""
+    return mask64(hart.gprs[cf.rs1p] + cf.imm)
+
+
+def _c0_fld(hart: HartWithRegs, cf) -> int:
+    """C.FLD: fpr[rd'] = mem[rs1' + uimm]."""
+    if not hart._fp_enabled():
+        raise ValueError("C.FLD: FP disabled (mstatus.FS=Off)")
+    addr = _c0_mem_addr(hart, cf)
+    saved_pc = hart.pc
+    mem = mem_read(hart, addr, 8)
+    if hart.pc != saved_pc:
+        return 0
+    hart._fpr_bits[cf.rd] = int.from_bytes(mem, "little")
+    hart._fp_mark_dirty()
+    return 2
+
+
+def _c0_lw(hart: HartWithRegs, cf) -> int:
+    """C.LW: rd' = sext32(mem[rs1' + uimm])."""
+    addr = _c0_mem_addr(hart, cf)
+    saved_pc = hart.pc
+    mem = mem_read(hart, addr, 4)
+    if hart.pc != saved_pc:
+        return 0
+    hart.gprs[cf.rd] = sext32(int.from_bytes(mem, "little"))
+    return 2
+
+
+def _c0_ld(hart: HartWithRegs, cf) -> int:
+    """C.LD: rd' = mem[rs1' + uimm]."""
+    addr = _c0_mem_addr(hart, cf)
+    saved_pc = hart.pc
+    mem = mem_read(hart, addr, 8)
+    if hart.pc != saved_pc:
+        return 0
+    hart.gprs[cf.rd] = int.from_bytes(mem, "little")
+    return 2
+
+
+def _c0_sw(hart: HartWithRegs, cf) -> int:
+    """C.SW: mem[rs1' + uimm] = rs2'[31:0]."""
+    addr = _c0_mem_addr(hart, cf)
+    data = mask32(hart.gprs[cf.rdp]).to_bytes(4, "little")
+    saved_pc = hart.pc
+    mem_write(hart, addr, data)
+    return 0 if hart.pc != saved_pc else 2
+
+
+def _c0_sd(hart: HartWithRegs, cf) -> int:
+    """C.SD: mem[rs1' + uimm] = rs2'."""
+    addr = _c0_mem_addr(hart, cf)
+    data = hart.gprs[cf.rdp].to_bytes(8, "little")
+    saved_pc = hart.pc
+    mem_write(hart, addr, data)
+    return 0 if hart.pc != saved_pc else 2
+
+
+def _c0_fsd(hart: HartWithRegs, cf) -> int:
+    """C.FSD: mem[rs1' + uimm] = fpr[rd']."""
+    if not hart._fp_enabled():
+        raise ValueError("C.FSD: FP disabled (mstatus.FS=Off)")
+    addr = _c0_mem_addr(hart, cf)
+    data = hart._fpr_bits[cf.rd].to_bytes(8, "little")
+    saved_pc = hart.pc
+    mem_write(hart, addr, data)
+    if hart.pc != saved_pc:
+        return 0
+    hart._fp_mark_dirty()
+    return 2
+
+
+_C0_OPS = {
+    0b001: _c0_fld,
+    0b010: _c0_lw,
+    0b011: _c0_ld,
+    0b101: _c0_fsd,
+    0b110: _c0_sw,
+    0b111: _c0_sd,
+}
+
+
+def _c1_shamt(cf) -> int:
+    """C.SRLI/C.SRAI/C.ANDI 的 6 位立即数, 由 bit12 与 bits[6:2] 组成."""
+    return (cf.bit12 << 5) | (cf.rs2 & 0x1F)
+
+
+def _c1_addi(hart: HartWithRegs, instr: int) -> int:
+    """C.ADDI: rd += imm."""
+    cf = hart._cf
+    hart.gprs[cf.rd] = mask64(hart.gprs[cf.rd] + cf.imm)
+    return 2
+
+
+def _c1_addiw(hart: HartWithRegs, instr: int) -> int:
+    """C.ADDIW: rd = sext32(rd + imm)."""
+    cf = hart._cf
+    hart.gprs[cf.rd] = sext32(mask32(hart.gprs[cf.rd] + cf.imm))
+    return 2
+
+
+def _c1_li(hart: HartWithRegs, instr: int) -> int:
+    """C.LI: rd = imm."""
+    cf = hart._cf
+    hart.gprs[cf.rd] = mask64(cf.imm)
+    return 2
+
+
+def _c1_lui_or_addi16sp(hart: HartWithRegs, instr: int) -> int:
+    """C.LUI (rd≠2) 或 C.ADDI16SP (rd=2), nzuimm 为 0 属保留编码."""
+    cf = hart._cf
+    if cf.rd == 2:
+        if cf.imm == 0:
+            raise ValueError("C.ADDI16SP: nzuimm must be non-zero")
+        hart.gprs[2] = mask64(hart.gprs[2] + cf.imm)
+    else:
+        if cf.imm == 0:
+            raise ValueError("C.LUI: nzuimm must be non-zero")
+        hart.gprs[cf.rd] = mask64(cf.imm << 12)
+    return 2
+
+
+def _c1_j(hart: HartWithRegs, instr: int) -> int:
+    """C.J: pc += offset."""
+    hart.pc = mask64(hart.pc + hart._cf.imm)
+    return 0
+
+
+def _c1_branch(hart: HartWithRegs, is_eqz: bool) -> int:
+    """C.BEQZ 与 C.BNEZ 的公共部分, is_eqz 为真时按 rs1' == 0 取跳转条件."""
+    cf = hart._cf
+    if (hart.gprs[cf.rs1p] == 0) == is_eqz:
+        hart.pc = mask64(hart.pc + cf.imm)
+        return 0
+    return 2
+
+
+def _c1_beqz(hart: HartWithRegs, instr: int) -> int:
+    """C.BEQZ: rs1' == 0 时跳转."""
+    return _c1_branch(hart, True)
+
+
+def _c1_bnez(hart: HartWithRegs, instr: int) -> int:
+    """C.BNEZ: rs1' != 0 时跳转."""
+    return _c1_branch(hart, False)
+
+
+_C1_ALU_REGS = {
+    0b00: lambda a, b: mask64(a - b),  # C.SUB
+    0b01: lambda a, b: a ^ b,  # C.XOR
+    0b10: lambda a, b: a | b,  # C.OR
+    0b11: lambda a, b: a & b,  # C.AND
+}
+
+_C1_OPS = {
+    0b000: _c1_addi,
+    0b001: _c1_addiw,
+    0b010: _c1_li,
+    0b011: _c1_lui_or_addi16sp,
+    0b100: lambda hart, instr: hart._handle_compressed_c1_alu(),
+    0b101: _c1_j,
+    0b110: _c1_beqz,
+    0b111: _c1_bnez,
+}
+
+
+def _sp_addr(hart: HartWithRegs, uimm: int) -> int:
+    """栈指针相对的访存地址."""
+    return mask64(hart.gprs[2] + uimm)
+
+
+def _c2_slli(hart: HartWithRegs, instr: int) -> int:
+    """C.SLLI: rd <<= shamt."""
+    cf = hart._cf
+    hart.gprs[cf.rd] = mask64(hart.gprs[cf.rd] << cf.imm)
+    return 2
+
+
+def _c2_fldsp(hart: HartWithRegs, instr: int) -> int:
+    """C.FLDSP: fpr[rd] = mem[sp + uimm]."""
+    if not hart._fp_enabled():
+        raise ValueError("C.FLDSP: FP disabled (mstatus.FS=Off)")
+    cf = hart._cf
+    addr = _sp_addr(hart, cf.imm)
+    saved_pc = hart.pc
+    mem = mem_read(hart, addr, 8)
+    if hart.pc != saved_pc:
+        return 0
+    hart._fpr_bits[cf.rd] = int.from_bytes(mem, "little")
+    hart._fp_mark_dirty()
+    return 2
+
+
+def _c2_lwsp(hart: HartWithRegs, instr: int) -> int:
+    """C.LWSP: rd = sext32(mem[sp + uimm])."""
+    cf = hart._cf
+    if cf.rd == 0:
+        raise ValueError("C.LWSP rd=0 (reserved)")
+    addr = _sp_addr(hart, cf.imm)
+    saved_pc = hart.pc
+    mem = mem_read(hart, addr, 4)
+    if hart.pc != saved_pc:
+        return 0
+    hart.gprs[cf.rd] = sext32(int.from_bytes(mem, "little"))
+    return 2
+
+
+def _c2_ldsp(hart: HartWithRegs, instr: int) -> int:
+    """C.LDSP: rd = mem[sp + uimm]."""
+    cf = hart._cf
+    if cf.rd == 0:
+        raise ValueError("C.LDSP rd=0 (reserved)")
+    addr = _sp_addr(hart, cf.imm)
+    saved_pc = hart.pc
+    mem = mem_read(hart, addr, 8)
+    if hart.pc != saved_pc:
+        return 0
+    hart.gprs[cf.rd] = int.from_bytes(mem, "little")
+    return 2
+
+
+def _c2_jump_or_mv(hart: HartWithRegs, instr: int) -> int:
+    """funct3=100: C.JR / C.JALR / C.MV / C.ADD / C.EBREAK, 由 bit12 与 rs2 区分."""
+    cf = hart._cf
+    rd_rs1 = cf.rd  # C.JR/C.JALR 的 rs1, C.MV/C.ADD 的 rd
+    rs2 = cf.rs2
+    if rd_rs1 == 0 and rs2 == 0:
+        trap_ebreak(hart)
+        return 0
+    if rs2 == 0:
+        # 先读跳转目标, rd_rs1 可能为 x1 并在随后被写入
+        target = hart.gprs[rd_rs1]
+        if cf.bit12:
+            hart.gprs[1] = mask64(hart.pc + 2)
+        hart.pc = mask64(target & ~1)
+        return 0
+    if cf.bit12:
+        hart.gprs[rd_rs1] = mask64(hart.gprs[rd_rs1] + hart.gprs[rs2])
+    else:
+        hart.gprs[rd_rs1] = hart.gprs[rs2]
+    return 2
+
+
+def _c2_fsdsp(hart: HartWithRegs, instr: int) -> int:
+    """C.FSDSP: mem[sp + uimm] = fpr[rs2]."""
+    if not hart._fp_enabled():
+        raise ValueError("C.FSDSP: FP disabled (mstatus.FS=Off)")
+    cf = hart._cf
+    addr = _sp_addr(hart, cf.imm2)
+    data = hart._fpr_bits[cf.rs2].to_bytes(8, "little")
+    saved_pc = hart.pc
+    mem_write(hart, addr, data)
+    if hart.pc != saved_pc:
+        return 0
+    hart._fp_mark_dirty()
+    return 2
+
+
+def _c2_swsp(hart: HartWithRegs, instr: int) -> int:
+    """C.SWSP: mem[sp + uimm] = rs2[31:0]."""
+    cf = hart._cf
+    addr = _sp_addr(hart, cf.imm2)
+    data = mask32(hart.gprs[cf.rs2]).to_bytes(4, "little")
+    saved_pc = hart.pc
+    mem_write(hart, addr, data)
+    return 0 if hart.pc != saved_pc else 2
+
+
+def _c2_sdsp(hart: HartWithRegs, instr: int) -> int:
+    """C.SDSP: mem[sp + uimm] = rs2."""
+    cf = hart._cf
+    addr = _sp_addr(hart, cf.imm2)
+    data = hart.gprs[cf.rs2].to_bytes(8, "little")
+    saved_pc = hart.pc
+    mem_write(hart, addr, data)
+    return 0 if hart.pc != saved_pc else 2
+
+
+_C2_OPS = {
+    0b000: _c2_slli,
+    0b001: _c2_fldsp,
+    0b010: _c2_lwsp,
+    0b011: _c2_ldsp,
+    0b100: _c2_jump_or_mv,
+    0b101: _c2_fsdsp,
+    0b110: _c2_swsp,
+    0b111: _c2_sdsp,
+}
+
 
 class Hart(HartWithRegs):
     # 32-bit 指令分发表: opcode 映射到处理方法名, 索引取值为整数 0 到 127, 分发复杂度为 O(1)
     _DISPATCH: dict[int, str] = {
-        0b01100_11: "handle_alu",       # Opc.op
-        0b00100_11: "handle_op_imm",    # Opc.opImm
-        0b00110_11: "handle_op_imm32",  # Opc.opImm32
-        0b01110_11: "handle_op32",      # Opc.op32
-        0b00000_11: "handle_ld",        # Opc.ld
-        0b01000_11: "handle_st",        # Opc.st
-        0b11000_11: "handle_br",        # Opc.br
-        0b11001_11: "handle_jalr",      # Opc.jalr
-        0b11011_11: "_handle_jal",      # Opc.jal
-        0b01101_11: "_handle_lui",      # Opc.lui
-        0b00101_11: "_handle_auipc",    # Opc.auipc
-        0b11100_11: "handle_sys",       # Opc.sys
-        0b00011_11: "handle_fence",     # Opc.fence
-        0b01011_11: "handle_amo",       # Opc.amo
-        0b00001_11: "handle_fp_load",   # Opc.opfp (FLW/FLD)
+        0b01100_11: "handle_alu",  # Opc.op
+        0b00100_11: "handle_op_imm",  # Opc.op_imm
+        0b00110_11: "handle_op_imm32",  # Opc.op_imm32
+        0b01110_11: "handle_op32",  # Opc.op32
+        0b00000_11: "handle_ld",  # Opc.ld
+        0b01000_11: "handle_st",  # Opc.st
+        0b11000_11: "handle_br",  # Opc.br
+        0b11001_11: "handle_jalr",  # Opc.jalr
+        0b11011_11: "_handle_jal",  # Opc.jal
+        0b01101_11: "_handle_lui",  # Opc.lui
+        0b00101_11: "_handle_auipc",  # Opc.auipc
+        0b11100_11: "handle_sys",  # Opc.sys
+        0b00011_11: "handle_fence",  # Opc.fence
+        0b01011_11: "handle_amo",  # Opc.amo
+        0b00001_11: "handle_fp_load",  # Opc.ld_fp (FLW/FLD)
         0b01001_11: "handle_fp_store",  # Opc.stfp (FSW/FSD)
-        0b10100_11: "handle_fp_op",     # Opc.opFp (OP-FP)
-        0b10000_11: "handle_fp_fma",    # Opc.fmadd
-        0b10001_11: "handle_fp_fma",    # Opc.fmsub
-        0b10010_11: "handle_fp_fma",    # Opc.fnmsub
-        0b10011_11: "handle_fp_fma",    # Opc.fnmadd
+        0b10100_11: "handle_fp_op",  # Opc.fp_op (OP-FP)
+        0b10000_11: "handle_fp_fma",  # Opc.fmadd
+        0b10001_11: "handle_fp_fma",  # Opc.fmsub
+        0b10010_11: "handle_fp_fma",  # Opc.fnmsub
+        0b10011_11: "handle_fp_fma",  # Opc.fnmadd
     }
 
     # ----------------------------------------------------------
@@ -350,165 +1147,26 @@ class Hart(HartWithRegs):
         """执行 R 型 ALU 指令."""
         f = self._f
         v1, v2 = self.gprs[f.rs1], self.gprs[f.rs2]
-
         if native_available():
-            r = exec_alu_op(f.func3, f.func7, v1, v2)
-            if not r.trap:
-                self.gprs[f.rd] = r.value
-                return 4
-            # funct7 属于 Zbb 扩展的 {0x05, 0x20, 0x30}: 加速执行引擎的 alu 辅助
-            # 函数对这些编码返回无效编码, 故在此交由 _zbb_alu 计算
-            if f.func7 in (0x05, 0x20, 0x30):
-                result = _zbb_alu(f.func3, f.func7, v1, v2)
-                if f.rd != 0:
-                    self.gprs[f.rd] = result
-                return 4
-            raise ValueError(
-                f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
-            )
-
-        part1, part2 = f.func3, f.func7
-        if part1 == 0b000:
-            if part2 == 0:
-                result = mask64((v1 + v2))
-            elif part2 == 1:
-                result = mask64((v1 * v2))
-            elif part2 == 0x20:
-                result = mask64((v1 - v2))
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for funct3=000")
-        elif part1 == 0b001:
-            if part2 == 0:
-                result = mask64((v1 << (v2 & 0x3F)))
-            elif part2 == 1:
-                s1 = _sint64(v1).value
-                s2 = _sint64(v2).value
-                result = mask64(_sint64((s1 * s2) >> 64).value)
-            elif part2 == 0x30:
-                result = _zbb_alu(part1, part2, v1, v2)  # Zbb: rol
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for funct3=001")
-        elif part1 == 0b010:
-            if part2 == 0:
-                result = 1 if _sint64(v1).value < _sint64(v2).value else 0
-            elif part2 == 1:
-                s1 = _sint64(v1).value
-                u2 = _uint64(v2).value
-                result = mask64(_sint64((s1 * u2) >> 64).value)
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for funct3=010")
-        elif part1 == 0b011:
-            if part2 == 0:
-                result = 1 if _uint64(v1).value < _uint64(v2).value else 0
-            elif part2 == 1:
-                u1 = _uint64(v1).value
-                u2 = _uint64(v2).value
-                result = mask64(((u1 * u2) >> 64))
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for funct3=011")
-        elif part1 == 0b100:
-            if part2 not in {0, 1}:
-                # Zbb: xnor (0x20), min (0x05)
-                result = _zbb_alu(part1, part2, v1, v2)
-            else:
-                result = v1 ^ v2
-                if part2 == 1:
-                    result = mask64(_trunc_div(_sint64(v1).value, _sint64(v2).value))
-        elif part1 == 0b101:
-            if part2 == 0:
-                result = mask64((_uint64(v1).value >> (v2 & 0x3F)))
-            elif part2 == 1:
-                result = mask64(_trunc_div(_uint64(v1).value, _uint64(v2).value))
-            elif part2 == 0x20:
-                result = mask64(_sint64(_sint64(v1).value >> (v2 & 0x3F)).value)
-            elif part2 == 0x30:
-                result = _zbb_alu(part1, part2, v1, v2)  # Zbb: ror
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for funct3=101")
-        elif part1 == 0b110:
-            if part2 not in {0, 1}:
-                # Zbb: orn (0x20), max (0x05)
-                result = _zbb_alu(part1, part2, v1, v2)
-            else:
-                result = v1 | v2
-                if part2 == 1:
-                    result = mask64(_trunc_rem(_sint64(v1).value, _sint64(v2).value))
-        elif part2 not in {0, 1}: # part1 == 0b111
-            # Zbb: andn (0x20), maxu (0x05)
-            result = _zbb_alu(part1, part2, v1, v2)
+            result = _exec_alu_via_native(f, v1, v2)
         else:
-            result = v1 & v2
-            if part2 == 1:
-                result = mask64(_trunc_rem(_uint64(v1).value, _uint64(v2).value))
+            result = _ALU_PY_OPS[f.func3](f.func7, v1, v2)
         if f.rd != 0:
             self.gprs[f.rd] = result
         return 4
 
     # ----------------------------------------------------------
-    #  I-type ALU (opcode = Opc.opImm)
+    #  I-type ALU (opcode = Opc.op_imm)
     # ----------------------------------------------------------
     def handle_op_imm(self, instr: int) -> int:
         """执行 I 型立即数 ALU 指令."""
         f = self._f
         v1 = self.gprs[f.rs1]
-
         if native_available():
-            r = exec_op_imm(f.func3, f.func7, v1, f.imm12_se)
-            if not r.trap:
-                self.gprs[f.rd] = r.value
-                return 4
-            # funct7 属于 Zbb 扩展的 0x30: 加速执行引擎的 alu 辅助函数对该编码
-            # 返回无效编码, 故在此交由 _zbb_imm 计算
-            if f.func7 != 0x30:
-                raise ValueError(
-                    f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
-                )
-            result = _zbb_imm(f.func3, v1, f.imm12_se & 0x3F)
-            if f.rd != 0:
-                self.gprs[f.rd] = result
-            return 4
-
-        part1 = f.func3
-        part6 = f.func7 >> 1
-        imm = f.imm12_se
-        shamt = f.imm12_se & 0x3F
-
-        if part1 == 0b000:
-            result = mask64((v1 + imm))
-        elif part1 == 0b001:
-            if part6 == 0:
-                result = mask64((v1 << shamt))
-            elif part6 == 0x18:
-                # Zbb: clz/ctz/cpop/sext.b/sext.h (shamt=imm[4:0] 选子指令)
-                result = _zbb_imm(part1, v1, shamt)
-            else:
-                raise ValueError(f"invalid funct6={part6:#x} for SLLI")
-        elif part1 == 0b010:
-            result = 1 if _sint64(v1).value < imm else 0
-        elif part1 == 0b011:
-            result = 1 if _uint64(v1).value < _uint64(imm).value else 0
-        elif part1 == 0b100:
-            result = v1 ^ imm
-        elif part1 == 0b101:
-            if part6 == 0:
-                result = mask64((_uint64(v1).value >> shamt))
-            elif part6 == 0x10:
-                result = mask64(_sint64(_sint64(v1).value >> shamt).value)
-            elif part6 == 0x18:
-                # Zbb: rori (rotate right immediate, funct7=0x30)
-                result = _zbb_imm(0b101, v1, shamt)
-            elif part6 == 0x0A:
-                # Zbb: orc.b (funct7=0x14, funct12=0x287)
-                result = _zbb_orc_b(v1)
-            elif part6 == 0x1A:
-                # Zbb: rev8.d (funct7=0x35, funct12=0x6B8, RV64)
-                result = _zbb_rev8(v1)
-            else:
-                raise ValueError(f"invalid funct6={part6:#x} for SRLI/SRAI")
-        elif part1 == 0b110:
-            result = v1 | imm
+            result = _exec_op_imm_via_native(f, v1)
         else:
-            result = v1 & imm
+            op = _OP_IMM_PY_OPS[f.func3]
+            result = op(f.func7 >> 1, v1, f.imm12_se, f.imm12_se & 0x3F)
         if f.rd != 0:
             self.gprs[f.rd] = result
         return 4
@@ -520,178 +1178,29 @@ class Hart(HartWithRegs):
         """执行 RV64 的 32 位字运算指令, 如 ADDW、SUBW、SLLW 等."""
         f = self._f
         v1, v2 = self.gprs[f.rs1], self.gprs[f.rs2]
-
         if native_available():
-            r = exec_op32(f.func3, f.func7, v1, v2)
-            if not r.trap:
-                self.gprs[f.rd] = r.value
-                return 4
-            # funct7 属于 Zbb 扩展的 0x30 且 funct3 为 001 或 101: 加速执行引擎的
-            # alu 辅助函数对这些编码返回无效编码, 故在此交由 _zbb_alu32 计算
-            if f.func7 == 0x30 and f.func3 in (0b001, 0b101):
-                result = _zbb_alu32(f.func3, f.func7, v1, v2)
-                if f.rd != 0:
-                    self.gprs[f.rd] = result
-                return 4
-            raise ValueError(
-                f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
-            )
-
-        part1, part2 = f.func3, f.func7
-        v1 = mask32(v1)
-        v2 = mask32(v2)
-
-        if part1 == 0b000:
-            if part2 == 0:
-                result = mask32((v1 + v2))
-            elif part2 == 1:
-                result = mask32((v1 * v2))
-            elif part2 == 0x20:
-                result = mask32((v1 - v2))
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=000")
-            result = sext32(result)
-        elif part1 == 0b001:
-            if part2 == 0:
-                result = mask32((v1 << (v2 & 0x1F)))
-                result = sext32(result)
-            elif part2 == 1:
-                s1 = _sint64(sext32(v1)).value
-                s2 = _sint64(sext32(v2)).value
-                result = mask64(_sint64((s1 * s2) >> 32).value)
-            elif part2 == 0x30:
-                result = _zbb_alu32(part1, part2, v1, v2)  # Zbb: rolw
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=001")
-        elif part1 == 0b010:
-            if part2 == 0:
-                result = (
-                    1 if _sint64(sext32(v1)).value < _sint64(sext32(v2)).value else 0
-                )
-            elif part2 == 1:
-                s1 = _sint64(sext32(v1)).value
-                u2 = _uint64(v2).value
-                result = mask64(_sint64((s1 * u2) >> 32).value)
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=010")
-        elif part1 == 0b011:
-            if part2 == 0:
-                result = 1 if v1 < v2 else 0
-            elif part2 == 1:
-                result = mask64(((v1 * v2) >> 32))
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=011")
-        elif part1 == 0b100:
-            if part2 == 0:
-                result = mask32((v1 ^ v2))
-                result = sext32(result)
-            elif part2 == 1:
-                result = _trunc_div(
-                    _sint64(sext32(v1)).value,
-                    _sint64(sext32(v2)).value,
-                )
-                result = sext32(mask32(result))
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=100")
-        elif part1 == 0b101:
-            if part2 == 0:
-                result = mask32((v1 >> (v2 & 0x1F)))
-                result = sext32(result)
-            elif part2 == 1:
-                result = _trunc_div(v1, v2)
-                result = sext32(mask32(result))
-            elif part2 == 0x20:
-                result = _sint64(sext32(v1) >> (v2 & 0x1F)).value
-                result = sext32(mask32(result))
-            elif part2 == 0x30:
-                result = _zbb_alu32(part1, part2, v1, v2)  # Zbb: rorw
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=101")
-        elif part1 == 0b110:
-            if part2 == 0:
-                result = mask32((v1 | v2))
-                result = sext32(result)
-            elif part2 == 1:
-                result = _trunc_rem(
-                    _sint64(sext32(v1)).value,
-                    _sint64(sext32(v2)).value,
-                )
-                result = sext32(mask32(result))
-            else:
-                raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=110")
-        elif part2 == 0:
-            result = mask32((v1 & v2))
-            result = sext32(result)
-        elif part2 == 1:
-            result = _trunc_rem(v1, v2)
-            result = sext32(mask32(result))
+            result = _exec_op32_via_native(f, v1, v2)
         else:
-            raise ValueError(f"invalid funct7={part2:#x} for op32 funct3=111")
+            result = _OP32_PY_OPS[f.func3](f.func7, mask32(v1), mask32(v2))
         if f.rd != 0:
             self.gprs[f.rd] = result
         return 4
 
     # ----------------------------------------------------------
-    #  I-type immediate word operations (opcode = Opc.opImm32)
+    #  I-type immediate word operations (opcode = Opc.op_imm32)
     # ----------------------------------------------------------
     def handle_op_imm32(self, instr: int):
         """执行 I 型 32 位字立即数 ALU 指令, 如 ADDIW、SLLIW 等."""
         f = self._f
         v1 = self.gprs[f.rs1]
-
         if native_available():
-            r = exec_op_imm32(f.func3, f.func7, v1, f.imm12_se)
-            if not r.trap:
-                self.gprs[f.rd] = r.value
-                return 4
-            # funct7 属于 Zbb 扩展的 0x30: 加速执行引擎的 alu 辅助函数对该编码
-            # 返回无效编码, 故在此交由 _zbb_imm32 计算
-            if f.func7 != 0x30:
-                raise ValueError(
-                    f"invalid funct3={f.func3:#b} funct7={f.func7:#x}"
-                )
-            result = _zbb_imm32(f.func3, v1, f.imm12_se & 0x1F)
-            if f.rd != 0:
-                self.gprs[f.rd] = result
-            return 4
-
-        part1, part7 = f.func3, f.func7
-        imm = f.imm12_se
-        shamt = f.imm12_se & 0x1F
-
-        if part1 == 0b000:
-            result = mask32((v1 + imm))
-            result = sext32(result)
-        elif part1 == 0b001:
-            if part7 == 0:
-                result = mask32((mask32(v1) << shamt))
-                result = sext32(result)
-            elif part7 == 0x30:
-                # Zbb: clzw/ctzw/cpopw
-                result = _zbb_imm32(part1, v1, shamt)
-            else:
-                raise ValueError(f"invalid funct7={part7:#x} for SLLIW")
-        elif part1 == 0b101:
-            if part7 == 0:
-                result = mask32((mask32(v1) >> shamt))
-                result = sext32(result)
-            elif part7 == 0x20:
-                result = mask32(_sint64(sext32(mask32(v1)) >> shamt).value)
-                result = sext32(result)
-            elif part7 == 0x30:
-                # Zbb: roriw
-                result = _zbb_imm32(part1, v1, shamt)
-            else:
-                raise ValueError(f"invalid funct7={part7:#x} for SRLIW/SRAIW")
+            result = _exec_op_imm32_via_native(f, v1)
         else:
-            raise ValueError(f"invalid funct3={part1:#x} for opImm32")
+            result = _op_imm32_py(f.func3, f.func7, v1, f.imm12_se, f.imm12_se & 0x1F)
         if f.rd != 0:
             self.gprs[f.rd] = result
         return 4
 
-    # ----------------------------------------------------------
-    #  Branch (opcode = Opc.br)
-    # ----------------------------------------------------------
     def handle_br(self, instr: int) -> int:
         """Execute a conditional branch.  Returns 0 if taken (pc updated),
         4 if not taken (pc advances normally)."""
@@ -705,21 +1214,21 @@ class Hart(HartWithRegs):
         v2 = self.gprs[rs2]
 
         taken = False
-        f = BRFN3_MAP.get(fn3)
+        f = BrFn3_MAP.get(fn3)
         if f is None:
             return 4
 
-        if f == brFn3.beq:
+        if f == BrFn3.beq:
             taken = v1 == v2
-        elif f == brFn3.bne:
+        elif f == BrFn3.bne:
             taken = v1 != v2
-        elif f == brFn3.blt:
+        elif f == BrFn3.blt:
             taken = _sint64(v1).value < _sint64(v2).value
-        elif f == brFn3.bge:
+        elif f == BrFn3.bge:
             taken = _sint64(v1).value >= _sint64(v2).value
-        elif f == brFn3.bltu:
+        elif f == BrFn3.bltu:
             taken = _uint64(v1).value < _uint64(v2).value
-        elif f == brFn3.bgeu:
+        elif f == BrFn3.bgeu:
             taken = _uint64(v1).value >= _uint64(v2).value
 
         if taken:
@@ -727,67 +1236,24 @@ class Hart(HartWithRegs):
             return 0
         return 4
 
-    # ----------------------------------------------------------
-    #  Load (opcode = Opc.ld)
-    # ----------------------------------------------------------
     def handle_ld(self, instr: int):
-        """Execute a load instruction."""
-        f = self._f
-        fn3 = f.func3
-        rd = f.rd
-        rs1 = f.rs1
-        offset = f.imm12_se
-
-        addr = mask64((self.gprs[rs1] + offset))
-
-        f = LDFN3_MAP.get(fn3)
-        if f is None:
-            raise ValueError(f"invalid funct3={fn3:#x} for load")
-
-        # 按实际操作宽度读取, 避免对 lb/lbu/lh/lhu/lw/lwu 产生虚假对齐故障
-        if f in (ldFn3.lb, ldFn3.lbu):
-            read_size = 1
-        elif f in (ldFn3.lh, ldFn3.lhu):
-            read_size = 2
-        elif f in (ldFn3.lw, ldFn3.lwu):
-            read_size = 4
-        else:
-            read_size = 8  # ld
-
+        """执行加载指令, 按 funct3 决定读取宽度与符号扩展方式."""
+        fields = self._f
+        kind = LdFn3_MAP.get(fields.func3)
+        if kind is None:
+            raise ValueError(f"invalid funct3={fields.func3:#x} for load")
+        addr = mask64((self.gprs[fields.rs1] + fields.imm12_se))
         saved_pc = self.pc
-        mem = mem_read(self, addr, read_size)
-        # mem_read may have delivered a trap (LdPageFault / LdAccessFault) and
-        # redirected PC to stvec.  If so, do NOT overwrite rd — the kernel's
-        # trap handler must see the original register state.
+        # 按实际操作宽度读取, 避免对 lb/lbu/lh/lhu/lw/lwu 产生虚假对齐故障
+        mem = mem_read(self, addr, _LD_READ_SIZE[kind])
+        # 访存故障已经投递并把 PC 改写为陷态入口时, 不覆盖 rd, 使陷态处理
+        # 函数看到故障前的寄存器状态
         if self.pc != saved_pc:
             return 0
-
-        if f == ldFn3.lb:
-            val = sext8(mem[0])
-        elif f == ldFn3.lh:
-            val = sext16(mem[0] | (mem[1] << 8))
-        elif f == ldFn3.lw:
-            val = sext32(mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24))
-        elif f == ldFn3.ld:
-            val = 0
-            for i in range(8):
-                val |= mem[i] << (8 * i)
-        elif f == ldFn3.lbu:
-            val = mem[0]
-        elif f == ldFn3.lhu:
-            val = mem[0] | (mem[1] << 8)
-        elif f == ldFn3.lwu:
-            val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
-        else:
-            raise ValueError(f"unhandled load funct3={fn3:#x}")
-
-        if rd != 0:
-            self.gprs[rd] = val
+        if fields.rd != 0:
+            self.gprs[fields.rd] = _load_value(kind, mem)
         return 4
 
-    # ----------------------------------------------------------
-    #  Store (opcode = Opc.st)
-    # ----------------------------------------------------------
     def handle_st(self, instr: int):
         """Execute a store instruction."""
         f = self._f
@@ -799,19 +1265,19 @@ class Hart(HartWithRegs):
         addr = mask64((self.gprs[rs1] + offset))
         val = self.gprs[rs2]
 
-        f = STFN3_MAP.get(fn3)
+        f = StFn3_MAP.get(fn3)
         if f is None:
             raise ValueError(f"invalid funct3={fn3:#x} for store")
 
-        if f == stFn3.sb:
+        if f == StFn3.sb:
             data = bytes([val & 0xFF])
-        elif f == stFn3.sh:
+        elif f == StFn3.sh:
             data = bytes([val & 0xFF, (val >> 8) & 0xFF])
-        elif f == stFn3.sw:
+        elif f == StFn3.sw:
             data = bytes(
                 [val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF, (val >> 24) & 0xFF]
             )
-        elif f == stFn3.sd:
+        elif f == StFn3.sd:
             data = bytes([(val >> (8 * i)) & 0xFF for i in range(8)])
         else:
             raise ValueError(f"unhandled store funct3={fn3:#x}")
@@ -825,7 +1291,7 @@ class Hart(HartWithRegs):
         return 4
 
     # ----------------------------------------------------------
-    #  F/D 浮点指令 (opcode = opfp/stfp/opFp/fmadd…)
+    #  F/D 浮点指令
     #
     #  计算委托给加速执行引擎的 softfloat, 入口为 fp_exec_op 与 fp_exec_fma,
     #  单精度结果的高 32 位由该引擎填为全 1 以设置为 NaN; Python 侧仅负责寄存器与内存的路由,
@@ -908,7 +1374,7 @@ class Hart(HartWithRegs):
         # int->float (0x1A) 与 FMV.*.X (0x1E) 的 rs1 源为 GPR。
         rs1_bits = self.gprs[f.rs1] if op5 in (0x1A, 0x1E) else self._fpr_bits[f.rs1]
         rs2_bits = self._fpr_bits[f.rs2]
-        out = fp_exec_op(f.func7, f.func3, f.rs2, rs1_bits, rs2_bits, self._fp_frm())
+        out = fp_exec_op(f.func7, f.func3, f.rs2, (rs1_bits, rs2_bits), self._fp_frm())
         if out.trap:
             raise ValueError(f"invalid OP-FP funct7={f.func7:#x} funct3={f.func3:#x}")
         if out.to_gpr:
@@ -926,8 +1392,10 @@ class Hart(HartWithRegs):
             raise ValueError("FP disabled (mstatus.FS=Off)")
         f = self._f
         out = fp_exec_fma(
-            f.opcode, f.func3, f.fmt,
-            self._fpr_bits[f.rs1], self._fpr_bits[f.rs2], self._fpr_bits[f.rs3],
+            f.opcode,
+            f.func3,
+            f.fmt,
+            (self._fpr_bits[f.rs1], self._fpr_bits[f.rs2], self._fpr_bits[f.rs3]),
             self._fp_frm(),
         )
         if out.trap:
@@ -951,96 +1419,67 @@ class Hart(HartWithRegs):
         """执行原子内存操作 (LR/SC/AMOxxx)."""
         f = self._f
         funct5_val = f.func7 >> 2  # bits[31:27] = func7[6:2]
-        funct3_val = f.func3
-        rd = f.rd
-        rs1 = f.rs1
-        rs2 = f.rs2
-
         op = AMOF5_MAP.get(funct5_val)
-        width = AMOW_MAP.get(funct3_val)
+        width = AMOW_MAP.get(f.func3)
         if op is None or width is None:
             raise ValueError(
-                f"invalid AMO encoding: funct5={funct5_val:#07b}, funct3={funct3_val:#05b}"
+                f"invalid AMO encoding: funct5={funct5_val:#07b}, funct3={f.func3:#05b}"
             )
-
-        is_64bit = width == AmoWidth.D
-        byte_len = 8 if is_64bit else 4
-        mask = 0xFFFF_FFFF_FFFF_FFFF if is_64bit else 0xFFFF_FFFF
-
-        addr = mask64(self.gprs[rs1])
-
+        addr = mask64(self.gprs[f.rs1])
         if op == AmoFunct5.LR:
-            # Load-Reserved: 读取内存并设置预留
-            saved_pc = self.pc
-            data_bytes = mem_read(self, addr, byte_len)
-            if self.pc != saved_pc:
-                return 0
-            val = int.from_bytes(data_bytes, "little", signed=False) & mask
-            if rd != 0:
-                # LR.D: 64-bit 值不需要符号扩展; LR.W: 由 32-bit 符号扩展到 64-bit
-                self.gprs[rd] = val if is_64bit else sext32(val)
-            self.set_reservation(addr, val)
-            return 4
-        elif op == AmoFunct5.SC:
-            # Store-Conditional: 仅预留有效时写入
-            if self.reservation_valid and self.reservation_addr == addr:
-                store_val = self.gprs[rs2] & mask
-                data = store_val.to_bytes(byte_len, "little", signed=False)
-                saved_pc = self.pc
-                mem_write(self, addr, data)
-                if self.pc != saved_pc:
-                    return 0
-                if rd != 0:
-                    self.gprs[rd] = 0  # 成功 -> rd <- 0
-            elif rd != 0:
-                self.gprs[rd] = 1  # 失败 -> rd <- 非零
-            self.clear_reservation()
-            return 4
-        # else: AMOxxx - 原子读-改-写
+            return self._amo_lr(f, addr, width)
+        if op == AmoFunct5.SC:
+            return self._amo_sc(f, addr, width)
+        return self._amo_rmw(f, addr, width, op)
+
+    def _amo_lr(self, f, addr: int, width: AmoWidth) -> int:
+        """Load-Reserved: 读取内存并设置预留."""
+        byte_len, mask = _amo_width(width)
         saved_pc = self.pc
         data_bytes = mem_read(self, addr, byte_len)
         if self.pc != saved_pc:
             return 0
-        mem_val = int.from_bytes(data_bytes, "little", signed=False) & mask
-        op_val = self.gprs[rs2] & mask
-
-        if op == AmoFunct5.SWAP:
-            result = op_val
-        elif op == AmoFunct5.ADD:
-            result = (mem_val + op_val) & mask
-        elif op == AmoFunct5.XOR:
-            result = mem_val ^ op_val
-        elif op == AmoFunct5.AND:
-            result = mem_val & op_val
-        elif op == AmoFunct5.OR:
-            result = mem_val | op_val
-        elif op == AmoFunct5.MIN:
-            s_mem = _sint64(sext(mem_val, 64 if is_64bit else 32)).value
-            s_op = _sint64(sext(op_val, 64 if is_64bit else 32)).value
-            result = (op_val if s_op < s_mem else mem_val) & mask
-        elif op == AmoFunct5.MAX:
-            s_mem = _sint64(sext(mem_val, 64 if is_64bit else 32)).value
-            s_op = _sint64(sext(op_val, 64 if is_64bit else 32)).value
-            result = (op_val if s_op > s_mem else mem_val) & mask
-        elif op == AmoFunct5.MINU:
-            result = (op_val if op_val < mem_val else mem_val) & mask
-        elif op == AmoFunct5.MAXU:
-            result = (op_val if op_val > mem_val else mem_val) & mask
-        else:
-            raise ValueError(f"unhandled AMO op: {op}")
-
-        data = result.to_bytes(byte_len, "little", signed=False)
-        saved_pc = self.pc
-        mem_write(self, addr, data)
-        if self.pc != saved_pc:
-            return 0
-        if rd != 0:
-            self.gprs[rd] = sext(mem_val, 64) if is_64bit else sext32(mem_val)
+        val = int.from_bytes(data_bytes, "little") & mask
+        if f.rd != 0:
+            # LR.D 不需要符号扩展; LR.W 由 32 位符号扩展到 64 位
+            self.gprs[f.rd] = val if width == AmoWidth.D else sext32(val)
+        self.set_reservation(addr, val)
         return 4
 
-    # ----------------------------------------------------------
-    #  JALR (opcode = Opc.jalr)
-    # ----------------------------------------------------------
+    def _amo_sc(self, f, addr: int, width: AmoWidth) -> int:
+        """Store-Conditional: 仅预留有效时写入, 成功时 rd 写 0, 失败时写 1."""
+        byte_len, mask = _amo_width(width)
+        if self.reservation_valid and self.reservation_addr == addr:
+            data = (self.gprs[f.rs2] & mask).to_bytes(byte_len, "little")
+            saved_pc = self.pc
+            mem_write(self, addr, data)
+            if self.pc != saved_pc:
+                return 0
+            if f.rd != 0:
+                self.gprs[f.rd] = 0
+        elif f.rd != 0:
+            self.gprs[f.rd] = 1
+        self.clear_reservation()
+        return 4
+
+    def _amo_rmw(self, f, addr: int, width: AmoWidth, op: AmoFunct5) -> int:
+        """读-改-写: 把运算结果写回内存, 旧值写入 rd."""
+        byte_len, mask = _amo_width(width)
+        saved_pc = self.pc
+        data_bytes = mem_read(self, addr, byte_len)
+        if self.pc != saved_pc:
+            return 0
+        mem_val = int.from_bytes(data_bytes, "little") & mask
+        op_val = self.gprs[f.rs2] & mask
+        result = _amo_result(op, mem_val, op_val, width, mask)
+        saved_pc = self.pc
+        mem_write(self, addr, result.to_bytes(byte_len, "little"))
+        if self.pc != saved_pc:
+            return 0
+        if f.rd != 0:
+            self.gprs[f.rd] = sext(mem_val, 64) if width == AmoWidth.D else sext32(mem_val)
+        return 4
+
     def handle_jalr(self, instr: int) -> int:
         """Execute JALR: rd = pc+4; pc = (rs1 + imm) & ~1"""
         f = self._f
@@ -1056,122 +1495,47 @@ class Hart(HartWithRegs):
         self.pc = target
         return 0
 
-    # ----------------------------------------------------------
-    #  System (opcode = Opc.sys)  -- ecall / ebreak / CSR / mret / ...
-    # ----------------------------------------------------------
     def handle_sys(self, instr: int) -> int:
-        """Execute a system instruction (privileged or CSR access).
-        Returns 0 if PC was modified (trap/mret/sret), 4 otherwise."""
+        """执行系统指令 (特权指令或 CSR 访问).
+
+        返回 0 表示 pc 已被修改 (陷态或返回), 返回 4 表示 pc 正常推进.
+        """
         saved_pc = self.pc
         f = self._f
-        fn3 = f.func3
-        rd = f.rd
-        rs1 = f.rs1
-        csr_addr = f.func12  # CSR address [31:20] = func12
-        uimm = rs1  # 5-bit zero-extended imm for CSR
+        if f.func3 == 0:
+            self._sys_privileged(f, instr)
+        else:
+            spec = _CSR_OPS.get(f.func3)
+            if spec is None:
+                raise ValueError(f"invalid funct3={f.func3:#x} for sys")
+            self._sys_csr(f, spec)
+        return 0 if self.pc != saved_pc else 4
 
-        if fn3 == 0b000:
-            # Privileged instructions: funct12 determines the operation
-            funct12 = f.func12
-            if funct12 == 0x000:  # ECALL
-                trap_ecall(self)
-            elif funct12 == 0x001:  # EBREAK
-                trap_ebreak(self)
-            elif funct12 == 0x302:  # MRET
-                trap_mret(self)
-            elif funct12 == 0x102:  # SRET
-                trap_sret(self)
-            elif funct12 == 0x105:  # WFI
-                handle_wfi(self, instr)
-            elif funct12 == 0x120 or (0x121 <= funct12 <= 0x13F):
-                # SFENCE.VMA: funct7=0b0001001, funct12 = 0x120 | rs2.
-                # RISC-V spec: rs1=x0 时刷新全部 TLB; rs1≠x0 时仅刷新该 VA 对应条目.
-                # 刷新同步到全部 hart. RISC-V 只要求刷新本 hart, 扩大范围不影响
-                # 正确性, 且省去核间中断.
-                vpn = None if rs1 == 0 else (self.gprs[rs1] >> 12)
-                _flush_tlbs(self, vpn, self._all_harts)
-            elif funct12 == 0x5A0:  # MFENCE.DID — 按内存域刷新全部 hart TLB + L2
-                # 读取当前 hart 的 mdid, 广播刷新所有 hart 中匹配的条目
-                mdid_val = self.mdid_val
-                for h in self._all_harts or [self]:
-                    h.itlb.flush_by_mdid(mdid_val)
-                    h.dtlb.flush_by_mdid(mdid_val)
-                # 加速执行引擎按页号与内存域查询条目, 无按域刷新的入口, 故整表作废.
-                self.note_tlb_flush()
-                # 刷新共享 L2 缓存中匹配的条目
-                if self._bus is not None:
-                    l2 = getattr(self._bus, "_l2", None)
-                    if l2 is not None:
-                        l2.flush_by_mdid(mdid_val)
-            else:
-                raise ValueError(f"unknown privileged funct12={funct12:#05x}")
-            return 0 if self.pc != saved_pc else 4
+    def _sys_privileged(self, f, instr: int) -> None:
+        """执行 funct3=0 的特权指令, 由 funct12 决定具体操作."""
+        funct12 = f.func12
+        op = _SYS_PRIV_OPS.get(funct12)
+        if op is None and 0x121 <= funct12 <= 0x13F:
+            # SFENCE.VMA: funct7=0b0001001, 其 rs2 编码在 funct12 的低 5 位
+            op = _sys_sfence_vma
+        if op is None:
+            raise ValueError(f"unknown privileged funct12={funct12:#05x}")
+        op(self, instr)
 
-        elif fn3 == 0b001:  # CSRRW
-            validate_csr(self, csr_addr, is_write=True)
-            old_csr = self.read_csr(csr_addr)
-            new_csr = self.gprs[rs1]  # 先读 rs1 (可能在 rd==rs1 时被覆盖)
-            if rd != 0:
-                self.gprs[rd] = old_csr
-            self.write_csr(csr_addr, new_csr)
-            return 0 if self.pc != saved_pc else 4
+    def _sys_csr(self, f, spec: tuple) -> None:
+        """执行 CSR 指令; spec 给出新值算法与写入条件."""
+        calc, is_conditional = spec
+        csr_addr = f.func12
+        is_imm = (f.func3 & 0b100) != 0
+        src = f.rs1 if is_imm else self.gprs[f.rs1]
+        is_write = (src != 0) if is_conditional else True
+        validate_csr(self, csr_addr, is_write=is_write)
+        old = self.read_csr(csr_addr)
+        if f.rd != 0:
+            self.gprs[f.rd] = old
+        if is_write:
+            self.write_csr(csr_addr, calc(old, src))
 
-        elif fn3 == 0b010:  # CSRRS
-            do_write = rs1 != 0
-            validate_csr(self, csr_addr, is_write=do_write)
-            old_csr = self.read_csr(csr_addr)
-            rs1_val = self.gprs[rs1]  # 先读 rs1 (可能在 rd==rs1 时被覆盖)
-            if rd != 0:
-                self.gprs[rd] = old_csr
-            if do_write:
-                self.write_csr(csr_addr, old_csr | rs1_val)
-            return 0 if self.pc != saved_pc else 4
-
-        elif fn3 == 0b011:  # CSRRC
-            do_write = rs1 != 0
-            validate_csr(self, csr_addr, is_write=do_write)
-            old_csr = self.read_csr(csr_addr)
-            rs1_val = self.gprs[rs1]  # 先读 rs1 (可能在 rd==rs1 时被覆盖)
-            if rd != 0:
-                self.gprs[rd] = old_csr
-            if do_write:
-                self.write_csr(csr_addr, old_csr & ~rs1_val)
-            return 0 if self.pc != saved_pc else 4
-
-        elif fn3 == 0b101:  # CSRRWI
-            validate_csr(self, csr_addr, is_write=True)
-            old = self.read_csr(csr_addr)
-            if rd != 0:
-                self.gprs[rd] = old
-            self.write_csr(csr_addr, uimm)
-            return 0 if self.pc != saved_pc else 4
-
-        elif fn3 == 0b110:  # CSRRSI
-            do_write = uimm != 0
-            validate_csr(self, csr_addr, is_write=do_write)
-            old = self.read_csr(csr_addr)
-            if rd != 0:
-                self.gprs[rd] = old
-            if do_write:
-                self.write_csr(csr_addr, old | uimm)
-            return 0 if self.pc != saved_pc else 4
-
-        elif fn3 == 0b111:  # CSRRCI
-            do_write = uimm != 0
-            validate_csr(self, csr_addr, is_write=do_write)
-            old = self.read_csr(csr_addr)
-            if rd != 0:
-                self.gprs[rd] = old
-            if do_write:
-                self.write_csr(csr_addr, old & ~uimm)
-            return 0 if self.pc != saved_pc else 4
-
-        raise ValueError(f"invalid funct3={fn3:#x} for sys")
-
-
-    # ----------------------------------------------------------
-    #  FENCE (opcode = Opc.fence)
-    # ----------------------------------------------------------
     def handle_fence(self, instr: int) -> int:
         """Execute a FENCE / FENCE.I instruction.
         In a single-hart, in-order emulator these are mostly no-ops."""
@@ -1224,162 +1588,31 @@ class Hart(HartWithRegs):
     # -- C0: Quadrant 0 (低 2 位 = 00) --
     # C.ADDI4SPN / C.LW / C.LD / C.SW / C.SD (FLD/FSD 暂未实现)
 
-    def _handle_compressed_c0(
-        self,
-        instr: int,
-    ) -> int:
+    def _handle_compressed_c0(self, instr: int) -> int:
+        """C0 象限分发: C.ADDI4SPN 之外按 funct3 查表."""
         cf = self._cf
-        funct3 = cf.funct3
-        rd = cf.rd  # C0: creg-mapped by Rust
-
-        if funct3 == 0b000:
-            # C.ADDI4SPN — nzuimm pre-decoded by Rust
-            nzuimm = cf.imm
-            if nzuimm == 0:
-                deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
-                return 0
-            self.gprs[rd] = mask64((self.gprs[2] + nzuimm))
-            return 2
-
-        rs1 = cf.rs1p  # C0: creg-mapped rs1'
-
-        # C.FLD (RV64DC): fpr[rd'] = mem[rs1' + uimm]
-        if funct3 == 0b001:
-            if not self._fp_enabled():
-                raise ValueError("C.FLD: FP disabled (mstatus.FS=Off)")
-            uimm = cf.imm
-            addr = mask64((self.gprs[rs1] + uimm))
-            saved_pc = self.pc
-            mem = mem_read(self, addr, 8)
-            if self.pc != saved_pc:
-                return 0
-            val = sum(mem[i] << (8 * i) for i in range(8))
-            self._fpr_bits[rd] = val
-            self._fp_mark_dirty()
-            return 2
-
-        # C.LW / C.SW: uimm pre-decoded by Rust
-        if funct3 in (0b010, 0b110):
-            uimm = cf.imm
-            addr = mask64((self.gprs[rs1] + uimm))
-            if funct3 == 0b010:  # C.LW
-                saved_pc = self.pc
-                mem = mem_read(self, addr, 4)
-                if self.pc != saved_pc:
-                    return 0
-                val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
-                self.gprs[rd] = sext32(val)
-            else:  # C.SW
-                rs2 = cf.rdp
-                v = mask32(self.gprs[rs2])
-                data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
-                saved_pc = self.pc
-                mem_write(self, addr, data)
-                if self.pc != saved_pc:
-                    return 0
-
-        # C.LD / C.SD / C.FSD (RV64C): uimm pre-decoded by Rust (8-byte aligned)
-        elif funct3 in (0b011, 0b111, 0b101):
-            uimm = cf.imm
-            addr = mask64((self.gprs[rs1] + uimm))
-            if funct3 == 0b011:  # C.LD
-                saved_pc = self.pc
-                mem = mem_read(self, addr, 8)
-                if self.pc != saved_pc:
-                    return 0
-                val = sum(mem[i] << (8 * i) for i in range(8))
-                self.gprs[rd] = val
-            elif funct3 == 0b101:  # C.FSD
-                if not self._fp_enabled():
-                    raise ValueError("C.FSD: FP disabled (mstatus.FS=Off)")
-                v = self._fpr_bits[rd]
-                data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-                saved_pc = self.pc
-                mem_write(self, addr, data)
-                if self.pc != saved_pc:
-                    return 0
-                self._fp_mark_dirty()
-            else:  # C.SD
-                rs2 = cf.rdp
-                v = self.gprs[rs2]
-                data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-                saved_pc = self.pc
-                mem_write(self, addr, data)
-                if self.pc != saved_pc:
-                    return 0
-
-        else:
-            raise NotImplementedError(f"C0 funct3={funct3:#05b} (reserved)")
-        return 2
+        if cf.funct3 == 0b000:
+            return _c0_addi4spn(self, cf, instr)
+        handler = _C0_OPS.get(cf.funct3)
+        if handler is None:
+            raise NotImplementedError(f"C0 funct3={cf.funct3:#05b} (reserved)")
+        return handler(self, cf)
 
     # -- C1: Quadrant 1 (低 2 位 = 01) --
     # C.ADDI / C.ADDIW / C.LI / C.LUI / C.ADDI16SP /
     # C.SRLI/C.SRAI/C.ANDI / C.SUB/C.XOR/C.OR/C.AND /
     # C.J / C.BEQZ / C.BNEZ
 
-    def _handle_compressed_c1(
-        self,
-        instr: int,
-    ) -> int:
+    def _handle_compressed_c1(self, instr: int) -> int:
+        """C1 象限分发."""
         cf = self._cf
-        funct3 = cf.funct3
-        rd_raw = cf.rd  # C1: rd/rs1 在 bits [11:7], 5-bit 非 creg 映射
+        handler = _C1_OPS.get(cf.funct3)
+        if handler is None:
+            raise NotImplementedError(f"C1 funct3={cf.funct3:#05b}")
+        return handler(self, instr)
 
-        # C.ADDI / C.ADDIW / C.LI — imm 已由 Rust 符号扩展 (rd≠0)
-        if funct3 in (0b000, 0b001, 0b010):
-            imm = cf.imm
-            if funct3 == 0b000:
-                self.gprs[rd_raw] = mask64((self.gprs[rd_raw] + imm))
-            elif funct3 == 0b001:
-                r = mask32((self.gprs[rd_raw] + imm))
-                self.gprs[rd_raw] = sext32(r)
-            else:
-                self.gprs[rd_raw] = mask64(imm)
-            return 2
-
-        # C.LUI (rd≠{0,2}) / C.ADDI16SP (rd=2) — imm 已由 Rust 符号扩展
-        if funct3 == 0b011:
-            nz = cf.imm
-            if rd_raw == 2:
-                # C.ADDI16SP: nz 已 10-bit 符号扩展 (低 4 bit 恒零)
-                if nz == 0:
-                    raise ValueError("C.ADDI16SP: nzuimm must be non-zero")
-                self.gprs[2] = mask64((self.gprs[2] + nz))
-            else:
-                # C.LUI: nz 已按 6-bit 符号扩展, 随后左移 12 位
-                if nz == 0:
-                    raise ValueError("C.LUI: nzuimm must be non-zero")
-                self.gprs[rd_raw] = mask64((nz << 12))
-            return 2
-
-        # C1 ALU ops
-        if funct3 == 0b100:
-            return self._handle_compressed_c1_alu(instr)
-
-        # C.J — offset 已由 Rust 符号扩展
-        if funct3 == 0b101:
-            self.pc = mask64((self.pc + cf.imm))
-            return 0
-
-        # C.BEQZ / C.BNEZ — rs1 = cf.rs1p (creg-mapped from bits[9:7])
-        if funct3 in (0b110, 0b111):
-            rs1 = cf.rs1p
-            offset = cf.imm  # 已由 Rust 符号扩展
-            taken = self.gprs[rs1] == 0
-            if funct3 == 0b111:
-                taken = not taken
-            if taken:
-                self.pc = mask64((self.pc + offset))
-                return 0
-            return 2
-
-        raise NotImplementedError(f"C1 funct3={funct3:#05b}")
-
-    def _handle_compressed_c1_alu(
-        self,
-        instr: int,
-    ) -> int:
-        """C1 ALU (funct3=100).  All fields pre-decoded by Rust into ``self._cf``.
+    def _handle_compressed_c1_alu(self) -> int:
+        """C1 ALU 运算 (funct3=100), 由 sf 选择移位、与运算或寄存器运算.
 
         sf=00 -> C.SRLI  (shamt = {bit12, bits[6:2]}, 1-63 for RV64C)
         sf=01 -> C.SRAI  (shamt = {bit12, bits[6:2]}, 1-63 for RV64C)
@@ -1391,178 +1624,42 @@ class Hart(HartWithRegs):
         sf = cf.sf
         rd_rs1 = cf.rs1p  # creg-mapped from bits[9:7]
         v1 = self.gprs[rd_rs1]
-
         if sf == 0b00:
-            # C.SRLI: shamt = {bit12, bits[6:2]} (1-63 for RV64C)
-            shamt = (cf.bit12 << 5) | (cf.rs2 & 0x1F)
-            v1 = mask64((_uint64(v1).value >> shamt))
-            self.gprs[rd_rs1] = v1
+            self.gprs[rd_rs1] = mask64(_uint64(v1).value >> _c1_shamt(cf))
         elif sf == 0b01:
-            # C.SRAI: shamt = {bit12, bits[6:2]} (1-63 for RV64C)
-            shamt = (cf.bit12 << 5) | (cf.rs2 & 0x1F)
-            v1 = mask64(_sint64(_sint64(v1).value >> shamt).value)
-            self.gprs[rd_rs1] = v1
+            self.gprs[rd_rs1] = mask64(_sint64(v1).value >> _c1_shamt(cf))
         elif sf == 0b10:
-            # C.ANDI — imm[5:0] = {bit12, bits[6:2]}, sign-extended from 6 bits
-            imm = sext((cf.bit12 << 5) | (cf.rs2 & 0x1F), 6)
-            self.gprs[rd_rs1] = mask64((v1 & imm))
+            self.gprs[rd_rs1] = mask64(v1 & sext(_c1_shamt(cf), 6))
         elif sf == 0b11:
-            rs2 = cf.rdp  # creg-mapped from bits[4:2]
-            v2 = self.gprs[rs2]
-            bit_6_5 = cf.bit65
-            if cf.bit12 == 0:
-                # C.SUB / C.XOR / C.OR / C.AND
-                if bit_6_5 == 0b00:
-                    r = mask64((v1 - v2))
-                elif bit_6_5 == 0b01:
-                    r = v1 ^ v2
-                elif bit_6_5 == 0b10:
-                    r = v1 | v2
-                else:
-                    r = v1 & v2
-                self.gprs[rd_rs1] = r
-            # C.SUBW / C.ADDW (RV64C only)
-            elif bit_6_5 == 0b00:
-                r = mask32((v1 - v2))
-                self.gprs[rd_rs1] = sext32(r)
-            elif bit_6_5 == 0b01:
-                r = mask32((v1 + v2))
-                self.gprs[rd_rs1] = sext32(r)
-            else:
-                raise NotImplementedError(
-                    f"C.SUBW/C.ADDW reserved bit[6:5]={bit_6_5:#03b}"
-                )
+            self._c1_alu_register(cf, v1)
         else:
             raise NotImplementedError(f"C1 ALU sub_fn={sf:#03b}")
         return 2
 
+    def _c1_alu_register(self, cf, v1: int) -> None:
+        """sf=11: bit12=0 为 64 位运算, bit12=1 为 32 位运算."""
+        rd_rs1 = cf.rs1p
+        v2 = self.gprs[cf.rdp]
+        k = cf.bit65
+        if cf.bit12 == 0:
+            self.gprs[rd_rs1] = _C1_ALU_REGS[k](v1, v2)
+        elif k == 0b00:
+            self.gprs[rd_rs1] = sext32(mask32(v1 - v2))
+        elif k == 0b01:
+            self.gprs[rd_rs1] = sext32(mask32(v1 + v2))
+        else:
+            raise NotImplementedError(f"C.SUBW/C.ADDW reserved bit[6:5]={k:#03b}")
+
     # -- C2: Quadrant 2 (低 2 位 = 10) --
     # C.SLLI / C.LWSP / C.LDSP / C.JR/C.MV/C.EBREAK/C.JALR / C.SWSP / C.SDSP
 
-    def _handle_compressed_c2(
-        self,
-        instr: int,
-    ) -> int:
+    def _handle_compressed_c2(self, instr: int) -> int:
+        """C2 象限分发."""
         cf = self._cf
-        funct3 = cf.funct3
-        rd_rs1 = cf.rd  # bits[11:7] — rs1(C.JR/C.JALR) 或 rd(C.MV/C.ADD)
-        rs2 = cf.rs2   # bits[6:2] — rs2(C.MV/C.ADD) 或 0(C.JR/C.JALR)
-
-        if funct3 == 0b000:
-            # C.SLLI (RV64): shamt = cf.imm (Rust pre-decoded)
-            self.gprs[rd_rs1] = mask64((self.gprs[rd_rs1] << cf.imm))
-            return 2
-
-        # C.FLDSP: fpr[rd] = mem[sp + uimm] (RV64DC)
-        if funct3 == 0b001:
-            if not self._fp_enabled():
-                raise ValueError("C.FLDSP: FP disabled (mstatus.FS=Off)")
-            uimm = cf.imm
-            addr = mask64((self.gprs[2] + uimm))
-            saved_pc = self.pc
-            mem = mem_read(self, addr, 8)
-            if self.pc != saved_pc:
-                return 0
-            val = sum(mem[i] << (8 * i) for i in range(8))
-            self._fpr_bits[rd_rs1] = val
-            self._fp_mark_dirty()
-            return 2
-
-        # C.LWSP: uimm = cf.imm (4-byte aligned)
-        if funct3 == 0b010:
-            if rd_rs1 == 0:
-                raise ValueError("C.LWSP rd=0 (reserved)")
-            uimm = cf.imm
-            addr = mask64((self.gprs[2] + uimm))
-            saved_pc = self.pc
-            mem = mem_read(self, addr, 4)
-            if self.pc != saved_pc:
-                return 0
-            val = mem[0] | (mem[1] << 8) | (mem[2] << 16) | (mem[3] << 24)
-            self.gprs[rd_rs1] = sext32(val)
-            return 2
-
-        # C.LDSP: uimm = cf.imm (8-byte aligned)
-        if funct3 == 0b011:
-            if rd_rs1 == 0:
-                raise ValueError("C.LDSP rd=0 (reserved)")
-            uimm = cf.imm
-            addr = mask64((self.gprs[2] + uimm))
-            saved_pc = self.pc
-            mem = mem_read(self, addr, 8)
-            if self.pc != saved_pc:
-                return 0
-            val = sum(mem[i] << (8 * i) for i in range(8))
-            self.gprs[rd_rs1] = val
-            return 2
-
-        if funct3 == 0b100:
-            # C.JR (bit12=0, rs2==0, rd_rs1≠0) / C.JALR (bit12=1, rs2==0, rd_rs1≠0)
-            # C.MV (rs2≠0, rd_rs1≠0) / C.EBREAK (rd_rs1==0, rs2==0)
-            is_jalr = cf.bit12
-            if rd_rs1 == 0 and rs2 == 0:
-                # C.EBREAK
-                trap_ebreak(self)
-                return 0
-            elif rs2 == 0:
-                # C.JR 或 C.JALR
-                if is_jalr:
-                    target = self.gprs[rd_rs1]  # 先读跳转目标 (rd_rs1 可能 == 1)
-                    self.gprs[1] = mask64((self.pc + 2))  # ra
-                else:
-                    target = self.gprs[rd_rs1]
-                self.pc = mask64(target & ~1)
-                return 0
-            # else:
-            if is_jalr:
-                # C.ADD (bit12=1, rs2≠0): rd += rs2
-                result = self.gprs[rd_rs1] + self.gprs[rs2]
-                self.gprs[rd_rs1] = mask64(result)
-            else:
-                # C.MV (bit12=0, rs2≠0): rd = rs2
-                self.gprs[rd_rs1] = self.gprs[rs2]
-            return 2
-
-        # C.FSDSP: mem[sp + uimm] = fpr[rs2] (RV64DC)
-        if funct3 == 0b101:
-            if not self._fp_enabled():
-                raise ValueError("C.FSDSP: FP disabled (mstatus.FS=Off)")
-            uimm = cf.imm2
-            addr = mask64((self.gprs[2] + uimm))
-            v = self._fpr_bits[rs2]
-            data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-            saved_pc = self.pc
-            mem_write(self, addr, data)
-            if self.pc != saved_pc:
-                return 0
-            self._fp_mark_dirty()
-            return 2
-
-        # C.SWSP: uimm = cf.imm2 (4-byte aligned)
-        if funct3 == 0b110:
-            uimm = cf.imm2
-            addr = mask64((self.gprs[2] + uimm))
-            v = mask32(self.gprs[rs2])
-            data = bytes([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF])
-            saved_pc = self.pc
-            mem_write(self, addr, data)
-            if self.pc != saved_pc:
-                return 0
-            return 2
-
-        # C.SDSP: uimm = cf.imm2 (8-byte aligned)
-        if funct3 == 0b111:
-            uimm = cf.imm2
-            addr = mask64((self.gprs[2] + uimm))
-            v = self.gprs[rs2]
-            data = bytes([(v >> (8 * i)) & 0xFF for i in range(8)])
-            saved_pc = self.pc
-            mem_write(self, addr, data)
-            if self.pc != saved_pc:
-                return 0
-            return 2
-
-        raise NotImplementedError(f"C2 funct3={funct3:#05b} (reserved)")
+        handler = _C2_OPS.get(cf.funct3)
+        if handler is None:
+            raise NotImplementedError(f"C2 funct3={cf.funct3:#05b} (reserved)")
+        return handler(self, instr)
 
     # -- 压缩指令调度入口 --
 
@@ -1578,12 +1675,11 @@ class Hart(HartWithRegs):
         """
         # 预解码全部字段 — 避免 C0/C1/C2 处理器中重复的位提取
         self._cf = decode_compressed(instr)
-        op = self._cf.quadrant
-        if op == 0:
+        if self._cf.quadrant == 0:
             return self._handle_compressed_c0(instr)
-        elif op == 1:
+        elif self._cf.quadrant == 1:
             return self._handle_compressed_c1(instr)
-        elif op == 2:
+        elif self._cf.quadrant == 2:
             return self._handle_compressed_c2(instr)
         else:
             raise ValueError(f"handle_compressed: not compressed {instr:#06x}")
@@ -1613,7 +1709,7 @@ class Hart(HartWithRegs):
                 return self.handle_compressed(mask16(instr))
             except MemoryAccessError:
                 pass
-            except (ValueError, NotImplementedError, CsrAccessError):
+            except ValueError, NotImplementedError, CsrAccessError:
                 deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
             return 0
 
@@ -1629,7 +1725,7 @@ class Hart(HartWithRegs):
             return getattr(self, method_name)(instr)
         except MemoryAccessError:
             pass
-        except (ValueError, NotImplementedError, CsrAccessError):
+        except ValueError, NotImplementedError, CsrAccessError:
             # 操作码合法但编码字段无效 (如非法 funct3/funct12/nzuimm=0 等)
             deliver_trap(self, TrapType.IllInstr, tval=instr, is_interrupt=False)
         return 0

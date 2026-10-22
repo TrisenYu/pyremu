@@ -6,7 +6,7 @@ use crate::ecall_aux;
 use crate::ext_mod::table;
 use crate::hang;
 use crate::syscall;
-use crate::syscall::concurrency::{ proc, sched, thread, timer };
+use crate::syscall::concurrency::{proc, sched, thread, timer};
 use crate::trap_frame::TrapGprs;
 
 // ---------------------------------------------------------------
@@ -19,7 +19,7 @@ pub unsafe extern "C" fn trap_dispatch(
 	gprs: &mut TrapGprs,
 	sepc: u64,
 	scause: u64,
-	stval: u64
+	stval: u64,
 ) -> u64 {
 	// 返回值约定: 0 表示不切换线程; 非 0 为目标线程陷态栈帧基址,
 	// entry.s 据此 mv sp, a0 换到目标帧后走统一的恢复与 sret 路径.
@@ -28,8 +28,7 @@ pub unsafe extern "C" fn trap_dispatch(
 	if is_from_user {
 		// 陷阱来自 U 模式时, 为当前线程记下 U 模式停在哪条指令上: ecall 记 ecall 之后的那条
 		// 指令, 其余记被中断的那条指令. S 模式之内发生的陷阱会覆盖 sepc, 故模块在运行中出错
-		// 时, 被放弃的系统调用是哪一个、失败结果写回哪里, 只能取自这一条记录, 见
-		// proc::deliver_module_fault.
+		// 时, 被放弃的系统调用是哪一个、失败结果写回哪里, 只能取自这一条记录
 		let resume = if scause == 0x8 {
 			thread::TrapResume::Ecall { next: sepc + 4 }
 		} else {
@@ -102,8 +101,8 @@ pub unsafe extern "C" fn trap_dispatch(
 	}
 
 	// 故障指令落在模块映像的窗口之内时, 该次故障归属到该模块: 先按 sepc 判定, sepc 不在
-	// 任何窗口之内时再按 stval 判定, 判据见 table::module_of。清空该模块的操作表缓存并把
-	// 故障交回用户态, 见 proc::deliver_module_fault; 当前执行流不来自 U 模式时该次故障没有
+	// 任何窗口之内时再按 stval 判定。清空该模块的操作表缓存并把
+	// 故障交回用户态; 当前执行流不来自 U 模式时该次故障没有
 	// 可交回的可信应用, 落到下方按管理程序自身的缺陷挂起。
 	if let Some(module_id) = table::module_of(sepc, stval) {
 		if let Some(target_frame) = proc::deliver_module_fault(module_id) {
@@ -116,7 +115,7 @@ pub unsafe extern "C" fn trap_dispatch(
 	hang::fault_halt_exc(gprs, scause, stval, sepc);
 }
 
-/// 将 U 模式同步异常 scause 折算为进程收到该异常时的默认信号编号 (Linux 语义),
+/// 将 U 模式同步异常 scause 换算为进程收到该异常时的默认信号编号 (Linux 语义),
 /// 使自毁退出码 128+sig 与真实 Linux 下同缺陷进程的退出码一致 (如 NULL 解引用
 /// 触发页错误, SIGSEGV=11, 退出码 139), 便于可信应用管理器按退出码推断故障类型。
 fn user_fault_signal(cause: u64) -> u64 {
@@ -207,10 +206,10 @@ fn interrupt_dispatch(cause: Option<InterruptCause>) {
 				thread::wake_thread(waiter);
 			}
 
-			// 下次中断取「下一个时间片边界」与「表中最早的尚未到期时刻」中的较早者:
-			// 定时等待在截止时刻本身触发, 其精度不受时间片周期限制.
+			// 下次中断取「调度定时器的下一次触发时刻」与「表中最早的尚未到期时刻」中的较早者:
+			// 定时等待在截止时刻本身触发, 其精度不受调度定时器的触发间隔限制.
 			// 取走的条目已不参与 next_deadline, 故不会为同一个截止时刻反复设定.
-			let slice_end = now + TIMER_INTERVAL;
+			let slice_end = now + TICKS_PER_SCHED_TICK;
 			let deadline = match timer::next_deadline() {
 				Some(d) if d < slice_end => d,
 				_ => slice_end,
@@ -221,7 +220,7 @@ fn interrupt_dispatch(cause: Option<InterruptCause>) {
 			// 使 STIP 持续置位.
 			csr::write_stimecmp(deadline);
 			csr::clear_csr!(sip, csr::STI);
-			// 间隔定时器检查 (见 proc.rs). 遍历全部进程而不只当前进程: 父进程的
+			// 间隔定时器检查. 遍历全部进程而不只当前进程: 父进程的
 			// SIGALRM 常在子进程正在运行时到期.
 			proc::tick();
 			// 时间片检查. TIME_QUOTA=0 时不触发 SUSPEND.

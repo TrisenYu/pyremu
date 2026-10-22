@@ -9,7 +9,7 @@
 //! 仅用于在缺少随机数设备的平台上维持可用。
 
 use crate::ecall_aux;
-use crate::syscall::{ EFAULT, EINVAL };
+use crate::syscall::{EFAULT, EINVAL};
 
 /// 每次 ecall 搬运的字节数, 也是运行时栈上缓冲的大小。
 const RAND_CHUNK: usize = 256;
@@ -55,7 +55,11 @@ fn fallback_word() -> u64 {
 		if !FALLBACK_SEEDED {
 			let seed = time_ticks();
 			// xorshift 的状态不能为 0, 否则永远输出 0。
-			FALLBACK_STATE = if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed };
+			FALLBACK_STATE = if seed == 0 {
+				0x9e37_79b9_7f4a_7c15
+			} else {
+				seed
+			};
 			FALLBACK_SEEDED = true;
 		}
 		let mut x = FALLBACK_STATE;
@@ -85,7 +89,7 @@ fn fill_fallback(out: &mut [u8]) {
 /// getrandom: 参数 (Linux rv64) 为 buf = a0, buflen = a1, flags = a2。
 /// 返回写入的字节数。
 ///
-/// 载荷的缓冲区是只在其自身页表中有效的 U 模式虚拟地址, M-mode 无法折算, 故逐块
+/// 载荷的缓冲区是只在其自身页表中有效的 U 模式虚拟地址, M-mode 无法换算, 故逐块
 /// 拷到运行时栈上再交给 M-mode 按物理地址写入 (与 io.rs 的控制台输出同理)。
 /// 三个标志位都不改变行为, 未识别的标志位按 Linux 语义返回 EINVAL。
 pub fn getrandom_handler(buf: *mut u8, buflen: u64, flags: u64) -> u64 {
@@ -110,7 +114,8 @@ pub fn getrandom_handler(buf: *mut u8, buflen: u64, flags: u64) -> u64 {
 		}
 		for i in 0..n {
 			unsafe {
-				buf.add((off + (i as u64)) as usize).write_volatile(chunk[i]);
+				buf.add((off + (i as u64)) as usize)
+					.write_volatile(chunk[i]);
 			}
 		}
 		off += n as u64;

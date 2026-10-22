@@ -138,14 +138,11 @@ VIRTIO_BLK_S_OK = 0
 VIRTIO_BLK_S_IOERR = 1
 VIRTIO_BLK_S_UNSUPP = 2
 
-# ============================================================
-#  扇区大小 (字节)
-# ============================================================
 
 SECTOR_SIZE = 512
 
 # ============================================================
-#  PLIC 中断源号 (对齐 QEMU virt: virtio-mmio 设备 IRQ 从 1 起)
+#  PLIC 中断源号
 # ============================================================
 
 VIRTIO_BLK_IRQ = 1
@@ -155,6 +152,9 @@ _BLK_OUTHDR_SIZE = 16
 
 # 一条请求的描述符链长度: 请求头、数据缓冲区、状态字节
 _BLK_CHAIN_DESC_NUM = 3
+
+# 单个 virtqueue 支持的描述符数上限, 经 QUEUE_NUM_MAX 报告给驱动
+_BLK_QUEUE_NUM_MAX = 256
 
 # 本设备支持的 feature (64-bit)
 #
@@ -190,11 +190,10 @@ class VirtIOBlock(Device):
         image_path: str,
         mem_read: Callable[[int, int], bytes],
         mem_write: Callable[[int, bytes], None],
-        queue_size_max: int = 256,
-        on_irq: Callable[[int, bool], None] | None = None,
-        irq: int = 0,
         read_only: bool = False,
+        irq_sink: tuple[int, Callable[[int, bool], None]] | None = None,
     ) -> None:
+        """irq_sink 为 (中断源编号, 中断投递目标), 未给出时本设备不投递中断."""
         self.base_addr = 0
         self.size = VIRTIO_MMIO_SIZE
 
@@ -215,15 +214,16 @@ class VirtIOBlock(Device):
         self._read_only = read_only
         self._disk_size = os.lseek(self._fd, 0, os.SEEK_END)
 
-        # 中断投递: 完成中断经 on_irq(irq, level) 上报 (irq=0 或未给出 on_irq 时不投递)。
+        # 中断投递: 完成中断经投递目标上报, 编号为 0 或未给出目标时不投递。
         # 调用方应传设备中断投递目标 DeviceIrqSink, 该目标除置位中断控制器外还通知
         # 加速执行引擎并唤醒 WFI 阻塞的 hart; 直接调 plic.set_irq 会略过这两步, 使设备
         # 中断在引擎的单轮加速执行内不可见, 且无法唤醒已进入 WFI 的 hart。
+        irq, on_irq = irq_sink if irq_sink is not None else (0, None)
         self.mmio = VirtioMMIO(
             device_id=0x2,  # block device
             device_features=_DEVICE_FEATURES,
             num_queues=1,
-            queue_num_max=queue_size_max,
+            queue_num_max=_BLK_QUEUE_NUM_MAX,
             mem_read=mem_read,
             mem_write=mem_write,
             irq=irq,
@@ -305,7 +305,6 @@ class VirtIOBlock(Device):
 
         hdr_data = self._mem_read_chunk(hdr_desc.addr, _BLK_OUTHDR_SIZE)
         req_type = int.from_bytes(hdr_data[0:4], "little")
-        # ioprio = int.from_bytes(hdr_data[4:8], "little")  # 未使用
         sector = int.from_bytes(hdr_data[8:16], "little")
 
         if req_type == VIRTIO_BLK_T_IN:
@@ -350,7 +349,6 @@ class VirtIOBlock(Device):
         data = self._mem_read_chunk(buf_pa, buf_len)
         offset = sector * SECTOR_SIZE
         os.pwrite(self._fd, data, offset)
-        # 更新磁盘大小 (如果写到了文件末尾之后)
         end = offset + len(data)
         if end > self._disk_size:
             self._disk_size = end

@@ -1,10 +1,6 @@
 /* ext_mod_loader.c - 最小扩展模块装载器
  *
- * 把一个载荷创建并转入飞地, 在载荷让出期间应答它的模块请求, 直到载荷终止. 与回归
- * 工具 tee_ecall_regress 的区别在于本程序只做这一件事: 不做生命周期与令牌校验用例,
- * 也不扫描载荷名录, 故飞地的模块取入通路可以在此单点验证. 模块表与应答流程取自
- * ../ext-mod-svc, 与回归工具共用同一份实现.
- *
+ * 把一个载荷创建并转入飞地, 在载荷让出期间应答它的模块请求, 直到载荷终止.
  * 用法: ./ext_mod_loader <payload> <modules_dir>
  * 编译: riscv64-linux-gnu-gcc -static -O2 -I../cache-probe-exploit -I../ext-mod-svc \
  *           ext_mod_loader.c ../ext-mod-svc/tee_ext_mod_svc.c -o bin/ext_mod_loader
@@ -27,7 +23,10 @@
 #include "tee_enclave.h"
 #include "tee_ext_mod_svc.h"
 
-static long loader_ioctl(int fd, unsigned long cmd, void *arg) {
+static long loader_ioctl(
+	int fd,
+	unsigned long cmd,
+	void *arg) {
 	long rc = syscall(SYS_ioctl, fd, cmd, arg);
 	if (rc < 0) {
 		return -errno;
@@ -36,7 +35,9 @@ static long loader_ioctl(int fd, unsigned long cmd, void *arg) {
 }
 
 /* 读入整个文件. 失败返回 NULL. */
-static uint8_t *read_whole_file(const char *path, size_t *out_size) {
+static uint8_t *read_whole_file(
+	const char *path,
+	size_t *out_size) {
 	FILE *fp = fopen(path, "rb");
 	if (!fp) {
 		fprintf(stderr, "open '%s' failed (errno=%d)\n", path, errno);
@@ -67,7 +68,9 @@ static uint8_t *read_whole_file(const char *path, size_t *out_size) {
 	return buf;
 }
 
-int main(int argc, char **argv) {
+int main(
+	int argc,
+	char **argv) {
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s <payload> <modules_dir>\n", argv[0]);
 		return 2;
@@ -151,7 +154,6 @@ int main(int argc, char **argv) {
 
 	if (rc < 0) {
 		printf("[ext-mod-loader] enter/resume failed (errno=%ld)\n", -rc);
-		printf("[ext-mod-loader] result: enter-failed\n");
 		return 1;
 	}
 

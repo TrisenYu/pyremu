@@ -14,6 +14,7 @@ import struct
 import libfdt
 import pytest
 
+from pyremu import configs_gen
 from pyremu.emulator import Emulator
 from pyremu.memory.bus import Bus
 from pyremu.peripheral.gpio import GPIO
@@ -179,12 +180,12 @@ class TestGPIOConfig:
             num_harts=1,
             ram_base=0x8000_0000,
             prog_cnt=0x8000_0000,
-            periph=PeripheralConfig(),
+            periph=PeripheralConfig(gpio_base=GPIO_BASE),
         )
 
-    def test_default_gpio_base(self):
-        """默认 PeripheralConfig 启用 GPIO."""
-        assert PeripheralConfig().gpio_base == GPIO_BASE
+    def test_default_gpio_base_follows_build_config(self):
+        """默认 GPIO 基址取自 emu-configs.mk 生成的常量."""
+        assert PeripheralConfig().gpio_base == configs_gen.GPIO_BASE
 
     def test_emulator_registers_device(self):
         """基址非零时 Emulator 创建 GPIO 并挂到 Bus 上."""

@@ -57,7 +57,7 @@ pub struct FfiClintCtx {
 	pub msip: *mut u8,
 	pub base: u64,
 	/// mtime 时钟源频率 (Hz, 与 DTB timebase-frequency 同源).
-	/// 用于acceleration内按 clock-source 推进 mtime (QEMU QEMU_CLOCK_VIRTUAL 等价):
+	/// 用于acceleration内按 clock-source 推进 mtime
 	/// target = time_base_val + elapsed_ns * timebase_hz / 1e9.  0 = 禁用.
 	pub timebase_hz: u64,
 }

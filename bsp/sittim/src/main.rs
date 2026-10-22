@@ -1,4 +1,4 @@
-//! 飞地 S-mode 运行时启动入口。以 MMU 是否使能为界分为两阶段。
+//! 启动入口。以 MMU 是否使能为界分为两阶段。
 #![no_std]
 #![no_main]
 
@@ -12,8 +12,8 @@ mod elf;
 mod ext_mod;
 mod hang;
 mod mem;
-mod mem_prim;
 mod paging;
+mod prim;
 mod println;
 mod sync_aux;
 mod syscall;
@@ -23,7 +23,7 @@ mod trap_frame;
 use core::panic::PanicInfo;
 
 use crate::constants::*;
-use crate::mem_prim::align::align_up;
+use crate::prim::arith::align_up;
 use crate::syscall::concurrency::proc;
 use crate::syscall::concurrency::thread;
 
@@ -35,7 +35,7 @@ unsafe extern "C" {
 core::arch::global_asm!(include_str!("entry.s"));
 
 // ---------------------------------------------------------------
-//  阶段一：MMU 使能前 —— 构建页表
+//  阶段一：MMU 使能前构建页表
 // ---------------------------------------------------------------
 
 /// 阶段一返回给 entry.s 的启动信息。`repr(C)` 确保与汇编的
@@ -47,7 +47,7 @@ pub struct BootInfo {
 	pub va_offset: u64,
 }
 
-/// 阶段一入口 — 由 entry.s 调用。
+/// 阶段一入口。
 ///
 /// 所有参数按RISC-V调用规范通过a0~a4寄存器传入
 #[unsafe(no_mangle)]
@@ -56,7 +56,7 @@ pub unsafe extern "C" fn main_before_mmu(
 	_enclave_id: u64,
 	man_pa_start: u64,
 	_man_size: u64,
-	partition_num: u64
+	partition_num: u64,
 ) {
 	// _end 与 _instr_class_end 符号已由 entry.s 中的 PIE 重定位调整至运行时地址
 	// (base_pa + link_addr), 无需再加 load_offset, 否则会 double-count base_pa.
@@ -64,16 +64,8 @@ pub unsafe extern "C" fn main_before_mmu(
 	let instr_class_end = &raw const _instr_class_end as u64;
 	let man_size = end_pa - man_pa_start;
 
-	// 授予的区间以 2 MiB 分区为单位划分类别, 故镜像必须落在整数个分区内, 判据见
-	// [`mem::check_img_layout`]。
-	if
-		let Err(msg) = mem::check_img_layout(
-			man_pa_start,
-			instr_class_end,
-			end_pa,
-			partition_num
-		)
-	{
+	// 授予的区间以 2 MiB 分区为单位划分类别, 故镜像必须落在整数个分区内
+	if let Err(msg) = mem::check_img_layout(man_pa_start, instr_class_end, end_pa, partition_num) {
 		hang::fault_halt(msg);
 	}
 
@@ -113,15 +105,13 @@ pub unsafe extern "C" fn main_before_mmu(
 }
 
 // ---------------------------------------------------------------
-//  阶段二：MMU 使能后 —— 加载 ELF -> sret U-mode
+//  阶段二：MMU 使能后加载 ELF，sret返回至U-mode
 // ---------------------------------------------------------------
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn main_after_mmu() {
-	// 引导期交接: 必须交还宿主, 由宿主在 ENTER 返回路径上传入载荷信息.
-	let (payload_pa, payload_size, argc) = ecall_aux::enclave_call_suspend(
-		ENCLAVE_SUSPEND_VOLUNTARY
-	);
+	let (payload_pa, payload_size, argc) =
+		ecall_aux::enclave_call_suspend(ENCLAVE_SUSPEND_VOLUNTARY);
 
 	// argv 块基址必须与 M-mode enter_enclave_handler 的投递目标一致:
 	// enter.c 中 payload_argv_paddr = ROUNDUP(payload_base_pa + payload_size, PARTITION_SIZE),
@@ -131,13 +121,13 @@ pub unsafe extern "C" fn main_after_mmu() {
 	// 分区之外, map_user_argv 读到空白页.
 	let argv_pa = payload_pa + align_up(payload_size, CHUNK_2M_SIZE);
 	// M-mode 为 argv 与 U 模式栈另授一个分区, 即 enter.c 的 argv 分区: argv 数据落在
-	// 该分区的首地址, U 模式栈落在该分区的末尾, 见 mem::alloc_map_umode_stack.
+	// 该分区的首地址, U 模式栈落在该分区的末尾.
 	// 堆与 mmap 区不再出自任何页池, 由 grow_umode_va / take_mmap_region 经 500 号
 	// 调用逐个申请数据类分区.
 
 	// M-mode 移交的载荷物理区与紧随其后的 argv 物理区不在 setup_linear_map 的
 	// [5 GiB, 18 GiB) 全局线性窗口内, 故把 [payload_pa, argv_pa + CHUNK_2M_SIZE)
-	// 补建到 LINEAR_MAP_OFFSET 别名.
+	// 补建到 LINEAR_MAP_OFFSET.
 	//
 	// 该别名必须在读取本区间的任何代码之前建立, 读取方为 syscall::inject_manifest,
 	// elf::load_elf, map_user_argv 与 setup_musl_stack, 四处一律经 PA + OFFSET 读取.
@@ -194,14 +184,13 @@ pub unsafe extern "C" fn main_after_mmu() {
 	}
 	// 与 trap.rs 定时器中断路径一致: 直接改写 stimecmp (Sstc) 而非经 SBI TIME
 	// ecall.
-	csr::write_stimecmp(now + TIMER_INTERVAL);
+	csr::write_stimecmp(now + TICKS_PER_SCHED_TICK);
 
-	// 登记启动进程 (槽位 0) 与主线程并建立调度状态. 用户现场经参数传入 (见
-	// thread::init_main_thread 的说明), 不依赖 CSR 的写入时机.
+	// 登记启动进程与主线程并建立调度状态. 用户现场经参数传入, 不依赖 CSR 的写入时机.
 	proc::init_main_process();
 	thread::init_main_thread(payload.entry, sstatus);
 
-	// 末尾写入 U 模式现场. 此时 sstatus.SIE 已清 0 (见上), 因此从 csrw sstatus
+	// 末尾写入 U 模式现场. 此时 sstatus.SIE 已清 0, 因此从 csrw sstatus
 	// 到 sret 之间不会再有 S 级中断取走, sepc / sscratch / SPP 得以原样送达 sret.
 	// csrw sie 仅设置中断使能掩码, 在 SIE=0 时不触发任何中断.
 	csr::write_sstatus(sstatus);
@@ -211,9 +200,9 @@ pub unsafe extern "C" fn main_after_mmu() {
 }
 
 /*
-    musl 栈布局:
+	musl 栈布局:
 	sp ->  argc
-	      ------
+		  ------
 		  argv[]
 		  ------
 		   NULL
@@ -249,13 +238,8 @@ unsafe fn push_u64(sp: &mut u64, val: u64) {
 ///
 /// auxv 必须完整给出程序头表的三项 (AT_PHDR / AT_PHENT / AT_PHNUM): musl 静态
 /// 链接版的 dl_iterate_phdr 以此为唯一数据源, libunwind 经它定位 .eh_frame_hdr
-/// 才能取到展开表。缺失时 C++ 异常一律退化为 std::terminate (详见 elf::PayloadInfo)。
-fn setup_musl_stack(
-	sp_top: u64,
-	argv_pa: u64,
-	argc: u64,
-	payload: &elf::PayloadInfo
-) -> u64 {
+/// 才能取到展开表。缺失时 C++ 异常一律退化为 std::terminate
+fn setup_musl_stack(sp_top: u64, argv_pa: u64, argc: u64, payload: &elf::PayloadInfo) -> u64 {
 	let mut sp = sp_top;
 
 	// argv 终止 NULL 先于 argv 数组压入 (位于 argv[argc-1] 更高地址);
@@ -299,15 +283,16 @@ fn setup_musl_stack(
 	sp
 }
 
-// ---------------------------------------------------------------
-//  panic
-// ---------------------------------------------------------------
-
-// 测试构建链接 std 与 libtest, 二者各自提供 panic 入口。
+/// panic处理函数
 #[panic_handler]
 fn panic_handler(info: &PanicInfo) -> ! {
 	if let Some(loc) = info.location() {
-		println!("panic at {}:{}, {}\n", loc.file(), loc.line(), info.message());
+		println!(
+			"panic at {}:{}, {}\n",
+			loc.file(),
+			loc.line(),
+			info.message()
+		);
 	} else {
 		println!("panic: {}\n", info.message());
 	}

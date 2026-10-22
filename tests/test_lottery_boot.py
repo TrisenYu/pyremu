@@ -10,7 +10,7 @@ import re
 
 import pytest
 
-from pyremu.configs_aux import path_join, examed_elf_dir
+from pyremu.configs_aux import examed_elf_dir, path_join
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 from pyremu.utils.parse_bin import FirmwareImage, parse_firmware
@@ -25,6 +25,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 def _strip_ansi(text: str) -> str:
     """Strip ANSI escape codes from *text* (used by hart-coloured output)."""
     return _ANSI_RE.sub("", text)
+
 
 # ------------------------------------------------------------
 #  模块级固件缓存 — 避免每个测试重复解析 ELF

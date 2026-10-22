@@ -7,7 +7,7 @@ use crate::println;
 use crate::trap::get_trap_reason;
 use crate::trap_frame::TrapGprs;
 
-/// 无限 WFI 循环。用于飞地无恢复路径时挂起当前 hart。
+/// 用于飞地无恢复路径时挂起当前 hart。
 pub fn hang() -> ! {
 	loop {
 		unsafe {
@@ -40,7 +40,10 @@ pub fn fault_halt(msg: &str) -> ! {
 /// 报告本次陷态详情: 来源特权级、陷态栈帧的地址、帧内的 32 个通用寄存器、陷态入口读到的
 /// sepc 与当前的 satp。
 pub fn fault_halt_exc(gprs: &TrapGprs, scause: u64, stval: u64, sepc: u64) -> ! {
-	println!("\n!!!!!!!!!sittim-trap!!!!!!!!!\n{}\n\n", get_trap_reason(scause));
+	println!(
+		"\n!!!!!!!!!sittim-trap!!!!!!!!!\n{}\n\n",
+		get_trap_reason(scause)
+	);
 	println!(
 		"cause, tval: {:016x} {:016x}\n\
 		ctxAddr,epc: {:016x} {:016x}\n\

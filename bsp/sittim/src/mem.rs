@@ -1,17 +1,17 @@
 //! 页池分配器与内存管理。 memory.c + page_pool.c 逻辑。
 //!
-//! 设计要点：
-//! - 用相对偏移量而非绝对地址，方便日后迁移。
-//! - S-mode 页池 (页表与内核栈) 落在管理器镜像末尾起的分区内。
+//! 设计：
+//! - 用相对偏移量而非绝对地址。
+//! - S-mode 页表与内核栈落在管理器镜像末尾起的分区内。
 //! - U 模式的物理内存不出自页池: argv 与 U 模式栈落在 M 模式随载荷一并授予的分区内,
 //!   堆与 mmap 区经 `enclave_call_mem_alloc` 逐个分区申请。
 
 use crate::constants::*;
-use crate::context::{ self, PoolDesc };
-use crate::mem_prim::align::{ align_down, align_up };
+use crate::context::{self, PoolDesc};
 use crate::ecall_aux;
 use crate::hang;
 use crate::paging;
+use crate::prim::arith::{align_down, align_up};
 
 // ---------------------------------------------------------------
 //  页池初始化
@@ -32,18 +32,14 @@ pub fn init_smode_pool(offset: u64, size: u64) {
 
 /// 从 S-mode 页池分配 `n` 个物理页，返回物理地址；池耗尽返回 `!0u64`。
 ///
-/// 不再在此处 hang：由调用方决定是向上层报 OOM 还是视为致命错误 (S-mode 页表/栈,
-/// 见 `alloc_smode_page`)。
+/// 不再在此处 hang：由调用方决定是向上层报 OOM 还是视为致命错误
 fn pool_alloc(n: u64) -> u64 {
 	let ctx = context::ctx();
 	let expected = ctx.smode_pool.used_pages + n;
 	if expected * PAGE_SIZE > ctx.smode_pool.size {
 		return !0u64;
 	}
-	let pa =
-		ctx.manager_pa_start +
-		ctx.smode_pool.offset +
-		ctx.smode_pool.used_pages * PAGE_SIZE;
+	let pa = ctx.manager_pa_start + ctx.smode_pool.offset + ctx.smode_pool.used_pages * PAGE_SIZE;
 	context::ctx_mut().smode_pool.used_pages = expected;
 	pa
 }
@@ -100,9 +96,8 @@ pub fn is_dedicated_partition(pa: u64) -> bool {
 /// 把覆盖 [pa, pa + bytes) 的整数个 2 MiB 分区改判为 `attr`, 成功返回 true。
 ///
 /// 类别是分区的属性, 故 `pa` 须按分区对齐, 区间涉及的每个分区整块改判。该区间由
-/// 调用方独占, 区间之外的分区不受影响; 与飞地管理器镜像共用的分区一律拒绝, 判据见
-/// [`is_dedicated_partition`]。由数据类改判为指令类之后, 分区只登记读与执行权限,
-/// 写入将被拒绝。
+/// 调用方独占, 区间之外的分区不受影响; 与飞地管理器镜像共用的分区一律拒绝。
+/// 由数据类改判为指令类之后, 分区只登记读与执行权限,写入将被拒绝。
 pub fn set_partition_attr(pa: u64, bytes: u64, attr: u64) -> bool {
 	if (pa & (CHUNK_2M_SIZE - 1)) != 0 {
 		return false;
@@ -153,25 +148,25 @@ pub fn map_sections() {
 			&raw const _text_start as u64,
 			&raw const _text_end as u64,
 			va_ofs,
-			PTE_X
+			PTE_X,
 		);
 		map_one_section(
 			&raw const _rodata_start as u64,
 			&raw const _instr_class_end as u64,
 			va_ofs,
-			PTE_R
+			PTE_R,
 		);
 		map_one_section(
 			&raw const _data_class_start as u64,
 			&raw const _data_end as u64,
 			va_ofs,
-			PTE_R | PTE_W
+			PTE_R | PTE_W,
 		);
 		map_one_section(
 			&raw const _bss_start as u64,
 			&raw const _bss_end as u64,
 			va_ofs,
-			PTE_R | PTE_W
+			PTE_R | PTE_W,
 		);
 	}
 }
@@ -190,7 +185,7 @@ unsafe fn map_one_section(sec_start: u64, sec_end: u64, va_offset: u64, flags: u
 			align_down(sec_start, PAGE_SIZE) + i * PAGE_SIZE,
 			flags,
 			LEVEL_PAGE,
-			"map_sections: page table\n"
+			"map_sections: page table\n",
 		);
 	}
 }
@@ -208,7 +203,7 @@ pub fn map_smode_page_pool(pool_ofs: u64, pool_size: u64) {
 			pa,
 			PTE_R | PTE_W,
 			LEVEL_PAGE,
-			"map_smode_page_pool: page table\n"
+			"map_smode_page_pool: page table\n",
 		);
 	}
 }
@@ -260,7 +255,7 @@ pub fn alloc_map_umode_stack(argv_pa: u64) -> u64 {
 			bottom_pa + i * PAGE_SIZE,
 			PTE_U | PTE_R | PTE_W,
 			LEVEL_PAGE,
-			"alloc_map_umode_stack: page table\n"
+			"alloc_map_umode_stack: page table\n",
 		);
 	}
 	UMODE_STACK_TOP_VA
@@ -287,7 +282,7 @@ pub fn map_user_argv(argv_pa: u64, argc: u64) {
 		argv_pa,
 		PTE_U | PTE_R | PTE_W,
 		LEVEL_PAGE,
-		"map_user_argv: page table\n"
+		"map_user_argv: page table\n",
 	);
 }
 
@@ -301,19 +296,20 @@ pub fn map_user_argv(argv_pa: u64, argc: u64) {
 /// 超页之下不存在下一级页表, 块内不能再落 4 KiB 页, 故同一 VA 块只能由单一粒度
 /// 覆盖, 同一 VA 一经映射即不再二次映射。
 ///
-/// 取得的分区类别由 `flags` 的可执行位决定 (见 [`attr_of_pte_flags`])。
+/// 取得的分区类别由 `flags` 的可执行位决定。
 pub fn grow_umode_va(from: u64, to: u64, flags: u64) -> u64 {
 	// 用户空间的映射止于 UMODE_VA_LIMIT: 越界的块与低半区共用根表项, 建立映射会改写
 	// 另一个 VA 的页表项。上界之下按块推进, 故返回的上界可能略低于请求的上界。
-	let to = if to > UMODE_VA_LIMIT { UMODE_VA_LIMIT } else { to };
+	let to = if to > UMODE_VA_LIMIT {
+		UMODE_VA_LIMIT
+	} else {
+		to
+	};
 	let mut va = from;
 	let attr = attr_of_pte_flags(flags);
 
 	while va < to {
-		let (granted, pa) = ecall_aux::enclave_call_mem_alloc(
-			MEM_ALLOC_BLOCKS_PER_CALL,
-			attr
-		);
+		let (granted, pa) = ecall_aux::enclave_call_mem_alloc(MEM_ALLOC_BLOCKS_PER_CALL, attr);
 		if granted == 0 {
 			return va;
 		}
@@ -322,7 +318,7 @@ pub fn grow_umode_va(from: u64, to: u64, flags: u64) -> u64 {
 				va + i * CHUNK_2M_SIZE,
 				pa + i * CHUNK_2M_SIZE,
 				flags,
-				LEVEL_MEGA
+				LEVEL_MEGA,
 			);
 			if r.is_err() {
 				return va + i * CHUNK_2M_SIZE;
@@ -340,7 +336,11 @@ pub fn grow_umode_va(from: u64, to: u64, flags: u64) -> u64 {
 /// 类别是整块 2 MiB 分区的属性, 故由映射的可执行位唯一决定: 同一段映射的各页
 /// 同属一类, 一个分区也因此不会被同一次分配拆给两类映射。
 pub fn attr_of_pte_flags(flags: u64) -> u64 {
-	if (flags & PTE_X) != 0 { ENCLAVE_MEM_ATTR_INSTR } else { ENCLAVE_MEM_ATTR_DATA }
+	if (flags & PTE_X) != 0 {
+		ENCLAVE_MEM_ATTR_INSTR
+	} else {
+		ENCLAVE_MEM_ATTR_DATA
+	}
 }
 
 /// 在指定 VA 处按 4 KiB 粒度映射 `pages` 页, 供 MAP_FIXED 使用。
@@ -395,11 +395,7 @@ pub fn alias_umode_pages(src_va: u64, dst_va: u64, pages: u64, flags: u64) -> bo
 /// 块的物理基址加块内偏移算出, 故不能走 map_umode_pages。
 pub fn map_pages_at(va: u64, pa: u64, pages: u64, flags: u64) -> bool {
 	for i in 0..pages {
-		if
-			paging
-				::map_page(va + i * PAGE_SIZE, pa + i * PAGE_SIZE, flags, LEVEL_PAGE)
-				.is_err()
-		{
+		if paging::map_page(va + i * PAGE_SIZE, pa + i * PAGE_SIZE, flags, LEVEL_PAGE).is_err() {
 			return false;
 		}
 	}
@@ -459,7 +455,7 @@ fn is_mmap_pages_in_region(st_page: u64, page_num: u64) -> bool {
 /// 内存后继续。
 ///
 /// 数据类的请求可与其他数据类请求共用同一块的后备物理内存: 一个 2 MiB 块最多拆成
-/// 512 次 4 KiB 页使用。指令类的请求整块独占, 不参与块内切分, 见下。
+/// 512 次 4 KiB 页使用。指令类的请求整块独占, 不参与块内切分。
 pub fn take_mmap_region(bytes: u64, pte_flags: u64) -> u64 {
 	// 长度不小于用户空间上界时, 按页与按块的取整都会向上溢出而出小值, 后续算式因此
 	// 接受一个远大于映射区的区间。提前拒绝使算式只在无溢出的区间内求值。
@@ -532,7 +528,11 @@ pub fn take_mmap_region(bytes: u64, pte_flags: u64) -> u64 {
 			split_pa = pa;
 		}
 		let room = CHUNK_2M_PAGES - in_block;
-		let n = if pages - done < room { pages - done } else { room };
+		let n = if pages - done < room {
+			pages - done
+		} else {
+			room
+		};
 		let pa = split_pa + in_block * PAGE_SIZE;
 		if !map_pages_at(va + done * PAGE_SIZE, pa, n, pte_flags) {
 			break;
@@ -591,8 +591,7 @@ fn is_mmap_grow_in_place_allowed(old_end: u64, new_end: u64) -> bool {
 	// 新增页的物理地址按后备物理内存基址加块内偏移算出, 故新增的末页须与原末页同块 ——
 	// 换块须先取得新的后备内存, 那属于 mremap 的搬移路径。
 	match mmap_split_block_start() {
-		Some(block_start) =>
-			align_down(new_end - PAGE_SIZE, CHUNK_2M_SIZE) == block_start,
+		Some(block_start) => align_down(new_end - PAGE_SIZE, CHUNK_2M_SIZE) == block_start,
 		None => false,
 	}
 }
@@ -637,9 +636,7 @@ pub fn grow_mmap_in_place(addr: u64, old_size: u64, new_size: u64) -> bool {
 			return false;
 		}
 	};
-	let pa =
-		context::ctx().umode_curr_mmap_pa +
-		(old_end - align_down(old_end, CHUNK_2M_SIZE));
+	let pa = context::ctx().umode_curr_mmap_pa + (old_end - align_down(old_end, CHUNK_2M_SIZE));
 	let pages = (new_end - old_end) >> PAGE_SHIFT;
 	if !map_pages_at(old_end, pa, pages, flags) {
 		return false;
@@ -702,7 +699,7 @@ pub fn check_img_layout(
 	man_pa_start: u64,
 	instr_class_end: u64,
 	end_pa: u64,
-	partition_num: u64
+	partition_num: u64,
 ) -> Result<(), &'static str> {
 	if instr_class_end - man_pa_start > CHUNK_2M_SIZE {
 		return Err("sittim: RO sections overflow partition 0\n");
@@ -717,8 +714,6 @@ pub fn check_img_layout(
 
 	Ok(())
 }
-
-
 
 #[cfg(test)]
 mod tests {

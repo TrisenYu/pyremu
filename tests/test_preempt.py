@@ -21,6 +21,10 @@ def _make_emu(*procs: str):
     assert kernel is not None, "KERNEL_ELF 解析失败"
     emu = Emulator(PlatformConfig.qemu_virt())
     emu.load_firmware(kernel)
+    # 内核在全部进程终止后执行停机序列, 随后转入 stop_machine_idle 的 WFI 自旋.
+    # 内联服务打开时引擎在停机序列处停止; 关闭时该序列按普通断点投递后进入自旋.
+    # 在自旋入口登记停止地址, 使 run() 在两种编译选项下都以停止返回.
+    emu.add_breakpoint(kernel.symbols["stop_machine_idle"])
     loader = MultiProgramLoader(emu, kernel)
     for p in procs:
         loader.add_process(p)

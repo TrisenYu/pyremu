@@ -104,7 +104,7 @@ pub(crate) fn compute_mtopi(state: &mut HartState, _mtime: u64) -> (u64, u8) {
 	// 1. IMSIC M-file: ALL interrupts (IPI + external) -> IID=11 (MEI major
 	//    identity).  The IMSIC IPI is delivered via MEIP exactly like an
 	//    external interrupt — its minor identity (1) is NOT a major identity.
-	//    Per QEMU's riscv_imsic_update, every pending IMSIC interrupt raises
+	//    riscv_imsic_update, every pending IMSIC interrupt raises
 	//    the MEIP line, and read_mtopi returns the mip bit number (11=MEI).
 	//    The minor identity is revealed only via MTOPEI.
 	let (raw, _) = imsic_topei_peek(&state.imsic_m);
@@ -146,7 +146,7 @@ pub(crate) fn compute_stopi(state: &mut HartState, mtime: u64) -> (u64, u8) {
 	// 1. IMSIC S-file: ALL interrupts (IPI + external) -> IID=9 (SEI major
 	//    identity).  The IMSIC IPI is delivered via SEIP exactly like an
 	//    external interrupt — its minor identity (1) is NOT a major identity.
-	//    Per QEMU's riscv_imsic_update, every pending IMSIC interrupt raises
+	//    riscv_imsic_update, every pending IMSIC interrupt raises
 	//    the SEIP line, and read_stopi returns the mip bit number (9=SEI).
 	//    The minor identity is revealed only via STOPEI.
 	let (raw, _) = imsic_topei_peek(&state.imsic_s);
@@ -283,7 +283,7 @@ pub(crate) fn sync_ext_irq_mip(state: &mut HartState, ext_irq: *mut FfiExtIrqCtx
 mod tests {
 	use super::*;
 	use crate::concurrent::ConcurrentClintCtx;
-use crate::ffi::FfiExtIrqCtx;
+	use crate::ffi::FfiExtIrqCtx;
 	use crate::state::{riscv_mode, HartState};
 	use std::cell::Cell;
 	use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};

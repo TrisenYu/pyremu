@@ -1,16 +1,16 @@
 //! 扩展模块映像的完整性证明。
 //!
 //! 映像尾部追加 64 字节 ECDSA (secp256r1) 签名, 签名对象是签名之前的映像字节的摘要,
-//! 用内置公钥验证。验证在映像的入口被调用之前完成, 见 [`crate::ext_mod::loader`]。
+//! 用内置公钥验证。验证在映像的入口被调用之前完成。
 //!
 //! 摘要算法经 [`digest`] 单点隔离。更换 SM3 或私有算法时只改该函数, 但签名
 //! 工具必须同步更换
 
 use p256::ecdsa::signature::hazmat::PrehashVerifier;
-use p256::ecdsa::{ Signature, VerifyingKey };
-use sha2::{ Digest, Sha256 };
+use p256::ecdsa::{Signature, VerifyingKey};
+use sha2::{Digest, Sha256};
 
-use crate::constants::{ ATTEST_PUB_KEY, SHA256_DIGEST, SIG_LEN };
+use crate::constants::{ATTEST_PUB_KEY, SHA256_DIGEST, SIG_LEN};
 
 /// 计算消息的摘要, 长度为 [`SHA256_DIGEST`] 字节。
 pub fn digest(msg: &[u8]) -> [u8; SHA256_DIGEST] {

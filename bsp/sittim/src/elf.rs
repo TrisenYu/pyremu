@@ -3,20 +3,17 @@
 use crate::constants::*;
 use crate::ecall_aux;
 use crate::mem;
-use crate::mem_prim::align::{ align_down, align_up };
-use crate::paging::{ self, SetPageConfig };
+use crate::paging::{self, SetPageConfig};
+use crate::prim::arith::{align_down, align_up};
 use crate::println;
 
 /// 载荷被拒绝时的退出码。
-///
-/// 低于 128: 被信号终止的进程退出码从 128 起算, 故本码与它们不相混。
 const PAYLOAD_REJECT_EXIT_CODE: u64 = 125;
 
 /// 载荷无法执行: 向宿主报告原因并终止本飞地。
 ///
 /// 本路径在 U 模式入口之前执行, 飞地内没有可执行的载荷, 也没有恢复路径。宿主经
-/// ENTER 或 RESUME 的返回值取到运行状态 exited-err 与本退出码, 据此收尾本次载荷
-/// 并继续下一个。
+/// ENTER 或 RESUME 的返回值取到运行状态 exited-err 与本退出码
 pub fn reject_payload(reason: &str) -> ! {
 	println!("{reason}\n");
 	ecall_aux::enclave_call_exit(PAYLOAD_REJECT_EXIT_CODE)
@@ -25,26 +22,23 @@ pub fn reject_payload(reason: &str) -> ! {
 /// 检查 ELF 格式 —— 对应 smode_entry 的 check_elf_format。
 fn check_elf_format(
 	elf_header: &elf::file::FileHeader<elf::endian::LittleEndian>,
-	elf_size: u64
+	elf_size: u64,
 ) -> bool {
-	if
-		elf_header.class != elf::file::Class::ELF64 ||
-		elf_header.e_type != ET_EXEC ||
-		elf_header.e_machine != EM_RISCV
+	if elf_header.class != elf::file::Class::ELF64
+		|| elf_header.e_type != ET_EXEC
+		|| elf_header.e_machine != EM_RISCV
 	{
 		return true;
 	}
 
 	let prog_head_end =
-		elf_header.e_phoff +
-		(elf_header.e_phentsize as u64) * (elf_header.e_phnum as u64);
+		elf_header.e_phoff + (elf_header.e_phentsize as u64) * (elf_header.e_phnum as u64);
 	if elf_size < prog_head_end || prog_head_end < elf_header.e_phoff {
 		return true;
 	}
 
 	let sect_head_end =
-		elf_header.e_shoff +
-		(elf_header.e_shentsize as u64) * (elf_header.e_shnum as u64);
+		elf_header.e_shoff + (elf_header.e_shentsize as u64) * (elf_header.e_shnum as u64);
 	if elf_size < sect_head_end || sect_head_end < elf_header.e_shoff {
 		return true;
 	}
@@ -89,7 +83,7 @@ fn segment_mapped_size(prog_header: &elf::segment::ProgramHeader) -> u64 {
 /// 段的声明对齐只保证 p_vaddr 与 p_offset 对 p_align 同余, p_align 大于页大小时
 /// 段与段可以相接于页内, 故此处按页取整后比较。
 fn check_segments_page_disjoint(
-	segments: elf::segment::SegmentTable<'_, elf::endian::LittleEndian>
+	segments: elf::segment::SegmentTable<'_, elf::endian::LittleEndian>,
 ) -> bool {
 	for (i, first) in segments.iter().enumerate() {
 		if first.p_type != PT_LOAD || first.p_memsz == 0 {
@@ -130,7 +124,11 @@ unsafe fn map_one_segment(elf_va_base: u64, prog_header: elf::segment::ProgramHe
 	let is_instr_class = (prog_header.p_flags & PF_X) != 0;
 	let flags = set_pte_flag_via_elf64word(prog_header.p_flags);
 	// 指令类的分区只登记读与执行权限, 故可取指的段在改判之后不保留写权限。
-	let final_flags = if is_instr_class { flags & !PTE_W } else { flags };
+	let final_flags = if is_instr_class {
+		flags & !PTE_W
+	} else {
+		flags
+	};
 
 	// 段的虚拟区间按页取整后整体申请: filesz 未按页对齐时, 末张文件页的剩余部分
 	// 由 BSS 占据, 与文件内容同属本段, 故一并落在本段的分区内。
@@ -149,21 +147,19 @@ unsafe fn map_one_segment(elf_va_base: u64, prog_header: elf::segment::ProgramHe
 			flags: flags | PTE_R | PTE_W,
 			level: LEVEL_PAGE,
 		}),
-		pages
+		pages,
 	);
 
 	// 文件内容按整页拷入: 段的文件数据自 p_offset 起算, 与 p_vaddr 对页大小同余
 	// (链接器保证), 故两侧同按页对齐后逐字节对应。
 	let file_end_va = align_up(prog_header.p_vaddr + prog_header.p_filesz, PAGE_SIZE);
 	if file_end_va > va_start {
-		let src_va = elf_va_base.wrapping_add(
-			align_down(prog_header.p_offset, PAGE_SIZE)
-		);
+		let src_va = elf_va_base.wrapping_add(align_down(prog_header.p_offset, PAGE_SIZE));
 		unsafe {
 			core::ptr::copy_nonoverlapping(
 				src_va as *const u8,
 				va_start as *mut u8,
-				(file_end_va - va_start) as usize
+				(file_end_va - va_start) as usize,
 			);
 		}
 	}
@@ -174,16 +170,13 @@ unsafe fn map_one_segment(elf_va_base: u64, prog_header: elf::segment::ProgramHe
 			core::ptr::write_bytes(
 				(prog_header.p_vaddr + prog_header.p_filesz) as *mut u8,
 				0,
-				(prog_header.p_memsz - prog_header.p_filesz) as usize
+				(prog_header.p_memsz - prog_header.p_filesz) as usize,
 			);
 		}
 	}
 
 	// 写入完毕后整块改判为指令类: 改判一经返回, 该分区只登记读与执行权限。
-	if
-		is_instr_class &&
-		!mem::set_partition_attr(pa, pages << PAGE_SHIFT, ENCLAVE_MEM_ATTR_INSTR)
-	{
+	if is_instr_class && !mem::set_partition_attr(pa, pages << PAGE_SHIFT, ENCLAVE_MEM_ATTR_INSTR) {
 		reject_payload("elf: classify segment failed");
 	}
 	// 页表项按段标志位收回写权限, 与该分区的权限位一致。
@@ -197,18 +190,18 @@ unsafe fn map_one_segment(elf_va_base: u64, prog_header: elf::segment::ProgramHe
 /// 载荷加载结果。除入口地址外, 还携带程序头表在载荷地址空间中的位置,
 /// 供调用方填写 auxv 的 AT_PHDR / AT_PHENT / AT_PHNUM。
 ///
-/// musl 静态链接版的 dl_iterate_phdr (vendor/musl/src/ldso/dl_iterate_phdr.c)
+/// musl 静态链接版的 dl_iterate_phdr
 /// 直接以 auxv 的三项为唯一数据源遍历程序头; libunwind 又经它定位
 /// PT_GNU_EH_FRAME (.eh_frame_hdr) 以取得展开表。auxv 缺这三项时遍历条目数为 0,
 /// libunwind 找不到任何 FDE, _Unwind_RaiseException 判定已到栈底,
 /// __cxa_throw 随即调用 std::terminate —— 载荷内任何一个 C++ 异常都无法被捕获。
 pub struct PayloadInfo {
 	pub entry: u64,
-	/// 程序头表首地址 (AT_PHDR), 为载荷地址空间中的 VA。
+	/// 程序头表首地址, 为载荷地址空间中的 VA。
 	pub phdr_va: u64,
-	/// 单个程序头条目字节数 (AT_PHENT)。
+	/// 单个程序头条目字节数。
 	pub phentsize: u64,
-	/// 程序头条目数 (AT_PHNUM)。
+	/// 程序头条目数。
 	pub phnum: u64,
 }
 
@@ -236,12 +229,9 @@ fn phdr_va_of(elf_bytes: &elf::ElfBytes<elf::endian::LittleEndian>) -> u64 {
 /// 加载 ELF 到 U-mode。成功返回入口地址与程序头表信息。
 pub fn load_elf(elf_pa: u64, elf_size: u64) -> PayloadInfo {
 	let elf_va = elf_pa.wrapping_add(LINEAR_MAP_OFFSET);
-	let data = unsafe {
-		core::slice::from_raw_parts(elf_va as *const u8, elf_size as usize)
-	};
+	let data = unsafe { core::slice::from_raw_parts(elf_va as *const u8, elf_size as usize) };
 
-	let elf_bytes = elf::ElfBytes::<elf::endian::LittleEndian>
-		::minimal_parse(data)
+	let elf_bytes = elf::ElfBytes::<elf::endian::LittleEndian>::minimal_parse(data)
 		.unwrap_or_else(|_| reject_payload("elf: parse failed"));
 
 	if check_elf_format(&elf_bytes.ehdr, elf_size) {

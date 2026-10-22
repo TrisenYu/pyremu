@@ -4,6 +4,7 @@
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """Trap 处理测试: cause code 映射、ECALL/EBREAK/MRET/SRET 流程."""
+
 import struct
 
 import pytest
@@ -49,6 +50,27 @@ from pyremu.memory.mmu import sv39_vpn
 from pyremu.platform import PeripheralConfig, PlatformConfig
 from pyremu.utils.disassem import Opc
 from pyremu.utils.parse_bin import parse_firmware
+
+# Sv39 叶 PTE 的权限位
+PTE_V = 1 << 0
+PTE_R = 1 << 1
+PTE_W = 1 << 2
+PTE_X = 1 << 3
+PTE_U = 1 << 4
+
+
+def make_pte(perm: int = 0, ppn: int = 0) -> int:
+    """构造 Sv39 PTE 原始值: perm 为权限位, ppn 为物理页号.
+
+    PPN 按 RISC-V 标准连续编码写入: PPN[9:0] 到 bits[19:10],
+    PPN[18:10] 到 bits[28:20], PPN[43:19] 到 bits[53:29].
+    """
+    val = perm
+    val |= (ppn & 0x3FF) << 10
+    val |= ((ppn >> 10) & 0x1FF) << 20
+    val |= ((ppn >> 19) & 0x1FFFFFFF) << 29
+    return val
+
 
 # ============================================================
 #  trap_cause_code / trap_is_interrupt
@@ -218,6 +240,14 @@ class TestSemihostingEbreak:
     _POST = 0x40705013  # srai x0, x0, 7
     _EBREAK_PC = 0x80001000
 
+    @pytest.fixture(autouse=True)
+    def enable_semihosting(self, monkeypatch):
+        """本类覆盖内联服务的处理, 显式打开开关, 与编译选项无关.
+
+        关闭开关的用例在自身内部再把它置 0.
+        """
+        monkeypatch.setattr(trap_handler, "PYREMU_HAS_SEMIHOSTING", 1)
+
     @pytest.fixture
     def sh(self):
         bus = Bus(ram_size=0x100000, ram_base=0x80000000)
@@ -230,7 +260,7 @@ class TestSemihostingEbreak:
     @staticmethod
     def _put(bus: Bus, addr: int, data: bytes) -> None:
         off = addr - bus.ram_base
-        bus._ram[off:off + len(data)] = data
+        bus._ram[off : off + len(data)] = data
 
     def _place_ebreak(self, bus: Bus) -> None:
         """在 hart.pc 两侧写入 semihosting marker (中段 4 字节内容不限)."""
@@ -616,7 +646,6 @@ class TestTrapDelegation:
         hart.mode = RiscvMode.U
         hart.mie = True
         hart.csrs["mie"].val = 1 << 3
-        # mideleg = 0
         hart.pc = 0x2000
 
         clint.send_ipi(0)
@@ -1328,34 +1357,6 @@ class TestPageFault:
         data = pte_val.to_bytes(8, "little")
         ram[addr : addr + 8] = data
 
-    @staticmethod
-    def _make_pte(
-        v: bool = False,
-        r: bool = False,
-        w: bool = False,
-        x: bool = False,
-        u: bool = False,
-        ppn: int = 0,
-    ) -> int:
-        """构造 PTE 原始值."""
-        val = 0
-        if v:
-            val |= 1 << 0
-        if r:
-            val |= 1 << 1
-        if w:
-            val |= 1 << 2
-        if x:
-            val |= 1 << 3
-        if u:
-            val |= 1 << 4
-        # PPN 拆分 (RISC-V 标准连续编码): PPN[9:0]->bits[19:10],
-        # PPN[18:10]->bits[28:20], PPN[43:19]->bits[53:29].
-        val |= (ppn & 0x3FF) << 10
-        val |= ((ppn >> 10) & 0x1FF) << 20
-        val |= ((ppn >> 19) & 0x1FFFFFFF) << 29
-        return val
-
     def _setup_valid_4k(
         self,
         ram: bytearray,
@@ -1376,21 +1377,21 @@ class TestPageFault:
             ram,
             self.L1_BASE,
             vpn2,
-            self._make_pte(v=True, ppn=self.L2_BASE >> self.PAGE_SHIFT),
+            make_pte(PTE_V, self.L2_BASE >> self.PAGE_SHIFT),
         )
         # L2 -> L3
         self._write_pte(
             ram,
             self.L2_BASE,
             vpn1,
-            self._make_pte(v=True, ppn=self.L3_BASE >> self.PAGE_SHIFT),
+            make_pte(PTE_V, self.L3_BASE >> self.PAGE_SHIFT),
         )
         # L3 叶
         self._write_pte(
             ram,
             self.L3_BASE,
             vpn0,
-            self._make_pte(v=True, r=True, w=True, x=True, ppn=target_ppn),
+            make_pte(PTE_V | PTE_R | PTE_W | PTE_X, target_ppn),
         )
 
     def _enable_sv39(self, hart: "Hart", root_ppn: int = 1):
@@ -1420,8 +1421,7 @@ class TestPageFault:
     def test_ld_page_fault_l2_pte_invalid(self, hart, ram_ctx):
         """L2 条目 V=0 -> LdPageFault (13)."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._write_pte(ram, self.L1_BASE, 0,
-            self._make_pte(v=True, ppn=self.L2_BASE >> self.PAGE_SHIFT))
+        self._write_pte(ram, self.L1_BASE, 0, make_pte(PTE_V, self.L2_BASE >> self.PAGE_SHIFT))
         self._enable_sv39(hart)
         try:
             mem_read(hart, 0x0, 4)
@@ -1432,10 +1432,8 @@ class TestPageFault:
     def test_ld_page_fault_l3_pte_invalid(self, hart, ram_ctx):
         """L3 叶条目 V=0 -> LdPageFault (13)."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._write_pte(ram, self.L1_BASE, 0,
-            self._make_pte(v=True, ppn=self.L2_BASE >> self.PAGE_SHIFT))
-        self._write_pte(ram, self.L2_BASE, 0,
-            self._make_pte(v=True, ppn=self.L3_BASE >> self.PAGE_SHIFT))
+        self._write_pte(ram, self.L1_BASE, 0, make_pte(PTE_V, self.L2_BASE >> self.PAGE_SHIFT))
+        self._write_pte(ram, self.L2_BASE, 0, make_pte(PTE_V, self.L3_BASE >> self.PAGE_SHIFT))
         self._enable_sv39(hart)
         try:
             mem_read(hart, 0x0, 4)
@@ -1577,12 +1575,9 @@ class TestPtePermissionEnforcement(TestPageFault):
         ram: bytearray,
         va: int = 0,
         *,
-        r: bool = False,
-        w: bool = False,
-        x: bool = False,
-        u: bool = False,
+        perm: int = 0,
     ):
-        """构建三级 Sv39 映射 va -> DATA_PA, 叶 PTE 权限按参数."""
+        """构建三级 Sv39 映射 va -> DATA_PA, 叶 PTE 权限位为 perm."""
         vpn0 = (va >> 12) & 0x1FF
         vpn1 = (va >> 21) & 0x1FF
         vpn2 = (va >> 30) & 0x1FF
@@ -1591,19 +1586,19 @@ class TestPtePermissionEnforcement(TestPageFault):
             ram,
             self.L1_BASE,
             vpn2,
-            self._make_pte(v=True, ppn=self.L2_BASE >> self.PAGE_SHIFT),
+            make_pte(PTE_V, self.L2_BASE >> self.PAGE_SHIFT),
         )
         self._write_pte(
             ram,
             self.L2_BASE,
             vpn1,
-            self._make_pte(v=True, ppn=self.L3_BASE >> self.PAGE_SHIFT),
+            make_pte(PTE_V, self.L3_BASE >> self.PAGE_SHIFT),
         )
         self._write_pte(
             ram,
             self.L3_BASE,
             vpn0,
-            self._make_pte(v=True, r=r, w=w, x=x, u=u, ppn=target_ppn),
+            make_pte(PTE_V | perm, target_ppn),
         )
 
     # ---- 读权限 ----
@@ -1611,7 +1606,7 @@ class TestPtePermissionEnforcement(TestPageFault):
     def test_mem_read_execute_only_page_faults(self, hart, ram_ctx):
         """X=1/R=0 且 MXR=0: S 模式读 -> LdPageFault (13)."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._map_leaf(ram, x=True)
+        self._map_leaf(ram, perm=PTE_X)
         self._enable_sv39(hart)
         with pytest.raises(PageFaultError):
             mem_read(hart, 0x0, 4)
@@ -1620,7 +1615,7 @@ class TestPtePermissionEnforcement(TestPageFault):
     def test_mem_read_execute_only_with_mxr_allowed(self, hart, ram_ctx):
         """X=1/R=0 且 MXR=1: S 模式读应成功."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._map_leaf(ram, x=True)
+        self._map_leaf(ram, perm=PTE_X)
         self._enable_sv39(hart)
         ram[self.DATA_PA : self.DATA_PA + 4] = b"\xde\xad\xbe\xef"
         hart.mstatus_val |= MSTATUS_MXR
@@ -1632,7 +1627,7 @@ class TestPtePermissionEnforcement(TestPageFault):
     def test_mem_write_readonly_page_faults(self, hart, ram_ctx):
         """R=1/W=0 (R-X 代码页): S 模式写 -> StPageFault (15)."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._map_leaf(ram, r=True, x=True)
+        self._map_leaf(ram, perm=PTE_R | PTE_X)
         self._enable_sv39(hart)
         with pytest.raises(PageFaultError):
             mem_write(hart, 0x0, b"\x01\x02\x03\x04")
@@ -1641,7 +1636,7 @@ class TestPtePermissionEnforcement(TestPageFault):
     def test_mem_write_rw_page_succeeds(self, hart, ram_ctx):
         """R=1/W=1: S 模式写应成功 (正向对照)."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._map_leaf(ram, r=True, w=True)
+        self._map_leaf(ram, perm=PTE_R | PTE_W)
         self._enable_sv39(hart)
         mem_write(hart, 0x0, b"\x01\x02\x03\x04")
         assert hart.mcause_val == 0, f"不应 trap, mcause={hart.mcause_val}"
@@ -1652,7 +1647,7 @@ class TestPtePermissionEnforcement(TestPageFault):
     def test_smode_read_user_page_without_sum_faults(self, hart, ram_ctx):
         """U=1 且 SUM=0: S 模式读 -> LdPageFault (13)."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._map_leaf(ram, r=True, u=True)
+        self._map_leaf(ram, perm=PTE_R | PTE_U)
         self._enable_sv39(hart)
         with pytest.raises(PageFaultError):
             mem_read(hart, 0x0, 4)
@@ -1661,7 +1656,7 @@ class TestPtePermissionEnforcement(TestPageFault):
     def test_smode_read_user_page_with_sum_allowed(self, hart, ram_ctx):
         """U=1 且 SUM=1: S 模式读应成功."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._map_leaf(ram, r=True, u=True)
+        self._map_leaf(ram, perm=PTE_R | PTE_U)
         self._enable_sv39(hart)
         ram[self.DATA_PA : self.DATA_PA + 4] = b"\xaa\xbb\xcc\xdd"
         hart.mstatus_val |= MSTATUS_SUM
@@ -1673,7 +1668,7 @@ class TestPtePermissionEnforcement(TestPageFault):
     def test_fetch_non_executable_page_faults(self, hart, ram_ctx):
         """X=0: S 模式取指 -> InstrPageFault (12)."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._map_leaf(ram, r=True, w=True)
+        self._map_leaf(ram, perm=PTE_R | PTE_W)
         self._enable_sv39(hart)
         ok, _pa = check_instruction_fetch(hart, 0x0)
         assert not ok
@@ -1682,7 +1677,7 @@ class TestPtePermissionEnforcement(TestPageFault):
     def test_smode_fetch_user_page_faults(self, hart, ram_ctx):
         """U=1/X=1: S 模式取指 -> InstrPageFault (12), 即使 SUM=1 也不放行."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._map_leaf(ram, x=True, u=True)
+        self._map_leaf(ram, perm=PTE_X | PTE_U)
         self._enable_sv39(hart)
         hart.mstatus_val |= MSTATUS_SUM  # SUM 仅影响数据访问, 不影响取指
         ok, _pa = check_instruction_fetch(hart, 0x0)
@@ -1692,7 +1687,7 @@ class TestPtePermissionEnforcement(TestPageFault):
     def test_fetch_executable_page_succeeds(self, hart, ram_ctx):
         """X=1/U=0: S 模式取指应成功 (正向对照)."""
         ram, _read_fn, _write_fn = ram_ctx
-        self._map_leaf(ram, x=True)
+        self._map_leaf(ram, perm=PTE_X)
         self._enable_sv39(hart)
         ok, pa = check_instruction_fetch(hart, 0x0)
         assert ok
@@ -2219,7 +2214,6 @@ class TestWfi:
         # MIE=0: 全局使能关 (与 sbi_hsm_hart_wait 中仅设 mie CSR 一致)
         hart.mstatus_val = 0  # MIE=0
         hart.csrs["mtvec"].val = 0x80000100
-        # 源级使能: MSIE=1
         hart.csrs["mie"].val = 1 << 3  # MSIE
 
         # WFI 指令写入 RAM
@@ -2235,14 +2229,10 @@ class TestWfi:
 
         # step 2: MSIP 已挂起, WFI 应被唤醒 (即使 MIE=0)
         emu.step()
-        assert not hart._waiting, (
-            "MIE=0 时也应从 WFI 中唤醒 (mip & mie != 0 已满足)"
-        )
+        assert not hart._waiting, "MIE=0 时也应从 WFI 中唤醒 (mip & mie != 0 已满足)"
         assert hart._wfi_woken, "唤醒后须置位 wfi_woken"
         # MIE=0 -> 中断不应投递, PC 保持在 WFI+4
-        assert hart.pc == 0x80000004, (
-            "MIE=0 时中断不应投递, PC 保持在 WFI+4"
-        )
+        assert hart.pc == 0x80000004, "MIE=0 时中断不应投递, PC 保持在 WFI+4"
 
     # ============================================================
     #  多 hart WFI 交叉唤醒
@@ -2586,24 +2576,6 @@ class TestStackOverflowSmode:
         addr = table_base + index * 8
         ram[addr : addr + 8] = pte_val.to_bytes(8, "little")
 
-    @staticmethod
-    def _make_pte(*, v=False, r=False, w=False, x=False, u=False, ppn=0) -> int:
-        val = 0
-        if v:
-            val |= 1 << 0
-        if r:
-            val |= 1 << 1
-        if w:
-            val |= 1 << 2
-        if x:
-            val |= 1 << 3
-        if u:
-            val |= 1 << 4
-        val |= (ppn & 0x3FF) << 10
-        val |= ((ppn >> 10) & 0x1FF) << 20
-        val |= ((ppn >> 19) & 0x1FFFFFFF) << 29
-        return val
-
     def _setup_sv39_stack_only(self, ram: bytearray):
         """Map only S-mode stack page (R+W), guard page stays V=0.
 
@@ -2615,21 +2587,21 @@ class TestStackOverflowSmode:
             ram,
             self.L1_BASE,
             0,
-            self._make_pte(v=True, ppn=self.L2_BASE >> self.PAGE_SHIFT),
+            make_pte(PTE_V, self.L2_BASE >> self.PAGE_SHIFT),
         )
         # L2[0] -> L3
         self._write_pte(
             ram,
             self.L2_BASE,
             0,
-            self._make_pte(v=True, ppn=self.L3_BASE >> self.PAGE_SHIFT),
+            make_pte(PTE_V, self.L3_BASE >> self.PAGE_SHIFT),
         )
         # L3[2] -> stack physical page (R+W)
         self._write_pte(
             ram,
             self.L3_BASE,
             2,
-            self._make_pte(v=True, r=True, w=True, ppn=self.STACK_PA >> self.PAGE_SHIFT),
+            make_pte(PTE_V | PTE_R | PTE_W, self.STACK_PA >> self.PAGE_SHIFT),
         )
         # L3[1] stays V=0 -> guard page
 
@@ -2646,7 +2618,7 @@ class TestStackOverflowSmode:
         hart.mode = RiscvMode.S
 
     # fmt: off
-    @pytest.mark.parametrize("va,size,is_write,expected_cause", [
+    @pytest.mark.parametrize("case", [
         # guard page (unmapped) -> PageFault
         (_SO_SMODE_GUARD_VA, 8, True,  15),  # store guard   -> StPageFault
         (_SO_SMODE_GUARD_VA, 4, False, 13),  # load  guard   -> LdPageFault
@@ -2660,8 +2632,9 @@ class TestStackOverflowSmode:
         (_SO_SMODE_STACK_VA + 0xFFF, 1, True,   0),  # byte at page end
     ])
     # fmt: on
-    def test_guard_page_access(self, hart, ram_ctx, va, size, is_write, expected_cause):
+    def test_guard_page_access(self, hart, ram_ctx, case):
         """Sv39 guard page: parametrized over access direction/boundary/cross-page."""
+        va, size, is_write, expected_cause = case
         ram, _read_fn, _write_fn = ram_ctx
         self._prep_smode(hart, ram)
 
@@ -2856,9 +2829,7 @@ class TestStimecmpSTI:
         assert taken, "STI 应被触发"
         # STI 是非委派的 S 模式中断 (S 模式本身就处理它)
         # 在此配置下 (S-mode, 无 mideleg 位), 走 deliver_trap -> S 模式投递
-        assert hart.pc == 0x80004000, (
-            f"应跳转到 stvec=0x80004000, 实际 pc={hart.pc:#x}"
-        )
+        assert hart.pc == 0x80004000, f"应跳转到 stvec=0x80004000, 实际 pc={hart.pc:#x}"
         assert self._cause_is_sti(hart.scause_val), (
             f"scause 应为 STI (0x8000000000000005), 实际 {hart.scause_val:#018x}"
         )
@@ -2973,25 +2944,19 @@ class TestSstatusMstatusLinkage:
         assert (hart.read_csr(0x100) & MSTATUS_SPP) == 0
         # 写 mstatus.SPP=1
         hart.mstatus_val |= MSTATUS_SPP
-        assert (hart.read_csr(0x100) & MSTATUS_SPP) != 0, (
-            "sstatus.SPP 应反映 mstatus.SPP 的值"
-        )
+        assert (hart.read_csr(0x100) & MSTATUS_SPP) != 0, "sstatus.SPP 应反映 mstatus.SPP 的值"
 
     def test_sstatus_write_spp_updates_mstatus(self, hart):
         """写 sstatus.SPP 应更新 mstatus.SPP."""
         hart.mstatus_val &= ~MSTATUS_SPP  # 清零
         # 通过 write_csr 写 sstatus = SPP
         hart.write_csr(0x100, MSTATUS_SPP)
-        assert hart.mstatus_val & MSTATUS_SPP, (
-            "写 sstatus.SPP=1 应更新 mstatus.SPP"
-        )
+        assert hart.mstatus_val & MSTATUS_SPP, "写 sstatus.SPP=1 应更新 mstatus.SPP"
 
     def test_sstatus_read_sie_reflects_mstatus(self, hart):
         """读 sstatus.SIE 应返回 mstatus.SIE 的值."""
         hart.mstatus_val |= MSTATUS_SIE
-        assert (hart.read_csr(0x100) & MSTATUS_SIE) != 0, (
-            "sstatus.SIE 应反映 mstatus.SIE 的值"
-        )
+        assert (hart.read_csr(0x100) & MSTATUS_SIE) != 0, "sstatus.SIE 应反映 mstatus.SIE 的值"
         hart.mstatus_val &= ~MSTATUS_SIE
         assert (hart.read_csr(0x100) & MSTATUS_SIE) == 0
 
@@ -2999,9 +2964,7 @@ class TestSstatusMstatusLinkage:
         """写 sstatus.SIE 应更新 mstatus.SIE."""
         hart.mstatus_val &= ~MSTATUS_SIE
         hart.write_csr(0x100, MSTATUS_SIE)
-        assert hart.mstatus_val & MSTATUS_SIE, (
-            "写 sstatus.SIE=1 应更新 mstatus.SIE"
-        )
+        assert hart.mstatus_val & MSTATUS_SIE, "写 sstatus.SIE=1 应更新 mstatus.SIE"
 
     def test_sstatus_write_does_not_leak_to_higher_bits(self, hart):
         """sstatus 写只影响受限视图内的位, 不影响 mstatus 高位 (如 MPP)."""
@@ -3035,13 +2998,9 @@ class TestSstatusMstatusLinkage:
         deliver_trap(hart, TrapType.Breakpoint, hart.pc, is_interrupt=False)
 
         # 陷阱后 mstatus.SPP 应为 1 (来自 S 模式)
-        assert hart.mstatus_val & MSTATUS_SPP, (
-            "S 模式 ebreak 陷阱后 mstatus.SPP 必须为 1"
-        )
+        assert hart.mstatus_val & MSTATUS_SPP, "S 模式 ebreak 陷阱后 mstatus.SPP 必须为 1"
         # sstatus 读应反映 SPP=1
-        assert hart.read_csr(0x100) & MSTATUS_SPP, (
-            "sstatus.SPP 应反映 mstatus.SPP=1"
-        )
+        assert hart.read_csr(0x100) & MSTATUS_SPP, "sstatus.SPP 应反映 mstatus.SPP=1"
 
 
 class TestSipMipReadonlyMask:
@@ -3107,9 +3066,7 @@ class TestStimecmpClintSync:
         assert clint._mtimecmp[0] == 0xFFFF_FFFF_FFFF_FFFF, (
             "stimecmp 写入后 CLINT mtimecmp 应保持不变 (独立比较器)"
         )
-        assert hart.csrs["stimecmp"].val == 0x12345_6789_ABCD, (
-            "stimecmp CSR 应正确存储写入值"
-        )
+        assert hart.csrs["stimecmp"].val == 0x12345_6789_ABCD, "stimecmp CSR 应正确存储写入值"
 
     def test_mtimecmp_independent_of_stimecmp(self, hart, clint):
         """写 CLINT mtimecmp (MMIO) 不影响 stimecmp CSR."""
@@ -3123,9 +3080,7 @@ class TestStimecmpClintSync:
         """stimecmp=0 不影响已设置的 mtimecmp."""
         clint.set_mtimecmp(0, 0x100)
         hart.write_csr(0x14D, 0)
-        assert clint._mtimecmp[0] == 0x100, (
-            "stimecmp=0 写入后 mtimecmp 应保持不变"
-        )
+        assert clint._mtimecmp[0] == 0x100, "stimecmp=0 写入后 mtimecmp 应保持不变"
 
     def test_clint_check_interrupt_uses_mtimecmp_not_stimecmp(self, hart, clint):
         """CLINT.check_interrupt 的 MTIP 仅取决于 mtimecmp, 不取决于 stimecmp."""
@@ -3134,9 +3089,7 @@ class TestStimecmpClintSync:
         clint.set_mtimecmp(0, 0xFFFFFFFF_FFFFFFFF)  # far future
         clint.tick(200)
         has, mip, _src = clint.check_interrupt(0)
-        assert not (mip & (1 << 7)), (
-            "MTIP 仅取决于 CLINT mtimecmp; stimecmp 到期不应触发 MTIP"
-        )
+        assert not (mip & (1 << 7)), "MTIP 仅取决于 CLINT mtimecmp; stimecmp 到期不应触发 MTIP"
 
     def test_stimecmph_write_merges_to_stimecmp(self, hart):
         """stimecmph (0x15D) 写入高 32 位合并到 stimecmp (RV64)."""
@@ -3191,7 +3144,6 @@ class TestWfiWakeupByStimecmp:
 
     def test_wfi_wakeup_stimecmp_expired_wakes_hart(self, hart, clint):
         """stimecmp 已过期时 try_wfi_wakeup 应唤醒 WFI hart (STIP 置位)."""
-        # 设定时器已过期: stimecmp < mtime
         hart.csrs["stimecmp"].val = 50
         clint.tick(100)  # mtime = 100 >= 50
 
@@ -3201,9 +3153,7 @@ class TestWfiWakeupByStimecmp:
         hart.csrs["mip"].val = 0  # 清零 mip (仅测 stimecmp->STIP 路径)
 
         woken = try_wfi_wakeup(hart)
-        assert woken, (
-            f"stimecmp=50 已过期 (mtime={clint.get_mtime()}), 应唤醒 WFI"
-        )
+        assert woken, f"stimecmp=50 已过期 (mtime={clint.get_mtime()}), 应唤醒 WFI"
         assert not hart._waiting, "应清除 waiting 状态"
         assert hart._wfi_woken, "应置位 wfi_woken 标志"
         assert hart.mip_val & (1 << 5), "STIP (bit 5) 应已置位"
@@ -3218,8 +3168,7 @@ class TestWfiWakeupByStimecmp:
         hart.csrs["mip"].val = 0
 
         woken = try_wfi_wakeup(hart)
-        assert not woken, \
-            "stimecmp=500 > mtime=100, 不应唤醒"
+        assert not woken, "stimecmp=500 > mtime=100, 不应唤醒"
         assert hart._waiting, "应保持 waiting 状态"
 
     def test_wfi_wakeup_stimecmp_zero_no_wake(self, hart, clint):
@@ -3280,12 +3229,8 @@ class TestWfiWakeupByStimecmp:
         clint._mtime = 100  # mtime = 100 < 500
 
         remaining = emu._wfi_ticks_until_wake([hart])
-        assert remaining is not None, (
-            "stimecmp=500 > mtime=100, 应返回剩余 tick 数"
-        )
-        assert remaining == 400, (
-            f"剩余 ticks 应为 400, 实际 {remaining}"
-        )
+        assert remaining is not None, "stimecmp=500 > mtime=100, 应返回剩余 tick 数"
+        assert remaining == 400, f"剩余 ticks 应为 400, 实际 {remaining}"
 
     def test_wfi_ticks_returns_none_when_both_disabled(self, clint):
         """mtimecmp 和 stimecmp 都为 0 时返回 None."""
@@ -3324,9 +3269,7 @@ class TestWfiWakeupByStimecmp:
         clint._mtime = 50
 
         remaining = emu._wfi_ticks_until_wake([hart])
-        assert remaining == 50, (
-            f"应返回最早到期者 (stimecmp=100), 剩余 50, 实际 {remaining}"
-        )
+        assert remaining == 50, f"应返回最早到期者 (stimecmp=100), 剩余 50, 实际 {remaining}"
 
     # ---- 端到端: Emulator.step + stimecmp WFI wakeup ----
 
@@ -3369,16 +3312,12 @@ class TestWfiWakeupByStimecmp:
 
         # step 1: 执行 WFI -> mtime=10 (< 5000) -> 应进入等待
         emu.step()
-        assert hart._waiting, (
-            f"step 1: mtime={clint._mtime} < stimecmp=5000, 应进入 WFI 等待"
-        )
+        assert hart._waiting, f"step 1: mtime={clint._mtime} < stimecmp=5000, 应进入 WFI 等待"
 
         # step 2: 推进 mtime 到超过 stimecmp -> 应唤醒
         clint._mtime = 5100  # >= 5000
         emu.step()
-        assert not hart._waiting, (
-            f"step 2: mtime={clint._mtime} >= stimecmp=5000, 应唤醒"
-        )
+        assert not hart._waiting, f"step 2: mtime={clint._mtime} >= stimecmp=5000, 应唤醒"
         assert hart._wfi_woken, "唤醒后应置位 wfi_woken"
 
 
@@ -3444,9 +3383,7 @@ class TestMsipClearingOnTrapDelivery:
             f"投递 MSIP 到 M 模式后 _msip 必须清零, 实际={clint._msip[0]}"
         )
         # mip CSR 也应已清零 MSIP 位
-        assert not (h.mip_val & (1 << 3)), (
-            f"投递后 mip.MSIP 必须为 0, 实际 mip={h.mip_val:#x}"
-        )
+        assert not (h.mip_val & (1 << 3)), f"投递后 mip.MSIP 必须为 0, 实际 mip={h.mip_val:#x}"
 
     def test_deliver_msip_delegated_to_smode_clears_clint_msip(self):
         """MSIP 委派到 S 模式 (mideleg[3]=1) 后 CLINT _msip 必须为 0.
@@ -3476,9 +3413,7 @@ class TestMsipClearingOnTrapDelivery:
         assert clint._msip[0] == 0, (
             f"投递 MSIP 到 S 模式后 _msip 必须清零, 实际={clint._msip[0]}"
         )
-        assert not (h.mip_val & (1 << 3)), (
-            f"投递后 mip.MSIP 必须为 0, 实际 mip={h.mip_val:#x}"
-        )
+        assert not (h.mip_val & (1 << 3)), f"投递后 mip.MSIP 必须为 0, 实际 mip={h.mip_val:#x}"
 
     def test_repeated_msip_delivery_does_not_storm(self):
         """连续投递 MSIP 30 次 -> 每次 CLINT _msip 被清零, 不形成风暴.
@@ -3510,9 +3445,7 @@ class TestMsipClearingOnTrapDelivery:
             assert clint._msip[0] == 0, (
                 f"第 {_} 次投递后 _msip 必须清零, 实际={clint._msip[0]}"
             )
-            assert not (h.mip_val & (1 << 3)), (
-                f"第 {_} 次投递后 mip.MSIP 必须为 0"
-            )
+            assert not (h.mip_val & (1 << 3)), f"第 {_} 次投递后 mip.MSIP 必须为 0"
 
             # 模拟 MRET 回到中断上下文 (相同的 PC)
             h.mode = RiscvMode.S
@@ -3584,20 +3517,33 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
     # mem_read/mem_write 抛出 MemoryAccessError 的行为一致, 故直接继承。
 
     def _setup_sv39_for(
-        self, hart, ram: bytearray, valid_va: int, valid_pa: int,
+        self,
+        hart,
+        ram: bytearray,
+        valid_va: int,
+        valid_pa: int,
     ):
         """建立单页 Sv39 映射 (仅 valid_va ->valid_pa 可访问)."""
         vpn0 = (valid_va >> 12) & 0x1FF
         root_ppn = self.L1_BASE >> self.PAGE_SHIFT
-        self._write_pte(ram, self.L1_BASE, 0, self._make_pte(
-            v=True, ppn=self.L2_BASE >> self.PAGE_SHIFT,
-        ))
-        self._write_pte(ram, self.L2_BASE, 0, self._make_pte(
-            v=True, ppn=self.L3_BASE >> self.PAGE_SHIFT,
-        ))
-        self._write_pte(ram, self.L3_BASE, vpn0, self._make_pte(
-            v=True, r=True, ppn=valid_pa >> self.PAGE_SHIFT,
-        ))
+        self._write_pte(
+            ram,
+            self.L1_BASE,
+            0,
+            make_pte(PTE_V, self.L2_BASE >> self.PAGE_SHIFT),
+        )
+        self._write_pte(
+            ram,
+            self.L2_BASE,
+            0,
+            make_pte(PTE_V, self.L3_BASE >> self.PAGE_SHIFT),
+        )
+        self._write_pte(
+            ram,
+            self.L3_BASE,
+            vpn0,
+            make_pte(PTE_V | PTE_R, valid_pa >> self.PAGE_SHIFT),
+        )
         hart.satp_val = (8 << 60) | root_ppn  # Sv39
         hart.mode = RiscvMode.S
         # PMP: 1 条 NAPOT 规则覆盖全部地址空间 R+W+X, 否则 S 模式下页表遍历被拒绝
@@ -3627,8 +3573,8 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         lo12 = fault_va & 0xFFF
         addi_instr = 0x000E0E13 | ((lo12 & 0xFFF) << 20)
         ld_instr = 0x000E3683  # ld x13, 0(x28)
-        ram[instr_addr:instr_addr + 4] = struct.pack("<I", addi_instr)
-        ram[instr_addr + 4:instr_addr + 8] = struct.pack("<I", ld_instr)
+        ram[instr_addr : instr_addr + 4] = struct.pack("<I", addi_instr)
+        ram[instr_addr + 4 : instr_addr + 8] = struct.pack("<I", ld_instr)
 
         hart.pc = valid_va
         advance = hart.exec_instr(addi_instr)
@@ -3657,8 +3603,8 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         lo12 = fault_va & 0xFFF
         addi_instr = 0x000E0E13 | ((lo12 & 0xFFF) << 20)
         sd_instr = 0x005E3023  # sd x5, 0(x28)
-        ram[valid_pa:valid_pa + 4] = struct.pack("<I", addi_instr)
-        ram[valid_pa + 4:valid_pa + 8] = struct.pack("<I", sd_instr)
+        ram[valid_pa : valid_pa + 4] = struct.pack("<I", addi_instr)
+        ram[valid_pa + 4 : valid_pa + 8] = struct.pack("<I", sd_instr)
         hart.gprs[5] = 0x41414141
 
         hart.pc = valid_va
@@ -3688,8 +3634,8 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         lo12 = fault_va & 0xFFF
         addi_instr = 0x000E0E13 | ((lo12 & 0xFFF) << 20)
         c_ld = 0x60C8  # C.LD rd'=x10(a0), rs1'=x28(t3), uimm=0
-        ram[valid_pa:valid_pa + 4] = struct.pack("<I", addi_instr)
-        ram[valid_pa + 4:valid_pa + 6] = struct.pack("<H", c_ld)
+        ram[valid_pa : valid_pa + 4] = struct.pack("<I", addi_instr)
+        ram[valid_pa + 4 : valid_pa + 6] = struct.pack("<H", c_ld)
 
         hart.pc = valid_va
         advance = hart.exec_instr(addi_instr)
@@ -3718,8 +3664,8 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         lo12 = fault_va & 0xFFF
         addi_instr = 0x000E0E13 | ((lo12 & 0xFFF) << 20)
         c_sd = 0xE184  # C.SD rs2'=x8(s0), rs1'=x28(t3), uimm=0
-        ram[valid_pa:valid_pa + 4] = struct.pack("<I", addi_instr)
-        ram[valid_pa + 4:valid_pa + 6] = struct.pack("<H", c_sd)
+        ram[valid_pa : valid_pa + 4] = struct.pack("<I", addi_instr)
+        ram[valid_pa + 4 : valid_pa + 6] = struct.pack("<H", c_sd)
         hart.gprs[8] = 0xBBBBBBBB
 
         hart.pc = valid_va
@@ -3749,8 +3695,8 @@ class TestLoadPageFaultPreservesRd(TestPageFault):
         lo12 = fault_va & 0xFFF
         addi_instr = 0x000E0E13 | ((lo12 & 0xFFF) << 20)
         lr_w = 0x100E252F  # lr.w a0, (t3)
-        ram[valid_pa:valid_pa + 4] = struct.pack("<I", addi_instr)
-        ram[valid_pa + 4:valid_pa + 8] = struct.pack("<I", lr_w)
+        ram[valid_pa : valid_pa + 4] = struct.pack("<I", addi_instr)
+        ram[valid_pa + 4 : valid_pa + 8] = struct.pack("<I", lr_w)
 
         hart.pc = valid_va
         advance = hart.exec_instr(addi_instr)

@@ -1,19 +1,19 @@
 //! 飞地时间片调度与执行状态管理。
 //!
 //! 职责:
-//!   - 时间片记账与配额检查 (每次 timer interrupt 触发)
-//!   - 飞地执行状态追踪 (已消耗时间 / 剩余配额 / 违规计数)
+//!   - 时间片更新与记录事宜
+//!   - 飞地执行状态追踪
 //!   - SUSPEND/RESUME 调度决策
 //!
 //! 本模块提供策略 — 配额耗尽时主动让出 CPU, PMP 违规时决定处置方式.
 
-use core::sync::atomic::{ AtomicBool, Ordering };
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::constants::{ ENCLAVE_REQ_NET_EVENT, ENCLAVE_REQ_SHUTDOWN, ENCLAVE_SUSPEND_QUOTA };
+use crate::constants::{ENCLAVE_REQ_NET_EVENT, ENCLAVE_REQ_SHUTDOWN, ENCLAVE_SUSPEND_QUOTA};
 use crate::context;
 use crate::ecall_aux;
 use crate::syscall::concurrency::thread;
-use crate::syscall::{ fs, net };
+use crate::syscall::{fs, net};
 
 /// 时间片消耗记账与配额检查。
 ///
@@ -24,10 +24,10 @@ use crate::syscall::{ fs, net };
 ///
 /// # 调用约定
 ///
-/// 此函数可能在 SUSPEND 处阻塞 (直至被调度器恢复或 host RESUME), 因此调用方
+/// 此函数可能在 SUSPEND 处阻塞, 因此调用方
 /// 必须确保当前 U-mode 上下文已可被安全地保存和恢复。在 S-mode trap handler
 /// 中调用是安全的 — M-mode 的 `alter_hart_ctx_for_enclave` 会完整保存
-/// S-mode 寄存器状态 (含 sepc/sstatus, 即 U-mode 的 trap frame); 就地续期
+/// S-mode 寄存器状态; 就地续期
 /// 路径不切上下文, 更无现场丢失之虞。
 pub fn tick_and_check_quota() {
 	let expired = {
@@ -37,7 +37,7 @@ pub fn tick_and_check_quota() {
 	};
 
 	if expired {
-		// 让出 CPU 给调度器 (见函数注释): 原因码决定 M 模式是切换就绪飞地
+		// 让出 CPU 给调度器: 原因码决定 M 模式是切换就绪飞地
 		// 还是就地续期。宿主在 RESUME 上阻塞, 时间片耗尽时交还宿主只会被
 		// 原样交回, 且会耗尽宿主侧的恢复次数预算而误判载荷"不终止"。
 		ecall_aux::enclave_call_suspend(ENCLAVE_SUSPEND_QUOTA);
@@ -46,7 +46,7 @@ pub fn tick_and_check_quota() {
 	}
 }
 
-/// 返回当前时间片的剩余配额 (timer interrupt 次数)。
+/// 返回当前剩余的timer interrupt 次数。
 /// `time_quota == 0` 表示无限制, 返回 `u64::MAX`。
 #[allow(dead_code)]
 pub fn remaining_quota() -> u64 {
@@ -75,26 +75,24 @@ static IS_NET_EVENT_PENDING: AtomicBool = AtomicBool::new(false);
 /// 当前支持的请求:
 ///   - `ENCLAVE_REQ_SHUTDOWN`: host 申请终止飞地.
 ///     token 已在 M-mode 验证, S-mode 信任 M-mode 的判断直接执行 SHUTDOWN.
-///     Phase B 将替换为: S-mode 自行验证 host attestation quote.
+///     将替换为: S-mode 自行验证 host attestation quote.
 ///   - `ENCLAVE_REQ_NET_EVENT`: 飞地侧网卡有事件待处理.
 ///     经 `check_pending_net_event` 推进协议栈一次以收取设备已写入的帧, 唤醒在套接字上
 ///     等待接收的线程, 并唤醒在 ppoll 中等待描述符就绪的线程.
 ///
 /// 在 software interrupt 上下文中调用。
-/// SHUTDOWN 不返回 (通过 `enclave_call_exit` -> M-mode 清理 -> 切回 host).
+/// SHUTDOWN 不返回.
 pub fn check_pending_requests() {
 	let flags = ecall_aux::enclave_call_query_requests();
 
 	if (flags & ENCLAVE_REQ_SHUTDOWN) != 0 {
 		// host 已通过 token 验证, 执行终止.
-		// `enclave_call_exit` 触发 SHUTDOWN ecall -> M-mode 清理飞地
-		// -> alter_hart_ctx_for_enclave 切回 host -> 不返回.
 		ecall_aux::enclave_call_exit(0);
 	}
 
 	if (flags & ENCLAVE_REQ_NET_EVENT) != 0 {
-		// 事件标志已由 411 号调用清除, 先记入本模块的标志再统一处置: 网络模块尚未取入时
-		// 标志保留, 留待该模块取入之后补做.
+		// 事件标志已由 411 号调用清除, 先记入本模块的标志再统一处置:
+		// 网络模块尚未取入时标志保留, 留待该模块取入之后补做.
 		IS_NET_EVENT_PENDING.store(true, Ordering::Release);
 		check_pending_net_event();
 	}
@@ -102,7 +100,7 @@ pub fn check_pending_requests() {
 
 /// 处理已到达的网卡事件: 推进协议栈一次并唤醒等待中的线程。
 ///
-/// 中断上下文与系统调用的收尾处各调用一次。网络模块尚未取入时不作处理并保留标志: 中断
+/// 中断上下文与系统调用末尾各调用一次。网络模块尚未取入时不作处理并保留标志: 中断
 /// 上下文不得让出宿主, 故取入只由使用该模块的系统调用发起, 本函数不代为发起 —— 否则一次
 /// 与该模块无关的调用也会让出宿主, 并在宿主未提供该模块时得到一次取入失败。
 ///

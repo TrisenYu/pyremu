@@ -21,7 +21,7 @@ const POINT_MAX: usize = 32;
 pub enum FileSystem {
 	/// 根文件系统, 由宿主交付的文件系统模块实现。
 	Rootfs,
-	/// 内核自带的伪文件系统, 见 [super::sysfs]。
+	/// 内核自带的伪文件系统。
 	Sysfs,
 }
 

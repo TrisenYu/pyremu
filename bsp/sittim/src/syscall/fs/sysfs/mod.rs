@@ -5,11 +5,9 @@
 //! 装载与卸载都不改变它; 节点只增不改, 故整个文件系统只读。
 //!
 //! 本模块以 [VfsOps] 操作表交付目录树, 与文件系统模块交付根目录树的形式相同; 挂载层
-//! 据此把 `/sys` 之下的路径交给本模块, 见 [super::mount]。
+//! 据此把 `/sys` 之下的路径交给本模块。
 
-use crate::ext_mod::vfs_ops::{
-	O_CREAT, VFS_KIND_DIR, VfsOps, VfsStat, VfsStatus, mode_writable,
-};
+use crate::ext_mod::vfs_ops::{O_CREAT, VFS_KIND_DIR, VfsOps, VfsStat, VfsStatus, mode_writable};
 use crate::sync_aux::SpinLock;
 
 /// 节点表容量。
@@ -36,7 +34,7 @@ struct Node {
 	name: [u8; NAME_MAX],
 }
 
-/// 节点表。下标加一即该节点的 ino, 见 [ino_of]。
+/// 节点表。下标加一即该节点的 ino。
 static NODES: SpinLock<[Option<Node>; NODES_MAX]> = SpinLock::new([None; NODES_MAX]);
 
 // ---------------------------------------------------------------

@@ -59,7 +59,9 @@ mod csr {
 	/// 取时钟源锁。用例在持有该锁期间重置定时器表并设定时钟源读数。
 	pub fn clock_lock() -> MutexGuard<'static, ()> {
 		let mutex = clock_mutex();
-		let guard = mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+		let guard = mutex
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		mutex.clear_poison();
 		guard
 	}
@@ -208,17 +210,13 @@ pub mod syscall {
 mod tests {
 	use super::*;
 	use crate::syscall::{EFAULT, EINVAL};
-
-	/// clone 的标志位: 共享地址空间且属同一线程组, 即创建线程。
 	const CLONE_VM: u64 = 0x0000_0100;
 	const CLONE_THREAD: u64 = 0x0001_0000;
 
-	/// 5 ms 折合的时钟源计数增量。一个计数单位为 100 ns, 见 config.mk 的 TIMER_FREQ。
-	const FIVE_MS_TICKS: u64 = 50_000;
+	fn five_ms_ticks() -> u64 {
+		timer::nsec_to_ticks(5_000_000)
+	}
 
-	/// 取全局锁, 把线程表、调度状态与定时器表恢复到初始状态。
-	///
-	/// 三处都是进程内的全局量, 而用例默认并行执行, 故各用例须持有返回的守卫直到结束。
 	fn world() -> std::sync::MutexGuard<'static, ()> {
 		let guard = csr::clock_lock();
 		csr::set_time(0);
@@ -233,31 +231,23 @@ mod tests {
 
 	/// 在当前线程之外登记一个可运行线程, 使本线程的阻塞按「登记切换目标并返回」结束。
 	fn spawn_peer() {
-		let gprs = trap_frame::TrapGprs { regs: [0; 32], sp_before_trap: 0 };
-		thread::clone_thread(
-			&gprs,
-			CLONE_VM | CLONE_THREAD,
-			0,
-			0,
-			0,
-			0,
-		);
-		// clone 登记的切换目标在本次阻塞之前取走: 用例要观察的是睡眠本身登记的切换。
+		let gprs = trap_frame::TrapGprs {
+			regs: [0; 32],
+			sp_before_trap: 0,
+		};
+		thread::clone_thread(&gprs, CLONE_VM | CLONE_THREAD, 0, 0, 0, 0);
 		thread::tests::clear_switch();
 	}
 
-	/// 造一个时限。返回的值的地址即系统调用收到的时限指针。
 	fn timespec(sec: i64, nsec: i64) -> types::Timespec {
-		types::Timespec { tv_sec: sec, tv_nsec: nsec }
+		types::Timespec {
+			tv_sec: sec,
+			tv_nsec: nsec,
+		}
 	}
 
-	/// 用例使用的等待地址。
 	const WAIT_ADDR: u64 = 0x1000;
 
-	/// 阻塞的线程被唤醒后返回, 即使本飞地没有其它可运行线程。
-	///
-	/// 空闲让出即此情形: 唤醒方只把线程改回就绪, 不登记切换目标, 故返回不依赖存在其它
-	/// 可运行线程。
 	#[test]
 	fn test_block_current_returns_when_woken_with_no_other_runnable_thread() {
 		let _guard = world();
@@ -274,11 +264,11 @@ mod tests {
 	/// 让出宿主会使该时刻失效: 飞地的 stimecmp 随上下文保存, 到期不再触发定时器中断,
 	/// 发起等待的系统调用于是没有任何唤醒来源。故截止时刻本身即结束本次等待的依据。
 	#[test]
-	fn test_block_current_waits_out_an_armed_deadline_without_yielding_to_host() {
+	fn test_block_current_waits_out_its_cutoff_tick_without_yielding_to_host() {
 		let _guard = world();
 		let me = thread::current_thread_id();
 		csr::set_time(1_000);
-		timer::arm_after(me, 5_000_000);
+		timer::set_wait_timer(me, 5_000_000);
 		// 等待期间时间流逝: 每次读时钟源推进一个计数单位, 直至截止时刻。
 		csr::set_time_step(1);
 
@@ -286,7 +276,7 @@ mod tests {
 
 		assert_eq!(ecall_aux::SUSPEND_COUNT.load(Ordering::SeqCst), 0);
 		assert!(!thread::tests::is_blocked(me));
-		assert!(csr::read_time() >= 1_000 + FIVE_MS_TICKS);
+		assert!(csr::read_time() >= 1_000 + five_ms_ticks());
 	}
 
 	/// 时限指针取空的 nanosleep 返回 EFAULT。
@@ -294,7 +284,7 @@ mod tests {
 	fn test_nanosleep_rejects_a_null_request() {
 		let _guard = world();
 		assert_eq!(thread::nanosleep_handler(0, 0), EFAULT);
-		assert!(!timer::is_armed(thread::current_thread_id()));
+		assert!(!timer::has_wait_timer(thread::current_thread_id()));
 	}
 
 	/// 时限字段越界的 nanosleep 返回 EINVAL: tv_nsec 不在 [0, 1_000_000_000) 内, 或
@@ -311,7 +301,7 @@ mod tests {
 				EINVAL
 			);
 		}
-		assert!(!timer::is_armed(thread::current_thread_id()));
+		assert!(!timer::has_wait_timer(thread::current_thread_id()));
 	}
 
 	/// 时长为 0 的 nanosleep 立即返回 0, 不登记定时器也不进入阻塞。
@@ -323,37 +313,39 @@ mod tests {
 			thread::nanosleep_handler(&none as *const types::Timespec as u64, 0),
 			0
 		);
-		assert!(!timer::is_armed(thread::current_thread_id()));
+		assert!(!timer::has_wait_timer(thread::current_thread_id()));
 		assert!(!thread::switch_pending());
 	}
 
-	/// nanosleep 按传入时长设定截止时刻: 5 ms 的睡眠登记 50_000 个计数单位, 即时间片周期
-	/// (config.mk 的 TIMER_INTERVAL 为 10000 个计数单位, 折合 1 ms) 的 5 倍。
+	/// nanosleep 按传入时长设定截止时刻: 5 ms 的睡眠登记 5 ms 折合的计数增量。
 	///
-	/// 该用例是「睡眠时长不由时间片周期决定」的回归判据: 若把截止时刻取整到时间片边界,
-	/// 登记的增量会是 10000 的倍数而不是 50_000。
+	/// 该用例判定截止时刻是否取整到时间片边界: 取整时登记的增量是 TICKS_PER_SCHED_TICK 的
+	/// 倍数, 而不是 5 ms 折合的增量。
 	#[test]
-	fn test_nanosleep_arms_its_deadline_from_the_requested_duration() {
+	fn test_nanosleep_sets_its_cutoff_tick_from_the_requested_duration() {
 		let _guard = world();
 		let me = thread::current_thread_id();
 		let req = timespec(0, 5_000_000);
 		csr::set_time(1_000);
 
 		spawn_peer();
-		assert_eq!(thread::nanosleep_handler(&req as *const types::Timespec as u64, 0), 0);
-		assert_eq!(timer::next_deadline(), Some(1_000 + FIVE_MS_TICKS));
+		assert_eq!(
+			thread::nanosleep_handler(&req as *const types::Timespec as u64, 0),
+			0
+		);
+		assert_eq!(timer::next_deadline(), Some(1_000 + five_ms_ticks()));
 		// 睡眠期间让出的线程由本调用退回 ecall 之前运行, 故本次调用请求重启。
 		assert!(thread::take_restart());
 		assert!(thread::switch_pending());
 		// 阻塞不产生让出宿主的调用: 有可运行线程时只登记切换目标。
 		assert_eq!(ecall_aux::SUSPEND_COUNT.load(Ordering::SeqCst), 0);
-		assert!(timer::is_armed(me));
+		assert!(timer::has_wait_timer(me));
 	}
 
 	/// 被中断后重新执行 nanosleep 时沿用表中已有的截止时刻, 不重新计一段完整的时长;
 	/// 到达该时刻后返回 0 并收起条目。
 	#[test]
-	fn test_nanosleep_keeps_its_deadline_across_restarts() {
+	fn test_nanosleep_keeps_its_cutoff_tick_across_restarts() {
 		let _guard = world();
 		let me = thread::current_thread_id();
 		let req = timespec(0, 5_000_000);
@@ -362,22 +354,22 @@ mod tests {
 		spawn_peer();
 
 		assert_eq!(thread::nanosleep_handler(req_addr, 0), 0);
-		assert_eq!(timer::next_deadline(), Some(1_000 + FIVE_MS_TICKS));
+		assert_eq!(timer::next_deadline(), Some(1_000 + five_ms_ticks()));
 
 		// 重新执行本次调用: 截止时刻未到, 按同一截止时刻再次登记切换。
 		thread::tests::clear_switch();
-		csr::set_time(1_000 + FIVE_MS_TICKS - 1);
+		csr::set_time(1_000 + five_ms_ticks() - 1);
 		assert_eq!(thread::nanosleep_handler(req_addr, 0), 0);
 		assert!(thread::take_restart());
-		assert_eq!(timer::next_deadline(), Some(1_000 + FIVE_MS_TICKS));
+		assert_eq!(timer::next_deadline(), Some(1_000 + five_ms_ticks()));
 
 		// 到达截止时刻: 返回 0 且不再登记切换, 条目收起。
 		thread::tests::clear_switch();
-		csr::set_time(1_000 + FIVE_MS_TICKS);
+		csr::set_time(1_000 + five_ms_ticks());
 		assert_eq!(thread::nanosleep_handler(req_addr, 0), 0);
 		assert!(!thread::switch_pending());
 		assert!(!thread::take_restart());
-		assert!(!timer::is_armed(me));
+		assert!(!timer::has_wait_timer(me));
 	}
 
 	/// 定时器中断的唤醒路径: 到期条目取走后置为已到期, 按线程标识唤醒其所有者; 被唤醒的
@@ -396,13 +388,13 @@ mod tests {
 		assert_eq!(thread::nanosleep_handler(req_addr, 0), 0);
 		// 取走首次进入时登记的重启请求, 使末尾的断言只反映最后一次进入。
 		assert!(thread::take_restart());
-		let deadline = 1_000 + FIVE_MS_TICKS;
+		let cutoff_tick = 1_000 + five_ms_ticks();
 
 		// 截止时刻之前的定时器中断不改动条目, 也不唤醒任何线程。
-		assert_eq!(timer::elapse_due(deadline - 1), None);
+		assert_eq!(timer::elapse_due(cutoff_tick - 1), None);
 
 		// 到达截止时刻: 中断取走条目并唤醒其所有者。
-		assert_eq!(timer::elapse_due(deadline), Some(me));
+		assert_eq!(timer::elapse_due(cutoff_tick), Some(me));
 		assert!(timer::is_expired(me));
 		assert!(thread::wake_thread(me));
 		// 已唤醒的线程不再是阻塞状态, 重复唤醒不改动状态。
@@ -412,6 +404,6 @@ mod tests {
 		thread::tests::clear_switch();
 		assert_eq!(thread::nanosleep_handler(req_addr, 0), 0);
 		assert!(!thread::take_restart());
-		assert!(!timer::is_armed(me));
+		assert!(!timer::has_wait_timer(me));
 	}
 }

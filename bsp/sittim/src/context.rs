@@ -183,7 +183,7 @@ pub fn ctx() -> &'static EnclaveContext {
 /// 运行时按 PIE 链接, 代码以 PC 相对方式引用 `PAGE_TABLE_ROOT`:
 /// 物理恒等主流程 (MMU 关闭阶段与 MMU 开启后的 after_mmu) 取到 PA,
 /// 虚拟映射的陷态处理 (stvec = VA) 取到 VA, 两者指向同一物理页且
-/// 均已被映射, 可直接解引用 (见 paging::root_table)。
+/// 均已被映射, 可直接解引用
 ///
 /// 需要真正物理地址的调用方 (如 `init_satp` 计算 PPN) 只能在物理恒等
 /// 主流程调用, 此刻返回的即为 PA。

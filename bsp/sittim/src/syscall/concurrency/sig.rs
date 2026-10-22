@@ -2,20 +2,20 @@
 //!
 //! 本模块只维护信号自身的状态与状态变换, 不含调度决策:
 //! - 处置表 (rt_sigaction)、屏蔽集合 (rt_sigprocmask)、待投递集合三者在 `SigState`,
-//!   作为进程控制块的一个字段随进程保存 (见 crate::syscall::concurrency::proc)。
+//!   作为进程控制块的一个字段随进程保存
 //! - 信号帧的构造与恢复 (`build_frame` / `restore_frame`) 是纯地址运算, 只读写
 //!   用户栈与陷态栈帧, 不触碰进程表。
 //! - 决定「投递给谁、投不投递、是否终止进程」的部分在 syscall::concurrency::proc ——
 //!   终止进程要动进程表与调度器, 属进程层职责。
 //!
 //! 投递时机: 无独立投递线程。待投递集合只被置位, 实际投递发生在被投递进程的
-//! 某个线程返回 U 模式之前的陷阱返回路径上 (见 trap.rs 的两处返回分支)。
+//! 某个线程返回 U 模式之前的陷阱返回路径上
 
 use core::ptr;
 
 use crate::csr;
 use crate::syscall::EINVAL;
-use crate::trap_frame::{ TrapGprs, A0, A1, A2, RA, SP };
+use crate::trap_frame::{A0, A1, A2, RA, SP, TrapGprs};
 
 /// 登记的信号编号上界。只登记 1..=31 号标准信号: 待投递集合与屏蔽集合都是
 /// 单字位图, 位下标即信号编号; 实时信号 (32..=64) 本运行时未使用。
@@ -39,7 +39,7 @@ const SIGACTION_HANDLER_OFF: u64 = 0;
 const SIGACTION_SIZE: u64 = 32;
 
 /// 进程被信号终止时的退出码 = 128 + 信号编号, 与 U 模式同步异常终止载荷的
-/// 约定一致 (见 trap.rs 的 user_fault_signal)。
+/// 约定一致。
 pub const SIGNAL_EXIT_OFFSET: u64 = 128;
 
 // ---------------------------------------------------------------
@@ -195,7 +195,10 @@ pub fn action(st: &mut SigState, sig: u64, new_action: u64, old_action: u64) -> 
 	unsafe {
 		if old_action != 0 {
 			ptr::write_bytes(old_action as *mut u8, 0, SIGACTION_SIZE as usize);
-			ptr::write_volatile((old_action + SIGACTION_HANDLER_OFF) as *mut u64, st.handler[s]);
+			ptr::write_volatile(
+				(old_action + SIGACTION_HANDLER_OFF) as *mut u64,
+				st.handler[s],
+			);
 		}
 		if new_action != 0 {
 			let handler = ptr::read_volatile((new_action + SIGACTION_HANDLER_OFF) as *const u64);
@@ -286,7 +289,13 @@ pub fn take_pending(st: &mut SigState) -> Option<usize> {
 
 /// 在用户栈上构造信号帧, 改写陷态栈帧使返回时进入处理函数, 返回处理函数地址
 /// (即应写入 sepc 的值)。
-pub fn build_frame(st: &mut SigState, sig: usize, handler: u64, gprs: &mut TrapGprs, sepc: u64) -> u64 {
+pub fn build_frame(
+	st: &mut SigState,
+	sig: usize,
+	handler: u64,
+	gprs: &mut TrapGprs,
+	sepc: u64,
+) -> u64 {
 	let usp = gprs.sp_before_trap;
 	let frame = usp.wrapping_sub(FRAME_SIZE) & !0xf_u64;
 	let blocked_before = st.blocked;
@@ -299,15 +308,23 @@ pub fn build_frame(st: &mut SigState, sig: usize, handler: u64, gprs: &mut TrapG
 		ptr::copy_nonoverlapping(
 			gprs as *const TrapGprs as *const u8,
 			(frame + FRAME_GPRS_OFF) as *mut u8,
-			core::mem::size_of::<TrapGprs>()
+			core::mem::size_of::<TrapGprs>(),
 		);
 		ptr::write_volatile((frame + FRAME_USP_OFF) as *mut u64, usp);
 
 		// siginfo: 只写 si_signo 与 si_code 两栏, 其余保持为零。
-		ptr::write_bytes((frame + FRAME_SIGINFO_OFF) as *mut u8, 0, SIGINFO_SIZE as usize);
+		ptr::write_bytes(
+			(frame + FRAME_SIGINFO_OFF) as *mut u8,
+			0,
+			SIGINFO_SIZE as usize,
+		);
 		ptr::write_volatile((frame + FRAME_SIGINFO_OFF) as *mut i32, sig as i32);
 		ptr::write_volatile((frame + FRAME_SIGINFO_OFF + 8) as *mut i32, SI_USER);
-		ptr::write_bytes((frame + FRAME_UCONTEXT_OFF) as *mut u8, 0, UCONTEXT_SIZE as usize);
+		ptr::write_bytes(
+			(frame + FRAME_UCONTEXT_OFF) as *mut u8,
+			0,
+			UCONTEXT_SIZE as usize,
+		);
 
 		// 处理函数执行期间屏蔽本信号 (未置 SA_NODEFER 时与 Linux 一致)。
 		st.blocked |= 1u64 << sig;
@@ -335,7 +352,7 @@ pub fn restore_frame(st: &mut SigState, gprs: &mut TrapGprs) -> u64 {
 		ptr::copy_nonoverlapping(
 			(frame + FRAME_GPRS_OFF) as *const u8,
 			gprs as *mut TrapGprs as *mut u8,
-			core::mem::size_of::<TrapGprs>()
+			core::mem::size_of::<TrapGprs>(),
 		);
 		gprs.sp_before_trap = ptr::read_volatile((frame + FRAME_USP_OFF) as *const u64);
 		// 帧内 sstatus 取自信号送达时刻, 其 SPP = 0 (来自 U 模式) 与 SPIE = 1

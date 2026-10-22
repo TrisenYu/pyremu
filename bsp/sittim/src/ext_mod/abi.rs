@@ -68,7 +68,7 @@ pub struct ModuleInterface {
 /// 模块取用器。参数为运行时的管理器回调集合, 返回该模块的接口。
 pub type GetterFn = unsafe extern "C" fn(manager: *const Manager) -> ModuleInterface;
 
-/// 模块入口。它在映像内的偏移由映像描述块给出, 见 [`img_descriptor`](super::img_descriptor)。
+/// 模块入口。它在映像内的偏移由映像描述块给出
 /// 参数为运行时的管理器回调集合, 返回该模块的取用器。
 ///
 /// 取用器须可重复调用并返回相同接口: `ext_mod::loader` 在入口之后另调一次取用器,
@@ -80,7 +80,13 @@ pub type InitFn = unsafe extern "C" fn(manager: *const Manager) -> GetterFn;
 ///
 /// 模块在接口中自行给出表指针, 其取值在验签之后仍不可信, 故在登记接口之前必须确认
 /// 表的落点。`size` 为 0 时只检查指针本身, 供调用方在表的尺寸未知时使用。
-pub fn is_region_in_image(ptr: *const u8, size: usize, align: usize, va: u64, window_size: u64) -> bool {
+pub fn is_region_in_image(
+	ptr: *const u8,
+	size: usize,
+	align: usize,
+	va: u64,
+	window_size: u64,
+) -> bool {
 	let addr = ptr as u64;
 	if addr % align as u64 != 0 || addr < va {
 		return false;
@@ -90,8 +96,6 @@ pub fn is_region_in_image(ptr: *const u8, size: usize, align: usize, va: u64, wi
 		None => false,
 	}
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -147,7 +151,13 @@ mod tests {
 		assert!(!check(base + 0x1004));
 
 		// 空指针落在窗口之外。
-		assert!(!is_region_in_image(core::ptr::null(), size, align, base, window));
+		assert!(!is_region_in_image(
+			core::ptr::null(),
+			size,
+			align,
+			base,
+			window
+		));
 	}
 
 	/// 尺寸为 0 时只检查指针本身, 供调用方在表的尺寸未知时使用。
@@ -155,9 +165,27 @@ mod tests {
 	fn test_zero_sized_region_check_admits_the_window_end() {
 		let window = CHUNK_2M_SIZE;
 		let base = 0x1_0000_0000_u64;
-		assert!(is_region_in_image((base + window) as *const u8, 0, 8, base, window));
-		assert!(!is_region_in_image((base + window + 8) as *const u8, 0, 8, base, window));
+		assert!(is_region_in_image(
+			(base + window) as *const u8,
+			0,
+			8,
+			base,
+			window
+		));
+		assert!(!is_region_in_image(
+			(base + window + 8) as *const u8,
+			0,
+			8,
+			base,
+			window
+		));
 		// 尺寸非零时窗口末尾的地址放不下该区域。
-		assert!(!is_region_in_image((base + window) as *const u8, 8, 8, base, window));
+		assert!(!is_region_in_image(
+			(base + window) as *const u8,
+			8,
+			8,
+			base,
+			window
+		));
 	}
 }

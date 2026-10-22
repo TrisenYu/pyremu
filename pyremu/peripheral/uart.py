@@ -33,7 +33,7 @@ from typing import Callable, IO
 
 from pyremu.memory.bus import Device
 
-# PLIC 中断源编号 (对齐 QEMU virt 平台, 与 DTB 中 serial@.../interrupts-extended 一致)
+# PLIC 中断源编号
 UART_IRQ = 10
 # 寄存器偏移
 REG_TXDATA = 0x00
@@ -45,31 +45,31 @@ REG_IP = 0x14
 REG_DIV = 0x18
 
 # IP 位
-IP_TXWM = 1 << 0  # TX FIFO 占用 < txcnt (对照 QEMU SIFIVE_UART_IP_TXWM)
-IP_RXWM = 1 << 1  # RX FIFO 占用 > rxcnt (对照 QEMU SIFIVE_UART_IP_RXWM)
+IP_TXWM = 1 << 0  # TX FIFO 占用 < txcnt
+IP_RXWM = 1 << 1  # RX FIFO 占用 > rxcnt
 
-# RX FIFO 固定大小 (QEMU SIFIVE_UART_RX_FIFO_SIZE = 8, 但 8 字节
-# 不足以容纳完整 vt100 转义序列如 \x1b[1;5D (6 bytes) +
-# 连续键入时的队列缓冲. 32 字节确保转义序列始终原子交付.)
+# RX FIFO 固定大小
 RX_FIFO_SIZE = 32
 
 # RXDATA 状态位 (SiFive 硬件兼容)
 UART_RXFIFO_EMPTY = 1 << 31  # RX FIFO 空标志 (bit31=1 表示无数据)
 
 
+# 只读寄存器偏移到取值函数的映射; IP 在读取时计算, 不在写入时置位.
+_READ_REG_FIELDS = {
+    REG_TXCTRL: lambda uart: uart._txctrl,
+    REG_RXCTRL: lambda uart: uart._rxctrl,
+    REG_IE: lambda uart: uart._ie,
+    REG_IP: lambda uart: uart._ip_value(),
+    REG_DIV: lambda uart: uart._div,
+}
+
+
 class UART(Device):
     """SiFive 风格 UART 外设 — 纯被动 MMIO 设备.
-
-    寄存器行为对照 QEMU ``hw/char/sifive_uart.c`` 实现:
-    - RX FIFO 固定 8 字节 (``SIFIVE_UART_RX_FIFO_SIZE``)
-    - preload() 受 ``can_rx()`` 控制: FIFO 满时拒绝新数据
-    - RXDATA 读取后调用 ``_accept_input()`` 通知 termio 可继续接收
-    - IP 按 FIFO 占用量与比较阈值 rxcnt 的大小关系计算, 非简单非空判断
-
-    TXDATA 写入即自动输出 (无 hart 耦合): 每字节经 _tx_callback (若设置)
+    TXDATA 写入即自动输出: 每字节经 _tx_callback (若设置)
     即时输出, 不依赖外部 set_writer / flush_all.
     """
-
 
     def __init__(
         self,
@@ -93,7 +93,7 @@ class UART(Device):
 
         # 数据 buffer
         self._tx_buf: list[int] = []  # 已发送字节 (调试用)
-        # RX FIFO — 固定 8 字节, 对照 QEMU s->rx_fifo[8] + s->rx_fifo_len
+        # RX FIFO — 固定 8 字节
         self._rx_fifo: list[int] = []  # 待接收字节 (len <= RX_FIFO_SIZE)
         self._rx_lock = threading.Lock()  # daemon reader 线程与主线程共享 _rx_fifo
 
@@ -110,7 +110,7 @@ class UART(Device):
         # 故设备状态变化时须同步到此上下文.
         self._ffi_ctx: object | None = None
 
-        # 控制台回显开关 — 控制台输出只有一个写入者, 与 QEMU 的 chardev 模型一致:
+        # 控制台回显开关 — 控制台输出只有一个写入者:
         # Rust 的终端 I/O 线程运行期间为 False, 由该线程直写 stdout;
         # 其余时刻为 True, 由 _tx_callback 负责回显.
         self._console_echo: bool = True
@@ -163,13 +163,10 @@ class UART(Device):
             self._hart_log_files[hart_id] = f
         return f
 
-    # ---- QEMU 风格容量控制接口 (对照 sifive_uart_can_rx / sifive_uart_rx) ----
-
     def can_rx(self) -> bool:
-        """RX FIFO 是否有空闲槽位, 对照 QEMU ``sifive_uart_can_rx``.
-
+        """RX FIFO 是否有空闲槽位
         termio 的 ``drain_rx()`` 在 preload 前调用此方法; FIFO 满时不读
-        stdin, 数据留在内核 tty 缓冲, 对照 QEMU ``fd_chr_read_poll`` 的流量控制.
+        stdin, 数据留在内核 tty 缓冲的流量控制.
         """
         with self._rx_lock:
             return len(self._rx_fifo) < RX_FIFO_SIZE
@@ -184,21 +181,17 @@ class UART(Device):
 
     def _accept_input(self) -> None:
         """RXDATA 读取后调用: 通知上层 FIFO 已空出一个槽位, 可继续写入数据.
-
-        对照 QEMU ``sifive_uart_read`` 中的 ``qemu_chr_fe_accept_input()``,
-        与 ``can_rx()`` 构成反压协议的两半: 后者在 FIFO 满时暂停投递, 此处
         在空位出现后恢复投递. 未绑定回调时为空操作.
         """
         if self._on_rx_room is not None:
             self._on_rx_room()
 
-
     def _ip_value(self) -> int:
-        """动态计算 IP 寄存器值, 与 QEMU 的 ``sifive_uart_ip`` 一致.
+        """动态计算 IP 寄存器值
 
-        - **txwm**: TX FIFO 占用 < txctrl.txcnt, txcnt 位于 bits[18:16]. 本模型
+        - txwm: TX FIFO 占用 < txctrl.txcnt, txcnt 位于 bits[18:16]. 本模型
           写入 TXDATA 后立即输出, TX FIFO 恒为空, 故 txcnt>0 时条件恒成立.
-        - **rxwm**: RX FIFO 占用 > rxctrl.rxcnt, rxcnt 与 txcnt 同在 bits[18:16].
+        - rxwm: RX FIFO 占用 > rxctrl.rxcnt, rxcnt 与 txcnt 同在 bits[18:16].
           默认 rxcnt=0, 故 FIFO 非空时置位.
 
         TXDATA 写入可能由加速执行引擎在内部处理而绕过 _write_reg, 故 IP 必须在
@@ -248,7 +241,7 @@ class UART(Device):
 
     # ---- 公开方法 ----
     def preload(self, data: bytes) -> int:
-        """向 RX FIFO 预填入数据, 受 ``can_rx()`` 控制 (对照 QEMU ``sifive_uart_rx``).
+        """向 RX FIFO 预填入数据, 受 ``can_rx()`` 控制
 
         Returns:
             实际接受的字节数 (FIFO 满时可能少于 ``len(data)``).
@@ -315,27 +308,22 @@ class UART(Device):
 
     def _read_reg(self, offset: int) -> int:
         if offset == REG_RXDATA:
-            with self._rx_lock:
-                if not self._rx_fifo:
-                    return UART_RXFIFO_EMPTY
-                b = self._rx_fifo.pop(0)
-            self._accept_input()
-            self._publish_state()
-            return b
+            return self._read_rxdata()
         if offset == REG_TXDATA:
-            return 0  # TXDATA 只写; full 位即 bit31, 恒 0 — 写入即输出, TX FIFO 恒为空
-        if offset == REG_TXCTRL:
-            return self._txctrl
-        if offset == REG_RXCTRL:
-            return self._rxctrl
-        if offset == REG_IE:
-            return self._ie
-        if offset == REG_IP:
-            # IP 在读取时计算, 不在写入时置位 — 见 ``_ip_value()``.
-            return self._ip_value()
-        if offset == REG_DIV:
-            return self._div
-        return 0
+            # TXDATA 只写; full 位即 bit31, 恒 0 — 写入即输出, TX FIFO 恒为空
+            return 0
+        reader = _READ_REG_FIELDS.get(offset)
+        return 0 if reader is None else reader(self)
+
+    def _read_rxdata(self) -> int:
+        """读取 RXDATA: 非空时取出队首字节, 随后更新接收状态与中断线."""
+        with self._rx_lock:
+            if not self._rx_fifo:
+                return UART_RXFIFO_EMPTY
+            b = self._rx_fifo.pop(0)
+        self._accept_input()
+        self._publish_state()
+        return b
 
     def _write_reg(self, offset: int, val: int) -> None:
         if offset == REG_TXDATA:
@@ -378,4 +366,3 @@ class UART(Device):
             self._div = val & 0xFFFF
             return
         # 忽略未定义偏移的写入
-

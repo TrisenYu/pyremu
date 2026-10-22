@@ -8,8 +8,8 @@ import threading
 
 import pytest
 
+from pyremu import configs_gen
 from pyremu._native import native_available
-import pyremu.configs_gen
 from pyremu.core.hart import HartState, RiscvMode
 from pyremu.core.registers import AIA_CSR_ADDRS, csr_bank, sync_aia_csr_gate
 from pyremu.core.trap_def import trap_cause_code, TrapType
@@ -26,7 +26,7 @@ def _disable_aia_compile_override(monkeypatch):
 
     Tests use explicit configs: qemu_virt() for legacy, qemu_virt_aia() for AIA.
     """
-    monkeypatch.setattr(pyremu.configs_gen, "PYREMU_AIA", False)
+    monkeypatch.setattr(configs_gen, "PYREMU_AIA", False)
 
 
 @pytest.fixture
@@ -73,8 +73,8 @@ class TestImsicMMIO:
     def test_seteipnum_sets_pending_and_meip(self):
         """seteipnum 写后 eip 置位, get_pending_mip 返回 MEIP, eidelivery=1 且 eie 已使能."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)  # eie: enable identity 10
+        imsic.csr_write(0, "M", 0x70, 1)  # eidelivery=1
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)  # eie: enable identity 10
         imsic.write(0x000, (10).to_bytes(4, "little"))
         mip = imsic.get_pending_mip(0)
         assert mip & (1 << 11), f"MEIP should be set, got mip={mip:#x}"
@@ -82,10 +82,10 @@ class TestImsicMMIO:
     def test_seteipnum_hart_isolation(self):
         """hart 0 seteipnum 不影响 hart 1."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)
-        imsic.csr_write(1, 'M', 0x70, 1)
-        imsic.csr_write(1, 'M', 0xC0, 1 << 10)
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)
+        imsic.csr_write(1, "M", 0x70, 1)
+        imsic.csr_write(1, "M", 0xC0, 1 << 10)
         imsic.write(0x000, (10).to_bytes(4, "little"))  # hart 0
         assert imsic.get_pending_mip(0) & (1 << 11)
         assert imsic.get_pending_mip(1) == 0, "hart 1 should be unaffected"
@@ -93,8 +93,8 @@ class TestImsicMMIO:
     def test_clreipnum_clears_pending(self):
         """seteipnum -> clreipnum -> pending 清除."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)
         imsic.write(0x000, (10).to_bytes(4, "little"))
         assert imsic.get_pending_mip(0) & (1 << 11)
         imsic.write(0x008, (10).to_bytes(4, "little"))  # clreipnum
@@ -103,16 +103,16 @@ class TestImsicMMIO:
     def test_seteipnum_ignores_invalid_id(self):
         """seteipnum(0) 或 seteipnum(>=2048) 被忽略."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.write(0x000, (0).to_bytes(4, "little"))      # identity 0 = reserved
-        imsic.write(0x000, (2048).to_bytes(4, "little"))   # out of range
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.write(0x000, (0).to_bytes(4, "little"))  # identity 0 = reserved
+        imsic.write(0x000, (2048).to_bytes(4, "little"))  # out of range
         assert imsic.get_pending_mip(0) == 0
 
     def test_sfile_seteipnum_triggers_seip(self):
         """S-mode file seteipnum -> SEIP (bit 9)."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'S', 0x70, 1)  # S-file eidelivery=1
-        imsic.csr_write(0, 'S', 0xC0, 1 << 5)  # eie: enable identity 5
+        imsic.csr_write(0, "S", 0x70, 1)  # S-file eidelivery=1
+        imsic.csr_write(0, "S", 0xC0, 1 << 5)  # eie: enable identity 5
         # S-file hart 0: num_harts * 0x1000 + 0 * 0x1000 = 0x2000
         imsic.write(0x2000, (5).to_bytes(4, "little"))  # hart 0 S-file seteipnum
         mip = imsic.get_pending_mip(0)
@@ -131,61 +131,61 @@ class TestImsicCSR:
     def test_eidelivery_roundtrip(self):
         """miselect=0x70 -> mireg 读写 eidelivery."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
-        assert imsic.csr_read(0, 'M', 0x70) == 1
-        imsic.csr_write(0, 'M', 0x70, 0)
-        assert imsic.csr_read(0, 'M', 0x70) == 0
+        imsic.csr_write(0, "M", 0x70, 1)
+        assert imsic.csr_read(0, "M", 0x70) == 1
+        imsic.csr_write(0, "M", 0x70, 0)
+        assert imsic.csr_read(0, "M", 0x70) == 0
 
     def test_eithreshold_roundtrip(self):
         """miselect=0x72 -> mireg 读写 eithreshold."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x72, 0xFF)
-        assert imsic.csr_read(0, 'M', 0x72) == 0xFF
+        imsic.csr_write(0, "M", 0x72, 0xFF)
+        assert imsic.csr_read(0, "M", 0x72) == 0xFF
         # threshold clamped to 10 bits
-        imsic.csr_write(0, 'M', 0x72, 0x3FF)
-        assert imsic.csr_read(0, 'M', 0x72) == 0x3FF
+        imsic.csr_write(0, "M", 0x72, 0x3FF)
+        assert imsic.csr_read(0, "M", 0x72) == 0x3FF
 
     def test_eip_visible_via_mireg(self):
         """seteipnum 写后 eip 可通过 mireg (select 0x80+) 读取."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
+        imsic.csr_write(0, "M", 0x70, 1)
         # 注入中断号 10: word 0, bit 10
-        imsic.set_ip_number(0, 'M', 10)
+        imsic.set_ip_number(0, "M", 10)
         # 读 eip0: select = 0x80, 应含 bit 10
-        val = imsic.csr_read(0, 'M', 0x80)
+        val = imsic.csr_read(0, "M", 0x80)
         assert val & (1 << 10), f"eip[0] bit 10 should be set, got {val:#x}"
 
     def test_eie_visible_via_mireg(self):
         """eie 可通过 mireg (select 0xC0+) 读写."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0xC0, (1 << 15))
-        val = imsic.csr_read(0, 'M', 0xC0)
+        imsic.csr_write(0, "M", 0xC0, (1 << 15))
+        val = imsic.csr_read(0, "M", 0xC0)
         assert val & (1 << 15)
 
     def test_siselect_sireg(self):
         """S-mode siselect/sireg 独立于 M-mode."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'S', 0x70, 0)
-        assert imsic.csr_read(0, 'M', 0x70) == 1
-        assert imsic.csr_read(0, 'S', 0x70) == 0
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "S", 0x70, 0)
+        assert imsic.csr_read(0, "M", 0x70) == 1
+        assert imsic.csr_read(0, "S", 0x70) == 0
 
     def test_mireg_64bit_pairs_u32(self):
         """mireg 读 eip 返回 64 位 (相邻两 u32 拼装)."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
+        imsic.csr_write(0, "M", 0x70, 1)
         # 设 eip[0] bit 10 (IID 10) 和 eip[1] bit 31 (IID 63)
-        imsic.set_ip_number(0, 'M', 10)   # word 0, bit 10
-        imsic.set_ip_number(0, 'M', 63)   # word 1, bit 31
-        val = imsic.csr_read(0, 'M', 0x80)  # select eip0 -> eip[0] | (eip[1] << 32)
+        imsic.set_ip_number(0, "M", 10)  # word 0, bit 10
+        imsic.set_ip_number(0, "M", 63)  # word 1, bit 31
+        val = imsic.csr_read(0, "M", 0x80)  # select eip0 -> eip[0] | (eip[1] << 32)
         assert val & (1 << 10), "eip[0] bit 10 (IID 10) should be set"
         assert val & (1 << 63), "eip[1] bit 31 (IID 63) -> mireg bit 63 should be set"
 
     def test_unknown_select_reads_zero(self):
         """未注册的 select 读返回 0."""
         imsic = _make_imsic()
-        assert imsic.csr_read(0, 'M', 0x00) == 0
-        assert imsic.csr_read(0, 'M', 0xFF) == 0
+        assert imsic.csr_read(0, "M", 0x00) == 0
+        assert imsic.csr_read(0, "M", 0xFF) == 0
 
 
 # ============================================================
@@ -199,12 +199,12 @@ class TestImsicPriority:
     def test_eithreshold_filters_low_priority(self):
         """eithreshold=5: 优先级 <=5 的中断不触发 pending."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'M', 0x72, 5)  # threshold=5
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "M", 0x72, 5)  # threshold=5
         # IID=5 has priority 5, NOT > threshold 5 -> filtered by topei
-        imsic.csr_write(0, 'M', 0xC0, 1 << 5)  # enable identity 5
-        imsic.set_ip_number(0, 'M', 5)
-        topei = imsic.read_topei(0, 'M')
+        imsic.csr_write(0, "M", 0xC0, 1 << 5)  # enable identity 5
+        imsic.set_ip_number(0, "M", 5)
+        topei = imsic.read_topei(0, "M")
         assert topei == 0, f"topei should be 0 (filtered by eithreshold), got {topei:#x}"
 
     def test_get_pending_mip_respects_eithreshold(self):
@@ -219,18 +219,18 @@ class TestImsicPriority:
         """
         imsic = _make_imsic()
         # S-file: eidelivery=1, threshold=20
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.csr_write(0, 'S', 0x72, 20)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.csr_write(0, "S", 0x72, 20)
         # Enable & pend IID=10 (prio=10 <= threshold=20)
-        imsic.csr_write(0, 'S', 0xC0, 1 << 10)
-        imsic.set_ip_number(0, 'S', 10)
+        imsic.csr_write(0, "S", 0xC0, 1 << 10)
+        imsic.set_ip_number(0, "S", 10)
 
         assert imsic.get_pending_mip(0) == 0, (
             "get_pending_mip must be 0 when interrupt is masked by eithreshold"
         )
 
         # Lower threshold below priority -> SEIP should appear
-        imsic.csr_write(0, 'S', 0x72, 5)
+        imsic.csr_write(0, "S", 0x72, 5)
         assert imsic.get_pending_mip(0) & (1 << 9), (
             "SEIP must be set after lowering eithreshold below priority"
         )
@@ -238,35 +238,35 @@ class TestImsicPriority:
     def test_eidelivery_zero_suppresses_all(self):
         """eidelivery=0 -> get_pending_mip 返回 0, topei 返回 0."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)
-        imsic.set_ip_number(0, 'M', 10)
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)
+        imsic.set_ip_number(0, "M", 10)
         assert imsic.get_pending_mip(0) == 0
-        assert imsic.read_topei(0, 'M') == 0
+        assert imsic.read_topei(0, "M") == 0
 
     def test_topei_returns_highest_priority(self):
         """多个 pending: topei 返回最高 IID (即最高优先级)."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
+        imsic.csr_write(0, "M", 0x70, 1)
         # 使能 identity 5 和 100
-        imsic.csr_write(0, 'M', 0xC0, (1 << 5) | (1 << 4))  # eie[0] = bits 4, 5
+        imsic.csr_write(0, "M", 0xC0, (1 << 5) | (1 << 4))  # eie[0] = bits 4, 5
         # 需要使能 word 3 bit 4 for IID 100
-        w100 = 100 // 32       # = 3
-        b100 = 100 % 32       # = 4
-        imsic.csr_write(0, 'M', 0xC0 + w100, 1 << b100)
-        imsic.set_ip_number(0, 'M', 5)
-        imsic.set_ip_number(0, 'M', 100)
-        topei = imsic.read_topei(0, 'M')
+        w100 = 100 // 32  # = 3
+        b100 = 100 % 32  # = 4
+        imsic.csr_write(0, "M", 0xC0 + w100, 1 << b100)
+        imsic.set_ip_number(0, "M", 5)
+        imsic.set_ip_number(0, "M", 100)
+        topei = imsic.read_topei(0, "M")
         iid = (topei >> 16) & 0x7FF
         assert iid == 100, f"topei should return highest IID (100), got {iid}"
 
     def test_topei_claims_clears_pending(self):
         """topei 读后 pending 位被清除 (claim 语义)."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)
-        imsic.set_ip_number(0, 'M', 10)
-        assert imsic.read_topei(0, 'M') != 0, "first topei should return pending"
-        assert imsic.read_topei(0, 'M') == 0, "second topei should return 0 (claimed)"
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)
+        imsic.set_ip_number(0, "M", 10)
+        assert imsic.read_topei(0, "M") != 0, "first topei should return pending"
+        assert imsic.read_topei(0, "M") == 0, "second topei should return 0 (claimed)"
 
 
 # ============================================================
@@ -284,12 +284,12 @@ class TestImsicTopei:
         imsic = emu.imsic
         assert imsic is not None
         # 使能 + 注入
-        h.write_csr(0x350, 0xC0)     # miselect = eie0
+        h.write_csr(0x350, 0xC0)  # miselect = eie0
         h.write_csr(0x351, 1 << 15)  # mireg: enable identity 15
-        h.write_csr(0x350, 0x70)     # miselect = eidelivery
-        h.write_csr(0x351, 1)        # mireg: eidelivery = 1
-        imsic.set_ip_number(0, 'M', 15)
-        val = h.read_csr(0x35C)      # mtopei
+        h.write_csr(0x350, 0x70)  # miselect = eidelivery
+        h.write_csr(0x351, 1)  # mireg: eidelivery = 1
+        imsic.set_ip_number(0, "M", 15)
+        val = h.read_csr(0x35C)  # mtopei
         iid = (val >> 16) & 0x7FF
         assert iid == 15, f"mtopei should report IID 15, got {iid}"
 
@@ -305,10 +305,10 @@ class TestImsicTopei:
         h = emu.harts[0]
         imsic = emu.imsic
         assert imsic is not None
-        imsic.csr_write(0, 'S', 0x70, 1)   # S-file eidelivery
-        imsic.csr_write(0, 'S', 0xC0, 1 << 7)  # enable IID 7
-        imsic.set_ip_number(0, 'S', 7)
-        val = h.read_csr(0x15C)             # stopei
+        imsic.csr_write(0, "S", 0x70, 1)  # S-file eidelivery
+        imsic.csr_write(0, "S", 0xC0, 1 << 7)  # enable IID 7
+        imsic.set_ip_number(0, "S", 7)
+        val = h.read_csr(0x15C)  # stopei
         iid = (val >> 16) & 0x7FF
         assert iid == 7, f"stopei should report IID 7, got {iid}"
 
@@ -390,15 +390,15 @@ class TestMtopi:
         h.mode = RiscvMode.M
 
         # Enable IMSIC eidelivery for M-file
-        h.write_csr(0x350, 0x70)   # miselect ← eidelivery
-        h.write_csr(0x351, 1)      # mireg ← 1 (enable delivery)
-        h.write_csr(0x350, 0xC0)   # miselect ← eie[0]
-        h.write_csr(0x351, 1 << 1) # mireg ← enable identity 1
+        h.write_csr(0x350, 0x70)  # miselect ← eidelivery
+        h.write_csr(0x351, 1)  # mireg ← 1 (enable delivery)
+        h.write_csr(0x350, 0xC0)  # miselect ← eie[0]
+        h.write_csr(0x351, 1 << 1)  # mireg ← enable identity 1
 
         # Inject IMSIC interrupt: seteipnum identity 1 via M-file MMIO
         imsic = h._imsic
         assert imsic is not None, "IMSIC must be present in AIA mode"
-        imsic.write(0x000, (1).to_bytes(4, 'little'))  # hart 0 M-file seteipnum
+        imsic.write(0x000, (1).to_bytes(4, "little"))  # hart 0 M-file seteipnum
 
         # M-file + IID=1 stays in M-file (no cross-file routing) -> MEIP, not SEIP.
         imsic_mip = imsic.get_pending_mip(h.id)
@@ -421,8 +421,7 @@ class TestMtopi:
         mtopei = h.read_csr(0x35C)
         minor = (mtopei >> 16) & 0xFFFF
         assert minor == 1, (
-            f"mtopei>>16 should be minor identity 1, "
-            f"got minor={minor} (mtopei={mtopei:#x})"
+            f"mtopei>>16 should be minor identity 1, got minor={minor} (mtopei={mtopei:#x})"
         )
 
 
@@ -500,14 +499,14 @@ class TestStopi:
 
         # Enable IMSIC eidelivery + eie for IID=21 (external device interrupt)
         h.write_csr(0x150, 0x70)  # siselect ← eidelivery
-        h.write_csr(0x151, 1)     # sireg ← 1 (enable delivery)
+        h.write_csr(0x151, 1)  # sireg ← 1 (enable delivery)
         h.write_csr(0x150, 0xC0)  # siselect ← eie[0]
         h.write_csr(0x151, 1 << 21)  # sireg ← enable identity 21
 
         # Inject IMSIC S-mode external interrupt via S-file seteipnum
         imsic = h._imsic
         assert imsic is not None, "IMSIC must be present in AIA mode"
-        imsic.write(0x2000, (21).to_bytes(4, 'little'))  # hart 0 S-file seteipnum
+        imsic.write(0x2000, (21).to_bytes(4, "little"))  # hart 0 S-file seteipnum
 
         # Sync IMSIC -> mip bits
         imsic_mip = imsic.get_pending_mip(h.id)
@@ -546,7 +545,7 @@ class TestStopi:
         h = emu.harts[0]
         h.pc = 0x40000000
         h.mode = RiscvMode.S
-        h.csrs["mie"].val |= 1 << 5   # STIE
+        h.csrs["mie"].val |= 1 << 5  # STIE
 
         # Set stimecmp in the past -> hardware STIP = 1
         h.csrs["stimecmp"].val = 100
@@ -557,8 +556,7 @@ class TestStopi:
         stopi = h.read_csr(0xDB0)
         iid = (stopi >> 16) & 0xFFFF
         assert iid == 5, (
-            f"STIP stopi>>16 should be IRQ_S_TIMER (5), "
-            f"got IID={iid} (stopi={stopi:#x})"
+            f"STIP stopi>>16 should be IRQ_S_TIMER (5), got IID={iid} (stopi={stopi:#x})"
         )
         assert stopi & 0xFFFF, f"stopi priority should be non-zero, got {stopi:#x}"
 
@@ -575,7 +573,7 @@ class TestStopi:
         h = emu.harts[0]
         h.pc = 0x40000000
         h.mode = RiscvMode.S
-        h.csrs["mie"].val |= 1 << 5   # STIE
+        h.csrs["mie"].val |= 1 << 5  # STIE
 
         # Simulate stale mip_val from an earlier trap delivery
         h.mip_val |= 1 << 5  # STIP=1 (stale)
@@ -587,9 +585,7 @@ class TestStopi:
 
         # stopi must now return 0 because mtime < stimecmp
         stopi = h.read_csr(0xDB0)
-        assert stopi == 0, (
-            f"stopi must return 0 after stimecmp is advanced, got {stopi:#x}"
-        )
+        assert stopi == 0, f"stopi must return 0 after stimecmp is advanced, got {stopi:#x}"
 
     def test_stopi_ignores_mtip(self, aia_csr_gate):
         """MTIP (bit 7) alone must NOT be reported by stopi.
@@ -603,7 +599,7 @@ class TestStopi:
         h = emu.harts[0]
         h.pc = 0x40000000
         h.mode = RiscvMode.S
-        h.csrs["mie"].val |= 1 << 7   # MTIE
+        h.csrs["mie"].val |= 1 << 7  # MTIE
         h.csrs["mideleg"].val |= 1 << 7  # delegate MTIP -> S-mode
 
         # Set MTIP only (STIP is 0)
@@ -615,9 +611,7 @@ class TestStopi:
 
         # Read stopi -> should return 0 (MTIP is deliberately ignored)
         stopi = h.read_csr(0xDB0)
-        assert stopi == 0, (
-            f"stopi must ignore MTIP (bit 7), got stopi={stopi:#x}"
-        )
+        assert stopi == 0, f"stopi must ignore MTIP (bit 7), got stopi={stopi:#x}"
 
 
 # ============================================================
@@ -654,7 +648,7 @@ class TestImsicCoexistence:
         assert result, "MTIP with IMSIC should deliver interrupt"
 
     def test_plic_unaffected_by_imsic(self):
-        """默认配置 (imsic_base=0): PLIC 行为不变."""
+        """legacy 模式: PLIC 行为不变, 不创建 IMSIC."""
         cfg = PlatformConfig.qemu_virt()
         emu = Emulator(cfg)
         assert emu.imsic is None, "legacy config should have no IMSIC"
@@ -668,9 +662,9 @@ class TestImsicCoexistence:
         h = emu.harts[0]
         imsic = emu.imsic
         assert imsic is not None
-        imsic.csr_write(0, 'M', 0x70, 1)   # eidelivery=1
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)
-        imsic.set_ip_number(0, 'M', 10)
+        imsic.csr_write(0, "M", 0x70, 1)  # eidelivery=1
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)
+        imsic.set_ip_number(0, "M", 10)
         # 使能 MEIE
         h.csrs["mie"].val = 1 << 11  # MEIE
         h.mstatus_val |= 1 << 3  # MIE=1 (M-mode global enable)
@@ -691,7 +685,6 @@ class TestImsicHartIntegration:
         """csrw miselect + csrr mireg 往返一致."""
         emu = _make_aia_emu()
         h = emu.harts[0]
-        # miselect = eidelivery (0x70)
         h.write_csr(0x350, 0x70)
         assert h._imsic_select_m == 0x70
         # mireg: 读当前 eidelivery
@@ -705,9 +698,9 @@ class TestImsicHartIntegration:
         """csrw siselect + csrr sireg 往返一致."""
         emu = _make_aia_emu()
         h = emu.harts[0]
-        h.write_csr(0x150, 0x70)        # siselect = eidelivery
+        h.write_csr(0x150, 0x70)  # siselect = eidelivery
         assert h._imsic_select_s == 0x70
-        h.write_csr(0x151, 1)           # sireg -> S-file eidelivery=1
+        h.write_csr(0x151, 1)  # sireg -> S-file eidelivery=1
         assert h.read_csr(0x151) == 1
 
     def test_mireg_ignored_without_imsic(self):
@@ -740,10 +733,10 @@ class TestImsicFfiWriteThrough:
         imsic = _make_imsic()
         states = (HartState * 2)()
         imsic.bind_ffi_states(states)
-        imsic.csr_write(0, 'S', 0x70, 1)        # eidelivery = 1
-        imsic.csr_write(0, 'S', 0xC0, 1 << 10)  # eie: 使能 identity 10
+        imsic.csr_write(0, "S", 0x70, 1)  # eidelivery = 1
+        imsic.csr_write(0, "S", 0xC0, 1 << 10)  # eie: 使能 identity 10
 
-        imsic.set_ip_number(0, 'S', 10)
+        imsic.set_ip_number(0, "S", 10)
 
         assert states[0].imsic_s.eip[0] == 1 << 10, "注入的 eip 位必须写穿"
         assert states[0].imsic_s.eip_ext_any == 1, "外部中断存在性缓存必须同步置位"
@@ -754,10 +747,10 @@ class TestImsicFfiWriteThrough:
         imsic = _make_imsic()
         states = (HartState * 2)()
         imsic.bind_ffi_states(states)
-        imsic.set_ip_number(0, 'S', 10)
+        imsic.set_ip_number(0, "S", 10)
         assert states[0].imsic_s.eip[0] == 1 << 10
 
-        imsic.clear_ip_number(0, 'S', 10)
+        imsic.clear_ip_number(0, "S", 10)
 
         assert states[0].imsic_s.eip[0] == 0, "撤除的 eip 位必须同步清除"
         assert states[0].imsic_s.eip_ext_any == 0
@@ -765,13 +758,13 @@ class TestImsicFfiWriteThrough:
     def test_publish_skipped_without_binding(self):
         """未绑定共享数组 (纯 Python 路径) 时注入照常工作, 不得抛异常."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.csr_write(0, 'S', 0xC0, 1 << 10)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.csr_write(0, "S", 0xC0, 1 << 10)
 
-        imsic.set_ip_number(0, 'S', 10)
+        imsic.set_ip_number(0, "S", 10)
         assert imsic.get_pending_mip(0) & (1 << 9), "未绑定时仍应投递 SEIP"
 
-        imsic.clear_ip_number(0, 'S', 10)
+        imsic.clear_ip_number(0, "S", 10)
         assert imsic.get_pending_mip(0) == 0
 
     def test_speedup_lib_binds_imsic_states(self):
@@ -794,9 +787,9 @@ class TestImsicFfiWriteThrough:
         )
 
         # 经 APLIC 注入的外部中断在共享数组上立即可见 (无需等轮边界).
-        emu.imsic.csr_write(0, 'S', 0x70, 1)
-        emu.imsic.csr_write(0, 'S', 0xC0, 1 << 10)
-        emu.imsic.set_ip_number(0, 'S', 10)
+        emu.imsic.csr_write(0, "S", 0x70, 1)
+        emu.imsic.csr_write(0, "S", 0xC0, 1 << 10)
+        emu.imsic.set_ip_number(0, "S", 10)
         assert emu._speedup_hart_states[0].imsic_s.eip[0] == 1 << 10
 
 
@@ -817,9 +810,9 @@ class TestImsicConfig:
         assert cfg.periph.aplic_s_base == 0x0C00_0000
 
     def test_default_config_no_imsic(self):
-        """默认 qemu_virt 配置 imsic_base=0 — 不创建 IMSIC."""
+        """qemu_virt 预设为 legacy 模式 — 不创建 IMSIC."""
         cfg = PlatformConfig.qemu_virt()
-        assert cfg.periph.imsic_m_base == 0
+        assert cfg.periph.imsic_m_base == configs_gen.IMSIC_M_BASE
         emu = Emulator(cfg)
         assert emu.imsic is None
 
@@ -847,9 +840,9 @@ class TestImsicIpi:
         sets M-file eip[3] and drives MEIP.
         """
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
-        imsic.csr_write(0, 'M', 0xC0, 1 << 3)  # eie: enable identity 3
-        imsic.write(0x000, (3).to_bytes(4, 'little'))  # seteipnum 3 (M-file)
+        imsic.csr_write(0, "M", 0x70, 1)  # eidelivery=1
+        imsic.csr_write(0, "M", 0xC0, 1 << 3)  # eie: enable identity 3
+        imsic.write(0x000, (3).to_bytes(4, "little"))  # seteipnum 3 (M-file)
         mip = imsic.get_pending_mip(0)
         assert (mip & (1 << 11)) != 0, (
             f"MEIP should be set for M-file IID=3 (stays in M-file), got mip={mip:#x}"
@@ -861,9 +854,9 @@ class TestImsicIpi:
         All IMSIC interrupts drive the external interrupt line per AIA spec.
         """
         imsic = _make_imsic()
-        imsic.csr_write(0, 'S', 0x70, 1)  # eidelivery=1
-        imsic.csr_write(0, 'S', 0xC0, 1 << 3)  # eie: enable identity 3
-        imsic.write(0x2000, (3).to_bytes(4, 'little'))  # S-file seteipnum 3
+        imsic.csr_write(0, "S", 0x70, 1)  # eidelivery=1
+        imsic.csr_write(0, "S", 0xC0, 1 << 3)  # eie: enable identity 3
+        imsic.write(0x2000, (3).to_bytes(4, "little"))  # S-file seteipnum 3
         mip = imsic.get_pending_mip(0)
         assert (mip & (1 << 9)) != 0, (
             f"SEIP should be set for ALL IMSIC interrupts (including IPI IID=3), "
@@ -873,9 +866,9 @@ class TestImsicIpi:
     def test_ext_interrupt_sets_meip(self):
         """M-file 外部中断 IID>=6 时 get_pending_mip 返回 MEIP."""
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)  # eie bit 10
-        imsic.write(0x000, (10).to_bytes(4, 'little'))  # seteipnum 10
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)  # eie bit 10
+        imsic.write(0x000, (10).to_bytes(4, "little"))  # seteipnum 10
         mip = imsic.get_pending_mip(0)
         assert mip & (1 << 11), f"MEIP should be set for ext int, got mip={mip:#x}"
 
@@ -887,10 +880,10 @@ class TestImsicIpi:
         drive MEIP.  SEIP must remain clear — only an S-file write drives it.
         """
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)  # M-file eidelivery=1
-        imsic.csr_write(0, 'M', 0xC0, (1 << 1) | (1 << 10))  # eie: enable IID=1,10
-        imsic.write(0x000, (1).to_bytes(4, 'little'))   # M-file IID=1 -> stays in M-file
-        imsic.write(0x000, (10).to_bytes(4, 'little'))  # M-file IID=10 -> stays in M-file
+        imsic.csr_write(0, "M", 0x70, 1)  # M-file eidelivery=1
+        imsic.csr_write(0, "M", 0xC0, (1 << 1) | (1 << 10))  # eie: enable IID=1,10
+        imsic.write(0x000, (1).to_bytes(4, "little"))  # M-file IID=1 -> stays in M-file
+        imsic.write(0x000, (10).to_bytes(4, "little"))  # M-file IID=10 -> stays in M-file
         mip = imsic.get_pending_mip(0)
         assert mip & (1 << 11), (
             f"MEIP should be set (from IID=1,10 in M-file), got mip={mip:#x}"
@@ -906,13 +899,13 @@ class TestImsicIpi:
         written to the M-file clears M-file eip[1] (not the S-file).
         """
         imsic = _make_imsic()
-        imsic.csr_write(0, 'M', 0x70, 1)  # M-file eidelivery=1
-        imsic.csr_write(0, 'M', 0xC0, 1 << 1)
-        imsic.write(0x000, (1).to_bytes(4, 'little'))
+        imsic.csr_write(0, "M", 0x70, 1)  # M-file eidelivery=1
+        imsic.csr_write(0, "M", 0xC0, 1 << 1)
+        imsic.write(0x000, (1).to_bytes(4, "little"))
         # M-file IID=1 stays in M-file -> MEIP, M-file topei reports pending IPI.
         assert (imsic.get_pending_mip(0) & (1 << 11)) != 0, "MEIP should be set for IPI IID=1"
-        assert imsic.peek_topei(0, 'M') != 0, "M-file topei should report pending IPI"
-        imsic.write(0x008, (1).to_bytes(4, 'little'))  # clreipnum 1 on M-file
+        assert imsic.peek_topei(0, "M") != 0, "M-file topei should report pending IPI"
+        imsic.write(0x008, (1).to_bytes(4, "little"))  # clreipnum 1 on M-file
         # clreipnum clears the M-file eip bit directly.
         assert imsic.get_pending_mip(0) == 0, "mip should be 0 after clear"
-        assert imsic.peek_topei(0, 'M') == 0, "M-file topei should be 0 after clear"
+        assert imsic.peek_topei(0, "M") == 0, "M-file topei should be 0 after clear"

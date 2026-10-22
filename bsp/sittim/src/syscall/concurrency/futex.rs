@@ -4,7 +4,7 @@
 //! (操作码解码、字值比较、EAGAIN 判定), 需要阻塞或唤醒时调用
 //! thread::block_current / thread::wake_blocked / thread::requeue_blocked。
 //!
-//! musl 各同步原语落到的实际操作 (见 vendor/musl):
+//! musl 各同步原语落到的实际操作:
 //! - 互斥锁与自旋锁的 __wait: FUTEX_WAIT / FUTEX_WAKE, 可带 FUTEX_PRIVATE;
 //! - pthread_cond 私有条件变量: 等待者阻塞在自身栈上 node.barrier 字的
 //!   FUTEX_WAIT, signal 对其 a_swap 清零后 FUTEX_WAKE;

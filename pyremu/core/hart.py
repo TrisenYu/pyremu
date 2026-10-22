@@ -68,9 +68,6 @@ class HartGroup:
 class GprFile:
     """GPR 寄存器文件 — 32 个 64-bit 整数, x0 硬连线为 0.
 
-    替代 pydantic ``list[Reg]`` 作为指令执行热路径上的寄存器后端,
-    消除每条指令 ~150ns 的 pydantic 模型验证开销.
-
     用法与 ``list[int]`` 一致: ``gprs[10]`` 读, ``gprs[10] = v`` 写.
     x0 (索引 0) 写入被静默丢弃, 读取恒返回 0.
     """
@@ -166,6 +163,23 @@ _SSTATUS_MASK = (
 # writable sstatus mask 排除 VS (bits 9-10) 和 SD (bit 63)
 _SSTATUS_WRITABLE_MASK = _SSTATUS_MASK & ~(MSTATUS_VS | (1 << 63))
 MSTATUS_SUM = 1 << 18  # 允许 S 模式访问 U 模式页
+
+
+# IMSIC 的实现不提供 mireg2 至 mireg6 与 sireg2 至 sireg6, 读回零.
+UNUSED_IMSIC_CSRS: frozenset[str] = frozenset(
+    {
+        "mireg2",
+        "mireg3",
+        "mireg4",
+        "mireg5",
+        "mireg6",
+        "sireg2",
+        "sireg3",
+        "sireg4",
+        "sireg5",
+        "sireg6",
+    }
+)
 MSTATUS_MXR = 1 << 19  # 使能可执行内存的可读
 MSTATUS_TVM = 1 << 20  # 陷入 S 模式访问 satp
 MSTATUS_TW = 1 << 21  # 陷入 WFI
@@ -201,7 +215,6 @@ class HartWithRegs:
         self.csrs["mvendorid"].val = 0  # 非商业实现
         self.csrs["marchid"].val = 0  # 未指定架构 ID
         self.csrs["mimpid"].val = 1  # 实现版本
-        # misa: MXL=2 (RV64) | I | M | A | F | D | C | S | U
         #    (与 DTB riscv,isa 字段一致: rv64imafdc, 加 S/U 支持)
         self.csrs["misa"].val = (
             (2 << 62)  # MXL=2 (RV64)
@@ -267,7 +280,7 @@ class HartWithRegs:
         # 异常/陷态追踪
         self._halted: bool = False  # 进入不可恢复陷态后置位
 
-        # mdid 缓存 — 避免每周期通过 pydantic dict 读取 (热路径, ~1M 次/基准测试)
+        # mdid 缓存 — 与 csrs["mdid"] 同步, 供每次内存访问读取
         self._mdid_val: int = 0
 
         # pmpsplit 缓存 — PMP 条目拆分点: 低 [0, split) 归 host, 高 [split, N) 归飞地
@@ -287,10 +300,9 @@ class HartWithRegs:
         # 纯 Python 路径中由 sync_counters 递增.
         self._total_instrs: int = 0
 
-        # QEMU 一次性定时器 deadline (本 hart 指令计数空间, 0 = 未设定).
-        # 与 Rust HartState.stip_deadline/mtip_deadline 一一对应 (FFI 往返).
+        # 与 Rust HartState.stip_deadline/mtip_deadline 一一对应.
         # Rust 侧由 write_stimecmp/write_mtimecmp 在写入 timecmp 时设定;
-        # Python 侧不设定 (单线程步骤路径无并发 mtime 膨胀, 共享比较已足够),
+        # Python 侧不设定,
         # 仅随 marshal/unmarshal 往返保持与 Rust 一致。
         self._stip_deadline: int = 0
         self._mtip_deadline: int = 0
@@ -314,11 +326,15 @@ class HartWithRegs:
     #  寄存器读写
     # ----------------------------------------------------------
 
+    def _require_csr(self, csr_name: str) -> None:
+        """检查 CSR 名称存在, 不存在时抛出 ValueError."""
+        if csr_name not in self.csrs:
+            raise ValueError(f"{csr_name!r} not found in hart {self.id}")
+
     def _csr_read_raw(self, csr_name: str) -> int:
-        """Read CSR value bypassing pydantic model (hot path, ~10% faster)."""
-        csr = self.csrs[csr_name]
-        assert csr, f"CSR {csr_name!r} not found in hart {self.id}"
-        return csr.__dict__["val"]
+        """读取 CSR 的存储值, 不检查特权级, 不合成 sstatus/sie/sip 视图."""
+        self._require_csr(csr_name)
+        return self.csrs[csr_name].val
 
     def read_csr(self, csr_id: int) -> int:
         check, csr_name = check_csr(csr_id)
@@ -326,60 +342,69 @@ class HartWithRegs:
             return -1
         # 硬件计数器 — 从 CLINT 动态读取 (time / timeh)
         # RISC-V 规范: time / timeh 是内存映射 CLINT mtime 的只读 CSR 镜像
-        if csr_name == "time" and self._interrupt_ctrl:
-            return self._interrupt_ctrl.get_mtime()
-        if csr_name == "timeh" and self._interrupt_ctrl:
-            return mask32(self._interrupt_ctrl.get_mtime() >> 32)
+        if csr_name in ("time", "timeh") and self._interrupt_ctrl:
+            return self._read_time_csr(csr_name)
         # sstatus 是 mstatus 的受限视图, 读取 sstatus 时返回 mstatus 的对应位
         if csr_name == "sstatus":
-            mval = self._csr_read_raw("mstatus")
-            return mval & _SSTATUS_MASK
-        # sie 是 mie 的受限视图 — 只有 mideleg 委派的位在 S 模式可见
-        if csr_name == "sie":
-            return self._csr_read_raw("mie") & self._csr_read_raw("mideleg")
-        # sip 是 mip 的受限视图 — 只有 mideleg 委派的位在 S 模式可见
-        if csr_name == "sip":
-            return self._csr_read_raw("mip") & self._csr_read_raw("mideleg")
+            return self._csr_read_raw("mstatus") & _SSTATUS_MASK
+        # sie 与 sip 是 mie 与 mip 的受限视图 — 只有 mideleg 委派的位在 S 模式可见
+        if csr_name in ("sie", "sip"):
+            base = "mie" if csr_name == "sie" else "mip"
+            return self._csr_read_raw(base) & self._csr_read_raw("mideleg")
         # AIA IMSIC CSRs — indirect register access via miselect/mireg
-        if self._imsic is None:
-            return self._csr_read_raw(csr_name)
-        if csr_name == "miselect":
-            return self._imsic_select_m
-        if csr_name == "siselect":
-            return self._imsic_select_s
+        if self._imsic is not None:
+            val = self._read_imsic_csr(csr_name)
+            if val is not None:
+                return val
+        return self._csr_read_raw(csr_name)
+
+    def _read_time_csr(self, csr_name: str) -> int:
+        """读取 time/timeh: 取 CLINT mtime, timeh 取高 32 位."""
+        mtime = self._interrupt_ctrl.get_mtime()
+        return mtime if csr_name == "time" else mask32(mtime >> 32)
+
+    def _read_imsic_csr(self, csr_name: str) -> int | None:
+        """读取 IMSIC 间接访问 CSR; 非此类 CSR 返回 None."""
+        if csr_name in ("miselect", "siselect"):
+            return self._imsic_select_m if csr_name == "miselect" else self._imsic_select_s
+        if csr_name in ("mireg", "sireg"):
+            return self._read_imsic_reg(csr_name)
+        if csr_name in ("mtopi", "stopi"):
+            return self._imsic_read_topi(csr_name)
+        if csr_name in ("mtopei", "stopei"):
+            return self._read_imsic_topei(csr_name)
+        if csr_name in UNUSED_IMSIC_CSRS:
+            return 0
+        return None
+
+    def _read_imsic_reg(self, csr_name: str) -> int:
+        """读取 mireg/sireg: 按 miselect/siselect 指定的寄存器."""
         if csr_name == "mireg":
             return self._imsic.csr_read(self.id, "M", self._imsic_select_m)
-        if csr_name == "sireg":
-            return self._imsic.csr_read(self.id, "S", self._imsic_select_s)
-        if csr_name == "mtopi":
-            return self._read_mtopi()
-        if csr_name == "stopi":
-            return self._read_stopi()
-        if csr_name == "mtopei":
-            val = self._imsic.read_topei(self.id, "M")
-            # Clear MSIP for IID=3 (mirrors Rust MTOPEI read handler).
-            if val != 0 and mask16(val >> 16) == 3:
-                self.mip_val &= ~(1 << 3)
-            return val
-        if csr_name == "stopei":
-            val = self._imsic.read_topei(self.id, "S")
-            if val != 0 and mask16(val >> 16) == 1:
-                self.mip_val &= ~(1 << 1)
-            return val
-        if csr_name in (
-            "mireg2",
-            "mireg3",
-            "mireg4",
-            "mireg5",
-            "mireg6",
-            "sireg2",
-            "sireg3",
-            "sireg4",
-            "sireg5",
-            "sireg6",
-        ):
-            return 0
-        return self._csr_read_raw(csr_name)
+        return self._imsic.csr_read(self.id, "S", self._imsic_select_s)
+
+    def _imsic_read_topi(self, csr_name: str) -> int:
+        """读取 mtopi/stopi."""
+        return self._read_mtopi() if csr_name == "mtopi" else self._read_stopi()
+
+    def _read_imsic_topei(self, csr_name: str) -> int:
+        """读取 mtopei/stopei, 并清除对应 IPI 的中断挂起位."""
+        return self._read_mtopei() if csr_name == "mtopei" else self._read_stopei()
+
+    def _read_mtopei(self) -> int:
+        """读取 mtopei; IID=3 时清除 MSIP."""
+        val = self._imsic.read_topei(self.id, "M")
+        # Clear MSIP for IID=3 (mirrors Rust MTOPEI read handler).
+        if val != 0 and mask16(val >> 16) == 3:
+            self.mip_val &= ~(1 << 3)
+        return val
+
+    def _read_stopei(self) -> int:
+        """读取 stopei; IID=1 时清除 SSIP."""
+        val = self._imsic.read_topei(self.id, "S")
+        if val != 0 and mask16(val >> 16) == 1:
+            self.mip_val &= ~(1 << 1)
+        return val
 
     # CSR names whose writes affect interrupt state and must invalidate the
     # check_pending_interrupts cache.
@@ -394,15 +419,12 @@ class HartWithRegs:
     )
 
     def _csr_write_raw(self, csr_name: str, val: int) -> None:
-        """Write CSR value bypassing pydantic ``BaseModel.__setattr__``.
+        """写入 CSR 的存储值, 不检查特权级, 不触发 property setter 的副作用.
 
-        Hot-path optimization: ``h.csrs[name].val = v`` costs ~120ns per write
-        in pydantic field-set machinery; ``__dict__['val']`` is ~40ns (3× faster).
-        Callers MUST ensure *csr_name* is valid and no side-effects are required.
+        中断敏感 CSR 写入后递增 int_state_version, 使中断状态缓存失效.
         """
-        csr = self.csrs[csr_name]
-        assert csr, f"CSR {csr_name!r} not found in hart {self.id}"
-        csr.__dict__["val"] = mask64(val)  # type: ignore[index]  # pydantic MappingProxyType vs runtime dict
+        self._require_csr(csr_name)
+        self.csrs[csr_name].val = mask64(val)
         if csr_name in self._INT_SENSITIVE_CSRS:
             self.int_state_version.bump()
 
@@ -410,7 +432,14 @@ class HartWithRegs:
         check, csr_name = check_csr(csr_id)
         if not check:
             return
-        # 有副作用的 CSR 必须通过 property setter 写入以同步缓存
+        if self._write_csr_side_effect(csr_name, val):
+            return
+        if self._imsic is not None and self._write_csr_imsic(csr_name, val):
+            return
+        self._csr_write_raw(csr_name, val)
+
+    def _write_csr_side_effect(self, csr_name: str, val: int) -> bool:
+        """处理带副作用的 CSR 写入; 返回是否已处理."""
         if csr_name == "satp":
             self.satp_val = val
             # satp 改写使投递到物理地址的映射全部改变, 加速执行引擎内既有的翻译
@@ -421,109 +450,138 @@ class HartWithRegs:
         elif csr_name == "pmpsplit":
             self.pmpsplit_val = val
         elif csr_name.startswith(("pmpcfg", "pmpaddr")):
-            # PMP CSR 写入导致 Rust 扁平缓存失效, 并同步到所有 hart
-            self._csr_write_raw(csr_name, val)
-            self._pmp.invalidate_cache()
-            # 同步 PMP 到其他 hart — OpenSBI 冷启动 hart 可能不是 hart 0,
-            # 而 _speedup_for_cmd_step 始终使用 active[0]._pmp 构建传给 Rust 的扁平数组
-            for h in self._all_harts or ():
-                if h is not self:
-                    h._csr_write_raw(csr_name, val)
-                    h._pmp.invalidate_cache()
-            return
+            self._write_pmp_csr(csr_name, val)
         elif csr_name == "stimecmp":
-            # SSTC: S-mode stimecmp — INDEPENDENT of CLINT mtimecmp.
-            # Immediately re-evaluate STIP (matching QEMU's
-            # riscv_timer_write_timecmp).  This is critical for the
-            # kernel's stopi loop in riscv_intc_aia_irq() — without
-            # immediate update, stopi reads stale mip_val.STIP and
-            # never returns 0.
             self._csr_write_raw(csr_name, val)
             self._eval_stip(val)
         elif csr_name == "stimecmph":
-            # RV32 only: stimecmp 高 32 位 (RV64 上 stimecmp 已是 64-bit)
-            cur = mask32(self._csr_read_raw("stimecmp"))
-            merged = cur | (mask32(val) << 32)
-            self._csr_write_raw("stimecmp", merged)
-            self._csr_write_raw(csr_name, mask32(val))
-            self._eval_stip(merged)
+            self._write_stimecmph(csr_name, val)
         elif csr_name == "sstatus":
-            # sstatus 是 mstatus 的受限视图: 写入 sstatus 时更新 mstatus 对应位
-            mstatus = self._csr_read_raw("mstatus")
-            mstatus = (mstatus & ~_SSTATUS_WRITABLE_MASK) | (val & _SSTATUS_WRITABLE_MASK)
-            self._csr_write_raw("mstatus", mstatus)
-            self._csr_write_raw("sstatus", mstatus & _SSTATUS_MASK)
+            self._write_sstatus(val)
         elif csr_name == "sie":
-            # sie 是 mie 的受限视图 — 只有 mideleg 委派的位可通过 S 模式写
-            mideleg = self._csr_read_raw("mideleg")
-            old_mie = self._csr_read_raw("mie")
-            new_mie = (old_mie & ~mideleg) | (val & mideleg)
-            self._csr_write_raw("mie", new_mie)
+            self._write_sie(val)
         elif csr_name == "mip":
-            # mip 的硬件驱动位 (MSIP/STIP/MTIP/SEIP/MEIP) 只读, 由 CLINT / SSTC
-            # 定时器 / 外部中断控制器 (PLIC) 独占; 仅 SSIP (bit 1) 与 USIP (bit 0)
-            # 可被软件写入 (与 Rust csr.rs 的 ro_mask 一致).
-            ro_mask = (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 11)
-            old_mip = self._csr_read_raw("mip")
-            new_mip = (old_mip & ro_mask) | (val & ~ro_mask)
-            self._csr_write_raw("mip", new_mip)
+            self._write_mip(val)
         elif csr_name == "sip":
-            # sip 是 mip 的只读视图 — 唯一可写位是 SSIP (bit 1). 与 sie 不同,
-            # sip 并非对所有 mideleg 委派位都可写: STIP (bit 5) 由 SSTC 定时器
-            # 硬件驱动, SEIP (bit 9) 由 PLIC 硬件驱动, 均不得被 `csrw sip` 覆写.
-            # 飞地上下文切换 (csr_write(CSR_SIP, saved)) 写回陈旧 sip, 覆写
-            # SEIP/STIP 会丢失挂起的外设/定时器中断 (飞地回归测试后输入冻结).
-            old_mip = self._csr_read_raw("mip")
-            new_mip = (old_mip & ~(1 << 1)) | (val & (1 << 1))
-            self._csr_write_raw("mip", new_mip)
-        elif self._imsic and csr_name == "miselect":
+            self._write_sip(val)
+        else:
+            return False
+        return True
+
+    def _write_pmp_csr(self, csr_name: str, val: int) -> None:
+        """PMP CSR 写入: 失效扁平缓存并同步到其他 hart."""
+        self._csr_write_raw(csr_name, val)
+        self._pmp.invalidate_cache()
+        # 同步 PMP 到其他 hart — OpenSBI 冷启动 hart 可能不是 hart 0,
+        # 而 _speedup_for_cmd_step 始终使用 active[0]._pmp 构建传给 Rust 的扁平数组
+        for h in self._all_harts or ():
+            if h is not self:
+                h._csr_write_raw(csr_name, val)
+                h._pmp.invalidate_cache()
+
+    def _write_stimecmph(self, csr_name: str, val: int) -> None:
+        """写入 stimecmph (RV32 only): 合并到 stimecmp 的高 32 位."""
+        cur = mask32(self._csr_read_raw("stimecmp"))
+        merged = cur | (mask32(val) << 32)
+        self._csr_write_raw("stimecmp", merged)
+        self._csr_write_raw(csr_name, mask32(val))
+        self._eval_stip(merged)
+
+    def _write_sstatus(self, val: int) -> None:
+        """写入 sstatus: 仅更新 mstatus 中 sstatus 可见且可写的位."""
+        mstatus = self._csr_read_raw("mstatus")
+        mstatus = (mstatus & ~_SSTATUS_WRITABLE_MASK) | (val & _SSTATUS_WRITABLE_MASK)
+        self._csr_write_raw("mstatus", mstatus)
+        self._csr_write_raw("sstatus", mstatus & _SSTATUS_MASK)
+
+    def _write_sie(self, val: int) -> None:
+        """写入 sie: 只有 mideleg 委派的位可通过 S 模式写."""
+        mideleg = self._csr_read_raw("mideleg")
+        old_mie = self._csr_read_raw("mie")
+        new_mie = (old_mie & ~mideleg) | (val & mideleg)
+        self._csr_write_raw("mie", new_mie)
+
+    def _write_mip(self, val: int) -> None:
+        """写入 mip: 硬件驱动位只读, 仅 SSIP 与 USIP 可被软件写入."""
+        # MSIP/STIP/MTIP/SEIP/MEIP 由 CLINT / SSTC 定时器 / 外部中断控制器
+        # (PLIC) 独占 (与 Rust csr.rs 的 ro_mask 一致).
+        ro_mask = (1 << 3) | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 11)
+        old_mip = self._csr_read_raw("mip")
+        new_mip = (old_mip & ro_mask) | (val & ~ro_mask)
+        self._csr_write_raw("mip", new_mip)
+
+    def _write_sip(self, val: int) -> None:
+        """写入 sip: 唯一可写位是 SSIP (bit 1)."""
+        # sip 并非对所有 mideleg 委派位都可写: STIP (bit 5) 由 SSTC 定时器
+        # 硬件驱动, SEIP (bit 9) 由 PLIC 硬件驱动, 均不得被 `csrw sip` 覆写.
+        # 飞地上下文切换 (csr_write(CSR_SIP, saved)) 写回陈旧 sip, 覆写
+        # SEIP/STIP 会丢失挂起的外设/定时器中断 (飞地回归测试后输入冻结).
+        old_mip = self._csr_read_raw("mip")
+        new_mip = (old_mip & ~(1 << 1)) | (val & (1 << 1))
+        self._csr_write_raw("mip", new_mip)
+
+    def _write_csr_imsic(self, csr_name: str, val: int) -> bool:
+        """处理 IMSIC 间接访问 CSR 的写入; 返回是否已处理."""
+        if csr_name == "miselect":
             self._imsic_select_m = mask32(val)
             self._csr_write_raw(csr_name, self._imsic_select_m)
-        elif self._imsic and csr_name == "siselect":
+        elif csr_name == "siselect":
             self._imsic_select_s = mask32(val)
             self._csr_write_raw(csr_name, self._imsic_select_s)
-        elif self._imsic and csr_name == "mireg":
+        elif csr_name == "mireg":
             self._imsic.csr_write(self.id, "M", self._imsic_select_m, val)
-        elif self._imsic and csr_name == "sireg":
+        elif csr_name == "sireg":
             self._imsic.csr_write(self.id, "S", self._imsic_select_s, val)
-        elif self._imsic and csr_name in ("stopei", "mtopei"):
-            # Writing to stopei/mtopei claims the specified IID per AIA spec.
-            iid = (val >> 16) & 0x7FF
-            if iid == 0:
-                return
-            priv = "S" if csr_name == "stopei" else "M"
-            self._imsic.clear_ip_number(self.id, priv, iid)
-            # Clear MSIP/SSIP for IPI IIDs (same rationale as _read_mtopi).
-            if csr_name == "mtopei":  #  and iid == 3
-                self.mip_val &= ~(1 << iid)
-            elif csr_name == "stopei":  # and iid == 1
-                self.mip_val &= ~(1 << iid)
-        elif self._imsic and csr_name in ("stopi", "mtopi"):
-            # Writing to stopi/mtopi claims the specified IID per AIA spec.
-            iid = (val >> 16) & 0x7FF
-            if csr_name == "mtopi":
-                mip_clr = self._imsic.claim_mtopi_iid(self.id, iid)
-                self.mip_val &= ~mip_clr
-                if iid != 7 or self._interrupt_ctrl is None:  # IRQ_M_TIMER: bump mtimecmp
-                    return
-                now = self._interrupt_ctrl.get_mtime()
-                mtc = self._interrupt_ctrl.get_mtimecmp(self.id)
-                if 0 < mtc <= now:
-                    self._interrupt_ctrl.set_mtimecmp(self.id, now + 4)
-            elif csr_name == "stopi":
-                mip_clr = self._imsic.claim_stopi_iid(self.id, iid)
-                self.mip_val &= ~mip_clr
-                if iid != 5:  # IRQ_S_TIMER: bump stimecmp
-                    return
-                stc, now = 0, 0
-                if "stimecmp" in self.csrs:
-                    stc = self._csr_read_raw("stimecmp")
-                if self._interrupt_ctrl:
-                    now = self._interrupt_ctrl.get_mtime()
-                if 0 < stc <= now:
-                    self._csr_write_raw("stimecmp", now + 4)
+        elif csr_name in ("stopei", "mtopei"):
+            self._write_topei(csr_name, val)
+        elif csr_name in ("stopi", "mtopi"):
+            self._write_topi(csr_name, val)
         else:
-            self._csr_write_raw(csr_name, val)
+            return False
+        return True
+
+    def _write_topei(self, csr_name: str, val: int) -> None:
+        """写入 stopei/mtopei: 按 AIA 规范 claim 指定的 IID."""
+        iid = (val >> 16) & 0x7FF
+        if iid == 0:
+            return
+        priv = "S" if csr_name == "stopei" else "M"
+        self._imsic.clear_ip_number(self.id, priv, iid)
+        # IPI IID 对应 MSIP/SSIP, 一并清除其挂起位 (与 _read_mtopei 同理).
+        self.mip_val &= ~(1 << iid)
+
+    def _write_topi(self, csr_name: str, val: int) -> None:
+        """写入 stopi/mtopi: 按 AIA 规范 claim 指定的 IID."""
+        iid = (val >> 16) & 0x7FF
+        if csr_name == "mtopi":
+            self._claim_mtopi(iid)
+        else:
+            self._claim_stopi(iid)
+
+    def _claim_mtopi(self, iid: int) -> None:
+        """claim mtopi; 定时器中断的 mtimecmp 已到期时推后 4 个周期."""
+        mip_clr = self._imsic.claim_mtopi_iid(self.id, iid)
+        self.mip_val &= ~mip_clr
+        if iid != 7 or self._interrupt_ctrl is None:  # IRQ_M_TIMER: bump mtimecmp
+            return
+        now = self._interrupt_ctrl.get_mtime()
+        mtc = self._interrupt_ctrl.get_mtimecmp(self.id)
+        if 0 < mtc <= now:
+            self._interrupt_ctrl.set_mtimecmp(self.id, now + 4)
+
+    def _claim_stopi(self, iid: int) -> None:
+        """claim stopi; 定时器中断的 stimecmp 已到期时推后 4 个周期."""
+        mip_clr = self._imsic.claim_stopi_iid(self.id, iid)
+        self.mip_val &= ~mip_clr
+        if iid != 5:  # IRQ_S_TIMER: bump stimecmp
+            return
+        stc, now = 0, 0
+        if "stimecmp" in self.csrs:
+            stc = self._csr_read_raw("stimecmp")
+        if self._interrupt_ctrl:
+            now = self._interrupt_ctrl.get_mtime()
+        if 0 < stc <= now:
+            self._csr_write_raw("stimecmp", now + 4)
 
     def read_gpr(self, reg_id: int) -> int:
         return self.gprs[reg_id & 0x1F]
@@ -826,8 +884,7 @@ class HartWithRegs:
     def _eval_stip(self, stimecmp_val: int) -> None:
         """Immediately re-evaluate mip.STIP after stimecmp write.
 
-        Python 步骤路径: 单线程执行期间 mtime 不会被并发推进, 共享 mtime 比较即等价于
-        QEMU riscv_timer_write_timecmp: 比较值已过去则置位, 比较值在未来则清除.
+        Python 步骤路径: 单线程执行期间 mtime 不会被并发推进
         Rust native 路径由 csr.rs 的 write_stimecmp 承担同一语义并按自身的指令计数
         设定 deadline. 该行为决定内核的 stopi 循环能否退出.
         """
@@ -1065,7 +1122,6 @@ class HartState(ctypes.Structure):
         ("mideleg", ctypes.c_uint64),
         # PC
         ("pc", ctypes.c_uint64),
-        # Reservation (LR/SC)
         ("reservation_addr", ctypes.c_uint64),
         ("reservation_value", ctypes.c_uint64),
         # Single-byte fields (packed after u64s)
@@ -1079,29 +1135,22 @@ class HartState(ctypes.Structure):
         ("mdid", ctypes.c_uint64),
         ("pmpsplit", ctypes.c_uint8),
         ("_pad", ctypes.c_uint8 * 7),
-        # ---- Phase B: TLB entries (array-of-structs, 32 × 2) ----
         ("itlb", TlbEntry * TLB_SIZE),
         ("dtlb", TlbEntry * TLB_SIZE),
-        # ---- Phase C: Extra CSRs ----
         ("mscratch", ctypes.c_uint64),
         ("sscratch", ctypes.c_uint64),
         ("mhartid", ctypes.c_uint64),
         ("mcounteren", ctypes.c_uint64),
         ("scounteren", ctypes.c_uint64),
-        # ---- Phase D: Sstc stimecmp ----
         ("stimecmp", ctypes.c_uint64),
-        # ---- Phase E: cache ----
         ("_mmu_mode_pad", ctypes.c_uint64),
-        # ---- Phase F: per-hart instruction counter ----
         ("total_instrs", ctypes.c_uint64),
-        # ---- Phase G: F/D floating point ----
         ("fprs", ctypes.c_uint64 * 32),
         ("fcsr", ctypes.c_uint32),
         ("_fpad", ctypes.c_uint8 * 4),
-        # ---- Phase H: AIA IMSIC register files ----
         ("imsic_m", ImsicFileC),
         ("imsic_s", ImsicFileC),
-        # ---- Phase I: per-hart one-shot timer deadlines (QEMU ACLINT 模型) ----
+        # per-hart one-shot timer deadlines
         # 写入 timecmp 时在"本 hart 指令计数空间"固定的截止点 (0 = 未设定).
         # 见 Rust write_mtimecmp/write_stimecmp + sync_mtip, 与 state.rs 同步.
         ("stip_deadline", ctypes.c_uint64),
@@ -1185,14 +1234,6 @@ def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
     state.mdid = hart.mdid_val
     state.pmpsplit = hart.pmpsplit_val
 
-    # ---- Phase B: TLB entries ----
-    # Skip TLB marshalling for now — Rust handles TLB internally during acceleration.
-    # Python TLB stays as ground truth; before each acceleration, Rust TLB is cold
-    # but refills from page walks.
-    # 同一原因使引擎的 TLB 计数也不写入: 它是引擎侧的累计值, 只能由引擎递增,
-    # 由 unmarshal_hart 读出作为调试器展示的取值.
-
-    # ---- Phase C: Extra CSRs ----
     state.mscratch = hart.csrs["mscratch"].val
     state.sscratch = hart.csrs["sscratch"].val
     state.mhartid = hart.csrs["mhartid"].val
@@ -1200,21 +1241,17 @@ def marshal_hart(hart: HartWithRegs, state: HartState) -> None:
     state.scounteren = hart.csrs["scounteren"].val if "scounteren" in hart.csrs else 0
     state.stimecmp = hart.csrs["stimecmp"].val if "stimecmp" in hart.csrs else 0
 
-    # ---- Phase I: one-shot timer deadlines (QEMU ACLINT 模型) ----
     # 直接拷贝而非经写入路径重算 — Rust 侧写路径 (write_stimecmp/write_mtimecmp)
     # 已在写入时刻固定 deadline, Python 侧步骤写入会经 _eval_stip 置 0 失效.
     state.stip_deadline = hart._stip_deadline
     state.mtip_deadline = hart._mtip_deadline
 
-    # ---- Phase F: per-hart instruction counter ----
     state.total_instrs = hart._total_instrs
 
-    # ---- Phase G: F/D floating point ----
     for i in range(32):
         state.fprs[i] = hart._fpr_bits[i]
     state.fcsr = hart.csrs["fcsr"].val & 0xFF
 
-    # ---- Phase H: AIA IMSIC state ----
     _marshal_imsic(hart, state)  # TEMP: isolate PMP regression
 
 
@@ -1253,7 +1290,6 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
     hart._mdid_val = state.mdid
     hart._pmpsplit_val = state.pmpsplit
 
-    # ---- Phase B: TLB — Rust TLB is cold after acceleration, don't write back ----
     # Python TLB is ground truth.
 
     # ---- 加速执行引擎的 TLB 计数 — 只读出, 由引擎自身累加 ----
@@ -1262,7 +1298,6 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
     hart._speedup_dtlb_hits = state.dtlb_hits
     hart._speedup_dtlb_misses = state.dtlb_misses
 
-    # ---- Phase C: Extra CSRs ----
     hart.csrs["mscratch"].val = state.mscratch
     hart.csrs["sscratch"].val = state.sscratch
     hart.csrs["mhartid"].val = state.mhartid
@@ -1271,23 +1306,18 @@ def unmarshal_hart(state: HartState, hart: HartWithRegs) -> None:
         hart.csrs["scounteren"].val = state.scounteren
     hart._csr_write_raw("stimecmp", state.stimecmp)
 
-    # ---- Phase I: one-shot timer deadlines (QEMU ACLINT 模型) ----
-    # 直接拷贝回 Python — 与 marshal 对称, 保证 FFI 往返精确 (Rust 侧写路径
-    # 已设定的 deadline 原样带回, 供下一次 batch 继续使用).
+    # 直接拷贝回 Python — 与 marshal 对称, 保证 FFI 往返精确
     hart._stip_deadline = state.stip_deadline
     hart._mtip_deadline = state.mtip_deadline
 
-    # ---- Phase F: per-hart instruction counter ----
     hart._total_instrs = state.total_instrs
 
-    # ---- Phase G: F/D floating point ----
     for i in range(32):
         hart._fpr_bits[i] = state.fprs[i]
     hart.csrs["fcsr"].val = state.fcsr & 0xFF
     hart.csrs["frm"].val = (state.fcsr >> 5) & 0x7
     hart.csrs["fflags"].val = state.fcsr & 0x1F
 
-    # ---- Phase H: AIA IMSIC state ----
     _unmarshal_imsic(hart, state)  # TEMP: isolate PMP regression
 
 

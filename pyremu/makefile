@@ -12,11 +12,32 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo 'FW_RESERVED_MEM_BASE = $(FW_RESERVED_MEM_BASE)' >> $@.tmp
 	@echo 'FW_RESERVED_MEM_SIZE = $(FW_RESERVED_MEM_SIZE)' >> $@.tmp
 	@echo '' >> $@.tmp
+	@echo '# platform layout' >> $@.tmp
+	@echo 'NUM_HARTS = $(NUM_HARTS)' >> $@.tmp
+	@echo 'RAM_BASE = $(RAM_BASE)' >> $@.tmp
+	@echo 'RAM_SIZE = $(RAM_SIZE)' >> $@.tmp
+	@echo 'PROG_CNT = $(PROG_CNT)' >> $@.tmp
+	@echo 'L2_SIZE = $(L2_SIZE)' >> $@.tmp
+	@echo 'ISA = "$(ISA)"' >> $@.tmp
+	@echo 'UART_BASE = $(UART_BASE)' >> $@.tmp
+	@echo 'SPI_BASE = $(SPI_BASE)' >> $@.tmp
+	@echo 'I2C_BASE = $(I2C_BASE)' >> $@.tmp
+	@echo 'GPIO_BASE = $(GPIO_BASE)' >> $@.tmp
+	@echo 'CLINT_BASE = $(CLINT_BASE)' >> $@.tmp
+	@echo 'PLIC_BASE = $(PLIC_BASE)' >> $@.tmp
+	@echo 'WATCHDOG_BASE = $(WATCHDOG_BASE)' >> $@.tmp
+	@echo 'CRNG_BASE = $(CRNG_BASE)' >> $@.tmp
+	@echo 'VIRTIO_BLK_BASE = $(VIRTIO_BLK_BASE)' >> $@.tmp
+	@echo 'VIRTIO_NET_S_BASE = $(VIRTIO_NET_S_BASE)' >> $@.tmp
+	@echo 'VIRTIO_NET_M_BASE = $(VIRTIO_NET_M_BASE)' >> $@.tmp
+	@echo '' >> $@.tmp
 	@echo '# arguments for emulator' >> $@.tmp
 	@echo 'TLB_ENTRIES = $(TLB_ENTRIES)' >> $@.tmp
 	@echo 'PMP_ENTRIES = $(PMP_ENTRIES)' >> $@.tmp
 # mcycle 计数频率
 	@echo 'CPU_FREQ_HZ = $(CPU_FREQ_HZ)' >> $@.tmp
+# 时钟源频率
+	@echo 'TIMER_FREQ = $(TIMER_FREQ)' >> $@.tmp
 	@echo 'DEFAULT_TIMEOUT = $(DEFAULT_TIMEOUT)' >> $@.tmp
 	@echo 'WFI_MAX_SLEEP = $(WFI_MAX_SLEEP)' >> $@.tmp
 	@echo 'VIRTIO_PROCESS_BATCH = $(VIRTIO_PROCESS_BATCH)' >> $@.tmp
