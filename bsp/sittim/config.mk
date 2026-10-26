@@ -5,7 +5,7 @@
 # 时钟源频率 (Hz). 模拟器按该频率推进 mtime, DTB 的 timebase-frequency 取同一值.
 TIMER_FREQ ?= 100000
 # 调度定时器的中断频率 (Hz), 即调度所依赖的最小触发频率. 运行时每 TIMER_FREQ / SCHED_FREQ
-# 个时钟源计数请求一次中断; 定时等待的截止时刻更早时, 中断随该时刻提前到来.
+# 个时钟源计数请求一次中断.
 SCHED_FREQ ?= 1000
 
 
@@ -39,9 +39,10 @@ LINK_BASE ?= 0x0             # PIE: 链接基址为 0, 运行时重定位修正
 
 ## VA mem layout
 # 飞地运行时的虚拟地址空间分区. 各项之间存在约束, 改动须整组核对:
-#   - 模块窗口基址高于管理器窗口基址. ecall_aux::va_to_pa 按该顺序判定分支,
-#     模块地址若低于管理器窗口基址, 会被按管理器窗口的偏移换算而得到错误的物理地址;
-#   - 线性窗口与上述两个窗口互不重叠. 它把物理区间
+#   - 扩展模块虚拟地址空间基址高于管理器虚拟地址空间基址. ecall_aux::va_to_pa 按该顺序
+#     判定分支, 模块地址若低于管理器虚拟地址空间基址, 会被按管理器虚拟地址空间的偏移
+#     换算而得到错误的物理地址;
+#   - 线性窗口与上述两个虚拟地址空间互不重叠. 它把物理区间
 #     [LINEAR_MAP_START, LINEAR_MAP_START + LINEAR_MAP_SIZE) 映射到 LINEAR_MAP_OFFSET
 #     起的同一段 VA 区间;
 #   - U 模式区自 1 GiB 起向高地址排列: 堆自 UMODE_HEAP_START_ALIGNED 向上增长,
@@ -49,8 +50,9 @@ LINK_BASE ?= 0x0             # PIE: 链接基址为 0, 运行时重定位修正
 ENCLAVE_MAN_VA_START        ?= 0xFFFF_FFE0_0000_0000
 ENCLAVE_MODULE_LOAD_VA_INIT ?= 0xFFFF_FFF0_0000_0000
 
-# 模块窗口可交付的 VA 上界与基址之差. 该值约束窗口内能容纳多少个 2 MiB 分区,
-ENCLAVE_MODULE_WINDOW_SIZE  ?= 0x400_0000
+# 全部扩展模块共用的虚拟地址空间(virtual address space, VAS)的大小, 即可交付的 VA 上界
+# 与基址之差. 该值约束其中能容纳多少个 2 MiB 分区,
+EXT_MODS_VAS_SIZE           ?= 0x400_0000
 
 LINEAR_MAP_START  ?= 0x1_4000_0000
 LINEAR_MAP_SIZE   ?= 0x3_4000_0000
@@ -58,7 +60,6 @@ LINEAR_MAP_OFFSET ?= 0xFFFF_FFC0_0000_0000
 
 UMODE_HEAP_START_ALIGNED ?= 0x1_0000_0000
 UMODE_STACK_TOP_VA ?= 0x1_4000_0000
-
 # mmap 匿名映射起始 VA, 自此处向高地址增长, 避开堆与栈.
 UMODE_MMAP_BASE ?= 0x2_0000_0000
 

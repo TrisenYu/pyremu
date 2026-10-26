@@ -857,7 +857,7 @@ class TestDescriptorChainBounds:
 
     @staticmethod
     def _new_queue(mem_read, mem_write, num: int = 8) -> VirtQueue:
-        queue = VirtQueue(index=0, num_max=num, mem_read=mem_read, mem_write=mem_write)
+        queue = VirtQueue(index=0, num_max=num, read_fn=mem_read, write_fn=mem_write)
         queue.desc = _make_gpa(0x1000)
         return queue
 

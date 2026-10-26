@@ -4,20 +4,21 @@
 
 """测试 pyremu.debug.reg — GPR/CSR 读写命令."""
 
+from rich.console import Console
+
 from pyremu.core.registers import gpr_alias
-from pyremu.debug.reg import RegisterMixin
+from pyremu.debug.reg import RegisterOps
 from pyremu.emulator import Emulator
 
 # ============================================================
-#  Mini 测试类: RegisterMixin + 必要属性
+#  Mini 测试类: RegisterOps + 必要属性
 # ============================================================
 
 
-class _TestRegDbg(RegisterMixin):
-    """最小聚合类供 RegisterMixin 命令测试."""
+class _TestRegDbg(RegisterOps):
+    """最小聚合类供 RegisterOps 命令测试."""
 
     def __init__(self, emu, hart_id=0):
-        from rich.console import Console
         self._emu = emu
         self._hart_id = hart_id
         self._console = Console(highlight=False)
@@ -67,11 +68,38 @@ class TestFindGpr:
     def test_find_all_abi_names(self):
         dbg = _make_tdbg()
         aliases = [
-            "zero", "ra", "sp", "gp", "tp",
-            "t0", "t1", "t2", "t3", "t4", "t5", "t6",
-            "s0", "s1", "s2", "s3", "s4", "s5", "s6",
-            "s7", "s8", "s9", "s10", "s11",
-            "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+            "zero",
+            "ra",
+            "sp",
+            "gp",
+            "tp",
+            "t0",
+            "t1",
+            "t2",
+            "t3",
+            "t4",
+            "t5",
+            "t6",
+            "s0",
+            "s1",
+            "s2",
+            "s3",
+            "s4",
+            "s5",
+            "s6",
+            "s7",
+            "s8",
+            "s9",
+            "s10",
+            "s11",
+            "a0",
+            "a1",
+            "a2",
+            "a3",
+            "a4",
+            "a5",
+            "a6",
+            "a7",
         ]
         for alias in aliases:
             idx = dbg._find_gpr(alias)

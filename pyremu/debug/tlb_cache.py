@@ -3,7 +3,7 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""TlbCacheMixin — TLB 与 L2 缓存的状态显示和刷新.
+"""TlbCacheOps — TLB 与 L2 缓存的状态显示和刷新.
 
 依赖 DebuggerBase.
 """
@@ -12,14 +12,14 @@ from collections import Counter
 
 from rich.table import Table
 
-from pyremu.debug._attrs import SharedMixinAttrs
+from pyremu.debug.attrs import SharedAttrs
 from pyremu.debug.utils import check_rv64_addr
 from pyremu.memory.l2cache import L2Cache
 from pyremu.memory.tlb import decode_tlb_perm
 from pyremu.utils.wrapper import seize_val_err
 
 
-class TlbCacheMixin(SharedMixinAttrs):
+class TlbCacheOps(SharedAttrs):
     """TLB 和 L2 缓存显示."""
 
     _DEFAULT_TLB_LINES = 32
@@ -57,9 +57,7 @@ class TlbCacheMixin(SharedMixinAttrs):
         engine_total = engine_hits + engine_misses
 
         self._console.print(f"[bold]{name}[/]: {len(tlb)}/{tlb.size} entries")
-        self._console.print(
-            "  " + self._fmt_tlb_counters(engine_hits, engine_misses)
-        )
+        self._console.print("  " + self._fmt_tlb_counters(engine_hits, engine_misses))
         return engine_total
 
     def _show_tlb(
@@ -288,11 +286,10 @@ class TlbCacheMixin(SharedMixinAttrs):
             return
 
         entries, ways, num_sets = l2.entries, l2.ways, l2.num_sets
-        err, target_set, target_way, range_start, range_end = self._parse_cache_args(
-            arg, num_sets, ways
-        )
-        if err:
+        scope = self._cache_scope(arg, num_sets, ways)
+        if scope is None:
             return
+        limit = scope[3]
 
         mesi_counts: Counter[str] = Counter()
         valid_count, dirty_count = 0, 0
@@ -316,21 +313,46 @@ class TlbCacheMixin(SharedMixinAttrs):
             )
         )
 
-        set_range: range | list[int] = range(num_sets)
-        full_dump = False
-        limit: int | None = self._DEFAULT_CACHE_LINES
-        if range_start is not None and range_end is not None:
-            set_range = range(range_start, range_end + 1)
-            full_dump = False
-            limit = None
-        elif target_set is not None:
-            set_range = [target_set]
-            full_dump = True
-            limit = None
-
-        lines: list[str] = []
+        lines = self._collect_cache_lines(entries, ways, scope)
         # 判定用 None 比较: *limit* 为 None 表示不限制行数.
-        checker = lambda: limit is not None and len(lines) >= limit
+        if limit is not None and len(lines) >= limit and valid_count > len(lines):
+            lines.append(
+                f"[dim]... 还有 {valid_count - len(lines)} 条 valid 行, "
+                f"用 'cache <start>-<end>' 查看范围[/]"
+            )
+        header += "\n" + "\n".join(lines) if lines else "\n[dim](无 valid 行)[/]"
+        self._console.print(header)
+
+    def _cache_scope(
+        self,
+        arg: str | None,
+        num_sets: int,
+        ways: int,
+    ) -> tuple[range | list[int], int | None, bool, int | None] | None:
+        """解析参数并给出 (待遍历的 set, 目标 way, 是否完整转储, 行数上限).
+
+        参数非法时报告错误并返回 None.
+        """
+        err, target_set, target_way, range_start, range_end = self._parse_cache_args(
+            arg, num_sets, ways
+        )
+        if err:
+            return None
+        if range_start is not None and range_end is not None:
+            return range(range_start, range_end + 1), target_way, False, None
+        if target_set is not None:
+            return [target_set], target_way, True, None
+        return range(num_sets), target_way, False, self._DEFAULT_CACHE_LINES
+
+    def _collect_cache_lines(
+        self,
+        entries,
+        ways: int,
+        scope: tuple[range | list[int], int | None, bool, int | None],
+    ) -> list[str]:
+        """按 scope 给出的 set/way 与行数上限收集已格式化的 valid 行."""
+        set_range, target_way, full_dump, limit = scope
+        lines: list[str] = []
         for set_idx in set_range:
             for way_idx in range(ways):
                 if target_way is not None and way_idx != target_way:
@@ -339,15 +361,7 @@ class TlbCacheMixin(SharedMixinAttrs):
                 if not e.valid:
                     continue
                 lines.append(self._fmt_cache_line(e, set_idx, way_idx, full_dump))
-                if checker():
-                    break
-            if checker():
-                break
-
-        if checker() and valid_count > len(lines):
-            lines.append(
-                f"[dim]... 还有 {valid_count - len(lines)} 条 valid 行, "
-                f"用 'cache <start>-<end>' 查看范围[/]"
-            )
-        header += "\n" + "\n".join(lines) if lines else "\n[dim](无 valid 行)[/]"
-        self._console.print(header)
+                # 判定用 None 比较: *limit* 为 None 表示不限制行数.
+                if limit is not None and len(lines) >= limit:
+                    return lines
+        return lines

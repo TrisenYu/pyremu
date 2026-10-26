@@ -48,7 +48,7 @@ class InterruptMode(Enum):
 
 @dataclass
 class PeripheralConfig:
-    """外设 MMIO 基址 (0 = 禁用). 默认值由 emu-configs.mk 生成并注入 configs_gen."""
+    """外设 MMIO 基址 (0 = 禁用). 默认值由 mk/ 下的配置分片生成并注入 configs_gen."""
 
     uart_base: int = configs_gen.UART_BASE
     spi_base: int = configs_gen.SPI_BASE
@@ -61,7 +61,7 @@ class PeripheralConfig:
     virtio_net_m_base: int = configs_gen.VIRTIO_NET_M_BASE  # 飞地侧网卡, 中断由 M 模式接受
     watchdog_base: int = configs_gen.WATCHDOG_BASE
     crng_base: int = configs_gen.CRNG_BASE  # 模拟随机数生成器，0 = 禁用
-    # AIA 设备的基址由 emu-configs.mk 给出; legacy 模式不注册这些设备.
+    # AIA 设备的基址由 mk/interrupt.mk 给出; legacy 模式不注册这些设备.
     imsic_m_base: int = configs_gen.IMSIC_M_BASE
     imsic_s_base: int = configs_gen.IMSIC_S_BASE
     aplic_s_base: int = configs_gen.APLIC_S_BASE
@@ -76,6 +76,8 @@ class PlatformConfig:
         num_harts: hart 数量 (1-8).
         ram_size: 物理 RAM 大小 (字节).
         ram_base: 物理 RAM 起始地址.
+        rom_base: 引导只读存储器起始地址; 取 0 表示不注册该设备.
+        rom_size: 引导只读存储器大小 (字节).
         prog_cnt: 程序计数器 — 上电复位入口地址.
         l2_size: L2 缓存大小 (字节).
         isa: RISC-V ISA 字符串 (例: ``'rv64ima'``).
@@ -86,6 +88,8 @@ class PlatformConfig:
     num_harts: int = configs_gen.NUM_HARTS
     ram_size: int = configs_gen.RAM_SIZE
     ram_base: int = configs_gen.RAM_BASE
+    rom_base: int = configs_gen.ROM_BASE
+    rom_size: int = configs_gen.ROM_SIZE
     prog_cnt: int = configs_gen.PROG_CNT
     l2_size: int = configs_gen.L2_SIZE
 
@@ -96,7 +100,7 @@ class PlatformConfig:
     disk_image: str | None = None
 
     # DTB /reserved-memory no-map 区域列表 (base, size).
-    # 默认值由 emu-configs.mk 生成 pyremu/configs_gen.py 注入. 第一项为固件
+    # 默认值经 mk/memory.mk 生成 pyremu/configs_gen.py 注入. 第一项为固件
     # 映像保留区 (含内嵌的 .sittim 飞地运行时), 第二项为飞地内存池, 后者需与
     # custom-opensbi Kconfig POOL_BASE/POOL_SIZE 保持同步. 单边修改会导致内核
     # 在保留区内分配页面, 与固件访问产生冲突.
@@ -112,7 +116,7 @@ class PlatformConfig:
     def __post_init__(self) -> None:
         """编译期 AIA 开关: PYREMU_AIA=1 时强制启用 IMSIC+APLIC.
 
-        基址从 configs_gen (由 emu-configs.mk 生成) 读取. 仅在 legacy 模式下
+        基址从 configs_gen (由 mk/interrupt.mk 生成) 读取. 仅在 legacy 模式下
         覆盖, 显式指定 AIA 的预设不受影响. 任何构造路径
         (预设工厂 / from_dict / 直接实例化) 均经由此处统一解析, 故 Emulator
         无需再对 interrupt_mode 做二次判断.
@@ -125,6 +129,15 @@ class PlatformConfig:
             self.periph.aplic_m_base = configs_gen.APLIC_M_BASE
         # 低于 1000 Hz 时 1 ms 内不足一个计数, 固件无法按毫秒配置定时器.
         assert self.timebase_freq >= 1_000, f"timebase_freq={self.timebase_freq} < 1000 Hz!"
+        # 引导只读存储器与 RAM 的窗口不允许重叠: 同一物理地址只能有一条访问路径.
+        if self.rom_base:
+            assert self.rom_size > 0, f"rom_size={self.rom_size} 须大于 0"
+            rom_end = self.rom_base + self.rom_size
+            ram_end = self.ram_base + self.ram_size
+            assert rom_end <= self.ram_base or self.rom_base >= ram_end, (
+                f"引导只读存储器 [0x{self.rom_base:x}, 0x{rom_end:x}) "
+                f"与 RAM 窗口 [0x{self.ram_base:x}, 0x{ram_end:x}) 重叠"
+            )
 
     @classmethod
     def from_dict(
@@ -197,7 +210,7 @@ class PlatformConfig:
 
     @classmethod
     def qemu_virt(cls) -> PlatformConfig:
-        """QEMU RISC-V virt 风格布局; 各字段取 emu-configs.mk 给出的平台默认值."""
+        """QEMU RISC-V virt 风格布局; 各字段取 mk/ 下配置分片给出的平台默认值."""
         return cls()
 
     @classmethod
@@ -224,7 +237,7 @@ class PlatformConfig:
     def qemu_virt_aia(cls) -> PlatformConfig:
         """QEMU virt AIA 平台 — 使用 IMSIC+APLIC 替代 PLIC.
 
-        IMSIC 与 APLIC 的基址由 emu-configs.mk 给出, 默认取 AIA 标准布局:
+        IMSIC 与 APLIC 的基址由 mk/interrupt.mk 给出, 默认取 AIA 标准布局:
         IMSIC M 文件 0x2400_0000, S 文件 0x2800_0000, 每 hart stride 0x1000;
         APLIC S 域 0x0C00_0000 (复用 PLIC 地址空间), M 域 0x0C00_8000
         (S 域实例的 MMIO 覆盖为 0x6000).

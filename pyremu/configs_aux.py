@@ -86,19 +86,14 @@ def force_config(name: str, value: object) -> Iterator[None]:
     finally:
         setattr(configs_gen, name, old)
 
+
 # ---- 构建产物路径 ----
 # partial 以位置参数预绑定 path_join 的 dir_path: 无参调用返回目录
 # Path, 传 *name* 返回目录内文件 Path (path_join 的 name 有默认值).
 
-firmware_dir = partial(
-    path_join,
-    getattr(configs_gen, "FIRM_DIR", "build/firm-bin")
-)
+firmware_dir = partial(path_join, getattr(configs_gen, "FIRM_DIR", "build/firm-bin"))
 
-elf_dir = partial(
-    path_join,
-    getattr(configs_gen, "ELF_DIR", "build/elf")
-)
+elf_dir = partial(path_join, getattr(configs_gen, "ELF_DIR", "build/elf"))
 
 examed_elf_dir = partial(
     path_join,

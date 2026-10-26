@@ -57,7 +57,9 @@ static const uint64_t sha512_k[80] = {
 	0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
 	0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817};
 
-static inline uint64_t rotate_r(uint64_t x, int d) {
+static inline uint64_t rotate_r(
+	uint64_t x,
+	int d) {
 	return (x >> d) | (x << (64 - d));
 }
 
@@ -77,11 +79,17 @@ static inline uint64_t s1(uint64_t b) {
 	return rotate_r(b, 19) ^ rotate_r(b, 61) ^ b >> 6;
 }
 
-static inline uint64_t ch(uint64_t h4, uint64_t h5, uint64_t h6) {
+static inline uint64_t ch(
+	uint64_t h4,
+	uint64_t h5,
+	uint64_t h6) {
 	return h6 ^ (h4 & (h6 ^ h5));
 }
 
-static inline uint64_t maj(uint64_t h1, uint64_t h2, uint64_t h3) {
+static inline uint64_t maj(
+	uint64_t h1,
+	uint64_t h2,
+	uint64_t h3) {
 	return (h1 & h2) ^ (h3 & (h1 ^ h2));
 }
 
@@ -141,7 +149,10 @@ void sha512_init(struct sha512_ctx_t *ctx) {
 	memset(ctx->block, 0, sizeof(ctx->block));
 }
 
-void sha512_update(struct sha512_ctx_t *ctx, const unsigned char *data, uint64_t bytes) {
+void sha512_update(
+	struct sha512_ctx_t *ctx,
+	const unsigned char *data,
+	uint64_t bytes) {
 	assert(ctx->nbytes < 1ull << 56);
 	assert(bytes < 1ull << 56);
 
@@ -164,7 +175,9 @@ void sha512_update(struct sha512_ctx_t *ctx, const unsigned char *data, uint64_t
 	assert(ctx->nbytes < 1ull << 56);
 }
 
-void sha512_final(struct sha512_ctx_t *ctx, uint8_t result[64]) {
+void sha512_final(
+	struct sha512_ctx_t *ctx,
+	uint8_t result[64]) {
 	uint64_t fill	   = ctx->nbytes % 128, i;
 	ctx->block[fill++] = 0x80;
 	if (fill > 112) {

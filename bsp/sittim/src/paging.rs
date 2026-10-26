@@ -415,7 +415,7 @@ fn walk_page_table(va: u64) -> WalkResult {
 
 /// VA -> PA。未映射或 VA 不取规范形式时返回 None。
 ///
-/// 供无法用固定偏移换算的映射使用: 模块窗口的物理地址分散, 各块由独立一次向
+/// 供无法用固定偏移换算的映射使用: 扩展模块虚拟地址空间的物理地址分散, 各块由独立一次向
 /// M 模式申请取得, 块间不保证连续, 只能按页表查询。
 pub fn get_pa(va: u64) -> Option<u64> {
 	let r = walk_page_table(va);

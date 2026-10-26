@@ -3,9 +3,9 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""ExecutionMixin — 指令执行、快照回滚、写监控、运行循环.
+"""ExecutionOps — 指令执行、快照回滚、写监控、运行循环.
 
-依赖 DebuggerBase + MemoryMixin._try_read_va + future BreakpointMixin.
+依赖 DebuggerBase + MemoryOps._try_read_va + future BreakpointOps.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from pyremu.debug.types import (
         Breakpoint,
+        LoadedImage,
         MemoryChange,
         StackFrame,
     )
@@ -31,8 +32,8 @@ from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.trap_def import TrapType
 from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap
-from pyremu.debug._attrs import SharedMixinAttrs
-from pyremu.debug.types import HartSnapshot, MemWriteTracker
+from pyremu.debug.attrs import SharedAttrs
+from pyremu.debug.types import HartSnapshot, ImageKind, MemWriteTracker
 from pyremu.debug.utils import hex_addr, read_code_bytes
 from pyremu.emulator import Emulator, RunStopReason, TimeoutError
 from pyremu.env_inject import Preloader
@@ -40,10 +41,10 @@ from pyremu.utils.mask import mask64
 from pyremu.utils.parse_bin import FirmwareImage
 
 
-class ExecutionMixin(SharedMixinAttrs):
+class ExecutionOps(SharedAttrs):
     """指令执行、快照回滚、运行循环."""
 
-    # Cross-mixin attributes provided by DebuggerBase / other mixins
+    # 跨操作类属性, 由 DebuggerBase 与其余操作类提供
     # (hart 为 @property 提供, __getattr__ 解析)
     _emu: Emulator
     _console: Console
@@ -73,9 +74,7 @@ class ExecutionMixin(SharedMixinAttrs):
     _current_frame_idx: int
     _last_command: str | None
     _fdt_addr: int | None
-    _kernel_path: str | None
-    _kernel_addr: int
-    _preload_path: str | None
+    _bins_images: dict[ImageKind, LoadedImage]
 
     # ----------------------------------------------------------
     #  快照 & 回滚
@@ -231,7 +230,7 @@ class ExecutionMixin(SharedMixinAttrs):
 
         Args:
             timeout: 时钟源超时秒数
-            默认取 emu-configs.mk 的 DEFAULT_TIMEOUT 设为 0 禁用.
+            默认取 mk/emu-feats.mk 的 DEFAULT_TIMEOUT, 设为 0 禁用.
         """
         self._running = True
         self._terminated = False
@@ -459,12 +458,16 @@ class ExecutionMixin(SharedMixinAttrs):
             _dtb_addr = emu._cfg.ram_base + emu._cfg.ram_size - 0x10000
             emu.load_dtb(_dtb_addr)
 
-        if self._kernel_path:
-            kernel_data = Path(self._kernel_path).read_bytes()
-            emu.bus.write_ram_direct(self._kernel_addr, kernel_data)
+        kernel_image = self._bins_images.get(ImageKind.KERNEL)
+        if kernel_image is not None:
+            kernel_data = Path(kernel_image.path).read_bytes()
+            emu.bus.write_ram_direct(kernel_image.start, kernel_data)
 
-        if self._preload_path:
-            preload_entry = Preloader(emu).inject_file(self._preload_path)
+        preload_image = self._bins_images.get(ImageKind.PRELOAD)
+        if preload_image is not None:
+            preload_entry = Preloader(emu).inject_file(
+                preload_image.path, addr=preload_image.start
+            )
             for h in emu.harts:
                 h.csrs["misa"].val = (2 << 62) | (1 << 18) | (1 << 20)  # MXL=RV64 + S + U
                 h.csrs["mscratch"].val = cfg.ram_base + cfg.ram_size - 0x100000

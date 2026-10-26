@@ -42,15 +42,16 @@ struct tee_ext_mod_table {
 /* 以 *dir* 为模块目录填写 *table*, 返回登记的模块数. 各项的路径由 *dir* 与编译期登记
  * 的映像文件名拼接得到; 拼接结果超出 TEE_EXT_MOD_PATH_MAX 时返回 -ENAMETOOLONG, 不做
  * 部分登记. 本函数不访问映像文件. */
-int tee_ext_mod_table_init(struct tee_ext_mod_table *table, const char *dir);
+int tee_ext_mod_table_init(
+	struct tee_ext_mod_table *table,
+	const char *dir);
 
 /* 服务一次挂起的模块请求. 返回 1 表示已应答一项请求, 0 表示当前无挂起请求,
  * 负 errno 表示调用期失败. */
 int tee_ext_mod_serve(
 	int fd,
-    const struct tee_ext_mod_table *table,
-    uint64_t enclave_id,
-    uint64_t token
-);
+	const struct tee_ext_mod_table *table,
+	uint64_t enclave_id,
+	uint64_t token);
 
 #endif /* TEE_EXT_MOD_SVC_H */

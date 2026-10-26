@@ -3,7 +3,7 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""StatusMixin — Hart 状态、CSR Bitfield 显示.
+"""StatusOps — Hart 状态、CSR Bitfield 显示.
 
 依赖 DebuggerBase.
 """
@@ -11,7 +11,7 @@
 from rich.table import Table
 
 from pyremu.core.trap_def import trap_cause_name
-from pyremu.debug._attrs import SharedMixinAttrs
+from pyremu.debug.attrs import SharedAttrs
 from pyremu.debug.utils import (
     EXC_NAMES,
     fmt_instr_count,
@@ -21,7 +21,7 @@ from pyremu.debug.utils import (
 )
 
 
-class StatusMixin(SharedMixinAttrs):
+class StatusOps(SharedAttrs):
     """状态和 CSR bitfield 命令."""
 
     # ----------------------------------------------------------
@@ -148,14 +148,10 @@ class StatusMixin(SharedMixinAttrs):
     # ----------------------------------------------------------
 
     def cmd_medeleg(self) -> None:
-        self._show_deleg(
-            "medeleg", self.hart.csrs["medeleg"].val, EXC_NAMES
-        )
+        self._show_deleg("medeleg", self.hart.csrs["medeleg"].val, EXC_NAMES)
 
     def cmd_mideleg(self) -> None:
-        self._show_deleg(
-            "mideleg", self.hart.csrs["mideleg"].val, IRQ_NAMES
-        )
+        self._show_deleg("mideleg", self.hart.csrs["mideleg"].val, IRQ_NAMES)
 
     def _show_deleg(self, name: str, v: int, names: dict[int, str]) -> None:
         tbl = Table(
@@ -174,7 +170,7 @@ class StatusMixin(SharedMixinAttrs):
         self._console.print(tbl)
 
     # ----------------------------------------------------------
-    #  status (概览 / 详情)
+    #  status 命令: 概览与详情
     # ----------------------------------------------------------
 
     def cmd_status(self, hart_id_str: str | None = None) -> None:
@@ -213,7 +209,7 @@ class StatusMixin(SharedMixinAttrs):
             if h._halted:
                 state = "[red]halted[/]"
             elif h._waiting:
-                state = "[dim]pending[/]" # waiting 也行
+                state = "[dim]pending[/]"  # waiting 也行
             else:
                 state = "[green]running[/]"
             # Per-hart instruction count — WFI-waiting harts don't
@@ -221,8 +217,12 @@ class StatusMixin(SharedMixinAttrs):
             # harts advance.
             instr_fmt = fmt_instr_count(h._total_instrs)
             tbl.add_row(
-                mark, str(h.id), hex_addr(h.pc),
-                h.mode.name, state, instr_fmt,
+                mark,
+                str(h.id),
+                hex_addr(h.pc),
+                h.mode.name,
+                state,
+                instr_fmt,
             )
         self._console.print(tbl)
 

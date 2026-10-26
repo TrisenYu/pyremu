@@ -1,4 +1,4 @@
-//! Device MMIO helpers and inline handlers.
+//! 设备 MMIO 辅助函数与对应处理函数.
 
 pub mod plic;
 pub mod uart;
@@ -7,25 +7,25 @@ pub mod virtio;
 use crate::ffi::FfiPlicCtx;
 use crate::ffi::FfiVirtIoCtx;
 
-/// Device MMIO address ranges (base + end per device).
+/// 设备 MMIO 地址区间。 ``bases[i]`` 与 ``ends[i]`` 记录第 i 个设备的起始与结束地址.
 pub struct DevCtx {
 	pub bases: *const u64,
 	pub ends: *const u64,
 	pub num: u8,
-	/// virtio-blk MMIO base address (0 = no virtio device).
+	/// virtio-blk 的 MMIO 基址; 为 0 时不注册 virtio 设备.
 	pub virtio_base: u64,
-	/// Mutable pointer to the FFI virtio-blk state that Rust updates inline.
-	/// Valid for the duration of one ``run_parallel`` call.
+	/// 指向 FFI virtio-blk 状态的可变指针.
+	/// 用于更新虚拟块设备状态.
 	pub virtio_raw: *mut FfiVirtIoCtx,
-	/// Mutable pointer to the FFI PLIC state that Rust updates inline
-	/// (claim/complete/priority/enable/threshold).  Null = no PLIC present.
-	/// Valid for the duration of one ``run_parallel`` call.
+	/// FFI PLIC 状态的可变指针, 用于更新 claim、complete、
+	/// 优先级、使能与阈值. 空指针表示无 PLIC 设备, 仅在单次 ``run_parallel``
+	/// 调用期间有效.
 	pub plic: *mut FfiPlicCtx,
 }
 
 impl DevCtx {
-	/// 检查是否有设备将工作延迟到 Python 侧处理 (如 virtio QueueNotify
-	/// 仅设 notify_pending=1, 实际 virtqueue 处理在退出后进行)。
+	/// 判定是否有设备把工作延迟到 Python 侧处理: QueueNotify 只置位
+	/// ``notify_pending``, 虚拟队列的处理在 MMIO 退出后进行.
 	pub fn has_pending_python_work(&self) -> bool {
 		if self.virtio_raw.is_null() {
 			return false;

@@ -4,7 +4,9 @@
 
 """测试 pyremu.debug.status — Hart 状态/CSR Bitfield."""
 
-from pyremu.debug.status import StatusMixin
+from rich.console import Console
+
+from pyremu.debug.status import StatusOps
 from pyremu.emulator import Emulator
 
 # ============================================================
@@ -12,11 +14,10 @@ from pyremu.emulator import Emulator
 # ============================================================
 
 
-class _TestStatusDbg(StatusMixin):
-    """最小聚合类供 StatusMixin 测试."""
+class _TestStatusDbg(StatusOps):
+    """最小聚合类供 StatusOps 测试."""
 
     def __init__(self, emu, hart_id=0):
-        from rich.console import Console
         self._emu = emu
         self._hart_id = hart_id
         self._console = Console(highlight=False)
@@ -104,7 +105,7 @@ class TestCmdStvec:
 class TestCmdMip:
     def test_shows_bits(self):
         dbg = _make_sdbg()
-        dbg.hart.csrs["mip"].val = (1 << 7)  # MTIP
+        dbg.hart.csrs["mip"].val = 1 << 7  # MTIP
         dbg.cmd_mip()
 
 
@@ -134,14 +135,14 @@ class TestCmdSie:
 class TestCmdMedeleg:
     def test_shows_delegation(self):
         dbg = _make_sdbg()
-        dbg.hart.csrs["medeleg"].val = (1 << 8)  # Ecall from U
+        dbg.hart.csrs["medeleg"].val = 1 << 8  # Ecall from U
         dbg.cmd_medeleg()
 
 
 class TestCmdMideleg:
     def test_shows_delegation(self):
         dbg = _make_sdbg()
-        dbg.hart.csrs["mideleg"].val = (1 << 5)  # STIP
+        dbg.hart.csrs["mideleg"].val = 1 << 5  # STIP
         dbg.cmd_mideleg()
 
 

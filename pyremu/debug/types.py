@@ -3,9 +3,13 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""调试器数据类型 — 快照、内存变更、栈帧、断点."""
+"""调试器数据类型 — 快照、内存变更、栈帧、断点、trap 入口."""
 
 from dataclasses import dataclass
+from enum import Enum
+from typing import NamedTuple
+
+from pyremu.core.hart import RiscvMode
 
 
 @dataclass
@@ -64,6 +68,51 @@ class StackFrame:
     pc: int  # call site = ra - 4 (若 ra >= 4)
     note: str = ""  # 非空表示特殊帧 (如 "U->S trap", "S->M ecall")
     mode: str = ""  # "M" / "S" / "U" — 用于颜色渲染
+
+
+class TrapEntry(NamedTuple):
+    """trap 入口的一组参数."""
+
+    tvec: int
+    trapped_pc: int
+    prev_mode: RiscvMode
+
+
+class ImageKind(Enum):
+    """命令行映像的角色.
+
+    取值依次为显示名与对应命令行参数.
+    """
+
+    FIRMWARE = ("firmware", "firmware")
+    PRELOAD = ("zsbl", "--preload")
+    KERNEL = ("kernel image", "--kernel")
+    INITRD = ("initramfs", "--initrd")
+    FDT = ("fdt", "--fdt-file")
+
+    @property
+    def label(self) -> str:
+        return self.value[0]
+
+    @property
+    def option(self) -> str:
+        return self.value[1]
+
+
+@dataclass(frozen=True)
+class LoadedImage:
+    """经命令行装入调试器的一个映像.
+
+    *start* 为装入后的物理起始地址, *size* 为装入的字节数.
+    """
+
+    path: str
+    start: int
+    size: int
+
+    @property
+    def end(self) -> int:
+        return self.start + self.size
 
 
 @dataclass

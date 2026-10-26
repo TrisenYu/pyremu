@@ -4,7 +4,8 @@
 执行次序给出启动期间的必要过程. 
 
 地址以默认配置为准: `ram_base = 0x8000_0000`,
-`ram_size = 128 MiB`, 固件映像保留区为 `[0x8000_0000, 0x8040_0000)`.
+`ram_size = 128 MiB`, 固件映像保留区为 `[0x8000_0000, 0x8040_0000)`,
+引导只读存储器为 `[0x4000_0000, 0x4002_0000)`.
 
 ## 一、模拟器初始化与上电
 
@@ -17,21 +18,26 @@
    `Bus.apply_pie_ofs()` 登记链接地址区间, 使固件按链接地址给出的取值仍指向同一批字节;
    PC 置为映像入口地址.
 
-3. **注入 ZSBL.** 调试器把 `--preload` 指定的裸二进制注入 RAM. 该文件由
+3. **注入 ZSBL.** 调试器把 `--preload` 指定的裸二进制注入引导只读存储器, 起始地址取
+   `--preload-addr` 即 `rom_base = 0x4000_0000`. 该文件由
    [bsp/kei-boot/kei.sav.S](../bsp/kei-boot/kei.sav.S) 构建, 链接基址为 0, 全部地址取
-   PC 相对寻址. 未给出 `--preload-addr` 时注入到 `ram_base + ram_size - 128 KiB`;
-   全部 hart 的 PC 置为该地址. 随后调试器把每个 hart 的 `misa` 写为 MXL=RV64|S|U,
-   使固件的特权级判定能够通过.
+   PC 相对寻址, 故装入地址即其运行地址. 引导只读存储器的窗口由
+   `PlatformConfig.rom_base` 与 `rom_size` 给出, `rom_base` 取 0 时不注册该设备.
+   该设备接受读取, 经总线的写入触发访问故障, 装载经 `BootRom.load` 完成. 全部 hart 的
+   PC 置为该地址. 随后调试器把每个 hart 的 `misa` 写为 MXL=RV64|S|U, 使固件的特权级
+   判定能够通过.
 
-4. **准备设备树.** 未给出 `--no-fdt` 时, 调试器在 `ram_base + ram_size - 64 KiB` 生成
-   DTB 并写入全部 hart 的 `a1`; 另在 `ram_base + FW_PAYLOAD_FDT_OFFSET` 即
+4. **准备设备树.** 未给出 `--no-fdt` 时, 调试器生成 DTB 并写入全部 hart 的 `a1`.
+   复位地址落在引导只读存储器的窗口内时, DTB 写入 `rom_base + ROM_DTB_OFFSET` 即
+   `0x4100_0000`, 与 ZSBL 经 `lla a1, _start + 0x10000` 算出的地址一致; 其余情形写入
+   `ram_base + ram_size - 64 KiB`. 另在 `ram_base + FW_PAYLOAD_FDT_OFFSET` 即
    `0x8220_0000` 写入一份副本, 该地址是固件为下一阶段准备的 FDT 位置. 其后依次预载
    `--kernel` 指定的内核 Image、`--initrd` 指定的 initramfs, 并按 `--disk` 启用
    virtio-blk. 给出 `--no-fdt` 时调试器不生成也不交付 DTB, 其余初始化不变; 此时 ZSBL
-   仍执行 `lla a1, _start + 0x10000`, 在默认注入地址下 `a1` 即
-   `ram_base + ram_size - 64 KiB`, 而该处是零填充的内存. 不读取 `a1` 的裸机程序可以
-   照常运行; 本仓库的 OpenSBI 固件在该地址上读不到合法的 FDT 头, `fw_platform_init`
-   进入停机循环, 且此时串口尚未初始化, 故没有任何输出.
+   仍执行 `lla a1, _start + 0x10000`, 在默认注入地址下 `a1` 即 `0x4100_0000`, 而该处
+   在引导只读存储器内保持为零. 不读取 `a1` 的裸机程序可以照常运行; 本仓库的 OpenSBI
+   固件在该地址上读不到合法的 FDT 头, `fw_platform_init` 进入停机循环, 且此时串口
+   尚未初始化, 故没有任何输出.
 
 ## 二、ZSBL
 
@@ -44,7 +50,7 @@
    经 `mtvec` 进入停机; 读取成功即通过.
 
 8. **移交 OpenSBI.** 清零 t1 至 t6, 置 `a0 = mhartid`, `a1 = _start + 0x10000`, 即上一步
-   写入的 DTB 地址 `ram_base + ram_size - 64 KiB`, 跳转 `RAM_BASE` 处的 OpenSBI.
+   写入的 DTB 地址 `0x4100_0000`, 跳转 `RAM_BASE` 处的 OpenSBI.
 
 ## 三、OpenSBI 冷启动
 
@@ -122,10 +128,17 @@
 
 ```bash
 make kei-sav
-python -m pyremu.debugger --ram-base=0x80000000 \
+python -m pyremu.debugger \
     --preload=build/firm-bin/kei.sav \
+    --preload-addr=0x40000000 \
+    --fdt -1 \
+    --ram-base=0x80000000 \
     build/elf/custom_opensbi_fw_payload.elf
 ```
 
-`make emu` 使用同一组参数, 并另加 `--harts` 与 `--hart-logs`. `make emu-linux-sh`
-改用 `fw_jump` 固件, 并追加 `--kernel`、`--sym`、`--fdt -1`、`--disk` 与内核命令行参数.
+`make emu` 使用内存基址与零阶段引导程序的同一组参数, 并另加 `--harts` 与
+`--hart-logs`; 它不传递 `--fdt`, 需要交付设备树时在 `pyargs` 之外另行给出.
+零阶段引导程序的路径与装入地址集中在 `mk/pyremu-args.mk` 的 `zsbl_args`, 各启动目标
+共用. `make emu-linux-sh` 改用 `fw_jump` 固件, 并追加 `--kernel`、`--sym-dir=build/sym`、
+`--fdt -1`、`--disk` 与内核命令行参数. 内核符号不再随命令行自动加载; 启动后执行
+`sym ls` 与 `sym load vmlinux pa:<内核加载地址>` 登记.

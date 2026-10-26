@@ -20,8 +20,7 @@ mod abi;
 mod man;
 
 use abi::{
-	GetterFn, InitFn, ModuleDesc, ModuleInterface, SyscallTable, MODULE_NAME_LEN,
-	SYSCALL_TABLE_LEN,
+	GetterFn, InitFn, MODULE_NAME_LEN, ModuleDesc, ModuleInterface, SYSCALL_TABLE_LEN, SyscallTable,
 };
 use man::Manager;
 
@@ -50,7 +49,9 @@ const HANDLER_RESULT: u64 = 0x5A5A_0000_0000_0001;
 ///
 /// 处理函数的地址在入口内写入, 不以静态初值给出: 静态初值会把该地址作为常量放进
 /// 映像, 而映像在链接时不知道自己将被放在哪个基址。
-static mut SYSCALLS: SyscallTable = SyscallTable { handlers: [None; SYSCALL_TABLE_LEN] };
+static mut SYSCALLS: SyscallTable = SyscallTable {
+	handlers: [None; SYSCALL_TABLE_LEN],
+};
 
 /// 模块入口。它在映像内的偏移由映像描述块给出。
 #[unsafe(no_mangle)]

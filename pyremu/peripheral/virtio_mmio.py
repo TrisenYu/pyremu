@@ -110,6 +110,23 @@ VRING_DESC_SIZE = 16
 # 中断状态位 (InterruptStatus 寄存器)
 VIRTIO_MMIO_INT_VRING = 1
 
+# 读取时取值固定的寄存器
+_FIXED_READ_VALUES = {
+    VIRTIO_MMIO_MAGIC_VALUE: 0x74726976,  # "virt"
+    VIRTIO_MMIO_VERSION: 0x2,
+    # 厂商编号与配置代次不变化
+    VIRTIO_MMIO_VENDOR_ID: 0x0,
+    VIRTIO_MMIO_CONFIG_GENERATION: 0x0,
+}
+
+# 读取时直接取实例属性的寄存器, 值为属性名
+_DEVICE_READ_FIELDS = {
+    VIRTIO_MMIO_DEVICE_ID: "dev_id",
+    VIRTIO_MMIO_QUEUE_NUM_MAX: "max_queue_num",
+    VIRTIO_MMIO_INTERRUPT_STATUS: "interrupt_status",
+    VIRTIO_MMIO_STATUS: "status",
+}
+
 
 @dataclass(slots=True)
 class VirtqDesc:
@@ -132,20 +149,20 @@ class VirtQueue:
     """一条 virtqueue 的环状态与描述符遍历.
 
     available ring 由驱动写入, used ring 由本类写入。两部分都在受调试程序的物理内存里,
-    经 mem_read 与 mem_write 回调访问。
+    经 read_fn 与 write_fn 回调访问。
     """
 
     def __init__(
         self,
         index: int,
         num_max: int,
-        mem_read: Callable[[int, int], bytes],
-        mem_write: Callable[[int, bytes], None],
+        read_fn: Callable[[int, int], bytes],
+        write_fn: Callable[[int, bytes], None],
     ) -> None:
         self.index = index
         self.num_max = num_max
-        self._mem_read = mem_read
-        self._mem_write = mem_write
+        self._read_fn = read_fn
+        self._write_fn = write_fn
         # num 初值与重置后的取法都与设备重置前一致: 重置不清 num,
         # 驱动若不重设, 队列长度沿用上一次配置的值。
         self.num: int = num_max
@@ -209,7 +226,7 @@ class VirtQueue:
         """
         ring_idx = self.last_avail_idx % self.num
         entry_off = self.device + 4 + ring_idx * 8
-        self._mem_write(entry_off, struct.pack("<II", desc_head, mask32(length)))
+        self._write_fn(entry_off, struct.pack("<II", desc_head, mask32(length)))
 
     def commit_used(self) -> None:
         """把 used ring 的 idx 推进到当前已处理位置."""
@@ -219,7 +236,7 @@ class VirtQueue:
 
     def read_descriptor(self, idx: int) -> VirtqDesc:
         """读取第 *idx* 个描述符."""
-        raw = self._mem_read(self.desc + idx * VRING_DESC_SIZE, VRING_DESC_SIZE)
+        raw = self._read_fn(self.desc + idx * VRING_DESC_SIZE, VRING_DESC_SIZE)
         return VirtqDesc(
             addr=int.from_bytes(raw[0:8], "little"),
             length=int.from_bytes(raw[8:12], "little"),
@@ -254,10 +271,31 @@ class VirtQueue:
     # ---- 低层访问 ----
 
     def _read_u16(self, pa: int) -> int:
-        return int.from_bytes(self._mem_read(pa, 2), "little")
+        return int.from_bytes(self._read_fn(pa, 2), "little")
 
     def _write_u16(self, pa: int, val: int) -> None:
-        self._mem_write(pa, struct.pack("<H", mask16(val)))
+        self._write_fn(pa, struct.pack("<H", mask16(val)))
+
+
+@dataclass(frozen=True, slots=True)
+class VirtioMMIOConfig:
+    """virtio-mmio 传输层的构造参数.
+
+    给出设备身份与特征、队列条数与单条队列的最大条目数、受调试程序主存访问回调、
+    中断源号与中断投递目标, 以及 0x100 起的配置空间字节映像与单条请求允许的
+    最大描述符数。
+    """
+
+    dev_id: int
+    dev_feats: int
+    queue_num: int
+    max_queue_num: int
+    read_fn: Callable[[int, int], bytes]
+    write_fn: Callable[[int, bytes], None]
+    irq: int = 0
+    irq_resp_fn: Callable[[int, bool], None] | None = None
+    cfg_space_data: bytes = b""
+    chain_max_desc: int = 64
 
 
 class VirtioMMIO:
@@ -278,46 +316,36 @@ class VirtioMMIO:
     Usage::
 
         mmio = VirtioMMIO(
-            device_id=0x2,
-            device_features=VIRTIO_F_VERSION_1,
-            num_queues=1,
-            queue_num_max=256,
-            mem_read=bus.read,
-            mem_write=bus.write,
-            irq=VIRTIO_BLK_IRQ,
-            on_irq=irq_sink,
+            VirtioMMIOConfig(
+                dev_id=0x2,
+                dev_feats=VIRTIO_F_VERSION_1,
+                queue_num=1,
+                max_queue_num=256,
+                read_fn=bus.read,
+                write_fn=bus.write,
+                irq=VIRTIO_BLK_IRQ,
+                irq_resp_fn=irq_sink,
+            )
         )
     """
 
-    def __init__(
-        self,
-        *,
-        device_id: int,
-        device_features: int,
-        num_queues: int,
-        queue_num_max: int,
-        mem_read: Callable[[int, int], bytes],
-        mem_write: Callable[[int, bytes], None],
-        irq: int = 0,
-        on_irq: Callable[[int, bool], None] | None = None,
-        cfg_space_data: bytes = b"",
-        chain_max_desc: int = 64,
-    ) -> None:
+    def __init__(self, config: VirtioMMIOConfig) -> None:
         # 单条请求允许的最大描述符数, 设备可据此限制链长
-        self.chain_max_desc = chain_max_desc
-        self.device_id = device_id
-        self.device_features = device_features
-        self.queue_num_max = queue_num_max
+        self.chain_max_desc = config.chain_max_desc
+        self.dev_id = config.dev_id
+        self.dev_feats = config.dev_feats
+        self.max_queue_num = config.max_queue_num
         # 0x100 起的设备特定配置空间, 按字节寻址
-        self.cfg_space_data = cfg_space_data
-        self._mem_read = mem_read
-        self._mem_write = mem_write
+        self.cfg_space_data = config.cfg_space_data
+        self._read_fn = config.read_fn
+        self._write_fn = config.write_fn
         # 中断源号为 0 或未给出中断投递目标时, 电平变化不投递
-        self._irq = irq
-        self._on_irq = on_irq
+        self._irq = config.irq
+        self._irq_resp_fn = config.irq_resp_fn
 
         self.queues = [
-            VirtQueue(i, queue_num_max, mem_read, mem_write) for i in range(num_queues)
+            VirtQueue(i, config.max_queue_num, config.read_fn, config.write_fn)
+            for i in range(config.queue_num)
         ]
 
         self.device_features_sel: int = 0
@@ -348,106 +376,105 @@ class VirtioMMIO:
 
     def read_phys(self, pa: int, size: int) -> bytes:
         """读取受调试程序的物理内存. 设备处理请求数据时使用."""
-        return self._mem_read(pa, size)
+        return self._read_fn(pa, size)
 
     def write_phys(self, pa: int, data: bytes) -> None:
         """写入受调试程序的物理内存."""
-        self._mem_write(pa, data)
+        self._write_fn(pa, data)
 
     # ---- MMIO 读 ----
 
     def mmio_read(self, offset: int) -> int:
         """读取 MMIO 寄存器."""
-        if offset == VIRTIO_MMIO_MAGIC_VALUE:
-            return 0x74726976  # "virt"
-        if offset == VIRTIO_MMIO_VERSION:
-            return 0x2
-        if offset == VIRTIO_MMIO_DEVICE_ID:
-            return self.device_id
-        if offset in (VIRTIO_MMIO_VENDOR_ID, VIRTIO_MMIO_CONFIG_GENERATION):
-            # 配置不会变
-            return 0x0
-
-        if offset == VIRTIO_MMIO_DEVICE_FEATURES:
-            return mask32(self.device_features >> (self.device_features_sel * 32))
-
-        if offset == VIRTIO_MMIO_QUEUE_NUM_MAX:
-            return self.queue_num_max
-
-        if offset == VIRTIO_MMIO_INTERRUPT_STATUS:
-            return self.interrupt_status
-
-        if offset == VIRTIO_MMIO_STATUS:
-            return self.status
-
+        value = self._read_fixed_reg(offset)
+        if value is not None:
+            return value
         if offset >= VIRTIO_MMIO_CONFIG_OFFSET:
-            # 配置空间按字节寻址: 取以该偏移为起始的 4 字节小端字. 进入本分支时 offset 不小于
-            # VIRTIO_MMIO_CONFIG_OFFSET, 故 local 非负; 切片越出映像末尾时只取到实际存在的
-            # 字节, 不足 4 字节的部分由 ljust 补 0
-            local = offset - VIRTIO_MMIO_CONFIG_OFFSET
-            word = self.cfg_space_data[local : local + 4].ljust(4, b"\x00")
-            return int.from_bytes(word, "little")
-
+            return self._read_config_space(offset)
         # 未实现的寄存器, 返回 0
         return 0
+
+    def _read_fixed_reg(self, offset: int) -> int | None:
+        """读取取值固定的寄存器; offset 不属于这些寄存器时返回 None."""
+        if offset in _FIXED_READ_VALUES:
+            return _FIXED_READ_VALUES[offset]
+        field = _DEVICE_READ_FIELDS.get(offset)
+        if field is not None:
+            return getattr(self, field)
+        if offset == VIRTIO_MMIO_DEVICE_FEATURES:
+            return mask32(self.dev_feats >> (self.device_features_sel * 32))
+        return None
+
+    def _read_config_space(self, offset: int) -> int:
+        """读取 0x100 起的设备配置空间.
+
+        配置空间按字节寻址: 取以该偏移为起始的 4 字节小端字. 进入本方法时 offset 不小于
+        VIRTIO_MMIO_CONFIG_OFFSET, 故 local 非负; 切片越出映像末尾时只取到实际存在的
+        字节, 不足 4 字节的部分由 ljust 补 0
+        """
+        local = offset - VIRTIO_MMIO_CONFIG_OFFSET
+        word = self.cfg_space_data[local : local + 4].ljust(4, b"\x00")
+        return int.from_bytes(word, "little")
 
     # ---- MMIO 写 ----
 
     def mmio_write(self, offset: int, val: int, size: int) -> None:
         """写入 MMIO 寄存器. QueueNotify 由设备处理, 本方法对该寄存器不做动作."""
-        if offset == VIRTIO_MMIO_DEVICE_FEATURES_SEL:
-            self.device_features_sel = val
-
-        elif offset == VIRTIO_MMIO_DRIVER_FEATURES:
+        if offset == VIRTIO_MMIO_DRIVER_FEATURES:
             sel = self.driver_features_sel
             mask_low = mask32(val) << (sel * 32)
             self.driver_features = (
                 self.driver_features & ~(0xFFFF_FFFF << (sel * 32))
             ) | mask_low
-
-        elif offset == VIRTIO_MMIO_DRIVER_FEATURES_SEL:
-            self.driver_features_sel = val
-
-        elif offset == VIRTIO_MMIO_QUEUE_SEL:
-            self.queue_sel = val
-
-        elif offset == VIRTIO_MMIO_QUEUE_NUM:
-            self._current_queue().num = min(val, self.queue_num_max)
-
-        elif offset == VIRTIO_MMIO_QUEUE_READY:
-            queue = self._current_queue()
-            queue.ready = val != 0
-            if queue.ready:
-                queue.last_avail_idx = 0
-
-        elif offset == VIRTIO_MMIO_INTERRUPT_ACK:
-            self.interrupt_status &= ~val
-            self.lower_irq_if_idle()
-
         elif offset == VIRTIO_MMIO_STATUS:
             # 写 0 表示设备重置
             if val == 0:
                 self.reset()
             else:
                 self.status = val
+        else:
+            self._write_reg(offset, val)
 
-        elif offset == VIRTIO_MMIO_QUEUE_DESC_LOW:
-            self._current_queue().set_desc(val, high=False)
+    def _write_reg(self, offset: int, val: int) -> None:
+        """写入选择寄存器、队列寄存器与中断应答寄存器."""
+        if offset == VIRTIO_MMIO_DEVICE_FEATURES_SEL:
+            self.device_features_sel = val
+        elif offset == VIRTIO_MMIO_DRIVER_FEATURES_SEL:
+            self.driver_features_sel = val
+        elif offset == VIRTIO_MMIO_QUEUE_SEL:
+            self.queue_sel = val
+        elif offset == VIRTIO_MMIO_QUEUE_NUM:
+            self._current_queue().num = min(val, self.max_queue_num)
+        elif offset == VIRTIO_MMIO_QUEUE_READY:
+            self._set_queue_ready(val)
+        elif offset == VIRTIO_MMIO_INTERRUPT_ACK:
+            self.interrupt_status &= ~val
+            self.lower_irq_if_idle()
+        else:
+            self._write_queue_addr(offset, val)
 
+    def _set_queue_ready(self, val: int) -> None:
+        """按 QueueReady 的写入值切换队列就绪状态, 就绪时把可用环索引归零."""
+        queue = self._current_queue()
+        queue.ready = val != 0
+        if queue.ready:
+            queue.last_avail_idx = 0
+
+    def _write_queue_addr(self, offset: int, val: int) -> None:
+        """写入描述符表、可用环与已用环的地址低 32 位或高 32 位."""
+        queue = self._current_queue()
+        if offset == VIRTIO_MMIO_QUEUE_DESC_LOW:
+            queue.set_desc(val, high=False)
         elif offset == VIRTIO_MMIO_QUEUE_DESC_HIGH:
-            self._current_queue().set_desc(val, high=True)
-
+            queue.set_desc(val, high=True)
         elif offset == VIRTIO_MMIO_QUEUE_DRIVER_LOW:
-            self._current_queue().set_driver(val, high=False)
-
+            queue.set_driver(val, high=False)
         elif offset == VIRTIO_MMIO_QUEUE_DRIVER_HIGH:
-            self._current_queue().set_driver(val, high=True)
-
+            queue.set_driver(val, high=True)
         elif offset == VIRTIO_MMIO_QUEUE_DEVICE_LOW:
-            self._current_queue().set_device(val, high=False)
-
+            queue.set_device(val, high=False)
         elif offset == VIRTIO_MMIO_QUEUE_DEVICE_HIGH:
-            self._current_queue().set_device(val, high=True)
+            queue.set_device(val, high=True)
 
     def _current_queue(self) -> VirtQueue:
         """按 QueueSel 取当前队列. 选择越界时返回第 0 条, 与单队列设备的既有行为一致."""
@@ -532,8 +559,8 @@ class VirtioMMIO:
 
     def _set_irq_level(self, level: bool) -> None:
         """按电平向中断控制器投递本设备中断源. 中断源号为 0 或未给出投递目标时不做动作."""
-        if self._on_irq is not None and self._irq:
-            self._on_irq(self._irq, level)
+        if self._irq_resp_fn is not None and self._irq:
+            self._irq_resp_fn(self._irq, level)
 
     # ---- 重置 ----
 

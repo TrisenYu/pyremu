@@ -112,15 +112,8 @@ class TestNetNodePresence:
             cells = struct.unpack(f">{len(raw) // 4}I", raw)
             assert VIRTIO_NET_M_IRQ not in cells, f"飞地侧源号出现在 interrupts={cells}"
 
-    @pytest.mark.parametrize(
-        "is_s_nic,is_m_nic",
-        [(False, True), (False, False)]
-    )
-    def test_nic_fdt_node(
-        self,
-        is_s_nic: bool,
-        is_m_nic: bool
-    ) -> None:
+    @pytest.mark.parametrize("is_s_nic,is_m_nic", [(False, True), (False, False)])
+    def test_nic_fdt_node(self, is_s_nic: bool, is_m_nic: bool) -> None:
         fdt = _fdt(_cfg(is_net_s=is_s_nic, is_net_m=is_m_nic))
         assert _find(fdt, f"/soc/virtio@{NET_M_BASE:x}") < 0
         assert _find(fdt, f"/soc/virtio@{NET_S_BASE:x}") < 0

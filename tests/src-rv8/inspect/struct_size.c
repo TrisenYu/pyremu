@@ -22,7 +22,9 @@ struct Record {
 typedef struct Record RecordType;
 typedef RecordType *RecordPtr;
 
-int main(int argc, char *argv[]) {
+int main(
+	int argc,
+	char *argv[]) {
 	printf("%zu\n", sizeof(RecordPtr) * 2);
 	return 0;
 }

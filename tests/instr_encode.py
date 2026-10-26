@@ -12,12 +12,12 @@ from __future__ import annotations
 
 
 def pack_funct(funct7: int, funct3: int) -> int:
-    """把 funct7 与 funct3 打包为 ``funct7 << 3 | funct3``."""
+    """return: ``funct7 << 3 | funct3``."""
     return ((funct7 & 0x7F) << 3) | (funct3 & 0x7)
 
 
 def pack_src_regs(rs1: int, rs2: int) -> int:
-    """把 rs1 与 rs2 打包为 ``rs1 << 5 | rs2``."""
+    """return: ``rs1 << 5 | rs2``."""
     return ((rs1 & 0x1F) << 5) | (rs2 & 0x1F)
 
 

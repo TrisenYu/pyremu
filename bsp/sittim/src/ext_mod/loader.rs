@@ -1,6 +1,6 @@
 //! 取入一个模块。
 //!
-//! 取入分五步: 申请映像的字节数; 在模块窗口内取得一个槽位, 为它的可执行部分与可写部分各
+//! 取入分五步: 申请映像的字节数; 在扩展模块虚拟地址空间内取得一个槽位, 为它的可执行部分与可写部分各
 //! 建成映射; 登记映像的落点后请求宿主交付; 核对映像描述块并验签; 把可执行部分改判为指令
 //! 类, 调用模块入口并校验接口。
 
@@ -13,8 +13,7 @@ use super::transport::Transport;
 use crate::attest;
 use crate::constants::{
 	ATTEST_ENABLE, CHUNK_2M_SIZE, ENCLAVE_MEM_ATTR_DATA, ENCLAVE_MEM_ATTR_INSTR,
-	ENCLAVE_MODULE_LOAD_VA_INIT, ENCLAVE_MODULE_WINDOW_SIZE, PAGE_SIZE, PTE_R, PTE_W, PTE_X,
-	SIG_LEN,
+	ENCLAVE_MODULE_LOAD_VA_INIT, EXT_MODS_VAS_SIZE, PAGE_SIZE, PTE_R, PTE_W, PTE_X, SIG_LEN,
 };
 use crate::context;
 use crate::mem;
@@ -32,7 +31,7 @@ pub enum LoadError {
 	NotFound,
 	/// 映像的字节数不足以容纳一个签名。
 	TooSmall,
-	/// 映像的槽位越过模块窗口的上界。
+	/// 映像的槽位越过扩展模块虚拟地址空间的上界。
 	TooLarge,
 	/// 该模块已在取入过程中: 并发取用, 或模块的入口内重入取用同一个模块。
 	Loading,
@@ -80,13 +79,13 @@ impl LoadError {
 	}
 }
 
-/// 保护模块窗口内下一个空闲 VA 的锁。
+/// 保护扩展模块虚拟地址空间内下一个空闲 VA 的锁。
 static LOAD_LOCK: SpinLock<()> = SpinLock::new(());
 
-/// 一个模块在模块窗口内占用的字节数。
+/// 一个模块在扩展模块虚拟地址空间内占用的字节数。
 ///
 /// 一个模块占用一个槽位, 槽位自起点起为可执行部分、其后为可写部分, 两部分分处两个 2 MiB
-/// 分区。该值取 2 MiB, 使 `MAX_MODULES` 个模块恰好占满模块窗口。
+/// 分区。该值取 2 MiB, 使 `MAX_MODULES` 个模块恰好占满扩展模块虚拟地址空间。
 ///
 /// 模块的可写静态数据全部落在 BSS 段, 且该段的起始地址须等于映像本体按页取整的结果: 映像
 /// 中初值非零的部分位于可执行部分之内, 装入后该部分只有读与执行权限。该等式由模块的链接
@@ -133,10 +132,10 @@ pub fn load(
 
 /// 完成一次取入, 调用方已确认该模块不在登记表中。
 ///
-/// 返回取用器, 以及映像在模块窗口内的起始虚拟地址与槽位的字节数: 后两项随取用器一同
+/// 返回取用器, 以及映像在扩展模块虚拟地址空间内的起始虚拟地址与槽位的字节数: 后两项随取用器一同
 /// 登记, 供取用方判定接口中整张操作表的落点。
 ///
-/// `LOAD_LOCK` 保护模块窗口内下一个空闲 VA, 并在请求宿主交付之前释放: 让出之后本飞地
+/// `LOAD_LOCK` 保护扩展模块虚拟地址空间内下一个空闲 VA, 并在请求宿主交付之前释放: 让出之后本飞地
 /// 不再执行, 直到宿主应答; 持有该锁让出会使同一飞地的其它取用方在锁上自等, 而本 hart
 /// 直到交还之前都不会释放它。
 fn load_image(
@@ -230,7 +229,7 @@ fn load_image(
 	Ok((getter, va, MODULE_SLOT_SIZE))
 }
 
-/// 在模块窗口内为 *size* 字节的映像建立一个槽位, 返回槽位的起始虚拟地址与可执行部分的
+/// 在扩展模块虚拟地址空间内为 *size* 字节的映像建立一个槽位, 返回槽位的起始虚拟地址与可执行部分的
 /// 物理基址。
 ///
 /// 槽位自起点起是可执行部分, 长 `align_up(size - SIG_LEN, PAGE_SIZE)` 字节; 其后是可写
@@ -247,9 +246,9 @@ fn load_image(
 /// 映射为可读可写, 映像取入完毕后再把可执行部分改判为指令类。两部分必须分处两个分区:
 /// 类别是分区的属性, 取指要求指令类而模块的写入要求数据类, 一个分区不能同时满足两者。
 ///
-/// 起始虚拟地址是模块窗口内下一个未交付的地址 (`enclave_module_load_va`), 该地址只增不减,
-/// 已交付的地址不回收。故分区申请失败、页表项无法建立或该地址越过窗口上界, 都表现为取入
-/// 失败。
+/// 起始虚拟地址是扩展模块虚拟地址空间内下一个未交付的地址 (`enclave_module_load_va`),
+/// 该地址只增不减, 已交付的地址不回收。故分区申请失败、页表项无法建立或该地址越过该
+/// 虚拟地址空间的上界, 都表现为取入失败。
 ///
 /// 分配与映射在 `LOAD_LOCK` 内完成: 该地址的读取与递增之间不得插入另一次取入。请求宿主
 /// 交付的调用不在此锁内
@@ -267,7 +266,7 @@ fn open_img_recv_buf(size: u64) -> Result<(u64, u64), LoadError> {
 	let va_end = va
 		.checked_add(MODULE_SLOT_SIZE)
 		.ok_or(LoadError::TooLarge)?;
-	if va_end > ENCLAVE_MODULE_LOAD_VA_INIT + ENCLAVE_MODULE_WINDOW_SIZE {
+	if va_end > ENCLAVE_MODULE_LOAD_VA_INIT + EXT_MODS_VAS_SIZE {
 		return Err(LoadError::TooLarge);
 	}
 

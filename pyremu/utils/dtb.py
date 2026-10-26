@@ -128,7 +128,7 @@ def _dtb_chosen(
     bootargs: str | None,
     initrd: Initrd | None,
 ) -> None:
-    """/chosen — stdout-path + 内核命令行 + initrd 范围."""
+    """/chosen — stdout-path、内核命令行及initrd 范围."""
     if not (bootargs or initrd is not None):
         return
     p = cfg.periph
@@ -152,9 +152,6 @@ def _dtb_chosen(
     # 使用宿主 os.urandom(64) 提供 512 bit 真随机熵
     sw.property("rng-seed", os.urandom(64))
     if initrd is not None:
-        # initramfs (cpio[.gz]) 已加载到 [initrd.start, initrd.end)。
-        # Linux 从 /chosen 读取这两个属性; 以 2-cell (u64) 大端编码,
-        # of_read_number 按属性长度自动识别 4/8 字节。
         sw.property("linux,initrd-start", struct.pack(">Q", initrd.start))
         sw.property("linux,initrd-end", struct.pack(">Q", initrd.end))
     sw.end_node()

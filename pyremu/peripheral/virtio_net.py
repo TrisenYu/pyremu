@@ -29,6 +29,7 @@ from pyremu.peripheral.virtio_mmio import (
     VIRTIO_MMIO_QUEUE_NOTIFY,
     VIRTIO_MMIO_SIZE,
     VirtioMMIO,
+    VirtioMMIOConfig,
     VirtqDesc,
     VirtQueue,
     VRING_DESC_F_WRITE,
@@ -68,6 +69,9 @@ VIRTIO_NET_RX_QUEUE = 0
 VIRTIO_NET_TX_QUEUE = 1
 VIRTIO_NET_NUM_QUEUES = 2
 
+# 单条队列的最大条目数, 即 QueueNumMax 寄存器的取值
+VIRTIO_NET_QUEUE_NUM_MAX = 256
+
 # 单条发送链允许的描述符数上界。一个帧通常只占一个描述符, 取 16 已足够容纳
 # 首部与帧分处两个描述符的情形, 同时使畸形长链尽早被截断。
 VIRTIO_NET_CHAIN_MAX_DESC = 16
@@ -101,12 +105,11 @@ ETHERNET_HEADER_SIZE = 14
 # 以太网最大传输单元
 ETHERNET_MTU = 1500
 
-# 以太帧的最大长度 (不含前导码与帧校验序列)
+# 以太帧的最大长度, 不含前导码与帧校验序列
 ETHERNET_FRAME_MAX = ETHERNET_HEADER_SIZE + ETHERNET_MTU
 
-# 每个缓冲区开头的 virtio_net_hdr:
-# flags (u8) + gso_type (u8) + hdr_len (u16) + gso_size (u16)
-# + csum_start (u16) + csum_offset (u16)
+# 每个缓冲区开头的 virtio_net_hdr 依次为 flags、gso_type、hdr_len、gso_size、
+# csum_start 与 csum_offset, 前两个各占 1 字节, 其余各占 2 字节.
 #
 # 未协商 VIRTIO_NET_F_MRG_RXBUF 时首部为 10 字节; 协商后末尾多一个
 # num_buffers (u16)。本设备不协商该 feature, 故取 10。未协商任何 GSO 与校验和
@@ -189,11 +192,10 @@ class VirtIONet(Device):
     Usage::
 
         net = VirtIONet(
-            mac=DEFAULT_VIRTIO_NET_S_MAC,
             mem_read=bus.read,
             mem_write=bus.write,
-            on_irq=irq_sink,
-            irq=VIRTIO_NET_S_IRQ,
+            mac=DEFAULT_VIRTIO_NET_S_MAC,
+            irq_sink=(VIRTIO_NET_S_IRQ, irq_sink),
         )
         bus.add_device(0x1000_7000, net)
     """
@@ -203,11 +205,10 @@ class VirtIONet(Device):
         mem_read: Callable[[int, int], bytes],
         mem_write: Callable[[int, bytes], None],
         mac: bytes = DEFAULT_VIRTIO_NET_S_MAC,
-        queue_size_max: int = 256,
-        on_irq: Callable[[int, bool], None] | None = None,
-        irq: int = 0,
         backend: NetBackend | None = None,
+        irq_sink: tuple[int, Callable[[int, bool], None]] | None = None,
     ) -> None:
+        """irq_sink 为 (中断源编号, 中断投递目标), 未给出时本设备不投递中断."""
         if len(mac) != 6:
             raise ValueError(f"MAC 地址须为 6 字节, 实际 {len(mac)} 字节")
 
@@ -226,19 +227,23 @@ class VirtIONet(Device):
         self._backend = backend if backend is not None else LoopbackBackend()
         self._backend.bind(self)
 
-        # 中断投递: 完成中断经 on_irq(irq, level) 上报 (irq=0 或未给出 on_irq 时
-        # 不投递)。调用方应传设备中断投递目标 DeviceIrqSink, 理由见 virtio_blk.py。
+        # 中断投递: 完成中断经 irq_sink 给出的投递目标上报; 中断源号为 0 或未给出
+        # 投递目标时不投递。调用方应传设备中断投递目标 DeviceIrqSink, 理由见
+        # virtio_blk.py。
+        irq, on_irq = irq_sink if irq_sink is not None else (0, None)
         self.mmio = VirtioMMIO(
-            device_id=VIRTIO_NET_DEVICE_ID,
-            device_features=_DEVICE_FEATURES,
-            num_queues=VIRTIO_NET_NUM_QUEUES,
-            queue_num_max=queue_size_max,
-            mem_read=mem_read,
-            mem_write=mem_write,
-            irq=irq,
-            on_irq=on_irq,
-            cfg_space_data=self._build_config_space(),
-            chain_max_desc=VIRTIO_NET_CHAIN_MAX_DESC,
+            VirtioMMIOConfig(
+                dev_id=VIRTIO_NET_DEVICE_ID,
+                dev_feats=_DEVICE_FEATURES,
+                queue_num=VIRTIO_NET_NUM_QUEUES,
+                max_queue_num=VIRTIO_NET_QUEUE_NUM_MAX,
+                read_fn=mem_read,
+                write_fn=mem_write,
+                irq=irq,
+                irq_resp_fn=on_irq,
+                cfg_space_data=self._build_config_space(),
+                chain_max_desc=VIRTIO_NET_CHAIN_MAX_DESC,
+            )
         )
 
     # ---- Device 接口 ----

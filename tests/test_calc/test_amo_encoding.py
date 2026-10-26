@@ -13,9 +13,13 @@ from pyremu.core.hart import RiscvMode
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 
+# 执行路径上被递增或递减的内存初值
+_AMO_TEST_INITIAL = 1
+
 # ============================================================
 #  编码: amoadd.w rd, rs2, (rs1)  — funct5=00000, func7 含 aq/rl
 # ============================================================
+
 
 def _encode_amoadd_w(rd=5, rs1=10, rs2=11, aq=0, rl=0):
     return (
@@ -26,7 +30,7 @@ def _encode_amoadd_w(rd=5, rs1=10, rs2=11, aq=0, rl=0):
         | (rs1 << 15)
         | (0b010 << 12)  # funct3 = .W (32-bit)
         | (rd << 7)
-        | 0b0101111       # opcode = AMO
+        | 0b0101111  # opcode = AMO
     )
 
 
@@ -38,9 +42,7 @@ class TestAmoaddWFunct5:
         instr = _encode_amoadd_w(aq=aq, rl=rl)
         f = decode_fields(instr)
         funct5 = f.func7 >> 2  # Rust handler 的做法: func7 >> 2
-        assert funct5 == 0b00000, (
-            f"aq={aq} rl={rl}: funct5 expected 0 (AMOADD), got {funct5}"
-        )
+        assert funct5 == 0b00000, f"aq={aq} rl={rl}: funct5 expected 0 (AMOADD), got {funct5}"
 
     def test_func7_with_aqrl_is_0x03(self):
         """amoadd.w.aqrl 编码后 func7 = 0b0000011."""
@@ -52,6 +54,7 @@ class TestAmoaddWFunct5:
 # ============================================================
 #  Python 执行路径: 验证 amoadd.w.aqrl 正确递减 tlb_sync
 # ============================================================
+
 
 @pytest.fixture
 def _m_mode_hart():
@@ -67,13 +70,16 @@ class TestAmoaddWExecution:
     """amoadd.w.aqrl 的完整执行语义 (Python 路径)."""
 
     @staticmethod
-    def _exec_amo(emu, hart, instr, pa, rs2_val, initial=1):
-        """在给定 PA 执行 AMO 指令, 返回 (old_mem, new_mem, rd_val)."""
-        emu.bus.write(pa, struct.pack("<I", initial))
+    def _exec_amo(emu, hart, instr, pa, rs2_val):
+        """在给定 PA 执行 AMO 指令, 返回 (old_mem, new_mem, rd_val).
+
+        该 PA 在执行前写入初值 1.
+        """
+        emu.bus.write(pa, struct.pack("<I", _AMO_TEST_INITIAL))
         emu.bus.write(0x80000000, struct.pack("<I", instr))
-        hart.gprs[10] = pa       # rs1 = a0 = address
+        hart.gprs[10] = pa  # rs1 = a0 = address
         hart.gprs[11] = rs2_val  # rs2 = a1
-        hart.gprs[5] = 0         # rd = t0
+        hart.gprs[5] = 0  # rd = t0
         hart.pc = 0x80000000
         old_raw = emu.bus.read(pa, 4)
         old_val = struct.unpack("<I", old_raw)[0]
@@ -86,7 +92,11 @@ class TestAmoaddWExecution:
         emu, hart = _m_mode_hart
         instr = _encode_amoadd_w(rd=5, rs1=10, rs2=11, aq=1, rl=1)
         old_val, new_val, rd_val = self._exec_amo(
-            emu, hart, instr, 0x80001000, 0xFFFFFFFF  # -1 as u32
+            emu,
+            hart,
+            instr,
+            0x80001000,
+            0xFFFFFFFF,  # -1 as u32
         )
         assert old_val == 1
         assert new_val == 0, f"new_val={new_val}, expected 0"
@@ -96,9 +106,7 @@ class TestAmoaddWExecution:
         """不带 .aq/.rl 的 amoadd.w 与 .aqrl 功能等价."""
         emu, hart = _m_mode_hart
         instr = _encode_amoadd_w(rd=5, rs1=10, rs2=11, aq=0, rl=0)
-        old_val, new_val, rd_val = self._exec_amo(
-            emu, hart, instr, 0x80001000, 0xFFFFFFFF
-        )
+        old_val, new_val, rd_val = self._exec_amo(emu, hart, instr, 0x80001000, 0xFFFFFFFF)
         assert old_val == 1
         assert new_val == 0
         assert rd_val == 1
@@ -151,10 +159,14 @@ class TestAmoaddWExecution:
         emu.bus.write(pa, struct.pack("<Q", 1))
 
         instr = (
-            (0b00000 << 27) | (1 << 26) | (1 << 25)  # AMOADD .aqrl
-            | (11 << 20) | (10 << 15)                  # rs2, rs1
-            | (0b011 << 12)                             # funct3 = .D
-            | (5 << 7) | 0b0101111
+            (0b00000 << 27)
+            | (1 << 26)
+            | (1 << 25)  # AMOADD .aqrl
+            | (11 << 20)
+            | (10 << 15)  # rs2, rs1
+            | (0b011 << 12)  # funct3 = .D
+            | (5 << 7)
+            | 0b0101111
         )
         emu.bus.write(0x80000000, struct.pack("<I", instr))
         hart.gprs[10] = pa

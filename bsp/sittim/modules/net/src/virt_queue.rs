@@ -340,7 +340,8 @@ mod tests {
 	#[test]
 	fn test_write_desc_leaves_the_other_entries_untouched() {
 		let mut s = Store::new();
-		s.queue.write_desc(QNUM - 1, 0xAAAA_BBBB_CCCC_DDDD, 0x1234_5678, DESC_F_WRITE);
+		s.queue
+			.write_desc(QNUM - 1, 0xAAAA_BBBB_CCCC_DDDD, 0x1234_5678, DESC_F_WRITE);
 
 		let at = (QNUM as usize - 1) * DESC_SIZE;
 		assert!(s.desc_bytes()[..at].iter().all(|&b| b == 0));

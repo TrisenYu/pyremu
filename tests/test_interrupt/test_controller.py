@@ -18,7 +18,7 @@ from pyremu.interrupt.controller import (
     IntStateVersion,
 )
 
-# 优先级自高到低: MEI > MSI > MTI > SEI > SSI > STI
+# 优先级自高到低依次为 MEI、MSI、MTI、SEI、SSI、STI
 PRIORITY_ORDER = [
     IntSource.MEI,
     IntSource.MSI,

@@ -68,38 +68,38 @@ class TestAiaCsrGateCheckAccess:
     def test_mmode_access_consistent(self) -> None:
         """M 模式: implemented 为 False 时得到 CsrAccessError, 为 True 时通过.
         mtopi 0xFB0 / stopi 0xDB0 为只读 CSR, 写操作应报 readonly."""
-        M = RiscvMode.M.value
+        m_mode = RiscvMode.M.value
         for addr in _AIA_CSRS:
             if not csr_bank[addr].implemented:
                 with pytest.raises(CsrAccessError, match="unknown"):
-                    check_csr_access(addr, M, is_write=False)
+                    check_csr_access(addr, m_mode, is_write=False)
                 with pytest.raises(CsrAccessError, match="unknown"):
-                    check_csr_access(addr, M, is_write=True)
+                    check_csr_access(addr, m_mode, is_write=True)
             else:
-                check_csr_access(addr, M, is_write=False)
+                check_csr_access(addr, m_mode, is_write=False)
                 if (csr_bank[addr].access.value & 1) == 0:
                     # Read-only CSR (e.g. mtopi, stopi)
                     with pytest.raises(CsrAccessError, match="readonly"):
-                        check_csr_access(addr, M, is_write=True)
+                        check_csr_access(addr, m_mode, is_write=True)
                 else:
-                    check_csr_access(addr, M, is_write=True)
+                    check_csr_access(addr, m_mode, is_write=True)
 
     def test_privilege_boundary_smode_cannot_access_mmode_aia(self) -> None:
         """S 模式访问 M-mode AIA CSR: 权限不足 (privilege) 或 未实现 (unknown)."""
-        S = RiscvMode.S.value
+        s_mode = RiscvMode.S.value
         m_csrs = (0x350, 0x351, 0x35C, 0xFB0)
         for addr in m_csrs:
             with pytest.raises(CsrAccessError):
-                check_csr_access(addr, S, is_write=False)
+                check_csr_access(addr, s_mode, is_write=False)
 
     def test_non_aia_csrs_unaffected(self) -> None:
         """健全检查: 非 AIA CSR 不受门控影响."""
-        M = RiscvMode.M.value
-        S = RiscvMode.S.value
-        check_csr_access(0x300, M, is_write=False)  # mstatus
-        check_csr_access(0x300, M, is_write=True)
-        check_csr_access(0x105, S, is_write=False)  # stvec
-        check_csr_access(0x105, S, is_write=True)
+        m_mode = RiscvMode.M.value
+        s_mode = RiscvMode.S.value
+        check_csr_access(0x300, m_mode, is_write=False)  # mstatus
+        check_csr_access(0x300, m_mode, is_write=True)
+        check_csr_access(0x105, s_mode, is_write=False)  # stvec
+        check_csr_access(0x105, s_mode, is_write=True)
 
 
 # ============================================================
@@ -123,16 +123,22 @@ class TestAiaCsrGateInstruction:
     def _csrrw(rd: int, csr: int, rs1: int) -> int:
         """CSRRW rd, csr, rs1 (funct3=1)."""
         return (
-            ((csr & 0xFFF) << 20) | ((rs1 & 0x1F) << 15)
-            | (1 << 12) | ((rd & 0x1F) << 7) | 0x73
+            ((csr & 0xFFF) << 20)
+            | ((rs1 & 0x1F) << 15)
+            | (1 << 12)
+            | ((rd & 0x1F) << 7)
+            | 0x73
         )
 
     @staticmethod
     def _csrrs(rd: int, csr: int, rs1: int) -> int:
         """CSRRS rd, csr, rs1 (funct3=2). rs1=0 -> csrr pseudo-instruction."""
         return (
-            ((csr & 0xFFF) << 20) | ((rs1 & 0x1F) << 15)
-            | (2 << 12) | ((rd & 0x1F) << 7) | 0x73
+            ((csr & 0xFFF) << 20)
+            | ((rs1 & 0x1F) << 15)
+            | (2 << 12)
+            | ((rd & 0x1F) << 7)
+            | 0x73
         )
 
     # ---- write tests ----

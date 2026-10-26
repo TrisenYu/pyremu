@@ -147,7 +147,7 @@ class CacheBase(ABC):
                     oldest_idx = i
             return oldest_idx
 
-        # FIFO (默认)
+        # 默认策略为 FIFO
         idx = self._fifo_ptr
         self._fifo_ptr = (self._fifo_ptr + 1) % self._num_entries
         return idx

@@ -168,12 +168,15 @@ class TestTLBEdgeCases:
         assert hit
         # level 不通过 lookup 返回, 但应不影响基本功能
 
-    @pytest.mark.parametrize("inp, exp", [
-        (0xF, "RWXU"),
-        (0b0111, "RWXS"),
-        (0b0101, "R-XS"),
-        (0b0001, "R--S"),
-        (0b0000, "---S"),
-    ])
+    @pytest.mark.parametrize(
+        "inp, exp",
+        [
+            (0xF, "RWXU"),
+            (0b0111, "RWXS"),
+            (0b0101, "R-XS"),
+            (0b0001, "R--S"),
+            (0b0000, "---S"),
+        ],
+    )
     def test_decode_perm_full(self, inp: int, exp: str):
         assert decode_tlb_perm(inp) == exp

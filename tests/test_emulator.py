@@ -1780,13 +1780,13 @@ class TestBusErrorOnUnmappedAccess:
     """通过完整取指-执行流水线触发 Bus error, 验证 PMA 空洞地址访问 -> AccessFault.
 
     模拟 Linux 内核启动中探访未映射 MMIO 地址时发生的 Bus error 场景.
-    与 ``test_trap.py::TestMemoryAccessFaults`` 的区别: 本测试经过
+    与 ``test_trap/test_memory_fault.py::TestMemoryAccessFaults`` 的区别: 本测试经过
     fetch -> decode -> execute -> translate -> PMP -> PMA 完整路径,
     而非直接调用 ``mem_read`` / ``mem_write``.
     """
 
     RAM_BASE = 0x8000_0000
-    HOLE_ADDR = 0x4000_0000  # 非 RAM、非设备 MMIO 的空洞地址
+    HOLE_ADDR = 0x5000_0000  # 非 RAM、非设备 MMIO、非引导只读存储器的空洞地址
 
     @pytest.fixture
     def emu(self) -> Emulator:
@@ -2017,7 +2017,7 @@ class TestClockDecoupling:
     def nop_emu(self) -> Emulator:
         """单 hart 模拟器, 加载 4096 条 NOP — 无 WFI/ECALL/trap.
 
-        时钟源频率固定为 10 MHz, 使换算结果不随 emu-configs.mk 的 TIMER_FREQ 变化.
+        时钟源频率固定为 10 MHz, 使换算结果不随 TIMER_FREQ 变化.
         """
         emu = Emulator(num_harts=1, timebase_freq=10_000_000)
         nops = b"\x13\x00\x00\x00" * 4096  # addi x0, x0, 0

@@ -43,7 +43,9 @@ static void die(const char *msg) {
 	exit(EXIT_FAILURE);
 }
 
-static uint8_t *read_file(const char *path, size_t *size) {
+static uint8_t *read_file(
+	const char *path,
+	size_t *size) {
 	FILE *fp = fopen(path, "rb");
 	if (!fp) {
 		return NULL;
@@ -100,11 +102,11 @@ static void *worker(void *arg) {
 	}
 
 	struct tee_enclave_args args = {
-		.enclave_id	  = enclave_id,
-		.enter.payload_ptr  = (uint64_t)g_payload,
+		.enclave_id			= enclave_id,
+		.enter.payload_ptr	= (uint64_t)g_payload,
 		.enter.payload_size = g_payload_size,
-		.enter.argc		  = 0,
-		.enter.argv_ptr	  = 0,
+		.enter.argc			= 0,
+		.enter.argv_ptr		= 0,
 	};
 
 	// 请求进入可信应用
@@ -181,7 +183,9 @@ static void run_batch(int count) {
 
 /* ---- main ---- */
 
-int main(int argc, char **argv) {
+int main(
+	int argc,
+	char **argv) {
 	if (argc < 2) {
 		fprintf(stderr, "Usage: %s <stress_payload_path>\n", argv[0]);
 		return 1;

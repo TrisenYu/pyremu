@@ -4,8 +4,10 @@
 
 """测试 pyremu.debug.breakpoint — 断点设置/命中检查."""
 
+from rich.console import Console
 
-from pyremu.debug.breakpoint import BreakpointMixin
+from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
+from pyremu.debug.breakpoint import BreakpointOps
 from pyremu.debug.types import Breakpoint
 from pyremu.emulator import Emulator
 
@@ -14,11 +16,10 @@ from pyremu.emulator import Emulator
 # ============================================================
 
 
-class _TestBpDbg(BreakpointMixin):
-    """最小聚合类供 BreakpointMixin 测试."""
+class _TestBpDbg(BreakpointOps):
+    """最小聚合类供 BreakpointOps 测试."""
 
     def __init__(self, emu, hart_id=0):
-        from rich.console import Console
         self._emu = emu
         self._hart_id = hart_id
         self._console = Console(highlight=False)
@@ -39,27 +40,29 @@ class _TestBpDbg(BreakpointMixin):
     def hart(self):
         return self._emu.harts[self._hart_id]
 
-    # Stubs for cross-mixin dependencies
+    # 其余操作类提供的dummy方法
     def _fetch_and_disasm(self, pc):
         return ("00000013", "nop")
 
     def _resolve_addr(self, arg):
         try:
             return int(arg, 0)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return None
 
     def _read_gpr_by_name(self, name):
-        from pyremu.core.registers import gpr_idx_from_name
         idx = gpr_idx_from_name(name)
         return 0 if idx is None else self.hart.read_gpr(idx)
 
     def _read_csr_by_name(self, name):
-        from pyremu.core.registers import csr_addr_from_name
         addr = csr_addr_from_name(name)
         return 0 if addr is None else self.hart.read_csr(addr)
 
     def _resolve_sym_addr(self, va):
+        return None
+
+    def _module_runtime_addr_of_name(self, name):
+        """本测试类不登记符号模块, 按名称查找恒无结果."""
         return None
 
     def _check_rv64_addr(self, v):
@@ -111,8 +114,13 @@ class TestEvalBpCondition:
         dbg = _make_bpdbg()
         dbg.hart.gprs[10] = 42  # a0
         bp = Breakpoint(
-            kind="cond", value=0, desc="test",
-            cond_type="reg", cond_reg="a0", cond_op="==", cond_val=42,
+            kind="cond",
+            value=0,
+            desc="test",
+            cond_type="reg",
+            cond_reg="a0",
+            cond_op="==",
+            cond_val=42,
         )
         assert dbg._eval_bp_condition(dbg.hart, bp)
 
@@ -120,8 +128,13 @@ class TestEvalBpCondition:
         dbg = _make_bpdbg()
         dbg.hart.gprs[10] = 42
         bp = Breakpoint(
-            kind="cond", value=0, desc="test",
-            cond_type="reg", cond_reg="a0", cond_op="==", cond_val=99,
+            kind="cond",
+            value=0,
+            desc="test",
+            cond_type="reg",
+            cond_reg="a0",
+            cond_op="==",
+            cond_val=99,
         )
         assert not dbg._eval_bp_condition(dbg.hart, bp)
 
@@ -129,8 +142,13 @@ class TestEvalBpCondition:
         dbg = _make_bpdbg()
         dbg.hart.gprs[10] = 42
         bp = Breakpoint(
-            kind="cond", value=0, desc="test",
-            cond_type="reg", cond_reg="a0", cond_op="!=", cond_val=99,
+            kind="cond",
+            value=0,
+            desc="test",
+            cond_type="reg",
+            cond_reg="a0",
+            cond_op="!=",
+            cond_val=99,
         )
         assert dbg._eval_bp_condition(dbg.hart, bp)
 
@@ -138,8 +156,13 @@ class TestEvalBpCondition:
         dbg = _make_bpdbg()
         dbg.hart.gprs[10] = 5
         bp = Breakpoint(
-            kind="cond", value=0, desc="test",
-            cond_type="reg", cond_reg="a0", cond_op="<", cond_val=10,
+            kind="cond",
+            value=0,
+            desc="test",
+            cond_type="reg",
+            cond_reg="a0",
+            cond_op="<",
+            cond_val=10,
         )
         assert dbg._eval_bp_condition(dbg.hart, bp)
 
@@ -147,8 +170,13 @@ class TestEvalBpCondition:
         dbg = _make_bpdbg()
         dbg.hart.gprs[10] = 100
         bp = Breakpoint(
-            kind="cond", value=0, desc="test",
-            cond_type="reg", cond_reg="a0", cond_op=">", cond_val=10,
+            kind="cond",
+            value=0,
+            desc="test",
+            cond_type="reg",
+            cond_reg="a0",
+            cond_op=">",
+            cond_val=10,
         )
         assert dbg._eval_bp_condition(dbg.hart, bp)
 
@@ -156,8 +184,13 @@ class TestEvalBpCondition:
         dbg = _make_bpdbg()
         dbg.hart.csrs["mstatus"].val = 0x1800
         bp = Breakpoint(
-            kind="cond", value=0, desc="test",
-            cond_type="csr", cond_reg="mstatus", cond_op="==", cond_val=0x1800,
+            kind="cond",
+            value=0,
+            desc="test",
+            cond_type="csr",
+            cond_reg="mstatus",
+            cond_op="==",
+            cond_val=0x1800,
         )
         assert dbg._eval_bp_condition(dbg.hart, bp)
 

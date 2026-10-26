@@ -40,11 +40,11 @@ CLINT_SIZE = 0xC000  # 48 KiB
 # 遍历 IntSource Enum 并做 dict 查找, profile 显示 Enum.__hash__ 每秒调用 6M 次.
 _INT_PRIORITY: list[tuple[int, IntSource]] = [
     (1 << 11, IntSource.MEI),  # MEIP
-    (1 << 3,  IntSource.MSI),  # MSIP
-    (1 << 7,  IntSource.MTI),  # MTIP
-    (1 << 9,  IntSource.SEI),  # SEIP
-    (1 << 1,  IntSource.SSI),  # SSIP
-    (1 << 5,  IntSource.STI),  # STIP
+    (1 << 3, IntSource.MSI),  # MSIP
+    (1 << 7, IntSource.MTI),  # MTIP
+    (1 << 9, IntSource.SEI),  # SEIP
+    (1 << 1, IntSource.SSI),  # SSIP
+    (1 << 5, IntSource.STI),  # STIP
 ]
 
 # 寄存器偏移

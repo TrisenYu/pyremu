@@ -3,16 +3,19 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 # Created at 2026/06/06 星期六 17:00:47
-# Last modified at 2026/06/09 星期二
+# Last modified at 2026/10/24 星期六
 
 """
-多核 RISC-V 模拟器 — 管理 Bus、CLINT、外设、多个 Hart 的执行流程。
+多核 RISC-V 模拟器 — 管理 Bus、CLINT、外设、多个 Hart 的执行流程.
 
-上电后 hart 从可配置的复位向量 (reset vector) 开始执行。
-裸金属固件应被直接加载到复位向量对应的物理地址。
+上电后 hart 从可配置的复位向量开始执行. 裸金属固件应被直接加载到复位向量
+对应的物理地址.
 
-平台拓扑通过 PlatformConfig 描述, 外设按配置自动创建并注册。
-可选生成 FDT blob (通过 pyfdt) 供固件以 a1 寄存器接收。
+平台拓扑通过 PlatformConfig 描述, 外设按配置自动创建并注册. 可选生成设备树
+二进制数据 (DTB) 供固件以 a1 寄存器接收.
+
+装配、装载、执行循环与加速执行引擎的状态同步分别实现在 pyremu/emu 的四个
+模块中, 本模块只保留构造流程与对外的公开接口.
 
 Usage:
     from pyremu.platform import PlatformConfig
@@ -25,147 +28,40 @@ Usage:
 """
 
 import ctypes
-from enum import IntEnum
-from pathlib import Path
-import random
-import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Any
 
-from pyremu._native import (
-    ClintInfo,
-    DevInfo,
-    FfiExtIrqCtx,
-    FfiUartCtx,
-    native_available,
-    PlicInfo,
-    PmpInfo,
-    run_parallel,
-    RunConfig,
-    termio_set_emu_stop_flag,
-    UartInfo,
-    VirtIOInfo,
-)
-from pyremu.configs_aux import cfg_float, cfg_int
-from pyremu.configs_gen import (
-    CPU_FREQ_HZ,
-    WFI_WATCHDOG_MS,
-)
+from pyremu._native import FfiExtIrqCtx
 from pyremu.core.decoder import Hart
-from pyremu.core.hart import (
-    EXIT_BREAKPOINT,
-    EXIT_EBREAK,
-    EXIT_ECALL,
-    EXIT_MMIO,
-    EXIT_TIMEOUT,
-    EXIT_TRAP,
-    HartState,
-    InstrToBeExec,
-    marshal_hart,
-    unmarshal_hart,
-)
-from pyremu.core.mem_check_aux import (
-    check_instruction_fetch,
-    inject_memory_backend,
-    MemoryAccessError,
-)
-from pyremu.core.trap_def import TrapType
-from pyremu.core.trap_handler import check_pending_interrupts, deliver_trap, try_wfi_wakeup
+from pyremu.emu.load import LoadOps
+from pyremu.emu.native import NativeOps
+from pyremu.emu.run import RunOps, RunStopReason, TimeoutError
+from pyremu.emu.setup import SetupOps
 from pyremu.interrupt.aplic import APLIC
 from pyremu.interrupt.clint import CLINT
-from pyremu.interrupt.imsic import IID_EXT_MIN, IMSIC
+from pyremu.interrupt.imsic import IMSIC
 from pyremu.interrupt.irq_sink import DeviceIrqSink
 from pyremu.interrupt.plic import PLIC
-from pyremu.memory.bus import Bus
-from pyremu.memory.l2cache import L2Cache
 from pyremu.peripheral import (
     CRNG,
     GPIO,
     I2C,
     SPI,
-    TerminalIO,
     UART,
     VirtIOBlock,
     VirtIONet,
 )
-from pyremu.peripheral.uart import UART_IRQ
-from pyremu.peripheral.virtio_blk import VIRTIO_BLK_IRQ
-from pyremu.peripheral.virtio_net import (
-    DEFAULT_VIRTIO_NET_M_MAC,
-    DEFAULT_VIRTIO_NET_S_MAC,
-    VIRTIO_NET_M_IRQ,
-    VIRTIO_NET_S_IRQ,
-)
 from pyremu.peripheral.watchdog import HartWatchdog
-from pyremu.platform import InterruptMode, PeripheralConfig, PlatformConfig
+from pyremu.platform import PeripheralConfig, PlatformConfig
 from pyremu.utils import dtb
-from pyremu.utils.mask import mask64
-from pyremu.utils.parse_bin import FirmwareImage
-from pyremu.utils.tick import yield_cpu
+from pyremu.utils.str_aux import fmt_hexdump
+from pyremu.utils.wrapper import silent_on_err
 
-_WFI_MAX_SLEEP = cfg_float("WFI_MAX_SLEEP")  # 单次最大睡眠秒数, 降低 CPU 占用
-CYCLES_PER_INSTR = cfg_int("NS_PER_INSTR") * CPU_FREQ_HZ // 1_000_000_000
-# 阈值判断: <=2 MiB 的段走 L2 缓存, 更大的段 (如 Linux 内核 Image)
-# 绕过 L2 直写 RAM, 避免 cache-line 级逐片处理膨胀到数十秒.
-_FAST_LOAD_THRESHOLD = cfg_int("FAST_LOAD_THRESHOLD")
+__all__ = ["Emulator", "RunStopReason", "TimeoutError"]
 
 
-def _wrap_phy_write_for_uart(
-    hart_id: int,
-    uart,  # UART | None
-    orig_write: Callable[[int, bytes], None],
-) -> Callable[[int, bytes], None]:
-    """包装物理写回调: hart 写入 UART MMIO 范围时自动标记写者身份.
-
-    UART 据此将 TXDATA 字节归入 hart 日志文件 (set_hart_log_dir).
-    不做行缓冲 — 仅用于多 hart 输出分流归档.
-    """
-    if uart is None:
-        return orig_write
-    uart_base = uart.base_addr
-    uart_end = uart.base_addr + uart.size
-
-    def _write(pa: int, data: bytes) -> None:
-        if uart_base <= pa < uart_end:
-            uart._current_writer = hart_id
-        return orig_write(pa, data)
-
-    return _write
-
-
-class RunStopReason(IntEnum):
-    """run() 停止原因 — 由边界检查或引擎退出映射写入 ``Emulator._run_stop_reason``.
-
-    设备暂停事件 (stop_flag 由外部置位) 不属于本枚举的停止:
-    标志保留给调用方消费, 保持 NONE.
-    """
-
-    NONE = 0  # 设备暂停事件 / 全部 halted / WFI 空闲 / 正常结束
-    TIMEOUT = 1  # 时钟源超时 (单轮加速执行边界复核)
-    BREAKPOINT = 2  # 断点命中 (引擎 EXIT_BREAKPOINT)
-    EBREAK = 3  # 固件执行停机序列 (semihosting SYS_EXIT, 引擎 EXIT_EBREAK)
-
-
-class TimeoutError(RuntimeError):
-    """执行超时, 可能是死循环."""
-
-    def __init__(
-        self,
-        timeout_sec: float,
-        cycles: int,
-        pc: int | None = None,
-    ) -> None:
-        self.timeout_sec = timeout_sec
-        self.cycles = cycles
-        self.pc = pc
-        msg = f"模拟器超时 ({timeout_sec:g}s), 已执行 {cycles} 周期"
-        if pc is not None:
-            msg += f", 最后 PC={pc:#018x}"
-        super().__init__(msg)
-
-
-class Emulator:
+class Emulator(LoadOps, NativeOps, RunOps, SetupOps):
     """多核 RISC-V 模拟器.
 
     管理 N 个 hart, 共享总线、中断控制器和外设.
@@ -198,13 +94,13 @@ class Emulator:
         """
         if config is None:
             config = self._build_default_config(**kwargs)
-        # 编译期 AIA 开关 (PYREMU_AIA=1) 已在 PlatformConfig.__post_init__
-        # 中统一解析, 此处直接消费解析后的 interrupt_mode.
+        # 环境变量 PYREMU_AIA 已在 PlatformConfig.__post_init__ 中解析, 此处直接
+        # 使用解析后的 interrupt_mode.
         self._cfg = config
-        # 默认 bootargs: 内核控制台输出 + 信任 bootloader 随机数种子.
-        # 用户可通过 bootargs=None 显式禁用或传入自定义 bootargs 覆盖.
-        # 调试用途 (日后需要详细内核日志时取消下面注释即可):
+        # bootargs 为 None 时取默认值: 内核控制台输出与信任 bootloader 随机数
+        # 种子; 传入字符串时以传入值为准.
         self._dtb_addr: int | None = None  # 最近一次 load_dtb 的地址
+        self._dtb_size: int = 0  # 最近一次 load_dtb 写入的字节数
         self._bootargs = (
             bootargs
             if bootargs is not None
@@ -219,50 +115,49 @@ class Emulator:
         # 使用, 不写入 mcycle.
         self._cycle = 0
         self._total_instrs = 0
-        # mtime 在 native 加速路径按每 hart 指令增量推进 (Rust advance_clock_source,
-        # 每指令 20ns — 见 NS_PER_INSTR; 低速模拟下若跟随真实流逝, 内核 HZ=250 tick
-        # 无充足指令预算会活锁), 纯 Python 单步路径同样按指令计数推进
-        # (每指令 20ns, 见 _advance_mtime_instr). mcycle 与 minstret 都按各 hart
-        # 的指令数折算 (见 sync_counters), 与上面两条路径无关.  mtime 速率 =
-        # cfg.timebase_freq (与 DTB timebase-frequency 同源), 换算比 =
-        # timebase_freq * 20 / 1e9 (10 MHz -> 5 指令 / tick).
+        # mtime 在加速执行路径按各 hart 的指令增量推进, 见 Rust 的
+        # advance_clock_source, 每条指令计 NS_PER_INSTR 纳秒; 纯 Python 单步路径
+        # 同样按指令计数推进, 见 _advance_mtime_instr. 两条路径都不按真实流逝的
+        # 时间推进: 低速模拟下时钟若跟随真实时间, 内核 HZ=250 的 tick 得不到
+        # 足够的指令预算, 会长期停留于等待. mcycle 与 minstret 按各 hart 的指令
+        # 数折算, 见 sync_counters. mtime 的速率取 cfg.timebase_freq, 与设备树的
+        # timebase-frequency 同源, 换算比为 timebase_freq * NS_PER_INSTR / 1e9,
+        # 10 MHz 时每个 tick 对应 5 条指令.
         self._last_clock_sync: float = time.monotonic()  # _cycle 的时钟源基准
         self._mtime_instr_frac: int = 0  # 指令计数推进 mtime 的亚 tick 余数
-        self._prev_all_exec_cnt: int = 0  # 上一轮加速执行 Rust 累积 total_instrs
-        # initramfs 物理范围 (load_initrd 设置; None=未挂载)。
-        # build_dtb 据此写入 /chosen/linux,initrd-start/end。
+        self._prev_all_exec_cnt: int = 0  # 上一轮加速执行累计的指令数
+        # initramfs 的物理范围, 由 load_initrd 设置, 未加载时为 None;
+        # build_dtb 据此写入 /chosen/linux,initrd-start 与 linux,initrd-end.
         self._initrd: dtb.Initrd | None = None
 
-        # Terminal I/O — 后台线程管理 stdin/stdout, 由 _init_termio 在 UART 就绪后创建
+        # 终端 I/O 管理器, 由 _init_termio 在 UART 就绪后创建; 后台线程管理标准
+        # 输入与标准输出.
         self._termio = None
-        # 资源是否已释放 (close() 幂等标志). 生命周期结束时显式关闭 termio
-        # 管道 fd + UART 日志, 否则每实例泄漏 6 个 fd (见 [[termio-fd-leak-select-poll]]).
+        # 资源是否已释放, 供 close() 幂等使用. 生命周期结束时须显式关闭 termio
+        # 的管道与 UART 日志文件, 否则每个实例泄漏 6 个文件描述符; 进程内的
+        # 描述符编号达到 1024 之后 select() 无法监视.
         self._closed = False
 
-        # 共享停止标志 — 由外部实体经 notify_processor() 写入 (debugger
-        # Ctrl+Q daemon 等), Rust 引擎逐指令检查. 连续执行无指令配额:
-        # Ctrl+Q 是唯一的暂停机制, 暂停时全部 hart 的执行期间状态保留在
-        # live ctypes 数组 (_speedup_hart_states) 中.
+        # 共享停止标志: 外部实体经 notify_processor() 写入, 例如调试器的 Ctrl+Q
+        # 处理, 加速执行引擎逐指令检查. 连续执行不设指令配额, 该标志是暂停执行
+        # 的通道; 暂停时各 hart 的执行状态保留在跨轮保留的 ctypes 数组
+        # _speedup_hart_states 中.
         self._native_stop_flag = ctypes.c_uint8(0)
-        # run() 停止原因 — 由单轮加速执行边界检查 / 引擎退出映射写入
+        # run() 的停止原因, 由单轮加速执行的边界检查与引擎退出映射写入
         self._run_stop_reason: RunStopReason = RunStopReason.NONE
-        # 时钟源超时 deadline (time.monotonic() 秒), 0 = 禁用
+        # 时钟源超时的截止时刻, 单位为 time.monotonic() 的秒数, 取 0 表示禁用
         self._timeout_deadline: float = 0.0
 
-        # 外部中断共享上下文 — stdin daemon 注入 UART 数据后置 pending=1,
-        # Rust 循环检测到后退出以便 Python 同步 PLIC 中断到 mip.
-        # ctypes.Structure 实例构造时字段自动零初始化 (pending/sources/max_priority=0).
+        # 外部中断共享上下文: 接收守护线程写入 UART 数据后置 pending 为 1,
+        # Rust 循环检出后退出本轮, 以便 Python 把 PLIC 中断同步到 mip.
+        # ctypes.Structure 实例构造时字段自动清零.
         self._native_ext_irq = FfiExtIrqCtx()
 
         # WFI 唤醒事件 — 全部 hart 等待时用于阻塞而非轮询
         self._wake_event = threading.Event()
 
         # 共享总线
-        self.bus = Bus(
-            ram_size=config.ram_size,
-            ram_base=config.ram_base,
-            l2_cache=L2Cache(size=config.l2_size),
-        )
+        self.bus = self._create_bus(config)
         # CLINT 设备
         self.clint = CLINT(num_harts=config.num_harts)
         self.clint.base_addr = config.periph.clint_base
@@ -271,12 +166,12 @@ class Emulator:
         self.plic: PLIC | None = None
         self.imsic: IMSIC | None = None
         self.aplic: APLIC | None = None
-        # 设备中断投递目标 — 设备经 on_irq 持有本对象, 不持有 Emulator 的绑定方法,
-        # 理由见 DeviceIrqSink. 中断源编号与中断控制器的对应关系由
-        # _setup_interrupt_controllers 经 set_fallback / bind 登记.
+        # 设备中断投递目标: 设备经 on_irq 持有本对象, 不持有 Emulator 的绑定
+        # 方法, 理由见 DeviceIrqSink. 中断源编号与中断控制器的对应关系由
+        # _setup_interrupt_controllers 经 set_fallback 与 bind 登记.
         self._irq_sink = DeviceIrqSink(self._native_ext_irq, self._wake_event)
-        # 外设 + 看门狗 — 外设按配置创建 (base=0 跳过, 保持 None);
-        # 看门狗恒创建 (非 None), 二者均由 _setup_peripherals 填充.
+        # 外设与看门狗: 外设按配置创建, 基址取 0 时保持 None; 看门狗恒创建.
+        # 二者均由 _setup_peripherals 填充.
         self.uart: UART | None = None
         self.spi: SPI | None = None
         self.i2c: I2C | None = None
@@ -287,306 +182,28 @@ class Emulator:
         self.watchdog: HartWatchdog  # 恒创建, 类型非 Optional
         self.crng: CRNG | None = None
         self._peripherals: dict[str, object] = {}
-        # 全部 hart — 在 _create_harts 中原地填充. 本列表先于 hart 创建而存在,
-        # 使早于 hart 创建的外设 (看门狗) 可直接持有它.
+        # 全部 hart, 由 _create_harts 原地填充. 本列表先于 hart 创建而存在, 使
+        # 早于 hart 创建的外设可直接持有它.
         self.harts: list[Hart] = []
 
         self._setup_interrupt_controllers(config)
         self._setup_peripherals(config)
         self._create_harts(config)
 
-        # speedup execution state
-        self._speedup_hart_states: Any = None  # ctypes HartState array
+        # 加速执行的状态
+        self._speedup_hart_states: Any = None  # ctypes HartState 数组
         self._speedup_instr_group: Any = None  # ctypes InstrToBeExec
         self._native_ram_ptr: int = 0  # RAM 缓冲区首地址
-        self._bp_addrs: list[int] = []  # breakpoint PCs
+        self._bp_addrs: list[int] = []  # 断点地址表
         self._warned_infinite_virtio = False  # 防止 virtio 异常循环时重复告警
-        # WFI 空闲轮询回调: debugger 设为其 stdin 转发函数, 确保用户输入
-        # 能在内核 WFI 等待期间被及时 preload 到 UART RX 并触发中断唤醒。
+        # WFI 空闲轮询回调: 调试器设为其标准输入转发函数, 使内核处于 WFI 等待
+        # 期间用户输入仍能及时写入 UART 接收路径并触发中断唤醒.
         self._stdin_forward_callback: Any = None  # () -> bool
         self._init_termio()
         self._init_for_speedup_lib()
 
-    def _setup_interrupt_controllers(self, config: PlatformConfig) -> None:
-        """按 interrupt_mode 创建并注册中断控制器.
-
-        前置: ``self.plic`` / ``self.imsic`` / ``self.aplic`` 已在 ``__init__``
-        中统一声明为 None, 本函数仅填充当前模式对应的字段.
-
-        - legacy: PLIC, 承担外部中断与外设有线路由
-        - AIA:    IMSIC 承担 MSI 中断, APLIC S 域与 APLIC M 域把有线中断转成 MSI;
-                  M 域实例登记在设备中断投递目标的中断源表下
-        """
-        if config.interrupt_mode == InterruptMode.AIA:
-            p = config.periph
-            self.imsic = IMSIC(
-                num_harts=config.num_harts,
-                m_base_addr=p.imsic_m_base,
-                s_base_addr=p.imsic_s_base,
-                ipi_target=self.clint,  # 路由 IPI 到 CLINT MSIP
-            )
-            self.bus.add_device(self.imsic.m_base_addr, self.imsic)
-
-            self.aplic = APLIC(
-                imsic=self.imsic,
-                base_addr=p.aplic_s_base,
-                num_sources=128,
-            )
-            self.bus.add_device(self.aplic.base_addr, self.aplic)
-            # 未登记的中断源交给 S 域 APLIC.
-            self._irq_sink.set_fallback(self.aplic)
-
-            if p.aplic_m_base:
-                aplic_m = APLIC(
-                    imsic=self.imsic,
-                    base_addr=p.aplic_m_base,
-                    num_sources=128,
-                    is_mmode=True,
-                )
-                self.bus.add_device(aplic_m.base_addr, aplic_m)
-                # 该域没有软件写 MMIO 配置中断源路由: 中断源停留在 inactive 时
-                # set_irq 直接丢弃, 故在此预置网卡中断源的投递目标与使能.
-                # 投递 identity 取外部中断起始值, 不取中断源编号本身: 源号 3 与
-                # M 文件上的软件中断 identity 相同, 该 identity 的 pending 位由
-                # IPI 快路径不经使能位直接投递, 网卡置位会被当作 IPI 认领.
-                aplic_m.bind_source(VIRTIO_NET_M_IRQ, 0, IID_EXT_MIN)
-                self._irq_sink.bind(VIRTIO_NET_M_IRQ, aplic_m)
-            return
-        self.plic = PLIC(
-            base_addr=config.periph.plic_base,
-            num_sources=128,
-            num_contexts=2 * config.num_harts,
-        )
-        self.bus.add_device(self.plic.base_addr, self.plic)
-        # legacy 模式下全部中断源交给 PLIC.
-        self._irq_sink.set_fallback(self.plic)
-
-    def _setup_peripherals(self, config: PlatformConfig) -> None:
-        """按配置创建并注册外设 (base=0 时跳过) + 看门狗设备.
-
-        前置: ``self.uart`` / ``self.spi`` / ``self.i2c`` / ``self.gpio`` /
-        ``self.virtio_blk`` / ``self.virtio_net_{s,m}`` /
-        ``self.watchdog`` 已在 ``__init__`` 中统一声明为 None, 本函数仅填充
-        配置启用的字段.
-        """
-        p = config.periph
-        # 中断路由: AIA 模式 -> APLIC, legacy 模式 -> PLIC
-        int_ctrl = self.plic if self.aplic is None else self.aplic
-        if p.uart_base:
-            self.uart = UART(
-                base=p.uart_base,
-                plic=int_ctrl,
-                irq=UART_IRQ,
-            )
-            self.bus.add_device(p.uart_base, self.uart)
-            self._peripherals["uart"] = self.uart
-        if p.spi_base:
-            self.spi = SPI(base=p.spi_base)
-            self.bus.add_device(p.spi_base, self.spi)
-            self._peripherals["spi"] = self.spi
-        if p.i2c_base:
-            self.i2c = I2C(base=p.i2c_base)
-            self.bus.add_device(p.i2c_base, self.i2c)
-            self._peripherals["i2c"] = self.i2c
-        if p.gpio_base:
-            self.gpio = GPIO(base=p.gpio_base)
-            self.bus.add_device(p.gpio_base, self.gpio)
-            self._peripherals["gpio"] = self.gpio
-        if p.virtio_blk_base and config.disk_image:
-            self.virtio_blk = VirtIOBlock(
-                image_path=config.disk_image,
-                # 主存访问路径取自 MainMem 而不取 Bus: Bus 持有本设备, 设备再持有 Bus
-                # 的绑定方法会使二者之间形成环形引用, 见 Bus.main_mem.
-                mem_read=self.bus.main_mem.read,
-                mem_write=self.bus.main_mem.write,
-                # WFI 阻塞的 hart, 直接调 plic.set_irq 会略过这两步。此处不得改传
-                # raise_device_irq: 绑定方法持有 Emulator, 会与 Emulator 对设备的
-                # 持有构成环形引用, 见 DeviceIrqSink.
-                irq_sink=(VIRTIO_BLK_IRQ, self._irq_sink),
-            )
-            self.bus.add_device(p.virtio_blk_base, self.virtio_blk)
-            self._peripherals["virtio_blk"] = self.virtio_blk
-        if p.virtio_net_s_base:
-            self.virtio_net_s = self._create_virtio_net(
-                p.virtio_net_s_base,
-                VIRTIO_NET_S_IRQ,
-                DEFAULT_VIRTIO_NET_S_MAC,
-            )
-            self._peripherals["virtio_net_s"] = self.virtio_net_s
-        if p.virtio_net_m_base:
-            self.virtio_net_m = self._create_virtio_net(
-                p.virtio_net_m_base,
-                VIRTIO_NET_M_IRQ,
-                DEFAULT_VIRTIO_NET_M_MAC,
-            )
-            self._peripherals["virtio_net_m"] = self.virtio_net_m
-
-        # 看门狗设备 — 多 hart 停滞检测, DTB 可见. 经 clint 与 wake_event 两个对象
-        # 构造, 不传 Emulator, 也不传 hart 列表: 本设备持有其中任何一个都会与
-        # Emulator 对设备的持有构成环形引用. hart 列表在每次 tick 时随参数传入.
-        _wdog_base = p.watchdog_base or 0x1000_4000
-        self.watchdog = HartWatchdog(
-            clint=self.clint,
-            wake_event=self._wake_event,
-            base=_wdog_base,
-            num_harts=config.num_harts,
-        )
-        self.bus.add_device(_wdog_base, self.watchdog)
-        self._peripherals["watchdog"] = self.watchdog
-
-        # 随机数生成器 — 运行期熵源, DTB 可见 (pyremu,crng)
-        if p.crng_base:
-            self.crng = CRNG(base=p.crng_base)
-            self.bus.add_device(p.crng_base, self.crng)
-            self._peripherals["crng"] = self.crng
-
-    def _create_virtio_net(
-        self,
-        base: int,
-        irq: int,
-        mac: bytes,
-    ) -> VirtIONet:
-        """按 MMIO 基址、中断源编号与 MAC 创建一个 virtio-net 实例并注册到总线.
-
-        中断经设备中断投递目标投递: 该目标除置位中断控制器外还通知加速执行引擎并
-        唤醒 WFI 阻塞的 hart, 直接调控制器 set_irq 会略过这两步.
-
-        主存访问路径取自 MainMem 而不取 Bus: Bus 持有本设备, 设备再持有 Bus 的绑定
-        方法会使二者之间形成环形引用, 见 Bus.main_mem.
-        """
-        net = VirtIONet(
-            mem_read=self.bus.main_mem.read,
-            mem_write=self.bus.main_mem.write,
-            mac=mac,
-            on_irq=self._irq_sink,
-            irq=irq,
-        )
-        self.bus.add_device(base, net)
-        return net
-
-    def _create_harts(self, config: PlatformConfig) -> None:
-        """按配置创建全部 hart, 注入内存后端与中断控制器, 并原地填入 ``self.harts``.
-
-        前置: ``self.bus`` / ``self.clint`` / ``self.uart`` 与
-        ``_setup_interrupt_controllers`` 填充的控制器字段均已就绪;
-        ``self.harts`` 已声明为空列表, 本函数只向其追加, 不另建列表.
-        """
-        for i in range(config.num_harts):
-            h = Hart(id=i, pmp_entries=config.pmp_entries)
-            h.pc = config.prog_cnt
-            inject_memory_backend(
-                h,
-                self.bus.read,
-                _wrap_phy_write_for_uart(h.id, self.uart, self.bus.write),
-            )
-            h.bus = self.bus
-            h.interrupt_ctrl = self.clint
-            h.plic = self.plic
-            h.imsic = self.imsic
-            self.harts.append(h)
-
-        # 互引用: 每个 hart 持有全 hart 列表, 供 mfence.did 等广播操作
-        for h in self.harts:
-            h.all_harts = self.harts
-
-    def _init_termio(self) -> None:
-        """初始化终端 I/O 管理器 (Terminal I/O).
-
-        封装 Rust termio 后台线程
-        (或 Python 回退), 持续转发 stdin->UART RX 和 UART TX->stdout。
-        UART 此时已构造完毕 (见 __init__ 顺序), 可安全注入。
-        """
-        if self.uart is None or self._termio is not None:
-            return
-        try:
-            stdin_fd = sys.stdin.fileno()
-            stdout_fd = sys.stdout.fileno()
-        except OSError, ValueError:
-            return
-        self._termio = TerminalIO(
-            uart=self.uart,
-            wake_event=self._wake_event,
-            stdio_fds=(stdin_fd, stdout_fd),
-            ext_irq=self._native_ext_irq,
-            # RX 排空路径经设备中断投递目标同步 PLIC: 设备线程必须 write-through
-            # 持久 PLIC 数组, 否则 batch 内 Rust 内联仲裁看不到新到达的 UART
-            # 数据, plic_recompute_mip 覆盖 SEIP -> UART 中断丢失 -> 输入冻结.
-            on_irq=self._irq_sink,
-        )
-        self.uart.termio = self._termio
-        # 把 CPU 引擎停止标志地址注入 termio 线程 — Ctrl+Q 时由 termio 直接
-        # 置位 (与 rx_notify 同模式, 零 Python 往返), 绕过 SIGINT -> Python
-        # handler -> notify_processor 路径。主线程阻塞于 run_parallel 时信号
-        # 处理器不执行, 直连置位保证 Rust 引擎看门狗仍能即时感知停止请求。
-        termio_set_emu_stop_flag(ctypes.addressof(self._native_stop_flag))
-
-    def _init_for_speedup_lib(self) -> None:
-        """Initialise the acceleration infrastructure.
-
-        Called once during ``__init__``.  Sets up ctypes arrays mirroring the
-        Rust ``HartState`` / ``InstrToBeExec`` structs and wraps the bus RAM
-        ``bytearray`` as a ctypes pointer the FFI layer can read/write.
-
-        """
-        # 隐式禁用: 环境变量未显式设置 且 非交互式 (无 TTY termio)
-        # -> 避免后台线程泄漏 + 内存膨胀.
-        self._native_uart_ffi: Any = None
-        if self._termio is None or not native_available():
-            return
-
-        self._speedup_instr_group = InstrToBeExec()
-
-        num_harts = len(self.harts)
-        self._speedup_hart_states = (HartState * num_harts)()
-        # IMSIC 写穿目标 — 与 PLIC 的 _ffi_pending/_ffi_level 同一模式: 设备线程
-        # 经 set_ip_number 注入的 eip 必须落在引擎正在读的这份数组上, 否则 AIA
-        # 模式下外部中断要等到轮边界 _native_sync_plic_mip 才可见 (输入回显
-        # 延迟以百毫秒计).
-        if self.imsic is not None:
-            self.imsic.bind_ffi_states(self._speedup_hart_states)
-        # TLB 刷新计数的两处存放位置: 全局计数由总线持有, 各 hart 上次见到的取值
-        # 由本数组持有. 两者跨 FFI 调用保留, 引擎据此在两次调用之间沿用既有的翻译
-        # 条目; 使条目失效的动作无论发生在哪一侧都计入该计数.
-        self._tlb_flush_cnt_per_hart = (ctypes.c_uint64 * num_harts)()
-        self._tlb_flush_cnt_before: int = self.bus.tlb_flush_cnt.value
-
-        self._clint_msip_edge: list[int] = [0] * num_harts
-        self._clint_msip_prev: list[int] = [0] * num_harts
-        self._clint_mtimecmp_arr = (ctypes.c_uint64 * 0)()
-        self._clint_msip_arr = (ctypes.c_uint8 * 0)()
-
-        ram = self.bus._ram  # bytearray
-        # 首地址用 ctypes.addressof 取得; 取地址不用 ctypes.cast, 后者会与所转换的缓冲区
-        # 构成引用环.
-        self._native_ram_ptr = ctypes.addressof(ctypes.c_uint8.from_buffer(ram))
-
-        self._pmp_num: int = 0
-        self._pmp_cfg_buf = (ctypes.c_uint8 * 0)()
-        self._pmp_addr_buf = (ctypes.c_uint64 * 0)()
-
-        # PLIC 持久 ctypes 数组 — Rust inline 读写。与 CLINT 每轮 marshal
-        # 重分配不同: 必须跨 batch 持久, 否则设备线程写向的数组与 run_parallel
-        # 读取的不是同一份, batch 内新设备中断对 Rust 不可见。
-        # pending/level 由 PLIC 对象持有 (_ffi_pending/_ffi_level), set_irq 时
-        # 直接写穿; 本处仅保留 priority/enable/threshold/claimed — 由
-        # _native_marshal_plic 在尺寸变化时才重分配.
-        self._plic_base: int = 0
-        self._plic_num_sources: int = 0
-        self._plic_num_contexts: int = 0
-        self._plic_priority_arr = (ctypes.c_uint8 * 0)()
-        self._plic_enable_arr = (ctypes.c_uint32 * 0)()
-        self._plic_threshold_arr = (ctypes.c_uint8 * 0)()
-        self._plic_claimed_arr = (ctypes.c_uint32 * 0)()
-
-        # UART 持久 ctypes 上下文 — 与 PLIC 持久数组同理须跨 batch 保持同一份:
-        # Rust 内联应答受调试程序的 IP 读时, 数据源必须是设备侧持续更新的那个对象,
-        # 而非每轮重新构建的快照, 否则 batch 内新到的输入对受调试程序不可见.
-        if self.uart is not None:
-            self._native_uart_ffi = FfiUartCtx()
-            self.uart._ffi_ctx = self._native_uart_ffi
-
     # ----------------------------------------------------------
-    #  平台
+    #  公开属性
     # ----------------------------------------------------------
 
     @property
@@ -597,13 +214,53 @@ class Emulator:
     def peripherals(self) -> dict[str, object]:
         return self._peripherals
 
-    def close(self) -> None:
-        """释放本 Emulator 占用的全部 I/O 资源 (幂等).
+    @property
+    def dtb_addr(self) -> int | None:
+        """最近一次写入设备树的物理地址; 未写入时为 None."""
+        return self._dtb_addr
 
-        生命周期结束 (调试器退出 / 测试 teardown / GC) 时调用:
-        ``TerminalIO.stop()`` 停止后台线程并关闭 3 个管道 (6 个 fd), 再关闭
-        UART hart 日志文件。fd 不释放时每个实例占用 6 个, 进程内 fd 号达到 1024
-        之后 select() 无法监视该 fd。``__del__`` 释放未显式 close 的实例。
+    @property
+    def dtb_size(self) -> int:
+        """最近一次写入的设备树字节数; 未写入时为 0."""
+        return self._dtb_size
+
+    @property
+    def initrd(self) -> dtb.Initrd | None:
+        """initramfs 的物理范围; 未加载时为 None."""
+        return self._initrd
+
+    @property
+    def num_harts(self) -> int:
+        return self._cfg.num_harts
+
+    @property
+    def cycle(self) -> int:
+        return self._cycle
+
+    @property
+    def total_instructions(self) -> int:
+        return self._total_instrs
+
+    @property
+    def prog_cnt(self) -> int:
+        return self._cfg.prog_cnt
+
+    @property
+    def irq_route(self) -> dict[int, APLIC | PLIC]:
+        """中断源编号与中断控制器的对应关系, 由 _setup_interrupt_controllers 填充."""
+        return self._irq_sink.irq_route
+
+    # ----------------------------------------------------------
+    #  生命周期与外部接口
+    # ----------------------------------------------------------
+
+    def close(self) -> None:
+        """释放本 Emulator 占用的全部输入输出资源; 重复调用不产生效果.
+
+        调试器退出、测试清理与对象回收时调用. TerminalIO.stop() 停止后台线程
+        并关闭 3 个管道, 共 6 个文件描述符; 随后关闭 UART 的 hart 日志文件.
+        不释放时每个实例占用 6 个文件描述符, 进程内的描述符编号达到 1024 之后
+        select() 无法监视.
         """
         if self._closed:
             return
@@ -613,209 +270,18 @@ class Emulator:
         if self.uart is not None:
             self.uart.close_logs()
 
+    @silent_on_err
     def __del__(self) -> None:
-        """对象回收时释放资源: 未显式调用 close() 的实例在此释放 fd."""
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    def build_dtb(self) -> bytes:
-        """基于当前平台配置, 通过 libfdt 构建 DTB blob.
-
-        固件可将此 blob 加载到 RAM 并通过 a1 寄存器接收其地址.
-        """
-        devices = dtb.DtbDevices(
-            uart=self.uart,
-            spi=self.spi,
-            i2c_gen=self.i2c,
-            gpio=self.gpio,
-            virtio_blk=self.virtio_blk,
-            virtio_net_s=self.virtio_net_s,
-            watchdog=self.watchdog,
-            crng=self.crng,
-            plic=self.plic,
-            imsic=self.imsic,
-            aplic_s=self.aplic,
-        )
-        return dtb.build_dtb(
-            self._cfg,
-            devices=devices,
-            bootargs=self._bootargs,
-            initrd=self._initrd,
-            reserved_ranges=self._cfg.reserved_memory_ranges,
-        )
-
-    def load_dtb(
-        self,
-        addr: int,
-    ) -> None:
-        """生成 DTB, 写入 RAM, 并将地址写入所有 hart 的 a1 (x11).
-
-        遵循 RISC-V 引导约定: firmware 入口时 a1 指向设备树 blob.
-        """
-        dtb = self.build_dtb()
-        self.load_dtb_blob(addr, dtb)
-
-    def load_dtb_file(
-        self,
-        path: str,
-        addr: int | None = None,
-    ) -> None:
-        """加载预编译的 DTB 文件到 RAM, 并将地址写入所有 hart 的 a1.
-
-        *addr* 为 None 时自动放在 RAM 顶端 − 64 KiB.
-        """
-        if addr is None:
-            addr = self._cfg.ram_base + self._cfg.ram_size - 0x10000
-        dtb = Path(path).read_bytes()
-        self.load_dtb_blob(addr, dtb)
-
-    def load_dtb_blob(
-        self,
-        addr: int,
-        dtb: bytes,
-    ) -> None:
-        """将 *dtb* 写入 RAM 的 *addr*, 并设所有 hart 的 a1."""
-        self._dtb_addr = addr
-        self.load_code(addr, dtb)
-        for hart in self.harts:
-            hart.write_gpr(11, addr)
-
-    # ----------------------------------------------------------
-    #  代码加载
-    # ----------------------------------------------------------
-
-    def load_initrd(
-        self,
-        path: str,
-        addr: int,
-    ) -> dtb.Initrd:
-        """将 initramfs (cpio[.gz]) 加载到 RAM 的 *addr*, 记录物理范围.
-
-        返回 Initrd(start, end); 随后 build_dtb 会把该范围写入
-        /chosen/linux,initrd-start / -end 供内核解包为 rootfs。
-        必须在生成 DTB 之前调用 (范围需进入设备树)。
-        """
-        data = Path(path).read_bytes()
-        self.load_code(addr, data)
-        self._initrd = dtb.Initrd(start=addr, end=addr + len(data))
-        return self._initrd
-
-    def load_code(
-        self,
-        addr: int,
-        code: bytes,
-    ) -> None:
-        """将机器码写入物理 RAM 的指定地址.
-
-        裸金属程序应加载到复位向量对应的地址.
-
-        优先写入 bytearray (Rust读取路径); 仅对小段 (< 2 MiB)
-        预热 L2 缓存 (Python 路径受益), 避免大段逐 cache-line 拷贝膨胀到数十秒.
-        """
-        self.bus.write_ram_direct(addr, code)
-        if len(code) <= _FAST_LOAD_THRESHOLD:
-            self.bus.write(addr, code)
-
-    def _write_segment(self, seg, vaddr_offset: int, threshold: int) -> None:
-        """Write a single firmware segment (data + BSS zero-fill) to RAM.
-
-        始终写入 bytearray (加速动态库的直接读取源);
-        对小段同时写入 L2 以预热缓存 (Python 路径受益).
-        """
-        vaddr = seg.vaddr + vaddr_offset
-
-        # 加速动态库读取路径的数据源
-        self.bus.write_ram_direct(vaddr, seg.data)
-        # 小段预热 L2
-        if len(seg.data) <= threshold:
-            self.bus.write(vaddr, seg.data)
-
-        if seg.memsz > len(seg.data):
-            zero_pad = seg.memsz - len(seg.data)
-            zp_addr = vaddr + len(seg.data)
-            self.bus.write_ram_direct(zp_addr, b"\x00" * zero_pad)
-            if zero_pad <= threshold:
-                self.bus.write(zp_addr, b"\x00" * zero_pad)
-
-    def load_firmware(
-        self,
-        image: FirmwareImage | None,
-        load_offset: int = 0,
-    ) -> None:
-        """加载由 parse_firmware() 解析得到的固件镜像.
-
-        将镜像的所有内存段写入物理 RAM, 并将所有 hart
-        的 PC 设置为镜像的入口地址 (均加 *load_offset*).
-
-        *load_offset* 用于 PIE 固件搬迁: 当 ELF 段链接地址为 0x0
-        但 RAM 从 0x80000000 开始时, 传入 load_offset=ram_base
-        即可将各段上移.
-        """
-        if image is None:
-            raise ValueError("载入了无效的镜像")
-
-        for seg in image.segments:
-            self._write_segment(seg, load_offset, _FAST_LOAD_THRESHOLD)
-
-        # 若 load_offset ≠ 0, 施加 PIE 装载偏移:
-        # 固件链接在低地址 (VMA), 但 RAM 在高地址.
-        # S-mode mret 用 VMA 作为目标地址, 需要 VMA 也能访问同一 RAM.
-        if load_offset != 0 and image.segments:
-            for seg in image.segments:
-                self._write_segment(seg, 0, _FAST_LOAD_THRESHOLD)
-            link_min = min(seg.vaddr for seg in image.segments)
-            link_max = max(seg.vaddr + seg.memsz for seg in image.segments)
-            self.bus.apply_pie_ofs(link_min, link_max - link_min)
-
-        # 将所有 hart 的 PC 设置为入口地址
-        for hart in self.harts:
-            hart.pc = image.entry_point + load_offset
-
-        # 装入的段覆盖了既有的内存内容, 两个 TLB 中既有的翻译一律作废: 页表本身
-        # 可能就在被覆盖的范围内.
-        for hart in self.harts:
-            hart.itlb.flush_all()
-            hart.dtlb.flush_all()
-        self.bus.note_tlb_flush()
-
-    # ----------------------------------------------------------
-    #  执行
-    # ----------------------------------------------------------
-
-    @staticmethod
-    def _handle_native_sys_exit(hart: Hart, instr: int) -> int:
-        """Execute one instruction deferred by the Rust speedup execution engine.
-
-        Returns 1 if an instruction was executed, 0 if it was a no-op
-        (instr == 0 or WFI wake).
-        """
-        if instr == 0:
-            return 0
-        saved_pc = hart.pc
-        try:
-            advance = hart.exec_instr(instr)
-        except NotImplementedError, MemoryAccessError:
-            deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
-            advance = 0
-        if advance != 0 and hart.pc == saved_pc:
-            hart.pc = mask64(hart.pc + advance)
-        if not hart._halted:
-            check_pending_interrupts(hart)
-        return 0 if hart._wfi_woken else 1
-
-    # ----------------------------------------------------------
-    #  acceleration fast path
-    # ----------------------------------------------------------
+        """对象回收时释放资源: 未显式调用 close() 的实例在此释放文件描述符."""
+        self.close()
 
     def notify_processor(self) -> None:
-        """处理器通知接口 — 外部实体请求处理器暂停执行.
+        """通知处理器暂停执行.
 
-        暴露给所有外部实体 (看门狗设备/磁盘/串口/调试器 Ctrl+Q daemon):
-        置 stop_flag (Rust 引擎逐指令检查, 单轮加速执行内即可退出) 并唤醒 WFI 阻塞.
-        模拟器自身不内置看门狗线程 — 需要定时/条件暂停的外部设备通过
-        本接口通知处理器, 这是打断连续执行的唯一通道.
+        供看门狗设备、磁盘、串口与调试器的 Ctrl+Q 处理等外部实体调用: 置
+        stop_flag, 加速执行引擎逐指令检查该标志, 在本轮加速执行内退出, 并唤醒
+        处于 WFI 等待的 hart. 模拟器自身不设定时停机的线程, 需要按时间或条件
+        暂停的外部设备都经本接口通知处理器; 这是打断连续执行的唯一通道.
         """
         self._native_stop_flag.value = 1
         self._wake_event.set()
@@ -829,920 +295,18 @@ class Emulator:
         if addr not in self._bp_addrs:
             self._bp_addrs.append(addr)
 
-    @property
-    def irq_route(self) -> dict[int, APLIC | PLIC]:
-        """中断源编号与中断控制器的对应关系, 由 _setup_interrupt_controllers 填充."""
-        return self._irq_sink.irq_route
-
     def raise_device_irq(self, source: int, pending: bool = True) -> None:
-        """设备中断注入接口 — 外部调用方 (磁盘/串口/网卡/看门狗) 修改中断线电平.
+        """修改中断线的电平, 供磁盘、串口、网卡与看门狗等外部调用方使用.
 
-        转交设备中断投递目标处理, 后者按中断源编号选中处理该中断源的控制器, 写其
-        挂起状态并置 ext_irq 通知位. 设备自身持有的是 ``self._irq_sink``, 理由见
-        DeviceIrqSink; 本方法供 Emulator 之外的调用方使用.
+        转交设备中断投递目标处理: 后者按中断源编号选中处理该中断源的控制器,
+        写入其挂起状态并置 ext_irq 通知位. 设备自身持有的是 ``self._irq_sink``,
+        理由见 DeviceIrqSink; 本方法供 Emulator 之外的调用方使用.
         """
         self._irq_sink(source, pending)
 
-    def _speedup_for_cmd_step(self, active: list[Hart]) -> int:
-        # 将 L2 缓存的脏行回写到 bytearray, 使加速执行引擎直接读取 bytearray 中的指令
-        # 与数据时, 能看到 Python 侧的全部写入.
-        self.bus.flush_l2()
-
-        # 全部 hart 都要传送, 包括已停机的: Rust 侧统计 total_instrs 与 active_hart_num
-        # 时用得到每个 hart 的状态.
-        # RX 守护线程已在后台持续将输入搬进 UART FIFO, 不消费 _rx_notify; _rx_notify 由
-        # Rust 加速执行引擎检测, 检出即退出本轮, 随后在空闲轮询中清零.
-        # 进入本轮前先把 PLIC 外部中断 (MEIP/SEIP) 同步进各 hart 的 mip: 加速执行引擎内部
-        # 只同步 CLINT (MSIP/MTIP), 不感知 PLIC, 否则 virtio 等外设中断永远到不了 hart。
-        self._native_sync_plic_mip()
-        for i, hart in enumerate(self.harts):
-            marshal_hart(hart, self._speedup_hart_states[i])
-
-        dev_info = self._native_marshal_dev()
-        pmp_info = self._native_marshal_pmp(active)
-        clint_info = self._native_marshal_clint()
-        uart_info = self._native_marshal_uart()
-        virtio_info = self._native_marshal_virtio()
-        plic_info = self._native_marshal_plic()
-
-        # PIE 链接地址区间随本轮回传给加速执行引擎, 引擎按同一换算访问 RAM.
-        pie_ofs_base, pie_ofs_size = self.bus.pie_ofs_pair()
-
-        # 统一使用 run_parallel (thread-per-hart 并发引擎)。
-        virtio_ffi = run_parallel(
-            RunConfig(
-                states=self._speedup_hart_states,
-                num_harts=len(self.harts),
-                ram_ptr=self._native_ram_ptr,
-                ram_size=self.bus.ram_size,
-                ram_base=self.bus.ram_base,
-                shadow_base=pie_ofs_base,
-                shadow_size=pie_ofs_size,
-                result=self._speedup_instr_group,
-                pmp=pmp_info,
-                clint=clint_info,
-                dev=dev_info,
-                uart=uart_info,
-                virtio=virtio_info,
-                plic=plic_info,
-                watchdog_timeout_ns=self._watchdog_timeout_ns(),
-                bp_addrs=self._bp_addrs if self._bp_addrs else None,
-                stop_flag=self._native_stop_flag,
-                ext_irq=self._native_ext_irq,
-                flush_cnt=self.bus.tlb_flush_cnt,
-                flush_cnt_per_hart=self._tlb_flush_cnt_per_hart,
-            )
-        )
-
-        result = self._speedup_instr_group
-        # Level-triggered ext_irq: only clear when ring buffer + UART FIFO
-        # are both empty.  Otherwise new data that arrived during the acceleration
-        # (between drain_rx and Rust's ext_irq check) would be missed.
-        ring_empty = True
-        if self._termio is not None:
-            rd = self._termio._rx_rd.value
-            wr = self._termio._rx_wr.value
-            ring_empty = rd == wr
-        fifo_empty = self.uart is not None and len(self.uart._rx_fifo) == 0
-        if ring_empty and fifo_empty:
-            self._native_ext_irq.pending = 0
-        # _rx_notify 的唯一作用是让引擎尽快退出本轮, 退出后 Python 才能把
-        # ring buffer 的字节搬进 UART FIFO。本轮既已结束, 通知即已兑现, 无条件
-        # 清零 — 若等 ring buffer 与 UART FIFO 皆空才清 (旧行为), 在 UART FIFO
-        # 满或受调试程序关中断的窗口内, 下一轮会在第一条指令之前立即退出,
-        # 受调试程序得不到任何执行机会而活锁, 每轮指令数恒为 0.
-        # 尚未搬运的字节仍留在 ring buffer, 由每轮 _feed_uart_stdin 与 RX daemon
-        # 继续搬运, 不丢失; termio 线程写入新字节时会重新置位。
-        if self._termio is not None:
-            self._termio._rx_notify.value = 0
-        for hid in range(len(self.harts)):
-            unmarshal_hart(self._speedup_hart_states[hid], self.harts[hid])
-
-        # 本轮引擎内可能执行了使翻译条目失效的动作: 受调试程序执行 SFENCE.VMA
-        # 或改写 satp. 计数发生变化时把 Python 侧的两个 TLB 全部作废, 否则沿用
-        # 既有条目.
-        flush_cnt_after = self.bus.tlb_flush_cnt.value
-        if flush_cnt_after != self._tlb_flush_cnt_before:
-            for hart in self.harts:
-                hart.itlb.flush_all()
-                hart.dtlb.flush_all()
-        self._tlb_flush_cnt_before = flush_cnt_after
-
-        # Rust 加速执行期间可能直接修改了 bytearray; 使 L2 缓存全部失效,
-        # 强制 Python 侧后续读取从 bytearray 重新加载.
-        self.bus.invalidate_l2()
-
-        self._native_unmarshal_pmp()
-        # TX ring buffer 归档由 _tx_archive daemon 异步处理,
-        # 不在此处同步调用 — UART I/O 与单轮加速执行循环完全解耦.
-        self._native_unmarshal_clint(clint_info)
-        self._native_unmarshal_plic(plic_info)
-
-        # mtime 已由 Rust 引擎执行期间按指令增量推进 (advance_clock_source),
-        # 此处不再重复推进; _cycle 记录时钟源流逝, 供 run() 返回值与 cycle
-        # 属性使用, 不写入 mcycle.
-        self._advance_mcycle()
-
-        # CLINT._msip 的电平回写由 _native_unmarshal_clint 完成: 受调试程序的 handler
-        # 写 0 清除 MSIP 时, Rust 侧 clint_write_msip_concurrent 同步
-        # fetch_and(0xFE) 清零 msip 数组的电平位, unmarshal 据此把
-        # CLINT._msip 恢复为 batch 结束时的真实电平 (0 = 已确认)。
-        #
-        # 注意: 此处不得按 batch 前的旧电平反向清除 CLINT._msip。若 batch
-        # 前 MSIP 已挂起, 执行期间旧 IPI 的 handler 写 0 清电平, 随后另一
-        # hart 又写入新 IPI (电平重新置 1), 而目标 hart 的 sync_msip 尚未
-        # 消费该电平 (mip.MSIP == 0), 则 unmarshal 读到的电平 1 代表一个
-        # 真实挂起、尚未确认的 IPI, 必须保留到下一轮 batch 投递。若按旧电平
-        # 清除, 该新 IPI 被永久丢弃, 发送方永远自旋在 OpenSBI tlb_sync
-        # 等待确认 -> TLB-shootdown 死锁。
-
-        self._native_unmarshal_virtio(virtio_ffi)
-
-        all_exec_cnt = result.total_instrs
-        all_exec_cnt = self._native_handle_exit(result, all_exec_cnt)
-        return self._native_finalize(all_exec_cnt)
-
-    # ---- _speedup_for_cmd_step 分解: marshal-in / unmarshal-out / 收尾 ----
-
-    def _native_sync_plic_mip(self) -> None:
-        """将各 hart 的 PLIC 挂起外部中断合并进其 mip (MEIP bit11 / SEIP bit9)。
-
-        加速执行引擎内部只 `sync_msip`/`sync_mtip` (CLINT), 不感知 PLIC。设备的 MMIO
-        访问已退出到 Python 侧处理, 故每次进入单轮加速执行前在此从 PLIC 刷新
-        MEIP/SEIP, 否则 virtio 完成中断永远到不了 hart。MEIP/SEIP 纯由 PLIC 驱动,
-        同步时直接替换这两位, 其余软件置位保持不变。
-        """
-        ext_mask = (1 << 9) | (1 << 11)
-        for hart in self.harts:
-            if hart._imsic is None and hart._plic is None:
-                continue
-            ext_mip = 0
-            if hart._imsic is not None:
-                ext_mip = hart._imsic.get_pending_mip(hart.id)
-            if ext_mip == 0 and hart._plic is not None:
-                ext_mip = hart._plic.get_pending_mip(hart.id)
-            hart.mip_val = (hart.mip_val & ~ext_mask) | ext_mip
-
-    def _native_marshal_plic(self) -> PlicInfo | None:
-        """将 Python PLIC 状态复制进持久 ctypes 数组, 返回 PlicInfo 供 Rust 内联.
-
-        pending/level 由 PLIC 对象持有 (``_ffi_pending``/``_ffi_level``),
-        ``set_irq`` 每次改线实时写穿, 故此处无需复制。priority/enable/
-        threshold/claimed 由本处 marshal — 与 ClintInfo 每轮重新分配不同,
-        数组跨 batch 持久 (尺寸不变时不重分配), 设备中断投递目标
-        经 ``plic.set_irq`` 写穿的是同一批数组, batch 内新到达的设备中断对
-        Rust inline 仲裁可见. 仅在 num_sources/num_contexts 变化 (配置切换)
-        时重分配.
-        """
-        plic = self.plic
-        if plic is None:
-            return None
-        ns = plic._num_sources
-        nc = plic._num_contexts
-        nw = (ns + 31) // 32
-        if len(self._plic_priority_arr) != ns + 1 or len(self._plic_enable_arr) != nc * nw:
-            self._plic_priority_arr = (ctypes.c_uint8 * (ns + 1))()
-            self._plic_enable_arr = (ctypes.c_uint32 * (nc * nw))()
-            self._plic_threshold_arr = (ctypes.c_uint8 * nc)()
-            self._plic_claimed_arr = (ctypes.c_uint32 * nc)()
-        # marshal: Python PLIC 状态 -> 持久数组 (source 0 保留位保持 0)。
-        # pending/level 由 set_irq 实时写穿 _ffi_pending/_ffi_level, 此处无需复制.
-        for i in range(1, ns + 1):
-            self._plic_priority_arr[i] = plic._priority[i] & 0x7
-        for c in range(nc):
-            for w in range(nw):
-                word = 0
-                base = w * 32
-                for b in range(32):
-                    src = base + b
-                    if 0 < src <= ns and plic._enable[c][src]:
-                        word |= 1 << b
-                self._plic_enable_arr[c * nw + w] = word
-            self._plic_threshold_arr[c] = plic._threshold[c] & 0x7
-            self._plic_claimed_arr[c] = plic._claimed[c]
-        self._plic_base = plic.base_addr
-        self._plic_num_sources = ns
-        self._plic_num_contexts = nc
-        return PlicInfo(
-            base=plic.base_addr,
-            num_sources=ns,
-            num_contexts=nc,
-            priority=self._plic_priority_arr,
-            pending=plic._ffi_pending,
-            level=plic._ffi_level,
-            enable=self._plic_enable_arr,
-            threshold=self._plic_threshold_arr,
-            claimed=self._plic_claimed_arr,
-        )
-
-    def _native_unmarshal_plic(self, plic_info: PlicInfo | None) -> None:
-        """将 Rust 内联写回的持久数组同步到 Python PLIC 对象.
-
-        claim/complete/priority/enable/threshold 在 batch 内由 Rust 直接修改数组,
-        边界处反向复制, 使下一轮 ``_native_sync_plic_mip`` 读到的是 batch 后的
-        真实仲裁状态 (而非 batch 前快照).
-        """
-        if plic_info is None or self.plic is None:
-            return
-        plic = self.plic
-        ns = plic._num_sources
-        nc = plic._num_contexts
-        nw = (ns + 31) // 32
-        for i in range(1, ns + 1):
-            plic._priority[i] = self._plic_priority_arr[i] & 0x7
-            plic._pending[i] = bool(plic._ffi_pending[i])
-            plic._level[i] = bool(plic._ffi_level[i])
-        for c in range(nc):
-            for w in range(nw):
-                word = self._plic_enable_arr[c * nw + w]
-                base = w * 32
-                for b in range(32):
-                    src = base + b
-                    if 0 < src <= ns:
-                        plic._enable[c][src] = bool(word & (1 << b))
-            plic._threshold[c] = self._plic_threshold_arr[c] & 0x7
-            plic._claimed[c] = self._plic_claimed_arr[c]
-
-    def _native_marshal_dev(self) -> DevInfo:
-        """设备 MMIO 地址范围 -> DevInfo (供 Rust 判定 MMIO 直通)."""
-        devices = self.bus.devices
-        dev_bases = (ctypes.c_uint64 * 0)()
-        dev_ends = (ctypes.c_uint64 * 0)()
-        if devices:
-            dev_bases = (ctypes.c_uint64 * len(devices))()
-            dev_ends = (ctypes.c_uint64 * len(devices))()
-            for j, (base, dev) in enumerate(sorted(devices.items())):
-                dev_bases[j] = base
-                dev_ends[j] = base + dev.size
-        return DevInfo(bases=dev_bases, ends=dev_ends)
-
-    def _native_marshal_pmp(self, active: list[Hart]) -> PmpInfo:
-        """构建每个 hart 各占一个切片的 PMP 缓冲, 连续存放 num_harts * 64 项。
-
-        每个 hart 有独立的 PMP, hart h 的条目位于 [h*64, h*64+64); 加速执行引擎按
-        hart_id 偏移取各自切片。
-
-        不得让多个 hart 共享同一 PMP 缓冲: SMP 启动时各 hart 在各自的 `run_parallel`
-        线程中并发重写自己的 PMP, 共享缓冲会造成数据竞争, 一个 hart 取指时可能读到
-        另一个 hart 刚写下的条目, 其地址不在这些条目覆盖的范围内, 因而触发访问故障
-        (cause=1, 多出现在 handle_exception 入口)。参见 CHANGELOG 2026-07-14。
-        """
-        total = len(self.harts)
-        ref_pmp = self.harts[0]._pmp
-        self._pmp_num = ref_pmp._num_entries if ref_pmp is not None else 0
-        self._pmp_cfg_buf = (ctypes.c_uint8 * 0)()
-        self._pmp_addr_buf = (ctypes.c_uint64 * 0)()
-        if self._pmp_num > 0:
-            self._pmp_cfg_buf = (ctypes.c_uint8 * (64 * total))()
-            self._pmp_addr_buf = (ctypes.c_uint64 * (64 * total))()
-            for hid, h in enumerate(self.harts):
-                hp = h._pmp
-                if hp is None or hp._num_entries == 0:
-                    continue
-                if hp._cache_dirty:
-                    hp._rebuild_cache()
-                base = hid * 64
-                fc = hp._flat_cfg
-                fa = hp._flat_addr
-                for j in range(64):
-                    self._pmp_cfg_buf[base + j] = fc[j]
-                    self._pmp_addr_buf[base + j] = fa[j]
-        return PmpInfo(
-            cfg=self._pmp_cfg_buf,
-            addr=self._pmp_addr_buf,
-            pmpsplit=active[0].pmpsplit_val if active else 0,
-            hart_num=total,
-        )
-
-    def _native_unmarshal_pmp(self) -> None:
-        """将各 hart 的 PMP 切片回写到其独立 Pmp; 仅在实际改写时同步 CSR.
-
-        每个 hart 的 OpenSBI 会把 pmpcfg/pmpaddr 写入自己的 64 项切片。
-        不再镜像到其它 hart。sync_from_flat (回写 CSR) 开销较大, 绝大多数
-        单轮加速执行 PMP 无变化, 故仅在切片确实被 Rust 改写时才同步。
-        """
-        if self._pmp_num <= 0:
-            return
-        for hid, h in enumerate(self.harts):
-            hp = h._pmp
-            if hp is None or hp._num_entries == 0:
-                continue
-            base = hid * 64
-            fc = hp._flat_cfg
-            fa = hp._flat_addr
-            changed = False
-            for j in range(64):
-                cv = self._pmp_cfg_buf[base + j]
-                av = self._pmp_addr_buf[base + j]
-                if cv != fc[j] or av != fa[j]:
-                    fc[j] = cv
-                    fa[j] = av
-                    changed = True
-            if changed:
-                hp._sync_from_flat()
-
-    def _native_marshal_clint(self) -> ClintInfo:
-        """构建 ClintInfo 数组, Rust 侧可就地更新其中的 MSIP/MTIMECMP。
-
-        数组按全部 hart 而非仅运行中的 hart 分配: 某 hart 可能写已停机 hart 的
-        MSIP/MTIMECMP, 故每个 hart 在数组中各占一项。
-
-        每个 hart 的 MSIP 编码为 ``level | (edge << 1)``, 第 0 位是电平, 第 1 至 7 位
-        是电平由 0 变 1 的次数。电平由 0 变 1 时按 128 取模把该次数加一:
-
-            edge = (edge + 1) mod 128
-
-        Rust 的 `sync_msip` 比较本次与上次的次数来判定 MSIP 是否被改写; 只比较电平会
-        漏掉 0 变 1 再变回 0 的写法。
-        """
-        clint = self.clint
-        total = len(self.harts)
-        self._clint_mtimecmp_arr = (ctypes.c_uint64 * total)()
-        self._clint_msip_arr = (ctypes.c_uint8 * total)()
-        if clint is None:
-            return ClintInfo(
-                mtime=0,
-                mtimecmp=self._clint_mtimecmp_arr,
-                msip=self._clint_msip_arr,
-                base=0,
-                timebase_hz=0,
-            )
-
-        # mtime 由 Rust 的 `advance_clock_source` 在加速执行期间按指令增量推进,
-        # Python 侧不在此处按流逝的时间补足 mtime.
-
-        for hid in range(total):
-            if hid < len(clint._mtimecmp):
-                self._clint_mtimecmp_arr[hid] = clint._mtimecmp[hid]
-            if hid < len(clint._msip):
-                level = clint._msip[hid] & 1
-                prev = self._clint_msip_prev[hid]
-                if level == 1 and prev == 0:
-                    self._clint_msip_edge[hid] = (self._clint_msip_edge[hid] + 1) & 0x7F
-                self._clint_msip_prev[hid] = level
-                self._clint_msip_arr[hid] = level | (self._clint_msip_edge[hid] << 1)
-        return ClintInfo(
-            mtime=clint.get_mtime(),
-            mtimecmp=self._clint_mtimecmp_arr,
-            msip=self._clint_msip_arr,
-            base=clint.base_addr,
-            timebase_hz=self._cfg.timebase_freq,
-        )
-
-    def _native_unmarshal_clint(self, clint_info: ClintInfo) -> None:
-        """从 Rust 改写的数组同步 CLINT 状态回 Python; 并对齐 SSTC stimecmp.
-
-        内核通过 Sstc (csrw stimecmp) 设定时器, stimecmp 即权威定时器值;
-        始终复制到 mtimecmp 供 SBI_SET_TIMER 与 WFI 空闲优化一致使用。
-
-        MSIP: 从 Rust 返回的编码值中提取 edge counter 供下一轮 marshal;
-        仅 level bit 回写到 Python CLINT._msip.
-        """
-        clint = self.clint
-        if clint is None:
-            return
-        for hid in range(len(self.harts)):
-            if hid < len(clint._mtimecmp):
-                clint._mtimecmp[hid] = self._clint_mtimecmp_arr[hid]
-            if hid < len(clint._msip):
-                raw = self._clint_msip_arr[hid]
-                self._clint_msip_edge[hid] = (raw >> 1) & 0x7F
-                level = raw & 1
-                clint._msip[hid] = level
-                self._clint_msip_prev[hid] = level  # avoid double-count on next marshal
-        clint._mtime = clint_info.mtime
-
-    def _native_marshal_uart(self) -> UartInfo:
-        """UART info — 让 Rust inline 处理 TXDATA + IE/IP/TXCTRL 寄存器访问.
-
-        发送环形缓冲区与写索引由 TerminalIO 提供。tx_notify_fd 为兼容性字段,
-        Rust 从不写它: 归档线程按 poll 超时读出该缓冲区, 不依赖该通知。
-        no_stdout 保持 0, Rust 负责即时输出 stdout — 非阻塞写, 对端不可写时丢弃
-        (见 uart.rs try_write_fd), 防止 CPU 引擎线程阻塞在控制台输出上。
-        """
-        if self._termio is None:
-            return UartInfo(base=0)
-        uart = self.uart
-        ctx = self._native_uart_ffi
-        if uart is None or ctx is None:
-            return UartInfo(base=0)
-        # 此处刷新 termio 持有的字段与 UART 基址; 寄存器字段由下一行的
-        # uart._publish_native_regs() 写入.
-        ctx.base = uart.base_addr
-        ctx.tx_buf = ctypes.addressof(self._termio.tx_buf)
-        ctx.tx_cap = len(self._termio.tx_buf)
-        ctx.tx_wr = ctypes.addressof(self._termio.tx_wr)
-        ctx.tx_notify_fd = self._termio.tx_notify_w
-        ctx.no_stdout = 0
-        ctx.rx_notify = ctypes.addressof(self._termio.rx_notify)
-        uart._publish_native_regs()
-        return UartInfo(base=uart.base_addr, ffi=ctx)
-
-    def _native_flush_uart(self) -> None:
-        """TX ring buffer -> hart 日志归档.
-
-        Rust libc::write 已即时输出, 此处仅消费 ring buffer 防止溢出,
-        不触发 _tx_callback->stdout (避免双重输出).
-        """
-        if self.uart is None or self._termio is None:
-            return
-        self._termio.drain_tx_logs_archive_only()
-
-    # ---- virtio-blk inline marshal / unmarshal ----
-
-    def _native_marshal_virtio(self) -> VirtIOInfo:
-        """构建 VirtIOInfo, 携带完整运行时 MMIO 寄存器状态。
-
-        Rust 单轮加速执行内 inline 处理全部 virtio MMIO 读写; 单轮加速执行结束后
-        _native_unmarshal_virtio 将 Rust 修改过的字段同步回 Python vblk。
-        本方法必须在每轮单轮加速执行前将当前 Python 状态完整传递给 Rust,
-        否则动态寄存器 (queue 描述符、中断状态等) 会在跨单轮加速执行时归零,
-        受调试程序看到的设备状态回退为未初始化。"""
-        vblk = self.virtio_blk
-        if vblk is None:
-            return VirtIOInfo(base=0)
-        mmio = vblk.mmio
-        queue = mmio.queues[0]
-        return VirtIOInfo(
-            base=vblk.base_addr,
-            capacity=vblk.capacity_sectors,
-            queue_num_max=mmio.queue_num_max,
-            device_features_sel=mmio.device_features_sel,
-            driver_features_sel=mmio.driver_features_sel,
-            driver_features=mmio.driver_features,
-            queue_sel=mmio.queue_sel,
-            queue_num=queue.num,
-            queue_ready=queue.ready,
-            queue_desc=queue.desc,
-            queue_driver=queue.driver,
-            queue_device=queue.device,
-            status=mmio.status,
-            interrupt_status=mmio.interrupt_status,
-        )
-
-    def _native_unmarshal_virtio(self, virtio_ffi) -> None:
-        """将 Rust 修改过的 virtio 状态同步回 Python VirtIOBlock.
-
-        Rust 批量执行期间 inline 处理了 MMIO 寄存器读写,
-        单轮加速执行结束后同步 changed fields:
-        - QueueNotify pending ->调用 VirtIOBlock.process_queue
-        - irq_maybe_lower ->调用 VirtIOBlock.lower_irq_if_idle
-        - 寄存器状态 ->同步回 VirtIOBlock.mmio 与队列 0
-        """
-        vblk = self.virtio_blk
-        if vblk is None or virtio_ffi is None:
-            return
-
-        # 同步 inline 修改的寄存器状态
-        mmio = vblk.mmio
-        queue = mmio.queues[0]
-        mmio.device_features_sel = virtio_ffi.device_features_sel
-        mmio.driver_features_sel = virtio_ffi.driver_features_sel
-        mmio.driver_features = virtio_ffi.driver_features
-        mmio.queue_sel = virtio_ffi.queue_sel
-        queue.num = virtio_ffi.queue_num
-        queue.ready = bool(virtio_ffi.queue_ready)
-        queue.desc = virtio_ffi.queue_desc
-        queue.driver = virtio_ffi.queue_driver
-        queue.device = virtio_ffi.queue_device
-        mmio.status = virtio_ffi.status
-        mmio.interrupt_status = virtio_ffi.interrupt_status
-
-        # InterruptACK 清空所有中断位 ->拉低 PLIC IRQ.
-        # 必须在 notify_pending 之前处理: 若两者在同一单轮加速执行内触发,
-        # 先降低 IRQ 电平再处理新队列, 避免 lower_irq_if_idle 看到
-        # process_queue 刚写入的 interrupt_status 而跳过降电平,
-        # 导致 _do_complete 时 level 仍为高 ->无限 re-level.
-        if virtio_ffi.irq_maybe_lower:
-            virtio_ffi.irq_maybe_lower = 0
-            vblk.lower_irq_if_idle()
-
-        # QueueNotify: Rust 设置 notify_pending=1 ->Python 处理 virtqueue.
-        # 分批处理，每批最多 VIRTIO_PROCESS_BATCH 个描述符
-        # 循环直到全部完成. 每批之间 Python 可响应 ctrl+Q;
-        # _max_batches 防止异常情况下的死循环.
-        if not virtio_ffi.notify_pending:
-            return
-
-        virtio_ffi.notify_pending = 0
-        _batch_guard = 0
-        _max_batches = 256  # 256 x 16 = 4096 描述符, 远超正常 ext4 mount 所需
-        while vblk.process_queue(max_descriptors=cfg_int("VIRTIO_PROCESS_BATCH")):
-            _batch_guard += 1
-            if _batch_guard >= _max_batches:
-                if not self._warned_infinite_virtio:
-                    self._warned_infinite_virtio = True
-                break
-        virtio_ffi.interrupt_status = mmio.interrupt_status
-
-    def _native_handle_exit(self, result: InstrToBeExec, all_exec_cnt: int) -> int:
-        """处理单轮加速执行的退出原因 (ECALL/MMIO/TRAP/BREAKPOINT)."""
-        total_harts = len(self.harts)
-        if result.exit_hart_id >= total_harts:
-            return all_exec_cnt
-        exit_hart = self.harts[result.exit_hart_id]
-        if result.exit_reason in (EXIT_ECALL, EXIT_MMIO):
-            all_exec_cnt += self._handle_native_sys_exit(exit_hart, result.exit_instr)
-        elif result.exit_reason == EXIT_TRAP:
-            all_exec_cnt += 1
-        elif result.exit_reason == EXIT_BREAKPOINT:
-            # 断点命中 — PC 已核对 bp_addrs; 记录停止原因供 run()/调试器
-            # 区分于设备暂停事件. 若不清醒退出, 重入单轮加速执行会立即再命中, 空转.
-            self._run_stop_reason = RunStopReason.BREAKPOINT
-        elif result.exit_reason == EXIT_EBREAK:
-            # 固件停机序列 (semihosting SYS_EXIT) — 全部 hart 停止.
-            self._run_stop_reason = RunStopReason.EBREAK
-        elif result.exit_reason == EXIT_TIMEOUT:
-            # 时钟源超时 — 看门狗线程在单轮加速执行内推进 mtime 越过 deadline 时
-            # 置 stop; 记录原因供 run() 抛出 TimeoutError.
-            self._run_stop_reason = RunStopReason.TIMEOUT
-        return all_exec_cnt
-
-    def _native_finalize(self, all_exec_cnt: int) -> int:
-        """同步 CSR -> WFI 唤醒 -> 看门狗/PC-stall 检测.
-
-        mtime 由加速执行引擎按指令增量推进 (advance_clock_source), 边界处不再
-        重复推进; 此处仅同步 mcycle/minstret/time 等 CSR 镜像.
-        """
-        instr_delta = all_exec_cnt - self._prev_all_exec_cnt
-        self._prev_all_exec_cnt = all_exec_cnt
-
-        self.sync_counters(max(0, instr_delta))
-
-        wfi_waiting = 0
-        for hart in self.harts:
-            if not hart._waiting or hart._halted:
-                continue
-            try_wfi_wakeup(hart)
-            if hart._waiting:
-                wfi_waiting += 1
-
-        self._wfi_sleep_if_idle(self.harts, wfi_waiting)
-        self._native_sync_plic_mip()
-        _recheck = 0
-        for hart in self.harts:
-            if not hart._waiting or hart._halted:
-                continue
-            if try_wfi_wakeup(hart):
-                _recheck += 1
-        if _recheck:
-            wfi_waiting = max(0, wfi_waiting - _recheck)
-            self._wake_event.clear()
-
-        if instr_delta > 0:
-            self.watchdog.kick_all()
-        else:
-            self.watchdog.tick(self.harts)
-
-        for hart in self.harts:
-            if not hart._waiting or hart._halted:
-                continue
-            try_wfi_wakeup(hart)
-            if not hart._waiting:
-                wfi_waiting = max(0, wfi_waiting - 1)
-        return all_exec_cnt
-
-    def _advance_mcycle(self) -> None:
-        """记录时钟源流逝对应的周期数到 ``_cycle``, 提供 ``run()`` 的返回值与
-        ``Emulator.cycle`` 属性.
-
-        该值不写入 mcycle: mcycle 由各 hart 的指令数折算, 见 ``sync_counters``.
-        """
-        now = time.monotonic()
-        elapsed = now - self._last_clock_sync
-        self._last_clock_sync = now
-        self._cycle += int(elapsed * CPU_FREQ_HZ)
-
-    def _advance_mtime_instr(self, instr_delta: int) -> None:
-        """按指令条数推进 mtime, 每条指令计 NS_PER_INSTR=20ns.
-
-        仅纯 Python 的 step 路径使用; 加速执行路径由 Rust 的 `advance_clock_source`
-        按同一个 NS_PER_INSTR 换算推进. 换算与时钟源流逝的时间无关:
-
-            tick 数 = 指令条数 * timebase_freq * NS_PER_INSTR / 1e9
-
-        divmod 得到的余数留到下次累加, 使 step 路径每次只执行一条指令时, 不会因整除
-        截断而长期丢失 tick.
-        """
-        if self.clint is None or instr_delta <= 0:
-            return
-        total = instr_delta * self._cfg.timebase_freq * cfg_int("NS_PER_INSTR")
-        total += self._mtime_instr_frac
-        ticks, self._mtime_instr_frac = divmod(total, 1_000_000_000)
-        if ticks:
-            self.clint.tick(ticks)
-
-    def _watchdog_timeout_ns(self) -> int:
-        """剩余时钟源超时时间 (纳秒), 注入 FfiWatchdogCtx. 0 = 禁用."""
-        if self._timeout_deadline <= 0.0:
-            return 0
-        remaining = self._timeout_deadline - time.monotonic()
-        if remaining <= 0.0:
-            return 0
-        return int(remaining * 1_000_000_000)
-
     # ----------------------------------------------------------
-    #  默认 WFI 空闲轮询 (无调试器直连路径)
+    #  状态导出
     # ----------------------------------------------------------
-
-    # ----------------------------------------------------------
-    #  WFI 等待优化
-    # ----------------------------------------------------------
-
-    def _wfi_ticks_until_wake(self, active_harts: list) -> int | None:
-        """返回最早定时器中断剩余的 tick 数; 无活跃定时器时返回 None.
-
-        检查 CLINT mtimecmp 和 SSTC stimecmp CSR 两个定时器源,
-        取最早到期者.
-        """
-        now = self.clint._mtime
-        best = None
-        for h in active_harts:
-            cmp = self.clint._mtimecmp[h.id]
-            if cmp > 0 and cmp >= now:
-                rem = max(0, cmp - now)
-                if best is None or rem < best:
-                    best = rem
-            sstc = h._csr_read_raw("stimecmp")
-            if sstc > 0 and sstc >= now:
-                rem = max(0, sstc - now)
-                if best is None or rem < best:
-                    best = rem
-        return best
-
-    def _wfi_sleep_if_idle(self, active: list, waiting_count: int) -> None:
-        """全部 hart 处于 WFI 等待时阻塞本线程, 避免处理器空转.
-
-        等待对象为 ``_wake_event``. 键盘输入由守护线程经 select(stdin) 分发:
-        Ctrl+Q 交调试器暂停, 其余字节写入 UART 接收路径并触发外部中断, legacy
-        模式由 PLIC 投递, AIA 模式由 APLIC 转为 MSI 后交 IMSIC, 随后置位该事件;
-        termio 的接收排空路径同样置位该事件. stdin 由守护线程独占, 本函数不读取.
-
-        mtime 由加速执行引擎按已执行的指令数推进. 全部 hart 等待时引擎没有批次
-        运行, mtime 停滞; 引擎的空闲判定不推进 mtime, 故本函数在睡眠结束后按
-        真实流逝时间推进 mtime, 使定时器按真实时间触发.
-
-        ``_wake_event`` 为电平信号: 任何外设活动都会置位它, 只有中断唤醒 hart 的
-        路径会清除它. 等待前必须清除, 否则首次活动之后该事件一直处于置位状态,
-        wait 每次立即返回, 空闲退化为忙转. 清除与等待之间到达的事件至多使本轮
-        多等待一个 wait 超时, 数据不会丢失: 接收守护线程持续排空, 下一轮批次
-        处理已到达的字节, 输入延迟不超过本次 sleep_sec.
-        """
-        if waiting_count < len(active) or waiting_count == 0:
-            return
-
-        remaining = self._wfi_ticks_until_wake(active)
-        tb = self._cfg.timebase_freq
-        if remaining is not None and remaining > 0:
-            sleep_sec = min(remaining / tb, _WFI_MAX_SLEEP) if tb else _WFI_MAX_SLEEP
-        elif remaining is not None:
-            return  # 截止时间已到 — 立即执行, 让定时器在下一轮 batch 触发
-        else:
-            sleep_sec = max(1, int(WFI_WATCHDOG_MS)) * 0.001
-
-        if sleep_sec <= 0.0:
-            return
-
-        t_sleep = time.monotonic()
-        self._wake_event.clear()
-        self._wake_event.wait(timeout=sleep_sec)
-        # 睡眠期间 hart 零指令, 指令计数时钟不推进, 故按真实流逝时间补偿推进
-        # mtime, 使受调试程序时钟与定时器节奏跟随真实时间.
-        slept = time.monotonic() - t_sleep
-        if remaining is not None and slept > 0 and self.clint is not None and tb:
-            self.clint.tick(int(slept * tb))
-
-    # ----------------------------------------------------------
-    #  执行
-    # ----------------------------------------------------------
-
-    def sync_counters(self, instr_delta: int = 0) -> None:
-        """同步硬件计数器 CSR 镜像 (mcycle/cycle/minstret/instret/time).
-
-        mcycle 与 cycle 按本 hart 已执行完成的指令数折算, 与 Rust 加速引擎的
-        ``csr_read`` 给出同一取值; mtime 由 CLINT 当前值给出. 本函数仅把当前
-        值写入各 hart 的 CSR 镜像, 不推进任何计数.
-
-        Args:
-            instr_delta: 自上次调用以来全部 hart 合计新增的指令数, 累加到
-                全局 ``_total_instrs``; 各 hart 的 ``_total_instrs`` 由执行路径
-                自行递增.
-        """
-        self._total_instrs += instr_delta
-        time_val = mask64(self.clint.get_mtime())
-        for h in self.harts:
-            # 各 hart 的 mcycle 只由该 hart 的指令数给出, 不受其它 hart 与
-            # 时钟源流逝影响. 处于 WFI 等待状态的 hart 不执行指令, 两个计数
-            # 都不变.
-            cycle_val = mask64(h._total_instrs * CYCLES_PER_INSTR)
-            h._csr_write_raw("mcycle", cycle_val)
-            h._csr_write_raw("cycle", cycle_val)
-            h._csr_write_raw("minstret", mask64(h._total_instrs))
-            h._csr_write_raw("instret", mask64(h._total_instrs))
-            h._csr_write_raw("time", time_val)
-
-    def step(self) -> int:
-        """
-        每个周期让所有 hart 各执行一条指令,
-        每条指令前转发 stdin->UART RX、每条指令后检查中断,
-        CLINT 时钟按指令计数推进 (与时钟源解耦).
-
-        指令单轮加速执行设计已去除 — step() 恒为精确单指令 (纯 Python 路径);
-        高速连续执行由 run() (native 引擎) 承担.
-
-        Returns:
-            本轮执行的指令数.
-        """
-        active = [h for h in self.harts if not h._halted]
-        random.shuffle(active)
-        all_exec_cnt, wfi_waiting = 0, 0
-        for hart in active:
-            # 设置 L2 缓存的当前域标记, 分配/命中行时自动打上 hart 的 mdid
-            if self.bus._l2 is not None:
-                self.bus._l2.current_mdid = hart.mdid_val
-
-            # WFI 等待状态: 不取指/执行, 但仍检查中断唤醒
-            if hart._waiting:
-                # 1. WFI 唤醒: 仅需 mip & mie != 0 (源级使能).
-                #    不要求 mstatus.MIE=1 (全局使能是中断投递条件).
-                if try_wfi_wakeup(hart):
-                    # 2. 唤醒后尝试投递中断 (如 MIE=1 则立即投递).
-                    check_pending_interrupts(hart)
-                if hart._waiting:
-                    wfi_waiting += 1
-                continue
-
-            pc_before = hart.pc
-
-            # 取指校验: VA->PA (itlb 翻译) + PMP execute check
-            ok, fetch_pa = check_instruction_fetch(hart, hart.pc)
-            if not ok:
-                # trap 已在 check_instruction_fetch 内部投递
-                continue
-
-            # 跨页取指: 当 PC 在页末 2 字节内 (offset >= 0xFFE),
-            # 4 字节取指跨越到下个虚拟页. 虚拟页之间的物理页不保证连续,
-            # 需分别通过 MMU 翻译后从各物理地址读取各自字节.
-            _page_off = hart.pc & 0xFFF
-            if _page_off >= 0xFFE:
-                ok2, fetch_pa2 = check_instruction_fetch(hart, mask64(hart.pc + 2))
-                if not ok2:
-                    continue
-                instr_bytes = self.bus.read(fetch_pa, 2) + self.bus.read(fetch_pa2, 2)
-            else:
-                instr_bytes = self.bus.read(fetch_pa, 4)
-            instr = int.from_bytes(instr_bytes, "little", signed=False)
-
-            try:
-                advance = hart.exec_instr(instr)
-            except NotImplementedError, MemoryAccessError:
-                deliver_trap(hart, TrapType.IllInstr, tval=instr, is_interrupt=False)
-                advance = 0
-
-            # 正常顺序执行 -> 推进 PC
-            if advance != 0 and hart.pc == pc_before:
-                hart.pc = mask64(hart.pc + advance)
-
-            # 指令边界 — 检查中断
-            check_pending_interrupts(hart)
-
-            # WFI 唤醒路径 (中断 handler -> mret -> 回到正常流) 不计入指令数,
-            # 以保证 _total_instrs 反映固件实际执行的非中断上下文指令.
-            if not hart._wfi_woken:
-                hart._total_instrs += 1
-                all_exec_cnt += 1
-
-        self._advance_mcycle()
-        self._advance_mtime_instr(all_exec_cnt)
-        self.sync_counters(all_exec_cnt)
-
-        # WFI 优化: 全部未 halted 的 hart 处于 WFI 等待时, 阻塞而非轮询
-        self._wfi_sleep_if_idle(active, wfi_waiting)
-
-        return all_exec_cnt
-
-    def _check_bp_hit_py(self) -> bool:
-        """纯 Python 连续执行下的地址断点判定 (native 在 Rust 内联比对).
-
-        ``_bp_addrs`` 由调试器在 ``run()`` 前注入 (含符号物理地址对应的 VA
-        副本); 任一活跃 hart 的 PC 命中即返回 True, 由 ``run()`` 置
-        ``BREAKPOINT`` 停止 — 与 native 引擎 pre-execution 断点语义一致.
-        """
-        if not self._bp_addrs:
-            return False
-        for h in self.harts:
-            if not h._halted and h.pc in self._bp_addrs:
-                return True
-        return False
-
-    def _semihosting_exit_py(self) -> bool:
-        """消费 semihosting SYS_EXIT 停机标记.
-
-        ``trap_ebreak`` 检测到停机序列 (a0=0x18 + slli/ebreak/srai marker)
-        时置 ``hart._semihosting_sys_exit``; 此处消费并返回 True, 由 ``run()``
-        置 ``RunStopReason.EBREAK`` 停止 — 与 native 引擎 EXIT_EBREAK 对齐.
-        否则固件停机序列退化为 WFI 自旋, 纯 Python run() 永不返回.
-        """
-        hit = any(getattr(h, "_semihosting_sys_exit", False) for h in self.harts)
-        if hit:
-            for h in self.harts:
-                h._semihosting_sys_exit = False
-        return hit
-
-    def run(
-        self,
-        *,
-        timeout: float = 1800.0,
-        yield_every: int = 10000,
-        yield_interval: float = 0.001,
-    ) -> int:
-        """连续执行, 直至停止条件满足.
-
-        引擎无指令配额, 持续执行. 停止条件:
-        - 固件执行停机序列 (semihosting SYS_EXIT) — 全部 hart 停止
-        - 断点命中 (EXIT_BREAKPOINT)
-        - 全部 hart halted
-        - 超时 (*timeout*)
-
-        全部 hart WFI 空闲时 Python 侧阻塞等待唤醒 (stdin 转发在此进行).
-        执行中暂停由外部设备经 :meth:`notify_processor` 置 stop_flag:
-        引擎逐指令检查、即时退出, 状态保留在 live 数组中, 标志留给
-        调用方消费 — 不属于上述停止条件.
-
-        Args:
-            timeout: 超时秒数, 默认 1800 (30 分钟). 设为 0 禁用.
-            yield_every: 每执行 *yield_every* 条指令后让出 CPU,
-                         默认 10000.
-                         0 = 不限速 (跑满 CPU).
-            yield_interval: 每次让出等待秒数, 默认 0.001 (1ms).
-
-        Returns:
-            实际流逝的时钟周期数 (self._cycle, 按真实流逝记录; 各 hart 的
-            mcycle 另由该 hart 的指令数折算, 见 sync_counters).
-
-        Raises:
-            TimeoutError: 当 *timeout* 秒数被超过.
-        """
-        # 消费上次未处理的设备暂停标志; 执行期间新置位的标志留给调用方.
-        self._native_stop_flag.value = 0
-        self._run_stop_reason = RunStopReason.NONE
-
-        # 超时直接基于时钟源 (time.monotonic()), 不依赖 mtime 推进率.
-        self._timeout_deadline = time.monotonic() + timeout if timeout > 0 else 0.0
-        do_yield = yield_every > 0
-        instr_start = self._total_instrs
-        last_yield = instr_start
-
-        while True:
-            active = [h for h in self.harts if not h._halted]
-            if not active:
-                break
-            self._check_run_timeout(timeout, instr_start)
-            if self._stdin_forward_callback is not None:
-                self._stdin_forward_callback()
-            if self._run_one_round(active, timeout, instr_start):
-                break
-            if do_yield and self._total_instrs - last_yield >= yield_every:
-                yield_cpu(yield_interval)
-                last_yield = self._total_instrs
-
-        self._native_flush_uart()
-        return self._cycle
-
-    def _check_run_timeout(self, timeout: float, instr_start: int) -> None:
-        """达到时钟源超时则置停止原因并抛出 TimeoutError."""
-        if self._timeout_deadline and time.monotonic() >= self._timeout_deadline:
-            self._run_stop_reason = RunStopReason.TIMEOUT
-            raise TimeoutError(
-                timeout,
-                self._total_instrs - instr_start,
-                self.harts[0].pc if self.harts else None,
-            )
-
-    def _run_one_round(self, active, timeout: float, instr_start: int) -> bool:
-        """执行一轮; 返回 True 表示应结束连续执行."""
-        if self._speedup_hart_states is not None:
-            self._speedup_for_cmd_step(active)
-            if self._run_stop_reason == RunStopReason.TIMEOUT:
-                raise TimeoutError(
-                    timeout,
-                    self._total_instrs - instr_start,
-                    self.harts[0].pc if self.harts else None,
-                )
-            # 设备暂停事件 — 标志保留给调用方消费; 断点/停机 — 重入
-            # 单轮加速执行会立即再命中, 必须在此返回.
-            return self._native_stop_flag.value != 0 or self._run_stop_reason in (
-                RunStopReason.BREAKPOINT,
-                RunStopReason.EBREAK,
-            )
-        if self._check_bp_hit_py():
-            self._run_stop_reason = RunStopReason.BREAKPOINT
-            return True
-        self.step()
-        if self._semihosting_exit_py():
-            self._run_stop_reason = RunStopReason.EBREAK
-            return True
-        return False
 
     def dump_hart_regs(self, hart_id: int = 0) -> dict:
         """导出指定 hart 的关键寄存器状态."""
@@ -1763,52 +327,9 @@ class Emulator:
         """读取物理内存的 *size* 字节."""
         return self.bus.read(addr, size)
 
-    @staticmethod
-    def _fmt_hexdump(addr: int, data: bytes) -> str:
-        """将字节数据格式化为 hexdump 字符串 (供调试器复用).
-
-        三段分列着色: 地址列亮蓝, hex 列默认前景 (白/亮),
-        ASCII 列 dim 灰.  避免单一大区段 [dim] 包裹导致 hex 区
-        的数据字节意外被 Rich 解析为 markup 标签 (产生白/蓝混色).
-        """
-        lines = []
-        for offset in range(0, len(data), 16):
-            chunk = data[offset : offset + 16]
-            hex_bytes = " ".join(f"{b:02x}" for b in chunk)
-            # 转义 '[' 以防 Rich 误解析为 markup tag.
-            hex_bytes = hex_bytes.replace("[", "[[")
-            ascii_chars = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-            ascii_chars = ascii_chars.replace("[", "[[")
-            lines.append(
-                f"  [bright_blue]{addr + offset:016x}[/]  "
-                f"{hex_bytes:<48s}  "
-                f"[dim]|{ascii_chars}|[/]"
-            )
-        return "\n".join(lines)
-
     def mem_hexdump(self, addr: int, size: int) -> str:
-        """返回物理内存的十六进制 dump 字符串; 读取失败返回提示文本."""
+        """返回物理内存的十六进制转储字符串; 读取失败返回提示文本."""
         data = self.bus.try_read(addr, size)
         if data is None:
             return "(无法读取该地址)"
-        return self._fmt_hexdump(addr, data)
-
-    # ----------------------------------------------------------
-    #  属性
-    # ----------------------------------------------------------
-
-    @property
-    def num_harts(self) -> int:
-        return self._cfg.num_harts
-
-    @property
-    def cycle(self) -> int:
-        return self._cycle
-
-    @property
-    def total_instructions(self) -> int:
-        return self._total_instrs
-
-    @property
-    def prog_cnt(self) -> int:
-        return self._cfg.prog_cnt
+        return fmt_hexdump(data, addr)

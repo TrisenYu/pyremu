@@ -406,7 +406,7 @@ def print_report(result: dict, show_sections: bool) -> None:
             )
 
 
-def main() -> int:
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="统计二进制文件中基本块终结指令的静态条数")
     parser.add_argument("binaries", nargs="+", help="待统计的二进制文件")
     parser.add_argument(
@@ -434,7 +434,7 @@ def main() -> int:
         path = Path(name)
         if not path.is_file():
             print(f"[error] 找不到文件: {path}", file=sys.stderr)
-            return 2
+            sys.exit(1)
         results.append(
             count_file(
                 path,
@@ -446,7 +446,7 @@ def main() -> int:
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
-        return 0
+        sys.exit(0)
 
     for index, result in enumerate(results):
         if index:
@@ -455,8 +455,3 @@ def main() -> int:
 
     if len(results) > 1:
         print(f"\n合计终结指令条数: {sum(int(r['terminators']) for r in results)}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

@@ -1,4 +1,4 @@
-//! `#[repr(C)]` state structures that cross the Python FFI boundary.
+//! 跨 Python FFI 边界的 `#[repr(C)]` 状态结构体.
 
 use core::fmt;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -6,11 +6,11 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 include!("configs_gen.rs");
 
 // ============================================================
-//  TLB entry
+//  TLB 条目
 // ============================================================
 
-/// A single TLB entry — 40 bytes, 8-byte aligned.
-/// Layout is FFI-locked; must match Python ``TlbEntry`` ctypes definition.
+/// 单个 TLB 条目, 占 40 字节, 8 字节对齐.
+/// 布局由 FFI 锁定, 必须与 Python 侧 ``TlbEntry`` 的 ctypes 定义一致.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TlbEntry {
@@ -19,16 +19,12 @@ pub struct TlbEntry {
 	pub perm: u8,
 	pub level: u8,
 	pub valid: u8,
-	/// Memory domain ID — full 64-bit.  Must NOT be narrowed to u8:
-	/// enclave IDs >= 256 would alias to 0 (= host) and break both
-	/// `mfence.did` domain isolation and PMP enclave-mode checks.
 	pub mdid: u64,
 	pub tlb_epoch: u32,
 	pub dirty: u8,
 	pub accessed: u8,
-	/// ASID from satp at insertion time.  Lookup must match; different ASID
-	/// (process switch without SFENCE.VMA) is a miss — prevents stale entries
-	/// from leaking across address spaces when the kernel uses ASID-tagged TLBs.
+	/// 插入条目时取自 satp 的 ASID. 查找时 asid 与条目 asid 均非零且不相等即未命中;
+	/// 条目 asid 为 0 时匹配任何地址空间.
 	pub asid: u16,
 }
 
@@ -60,12 +56,12 @@ impl fmt::Debug for TlbEntry {
 }
 
 // ============================================================
-//  IMSIC interrupt file (AIA)
+//  IMSIC 中断文件
 // ============================================================
 
-/// Single IMSIC interrupt file — M-mode or S-mode per hart.
-/// eip/eie are u32 arrays (2048 bits / 32 bits per word = 64 words)
-/// for compact FFI transfer; RV64 CSR reads pack two adjacent u32s.
+/// 单个 IMSIC 中断文件, 每个 hart 各有一个 M 模式文件与一个 S 模式文件.
+/// eip 与 eie 各 2048 位, 按每字 32 位存为 64 个 u32,
+/// 便于 FFI 传输; RV64 的 CSR 读取把相邻的两个 u32 合并为一个 64 位值.
 #[repr(C)]
 pub struct ImsicFile {
 	pub eip: [AtomicU32; 64],
@@ -74,16 +70,14 @@ pub struct ImsicFile {
 	pub eithreshold: u8,
 	pub select: u32,
 	pub present: u8,
-	/// 外部中断位的存在性缓存, 供 ``imsic_topei_peek`` 快速排除无外部中断的
-	/// 情形 (见该函数注释). 由属主 hart 在 eip 变更后重算, 另由跨 hart 的
-	/// ``imsic_eip_set`` 置位 — 该调用可能来自另一个 hart 的加速执行线程, 故
-	/// 必须为原子类型. 类型与 u8 同布局 (1 字节, 对齐 1), FFI 布局不变.
+	/// 供 ``imsic_topei_peek`` 在没有外部中断时直接返回.
+	/// 本 hart 在 eip 变更后、跨 hart 调用的 ``imsic_eip_set`` 会重新计算这一用于暂存外部中断位的原子状态;
+	/// 该类型与 u8 布局相同, 占 1 字节, 对齐为 1, FFI 布局不变.
 	pub eip_ext_any: AtomicU8,
 }
 
-// Manual Clone: AtomicU32 is intentionally !Clone / !Copy:
-// a value-level copy is safe here because HartState cloning only happens
-// at snapshot / init time, never during concurrent cross-hart access.
+// AtomicU32 不实现 Clone 与 Copy. 克隆只发生在快照与初始化时,
+// 不与跨 hart 的并发访问同时进行, 故逐字段按值复制.
 impl Clone for ImsicFile {
 	fn clone(&self) -> Self {
 		let mut out = Self::empty();
@@ -114,7 +108,7 @@ impl ImsicFile {
 }
 
 // ============================================================
-//  Per-hart state
+//  每个 hart 的状态
 // ============================================================
 
 #[repr(C)]
@@ -122,7 +116,7 @@ pub struct HartState {
 	// ---- GPRs ----
 	pub gprs: [u64; 32],
 
-	// ---- Key CSRs (u64) ----
+	// ---- 关键 CSR ----
 	pub mstatus: u64,
 	pub mtvec: u64,
 	pub stvec: u64,
@@ -141,33 +135,29 @@ pub struct HartState {
 	// ---- PC ----
 	pub pc: u64,
 
-	// ---- Reservation (LR/SC) ----
+	// ---- 预留 LR/SC ----
 	pub reservation_addr: u64,
-	/// Value loaded by LR — used as the expected value in SC's CAS.
-	/// Without this, SC does a fresh load for the CAS expected value,
-	/// which always equals the current value ->SC never fails due to
-	/// a concurrent store from another hart (reservation-invalidation
-	/// bug: two harts can simultaneously enter the same critical section).
+	/// LR 读入的值, 作为 SC 判定是否写入的期望值.
+	/// 若 SC 在比较时重新读取, 读到的总是当前值, 另一个 hart 的并发写入
+	/// 不会使 SC 失败, 两个 hart 可同时进入同一临界区.
 	pub reservation_value: u64,
 
-	// ---- single-byte fields ----
+	// ---- 单字节字段 ----
 	pub reservation_valid: u8,
 	pub mode: u8,
 	pub mmu_mode: u8,
 	pub waiting: u8,
 	pub wfi_woken: u8,
 	pub halted: u8,
-	/// Memory domain ID — full 64-bit (see ``TlbEntry.mdid`` for why not u8).
-	/// u64 对齐后由偏移 6 移到偏移 8, 整个字节块从 16B 涨到 24B.
 	pub mdid: u64,
 	pub pmpsplit: u8,
 	pub _pad: [u8; 7],
 
-	// TLB entries ----
+	// TLB 条目
 	pub itlb: [TlbEntry; TLB_ENTRIES],
 	pub dtlb: [TlbEntry; TLB_ENTRIES],
 
-	// Additional CSRs ----
+	// 其余 CSR
 	pub mscratch: u64,
 	pub sscratch: u64,
 	pub mhartid: u64,
@@ -177,24 +167,23 @@ pub struct HartState {
 	// Sstc stimecmp ----
 	pub stimecmp: u64,
 
-	// interrupt cache ----
+	// 中断缓存
 	pub _mmu_mode_pad: u64,
 
-	// per-hart instruction counter ----
-	/// Number of instructions executed by this hart across all accelerationes.
-	/// Incremented after each slice; never reset.
-	/// Used to provide per-hart ``minstret`` and debugger display.
+	// 每 hart 指令计数
+	/// 该 hart 已执行完成的指令总数, 每轮加速执行结束后累加, 从不清零.
+	/// 用于提供该 hart 的 ``minstret`` 与调试器显示.
 	pub total_instrs: u64,
 
-	// F/D floating point ----
-	/// 32 个浮点寄存器, 存原始 bits (NaN-boxed), 非 f64 —
-	/// 保留 sNaN/qNaN payload 与单精度 NaN-boxing 语义。
+	// F/D 浮点 ----
+	/// 32 个浮点寄存器, 保存原始位模式而非 f64, 以保留 sNaN 与 qNaN
+	/// 的载荷以及单精度数的 NaN 语义.
 	pub fprs: [u64; 32],
-	/// 浮点控制状态寄存器: bits[7:5]=frm, bits[4:0]=fflags。
+	/// 浮点控制状态寄存器: 位 [7:5] 为 frm, 位 [4:0] 为 fflags.
 	pub fcsr: u32,
 	pub _fpad: [u8; 4],
 
-	// AIA IMSIC register files (M + S per hart)
+	// AIA IMSIC 寄存器文件, 每 hart 一个 M 文件与一个 S 文件
 	pub imsic_m: ImsicFile,
 	pub imsic_s: ImsicFile,
 
@@ -203,7 +192,7 @@ pub struct HartState {
 
 	// ---- 加速执行引擎的 TLB 计数 ----
 	//
-	// 由属主 hart 在 translate_va 的翻译点上累加, 从不清零, 跨批处理保留;
+	// 在 translate_va 的翻译点上保持累加;
 	// Python 侧只读取不回写, 故其取值覆盖该引擎此前记录的全部翻译活动.
 	// 权限检查未通过而返回故障的命中计入命中数: 该情形下 TLB 已给出翻译,
 	// 与未命中不同.
@@ -214,7 +203,7 @@ pub struct HartState {
 }
 
 // ============================================================
-//  Constants
+//  常量
 // ============================================================
 
 #[allow(dead_code)]
@@ -225,11 +214,13 @@ pub mod exit_reason {
 	pub const ECALL: u8 = 3;
 	pub const EBREAK: u8 = 4;
 	pub const WFI_WAIT: u8 = 5;
-	pub const ERROR: u8 = 6;
+	/// 取指的目标物理地址不属于主存, 引擎只从主存读取指令字节, 故本轮退出.
+	/// 由 Python 取指: 目标属于设备 MMIO 时读取设备的寄存器, 属于未定义物理地址范围时投递访问故障.
+	pub const NOT_MAINRAM: u8 = 6;
 	pub const BREAKPOINT: u8 = 7;
 	pub const TIMEOUT: u8 = 8;
-	/// TermIO RX 通知 — 引擎为让 Python 搬运 stdin 字节而主动退出本轮,
-	/// 不是调试器可见的停止事件 (见 hart_sched.rs 的 hart_worker)。
+	/// TermIO 接收通知: 为能让 Python 读取标准输入的字节而主动退出。
+	/// 非调试器可见的停止事件.
 	pub const RX_WAIT: u8 = 9;
 }
 
@@ -243,7 +234,7 @@ pub mod riscv_mode {
 }
 
 // ============================================================
-//  Tests
+//  测试
 // ============================================================
 
 #[cfg(test)]
@@ -254,7 +245,6 @@ mod tests {
 
 	#[test]
 	fn tlb_entry_size() {
-		// mdid 加宽 u8->u64 后 TlbEntry 由 32B 涨到 40B (mdid 对齐到偏移 24).
 		assert_eq!(size_of::<TlbEntry>(), 40);
 		assert_eq!(align_of::<TlbEntry>(), 8);
 	}
@@ -264,13 +254,12 @@ mod tests {
 		assert_eq!(align_of::<HartState>(), 8);
 	}
 
-	/// ImsicFile 的字段偏移锁定 — 必须与 Python 侧 ``ImsicFileC``
-	/// (hart.py) 的 ctypes 字段顺序逐一对应, 否则 marshal 时 Python 写入
-	/// 会落到错误的字节 (eip_ext_any 改为 AtomicU8 时布局不变, 由本测试守住).
+	/// ImsicFile 的字段偏移必须与 Python 侧 ``ImsicFileC`` 的 ctypes 定义
+	/// 逐一对应, 否则 marshal 时 Python 会写到错误的偏移而引发执行期间的异常.
 	#[test]
 	fn imsic_file_offsets_match_python_layout() {
 		use core::mem::offset_of;
-		// eip[64] + eie[64] 各 256 字节.
+		// eip 与 eie 各 64 个 u32, 各占 256 字节.
 		assert_eq!(offset_of!(ImsicFile, eidelivery), 512);
 		assert_eq!(offset_of!(ImsicFile, eithreshold), 513);
 		assert_eq!(offset_of!(ImsicFile, select), 516);
@@ -282,8 +271,8 @@ mod tests {
 	#[test]
 	fn hart_state_size_reasonable() {
 		let sz = size_of::<HartState>();
-		// With TLB_ENTRIES entries per TLB, HartState grows proportionally.
-		// 256 entries × 32 bytes × 2 (itlb+dtlb) = 16384 bytes for TLB alone.
+		// 每个 TLB 有 TLB_ENTRIES 个条目, 每个条目 40 字节,
+		// itlb 与 dtlb 合计 TLB_ENTRIES * 80 字节.
 		assert!(sz < 65536, "HartState size {} should be < 65536", sz);
 	}
 
@@ -344,8 +333,8 @@ mod tests {
 			dtlb_hits: 0,
 			dtlb_misses: 0,
 		};
-		// Enable IMSIC state tracking when AIA is active so that
-		// sync_imsic() and imsic_topei_peek() see eip/eie state.
+		// AIA 使能时标记 IMSIC 状态可用, 使 sync_imsic() 与 imsic_topei_peek()
+		// 能读到 eip 与 eie 状态.
 		if crate::CFG_AIA {
 			hs.imsic_m.present = 1;
 			hs.imsic_s.present = 1;

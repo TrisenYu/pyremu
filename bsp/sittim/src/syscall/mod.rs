@@ -24,13 +24,13 @@ mod rand;
 mod types;
 
 use crate::constants::LINEAR_MAP_OFFSET;
-use crate::mem;
 #[cfg(feature = "diagnostic")]
 use crate::diag;
+use crate::mem;
 use crate::trap_frame::TrapGprs;
 
-use types::*;
 pub use errno::*;
+use types::*;
 
 // ---------------------------------------------------------------
 //  Syscall numbers  (prefixed SYSNUM_ per smode_entry convention)
@@ -232,13 +232,11 @@ pub fn syscall_handler(gprs: &mut TrapGprs) -> u64 {
 		// ---- 资源 ----
 		SYSNUM_GETRUSAGE => proc::getrusage_handler(a1 as *mut Rusage),
 		SYSNUM_GETCPU => proc::getcpu_handler(a0 as *mut u32, a1 as *mut u32),
-		SYSNUM_PRLIMIT64 => {
-			proc::prlimit64_handler(a0, a1 as *const Rlimit, a2 as *mut Rlimit)
-		}
+		SYSNUM_PRLIMIT64 => proc::prlimit64_handler(a0, a1 as *const Rlimit, a2 as *mut Rlimit),
 		SYSNUM_SYSINFO => proc::sysinfo_handler(a0 as *mut Sysinfo),
 
 		// ---- 跳过 (无副作用) ----
-		| SYSNUM_IOCTL
+		SYSNUM_IOCTL
 		| SYSNUM_STATFS
 		| SYSNUM_FCHOWN
 		| SYSNUM_VHANGUP
@@ -312,20 +310,13 @@ pub fn inject_manifest(payload_pa: u64, payload_size: u64) -> usize {
 		let data_len = read_u32_le(trailer.add(20)) as u64;
 
 		// 越界保护: 偏移 + 长度不得越过载荷镜像末尾 (trailer 起点)。
-		if
-			path_off + path_len > payload_size - MANIFEST_TRAILER ||
-			data_off + data_len > payload_size - MANIFEST_TRAILER
+		if path_off + path_len > payload_size - MANIFEST_TRAILER
+			|| data_off + data_len > payload_size - MANIFEST_TRAILER
 		{
 			return 0;
 		}
-		let path = core::slice::from_raw_parts(
-			(base + path_off) as *const u8,
-			path_len as usize
-		);
-		let data = core::slice::from_raw_parts(
-			(base + data_off) as *const u8,
-			data_len as usize
-		);
+		let path = core::slice::from_raw_parts((base + path_off) as *const u8, path_len as usize);
+		let data = core::slice::from_raw_parts((base + data_off) as *const u8, data_len as usize);
 		if fs::vfs_inject_file(path, data) {
 			1
 		} else {

@@ -149,7 +149,6 @@ class TestSPIConfig:
         )
 
     def test_default_spi_base_follows_build_config(self):
-        """默认 SPI 基址取自 emu-configs.mk 生成的常量."""
         assert PeripheralConfig().spi_base == configs_gen.SPI_BASE
 
     def test_emulator_registers_device(self):

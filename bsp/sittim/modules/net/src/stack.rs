@@ -14,8 +14,7 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::udp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-	EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint,
-	Ipv4Address,
+	EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address,
 };
 
 use crate::driver;
@@ -78,9 +77,8 @@ impl Storage {
 	/// 元素的大小。`dst` 必须指向一块可以按 [`Storage`] 写入的存储。
 	unsafe fn write_into(dst: *mut Self) -> &'static mut Self {
 		let buf_sets = unsafe { addr_of_mut!((*dst).buf_sets).cast::<BufferSet>() };
-		let socket_storage = unsafe {
-			addr_of_mut!((*dst).socket_storage).cast::<SocketStorage<'static>>()
-		};
+		let socket_storage =
+			unsafe { addr_of_mut!((*dst).socket_storage).cast::<SocketStorage<'static>>() };
 		for i in 0..UDP_SOCKETS {
 			unsafe { buf_sets.add(i).write(BufferSet::new()) };
 			unsafe { socket_storage.add(i).write(SocketStorage::EMPTY) };
@@ -164,7 +162,10 @@ pub fn init() -> bool {
 		let dst = (*addr_of_mut!(STORAGE)).as_mut_ptr();
 		Storage::write_into(dst)
 	};
-	let Storage { buf_sets, socket_storage } = storage;
+	let Storage {
+		buf_sets,
+		socket_storage,
+	} = storage;
 	let mut sockets = SocketSet::new(&mut socket_storage[..]);
 	let mut handles = [SocketHandle::default(); UDP_SOCKETS];
 	for (bufs, handle) in buf_sets.iter_mut().zip(handles.iter_mut()) {
@@ -259,10 +260,18 @@ pub fn bind(index: usize, addr: Option<Ipv4Address>, port: u16) -> Result<(), Bi
 
 /// 把本地端点写入套接字。*addr* 为 None 时本地地址取未指定。
 fn bind_endpoint(
-	st: &mut Stack, index: usize, addr: Option<Ipv4Address>, port: u16,
+	st: &mut Stack,
+	index: usize,
+	addr: Option<Ipv4Address>,
+	port: u16,
 ) -> Result<(), BindError> {
-	let local = IpListenEndpoint { addr: addr.map(IpAddress::Ipv4), port };
-	socket(st, index).bind(local).map_err(|_| BindError::PortInUse)
+	let local = IpListenEndpoint {
+		addr: addr.map(IpAddress::Ipv4),
+		port,
+	};
+	socket(st, index)
+		.bind(local)
+		.map_err(|_| BindError::PortInUse)
 }
 
 /// 记录对端地址, 供后续的发送与 getpeername 使用。
@@ -295,7 +304,9 @@ pub fn clear_peer(index: usize) {
 fn bind_ephemeral(st: &mut Stack, index: usize) -> Result<(), BindError> {
 	let port = alloc_ephemeral_port(st).ok_or(BindError::NoFreePort)?;
 	let local = IpEndpoint::new(IpAddress::Ipv4(LOCAL_IP), port);
-	socket(st, index).bind(local).map_err(|_| BindError::NoFreePort)
+	socket(st, index)
+		.bind(local)
+		.map_err(|_| BindError::NoFreePort)
 }
 
 /// 端口是否已被下标 *index* 之外的某个已取用套接字绑定。
@@ -335,7 +346,10 @@ fn alloc_ephemeral_port(st: &mut Stack) -> Option<u16> {
 /// 该套接字绑定的本地端点。未绑定时地址为未指定, 端口为 0。
 pub fn local_endpoint(index: usize) -> IpListenEndpoint {
 	let Some(st) = stack() else {
-		return IpListenEndpoint { addr: None, port: 0 };
+		return IpListenEndpoint {
+			addr: None,
+			port: 0,
+		};
 	};
 	socket(st, index).endpoint()
 }
@@ -467,7 +481,10 @@ mod tests {
 		let _guard = setup();
 		let index = open().unwrap();
 		assert!(matches!(bind(index, None, 0x1234), Ok(())));
-		assert!(matches!(bind(index, None, 0x1234), Err(BindError::AlreadyBound)));
+		assert!(matches!(
+			bind(index, None, 0x1234),
+			Err(BindError::AlreadyBound)
+		));
 		assert!(matches!(bind(index, None, 0), Err(BindError::AlreadyBound)));
 	}
 
@@ -478,7 +495,10 @@ mod tests {
 		let first = open().unwrap();
 		let second = open().unwrap();
 		assert!(matches!(bind(first, None, 0x1234), Ok(())));
-		assert!(matches!(bind(second, None, 0x1234), Err(BindError::PortInUse)));
+		assert!(matches!(
+			bind(second, None, 0x1234),
+			Err(BindError::PortInUse)
+		));
 	}
 
 	/// 同一端口在未被取用的下标上可以绑定。

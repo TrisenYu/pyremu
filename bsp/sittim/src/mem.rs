@@ -489,8 +489,7 @@ pub fn take_mmap_region(bytes: u64, pte_flags: u64) -> u64 {
 
 	if pages >= CHUNK_2M_PAGES {
 		// 达到一整块及以上: 用 2 MiB 超页覆盖。超页叶子之下不存在下一级页表,
-		// 块内不能再落 4 KiB 页, 故页计数不在块边界时先推进到块边界, 当前块的余量
-		// 作废 (只损失地址空间, 无物理代价)。
+		// 块内不能再落 4 KiB 页, 故页计数不在块边界时先推进到块边界。
 		let used = context::ctx().umode_mmap_pages_used;
 		let aligned = align_up(used, CHUNK_2M_PAGES);
 		let blocks = align_up(pages * PAGE_SIZE, CHUNK_2M_SIZE) >> CHUNK_2M_SHIFT;
@@ -542,8 +541,7 @@ pub fn take_mmap_region(bytes: u64, pte_flags: u64) -> u64 {
 		done += n;
 	}
 
-	// 未交付满: 已交付的部分保留 (页计数按实交付页数推进, 不会被二次发放),
-	// 返回 0 由调用方回 ENOMEM。
+	//  已交付的部分保留，返回 0 由调用方回 ENOMEM。
 	if done < pages {
 		return 0;
 	}

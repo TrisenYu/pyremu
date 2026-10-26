@@ -3,11 +3,12 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""BreakpointMixin — 断点设置/命中检查/条件评估/子命令分发.
+"""BreakpointOps — 断点设置/命中检查/条件评估/子命令分发.
 
-依赖 DebuggerBase + MemoryMixin + SymbolMixin.
+依赖 DebuggerBase + MemoryOps + SymLookupOps.
 """
 
+import operator
 import re
 
 from rich.table import Table
@@ -16,10 +17,20 @@ from pyremu._native import decode_fields
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import translate_addr
 from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
-from pyremu.debug._attrs import SharedMixinAttrs
+from pyremu.debug.attrs import SharedAttrs
 from pyremu.debug.types import Breakpoint
 from pyremu.debug.utils import check_rv64_addr, hex_addr, INSTR_BP_NAMES, KNOWN_OPCODES
 from pyremu.utils.wrapper import seize_val_err
+
+# 条件断点的比较符到比较函数
+_COMPARE_OPS = {
+    "==": operator.eq,
+    "!=": operator.ne,
+    "<": operator.lt,
+    ">": operator.gt,
+    "<=": operator.le,
+    ">=": operator.ge,
+}
 
 
 def _parse_bp_condition(text: str) -> tuple[str, str, str, int] | None:
@@ -55,7 +66,7 @@ def _parse_bp_condition(text: str) -> tuple[str, str, str, int] | None:
     return (parts[0], m.group("name"), cond_op, cond_val)
 
 
-class BreakpointMixin(SharedMixinAttrs):
+class BreakpointOps(SharedAttrs):
     """断点管理."""
 
     # ----------------------------------------------------------
@@ -110,20 +121,8 @@ class BreakpointMixin(SharedMixinAttrs):
             actual = hart.read_csr_by_name(bp.cond_reg)
         else:
             return True
-        c = bp.cond_val
-        if bp.cond_op == "==":
-            return actual == c
-        elif bp.cond_op == "!=":
-            return actual != c
-        elif bp.cond_op == "<":
-            return actual < c
-        elif bp.cond_op == ">":
-            return actual > c
-        elif bp.cond_op == "<=":
-            return actual <= c
-        elif bp.cond_op == ">=":
-            return actual >= c
-        return actual == c
+        compare = _COMPARE_OPS.get(bp.cond_op, operator.eq)
+        return compare(actual, bp.cond_val)
 
     # ----------------------------------------------------------
     #  命中报告
@@ -164,7 +163,7 @@ class BreakpointMixin(SharedMixinAttrs):
         return False
 
     # ----------------------------------------------------------
-    #  断点检查 (执行前)
+    #  执行前检查断点
     # ----------------------------------------------------------
 
     def _check_breakpoints(self, hart, pc: int, instr: int) -> bool:
@@ -222,33 +221,41 @@ class BreakpointMixin(SharedMixinAttrs):
 
     def _try_set_symbol_bp(self, name: str) -> bool:
         """尝试按符号名设置地址断点.  成功返回 True, 未匹配返回 False."""
-        # 1) 固件符号 (OpenSBI / 测试固件)
-        if self._image and self._image.symbols:
-            sym_addr = self._image.symbols.get(name)
-            # 判定用 None 比较: 链接在地址 0 的符号 (入口点 0x0 的固件) 取值为 0,
-            # 用真值判定会把该符号当作未找到.
-            if sym_addr is not None:
-                addr = sym_addr + self._load_offset
-                if not check_rv64_addr(addr):
-                    return True
-                self._add_bp_and_report(addr, name)
-                return True
+        addr = self._firmware_symbol_addr(name)
+        if addr is not None:
+            self._install_symbol_bp(addr, name)
+            return True
 
-        # 2) 外部调试符号 (Linux vmlinux 等)
-        if (
-            self._sym_symbols is None
-            or not self._sym_symbols
-            or self._sym_symbols.get(name) is None
-        ):
+        module_pa = self._module_runtime_addr_of_name(name)
+        if module_pa is not None:
+            self._install_symbol_bp(module_pa, name)
+            return True
+
+        if not self._sym_symbols or self._sym_symbols.get(name) is None:
             return False
         runtime_addr = self._resolve_sym_addr(self._sym_symbols.get(name))
         if runtime_addr is None:
             self._err(f"无法解析符号运行时地址: {name}")
             return True
-        if not check_rv64_addr(runtime_addr):
-            return True
-        self._add_bp_and_report(runtime_addr, name)
+        self._install_symbol_bp(runtime_addr, name)
         return True
+
+    def _firmware_symbol_addr(self, name: str) -> int | None:
+        """按固件符号表求运行时地址."""
+        if not (self._image and self._image.symbols):
+            return None
+        sym_addr = self._image.symbols.get(name)
+        # 判定用 None 比较: 链接在地址 0 的符号 (入口点 0x0 的固件) 取值为 0,
+        # 用真值判定会把该符号当作未找到.
+        if sym_addr is None:
+            return None
+        return sym_addr + self._load_offset
+
+    def _install_symbol_bp(self, addr: int, name: str) -> None:
+        """地址落在 RV64 范围内时设置断点并报告."""
+        if not check_rv64_addr(addr):
+            return
+        self._add_bp_and_report(addr, name)
 
     # ----------------------------------------------------------
     #  bp 命令

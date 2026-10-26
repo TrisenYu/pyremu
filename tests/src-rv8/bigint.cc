@@ -74,7 +74,8 @@ struct Nat {
 	Nat(const std::initializer_list<limb_t> l);
 
 	/*! string constructor */
-	Nat(std::string str, size_t radix = 0);
+	Nat(std::string str,
+		size_t radix = 0);
 
 	/*! copy constructor  */
 	Nat(const Nat &operand);
@@ -193,11 +194,17 @@ struct Nat {
 	 */
 
 	/*! base 2^limb_bits multiply */
-	static void mult(const Nat &multiplicand, const Nat multiplier, Nat &result);
+	static void mult(
+		const Nat &multiplicand,
+		const Nat multiplier,
+		Nat &result);
 
 	/*! base 2^limb_bits division */
 	static void divrem(
-		const Nat &dividend, const Nat &divisor, Nat &quotient, Nat &remainder);
+		const Nat &dividend,
+		const Nat &divisor,
+		Nat &quotient,
+		Nat &remainder);
 
 	/*! multiply */
 	Nat operator*(const Nat &operand) const;
@@ -228,7 +235,10 @@ struct Nat {
 	std::string to_string(size_t radix = 10) const;
 
 	/*! convert Nat from string */
-	void from_string(const char *str, size_t len, size_t radix);
+	void from_string(
+		const char *str,
+		size_t len,
+		size_t radix);
 };
 
 using limb_t  = Nat::limb_t;
@@ -253,7 +263,9 @@ Nat::Nat(const std::initializer_list<limb_t> l)
 }
 
 /*! string constructor */
-Nat::Nat(std::string str, size_t radix)
+Nat::Nat(
+	std::string str,
+	size_t radix)
 : limbs{0} {
 	from_string(str.c_str(), str.size(), radix);
 }
@@ -555,7 +567,10 @@ bool Nat::operator!() const {
  */
 
 /*! base 2^limb_bits multiply */
-void Nat::mult(const Nat &multiplicand, const Nat multiplier, Nat &result) {
+void Nat::mult(
+	const Nat &multiplicand,
+	const Nat multiplier,
+	Nat &result) {
 	size_t m = multiplicand.num_limbs(), n = multiplier.num_limbs();
 	result._resize(m + n);
 	for (size_t j = 0; j < n; j++) {
@@ -572,7 +587,11 @@ void Nat::mult(const Nat &multiplicand, const Nat multiplier, Nat &result) {
 }
 
 /*! base 2^limb_bits division */
-void Nat::divrem(const Nat &dividend, const Nat &divisor, Nat &quotient, Nat &remainder) {
+void Nat::divrem(
+	const Nat &dividend,
+	const Nat &divisor,
+	Nat &quotient,
+	Nat &remainder) {
 	quotient	= 0;
 	remainder	= 0;
 	ptrdiff_t m = dividend.num_limbs(), n = divisor.num_limbs();
@@ -739,7 +758,10 @@ Nat Nat::pow(size_t exp) const {
  * helpers for recursive divide and conquer conversion to string
  */
 
-static inline ptrdiff_t _to_string_c(const Nat &val, std::string &s, ptrdiff_t offset) {
+static inline ptrdiff_t _to_string_c(
+	const Nat &val,
+	std::string &s,
+	ptrdiff_t offset) {
 	limb2_t v = limb2_t(val.limb_at(0)) | (limb2_t(val.limb_at(1)) << Nat::limb_bits);
 	do {
 		s[--offset] = '0' + char(v % 10);
@@ -855,7 +877,10 @@ std::string Nat::to_string(size_t radix) const {
 	}
 }
 
-void Nat::from_string(const char *str, size_t len, size_t radix) {
+void Nat::from_string(
+	const char *str,
+	size_t len,
+	size_t radix) {
 	static const Nat tenp18{0xa7640000, 0xde0b6b3};
 	static const Nat twop64{0, 0, 1};
 	if (len > 2) {
@@ -922,7 +947,9 @@ void Nat::from_string(const char *str, size_t len, size_t radix) {
 }
 
 // bigint.cc
-int main(int argc, char const *argv[]) {
+int main(
+	int argc,
+	char const *argv[]) {
 	int val = 23, power = 111121;
 	Nat result = Nat(val).pow(power);
 	// 23 ^ 111121 has 151317 digits

@@ -54,7 +54,7 @@ src/configs_gen.rs: FORCE
 	@echo 'pub const LINK_BASE: u64 = $(LINK_BASE);' >> $@.tmp
 	@echo 'pub const ENCLAVE_MAN_VA_START: u64 = $(ENCLAVE_MAN_VA_START);' >> $@.tmp
 	@echo 'pub const ENCLAVE_MODULE_LOAD_VA_INIT: u64 = $(ENCLAVE_MODULE_LOAD_VA_INIT);' >> $@.tmp
-	@echo 'pub const ENCLAVE_MODULE_WINDOW_SIZE: u64 = $(ENCLAVE_MODULE_WINDOW_SIZE);' >> $@.tmp
+	@echo 'pub const EXT_MODS_VAS_SIZE: u64 = $(EXT_MODS_VAS_SIZE);' >> $@.tmp
 	@echo 'pub const LINEAR_MAP_START: u64 = $(LINEAR_MAP_START);' >> $@.tmp
 	@echo 'pub const LINEAR_MAP_SIZE: u64 = $(LINEAR_MAP_SIZE);' >> $@.tmp
 	@echo 'pub const LINEAR_MAP_OFFSET: u64 = $(LINEAR_MAP_OFFSET);' >> $@.tmp

@@ -11,7 +11,8 @@
 #[inline(always)]
 #[allow(unused)]
 pub fn log(args: core::fmt::Arguments) {
-	#[cfg(feature = "diagnostic")] {
+	#[cfg(feature = "diagnostic")]
+	{
 		crate::println!("{}", args);
 	}
 }

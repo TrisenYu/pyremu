@@ -3,9 +3,9 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""MemoryMixin — 虚拟/物理内存读写、地址解析、反汇编.
+"""MemoryOps — 虚拟/物理内存读写、地址解析、反汇编.
 
-依赖 DebuggerBase + SymbolMixin.
+依赖 DebuggerBase + SymLookupOps.
 """
 
 import re
@@ -17,7 +17,7 @@ from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import translate_addr
 from pyremu.core.registers import csr_addr_from_name, gpr_idx_from_name
 from pyremu.core.trap_def import trap_cause_name
-from pyremu.debug._attrs import SharedMixinAttrs
+from pyremu.debug.attrs import SharedAttrs
 from pyremu.debug.utils import (
     check_rv64_addr,
     hex_addr,
@@ -27,40 +27,173 @@ from pyremu.debug.utils import (
 from pyremu.memory.mmu import sv39_walk
 from pyremu.utils.disassem import disasm
 from pyremu.utils.mask import mask64
+from pyremu.utils.str_aux import dye_hexdump
 from pyremu.utils.wrapper import seize_val_err
 
 # 反汇编着色常量
-_GPR_ALIASES = frozenset({
-    "zero", "ra", "sp", "gp", "tp",
-    "t0", "t1", "t2", "t3", "t4", "t5", "t6",
-    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
-    "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
-    "fp",
-})
-_BRANCH_JUMP_MNEMONICS = frozenset({
-    "beq", "bne", "blt", "bge", "bltu", "bgeu",
-    "jal", "jalr", "j", "jr", "ret",
-    # Compressed jump/branch mnemonics
-    "c.j", "c.jr", "c.jalr", "c.beqz", "c.bnez",
-})
-_LOAD_STORE_MNEMONICS = frozenset({
-    "ld", "lw", "lh", "lb", "lwu", "lhu", "lbu",
-    "sd", "sw", "sh", "sb",
-    # Compressed load/store mnemonics
-    "c.ld", "c.ldsp", "c.lw", "c.lwsp",
-    "c.sd", "c.sdsp", "c.sw", "c.swsp",
-})
-_FENCE_AMO_MNEMONICS = frozenset({
-    "fence", "fence.i", "sfence.vma",
-    "lr.w", "lr.d", "sc.w", "sc.d",
-    "amoswap.w", "amoswap.d", "amoadd.w", "amoadd.d",
-    "amoxor.w", "amoxor.d", "amoand.w", "amoand.d",
-    "amoor.w", "amoor.d", "amomin.w", "amomin.d",
-    "amomax.w", "amomax.d", "amominu.w", "amominu.d",
-    "amomaxu.w", "amomaxu.d",
-})
+_GPR_ALIASES = frozenset(
+    {
+        "zero",
+        "ra",
+        "sp",
+        "gp",
+        "tp",
+        "t0",
+        "t1",
+        "t2",
+        "t3",
+        "t4",
+        "t5",
+        "t6",
+        "s0",
+        "s1",
+        "s2",
+        "s3",
+        "s4",
+        "s5",
+        "s6",
+        "s7",
+        "s8",
+        "s9",
+        "s10",
+        "s11",
+        "a0",
+        "a1",
+        "a2",
+        "a3",
+        "a4",
+        "a5",
+        "a6",
+        "a7",
+        "fp",
+    }
+)
+_BRANCH_JUMP_MNEMONICS = frozenset(
+    {
+        "beq",
+        "bne",
+        "blt",
+        "bge",
+        "bltu",
+        "bgeu",
+        "jal",
+        "jalr",
+        "j",
+        "jr",
+        "ret",
+        # Compressed jump/branch mnemonics
+        "c.j",
+        "c.jr",
+        "c.jalr",
+        "c.beqz",
+        "c.bnez",
+    }
+)
+_LOAD_STORE_MNEMONICS = frozenset(
+    {
+        "ld",
+        "lw",
+        "lh",
+        "lb",
+        "lwu",
+        "lhu",
+        "lbu",
+        "sd",
+        "sw",
+        "sh",
+        "sb",
+        # Compressed load/store mnemonics
+        "c.ld",
+        "c.ldsp",
+        "c.lw",
+        "c.lwsp",
+        "c.sd",
+        "c.sdsp",
+        "c.sw",
+        "c.swsp",
+    }
+)
+_PRIVILEGED_MNEMONICS = frozenset({"ecall", "ebreak", "mret", "sret", "wfi", "c.ebreak"})
+_FENCE_AMO_MNEMONICS = frozenset(
+    {
+        "fence",
+        "fence.i",
+        "sfence.vma",
+        "lr.w",
+        "lr.d",
+        "sc.w",
+        "sc.d",
+        "amoswap.w",
+        "amoswap.d",
+        "amoadd.w",
+        "amoadd.d",
+        "amoxor.w",
+        "amoxor.d",
+        "amoand.w",
+        "amoand.d",
+        "amoor.w",
+        "amoor.d",
+        "amomin.w",
+        "amomin.d",
+        "amomax.w",
+        "amomax.d",
+        "amominu.w",
+        "amominu.d",
+        "amomaxu.w",
+        "amomaxu.d",
+    }
+)
 
-class MemoryMixin(SharedMixinAttrs):
+# 助记符类别与对应的颜色名, 按该顺序判定
+_MNEMONIC_COLORS = (
+    (_BRANCH_JUMP_MNEMONICS, "green"),
+    (_FENCE_AMO_MNEMONICS, "yellow"),
+    (_PRIVILEGED_MNEMONICS, "red"),
+    (_LOAD_STORE_MNEMONICS, "cyan"),
+)
+
+# 32 位指令的 opcode 到控制流分类
+_OPCODE_FLOW_KINDS = {
+    0x6F: "jal",
+    0x67: "jalr",
+    0x63: "branch",
+    0x0F: "fence",
+    0x2F: "fence",
+}
+
+# 反汇编在此类控制流之后画分隔线并停止累计步数
+_TERMINATOR_KINDS = frozenset(
+    {
+        "jal",
+        "jalr",
+        "ecall",
+        "ebreak",
+        "mret",
+        "sret",
+        "wfi",
+        "branch",
+    }
+)
+
+# SYSTEM 指令的 funct12 到控制流分类
+_SYSTEM_FLOW_KINDS = {
+    0x000: "ecall",
+    0x001: "ebreak",
+    0x302: "mret",
+    0x102: "sret",
+    0x105: "wfi",
+}
+
+
+def _mnemonic_color(mnemonic: str) -> str | None:
+    """返回反汇编助记符对应的颜色名; 无对应颜色时返回 None."""
+    for group, color in _MNEMONIC_COLORS:
+        if mnemonic in group:
+            return color
+    return None
+
+
+class MemoryOps(SharedAttrs):
     """内存访问和反汇编."""
 
     # ----------------------------------------------------------
@@ -139,16 +272,31 @@ class MemoryMixin(SharedMixinAttrs):
         if v != 0 or csr_addr_from_name(arg) is not None:
             return v
 
+        name_addr = self._resolve_symbol_operand(arg)
+        if name_addr is not None:
+            return name_addr
+        return self._parse_addr_literal(arg)
+
+    def _resolve_symbol_operand(self, name: str) -> int | None:
+        """按固件符号、已加载模块、外部符号表的顺序解析符号名."""
         if self._image and self._image.symbols:
-            sym_va = self._image.symbols.get(arg)
+            sym_va = self._image.symbols.get(name)
             if sym_va is not None:
                 return sym_va + self._load_offset
+        module_pa = self._module_runtime_addr_of_name(name)
+        if module_pa is not None:
+            return module_pa
         if self._sym_symbols:
-            sym_va = self._sym_symbols.get(arg)
+            sym_va = self._sym_symbols.get(name)
             if sym_va is not None:
                 return self._resolve_sym_addr(sym_va)
+        return None
+
+    @staticmethod
+    def _parse_addr_literal(text: str) -> int | None:
+        """解析数值字面量; 超出 RV64 范围或非整数时返回 None."""
         try:
-            v = int(arg, 0)
+            v = int(text, 0)
         except ValueError:
             return None
         if v < 0 or v >= (1 << 64):
@@ -176,57 +324,28 @@ class MemoryMixin(SharedMixinAttrs):
 
     @staticmethod
     def _colorize_asm(asm_text: str) -> str:
-        """为反汇编文本添加 Rich 颜色标记 (助记符 + 立即数)."""
+        """为反汇编文本添加 Rich 颜色标记."""
         if not asm_text or asm_text.startswith("[") or asm_text == "(unknown)":
             return asm_text
         parts = asm_text.split(maxsplit=1)
         mnemonic = parts[0]
-        rest = parts[1] if len(parts) > 1 else ""
+        operands = parts[1] if len(parts) > 1 else ""
+        color = _mnemonic_color(mnemonic)
+        if not operands:
+            return asm_text if color is None else f"[{color}]{mnemonic}[/]"
         # 十六进制与纯数字立即数显示为品红
-        if rest:
-            rest = re.sub(
-                r'\b(0x[0-9a-fA-F]+|\d+)\b',
-                r'[magenta]\1[/]',
-                rest,
-            )
-        if mnemonic in _BRANCH_JUMP_MNEMONICS:
-            return f"[green]{mnemonic}[/] {rest}".rstrip()
-        if mnemonic in _FENCE_AMO_MNEMONICS:
-            return f"[yellow]{mnemonic}[/] {rest}".rstrip()
-        if mnemonic in {"ecall", "ebreak", "mret", "sret", "wfi", "c.ebreak"}:
-            return f"[red]{mnemonic}[/] {rest}".rstrip()
-        if mnemonic in _LOAD_STORE_MNEMONICS:
-            return f"[cyan]{mnemonic}[/] {rest}".rstrip()
-        if rest:
-            return f"{mnemonic} {rest}".rstrip()
-        return asm_text
+        operands = re.sub(r"\b(0x[0-9a-fA-F]+|\d+)\b", r"[magenta]\1[/]", operands)
+        if color is None:
+            return f"{mnemonic} {operands}"
+        return f"[{color}]{mnemonic}[/] {operands}"
 
     @staticmethod
     def _ctrl_flow_kind(instr: int) -> str:
         """32-bit 指令的控制流分类."""
         opcode = instr & 0x7F
-        if opcode == 0x6F:
-            return "jal"
-        if opcode == 0x67:
-            return "jalr"
-        if opcode == 0x63:
-            return "branch"
         if opcode == 0x73:
-            funct12 = (instr >> 20) & 0xFFF
-            if funct12 == 0x000:
-                return "ecall"
-            if funct12 == 0x001:
-                return "ebreak"
-            if funct12 == 0x302:
-                return "mret"
-            if funct12 == 0x102:
-                return "sret"
-            if funct12 == 0x105:
-                return "wfi"
-            return "csr"
-        if opcode in (0x0F, 0x2F):
-            return "fence"
-        return "normal"
+            return _SYSTEM_FLOW_KINDS.get((instr >> 20) & 0xFFF, "csr")
+        return _OPCODE_FLOW_KINDS.get(opcode, "normal")
 
     @staticmethod
     def _ctrl_flow_kind_compressed(instr16: int) -> str:
@@ -296,6 +415,10 @@ class MemoryMixin(SharedMixinAttrs):
             + f"\nRaw  = [bright_black]{raw_hex}[/]"
             + f"\n[bold green]      {asm}[/]"
         )
+        self._print_trap_context(h)
+
+    def _print_trap_context(self, h) -> None:
+        """输出 M/S 两侧的 trap 上下文; 同一 mcause 只输出一次."""
         mcause = h.mcause_val
         if mcause == 0:
             self._trap_displayed_mcause = None
@@ -318,8 +441,7 @@ class MemoryMixin(SharedMixinAttrs):
             m_style, s_style = "cyan", "cyan"
 
         tbl = Table(
-            title=f"Hart {self._hart_id}  Trap 上下文 "
-                  f"{'中断' if is_intr else '异常'}",
+            title=f"Hart {self._hart_id}  Trap 上下文 {'中断' if is_intr else '异常'}",
             border_style="red",
             show_header=True,
         )
@@ -344,21 +466,16 @@ class MemoryMixin(SharedMixinAttrs):
         self._console.print(tbl)
 
         m_anno = (
-            f"[cyan]{_mcause_name}[/]  "
-            f"MIE={(_mstatus >> 3) & 1} MPP={(_mstatus >> 11) & 3}"
+            f"[cyan]{_mcause_name}[/]  MIE={(_mstatus >> 3) & 1} MPP={(_mstatus >> 11) & 3}"
         )
         s_anno = ""
         if _scause != 0:
             _scause_name = trap_cause_name(_scause)
             s_anno = (
-                f"[cyan]{_scause_name}[/]  "
-                f"SIE={(_sstatus >> 1) & 1} SPP={(_sstatus >> 8) & 1}"
+                f"[cyan]{_scause_name}[/]  SIE={(_sstatus >> 1) & 1} SPP={(_sstatus >> 8) & 1}"
             )
         elif _sstatus != 0:
-            s_anno = (
-                f"SIE={(_sstatus >> 1) & 1} "
-                f"SPP={(_sstatus >> 8) & 1}"
-            )
+            s_anno = f"SIE={(_sstatus >> 1) & 1} SPP={(_sstatus >> 8) & 1}"
         self._console.print(f"  {m_anno}    {s_anno}")
 
     # ----------------------------------------------------------
@@ -366,9 +483,10 @@ class MemoryMixin(SharedMixinAttrs):
     # ----------------------------------------------------------
 
     def _count_instrs_between(self, start: int, end: int) -> int:
-        """计算从 *start* (含) 到 *end* (不含) 之间的指令条数."""
+        """计算从 [start, end) 的指令条数."""
         bus = self._emu.bus
-        if not bus.is_ram_addr(start):
+        # 引导只读存储器同样可以存放指令, 从该窗口起始的区间参与计数.
+        if not (bus.is_ram_addr(start) or bus.is_rom_addr(start)):
             return MAX_INSTR_COUNT
         count = 0
         addr = start
@@ -404,18 +522,33 @@ class MemoryMixin(SharedMixinAttrs):
         if addr & 1:
             orig = addr
             addr &= ~1
-            self._warn(
-                f"addr 至少应为 2-字节对齐, 已从 0x{orig:016x} 对齐到 0x{addr:016x}"
-            )
+            self._warn(f"addr 至少应为 2-字节对齐, 已从 0x{orig:016x} 对齐到 0x{addr:016x}")
         raw = self._try_read_pa(addr, inst_count * 4)
         if raw is None:
             self._err(f"无法读取物理地址: [yellow]{hex_addr(addr)}[/]")
             return
 
-        is_continue = (
-            self._disasm_ref_pc is not None
-            and addr == self._disasm_next_addr
+        is_continue = self._disasm_ref_pc is not None and addr == self._disasm_next_addr
+        instrs, offset = self._decode_pa_range(addr, raw, inst_count)
+        self._disasm_next_addr = addr + offset
+        if not instrs:
+            self._console.print("[dim](空)[/]")
+            return
+
+        self._update_disasm_anchor(addr, instrs, is_continue)
+        lines = self._disasm_lines(instrs)
+        self._console.print(
+            f"[bold]反汇编[/] [yellow]{hex_addr(addr)}[/]"
+            f"  {inst_count} 条指令\n" + "\n".join(lines)
         )
+
+    def _decode_pa_range(
+        self,
+        addr: int,
+        raw: bytes,
+        inst_count: int,
+    ) -> tuple[list[tuple[int, str, str, str]], int]:
+        """按物理地址逐条解码, 返回指令列表与已解码的字节数."""
         instrs: list[tuple[int, str, str, str]] = []
         offset = 0
         max_offset = len(raw)
@@ -427,13 +560,12 @@ class MemoryMixin(SharedMixinAttrs):
             is_compressed = decode_fields(instr).is_compressed
             inst_size = 2 if is_compressed else 4
             if remaining < inst_size:
-                extra = self._emu.bus.try_read(addr + offset, inst_size)
+                extra = self._emu.bus.try_read(pc_addr, inst_size)
                 if extra is None:
                     hex_s = " ".join(f"{b:02x}" for b in raw[offset:])
                     instrs.append((pc_addr, hex_s, "[dim](截断)[/]", "normal"))
                     break
-                raw = raw[:offset] + extra + raw[offset + len(extra):]
-                remaining = inst_size
+                raw = raw[:offset] + extra + raw[offset + len(extra) :]
             asm = disasm(instr, pc_addr)
             raw_hex = f"{instr & 0xFFFF:04x}" if is_compressed else f"{instr:08x}"
             ctrl = (
@@ -443,35 +575,64 @@ class MemoryMixin(SharedMixinAttrs):
             )
             instrs.append((pc_addr, raw_hex, asm, ctrl))
             offset += inst_size
-        self._disasm_next_addr = addr + offset
-        if not instrs:
-            self._console.print("[dim](空)[/]")
+        return instrs, offset
+
+    def _update_disasm_anchor(
+        self,
+        addr: int,
+        instrs: list[tuple[int, str, str, str]],
+        is_continue: bool,
+    ) -> None:
+        """本次反汇编接续上一次时直接返回. 否则以当前 PC 为参照 PC, 计算首条指令
+        到参照 PC 之间的指令条数并写入 `_disasm_base_step`; 条数达到上限时置
+        `_disasm_past_terminator`.
+        """
+        if is_continue:
             return
+        self._disasm_ref_pc = self.hart.pc
+        self._disasm_past_terminator = False
+        ref_idx: int | None = None
+        for i, (pc_addr, _, _, _) in enumerate(instrs):
+            if pc_addr == self._disasm_ref_pc:
+                ref_idx = i
+                break
+        if ref_idx is not None:
+            self._disasm_base_step = -ref_idx
+            return
+        if self._disasm_ref_pc is None:
+            self._disasm_base_step = 0
+            return
+        if addr > self._disasm_ref_pc:
+            step_cnt = self._count_instrs_between(self._disasm_ref_pc, addr)
+            self._disasm_base_step = step_cnt
+        else:
+            step_cnt = self._count_instrs_between(addr, self._disasm_ref_pc)
+            self._disasm_base_step = -step_cnt
+        if step_cnt >= MAX_INSTR_COUNT:
+            self._disasm_past_terminator = True
 
-        if not is_continue:
-            self._disasm_ref_pc = self.hart.pc
-            self._disasm_past_terminator = False
-            ref_idx: int | None = None
-            for i, (pc_addr, _, _, _) in enumerate(instrs):
-                if pc_addr == self._disasm_ref_pc:
-                    ref_idx = i
-                    break
-            if ref_idx is not None:
-                self._disasm_base_step = -ref_idx
-            elif self._disasm_ref_pc is None:
-                self._disasm_base_step = 0
-            elif addr > self._disasm_ref_pc:
-                step_cnt = self._count_instrs_between(self._disasm_ref_pc, addr)
-                self._disasm_base_step = step_cnt
-                if step_cnt >= MAX_INSTR_COUNT:
-                    self._disasm_past_terminator = True
-            else:
-                step_cnt = self._count_instrs_between(addr, self._disasm_ref_pc)
-                self._disasm_base_step = -step_cnt
-                if step_cnt >= MAX_INSTR_COUNT:
-                    self._disasm_past_terminator = True
+    def _scope_label(self, pc_addr: int) -> str:
+        """按符号名与段名给出作用域标注; 都解析不到时返回空串."""
+        sym_name = self._resolve_any_symbol_name(pc_addr)
+        seg = self._find_segment(pc_addr - self._load_offset)
+        seg_name = seg.name if seg and seg.name else ""
+        if seg_name and sym_name:
+            return f"<[dim]{seg_name}[/]:[yellow]{sym_name}[/]>"
+        if sym_name:
+            return f"<[yellow]{sym_name}[/]>"
+        return ""
 
-        ref_pc = self._disasm_ref_pc
+    @staticmethod
+    def _disasm_prefix(step: int, at_ref: bool, past_term: bool) -> str:
+        """给出反汇编行首的步数标注."""
+        if at_ref:
+            return "pc -> "
+        if step > 0 and not past_term:
+            return f"+{step:<5d}"
+        return "      "
+
+    def _disasm_lines(self, instrs: list[tuple[int, str, str, str]]) -> list[str]:
+        """渲染反汇编行, 并更新下一次续接时使用的步数值与终止标记."""
         base = self._disasm_base_step
         past_term = self._disasm_past_terminator
         next_base = base
@@ -479,35 +640,16 @@ class MemoryMixin(SharedMixinAttrs):
         last_scope: str | None = None
         for i, (pc_addr, raw_hex, asm, ctrl) in enumerate(instrs):
             step = base + i
-            at_ref = pc_addr == ref_pc
-            if at_ref:
-                prefix = "pc -> "
-            elif step > 0 and not past_term:
-                prefix = f"+{step:<5d}"
-            else:
-                prefix = "      "
-            link_addr = pc_addr - self._load_offset
-            sym_name = self._resolve_any_symbol_name(pc_addr)
-            seg = self._find_segment(link_addr)
-            seg_name = seg.name if seg and seg.name else ""
-            scope = (
-                f"<[dim]{seg_name}[/]:[yellow]{sym_name}[/]>"
-                if (seg_name and sym_name)
-                else f"<[yellow]{sym_name}[/]>" if sym_name
-                else ""
-            )
+            scope = self._scope_label(pc_addr)
             if scope and scope != last_scope:
                 last_scope = scope
                 lines.append(f"  {scope}")
-            asm_colored = self._colorize_asm(asm)
+            prefix = self._disasm_prefix(step, pc_addr == self._disasm_ref_pc, past_term)
             lines.append(
                 f"{prefix}    [blue]{hex_addr(pc_addr)}[/]    "
-                f"[bright_black]{raw_hex:>8s}[/]    {asm_colored}"
+                f"[bright_black]{raw_hex:>8s}[/]    {self._colorize_asm(asm)}"
             )
-            if ctrl in (
-                    "jal", "jalr", "ecall", "ebreak",
-                    "mret", "sret", "wfi", "branch",
-                ):
+            if ctrl in _TERMINATOR_KINDS:
                 lines.append(f"  {'─' * 80}")
                 if not past_term and step >= 0:
                     past_term = True
@@ -515,46 +657,72 @@ class MemoryMixin(SharedMixinAttrs):
                 next_base = step + 1
         self._disasm_base_step = next_base
         self._disasm_past_terminator = past_term
-        self._console.print(
-            f"[bold]反汇编[/] [yellow]{hex_addr(addr)}[/]"
-            f"  {inst_count} 条指令\n" + "\n".join(lines)
-        )
+        return lines
 
     def cmd_vdisasm(self, addr_str: str, inst_count_str: str = "16") -> None:
         """虚拟地址反汇编: vdisasm <vaddr> [count]."""
+        prepared = self._prepare_vdisasm(addr_str, inst_count_str)
+        if prepared is None:
+            return
+        va, first_pa, raw, inst_count = prepared
+
+        instrs, offset = self._decode_va_range(va, first_pa, raw, inst_count)
+        self._vdisasm_next_addr = va + offset
+        if not instrs:
+            self._console.print("[dim](空)[/]")
+            return
+
+        lines = self._vdisasm_lines(instrs)
+        self._console.print(
+            f"[bold]vdisasm[/] VA [yellow]{hex_addr(va)}[/]"
+            f" -> PA [yellow]{hex_addr(first_pa)}[/]"
+            f"  {inst_count} 条指令\n" + "\n".join(lines)
+        )
+
+    def _resolve_vdisasm_va(self, addr_str: str) -> int | None:
+        """把 vdisasm 的参数解析成可遍历页表的虚拟地址."""
         va = self._resolve_addr(addr_str)
         if va is None and self._image and self._image.symbols:
             sym_addr = self._image.symbols.get(addr_str)
             if sym_addr is not None:
                 va = sym_addr + self._load_offset
-        inst_count = int(inst_count_str, 0)
         if va is None:
             self._err(f"无法解析地址: {addr_str}")
-            return
-        if inst_count <= 0 or inst_count > 512:
-            self._err("指令数需在 1-512 之间")
-            return
+            return None
         if not check_rv64_addr(va):
             self._err(f"地址 {va:#x} 超出 RV64 范围")
-            return
+            return None
         if self.hart.mmu_mode == 0:
             self._err("satp 未使能 (Bare 模式), vdisasm 无可用翻译; 请用 disasm")
-            return
+            return None
         # _resolve_sym_addr 在 Sv39 模式下返回 PA (经 translate_addr),
         # 但 vdisasm 需要 VA 才能做页表遍历. 通过 _pa_to_va 反查回 VA.
-        if va is not None and self._pa_to_va:
+        if self._pa_to_va:
             maybe_va = self._pa_to_va.get(va)
             if maybe_va is not None:
                 va = maybe_va
         if va & 1:
             orig = va
             va &= ~1
-            self._warn(
-                f"addr 至少应为 2-字节对齐, 已从 0x{orig:016x} 对齐到 0x{va:016x}"
-            )
+            self._warn(f"addr 至少应为 2-字节对齐, 已从 0x{orig:016x} 对齐到 0x{va:016x}")
+        return va
+
+    def _prepare_vdisasm(
+        self,
+        addr_str: str,
+        inst_count_str: str,
+    ) -> tuple[int, int, bytes, int] | None:
+        """完成地址解析、页表遍历与首次读取; 任一步失败时报告原因并返回 None."""
+        inst_count = int(inst_count_str, 0)
+        if inst_count <= 0 or inst_count > 512:
+            self._err("指令数需在 1-512 之间")
+            return None
+        va = self._resolve_vdisasm_va(addr_str)
+        if va is None:
+            return None
         if self.hart._mem_read_phy is None:
             self._err("内存后端未挂载")
-            return
+            return None
         root_ppn = self.hart.satp_val & ((1 << 44) - 1)
         ok, ppn, _perm, page_size = sv39_walk(root_ppn, va, self.hart._mem_read_phy)
         if not ok:
@@ -562,7 +730,7 @@ class MemoryMixin(SharedMixinAttrs):
                 f"VA [yellow]{hex_addr(va)}[/] 页表翻译失败 (缺页);"
                 f" satp root PPN=0x{root_ppn:x}"
             )
-            return
+            return None
         # sv39_walk 返回 PPN (非 PA); 用页大小计算完整物理地址.
         # 注: 不走 _try_read_va_forced — 后者在 M-mode 下会将 VA 当作
         # PA (Bare 翻译) 返回, 对 S-mode 内核 VA 会读到错误物理地址.
@@ -571,8 +739,17 @@ class MemoryMixin(SharedMixinAttrs):
         raw = self._emu.bus.try_read(first_pa, inst_count * 4)
         if raw is None:
             self._err(f"VA [yellow]{hex_addr(va)}[/] 翻译后物理读取失败")
-            return
+            return None
+        return va, first_pa, raw, inst_count
 
+    def _decode_va_range(
+        self,
+        va: int,
+        first_pa: int,
+        raw: bytes,
+        inst_count: int,
+    ) -> tuple[list[tuple[int, str, str, str, int]], int]:
+        """按虚拟地址逐条解码, 返回指令列表与已解码的字节数."""
         instrs: list[tuple[int, str, str, str, int]] = []
         offset = 0
         max_offset = len(raw)
@@ -586,13 +763,11 @@ class MemoryMixin(SharedMixinAttrs):
             inst_size = 2 if is_compressed else 4
             if remaining < inst_size:
                 extra = self._emu.bus.try_read(pc_pa, inst_size)
-                if extra is not None:
-                    raw = raw[:offset] + extra + raw[offset + len(extra):]
-                    remaining = inst_size
-                else:
+                if extra is None:
                     hex_s = " ".join(f"{b:02x}" for b in raw[offset:])
                     instrs.append((pc_va, hex_s, "[dim](截断)[/]", "normal", pc_pa))
                     break
+                raw = raw[:offset] + extra + raw[offset + len(extra) :]
             asm = disasm(instr, pc_va)
             raw_hex = f"{instr & 0xFFFF:04x}" if is_compressed else f"{instr:08x}"
             ctrl = (
@@ -602,50 +777,33 @@ class MemoryMixin(SharedMixinAttrs):
             )
             instrs.append((pc_va, raw_hex, asm, ctrl, pc_pa))
             offset += inst_size
-        self._vdisasm_next_addr = va + offset
-        if not instrs:
-            self._console.print("[dim](空)[/]")
-            return
+        return instrs, offset
 
+    def _vdisasm_lines(
+        self,
+        instrs: list[tuple[int, str, str, str, int]],
+    ) -> list[str]:
+        """渲染虚拟地址反汇编行, 表头之后逐条给出 VA、PA、原字节与助记符."""
         ref_pc = self.hart.pc
         last_scope: str | None = None
         lines: list[str] = [
             # pc ->的长度与4空格间距
-            f"{' '*(5+4)}VA{' '*(16+4)}PA{' '*(16+8+1)}raw    asm"
+            f"{' ' * (5 + 4)}VA{' ' * (16 + 4)}PA{' ' * (16 + 8 + 1)}raw    asm"
         ]
         for pc_va, raw_hex, asm, ctrl, pc_pa in instrs:
-            link_addr = pc_va - self._load_offset
-            sym_name = self._resolve_any_symbol_name(pc_va)
-            seg = self._find_segment(link_addr)
-            seg_name = seg.name if seg and seg.name else ""
-            scope = (
-                f"<[dim]{seg_name}[/]:[yellow]{sym_name}[/]>"
-                if (seg_name and sym_name)
-                else f"<[yellow]{sym_name}[/]>" if sym_name
-                else ""
-            )
+            scope = self._scope_label(pc_va)
             if scope and scope != last_scope:
                 last_scope = scope
                 lines.append(f"{scope}")
-            va_str = hex_addr(pc_va)
-            pa_str = hex_addr(pc_pa)
-            at_ref = pc_va == ref_pc
-            prefix_fixed = "pc ->" if at_ref else " "*5
-            asm_colored = self._colorize_asm(asm)
+            prefix_fixed = "pc ->" if pc_va == ref_pc else " " * 5
             lines.append(
-                f"{prefix_fixed}    [dim]{va_str}[/]    "
-                f"[bright_black]{pa_str}[/]    "
-                f"[bright_black]{raw_hex:>8s}[/]    {asm_colored}"
+                f"{prefix_fixed}    [dim]{hex_addr(pc_va)}[/]    "
+                f"[bright_black]{hex_addr(pc_pa)}[/]    "
+                f"[bright_black]{raw_hex:>8s}[/]    {self._colorize_asm(asm)}"
             )
-            if ctrl in (
-                "jal", "jalr", "ecall", "ebreak", "mret", "sret", "wfi", "branch",
-            ):
+            if ctrl in _TERMINATOR_KINDS:
                 lines.append(f"  {'─' * 80}")
-        self._console.print(
-            f"[bold]vdisasm[/] VA [yellow]{hex_addr(va)}[/]"
-            f" -> PA [yellow]{hex_addr(first_pa)}[/]"
-            f"  {inst_count} 条指令\n" + "\n".join(lines)
-        )
+        return lines
 
     # ----------------------------------------------------------
     #  内存显示命令
@@ -661,26 +819,20 @@ class MemoryMixin(SharedMixinAttrs):
             vpn = page_va >> 12
             hit, ppn, perm = h.dtlb.lookup(vpn)
             if not hit and h._mem_read_phy is None:
-                lines.append(
-                    f"  [red]VA 0x{page_va:016x}  内存后端未挂载[/]"
-                )
+                lines.append(f"  [red]VA 0x{page_va:016x}  内存后端未挂载[/]")
                 continue
             if not hit and h._mem_read_phy is not None:
                 root_ppn = h.satp_val & ((1 << 44) - 1)
                 ok, ppn, perm, _ = sv39_walk(root_ppn, page_va, h._mem_read_phy)
                 if not ok:
-                    lines.append(
-                        f"  [red]VA 0x{page_va:016x}  缺页 (无法翻译)[/]"
-                    )
+                    lines.append(f"  [red]VA 0x{page_va:016x}  缺页 (无法翻译)[/]")
                     continue
             pa = ppn << 12
             r = "r" if perm & 1 else "-"
             w = "w" if perm & 2 else "-"
             x = "x" if perm & 4 else "-"
             u = "u" if perm & 8 else "s"
-            lines.append(
-                f"  VA 0x{page_va:016x} -> PA 0x{pa:016x}  [{r}{w}{x}{u}]"
-            )
+            lines.append(f"  VA 0x{page_va:016x} -> PA 0x{pa:016x}  [{r}{w}{x}{u}]")
         self._console.print("\n".join(lines))
 
     @seize_val_err("addr 和 size 需为整数 (支持 0x 前缀)")
@@ -701,7 +853,7 @@ class MemoryMixin(SharedMixinAttrs):
         if data is None:
             self._err("无法读取物理地址")
             return
-        self._console.print(self._emu._fmt_hexdump(addr, data))
+        self._console.print(dye_hexdump(data, addr))
 
     def cmd_vmem(self, addr_str: str, size_str: str = "64") -> None:
         """虚拟内存 hexdump: vmem <vaddr> [size]."""
@@ -725,9 +877,19 @@ class MemoryMixin(SharedMixinAttrs):
             maybe_va = self._pa_to_va.get(va)
             if maybe_va is not None:
                 va = maybe_va
+        result = self._walk_and_read_va(va, size)
+        if result is None:
+            return
+        first_pa, data = result
+        self._show_va_mapping_header(va, size)
+        self._console.print(f"[dim]VA {hex_addr(va)} -> PA {hex_addr(first_pa)}[/]")
+        self._console.print(dye_hexdump(data, va))
+
+    def _walk_and_read_va(self, va: int, size: int) -> tuple[int, bytes] | None:
+        """遍历页表并按虚拟地址读出 size 字节; 失败时报告原因并返回 None."""
         if self.hart._mem_read_phy is None:
             self._err("内存后端未挂载")
-            return
+            return None
         root_ppn = self.hart.satp_val & ((1 << 44) - 1)
         ok, _, _, _ = sv39_walk(root_ppn, va, self.hart._mem_read_phy)
         if not ok:
@@ -735,14 +897,9 @@ class MemoryMixin(SharedMixinAttrs):
                 f"VA [yellow]{hex_addr(va)}[/] 页表翻译失败 (缺页);"
                 f" satp root PPN=0x{root_ppn:x}"
             )
-            return
+            return None
         result = self._try_read_va_forced(va, size)
         if result is None:
             self._err(f"VA [yellow]{hex_addr(va)}[/] 翻译后物理读取失败")
-            return
-        first_pa, data = result
-        self._show_va_mapping_header(va, size)
-        self._console.print(
-            f"[dim]VA {hex_addr(va)} -> PA {hex_addr(first_pa)}[/]"
-        )
-        self._console.print(self._emu._fmt_hexdump(va, data))
+            return None
+        return result

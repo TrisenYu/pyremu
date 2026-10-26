@@ -9,7 +9,7 @@ Physical Memory Protection (PMP) — RISC-V Privileged Spec §3.7.
 PMP 在物理地址翻译完成后检查每次访存的合法性.
 支持三种地址匹配模式: OFF (禁用), TOR (地址范围), NA4 (4 字节), NAPOT (2 的幂).
 
-入口数由 emu-configs.mk 的 PMP_ENTRIES 给出, 上限 64.
+入口数由 mk/processor.mk 的 PMP_ENTRIES 给出, 上限 64.
 RV64 编码: pmpcfgN 覆盖 8 个条目, 仅偶数编号的 pmpcfg 可用.
 """
 

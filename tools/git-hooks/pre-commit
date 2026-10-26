@@ -1,106 +1,153 @@
 #!/bin/sh
-# 提交前格式化: 只处理本次纳入索引的代码文件, 不改动工作区的其余文件.
+# 提交前检查与格式化.
+#
+# 绑定: 在仓库根目录执行下列指令，相应的取消操作定义于docs/README.md中。
+# 	git config core.hooksPath tools/git-hooks
+#
+# 检查覆盖一直在维护的代码, 范围按语言划分:
+#   Python  pyremu/ tests/ tools/        ruff check 与 ruff format
+#   Rust    pyremu/_native/ bsp/sittim/  rustfmt
+#   C{pp}       bsp/sittim/ bsp/kei-boot/ bsp/tee_aux_tools/ tests/ pyremu/
+#               clang-format
+# 检查范围取 git 已跟踪的文件, 因此不进入 bsp/linux、bsp/setup-rootfs 等未跟踪目录.
+#
+# 每个文件先做格式检查; 检查不通过时格式化该文件, 格式化仍失败则以 1 退出.
+# 全部检查通过后, 把本次被格式化的文件加入索引, 提交继续进行.
+# 格式化作用于检查范围内的全部已跟踪文件, 因此未在本次提交中暂存的文件也可能被改写并加入索引.
 #
 # 语言与工具:
-#   .py        uv run ruff format 与 uv run ruff check
-#   .rs        rustfmt, 版本由文件所在 crate 的 Cargo.toml 给出, 找不到时取 2021
-#   .c / .h    clang-format -i, 配置由 clang-format 按文件所在目录向上查找
-#              本仓库的 .clang-format 需要 clang-format 20 及以上
+#   .py               uv run ruff format 与 uv run ruff check
+#   .rs               rustfmt, 版本由文件所在 crate 的 Cargo.toml 给出, 找不到时取 2021
+#   .c{c,pp}/.h{h,pp} clang-format -i, 配置由 clang-format 按文件所在目录向上查找
+#                     本仓库的 .clang-format 需要 clang-format 20 及以上
 #
 # 缺失时提示并以 1 退出.
-# 任一步骤失败即退出 1, 且不把格式化结果加入索引;
-# 全部通过后重新 git add 本次纳入索引的文件.
 
 cd "$(git rev-parse --show-toplevel)" || exit 1
 
+PY_CHECK_DIRS="pyremu tests tools"
+RS_CHECK_DIRS="pyremu/_native bsp/sittim"
+C_CHECK_DIRS="bsp/sittim bsp/kei-boot bsp/tee_aux_tools tests pyremu"
+
+TAB=$(printf '\t')
+
 require_tool() {
-    if ! command -v "$1" >/dev/null 2>&1; then
-        echo "pre-commit: $1 not found in PATH" >&2
-        exit 1
-    fi
+	if ! command -v "$1" >/dev/null 2>&1; then
+		echo "pre-commit: $1 not found in PATH" >&2
+		exit 1
+	fi
 }
 
 # 由文件所在目录向上查找最近的 Cargo.toml, 取其 edition; 找不到时取 2021.
 crate_edition() {
-    dir=$(dirname "$1")
-    while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
-        if [ -f "$dir/Cargo.toml" ]; then
-            edition=$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\)".*/\1/p' \
-                "$dir/Cargo.toml" | head -n 1)
-            if [ -n "$edition" ]; then
-                echo "$edition"
-                return 0
-            fi
-        fi
-        dir=$(dirname "$dir")
-    done
-    echo 2021
+	dir=$(dirname "$1")
+	while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
+		if [ -f "$dir/Cargo.toml" ]; then
+			edition=$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9][0-9]*\)".*/\1/p' \
+				"$dir/Cargo.toml" | head -n 1)
+			if [ -n "$edition" ]; then
+				echo "$edition"
+				return 0
+			fi
+		fi
+		dir=$(dirname "$dir")
+	done
+	echo 2021
 }
 
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 if [ -z "$STAGED" ]; then
-    exit 0
+	exit 0
 fi
 
 PY_FILES=$(printf '%s\n' "$STAGED" | grep '\.py$')
 RS_FILES=$(printf '%s\n' "$STAGED" | grep '\.rs$')
-C_FILES=$(printf '%s\n' "$STAGED" | grep -E '\.(c|h)$')
+C_FILES=$(printf '%s\n' "$STAGED" | grep -E '\.(c|h|cc|cpp|hpp)$')
+
+WORK=$(mktemp -d) || exit 1
+trap 'rm -rf "$WORK"' EXIT
+FORMATTED="$WORK/formatted"
+: > "$FORMATTED"
 
 if [ -n "$PY_FILES" ]; then
-    require_tool uv
-    echo "==> ruff format ..."
-    uv run ruff format $PY_FILES
-    echo "==> ruff check ..."
-    uv run ruff check $PY_FILES
-    status=$?
-
-    if [ $status -ne 0 ]; then
-        echo ""
-        echo "ruff check failed. Fix errors above, then:"
-        echo "  uv run ruff check --fix <files>"
-        echo "  git add <files>"
-        exit 1
-    fi
+	require_tool uv
+	git ls-files $PY_CHECK_DIRS | grep '\.py$' | while IFS= read -r f; do
+		if [ -f "$f" ]; then
+			printf '%s\n' "$f"
+		fi
+	done > "$WORK/py_all"
+	echo "==> ruff check (pyremu/ tests/ tools/) ..."
+	if ! xargs -r uv run ruff check < "$WORK/py_all"; then
+		echo ""
+		echo "ruff check failed. Fix errors above, then:"
+		echo "  uv run ruff check --fix  $PY_CHECK_DIRS"
+		exit 1
+	fi
+	echo "==> ruff format (pyremu/ tests/ tools/) ..."
+	if ! xargs -r uv run ruff format --check < "$WORK/py_all" >/dev/null 2>&1; then
+		git hash-object --stdin-paths < "$WORK/py_all" > "$WORK/py_before" || exit 1
+		if ! xargs -r uv run ruff format < "$WORK/py_all"; then
+			echo "ruff format failed." >&2
+			exit 1
+		fi
+		git hash-object --stdin-paths < "$WORK/py_all" > "$WORK/py_after" || exit 1
+		paste -d "$TAB" "$WORK/py_all" "$WORK/py_before" "$WORK/py_after" \
+			| awk -F "$TAB" '$2 != $3 { print $1 }' >> "$FORMATTED"
+		if ! xargs -r uv run ruff format --check < "$WORK/py_all" >/dev/null 2>&1; then
+			echo "ruff format left files unformatted:" >&2
+			xargs -r uv run ruff format --check < "$WORK/py_all" >&2
+			exit 1
+		fi
+	fi
 fi
 
 if [ -n "$RS_FILES" ]; then
-    require_tool rustfmt
-    echo "==> rustfmt ..."
-    for f in $RS_FILES; do
-        if [ ! -f "$f" ]; then
-            continue
-        fi
-        edition=$(crate_edition "$f")
-        # skip_children: 只格式化本文件, 不连带其声明的子模块.
-        rustfmt --config skip_children=true --edition "$edition" "$f"
-        if [ $? -ne 0 ]; then
-            echo ""
-            echo "rustfmt failed on $f (edition $edition)."
-            exit 1
-        fi
-    done
+	require_tool rustfmt
+	git ls-files $RS_CHECK_DIRS | grep '\.rs$' > "$WORK/rs_all"
+	echo "==> rustfmt (pyremu/_native/ bsp/sittim/) ..."
+	while IFS= read -r f; do
+		if [ ! -f "$f" ]; then
+			continue
+		fi
+		edition=$(crate_edition "$f")
+		if rustfmt --check --config skip_children=true --edition "$edition" "$f" \
+			>/dev/null 2>&1; then
+			continue
+		fi
+		if ! rustfmt --config skip_children=true --edition "$edition" "$f"; then
+			echo ""
+			echo "rustfmt failed on $f (edition $edition)." >&2
+			exit 1
+		fi
+		printf '%s\n' "$f" >> "$FORMATTED"
+	done < "$WORK/rs_all"
 fi
 
 if [ -n "$C_FILES" ]; then
-    require_tool clang-format
-    echo "==> clang-format ..."
-    for f in $C_FILES; do
-        if [ ! -f "$f" ]; then
-            continue
-        fi
-        clang-format -i "$f"
-        if [ $? -ne 0 ]; then
-            echo ""
-            echo "clang-format failed on $f."
-            exit 1
-        fi
-    done
+	require_tool clang-format
+	git ls-files $C_CHECK_DIRS | grep -E '\.(c|h|cc|cpp|hpp)$' > "$WORK/c_all"
+	echo "==> clang-format (bsp/sittim bsp/kei-boot bsp/tee_aux_tools tests/ pyremu/) ..."
+	while IFS= read -r f; do
+		if [ ! -f "$f" ]; then
+			continue
+		fi
+		if clang-format --dry-run --Werror "$f" >/dev/null 2>&1; then
+			continue
+		fi
+		if ! clang-format -i "$f"; then
+			echo ""
+			echo "clang-format failed on $f."
+			exit 1
+		fi
+		printf '%s\n' "$f" >> "$FORMATTED"
+	done < "$WORK/c_all"
 fi
 
-# 重新纳入由格式化改写过的文件
-for f in $PY_FILES $RS_FILES $C_FILES; do
-    if [ -f "$f" ]; then
-        git add -- "$f"
-    fi
-done
+if [ -s "$FORMATTED" ]; then
+	echo "==> formatted files will be staged:"
+	sed 's/^/    /' "$FORMATTED"
+	while IFS= read -r f; do
+		git add -- "$f"
+	done < "$FORMATTED"
+fi
 echo "==> pre-commit OK"

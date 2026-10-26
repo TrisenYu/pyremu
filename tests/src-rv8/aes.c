@@ -58,14 +58,14 @@ extern const u32 rcon[10];
 extern const u8 Td4s[256];
 extern const u8 rcons[10];
 
-#define TE0(i) Te0[((i) >> 24) & 0xff]
-#define TE1(i) Te1[((i) >> 16) & 0xff]
-#define TE2(i) Te2[((i) >> 8) & 0xff]
-#define TE3(i) Te3[(i) & 0xff]
-#define TE41(i) (Te4[((i) >> 24) & 0xff] & 0xff000000)
-#define TE42(i) (Te4[((i) >> 16) & 0xff] & 0x00ff0000)
-#define TE43(i) (Te4[((i) >> 8) & 0xff] & 0x0000ff00)
-#define TE44(i) (Te4[(i) & 0xff] & 0x000000ff)
+#define TE0(i)	 Te0[((i) >> 24) & 0xff]
+#define TE1(i)	 Te1[((i) >> 16) & 0xff]
+#define TE2(i)	 Te2[((i) >> 8) & 0xff]
+#define TE3(i)	 Te3[(i) & 0xff]
+#define TE41(i)	 (Te4[((i) >> 24) & 0xff] & 0xff000000)
+#define TE42(i)	 (Te4[((i) >> 16) & 0xff] & 0x00ff0000)
+#define TE43(i)	 (Te4[((i) >> 8) & 0xff] & 0x0000ff00)
+#define TE44(i)	 (Te4[(i) & 0xff] & 0x000000ff)
 #define TE421(i) (Te4[((i) >> 16) & 0xff] & 0xff000000)
 #define TE432(i) (Te4[((i) >> 8) & 0xff] & 0x00ff0000)
 #define TE443(i) (Te4[(i) & 0xff] & 0x0000ff00)
@@ -74,20 +74,20 @@ extern const u8 rcons[10];
 #define TE422(i) (Te4[((i) >> 16) & 0xff] & 0x00ff0000)
 #define TE433(i) (Te4[((i) >> 8) & 0xff] & 0x0000ff00)
 #define TE444(i) (Te4[(i) & 0xff] & 0x000000ff)
-#define TE4(i) (Te4[(i)] & 0x000000ff)
-#define TD0(i) Td0[((i) >> 24) & 0xff]
-#define TD1(i) Td1[((i) >> 16) & 0xff]
-#define TD2(i) Td2[((i) >> 8) & 0xff]
-#define TD3(i) Td3[(i) & 0xff]
-#define TD41(i) (Td4[((i) >> 24) & 0xff] & 0xff000000)
-#define TD42(i) (Td4[((i) >> 16) & 0xff] & 0x00ff0000)
-#define TD43(i) (Td4[((i) >> 8) & 0xff] & 0x0000ff00)
-#define TD44(i) (Td4[(i) & 0xff] & 0x000000ff)
-#define TD0_(i) Td0[(i) & 0xff]
-#define TD1_(i) Td1[(i) & 0xff]
-#define TD2_(i) Td2[(i) & 0xff]
-#define TD3_(i) Td3[(i) & 0xff]
-#define RCON(i) rcon[(i)]
+#define TE4(i)	 (Te4[(i)] & 0x000000ff)
+#define TD0(i)	 Td0[((i) >> 24) & 0xff]
+#define TD1(i)	 Td1[((i) >> 16) & 0xff]
+#define TD2(i)	 Td2[((i) >> 8) & 0xff]
+#define TD3(i)	 Td3[(i) & 0xff]
+#define TD41(i)	 (Td4[((i) >> 24) & 0xff] & 0xff000000)
+#define TD42(i)	 (Td4[((i) >> 16) & 0xff] & 0x00ff0000)
+#define TD43(i)	 (Td4[((i) >> 8) & 0xff] & 0x0000ff00)
+#define TD44(i)	 (Td4[(i) & 0xff] & 0x000000ff)
+#define TD0_(i)	 Td0[(i) & 0xff]
+#define TD1_(i)	 Td1[(i) & 0xff]
+#define TD2_(i)	 Td2[(i) & 0xff]
+#define TD3_(i)	 Td3[(i) & 0xff]
+#define RCON(i)	 rcon[(i)]
 
 #define GETU32(pt)                                                                       \
 	(((u32)(pt)[0] << 24) ^ ((u32)(pt)[1] << 16) ^ ((u32)(pt)[2] << 8) ^ ((u32)(pt)[3]))
@@ -99,7 +99,7 @@ extern const u8 rcons[10];
 		(ct)[3] = (u8)(st);                                                              \
 	}
 
-#define AES_PRIV_SIZE (4 * 4 * 15 + 4)
+#define AES_PRIV_SIZE	(4 * 4 * 15 + 4)
 #define AES_PRIV_NR_POS (4 * 15)
 
 const u32 Te0[256] = {
@@ -570,7 +570,10 @@ const u32 rcon[] = {
  *
  * @return      the number of rounds for the given cipher key size.
  */
-int aes_rijndael_key_setup_enc(u32 rk[], const u8 cipherKey[], size_t keyBits) {
+int aes_rijndael_key_setup_enc(
+	u32 rk[],
+	const u8 cipherKey[],
+	size_t keyBits) {
 	int i;
 	u32 temp;
 
@@ -638,7 +641,11 @@ int aes_rijndael_key_setup_enc(u32 rk[], const u8 cipherKey[], size_t keyBits) {
 	return -1;
 }
 
-void aes_rijndael_encrypt(const u32 rk[], int Nr, const u8 pt[16], u8 ct[16]) {
+void aes_rijndael_encrypt(
+	const u32 rk[],
+	int Nr,
+	const u8 pt[16],
+	u8 ct[16]) {
 	u32 s0, s1, s2, s3, t0, t1, t2, t3;
 #ifndef AES_FULL_UNROLL
 	int r;
@@ -717,7 +724,10 @@ void aes_rijndael_encrypt(const u32 rk[], int Nr, const u8 pt[16], u8 ct[16]) {
  *
  * @return      the number of rounds for the given cipher key size.
  */
-int aes_rijndael_key_setup_dec(u32 rk[], const u8 cipherKey[], size_t keyBits) {
+int aes_rijndael_key_setup_dec(
+	u32 rk[],
+	const u8 cipherKey[],
+	size_t keyBits) {
 	int Nr, i, j;
 	u32 temp;
 
@@ -754,7 +764,11 @@ int aes_rijndael_key_setup_dec(u32 rk[], const u8 cipherKey[], size_t keyBits) {
 	return Nr;
 }
 
-void aes_rijndael_decrypt(const u32 rk[], int Nr, const u8 ct[16], u8 pt[16]) {
+void aes_rijndael_decrypt(
+	const u32 rk[],
+	int Nr,
+	const u8 ct[16],
+	u8 pt[16]) {
 	u32 s0, s1, s2, s3, t0, t1, t2, t3;
 #ifndef AES_FULL_UNROLL
 	int r;
@@ -830,7 +844,9 @@ void aes_rijndael_decrypt(const u32 rk[], int Nr, const u8 ct[16], u8 pt[16]) {
 
 /* AES decrypt interface */
 
-void *aes_decrypt_init(const u8 *key, size_t len) {
+void *aes_decrypt_init(
+	const u8 *key,
+	size_t len) {
 	u32 *rk;
 	int res;
 	rk = malloc(AES_PRIV_SIZE);
@@ -846,7 +862,10 @@ void *aes_decrypt_init(const u8 *key, size_t len) {
 	return rk;
 }
 
-void aes_decrypt(void *ctx, const u8 *crypt, u8 *plain) {
+void aes_decrypt(
+	void *ctx,
+	const u8 *crypt,
+	u8 *plain) {
 	u32 *rk = ctx;
 	aes_rijndael_decrypt(ctx, rk[AES_PRIV_NR_POS], crypt, plain);
 }
@@ -858,7 +877,9 @@ void aes_decrypt_deinit(void *ctx) {
 
 /* AES encrypt interface */
 
-void *aes_encrypt_init(const u8 *key, size_t len) {
+void *aes_encrypt_init(
+	const u8 *key,
+	size_t len) {
 	u32 *rk;
 	int res;
 	rk = malloc(AES_PRIV_SIZE);
@@ -874,7 +895,10 @@ void *aes_encrypt_init(const u8 *key, size_t len) {
 	return rk;
 }
 
-void aes_encrypt(void *ctx, const u8 *plain, u8 *crypt) {
+void aes_encrypt(
+	void *ctx,
+	const u8 *plain,
+	u8 *crypt) {
 	u32 *rk = ctx;
 	aes_rijndael_encrypt(ctx, rk[AES_PRIV_NR_POS], plain, crypt);
 }

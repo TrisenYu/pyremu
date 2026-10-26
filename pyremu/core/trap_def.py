@@ -11,51 +11,54 @@ RISC-V 特权架构定义的 trap 类型及对应的 mcause/scause 编码。
 
 from enum import Enum
 
-TrapType = Enum("TrapType", (
-    # === 异常 (Exception) ===
-    "InstrAddrMisaligned",  # 0: 指令地址未对齐
-    "InstrAccessFault",  # 1: 指令访问错误
-    "IllInstr",  # 2: 非法指令
-    "Breakpoint",  # 3: 断点 (ebreak)
-    "LdAddrMisaligned",  # 4: 载入地址未对齐
-    "LdAccessFault",  # 5: 载入访问错误
-    "StAddrMisaligned",  # 6: 存储地址未对齐
-    "StAccessFault",  # 7: 存储访问错误
-    "EcallFromUmode",  # 8: U 模式 ecall
-    "EcallFromSmode",  # 9: S 模式 ecall  (also VS-mode)
-    "EcallFromHmode",  # 10: HS-mode ecall (reserved; normally M-mode handles via other means)
-    "EcallFromMmode",  # 11: M 模式 ecall
-    "InstrPageFault",  # 12: 指令页错误
-    "LdPageFault",  # 13: 载入页错误
-    "StPageFault",  # 15: 存储页错误
-    # H-extension guest-page faults (RISC-V privileged spec §8.6.2)
-    "InstrGuestPageFault",  # 20: 指令 guest-physical 地址页错误
-    "LdGuestPageFault",  # 21: 载入 guest-physical 地址页错误
-    "VirtualInstruction",  # 22: 虚拟指令 (HLVID emulation)
-    "StGuestPageFault",  # 23: 存储 guest-physical 地址页错误
-    # === 中断 (Interrupt) — mcause bit 63 置 1 ===
-    "SoftInterrupt",  # 软件中断 (通用)
-    "UmodeSoftInterrupt",  # 0: U 模式软件中断
-    "SmodeSoftInterrupt",  # 1: S 模式软件中断
-    "MmodeSoftInterrupt",  # 3: M 模式软件中断
-    "UmodeTimerInterrupt",  # 4: U 模式定时器中断
-    "SmodeTimerInterrupt",  # 5: S 模式定时器中断
-    "MmodeTimerInterrupt",  # 7: M 模式定时器中断
-    "UmodeExternInterrupt",  # 8: U 模式外部中断
-    "SmodeExternInterrupt",  # 9: S 模式外部中断
-    "MmodeExternInterrupt",  # 11: M 模式外部中断
-    "HmodeSoftInterrupt",  # 2 (interrupt):  HS-mode 软件中断
-    "HmodeTimerInterrupt",  # 6 (interrupt):  HS-mode 定时器中断
-    "HmodeExternInterrupt",  # 10 (interrupt): HS-mode 外部中断
-    "VSmodeSoftInterrupt",  # 2 (interrupt):  VS-mode 软件中断
-    "VSmodeTimerInterrupt",  # 6 (interrupt):  VS-mode 定时器中断
-    "VSmodeExternInterrupt",  # 10 (interrupt): VS-mode 外部中断
-))
+TrapType = Enum(
+    "TrapType",
+    (
+        # === 异常 (Exception) ===
+        "InstrAddrMisaligned",  # 0: 指令地址未对齐
+        "InstrAccessFault",  # 1: 指令访问错误
+        "IllInstr",  # 2: 非法指令
+        "Breakpoint",  # 3: 断点 (ebreak)
+        "LdAddrMisaligned",  # 4: 载入地址未对齐
+        "LdAccessFault",  # 5: 载入访问错误
+        "StAddrMisaligned",  # 6: 存储地址未对齐
+        "StAccessFault",  # 7: 存储访问错误
+        "EcallFromUmode",  # 8: U 模式 ecall
+        "EcallFromSmode",  # 9: S 模式 ecall  (also VS-mode)
+        "EcallFromHmode",  # 10: HS-mode ecall (reserved)
+        "EcallFromMmode",  # 11: M 模式 ecall
+        "InstrPageFault",  # 12: 指令页错误
+        "LdPageFault",  # 13: 载入页错误
+        "StPageFault",  # 15: 存储页错误
+        # H-extension guest-page faults (RISC-V privileged spec §8.6.2)
+        "InstrGuestPageFault",  # 20: 指令 guest-physical 地址页错误
+        "LdGuestPageFault",  # 21: 载入 guest-physical 地址页错误
+        "VirtualInstruction",  # 22: 虚拟指令 (HLVID emulation)
+        "StGuestPageFault",  # 23: 存储 guest-physical 地址页错误
+        # === 中断 (Interrupt) — mcause bit 63 置 1 ===
+        "SoftInterrupt",  # 软件中断 (通用)
+        "UmodeSoftInterrupt",  # 0: U 模式软件中断
+        "SmodeSoftInterrupt",  # 1: S 模式软件中断
+        "MmodeSoftInterrupt",  # 3: M 模式软件中断
+        "UmodeTimerInterrupt",  # 4: U 模式定时器中断
+        "SmodeTimerInterrupt",  # 5: S 模式定时器中断
+        "MmodeTimerInterrupt",  # 7: M 模式定时器中断
+        "UmodeExternInterrupt",  # 8: U 模式外部中断
+        "SmodeExternInterrupt",  # 9: S 模式外部中断
+        "MmodeExternInterrupt",  # 11: M 模式外部中断
+        "HmodeSoftInterrupt",  # 2 (interrupt):  HS-mode 软件中断
+        "HmodeTimerInterrupt",  # 6 (interrupt):  HS-mode 定时器中断
+        "HmodeExternInterrupt",  # 10 (interrupt): HS-mode 外部中断
+        "VSmodeSoftInterrupt",  # 2 (interrupt):  VS-mode 软件中断
+        "VSmodeTimerInterrupt",  # 6 (interrupt):  VS-mode 定时器中断
+        "VSmodeExternInterrupt",  # 10 (interrupt): VS-mode 外部中断
+    ),
+)
 
 # ============================================================
 #  TrapType -> mcause/scause 编码映射
-#  异常: code = 直接编号 (bit 63 = 0)
-#  中断: code = 直接编号 | (1 << 63)
+#  异常: code = 直接编号, bit 63 = 0
+#  中断: code = 直接编号, bit 63 = 1
 # ============================================================
 
 # 每个 TrapType 对应的 mcause 异常/中断编号
@@ -81,7 +84,7 @@ _TRAP_CAUSE_CODE: dict[TrapType, int] = {
     TrapType.LdGuestPageFault: 21,
     TrapType.VirtualInstruction: 22,
     TrapType.StGuestPageFault: 23,
-    # 中断 (编号 | 中断标志位)
+    # 中断
     TrapType.SoftInterrupt: 1 | (1 << 63),
     TrapType.UmodeSoftInterrupt: 0 | (1 << 63),
     TrapType.SmodeSoftInterrupt: 1 | (1 << 63),

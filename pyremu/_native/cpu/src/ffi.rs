@@ -1,11 +1,11 @@
 //! FFI 边界上下文结构体 — 与 Python ctypes 逐一对应的 `#[repr(C)]` 定义.
 //!
-//! 集中存放所有跨 FFI 边界的参数结构体: 内存/PMP/CLINT/PLIC/UART/virtio/
-//! watchdog/断点/TLB, 以及设备快速路径接口 (``FfiDevCtx``). 处理器自身的状态
-//! (``HartState`` / ``TlbEntry`` / ``ImsicFile``) 保留在 [state](crate::state).
+//! 集中存放所有跨 FFI 边界的参数结构体: 内存、PMP、CLINT、PLIC、UART、virtio、
+//! 看门狗、断点与 TLB, 以及设备快速路径接口 ``FfiDevCtx``. 处理器自身的状态
+//! ``HartState``、``TlbEntry`` 与 ``ImsicFile`` 位于 [state](crate::state).
 //!
 //! 布局约束: 每个结构体在 Python 侧都有 ctypes 镜像, 两侧必须逐字段一致,
-//! 否则 Rust 会在错误偏移读取字段而引发段错误。
+//! 否则 Rust 在错误的偏移处读取字段而引发段错误.
 
 use crate::peripheral::uart::uart_tx_push;
 use crate::state::HartState;
@@ -25,10 +25,10 @@ pub struct InstrToBeExec {
 }
 
 // ============================================================
-//  FFI context structs — group related parameters
+//  FFI 上下文结构体
 // ============================================================
 
-/// Memory context: RAM + shadow region.
+/// 主存范围与 PIE 链接地址区间构成的内存上下文.
 #[repr(C)]
 pub struct MemCtx {
 	pub ram: *mut u8,
@@ -38,8 +38,8 @@ pub struct MemCtx {
 	pub shadow_size: u64,
 }
 
-/// PMP configuration (crosses FFI boundary).  Pointers are mutable
-/// so that Rust can write PMP CSR values back inline.
+/// 跨 FFI 边界的 PMP 配置.
+/// Rust 借此就地写回 PMP 的 CSR 取值.
 #[repr(C)]
 pub struct FfiPmpCtx {
 	pub cfg: *mut u8,
@@ -48,111 +48,104 @@ pub struct FfiPmpCtx {
 	pub pmpsplit: u8,
 }
 
-/// CLINT state (crosses FFI boundary).  Pointers inside are mutable
-/// so that Rust can update MSIP / MTIMECMP / MTIME inline.
+/// 跨 FFI 边界的 CLINT 状态.
+/// Rust 借此就地更新 MSIP、MTIMECMP 与 MTIME.
 #[repr(C)]
 pub struct FfiClintCtx {
 	pub mtime: *mut u64,
 	pub mtimecmp: *mut u64,
 	pub msip: *mut u8,
 	pub base: u64,
-	/// mtime 时钟源频率 (Hz, 与 DTB timebase-frequency 同源).
-	/// 用于acceleration内按 clock-source 推进 mtime
-	/// target = time_base_val + elapsed_ns * timebase_hz / 1e9.  0 = 禁用.
+	/// mtime 的计数频率 (Hz); 取 0 表示不按指令推进 mtime.
+	/// 加速执行内按本 hart 本轮已执行的指令数 instr_delta 换算 mtime:
+	/// target = time_base_val + instr_delta * timebase_hz * NS_PER_INSTR / NS_PER_SEC
 	pub timebase_hz: u64,
 }
 
-/// PLIC state (crosses FFI boundary).  Pointers are mutable so Rust can
-/// update priority / pending / level / enable / threshold / claimed inline
-/// (claim/complete 语义), 避免 kernel 直映射访问 PLIC 时的 batch 退出.
+/// 跨 FFI 边界的 PLIC 状态. Rust 就地更新优先级、pending、使能、
+/// 阈值与 claimed 等状态, 并执行 claim 与 complete 语义, 避免受调试程序直接映射访问
+/// PLIC 时退出加速执行. 电平由 Python 在设备中断线变化时写入.
 ///
-/// Python 持有底层 ctypes 数组, 并在每次加速执行边界 marshal/unmarshal;
-/// 设备中断投递目标也会经 ``set_irq`` 直接写入本数组 (write-through), 保证 batch
-/// 内新到达的设备中断对 Rust 可见.
+/// Python 持有底层 ctypes 数组, 并在每轮加速执行边界同步两个方向的状态;
+/// 设备中断的投递目标经 ``set_irq`` 直接写入该数组, 本轮加速执行内新到达的
+/// 设备中断因而对 Rust 可见.
 #[repr(C)]
 pub struct FfiPlicCtx {
-	/// PLIC MMIO base address (0 = no PLIC device present).
+	/// PLIC 的 MMIO 基址; 取 0 表示不存在 PLIC 设备.
 	pub base: u64,
-	/// Number of interrupt sources (source 0 reserved, sources 1..=num_sources).
+	/// 中断源个数; 中断源 0 保留, 有效中断源为 1..=num_sources.
 	pub num_sources: u32,
-	/// Number of contexts (2 per hart typically: M + S).
+	/// 上下文个数; 每个 hart 通常有 2 个, 分别为 M 模式与 S 模式.
 	pub num_contexts: u32,
-	/// Per-source priority (u8, bits [2:0] valid).  Index 0..=num_sources.
+	/// 每个中断源的优先级. 索引范围 0..=num_sources.
 	pub priority: *mut u8,
-	/// Per-source pending flag (0/1).  Shared with Python device set_irq.
+	/// 每个中断源的 pending 标志, 与 Python 设备侧的 set_irq 共享.
 	pub pending: *mut u8,
-	/// Per-source level flag (0/1) — gateway 语义: complete 时电平仍高则重挂 pending.
+	/// 每个中断源的电平标志. complete 时电平仍为高则重新置位 pending.
 	pub level: *mut u8,
-	/// Per-context enable 位图: enable[ctx * num_words + word], 每 u32 一个 word,
-	/// bit i = source (word*32 + i); source 0 保留恒为 0 (与 Python plic.py 一致).
-	/// num_words = (num_sources + 31) / 32.
+	/// 每个上下文的中断使能位图: enable[ctx * num_words + word_idx], 每个元素为一个 u32 字,
+	/// 位 i 对应中断源 word_idx * 32 + i; 中断源 0 保留.
+	/// num_words = (num_sources + 31) / 32
 	pub enable: *mut u32,
-	/// Per-context threshold (u8, bits [2:0] valid).
+	/// 每个上下文的阈值.
 	pub threshold: *mut u8,
-	/// Per-context claimed source (0 = none).
+	/// 每个上下文已 claim 的中断源; 取 0 表示没有.
 	pub claimed: *mut u32,
 }
 
-/// Host-side execution watchdog (crosses FFI boundary).
+/// 跨 FFI 边界的宿主侧执行看门狗.
 ///
-/// 与 DevMMIOAddrInfo / FfiUartCtx / FfiVirtIoCtx 同属设备上下文组 (由 FfiDevicesCtx
-/// 携带), 但其中不含任何设备寄存器: 仅携带一次加速执行的时钟源超时时间
-/// ``timeout_ns`` (0 = 禁用).  看门狗线程 ``watchdog_loop`` 以 ``module.st_time_val``
-/// 为基准, 越过该时间后经通用停止接口 (``request_stop`` + ``unpark_all_harts``)
-/// 以 ``exit_reason::TIMEOUT`` 退出.
+/// 同样定义于 FfiDevicesCtx, 但不含任何设备寄存器,
+/// 只携带本轮加速执行的超时时间 ``timeout_ns``, 取 0 表示不启用.
+/// 看门狗线程 ``watchdog_loop`` 以 ``module.st_time_val`` 为起点, 真实流逝时间达到
+/// ``timeout_ns`` 后经 ``request_stop`` 与 ``unpark_all_harts`` 以
+/// ``exit_reason::TIMEOUT`` 终止本轮加速执行.
 #[repr(C)]
 pub struct FfiWatchdogCtx {
 	pub timeout_ns: u64,
 }
 
-/// UART context (crosses FFI boundary).  Rust writes TX characters
-/// directly into ``tx_buf`` so that ``sbi_printf`` does NOT cause a
-/// acceleration exit.  Python reads the buffer after the acceleration completes.
+/// 跨 FFI 边界的 UART 上下文.
 #[repr(C)]
 pub struct FfiUartCtx {
-	/// UART MMIO base address (e.g. 0x10000000).
+	/// UART 的 MMIO 基址, 如 0x10000000.
 	pub base: u64,
-	/// Ring buffer for TX entries: each entry is the two bytes ``[hid, byte]``,
-	/// so the entry capacity is ``tx_cap / 2``.
+	/// 发送环形缓冲区: 每条目为 ``[hid, byte]`` 两个字节, 故条目容量为 ``tx_cap / 2``
 	pub tx_buf: *mut u8,
-	/// Byte capacity of ``tx_buf`` (must be power of two, <= 256 MiB).
+	/// ``tx_buf`` 的字节容量.
 	pub tx_cap: u32,
-	/// Write-index into ``tx_buf`` in entries (monotonic, wraps at ``tx_cap / 2``).
-	/// Updated atomically by Rust; Python reads after acceleration.
+	/// ``tx_buf`` 的写索引, 以条目为单位; 每写入一条目加 1, 以 2^32 为取模对象,
+	/// 槽位下标为写索引对条目容量取模.
 	pub tx_wr: *mut u32,
-	/// Shadow copy of UART IE register (offset 0x10), written by Python
-	/// during marshal so Rust can handle IE/IP reads inline.
+	/// UART IE 寄存器(偏移 0x10)的副本
 	pub ie: u32,
-	/// Shadow copy of UART TXCTRL register (offset 0x08).
+	/// UART TXCTRL 寄存器 (偏移 0x08) 的副本, 供寄存器读取与 IP 的 TX 位计算.
 	pub txctrl: u32,
-	/// Shadow copy of UART RXCTRL register (offset 0x0C).
+	/// UART RXCTRL 寄存器 (偏移 0x0C) 的副本, 供 IP 的 RX 位计算.
 	pub rxctrl: u32,
-	/// Approximate RX FIFO fill level (Python sets during marshal).
+	/// RX FIFO 的近似占用量, 由 Python 在取值变化时写入.
 	pub rx_fifo_len: u32,
-	/// Pipe write-end for TX notification: Rust writes 1 byte per TXDATA
-	/// write; Python TX thread select()s the read-end and drains to stdout.
-	/// -1 = disabled.
+	/// 兼容性字段, 取 -1 表示未设置
 	pub tx_notify_fd: i32,
-	/// When 1, Rust writes to ring buffer only (no libc::write).
-	/// Python _tx_callback handles all stdout output.
+	/// 取非 0 时 Rust 只写发送环形缓冲区, 不调用 libc::write 写标准输出;
+	/// 标准输出由 Python 的 _tx_callback 负责.
 	pub no_stdout: u8,
-	/// RX notification — set to 1 by TermIO daemon when new stdin data
-	/// arrives in the ring buffer.  ``hart_worker`` polls this flag and
-	/// wakes WFI / triggers SEIP inline.
+	/// 接收通知标志. TermIO 守护线程把标准输入的新字节写入接收环形缓冲区后置位.
+	/// ``hart_worker`` 每轮读取该标志: IMSIC 独占外部中断线路时置位即结束本轮,
+	/// 退出原因为 ``exit_reason::RX_WAIT``; 进入 WFI 等待前的检查也以该标志作为唤醒条件.
 	pub rx_notify: *mut u8,
 }
 
-// Safety: Python holds the backing ctypes arrays alive for the FFI call.
+// 安全性: Python 在 FFI 调用期间保持底层 ctypes 数组不被 gc 回收.
 unsafe impl Send for FfiUartCtx {}
 unsafe impl Sync for FfiUartCtx {}
 
 // ============================================================
-//  设备快速路径接口 — 避免 MMIO batch 退出的统一抽象
 // ============================================================
 
-/// MMIO 地址范围 — 设备基址/结束地址对 (crosses FFI boundary).
+/// 跨 FFI 边界的各设备 MMIO 地址范围.
 ///
-/// 从原 ``FfiDevCtx`` struct 中提取, 供 ``FfiDevicesCtx`` 直接携带.
+/// 由 ``FfiDevicesCtx`` 携带.
 #[repr(C)]
 pub struct DevMMIOAddrInfo {
 	pub bases: *const u64,
@@ -160,46 +153,39 @@ pub struct DevMMIOAddrInfo {
 	pub num: u8,
 }
 
-/// 设备上下文接口 — 统一抽象各设备 (UART/SPI/I2C/块设备) 的快速路径.
+/// 处理受调试程序发起的 ecall.
 ///
-/// 每个设备类型实现此 trait, ``priv_ecall_concurrent`` 通过
-/// ``&dyn FfiDevCtx`` 调用, 无需知道具体设备类型:
-///
+/// ``priv_ecall_concurrent`` 经 ``&dyn FfiDevCtx`` 调用 ``try_ecall``,
+/// 调用方无需知道具体设备类型.
 /// ```ignore
-/// // UART: sbi_putchar 直接写入 TX ring buffer
 /// impl FfiDevCtx for FfiUartCtx { ... }
-/// // SPI: 飞地 SPI 闪存快速读写 (未来)
-/// impl FfiDevCtx for FfiSpiCtx { ... }
-/// // I2C: 飞地传感器快速读取 (未来)
-/// impl FfiDevCtx for FfiI2cCtx { ... }
 /// ```
 ///
-/// 新增设备只需实现 trait, 无需改 ecall 分发代码.
+/// 新增设备只需实现 trait, 无需改动 ecall 分发代码.
 pub trait FfiDevCtx: Send + Sync {
-	/// 尝试处理 ecall 快速路径. 返回 ``Some(advance)`` 表示已处理
-	/// (advance = 指令前进字节数, 通常 4); ``None`` 表示不匹配,
-	/// 回落通用 trap 投递.
+	/// 尝试加速处理 ecall. 返回 ``Some(advance)`` 表示已处理,
+	/// advance 为指令前进的字节数, 通常为 4; 返回 ``None`` 表示未处理,
+	/// 调用方转入通用 trap 投递.
 	fn try_ecall(&self, state: &mut HartState, ext_id: u64, func_id: u64) -> Option<u64>;
 
-	/// 设备名称 (供诊断日志使用).
+	/// 设备名称.
 	fn name(&self) -> &'static str;
 }
 
-/// FfiUartCtx 的 FfiDevCtx 实现 — sbi_putchar 直接写入 TX ring buffer.
+/// ``FfiUartCtx`` 的 ``FfiDevCtx`` 实现: ``sbi_putchar`` 直接写入发送环形缓冲区.
 ///
-/// 避免走完整 M-mode trap 路径后写 UART TXDATA 触发 MMIO batch 退出.
-/// 每个字符一次 batch 退出 (~1-5 ms marshal/unmarshal) 是飞地输出密集时
-/// 数百倍减速的根因之一.
+/// 受调试程序经 SBI 控制台输出字符时不写 UART TXDATA, 因而不退出加速执行;
+/// 发送环形缓冲区不可写入时返回 ``None``, 由调用方转入通用 trap 投递.
 impl FfiDevCtx for FfiUartCtx {
 	fn try_ecall(&self, state: &mut HartState, ext_id: u64, func_id: u64) -> Option<u64> {
-		// SBI legacy putchar: ext=0x01, func=0, a0=character
+		// SBI 传统 putchar: ext_id 为 0x01, func_id 为 0, a0 为字符.
 		if ext_id != 0x01 || func_id != 0 {
 			return None;
 		}
 		let c = state.gprs[10] as u8;
 		if uart_tx_push(self, state.mhartid as u8, c) {
-			state.gprs[10] = 0; // SBI success
-			Some(4) // advance past ecall instruction
+			state.gprs[10] = 0; // 按 SBI 约定返回成功
+			Some(4) // 前进越过 ecall 指令
 		} else {
 			None
 		}
@@ -210,91 +196,86 @@ impl FfiDevCtx for FfiUartCtx {
 	}
 }
 
-/// virtio-blk MMIO inline context (crosses FFI boundary).
+/// 跨 FFI 边界的 virtio-blk MMIO 就地处理上下文.
 ///
-/// Rust handles all MMIO register reads/writes inline inside the acceleration,
-/// avoiding expensive exits to Python during the device probe sequence.
-/// Only ``QueueNotify`` (offset 0x050) triggers an exit to Python
-/// then processes the virtqueue descriptors (disk I/O).
+/// 除下列两类写操作外, Rust 在加速执行内就地处理全部 MMIO 寄存器读写,
+/// 设备探测过程无需退出至 Python. 驱动写 ``QueueNotify`` (偏移 0x050) 时返回
+/// ``None`` 强制退出, 由 Python 处理虚拟队列描述符; 清空全部中断位的
+/// ``InterruptACK`` (偏移 0x064) 同样强制退出, 由 Python 拉低 PLIC 中断线.
 ///
-/// Fields are laid out to match the Python ``VirtIOBlock`` MMIO state
-/// 1:1; Python initialises them before the acceleration and reads back changed
-/// fields after the acceleration.
+/// 字段与 Python ``VirtIOBlock`` 的 MMIO 状态逐项对应; Python 在每轮加速执行前
+/// 写入这些字段, 结束后读回被 Rust 改动的字段.
 #[repr(C)]
 pub struct FfiVirtIoCtx {
-	/// virtio MMIO base address (0 = no virtio device present).
+	/// virtio 的 MMIO 基址; 取 0 表示不存在 virtio 设备.
 	pub base: u64,
-	/// Disk capacity in 512-byte sectors (for Config reads at offset 0x100).
+	/// 磁盘容量, 以 512 字节扇区为单位, 供偏移 0x100 起的配置空间读取.
 	pub capacity: u64,
-	/// Maximum queue entries (read-only, set by Python at init).
+	/// 队列最大条目数, 只读.
 	pub queue_num_max: u32,
 
-	// ---- Feature negotiation ----
-	/// Device features page selector (written at offset 0x014).
+	// ---- 特性协商 ----
+	/// 设备特性页选择寄存器, 写偏移 0x014.
 	pub device_features_sel: u32,
-	/// Driver features page selector (written at offset 0x024).
+	/// 驱动特性页选择寄存器, 写偏移 0x024.
 	pub driver_features_sel: u32,
-	/// Driver features accepted by the guest (written at offset 0x020, 64-bit).
+	/// 受调试程序接受的驱动特性, 写偏移 0x020, 共 64 位, 按页选择分两次写入.
 	pub driver_features: u64,
 
-	// ---- Queue setup ----
-	/// Currently selected queue index (written at offset 0x030).
+	// ---- 队列设置 ----
+	/// 当前选中的队列索引, 写偏移 0x030.
 	pub queue_sel: u32,
-	/// Chosen queue size (written at offset 0x038).
+	/// 选定的队列长度, 写偏移 0x038; 取值不超过 ``queue_num_max``.
 	pub queue_num: u32,
-	/// Queue is ready / activated (written at offset 0x044).
+	/// 队列就绪标志, 写偏移 0x044.
 	pub queue_ready: u8,
 
-	// ---- Queue addresses (split 64-bit, written at offsets 0x080-0x0A4) ----
+	// 队列地址
 	pub queue_desc: u64,
 	pub queue_driver: u64,
 	pub queue_device: u64,
 
-	// ---- Device status + interrupts ----
-	/// Device status register (offset 0x070).  Writing 0 resets the device.
+	// ---- 设备状态与中断 ----
+	/// 设备状态寄存器, 偏移 0x070; 写入 0 复位设备.
 	pub status: u32,
-	/// Interrupt status (offset 0x060).  Bit 0 = used buffer notification.
+	/// 中断状态, 偏移 0x060; 位 0 表示已用缓冲区通知.
 	pub interrupt_status: u32,
 
-	// ---- QueueNotify pending flag ----
-	/// Set to 1 by Rust when the driver writes to QueueNotify (offset 0x050).
-	/// Python reads and clears this after processing the virtqueue.
+	// QueueNotify 待处理标志
+	/// 驱动写 ``QueueNotify`` (偏移 0x050) 时 Rust 置 1, 并强制退出加速执行.
+	/// Python 在进入虚拟队列处理前将该字段清零.
 	pub notify_pending: u8,
-	/// Set to 1 by Rust when InterruptACK clears all interrupt bits and the
-	/// PLIC IRQ should be lowered (``_lower_irq_if_idle``).
+	/// 取 1 时 Python 在加速执行结束后调用 ``lower_irq_if_idle`` 拉低 PLIC 中断线.
+	/// 当前没有代码置位该字段.
 	pub irq_maybe_lower: u8,
 	pub _pad: [u8; 6],
 }
 
-// Safety: Python holds the backing ctypes arrays alive for the FFI call.
+// 安全性: Python 在 FFI 调用期间保持底层 ctypes 数组不被 gc 回收.
 unsafe impl Send for FfiVirtIoCtx {}
 unsafe impl Sync for FfiVirtIoCtx {}
 
 // ============================================================
-//  FFI structs (grouped parameters for run_parallel)
+//  FFI 结构体 — run_parallel 的分组参数
 // ============================================================
 
-/// Hart execution parameters passed across the FFI boundary.
 #[repr(C)]
-/// Shared external-interrupt context owned by Python, polled by Rust.
+/// Python 持有的共享外部中断上下文, 由 Rust 在 hart 循环内读取.
 ///
-/// PLIC and device state lives on the Python side.  When a device raises
-/// (or lowers) an interrupt, Python updates this struct.  Rust checks
-/// ``pending`` periodically inside the hart loop; when set it exits,
-/// Python can call ``_native_sync_plic_mip()`` to update each
-/// hart's ``mip`` with the latest PLIC-driven MEIP/SEIP bits.
+/// PLIC 与设备状态位于 Python 侧. 设备置位或拉低中断线时 Python 更新本结构体.
+/// 链接库在 hart 循环内读取 ``pending``: 置位时对未被 IMSIC 文件占用的线路就地置位
+/// ``mip`` 的 MEIP 与 SEIP, 对已被占用的线路改为由该文件的 eip 派生对应的 ``mip`` 位.
+/// 该标志同时是 WFI 的唤醒条件; 每轮加速执行结束时, 接收环形缓冲区与
+/// UART FIFO 均为空则 Python 将其清零.
 #[repr(C)]
 pub struct FfiExtIrqCtx {
-	/// Non-zero: at least one external interrupt source is asserted and
-	/// the PLIC state may have changed.  Rust exits on next check.
+	/// 非 0 表示至少一个外部中断源已置位, PLIC 状态可能已改变. Rust 在 hart 循环内读取该字段.
 	pub pending: u8,
-	/// Bitmap of pending interrupt sources.  Bit *i* corresponds to PLIC
-	/// interrupt source *i* (1 = UART, 2 = VirtIO, …).  Updated atomically
-	/// by Python; currently informational, may drive inline delivery later.
+	/// 待处理中断源的位图, 位 i 对应 PLIC 中断源 i, 例如 1 为 virtio 块设备、10 为 UART.
+	/// 当前没有代码读取或写入该字段.
 	pub sources: u32,
-	/// Highest priority among currently-pending sources, or 0 if none.
-	/// Rust may skip and exit when priority <= the current hart's
-	/// PLIC threshold (not yet implemented — always exits when pending≠0).
+	/// 当前待处理中断源中的最高优先级, 无待处理源时为 0.
+	/// 当前没有代码读取或写入该字段.
 	pub max_priority: u8,
 	pub _pad: [u8; 2],
 }
@@ -308,21 +289,21 @@ pub struct FfiHartCtx {
 	pub ext_irq: *mut FfiExtIrqCtx,
 }
 
-/// 内存与保护上下文 (FFI 边界): RAM/shadow + PMP.
+/// 跨 FFI 边界的内存与保护上下文，暂存有主存范围、PIE 链接地址区间与 PMP.
 #[repr(C)]
 pub struct FfiMemCtx {
 	pub mem: *const MemCtx,
 	pub pmp: *const FfiPmpCtx,
 }
 
-/// 中断控制器上下文 (FFI 边界): CLINT (定时器/IPI) + PLIC (外部中断).
+/// 跨 FFI 边界的中断控制器上下文，记录 CLINT 提供定时器与 IPI, PLIC 提供外部中断.
 #[repr(C)]
 pub struct FfiInterruptCtx {
 	pub clint: *const FfiClintCtx,
 	pub plic: *const FfiPlicCtx,
 }
 
-/// 设备上下文 (FFI 边界): MMIO 范围 + UART/virtio/watchdog 设备指针.
+/// 跨 FFI 边界的设备上下文，记录 MMIO 地址范围, 以及 UART、virtio 与看门狗设备指针.
 #[repr(C)]
 pub struct FfiDevicesCtx {
 	pub dev: *const DevMMIOAddrInfo,
@@ -331,7 +312,7 @@ pub struct FfiDevicesCtx {
 	pub watchdog: *const FfiWatchdogCtx,
 }
 
-/// Breakpoint configuration passed across the FFI boundary.
+/// 跨 FFI 边界传递的断点配置.
 #[repr(C)]
 pub struct FfiBpCtx {
 	pub addrs: *const u64,
@@ -346,7 +327,7 @@ pub struct FfiTlbCtx {
 	pub flush_cnt_per_hart: *mut u64,
 }
 
-/// Empty UART context for when no UART is configured.
+/// 未配置 UART 时使用的空上下文.
 pub(crate) static EMPTY_UART: FfiUartCtx = FfiUartCtx {
 	base: 0,
 	tx_buf: std::ptr::null_mut(),

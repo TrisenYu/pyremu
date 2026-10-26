@@ -1,10 +1,8 @@
-//! Pure-compute instruction handlers.
+//! 纯计算的指令处理函数。
 //!
-//! Each handler receives ``&mut HartState`` and ``&DecodedFields``,
-//! executes the instruction, and returns the PC advance (0 or 4).
-//!
-//! Handlers that encounter an invalid encoding call ``deliver_illegal_instruction``
-//! and return 0 (PC already redirected to ``mtvec``).
+//! 每个处理函数接收 ``&mut HartState`` 与 ``&DecodedFields``, 执行指令后返回
+//! PC 的推进量, 取值为 0 或 4。遇到非法编码时调用 ``deliver_illegal_instruction``
+//! 并返回 0, 此时 PC 已被设置为 mtvec 的取值。
 
 use crate::alu::{exec_alu_op, exec_op32, exec_op_imm, exec_op_imm32};
 use crate::decode::DecodedFields;
@@ -13,15 +11,15 @@ use crate::state::HartState;
 use crate::trap::deliver_illegal_instruction;
 
 // ============================================================
-//  Helpers
+//  辅助函数
 // ============================================================
 
-/// mstatus.FS 字段掩码 (bits[14:13]) — 浮点单元状态。
+/// mstatus.FS 字段的掩码, 取自 bits[14:13], 表示浮点单元状态。
 const MSTATUS_FS: u64 = 0b11 << 13;
-/// mstatus.SD 位 (bit 63) — 任一扩展状态为 Dirty 时置位。
+/// mstatus 的 SD 位, 取自 bit 63, 任一扩展状态为 Dirty 时置位。
 const MSTATUS_SD: u64 = 1 << 63;
 
-/// Write ``val`` to GPR ``rd``, skipping x0 (hardwired to 0).
+/// 将 ``val`` 写入通用寄存器 ``rd``; x0 恒为 0, 不写入。
 #[inline]
 fn write_gpr(state: &mut HartState, rd: u8, val: u64) {
 	if rd != 0 {
@@ -29,7 +27,7 @@ fn write_gpr(state: &mut HartState, rd: u8, val: u64) {
 	}
 }
 
-/// Read GPR ``rs`` (x0 always returns 0).
+/// 读取通用寄存器 ``rs``; x0 恒返回 0。
 #[inline]
 fn read_gpr(state: &HartState, rs: u8) -> u64 {
 	if rs == 0 {
@@ -39,7 +37,7 @@ fn read_gpr(state: &HartState, rs: u8) -> u64 {
 	}
 }
 
-/// Check if the ALU result has a trap flag set; if so, deliver IllInstr.
+/// 检查 ALU 结果的陷阱标记; 置位时投递 IllInstr 并返回 true。
 #[inline]
 fn check_alu_trap(state: &mut HartState, trap: u8, tval: u64) -> bool {
 	if trap == 0 {
@@ -50,9 +48,9 @@ fn check_alu_trap(state: &mut HartState, trap: u8, tval: u64) -> bool {
 }
 
 // ============================================================
-//  R-type ALU: ADD / SUB / SLL / SLT / SLTU / XOR / SRL / SRA
-//              OR / AND / MUL / MULH / MULHSU / MULHU /
-//              DIV / DIVU / REM / REMU
+//  R 型 ALU 指令: ADD、SUB、SLL、SLT、
+//  SLTU、XOR、SRL、SRA、OR、AND、MUL、
+//  MULH、MULHSU、MULHU、DIV、DIVU、REM、REMU
 // ============================================================
 
 pub fn handle_alu(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
@@ -67,8 +65,7 @@ pub fn handle_alu(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
 }
 
 // ============================================================
-//  I-type ALU: ADDI / SLLI / SLTI / SLTIU / XORI /
-//              SRLI / SRAI / ORI / ANDI
+//  I 型 ALU 指令: ADDI、SLLI、SLTI、SLTIU、XORI、SRLI、SRAI、ORI、ANDI
 // ============================================================
 
 pub fn handle_op_imm(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
@@ -82,8 +79,7 @@ pub fn handle_op_imm(state: &mut HartState, f: &DecodedFields, instr: u32) -> u6
 }
 
 // ============================================================
-//  RV64 32-bit word ALU: ADDW / SUBW / SLLW / SRLW / SRAW /
-//                        MULW / DIVW / DIVUW / REMW / REMUW
+//  RV64 的 32 位字 ALU 指令: ADDW、SUBW、SLLW、SRLW、SRAW、MULW、DIVW、DIVUW、REMW、REMUW
 // ============================================================
 
 pub fn handle_op32(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
@@ -98,7 +94,7 @@ pub fn handle_op32(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 
 }
 
 // ============================================================
-//  RV64 32-bit immediate ALU: ADDIW / SLLIW / SRLIW / SRAIW
+//  RV64 的 32 位立即数 ALU 指令: ADDIW、SLLIW、SRLIW、SRAIW
 // ============================================================
 
 pub fn handle_op_imm32(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
@@ -112,47 +108,47 @@ pub fn handle_op_imm32(state: &mut HartState, f: &DecodedFields, instr: u32) -> 
 }
 
 // ============================================================
-//  F/D floating point
+//  F/D 浮点指令
 // ============================================================
 
-/// 读取 FPR 原始 bits (f0 是真实寄存器, 无 x0 特例)。
+/// 读取 FPR 的原始位值; 其中 f0 区别于恒为 0 的 x0，是正常的浮点寄存器。
 #[inline]
 fn read_fpr(state: &HartState, r: u8) -> u64 {
 	state.fprs[r as usize]
 }
 
-/// 写入 FPR 原始 bits。
+/// 写入 FPR 的原始位值。
 #[inline]
 fn write_fpr(state: &mut HartState, r: u8, v: u64) {
 	state.fprs[r as usize] = v;
 }
 
-/// 浮点单元是否被禁用 (mstatus.FS == Off)。
+/// 通过 mstatus.FS 是否为 Off 来判定浮点单元是否被禁用。
 #[inline]
 fn fp_disabled(state: &HartState) -> bool {
 	(state.mstatus & MSTATUS_FS) == 0
 }
 
-/// 执行浮点指令后将 FS 标记为 Dirty (0b11) 并置 SD。
+/// 执行浮点指令后将 FS 置为 Dirty, 即 0b11, 并设置 SD。
 #[inline]
 fn set_fs_dirty(state: &mut HartState) {
 	state.mstatus |= MSTATUS_FS | MSTATUS_SD;
 }
 
-/// 当前动态舍入模式 (fcsr.frm)。
+/// 当前的动态舍入模式, 取自 fcsr.frm。
 #[inline]
 fn cur_frm(state: &HartState) -> u8 {
 	((state.fcsr >> 5) & 0x7) as u8
 }
 
-/// OP-FP (opcode 0x53): 算术 / 转换 / 比较 / 符号 / 分类 / 移动。
+/// OP-FP, opcode 为 0x53: 算术、转换、比较、符号、分类与移动指令。
 pub fn handle_fp_op(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
 	if fp_disabled(state) {
 		deliver_illegal_instruction(state, instr as u64);
 		return 0;
 	}
 	let op5 = f.func7 >> 2;
-	// int->float (0x1A) 与 FMV.*.X (0x1E) 的 rs1 源为 GPR; 其余为 FPR。
+	// 0x1A 的整数转浮点与 0x1E 的 FMV.*.X, 其 rs1 源为通用寄存器; 其余指令的 rs1 源为 FPR。
 	let rs1_bits = if matches!(op5, 0x1a | 0x1e) {
 		read_gpr(state, f.rs1)
 	} else {
@@ -174,7 +170,7 @@ pub fn handle_fp_op(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64
 	4
 }
 
-/// FMA (opcode 0x43/0x47/0x4B/0x4F): 合并乘加的四种变体。
+/// FMA, opcode 为 0x43、0x47、0x4B 与 0x4F: 合并乘加的四种变体。
 pub fn handle_fp_fma(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
 	if fp_disabled(state) {
 		deliver_illegal_instruction(state, instr as u64);
@@ -195,19 +191,19 @@ pub fn handle_fp_fma(state: &mut HartState, f: &DecodedFields, instr: u32) -> u6
 }
 
 // ============================================================
-//  LUI: rd = imm20 << 12  (sign-extended from 32 bits)
+//  LUI: rd = imm20 << 12, 结果按 32 位符号扩展
 // ============================================================
 
 pub fn handle_lui(state: &mut HartState, f: &DecodedFields) -> u64 {
-	// imm20_raw is bits[31:12] zero-extended to u64.
-	// Shift left 12, then sign-extend from bit 31.
+	// imm20_raw 是 bits[31:12] 零扩展为 u64 的值。
+	// 左移 12 位后按 bit 31 符号扩展。
 	let imm = (f.imm20_raw << 12) as i32 as i64 as u64;
 	write_gpr(state, f.rd, imm);
 	4
 }
 
 // ============================================================
-//  AUIPC: rd = pc + (imm20 << 12)  (sign-extended from 32 bits)
+//  AUIPC: rd = pc + (imm20 << 12), 结果按 32 位符号扩展
 // ============================================================
 
 pub fn handle_auipc(state: &mut HartState, f: &DecodedFields) -> u64 {
@@ -217,7 +213,7 @@ pub fn handle_auipc(state: &mut HartState, f: &DecodedFields) -> u64 {
 }
 
 // ============================================================
-//  JAL: rd = pc + 4;  pc += imm_j
+//  JAL: rd = pc + 4, 随后 pc = pc + imm_j
 // ============================================================
 
 pub fn handle_jal(state: &mut HartState, f: &DecodedFields) -> u64 {
@@ -228,7 +224,7 @@ pub fn handle_jal(state: &mut HartState, f: &DecodedFields) -> u64 {
 }
 
 // ============================================================
-//  JALR: rd = pc + 4;  pc = (rs1 + imm) & ~1
+//  JALR: rd = pc + 4, 随后 pc = (rs1 + imm) & ~1
 // ============================================================
 
 pub fn handle_jalr(state: &mut HartState, f: &DecodedFields) -> u64 {
@@ -240,7 +236,7 @@ pub fn handle_jalr(state: &mut HartState, f: &DecodedFields) -> u64 {
 }
 
 // ============================================================
-//  Branch: BEQ / BNE / BLT / BGE / BLTU / BGEU
+//  分支指令: BEQ、BNE、BLT、BGE、BLTU、BGEU
 // ============================================================
 
 pub fn handle_br(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
@@ -269,45 +265,31 @@ pub fn handle_br(state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
 }
 
 // ============================================================
-//  FENCE / FENCE.I: memory-ordering barriers
+//  FENCE 与 FENCE.I: 指令执行顺序与访存屏障
 // ============================================================
 //
-// In the concurrent (thread-per-hart) model, these must emit real CPU
-// memory barriers.  OpenSBI relies on ``fence ow,ow`` (wmb) and
-// ``fence ir,ir`` (rmb) for lock-free FIFO enqueue/dequeue between
-// harts.  Without real barriers the compiler and CPU may reorder
-// stores/loads across the fence ->FIFO corruption ->TLB-shootdown
-// deadlocks (sender spins in tlb_update retry because the remote
-// FIFO appears full / head pointer is never observed advancing).
+// 并发模型中每个 hart 对应一个线程, FENCE 必须发出真实的 CPU 内存屏障。
+// OpenSBI 在 hart 之间以无锁方式对 FIFO 入队与出队时依赖 ``fence ow,ow`` 与
+// ``fence ir,ir``。缺少真实屏障时编译器与 CPU 可能重排跨屏障的存储与读取, 造成
+// FIFO 内容损坏与 TLB shootdown 死锁, 发送方在 opensbi 中的 tlb_update 中反复重试。
 
 pub fn handle_fence(_state: &mut HartState, f: &DecodedFields, instr: u32) -> u64 {
-	// func3 == 0b000: FENCE  — emit a full SeqCst barrier.
-	//   Conservative (the RISC-V spec allows pred/succ filtering
-	//   via the encoded predecessor/successor sets), but always
-	//   correct and fast enough for the current workload.
-	// func3 == 0b001: FENCE.I — instruction fence; no-op in an
-	//   emulator where the icache is implicitly coherent with
-	//   stores (single bytearray backing RAM).
+	// func3 == 0b000: FENCE, 由下方分支发出数据内存屏障。
+	// func3 == 0b001: FENCE.I, 不执行任何操作; 模拟器没有独立的指令缓存,
+	//   取指与数据读取访问同一份 RAM, 无需刷新。
 	if f.func3 > 1 {
 		deliver_illegal_instruction(_state, instr as u64);
 		return 0;
 	}
 	if f.func3 == 0 {
-		// FENCE — data memory barrier.
-		// Acquire-Release is sufficient for two reasons:
-		// 1. Guest stores/loads already use Release/Acquire atomics
-		//    (ram_write_raw / ram_read_raw), so an AcqRel fence
-		//    between them keeps the happens-before chain intact.
-		// 2. x86-64 TSO provides the hardware ordering for free
-		//    (fence(AcqRel) is a zero-cycle compiler barrier);
-		//    SeqCst would emit mfence (~100 cycles) for no benefit.
+		// FENCE: 数据内存屏障。fence(AcqRel) 禁止屏障之前的访存与之后的访存相互重排。
 		std::sync::atomic::fence(std::sync::atomic::Ordering::AcqRel);
 	}
 	4
 }
 
 // ============================================================
-//  Tests
+//  测试
 // ============================================================
 
 #[cfg(test)]
@@ -328,19 +310,19 @@ mod tests {
 	#[test]
 	fn lui_small() {
 		let mut s = new_state();
-		// lui x5, 0x42  ->  instr = 0x42 << 12 | 5 << 7 | 0x37
+		// lui x5, 0x42
 		let instr: u32 = (0x42u32 << 12) | (5u32 << 7) | 0x37;
 		let f = decode_fields(instr);
 		let adv = handle_lui(&mut s, &f);
 		assert_eq!(adv, 4);
 		assert_eq!(s.gprs[5], 0x0004_2000);
-		assert_eq!(s.gprs[0], 0); // x0 untouched
+		assert_eq!(s.gprs[0], 0); // x0 未被写入
 	}
 
 	#[test]
 	fn lui_negative() {
 		let mut s = new_state();
-		// lui x10, 0xFFFFF  ->  should give 0xFFFF_FFFF_FFFF_F000
+		// lui x10, 0xFFFFF, 结果应为 0xFFFF_FFFF_FFFF_F000
 		let instr: u32 = (0xfffffu32 << 12) | (10u32 << 7) | 0x37;
 		let f = decode_fields(instr);
 		let adv = handle_lui(&mut s, &f);
@@ -377,9 +359,9 @@ mod tests {
 	fn jal_forward() {
 		let mut s = new_state();
 		s.pc = 0x8000_0000;
-		// jal x1, +8  -> offset = 8
-		// imm_j: bit layout -> we'll use decode_fields
-		let instr: u32 = 0x0080_00ef; // jal ra, +8 (pre-encoded)
+		// jal x1, +8
+		// imm_j 的位布局交给 decode_fields 计算
+		let instr: u32 = 0x0080_00ef; // jal ra, +8
 		let f = decode_fields(instr);
 		let adv = handle_jal(&mut s, &f);
 		assert_eq!(adv, 0);
@@ -391,12 +373,12 @@ mod tests {
 	fn jal_backward() {
 		let mut s = new_state();
 		s.pc = 0x8000_0100;
-		// jal x0, -4  ->  x0 isn't written, PC goes back
-		let instr: u32 = 0xffdf_f06f; // JAL x0, -4 (imm_j = -4 as 21-bit signed)
+		// jal x0, -4; x0 不写入, PC 回到低地址
+		let instr: u32 = 0xffdf_f06f; // jal x0, -4, imm_j 为 -4 按 21 位有符号数编码
 		let f = decode_fields(instr);
 		let adv = handle_jal(&mut s, &f);
 		assert_eq!(adv, 0);
-		assert_eq!(s.gprs[0], 0); // x0 hardwired
+		assert_eq!(s.gprs[0], 0); // x0 恒为 0
 		assert_eq!(s.pc, (0x8000_0100u64).wrapping_add(0xffff_ffff_ffff_fffc));
 	}
 
@@ -420,32 +402,31 @@ mod tests {
 	fn jalr_lsb_clear() {
 		let mut s = new_state();
 		s.pc = 0x8000_0000;
-		s.gprs[10] = 0x8000_1003; // odd address
+		s.gprs[10] = 0x8000_1003; // 奇数地址
 		let instr: u32 = (10u32 << 15) | 0x67;
 		let f = decode_fields(instr);
 		let _adv = handle_jalr(&mut s, &f);
-		assert_eq!(s.pc, 0x8000_1002); // LSB cleared
+		assert_eq!(s.pc, 0x8000_1002); // 最低位被清零
 	}
 
-	// -- Branches --
+	// -- 分支指令 --
 
 	#[test]
 	fn beq_taken() {
 		let mut s = new_state();
 		s.gprs[1] = 42;
 		s.gprs[2] = 42;
-		// beq x1, x2, +16  -> func3=000, offset=16
+		// beq x1, x2, +16
 		let _instr: u32 =
-			(0u32 << 31) | (2u32 << 20) | (1u32 << 15) | (0u32 << 12) | (0b000_1000u32 << 7) | 0x63; // imm_b=16, bits [8:7]=01
-																							// Let's use a pre-computed encoding
-		let _pre: u32 = ((1u32 << 12) << 19) | // bit12=1: offset bit 12 set
-			(1u32 << 8) | // offset bit 4
-			(0u32 << 7) | // offset bit 11
+			(0u32 << 31) | (2u32 << 20) | (1u32 << 15) | (0u32 << 12) | (0b000_1000u32 << 7) | 0x63; // imm_b=16, bits[8:7]=01
+																							// 同时改用预先算好的编码
+		let _pre: u32 = ((1u32 << 12) << 19) | // bit12=1, 偏移量的 bit 12 置位
+			(1u32 << 8) | // 偏移量的 bit 4
+			(0u32 << 7) | // 偏移量的 bit 11
 			(2u32 << 20) | // rs2 = x2
 			(1u32 << 15) | // rs1 = x1
 			(0u32 << 12) | // func3 = 000
 			0x63; // opcode = BR
-		 // Hmm, this is error-prone. Let me just test with a known encoding.
 		let instr: u32 = 0x0020_8863; // beq x1, x2, +16
 		let f = decode_fields(instr);
 		let adv = handle_br(&mut s, &f, instr);
@@ -462,17 +443,16 @@ mod tests {
 		let f = decode_fields(instr);
 		let adv = handle_br(&mut s, &f, instr);
 		assert_eq!(adv, 4, "branch should NOT be taken");
-		assert_eq!(s.pc, 0x8000_0000); // pc unchanged
+		assert_eq!(s.pc, 0x8000_0000); // pc 未改变
 	}
 
 	#[test]
 	fn blt_signed() {
 		let mut s = new_state();
-		// -1 < 1 is true
+		// -1 < 1 成立
 		s.gprs[1] = 0xffff_ffff_ffff_ffffu64; // -1
 		s.gprs[2] = 1;
-		// let instr: u32 = 0x0021_C463; // blt x1, x2, +8  (approx)
-		// Actually let me compute: blt is func3=100
+		// blt 的 func3 为 0b100, 下面的编码按位构造
 		let instr: u32 = ((1u32 << 12) << 19) | // bit12=1
 			(1u32 << 8) |
 			(2u32 << 20) |
@@ -487,7 +467,7 @@ mod tests {
 	#[test]
 	fn bgeu_unsigned() {
 		let mut s = new_state();
-		// 5 >= 3 unsigned
+		// 无符号比较 5 >= 3
 		s.gprs[1] = 5;
 		s.gprs[2] = 3;
 		let instr: u32 = ((1u32 << 12) << 19) |
@@ -501,7 +481,7 @@ mod tests {
 		assert_eq!(adv, 0, "bgeu 5 >= 3 should be taken");
 	}
 
-	// -- ALU (Rust native, integration test) --
+	// -- ALU: 在 Rust 侧直接调用处理函数的集成测试 --
 
 	#[test]
 	fn addi_via_handler() {
@@ -521,7 +501,7 @@ mod tests {
 		let mut s = new_state();
 		s.gprs[10] = 100;
 		s.gprs[11] = 30;
-		// sub x5, x10, x11  -> func7=0x20, func3=000
+		// sub x5, x10, x11
 		let instr: u32 =
 			(0x20u32 << 25) | (11u32 << 20) | (10u32 << 15) | (0u32 << 12) | (5u32 << 7) | 0x33;
 		let f = decode_fields(instr);
@@ -534,7 +514,7 @@ mod tests {
 	#[allow(dead_code)]
 	fn x0_source_is_zero() {
 		let mut s = new_state();
-		// addi x5, x0, 42  -> x0 is always 0
+		// addi x5, x0, 42; x0 恒为 0
 		let instr: u32 = ((42u32 & 0xfff) << 20) | (0u32 << 15) | (0u32 << 12) | (5u32 << 7) | 0x13;
 		let f = decode_fields(instr);
 		let _adv = handle_op_imm(&mut s, &f, instr);
@@ -546,7 +526,7 @@ mod tests {
 		let mut s = new_state();
 		s.gprs[10] = 1;
 		s.gprs[11] = 2;
-		// func3=001, func7=0b001_0011 (invalid combination for SLL/MULH)
+		// func3=001, func7=0b001_0011, 对 SLL 与 MULH 都是非法组合
 		let instr: u32 =
 			(0x13u32 << 25) | (11u32 << 20) | (10u32 << 15) | (1u32 << 12) | (5u32 << 7) | 0x33;
 		let f = decode_fields(instr);
@@ -559,15 +539,15 @@ mod tests {
 	}
 
 	// ============================================================
-	//  rd == rs1  regression tests
+	//  rd == rs1 的回归测试
 	// ============================================================
 
-	/// ADDI with rd==rs1 must use the old value as the operand, then overwrite.
+	/// rd 与 rs1 相同时, ADDI 必须以旧值作为操作数, 然后写入结果。
 	#[test]
 	fn addi_rd_equals_rs1_uses_old_value() {
 		let mut s = new_state();
 		s.gprs[5] = 10;
-		// addi x5, x5, 42  -> x5 = 10 + 42 = 52
+		// addi x5, x5, 42, 结果 x5 = 10 + 42 = 52
 		let instr: u32 = (42u32 << 20) | (5u32 << 15) | (0u32 << 12) | (5u32 << 7) | 0x13;
 		let f = decode_fields(instr);
 		let adv = handle_op_imm(&mut s, &f, instr);
@@ -579,12 +559,12 @@ mod tests {
 		);
 	}
 
-	/// SLLI with rd==rs1.
+	/// rd 与 rs1 相同时的 SLLI。
 	#[test]
 	fn slli_rd_equals_rs1_uses_old_value() {
 		let mut s = new_state();
 		s.gprs[10] = 3;
-		// slli x10, x10, 4  -> x10 = 3 << 4 = 48
+		// slli x10, x10, 4, 结果 x10 = 3 << 4 = 48
 		let instr: u32 =
 			(0u32 << 25) | (4u32 << 20) | (10u32 << 15) | (1u32 << 12) | (10u32 << 7) | 0x13;
 		let f = decode_fields(instr);
@@ -597,13 +577,13 @@ mod tests {
 		);
 	}
 
-	/// ADD with rd==rs1 (rd same as rs1, different from rs2).
+	/// rd 与 rs1 相同而 rs2 不同的 ADD。
 	#[test]
 	fn add_rd_equals_rs1_uses_old_value() {
 		let mut s = new_state();
 		s.gprs[5] = 20;
 		s.gprs[6] = 7;
-		// add x5, x5, x6  -> x5 = 20 + 7 = 27
+		// add x5, x5, x6, 结果 x5 = 20 + 7 = 27
 		let instr: u32 =
 			(0u32 << 25) | (6u32 << 20) | (5u32 << 15) | (0u32 << 12) | (5u32 << 7) | 0x33;
 		let f = decode_fields(instr);
@@ -612,20 +592,20 @@ mod tests {
 		assert_eq!(s.gprs[5], 27, "ADD rd==rs1: 20 + 7 = 27, got {}", s.gprs[5]);
 	}
 
-	/// JALR with rd==rs1 must save the return address before jumping.
+	/// rd 与 rs1 相同时, JALR 必须先保存返回地址再跳转。
 	#[test]
 	fn jalr_rd_equals_rs1_preserves_link_and_jumps() {
 		let mut s = new_state();
 		s.pc = 0x8000_1000;
-		s.gprs[1] = 0x8000_2000; // ra = target
-						   // jalr ra, ra, 0  -> rd=1, rs1=1
+		s.gprs[1] = 0x8000_2000; // ra 设为目标地址
+						   // jalr ra, ra, 0, rd=1, rs1=1
 		let instr: u32 = (0u32 << 20) | (1u32 << 15) | (0u32 << 12) | (1u32 << 7) | 0x67;
 		let f = decode_fields(instr);
 		let adv = handle_jalr(&mut s, &f);
 		assert_eq!(adv, 0, "JALR returns 0 (PC modified directly)");
-		// PC jumps to old ra value (with LSB cleared)
+		// PC 跳到 ra 的旧值, 最低位被清零
 		assert_eq!(s.pc, 0x8000_2000, "JALR must jump to old ra");
-		// ra gets the return address (old PC + 4)
+		// ra 写入返回地址, 即旧 PC + 4
 		assert_eq!(
 			s.gprs[1], 0x8000_1004,
 			"JALR rd==rs1: ra must hold return address, got {:#x}",
@@ -633,11 +613,12 @@ mod tests {
 		);
 	}
 
-	// -- ld-linux loop exit regression (crash at offset 0x3ae8) --
+	// -- ld-linux 循环退出回归测试, 崩溃点在偏移 0x3ae8 --
 
-	/// bltz at 0x3ab6: with s2=-1, branch MUST be taken to skip the loop.
-	/// If this fails, the loop body executes with s2=-1 and accesses
-	/// base + (-1)*0xa0 = base - 0xa0 ->.dynamic section ->reads d_tag=7.
+	/// 地址 0x3ab6 处的 bltz: s2=-1 时必须跳转以跳过循环。
+	/// 若不跳转, 循环体将以 s2=-1 执行, 访问的地址为
+	///   base + (-1)*0xa0 = base - 0xa0
+	/// 该地址位于 .dynamic 段内, 读取到的 d_tag 为 7。
 	#[test]
 	fn ldlinux_bltz_skip_loop_on_counter_zero() {
 		let mut s = new_state();
@@ -655,8 +636,8 @@ mod tests {
 		);
 	}
 
-	/// bne at 0x3b06: with s2=s4=-1, branch must NOT be taken (exit loop).
-	/// If this fails, the loop continues past the array boundary.
+	/// 地址 0x3b06 处的 bne: s2=s4=-1 时不得跳转, 从而退出循环。
+	/// 若跳转, 循环将继续越过数组边界。
 	#[test]
 	fn ldlinux_bne_exit_on_s2_eq_s4() {
 		let mut s = new_state();

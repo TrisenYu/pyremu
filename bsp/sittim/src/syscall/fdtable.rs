@@ -13,9 +13,9 @@
 
 use crate::sync_aux::SpinLock;
 
+use super::EMFILE;
 use super::fs::mount::FileSystem;
 use super::net;
-use super::EMFILE;
 
 /// 打开文件表容量 (fd 0..MAX_FD)。
 pub const MAX_FD: usize = 64;
@@ -62,7 +62,10 @@ pub struct Tables {
 
 impl Tables {
 	const fn empty() -> Self {
-		Self { fds: [None; MAX_FD], open_files: [None; MAX_FD] }
+		Self {
+			fds: [None; MAX_FD],
+			open_files: [None; MAX_FD],
+		}
 	}
 }
 
@@ -133,7 +136,9 @@ pub fn write_back_open_file(open_file_idx: usize, open_file: OpenFile) {
 /// 本层内的描述符表只经本函数由编号取下标: 编号到下标只此一处转换, 且转换连同范围一并
 /// 判定, 故取到的下标必定落在表内。
 fn fd_index(tables: &Tables, fd: u64) -> Option<usize> {
-	usize::try_from(fd).ok().filter(|index| *index < tables.fds.len())
+	usize::try_from(fd)
+		.ok()
+		.filter(|index| *index < tables.fds.len())
 }
 
 /// 取描述符 *fd* 的表项; fd 越界或落在空闲编号上时返回 None。
@@ -160,7 +165,12 @@ pub fn fd_target(tables: &Tables, fd: u64) -> Option<FdTarget> {
 /// 取不小于 *from* 的最小编号空闲槽位; 该编号起没有空闲槽位时返回 None。
 pub fn take_fd_slot_from(tables: &Tables, from: u64) -> Option<u64> {
 	// 编号随迭代以 u64 给出, 与调用方的 fd 类型一致, 不在此处做一次宽度转换。
-	tables.fds.iter().zip(0u64..).find(|(entry, fd)| entry.is_none() && *fd >= from).map(|(_, fd)| fd)
+	tables
+		.fds
+		.iter()
+		.zip(0u64..)
+		.find(|(entry, fd)| entry.is_none() && *fd >= from)
+		.map(|(_, fd)| fd)
 }
 
 /// 取编号最小的空闲描述符槽位; 槽位耗尽返回 None。
@@ -170,20 +180,37 @@ pub fn take_fd_slot(tables: &Tables) -> Option<u64> {
 
 /// 取一个空闲的描述槽位; 描述耗尽返回 None。
 fn take_open_file_slot(tables: &Tables) -> Option<usize> {
-	tables.open_files.iter().position(|open_file| open_file.is_none())
+	tables
+		.open_files
+		.iter()
+		.position(|open_file| open_file.is_none())
 }
 
 /// 建立一项引用计数为 1 的描述并挂到编号 *fd* 上, 返回是否成功。调用前须确认该编号空闲;
 /// 编号落在描述符表之外或描述槽位耗尽时返回假, 且不改动任何表项。
-pub fn install_fd(tables: &mut Tables, fd: u64, target: FdTarget, flags: u32, desc_flags: u32) -> bool {
+pub fn install_fd(
+	tables: &mut Tables,
+	fd: u64,
+	target: FdTarget,
+	flags: u32,
+	desc_flags: u32,
+) -> bool {
 	let Some(index) = fd_index(tables, fd) else {
 		return false;
 	};
 	let Some(open_file_idx) = take_open_file_slot(tables) else {
 		return false;
 	};
-	tables.open_files[open_file_idx] = Some(OpenFile { target, offset: 0, flags, refs: 1 });
-	tables.fds[index] = Some(FdEntry { open_file_idx, flags: desc_flags & FD_FLAG_MASK });
+	tables.open_files[open_file_idx] = Some(OpenFile {
+		target,
+		offset: 0,
+		flags,
+		refs: 1,
+	});
+	tables.fds[index] = Some(FdEntry {
+		open_file_idx,
+		flags: desc_flags & FD_FLAG_MASK,
+	});
 	true
 }
 
@@ -204,13 +231,22 @@ pub fn alloc_fd(tables: &mut Tables, target: FdTarget, flags: u32, desc_flags: u
 /// 调用前须确认该编号空闲, 且 *open_file* 为下标 *open_file_idx* 处描述的当前取值。引用
 /// 计数按该取值加一, 故取得之后、本调用之前不得改写该描述, 释放被替换的描述的动作须在
 /// 本调用之后进行。
-pub fn dup_at(tables: &mut Tables, fd: u64, open_file_idx: usize, mut open_file: OpenFile, desc_flags: u32) {
+pub fn dup_at(
+	tables: &mut Tables,
+	fd: u64,
+	open_file_idx: usize,
+	mut open_file: OpenFile,
+	desc_flags: u32,
+) {
 	let Some(index) = fd_index(tables, fd) else {
 		return;
 	};
 	open_file.refs += 1;
 	tables.open_files[open_file_idx] = Some(open_file);
-	tables.fds[index] = Some(FdEntry { open_file_idx, flags: desc_flags & FD_FLAG_MASK });
+	tables.fds[index] = Some(FdEntry {
+		open_file_idx,
+		flags: desc_flags & FD_FLAG_MASK,
+	});
 }
 
 /// 释放描述下标 *open_file_idx* 处描述的一条引用: 引用计数减一, 归零时释放该描述并报告

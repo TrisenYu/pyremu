@@ -37,22 +37,22 @@ class TestHexAddr:
 class TestFmtSize:
     def test_bytes(self):
         assert fmt_size(0) == "0 B"
-        assert fmt_size(512) == "512 B"
+        assert fmt_size(512) == "512.000 B"
 
     def test_kb(self):
-        assert fmt_size(2048) == "2.0 KB"
+        assert fmt_size(2048) == "2.000 KB"
 
     def test_mb(self):
-        assert fmt_size(2 * 1024 * 1024) == "2.0 MB"
+        assert fmt_size(2 * 1024 * 1024) == "2.000 MB"
 
     def test_gb(self):
-        assert fmt_size(3 * 1024**3) == "3.0 GB"
+        assert fmt_size(3 * 1024**3) == "3.000 GB"
 
 
 class TestFmtInstrCount:
     def test_small(self):
-        assert fmt_instr_count(0) == "0"
-        assert fmt_instr_count(999) == "999"
+        assert fmt_instr_count(0) == "0.000"
+        assert fmt_instr_count(999) == "999.000"
 
     def test_k(self):
         assert fmt_instr_count(1000) == "1.000K"

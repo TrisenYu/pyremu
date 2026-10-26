@@ -4,7 +4,10 @@
 
 """测试 pyremu.debug.exec — 快照、回滚、写监控."""
 
-from pyremu.debug.exec import ExecutionMixin
+from rich.console import Console
+
+from pyremu.core.hart import RiscvMode
+from pyremu.debug.exec import ExecutionOps
 from pyremu.debug.types import MemoryChange
 from pyremu.emulator import Emulator
 
@@ -13,11 +16,10 @@ from pyremu.emulator import Emulator
 # ============================================================
 
 
-class _TestExecDbg(ExecutionMixin):
-    """最小聚合类供 ExecutionMixin 测试."""
+class _TestExecDbg(ExecutionOps):
+    """最小聚合类供 ExecutionOps 测试."""
 
     def __init__(self, emu, hart_id=0):
-        from rich.console import Console
         self._emu = emu
         self._hart_id = hart_id
         self._console = Console(highlight=False)
@@ -59,7 +61,7 @@ class _TestExecDbg(ExecutionMixin):
     def _resolve_addr(self, arg):
         try:
             return int(arg, 0)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return None
 
 
@@ -105,7 +107,6 @@ class TestSnapshot:
         assert edbg.hart.csrs["mstatus"].val == 0x1800
 
     def test_save_restore_preserves_mode(self):
-        from pyremu.core.hart import RiscvMode
         edbg = _make_edbg()
         edbg.hart.mode = RiscvMode.S
         snap = edbg._save_snapshot()
@@ -166,7 +167,7 @@ class TestRollback:
         edbg = _make_edbg()
         addr = 0x80000800
         old_val = b"\x00" * 8
-        new_val = b"\xFF" * 8
+        new_val = b"\xff" * 8
         edbg._emu.bus.write_ram_direct(addr, new_val)
         edbg._mem_changes = [MemoryChange(addr=addr, old=old_val)]
         edbg._snapshot = edbg._save_snapshot()

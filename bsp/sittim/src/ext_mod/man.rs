@@ -23,7 +23,7 @@ pub struct Manager {
 	pub read_time: unsafe extern "C" fn() -> u64,
 	/// 把飞地地址空间中的虚拟地址翻译为物理地址。
 	///
-	/// 设备寄存器按物理地址访问, 而模块的静态存储落在模块窗口内, 其物理地址由 M
+	/// 设备寄存器按物理地址访问, 而模块的静态存储落在扩展模块虚拟地址空间内, 其物理地址由 M
 	/// 模式按分区交付, 没有固定的偏移可用, 故驱动两处都要经本回调取得物理地址。
 	pub va_to_pa: unsafe extern "C" fn(u64) -> u64,
 	/// 设备窗口的虚拟地址; 平台不提供该设备时取 0。
@@ -31,8 +31,6 @@ pub struct Manager {
 	/// 时间源的频率, 单位为赫兹, 与 [`Manager::read_time`] 的计数单位对应。
 	pub time_freq: u64,
 }
-
-
 
 #[cfg(test)]
 mod tests {

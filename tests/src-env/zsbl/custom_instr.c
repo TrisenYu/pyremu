@@ -7,7 +7,9 @@
 #include <riscv_tee.h>
 /* 测试定义结束区域 */
 
-int main(int argc, char *argv[]) {
+int main(
+	int argc,
+	char *argv[]) {
 	unsigned long *tval = (unsigned long *)(0x12345678), a = 0x31415926, b = 0xFF, c,
 				  *tptr = &a;
 	char *ptr_str		= (char *)(0xFFFF000023456789);

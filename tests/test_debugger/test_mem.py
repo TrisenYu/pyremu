@@ -6,12 +6,13 @@
 
 import io
 
+import pytest
 from rich.console import Console
 
 from pyremu.core.hart import RiscvMode
 from pyremu.core.trap_def import trap_cause_name
 from pyremu.debug import Debugger
-from pyremu.debug.mem import MemoryMixin
+from pyremu.debug.mem import MemoryOps
 from pyremu.debug.utils import MAX_INSTR_COUNT
 from pyremu.emulator import Emulator
 from pyremu.memory.mmu import PTE
@@ -300,108 +301,71 @@ class TestFetchAndDisasm:
 
 
 class TestColorizeAsm:
-    def test_empty_text_is_returned_as_is(self):
-        assert MemoryMixin._colorize_asm("") == ""
-
-    def test_markup_prefixed_text_is_returned_as_is(self):
-        assert MemoryMixin._colorize_asm("[dim]x[/]") == "[dim]x[/]"
-
-    def test_unknown_is_returned_as_is(self):
-        assert MemoryMixin._colorize_asm("(unknown)") == "(unknown)"
-
-    def test_load_store_mnemonic_without_operand_is_cyan(self):
-        assert MemoryMixin._colorize_asm("ld") == "[cyan]ld[/]"
-
-    def test_load_store_with_operand_is_cyan(self):
-        assert MemoryMixin._colorize_asm("sd a0, 8(sp)") == "[cyan]sd[/] a0, [magenta]8[/](sp)"
-
-    def test_branch_mnemonic_is_green(self):
-        colored = MemoryMixin._colorize_asm("beq a0, a1, 16")
-        assert colored == "[green]beq[/] a0, a1, [magenta]16[/]"
-
-    def test_fence_mnemonic_is_yellow(self):
-        assert MemoryMixin._colorize_asm("fence rw, rw") == "[yellow]fence[/] rw, rw"
-
-    def test_privileged_mnemonic_is_red(self):
-        assert MemoryMixin._colorize_asm("mret") == "[red]mret[/]"
-
-    def test_plain_mnemonic_keeps_operands_unstyled(self):
-        assert MemoryMixin._colorize_asm("mv a0, a1") == "mv a0, a1"
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("", ""),
+            ("[dim]x[/]", "[dim]x[/]"),
+            ("(unknown)", "(unknown)"),
+            ("ld", "[cyan]ld[/]"),
+            ("sd a0, 8(sp)", "[cyan]sd[/] a0, [magenta]8[/](sp)"),
+            ("beq a0, a1, 16", "[green]beq[/] a0, a1, [magenta]16[/]"),
+            ("fence rw, rw", "[yellow]fence[/] rw, rw"),
+            ("mret", "[red]mret[/]"),
+            ("mv a0, a1", "mv a0, a1"),
+        ],
+    )
+    def test_colorize_asm_matches_expected_markup(self, text, expected):
+        assert MemoryOps._colorize_asm(text) == expected
 
 
 class TestCtrlFlowKind:
-    def test_jal(self):
-        assert MemoryMixin._ctrl_flow_kind(0x0000006F) == "jal"
-
-    def test_jalr(self):
-        assert MemoryMixin._ctrl_flow_kind(0x00000067) == "jalr"
-
-    def test_branch(self):
-        assert MemoryMixin._ctrl_flow_kind(0x00000063) == "branch"
-
-    def test_ecall(self):
-        assert MemoryMixin._ctrl_flow_kind(0x00000073) == "ecall"
-
-    def test_ebreak(self):
-        assert MemoryMixin._ctrl_flow_kind((0x001 << 20) | 0x73) == "ebreak"
-
-    def test_mret(self):
-        assert MemoryMixin._ctrl_flow_kind((0x302 << 20) | 0x73) == "mret"
-
-    def test_sret(self):
-        assert MemoryMixin._ctrl_flow_kind((0x102 << 20) | 0x73) == "sret"
-
-    def test_wfi(self):
-        assert MemoryMixin._ctrl_flow_kind((0x105 << 20) | 0x73) == "wfi"
-
-    def test_other_system_instruction_is_csr(self):
-        assert MemoryMixin._ctrl_flow_kind((0xC00 << 20) | 0x73) == "csr"
-
-    def test_fence(self):
-        assert MemoryMixin._ctrl_flow_kind(0x0000000F) == "fence"
-        assert MemoryMixin._ctrl_flow_kind(0x0000002F) == "fence"
-
-    def test_ordinary_instruction_is_normal(self):
-        assert MemoryMixin._ctrl_flow_kind(0x00000013) == "normal"
+    @pytest.mark.parametrize(
+        ("instr", "expected"),
+        [
+            (0x0000006F, "jal"),
+            (0x00000067, "jalr"),
+            (0x00000063, "branch"),
+            (0x00000073, "ecall"),
+            ((0x001 << 20) | 0x73, "ebreak"),
+            ((0x302 << 20) | 0x73, "mret"),
+            ((0x102 << 20) | 0x73, "sret"),
+            ((0x105 << 20) | 0x73, "wfi"),
+            ((0xC00 << 20) | 0x73, "csr"),
+            (0x0000000F, "fence"),
+            (0x0000002F, "fence"),
+            (0x00000013, "normal"),
+        ],
+    )
+    def test_ctrl_flow_kind_matches_expected(self, instr, expected):
+        assert MemoryOps._ctrl_flow_kind(instr) == expected
 
 
 class TestCtrlFlowKindCompressed:
-    def test_c_jal(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed((1 << 13) | 1) == "jal"
-
-    def test_c_j(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed((5 << 13) | 1) == "jal"
-
-    def test_c_jr(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed((4 << 13) | 2) == "jalr"
-
-    def test_c_mv_is_normal(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed((4 << 13) | 2 | (1 << 2)) == "normal"
-
-    def test_c_jalr(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed((6 << 13) | 2) == "jalr"
-
-    def test_c_jalr_with_nonzero_rs2_is_normal(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed((6 << 13) | 2 | (1 << 2)) == "normal"
-
-    def test_c_beqz(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed((6 << 13) | 1) == "branch"
-
-    def test_c_bnez(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed((7 << 13) | 1) == "branch"
-
-    def test_c_ebreak(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed(0x0002) == "ebreak"
-
-    def test_other_compressed_is_normal(self):
-        assert MemoryMixin._ctrl_flow_kind_compressed(0x0001) == "normal"
+    @pytest.mark.parametrize(
+        ("instr", "expected"),
+        [
+            ((1 << 13) | 1, "jal"),
+            ((5 << 13) | 1, "jal"),
+            ((4 << 13) | 2, "jalr"),
+            ((4 << 13) | 2 | (1 << 2), "normal"),
+            ((6 << 13) | 2, "jalr"),
+            ((6 << 13) | 2 | (1 << 2), "normal"),
+            ((6 << 13) | 1, "branch"),
+            ((7 << 13) | 1, "branch"),
+            (0x0002, "ebreak"),
+            (0x0001, "normal"),
+        ],
+    )
+    def test_ctrl_flow_kind_compressed_matches_expected(self, instr, expected):
+        assert MemoryOps._ctrl_flow_kind_compressed(instr) == expected
 
 
 class TestTrapCauseNameStatic:
-    def test_matches_module_level_function(self):
+    @pytest.mark.parametrize("mcause", [0, 2, 13, (1 << 63) | 7])
+    def test_matches_module_level_function(self, mcause):
         """静态转发与 trap_def 的映射一致."""
-        for mcause in (0, 2, 13, (1 << 63) | 7):
-            assert MemoryMixin._trap_cause_name_static(mcause) == trap_cause_name(mcause)
+        assert MemoryOps._trap_cause_name_static(mcause) == trap_cause_name(mcause)
 
 
 class TestWarnPcIfSuspect:

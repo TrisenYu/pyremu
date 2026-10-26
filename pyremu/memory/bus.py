@@ -91,6 +91,47 @@ class AccessFaultError(Exception):
         )
 
 
+class BootRom(Device):
+    """引导只读存储器 — 存放零阶段引导程序与交付给下一级的设备树.
+
+    hart 经总线读取本对象的内容; 对它的写入按访问故障投递陷态. 固件与设备树的装载
+    调用 load 写入, 不经过总线写路径.
+    """
+
+    def __init__(self, size: int) -> None:
+        self.size = size
+        self._data = bytearray(size)
+
+    def contains(self, addr: int) -> bool:
+        """判定 addr 是否属于本设备的地址范围."""
+        return self.base_addr <= addr < self.base_addr + self.size
+
+    def load(self, ofs: int, data: bytes) -> None:
+        """尝试将 data 写入自 ofs 起的位置.
+
+        Raises:
+            ValueError: 待写入的数据超出容量.
+        """
+        if ofs < 0 or ofs + len(data) > self.size:
+            raise ValueError(
+                f"待写入数据超出引导 ROM 的容量({self.size} B):"
+                f"偏移 0x{ofs:x}, 长度 {len(data)} 字节"
+            )
+        self._data[ofs : ofs + len(data)] = data
+
+    def read(self, ofs: int, size: int) -> bytes:
+        """读取自 ofs 起的 size 个字节; 超出本设备范围的部分以零字节填充."""
+        size = max(0, size)
+        if ofs < 0 or ofs >= self.size:
+            return b"\x00" * size
+        ret = bytes(self._data[ofs : min(ofs + size, self.size)])
+        return ret + b"\x00" * max(size - len(ret), 0)
+
+    def write(self, offset: int, data: bytes) -> None:
+        """经总线的写访问一律拒绝; 装载经 load 完成."""
+        raise AccessFaultError(self.base_addr + offset, is_write=True)
+
+
 class DirectRam:
     """RAM 缓冲区及其地址窗口, 提供绕过 L2 缓存的读写.
 
@@ -348,6 +389,10 @@ class Bus:
         # add_device 后置 None, 首次 _find_device 时重建.
         self._device_cache: list[tuple[int, int, Device]] | None = None
 
+        # 引导只读存储器 — 未注册时保持 None. 它同时位于设备表中, 由 add_boot_rom
+        # 登记.
+        self._boot_rom: BootRom | None = None
+
         # 若 L2 缓存存在, 注入 RAM 后端回调. L2 缓存只缓存 RAM, 不缓存设备.
         # 后端取 DirectRam 的方法而不取 Bus 的: Bus 持有 L2 缓存并按主存访问路径
         # 调用它, 后端再持有 Bus 的方法会使二者之间形成环形引用.
@@ -376,6 +421,17 @@ class Bus:
         device.base_addr = base_addr
         self._devices[base_addr] = device
         self._device_cache = None  # 下次 _find_device 时重建
+
+    def add_boot_rom(self, base_addr: int, size: int) -> BootRom:
+        """在 *base_addr* 注册宽度为 *size* 的引导只读存储器, 返回该对象.
+
+        引导只读存储器同时进入设备表: hart 的读取经 Bus.read 直通本对象, 写入由
+        BootRom.write 拒绝, 加速执行引擎按设备地址退出到 Python 侧执行该访问.
+        """
+        rom = BootRom(size)
+        self.add_device(base_addr, rom)
+        self._boot_rom = rom
+        return rom
 
     def _find_device(self, addr: int) -> tuple[Device | None, int]:
         """二分查找地址对应的设备及设备内偏移"""
@@ -425,6 +481,10 @@ class Bus:
         dev, _ = self._find_device(addr)
         return dev is not None
 
+    def is_rom_addr(self, addr: int) -> bool:
+        """判断物理地址是否属于引导只读存储器的地址范围."""
+        return self._boot_rom is not None and self._boot_rom.contains(addr)
+
     def is_valid_addr(self, addr: int) -> bool:
         """PMA 检查: 地址是否在有效物理区域 (主存或 I/O 设备).
 
@@ -455,6 +515,11 @@ class Bus:
     def devices(self) -> dict[int, Device]:
         """返回所有已注册设备 (按基址索引)."""
         return self._devices
+
+    @property
+    def boot_rom(self) -> BootRom | None:
+        """返回已注册的引导只读存储器; 未注册时为 None."""
+        return self._boot_rom
 
     # ----------------------------------------------------------
     #  RAM 直接访问, 绕过 L2 缓存, 供 L2 回退和调试使用

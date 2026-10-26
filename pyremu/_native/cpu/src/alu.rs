@@ -1,14 +1,14 @@
-//! RISC-V ALU pure-compute operations.
+//! RISC-V ALU 纯计算操作.
 //!
-//! All functions return an `Alu64` struct with a `.value` field (the result)
-//! and a `.trap` field (0 = ok, 1 = invalid encoding -> IllInstr).
+//! 所有函数返回 `Alu64` 结构体:
+//!     .value: 存放运算结果
+//!     .trap: 记录陷态标志, 0 表示编码合法, 1 表示编码非法并提示产生非法指令陷态.
 
 // ============================================================
-//  Return type
+//  返回类型
 // ============================================================
 
-/// ALU result with trap flag.  `trap == 1` means the encoding is illegal
-/// and the caller should deliver an Illegal Instruction trap.
+/// 带陷态标志的 ALU 结果. `trap` 为 1 表示编码非法并提示产生非法指令陷态
 #[repr(C)]
 pub struct Alu64 {
 	pub value: u64,
@@ -27,10 +27,10 @@ impl Alu64 {
 }
 
 // ============================================================
-//  RV64 helpers
+//  RV64 辅助函数
 // ============================================================
 
-/// RISC-V R-type ALU: funct3 selects the operation, funct7 selects the variant.
+/// RISC-V R 型 ALU: funct3 选择运算, funct7 选择变体.
 ///
 /// | funct3 | funct7=0 | funct7=1 | funct7=0x20 |
 /// |--------|----------|----------|-------------|
@@ -126,13 +126,13 @@ pub extern "C" fn exec_alu_op(funct3: u8, funct7: u8, v1: u64, v2: u64) -> Alu64
 }
 
 // ============================================================
-//  I-type ALU (op-imm)
+//  I 型立即数 ALU
 // ============================================================
 
-/// RISC-V I-type immediate ALU: funct3 selects the operation.
+/// RISC-V I 型立即数 ALU: funct3 选择运算.
 ///
-/// `imm` is the already sign-extended 12-bit immediate.
-/// `funct7` provides the funct6 field (bits[31:26]) for SRLI/SRAI distinction.
+/// `imm` 为已经符号扩展的 12 位立即数.
+/// `funct7` 的高 6 位即 funct6 字段, 对应 bits[31:26], 用于区分 SRLI 与 SRAI.
 #[no_mangle]
 pub extern "C" fn exec_op_imm(funct3: u8, funct7: u8, v1: u64, imm: u64) -> Alu64 {
 	let shamt = imm & 0x3F;
@@ -162,10 +162,10 @@ pub extern "C" fn exec_op_imm(funct3: u8, funct7: u8, v1: u64, imm: u64) -> Alu6
 }
 
 // ============================================================
-//  RV64 32-bit word ops (op-32)
+//  RV64 32 位字运算
 // ============================================================
 
-/// RISC-V RV64 32-bit word ALU: operates on lower 32 bits, sign-extends result.
+/// RISC-V RV64 32 位字 ALU: 只对低 32 位运算, 结果符号扩展到 64 位.
 ///
 /// | funct3 | funct7=0 | funct7=1 | funct7=0x20 |
 /// |--------|----------|----------|-------------|
@@ -250,12 +250,12 @@ pub extern "C" fn exec_op32(funct3: u8, funct7: u8, v1: u64, v2: u64) -> Alu64 {
 }
 
 // ============================================================
-//  RV64 32-bit word immediate ops (op-imm-32)
+//  RV64 32 位字立即数运算
 // ============================================================
 
-/// RISC-V RV64 32-bit immediate ALU: operates on lower 32 bits, sign-extends.
+/// RISC-V RV64 32 位字立即数 ALU: 对低 32 位运算, 结果符号扩展到 64 位.
 ///
-/// | funct3 | operation |
+/// | funct3 | 运算 |
 /// |--------|-----------|
 /// | 000    | ADDIW     |
 /// | 001    | SLLIW     |
@@ -288,7 +288,7 @@ pub extern "C" fn exec_op_imm32(funct3: u8, funct7: u8, v1: u64, imm: u64) -> Al
 }
 
 // ============================================================
-//  Tests
+//  测试
 // ============================================================
 
 #[cfg(test)]
@@ -390,15 +390,15 @@ mod tests {
 		assert!(trap(exec_alu_op(0xFF, 0, 10, 5)));
 	}
 
-	// ---- REM 64-bit: verify full-width operands are NOT truncated ----
+	// ---- 64 位 REM: 检查操作数按完整 64 位参与运算而不被截断 ----
 	#[test]
 	fn test_rem_positive_large() {
-		// 0x3FD9CEF920 fits in 33 bits; REM must use full 64-bit, not 32-bit.
+		// 0x3FD9CEF920 占 33 位; REM 必须按完整 64 位运算.
 		assert_eq!(v(exec_alu_op(6, 1, 0x3FD9CEF920, 7)), 5);
 	}
 	#[test]
 	fn test_rem_negative() {
-		// -10 % 3 = -1 in RISC-V (truncated division)
+		// RISC-V 采用截断除法, 被除数为负时余数为负.
 		assert_eq!(v(exec_alu_op(6, 1, (-10i64) as u64, 3)), (-1i64) as u64);
 	}
 	#[test]
@@ -407,12 +407,11 @@ mod tests {
 	}
 	#[test]
 	fn test_rem_by_zero() {
-		// REM by zero: dividend is returned
+		// 除数为零时 REM 返回被除数
 		assert_eq!(v(exec_alu_op(6, 1, 42, 0)), 42);
 	}
 	#[test]
 	fn test_rem_overflow() {
-		// i64::MIN % -1 = 0
 		assert_eq!(v(exec_alu_op(6, 1, i64::MIN as u64, (-1i64) as u64)), 0);
 	}
 	#[test]
@@ -424,22 +423,21 @@ mod tests {
 		assert_eq!(v(exec_alu_op(7, 1, 42, 0)), 42);
 	}
 
-	// ---- REMW: 32-bit signed remainder with sign extension ----
+	// ---- REMW: 32 位有符号求余, 结果符号扩展 ----
 	#[test]
 	fn test_remw_positive() {
 		assert_eq!(v(exec_op32(6, 1, 20, 6)), 2);
 	}
 	#[test]
 	fn test_remw_negative_dividend() {
-		// -10 (as i32) % 3 = -1 -> sign-extended
 		assert_eq!(v(exec_op32(6, 1, (-10i64) as u64, 3)), (-1i64) as u64);
 	}
 	#[test]
 	fn test_remw_sign_extend_negative_result() {
-		// w1 = 0xD9CEF920 as i32 = -640747232, w2 = 7
-		// -640747232 / 7 = -91535318.857 -> q=-91535318 (truncated)
-		// r = -640747232 - (-91535318 * 7) = -6
-		// Sign-extended to 0xFFFF_FFFF_FFFF_FFFA
+		// w1 = 0xD9CEF920 按 i32 解释为 -640747232, w2 = 7
+		// -640747232 / 7 = -91535318.857, 截断后商为 -91535318
+		// 余数 r 为 -6
+		// 符号扩展后为 0xFFFF_FFFF_FFFF_FFFA
 		assert_eq!(
 			v(exec_op32(6, 1, 0x3FD9CEF920, 7)),
 			0xFFFF_FFFF_FFFF_FFFAu64
@@ -451,11 +449,10 @@ mod tests {
 	}
 	#[test]
 	fn test_remw_overflow() {
-		// i32::MIN % -1 = 0 -> sign-extended (i.e. 0)
 		assert_eq!(v(exec_op32(6, 1, i32::MIN as u64, (-1i64) as u64)), 0);
 	}
 
-	// ---- REMUW: 32-bit unsigned remainder, zero-extended ----
+	// REMUW: 32 位无符号求余, 结果零扩展
 	#[test]
 	fn test_remuw_positive() {
 		assert_eq!(v(exec_op32(7, 1, 20, 6)), 2);
@@ -473,61 +470,56 @@ mod tests {
 		assert_eq!(v(exec_op32(7, 1, 42, 0)), 42);
 	}
 
-	// ---- Cross-validation: REM ≠ REMW for the crash-pattern value ----
+	// 对该缺陷触发值, REM 与 REMW 的结果不同
 	#[test]
 	fn test_rem_vs_remw_crash_value() {
-		let v1 = 0x3FD9CEF920u64; // the crash-pattern pointer from the stack
+		let v1 = 0x3FD9CEF920u64; // 取自栈中的缺陷触发指针
 		let v2 = 7u64;
-		let r64 = v(exec_alu_op(6, 1, v1, v2)); // REM: full 64-bit -> 5
-		let r32 = v(exec_op32(6, 1, v1, v2)); // REMW: lower 32-bit = 0xD9CEF920 = -640747232 -> -6 sext
+		let r64 = v(exec_alu_op(6, 1, v1, v2)); // REM: 按完整 64 位运算, 结果为 5
+		let r32 = v(exec_op32(6, 1, v1, v2)); // REMW: 低 32 位为 0xD9CEF920, 按有符号数解释为 -640747232, 结果为 -6
 		assert_eq!(r64, 5);
 		assert_eq!(r32, 0xFFFF_FFFF_FFFF_FFFAu64);
-		// They MUST differ — if equal, the emulator confuses 32-bit and 64-bit ops
+		// 必须不同。若相同, 则说明代码实现混淆了 32 位运算与 64 位运算
 		assert_ne!(
 			r64, r32,
 			"REM and REMW MUST differ for this operand — bit-width confusion?"
 		);
 	}
 
-	// ---- REM boundary: bit63=1 operands ----
+	// ---- REM 边界: bit63 为 1 的操作数 ----
 	#[test]
 	fn test_rem_bit63_1_mod_positive() {
-		// -1 (all bits 1) % 3 = -1
-		assert_eq!(v(exec_alu_op(6, 1, u64::MAX, 3)), u64::MAX); // -1
+		// u64::MAX 即全部位为 1, 对应 -1
+		assert_eq!(v(exec_alu_op(6, 1, u64::MAX, 3)), u64::MAX);
 	}
 	#[test]
 	fn test_rem_bit63_1_mod_negative() {
-		// -1 % -3 = -1
 		assert_eq!(v(exec_alu_op(6, 1, u64::MAX, (-3i64) as u64)), u64::MAX);
 	}
 	#[test]
 	fn test_rem_positive_mod_negative() {
-		// 20 % -6 = 2
 		assert_eq!(v(exec_alu_op(6, 1, 20, (-6i64) as u64)), 2);
 	}
 	#[test]
 	fn test_rem_negative_mod_negative() {
-		// -20 % -6 = -2
 		assert_eq!(
 			v(exec_alu_op(6, 1, (-20i64) as u64, (-6i64) as u64)),
 			(-2i64) as u64
 		);
 	}
 
-	// ---- REMU boundary ----
 	#[test]
 	fn test_remu_bit63_1() {
-		// u64::MAX % 3 = 0 (since u64::MAX = 2^64-1, and 2^64-1 % 3 = 0)
-		// Actually: u64::MAX = 0xFFFFFFFFFFFFFFFF = 18446744073709551615
-		// This is divisible by 3. Let me verify: 2^64 = 1 mod 3, so 2^64-1 = 0 mod 3. Yes.
+		// u64::MAX % 3 = 0.  u64::MAX = 0xFFFFFFFFFFFFFFFF = 18446744073709551615.
+		// 以 3 作为取模对象时, 2^64 的余数为 1, 故 2^64 - 1 的余数为 0, 该值可被 3 整除.
 		assert_eq!(v(exec_alu_op(7, 1, u64::MAX, 3)), 0);
 	}
 
-	// ---- REMW boundary: bit31=1 in lower 32-bit ----
+	// 测试 REMW 指令的边界情况：低 32 位的 bit31 为 1
 	#[test]
 	fn test_remw_bit31_1_mod_positive() {
-		// w1 = 0x80000000 = i32::MIN = -2147483648
-		// -2147483648 % 3 = -2 -> 0xFFFFFFFFFFFFFFFE
+		// w1 = 0x80000000, 按 i32 解释为 i32::MIN = -2147483648
+		// -2147483648 % 3 = -2, 符号扩展后为 0xFFFFFFFFFFFFFFFE
 		assert_eq!(
 			v(exec_op32(6, 1, 0x8000_0000u64, 3)),
 			0xFFFF_FFFF_FFFF_FFFEu64
@@ -535,7 +527,6 @@ mod tests {
 	}
 	#[test]
 	fn test_remw_bit31_1_mod_negative() {
-		// -2147483648 % -3 = -2
 		assert_eq!(
 			v(exec_op32(6, 1, 0x8000_0000u64, (-3i64) as u64)),
 			0xFFFF_FFFF_FFFF_FFFEu64
@@ -543,31 +534,26 @@ mod tests {
 	}
 	#[test]
 	fn test_remw_bit31_0_mod_negative() {
-		// w1 = 10 (bit31=0), -3 -> 10 % -3 = 1
 		assert_eq!(v(exec_op32(6, 1, 10, (-3i64) as u64)), 1);
 	}
 	#[test]
 	fn test_remw_bit31_0_sign_extend_positive() {
-		// w1 = 0x7FFFFFFF (i32::MAX), w2 = 3
-		// 2147483647 % 3 = 1 -> stays as 1 (no sign extension needed)
 		assert_eq!(v(exec_op32(6, 1, 0x7FFF_FFFFu64, 3)), 1);
 	}
 
-	// ---- REMUW boundary: bit31=1 treated as unsigned ----
+	// REMUW 边界情况：bit31 为 1 时按无符号数解释
 	#[test]
 	fn test_remuw_bit31_1() {
-		// u1 = 0x80000000u32 = 2147483648, u2 = 3
-		// 2147483648 % 3 = 2  -> result = 2 (zero-extended)
 		assert_eq!(v(exec_op32(7, 1, 0x8000_0000u64, 3)), 2);
 	}
 	#[test]
 	fn test_remuw_contrast_remw_bit31_1() {
-		// Same lower 32 bits, but REMUW (unsigned) ≠ REMW (signed)
+		// 低 32 位相同, 但 REMUW 按无符号数运算, REMW 按有符号数运算
 		let v1 = 0x8000_0000u64;
-		let remw_r = v(exec_op32(6, 1, v1, 3)); // signed:   -2147483648 % 3 = -2
-		let remuw_r = v(exec_op32(7, 1, v1, 3)); // unsigned:  2147483648 % 3 = 2
-		assert_eq!(remw_r, 0xFFFF_FFFF_FFFF_FFFEu64); // sign-extended -2
-		assert_eq!(remuw_r, 2); // zero-extended 2
+		let remw_r = v(exec_op32(6, 1, v1, 3)); // 有符号: -2147483648 % 3 = -2
+		let remuw_r = v(exec_op32(7, 1, v1, 3)); // 无符号: 2147483648 % 3 = 2
+		assert_eq!(remw_r, 0xFFFF_FFFF_FFFF_FFFEu64); // 符号扩展后的 -2
+		assert_eq!(remuw_r, 2); // 零扩展后的 2
 		assert_ne!(remw_r, remuw_r, "REMW ≠ REMUW for bit31=1 operand");
 	}
 
@@ -593,8 +579,7 @@ mod tests {
 	}
 	#[test]
 	fn test_srli_bad_f6() {
-		// funct3=101 (SRLI/SRAI group): valid funct6 = 0 or 0x10.
-		// funct7=0x3E -> funct6=0x1F (invalid)
+		// funct3 为 101 时 funct6 只允许取 0 或 0x10, 该用例取 0x1F.
 		assert!(trap(exec_op_imm(5, 0x3E, 0x100, 2)));
 	}
 
@@ -621,7 +606,6 @@ mod tests {
 	}
 	#[test]
 	fn test_sraiw() {
-		// SRAIW: funct3=101, funct7=0100000=0x20 -> funct6=0x10
 		assert_eq!(
 			v(exec_op_imm32(5, 0x20, 0xFFFF_FFFF_8000_0000u64, 1)),
 			0xFFFF_FFFF_C000_0000u64

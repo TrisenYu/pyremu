@@ -6,10 +6,7 @@
 
 from pyremu.core.decoder import Hart
 from pyremu.core.hart import HartWithRegs, RiscvMode
-from pyremu.core.trap_def import (
-    TrapType,
-    trap_cause_code, trap_is_interrupt
-)
+from pyremu.core.trap_def import trap_cause_code, trap_is_interrupt, TrapType
 
 __all__ = [
     "Hart",

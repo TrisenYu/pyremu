@@ -8,7 +8,6 @@
 这是 SMP boot 死锁 (ticket spinlock in sbi_fifo.qlock) 的简化版复现.
 """
 
-import os
 import struct
 
 import pytest
@@ -23,10 +22,14 @@ CLINT_BASE = 0x02000000
 def _encode_amoadd_w(rd=5, rs1=10, rs2=11, aq=1, rl=1):
     """amoadd.w rd, rs2, (rs1) — funct5=AMOADD=00000."""
     return (
-        (0b00000 << 27) | (aq << 26) | (rl << 25)
-        | (rs2 << 20) | (rs1 << 15)
+        (0b00000 << 27)
+        | (aq << 26)
+        | (rl << 25)
+        | (rs2 << 20)
+        | (rs1 << 15)
         | (0b010 << 12)  # .W
-        | (rd << 7) | 0b0101111
+        | (rd << 7)
+        | 0b0101111
     )
 
 
@@ -84,7 +87,7 @@ class TestTlbSyncCounter:
         h0, h1 = emu.harts
         self._setup_two_mmode_harts(emu)
 
-        # 初始化共享计数器 = 1
+        # 将共享计数器初始化为 1
         emu.bus.write(self.SHARED_ADDR, struct.pack("<I", 1))
 
         # H0: amoadd.w t0, a1, (a0) — 递减 1
@@ -122,14 +125,14 @@ class TestTlbSyncCounter:
         h0, h1 = emu.harts
         self._setup_two_mmode_harts(emu)
 
-        # 初始化共享计数器 = 1
+        # 将共享计数器初始化为 1
         emu.bus.write(self.SHARED_ADDR, struct.pack("<I", 1))
 
-        # H0: wfi (进入等待)
+        # H0 执行 wfi 进入等待
         emu.bus.write(self.H0_BASE, struct.pack("<I", _encode_wfi()))
         h0.pc = self.H0_BASE
 
-        # H1: nop 循环 (保持活跃)
+        # H1 循环执行 nop 保持活跃
         emu.bus.write(self.H1_BASE, struct.pack("<I", _encode_nop()))
         h1.pc = self.H1_BASE
 
@@ -144,9 +147,7 @@ class TestTlbSyncCounter:
 
         emu.step()
 
-        assert not h0._waiting, (
-            f"H0 应被 MSIP 唤醒, waiting={h0._waiting}"
-        )
+        assert not h0._waiting, f"H0 应被 MSIP 唤醒, waiting={h0._waiting}"
 
         # 现在 H0 醒来了, 让它执行 amoadd 递减
         instr_dec = _encode_amoadd_w(rd=5, rs1=10, rs2=11)
@@ -161,9 +162,7 @@ class TestTlbSyncCounter:
         after = struct.unpack("<I", emu.bus.read(self.SHARED_ADDR, 4))[0]
         h0_rd = h0.gprs[5] & 0xFFFF_FFFF
 
-        assert after == 0, (
-            f"MSIP 唤醒后 H0 amoadd: 1->0 期望, 实际 {after}"
-        )
+        assert after == 0, f"MSIP 唤醒后 H0 amoadd: 1->0 期望, 实际 {after}"
         assert h0_rd == 1, f"amoadd 应返回旧值 1, 实际 {h0_rd}"
 
     # ================================================================
@@ -184,9 +183,7 @@ class TestTlbSyncCounter:
           4. H1 读共享变量, 应为 0, 因为该变量已被 H0 递减
 
         """
-        cfg = PlatformConfig(
-            num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024
-        )
+        cfg = PlatformConfig(num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024)
         emu = Emulator(cfg, bootargs="")
         h0, h1 = emu.harts
         self._setup_two_mmode_harts(emu)
@@ -196,17 +193,17 @@ class TestTlbSyncCounter:
 
         # H0 代码: wfi ->amoadd -1 ->wfi
         instr_dec = _encode_amoadd_w(rd=5, rs1=10, rs2=11)
-        emu.bus.write(self.H0_BASE, struct.pack("<I", _encode_wfi()))     # +0
-        emu.bus.write(self.H0_BASE + 4, struct.pack("<I", instr_dec))     # +4
-        emu.bus.write(self.H0_BASE + 8, struct.pack("<I", _encode_wfi())) # +8
+        emu.bus.write(self.H0_BASE, struct.pack("<I", _encode_wfi()))  # +0
+        emu.bus.write(self.H0_BASE + 4, struct.pack("<I", instr_dec))  # +4
+        emu.bus.write(self.H0_BASE + 8, struct.pack("<I", _encode_wfi()))  # +8
 
         # H1 代码: nop ->wfi
         emu.bus.write(self.H1_BASE, struct.pack("<I", _encode_nop()))
         emu.bus.write(self.H1_BASE + 4, struct.pack("<I", _encode_wfi()))
 
         # 预设 H0 寄存器
-        h0.gprs[10] = self.SHARED_ADDR   # rs1 = addr
-        h0.gprs[11] = 0xFFFF_FFFF         # rs2 = -1
+        h0.gprs[10] = self.SHARED_ADDR  # rs1 = addr
+        h0.gprs[11] = 0xFFFF_FFFF  # rs2 = -1
 
         h0.pc = self.H0_BASE
         h1.pc = self.H1_BASE
@@ -235,12 +232,8 @@ class TestTlbSyncCounter:
         after = struct.unpack("<I", emu.bus.read(self.SHARED_ADDR, 4))[0]
         h0_rd = h0.gprs[5] & 0xFFFF_FFFF
 
-        assert after == 0, (
-            f"[native={use_native}] 递减后应为 0, 实际 {after}"
-        )
-        assert h0_rd == 1, (
-            f"[native={use_native}] amoadd 应返回旧值 1, 实际 {h0_rd}"
-        )
+        assert after == 0, f"[native={use_native}] 递减后应为 0, 实际 {after}"
+        assert h0_rd == 1, f"[native={use_native}] amoadd 应返回旧值 1, 实际 {h0_rd}"
 
         # --- 阶段 4: H1 读取应看到 0 (模拟 tlb_sync 自旋退出) ---
         lw_instr = _encode_lw(rd=6, rs1=10)
@@ -250,9 +243,7 @@ class TestTlbSyncCounter:
         h1.exec_instr(lw_instr)
         h1_sees = h1.gprs[6] & 0xFFFF_FFFF
 
-        assert h1_sees == 0, (
-            f"[native={use_native}] H1 应看到 tlb_sync=0, 实际 {h1_sees}"
-        )
+        assert h1_sees == 0, f"[native={use_native}] H1 应看到 tlb_sync=0, 实际 {h1_sees}"
 
     # ================================================================
     #  Test 4: 多次 MSIP 唤醒 + AMO 的序列正确性
@@ -260,9 +251,7 @@ class TestTlbSyncCounter:
 
     def test_multiple_wake_amo_sequence(self):
         """连续两次 MSIP 唤醒并执行 AMO, 每次计数器正确递减."""
-        cfg = PlatformConfig(
-            num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024
-        )
+        cfg = PlatformConfig(num_harts=2, ram_base=0x80000000, ram_size=64 * 1024 * 1024)
         emu = Emulator(cfg, bootargs="")
         h0, h1 = emu.harts
         self._setup_two_mmode_harts(emu)
@@ -279,7 +268,7 @@ class TestTlbSyncCounter:
         h0.gprs[10] = self.SHARED_ADDR
         h0.gprs[11] = 0xFFFF_FFFF
 
-        # H1: nop
+        # hart1 的代码为一条 nop
         emu.bus.write(self.H1_BASE, struct.pack("<I", _encode_nop()))
         h1.pc = self.H1_BASE
 

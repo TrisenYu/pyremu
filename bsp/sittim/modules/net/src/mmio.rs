@@ -7,7 +7,7 @@
 use crate::platform;
 
 #[cfg(not(target_arch = "riscv64"))]
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{Ordering, fence};
 
 /// 魔数 "virt"。
 pub const MAGIC_VALUE: u32 = 0x7472_6976;
@@ -102,7 +102,7 @@ mod tests {
 		R_DEVICE_FEATURES_SEL, R_DEVICE_ID, R_DRIVER_FEATURES, R_DRIVER_FEATURES_SEL, R_MAGIC,
 		R_QUEUE_DESC_HIGH, R_QUEUE_DESC_LOW, R_QUEUE_DEVICE_HIGH, R_QUEUE_DEVICE_LOW,
 		R_QUEUE_DRIVER_HIGH, R_QUEUE_DRIVER_LOW, R_QUEUE_NOTIFY, R_QUEUE_NUM, R_QUEUE_NUM_MAX,
-		R_QUEUE_READY, R_QUEUE_SEL, R_STATUS, R_VERSION, is_present, read32, read_config_u8,
+		R_QUEUE_READY, R_QUEUE_SEL, R_STATUS, R_VERSION, is_present, read_config_u8, read32,
 		write32, write64,
 	};
 	use crate::platform;
@@ -140,7 +140,11 @@ mod tests {
 				assert_ne!(a, b, "{a:#x} 与 {b:#x} 重合");
 			}
 		}
-		assert!(offsets.iter().all(|&offset| offset + 4 <= DEVICE_CONFIG_OFFSET));
+		assert!(
+			offsets
+				.iter()
+				.all(|&offset| offset + 4 <= DEVICE_CONFIG_OFFSET)
+		);
 	}
 
 	/// write64 依次写入低半与高半两个 32 位寄存器, 故每对寄存器相差 4 字节。

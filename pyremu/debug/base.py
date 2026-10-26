@@ -18,6 +18,7 @@ from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pyremu.core.decoder import Hart
+    from pyremu.debug.sym.model import SymAvailItem, SymMod
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
@@ -31,10 +32,12 @@ from pyremu.core.registers import (
     register_gpr,
 )
 from pyremu.core.trap_def import trap_cause_name
-from pyremu.debug._attrs import SharedMixinAttrs
+from pyremu.debug.attrs import SharedAttrs
 from pyremu.debug.types import (
     Breakpoint,
     HartSnapshot,
+    ImageKind,
+    LoadedImage,
     MemoryChange,
     StackFrame,
 )
@@ -46,10 +49,22 @@ from pyremu.emulator import Emulator
 from pyremu.utils.parse_bin import FirmwareImage
 
 
-class DebuggerBase(SharedMixinAttrs):
+def init_sym_mod_dir() -> str | None:
+    """符号候选目录的初始值: 进程的当前工作目录; 取不到时取当前用户的主目录.
+
+    工作目录已被删除时 ``os.getcwd`` 抛出 ``OSError``, 此时改用 ``HOME`` 环境变量;
+    该变量也没有时返回 ``None``, 即未设置候选目录.
+    """
+    try:
+        return os.getcwd()
+    except OSError:
+        return os.environ.get("HOME") or None
+
+
+class DebuggerBase(SharedAttrs):
     """调试器核心基类 — 初始化所有共享状态, 提供输出和信号处理.
 
-    各功能域作为独立 mixin 通过多重继承组合; 本类必须在 MRO 最后 (最右侧)
+    各功能域作为独立的操作类通过多重继承组合; 本类必须在 MRO 最后 (最右侧)
     以确保 ``__init__`` 优先初始化所有属性.
     """
 
@@ -65,9 +80,8 @@ class DebuggerBase(SharedMixinAttrs):
         self._hart_id: int = hart_id
         self._image: FirmwareImage | None = image
         self._load_offset: int = 0
-        self._preload_path: str | None = None
-        self._kernel_path: str | None = None
-        self._kernel_addr: int = 0
+        # 命令行装入的映像: 角色 -> 路径、物理起始地址与字节数
+        self._bins_images: dict[ImageKind, LoadedImage] = {}
 
         # 外部调试符号
         self._init_symbol_state()
@@ -100,6 +114,7 @@ class DebuggerBase(SharedMixinAttrs):
 
         self._trap_displayed_mcause: int | None = None
         self._last_command: str | None = None
+        self._command_rest = ""
 
         self._init_disasm_state()
         self._init_breakpoint_state()
@@ -138,6 +153,11 @@ class DebuggerBase(SharedMixinAttrs):
         self._sym_load_offset: int = 0
         self._sym_path: str | None = None
         self._pa_to_va: dict[int, int] = {}
+
+        self._sym_avail_items: list[SymAvailItem] = []
+        self._sym_mod_dir: str | None = init_sym_mod_dir()
+        self._sym_mods: list[SymMod] = []
+        self._sym_next_order: int = 0
 
     def _init_disasm_state(self) -> None:
         self._disasm_next_addr: int | None = None
@@ -347,6 +367,9 @@ class DebuggerBase(SharedMixinAttrs):
             return self._feed_pending_daemon(uart)
 
         had_input = self._feed_pending_uart(uart)
+        if self._stdin_pending and not had_input:
+            # 接收缓冲区拒绝待转发数据: 数据留在 _stdin_pending, 本轮不再读取 stdin
+            return False
         if had_input and self._stdin_pending:
             return True
         return self._read_stdin(uart, had_input)
@@ -484,6 +507,13 @@ class DebuggerBase(SharedMixinAttrs):
             "info",
             "symbols",
             "sym",
+            "bins-info",
+            "disk-info",
+            "chdir",
+            "ls",
+            "load",
+            "detail",
+            "rm",
             "disasm",
             "vdisasm",
             "stack",
@@ -559,8 +589,10 @@ class DebuggerBase(SharedMixinAttrs):
             if not parts:
                 continue
 
+            # 命令名之后的原文: 保留内部空白, 供需要含空白参数的子命令解析
+            rest = user_input[len(parts[0]) :].lstrip()
             try:
-                if not self._dispatch(parts):
+                if not self._dispatch(parts, rest):
                     break
             except KeyboardInterrupt:
                 self._console.print("\n[dim]REPL 中断[/]")

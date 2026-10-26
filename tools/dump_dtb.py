@@ -11,12 +11,12 @@
 
 import argparse
 from pathlib import Path
+import sys
 
 from pyremu.emulator import Emulator
 from pyremu.platform import PlatformConfig
 
-
-def main() -> int:
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="生成平台设备树 DTB 并落盘")
     parser.add_argument(
         "out",
@@ -34,6 +34,7 @@ def main() -> int:
     factory = getattr(PlatformConfig, args.preset, None)
     if factory is None or not callable(factory):
         parser.error(f"未知平台预设: {args.preset}")
+        sys.exit(1)
 
     emu = Emulator(factory())
 
@@ -42,8 +43,3 @@ def main() -> int:
     blob = emu.build_dtb()
     out.write_bytes(blob)
     print(f"  -> {out} ({len(blob)} bytes)")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

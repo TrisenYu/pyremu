@@ -28,10 +28,10 @@
 #define SBI_ENCLAVE_MEM_ALLOC		  500
 /* 503 至 505: 宿主应答飞地挂起的模块请求, 三者均以 "飞地编号 + 管理令牌" 鉴权.
  * 508 为飞地侧调用: 取回本模块的交付结果. */
-#define SBI_ENCLAVE_MODULE_REQ		  503
-#define SBI_ENCLAVE_MODULE_SIZE		  504
+#define SBI_ENCLAVE_MODULE_REQ	  503
+#define SBI_ENCLAVE_MODULE_SIZE	  504
 #define SBI_ENCLAVE_MODULE_IMG	  505
-#define SBI_ENCLAVE_MODULE_RESULT	  508
+#define SBI_ENCLAVE_MODULE_RESULT 508
 
 /* ---- ioctl command codes ---- */
 
@@ -80,9 +80,9 @@
 
 /* 模块三个命令共用 struct tee_enclave_args, 各自的专属字段在其中的匿名 union 中
  * 按命令取用. 505 的映像缓冲区经内核缓冲区中转 (M 模式只读 U=0 的页). */
-#define TEE_IOC_MODULE_REQ	 _IOWR(TEE_IOC_MAGIC, 9, struct tee_enclave_args)
-#define TEE_IOC_MODULE_SIZE	 _IOWR(TEE_IOC_MAGIC, 10, struct tee_enclave_args)
-#define TEE_IOC_MODULE_IMG _IOWR(TEE_IOC_MAGIC, 11, struct tee_enclave_args)
+#define TEE_IOC_MODULE_REQ	_IOWR(TEE_IOC_MAGIC, 9, struct tee_enclave_args)
+#define TEE_IOC_MODULE_SIZE _IOWR(TEE_IOC_MAGIC, 10, struct tee_enclave_args)
+#define TEE_IOC_MODULE_IMG	_IOWR(TEE_IOC_MAGIC, 11, struct tee_enclave_args)
 
 /* ---- ENTER / RESUME 的 ioctl 返回值 (运行状态) ----
  *

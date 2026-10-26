@@ -28,7 +28,7 @@ class TestWFIMsipWakeup:
             mtvec = 0x80000000 + h.id * 0x100
             h.csrs["mtvec"].val = mtvec
             emu.bus.write(mtvec, struct.pack("<I", 0x30200073))  # mret
-            h.csrs["mie"].val = 1 << 3   # MSIE
+            h.csrs["mie"].val = 1 << 3  # MSIE
             h.csrs["mstatus"].val = 1 << 3  # MIE=1
 
     def test_msip_wakes_wfi_hart_native(self, emu_two_harts):
@@ -45,7 +45,7 @@ class TestWFIMsipWakeup:
 
         # 在 H1 的 PC 位置写入 WFI 指令 + 自旋
         wfi_loop = struct.pack("<I", 0x10500073)  # wfi
-        emu.bus.write(0x80000100, wfi_loop)       # H1 PC
+        emu.bus.write(0x80000100, wfi_loop)  # H1 PC
         h1.pc = 0x80000100
 
         # H0 先运行几步, 让 H1 有机会执行 WFI
@@ -87,6 +87,7 @@ class TestWFIMsipWakeup:
         h1.pc = 0x80000100
         for _ in range(5):
             emu.step()
-        assert h1._waiting, \
+        assert h1._waiting, (
             f"H1 should still be in WFI (no MSIP sent), got waiting={h1._waiting}"
+        )
         assert h1.pc == 0x80000104, f"H1 PC should advance past WFI, got {h1.pc:#010x}"

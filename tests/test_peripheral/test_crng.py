@@ -123,7 +123,6 @@ class TestCRNGConfig:
         )
 
     def test_default_crng_base_follows_build_config(self):
-        """默认 CRNG 基址取自 emu-configs.mk 生成的常量."""
         assert PeripheralConfig().crng_base == configs_gen.CRNG_BASE
 
     def test_crng_base_does_not_collide_with_virtio_blk(self):

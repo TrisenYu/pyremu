@@ -634,7 +634,9 @@ class TestPmpsplitPmpIsolation:
 
         class FakeCSR:
             val: int
-            def __init__(self, v): self.val = v
+
+            def __init__(self, v):
+                self.val = v
 
         # 配置条目 0 (host 范围): allow 0x1000, R+W, NAPOT 4KB
         k_4k = 9
@@ -645,30 +647,23 @@ class TestPmpsplitPmpIsolation:
         # 配置条目 5 (飞地范围): allow 0x2000, R+W, NAPOT 4KB
         addr_val_2 = (0x2000 >> 2) | ((1 << k_4k) - 1)
         pmp._csrs["pmpaddr5"] = FakeCSR(addr_val_2)
-        pmp._csrs["pmpcfg0"] = FakeCSR(
-            pmp._csrs["pmpcfg0"].val | ((0b11000 | 0b0011) << 40)
-        )
+        pmp._csrs["pmpcfg0"] = FakeCSR(pmp._csrs["pmpcfg0"].val | ((0b11000 | 0b0011) << 40))
 
         # Host 模式 (mdid=0): 两个条目都可见
         info_host = PmpAccessInfo(
-            pa=0x1000, size=4, mode_val=0,
-            mstatus_val=0, pmpsplit=4, mdid=0
+            pa=0x1000, size=4, mode_val=0, mstatus_val=0, pmpsplit=4, mdid=0
         )
         assert pmp.check(info_host), "host 应能访问条目 0 的区域"
 
         # 飞地模式 (mdid=1, pmpsplit=4): 条目 0 不可见, 应 DENY
         info_enc = PmpAccessInfo(
-            pa=0x1000, size=4, mode_val=0,
-            mstatus_val=0, pmpsplit=4, mdid=1
+            pa=0x1000, size=4, mode_val=0, mstatus_val=0, pmpsplit=4, mdid=1
         )
-        assert not pmp.check(info_enc), (
-            "飞地不应能访问 host 的 PMP 条目 0 区域"
-        )
+        assert not pmp.check(info_enc), "飞地不应能访问 host 的 PMP 条目 0 区域"
 
         # 飞地应能访问条目 5 的区域
         info_enc5 = PmpAccessInfo(
-            pa=0x2000, size=4, mode_val=0,
-            mstatus_val=0, pmpsplit=4, mdid=1
+            pa=0x2000, size=4, mode_val=0, mstatus_val=0, pmpsplit=4, mdid=1
         )
         assert pmp.check(info_enc5), "飞地应能访问自己的 PMP 条目 5 区域"
 
@@ -676,10 +671,7 @@ class TestPmpsplitPmpIsolation:
         """pmpsplit >= num_entries -> 飞地无可用 PMP 条目, 全部拒绝."""
 
         pmp = Pmp({}, num_entries=8)
-        info = PmpAccessInfo(
-            pa=0x1000, size=4, mode_val=0,
-            mstatus_val=0, pmpsplit=8, mdid=1
-        )
+        info = PmpAccessInfo(pa=0x1000, size=4, mode_val=0, mstatus_val=0, pmpsplit=8, mdid=1)
         assert not pmp.check(info), "pmpsplit=8 >= num_entries=8 -> 飞地全拒"
 
     def test_pmpsplit_zero_legacy_all_visible(self):
@@ -689,7 +681,9 @@ class TestPmpsplitPmpIsolation:
 
         class FakeCSR:
             val: int
-            def __init__(self, v): self.val = v
+
+            def __init__(self, v):
+                self.val = v
 
         k_4k = 9
         addr_val = (0x5000 >> 2) | ((1 << k_4k) - 1)
@@ -707,7 +701,9 @@ class TestPmpsplitPmpIsolation:
 
         class FakeCSR:
             val: int
-            def __init__(self, v): self.val = v
+
+            def __init__(self, v):
+                self.val = v
 
         addr_val = (0x3000 >> 2) | 0x1FF  # 4KB @ 0x3000
         pmp._csrs["pmpaddr0"] = FakeCSR(addr_val)
@@ -858,7 +854,12 @@ class TestPmpsplitMdidIntegration:
         # 飞地 A (mdid=1, pmpsplit=6): 只能看到条目 6-15
         # 访问自己的内存, 即条目 8, 允许
         info_a_own = PmpAccessInfo(
-            pa=0x8000_0000, size=4, mode_val=0, mstatus_val=0, pmpsplit=6, mdid=1,
+            pa=0x8000_0000,
+            size=4,
+            mode_val=0,
+            mstatus_val=0,
+            pmpsplit=6,
+            mdid=1,
         )
         assert pmp.check(info_a_own), "飞地 A 应能访问自己的内存"
 
@@ -866,13 +867,23 @@ class TestPmpsplitMdidIntegration:
         # 注意: 虽然 PMP 不阻止, 但 pmpsplit 只控制可见条目范围.
         # 飞地间的进一步隔离由 mfence.did + TLB 管理实现.
         info_a_other = PmpAccessInfo(
-            pa=0x8000_2000, size=4, mode_val=0, mstatus_val=0, pmpsplit=6, mdid=1,
+            pa=0x8000_2000,
+            size=4,
+            mode_val=0,
+            mstatus_val=0,
+            pmpsplit=6,
+            mdid=1,
         )
         assert pmp.check(info_a_other), "条目 10 在飞地区间内, PMP 不阻止"
 
         # host 侧条目的编号小于 pmpsplit, 对 mdid 非零的飞地不可见
         info_a_host = PmpAccessInfo(
-            pa=0x0000, size=4, mode_val=0, mstatus_val=0, pmpsplit=6, mdid=1,
+            pa=0x0000,
+            size=4,
+            mode_val=0,
+            mstatus_val=0,
+            pmpsplit=6,
+            mdid=1,
         )
         assert not pmp.check(info_a_host), "飞地不应看到 host 区间 (条目 0 < pmpsplit=6)"
 
@@ -880,10 +891,10 @@ class TestPmpsplitMdidIntegration:
         """多 hart 各自运行不同飞地, mdid + pmpsplit 独立配置."""
         emu = _make_emu(num_harts=4)
         hart_configs = [
-            (0, 1, 8),   # hart 0: mdid=1, pmpsplit=8
-            (1, 2, 8),   # hart 1: mdid=2, pmpsplit=8
-            (2, 3, 8),   # hart 2: mdid=3, pmpsplit=8
-            (3, 0, 0),   # hart 3: mdid=0, pmpsplit=0 (host)
+            (0, 1, 8),  # hart 0: mdid=1, pmpsplit=8
+            (1, 2, 8),  # hart 1: mdid=2, pmpsplit=8
+            (2, 3, 8),  # hart 2: mdid=3, pmpsplit=8
+            (3, 0, 0),  # hart 3: mdid=0, pmpsplit=0 (host)
         ]
         for hart_idx, mdid, pmpsplit in hart_configs:
             h = emu.harts[hart_idx]
@@ -909,7 +920,7 @@ class TestPmpsplitMdidIntegration:
         k_4k = 9
         host_addr_val = (0x8000_1000 >> 2) | ((1 << k_4k) - 1)
         hart.csrs["pmpaddr0"].val = host_addr_val
-        cfg = (0b11000 | 0b0011)  # NAPOT, R+W for entry 0
+        cfg = 0b11000 | 0b0011  # NAPOT, R+W for entry 0
         hart.csrs["pmpcfg0"].val = cfg
 
         # 飞地条目 4: 允许 0x8000_2000-0x8000_2FFF (NAPOT+R+W)

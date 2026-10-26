@@ -116,7 +116,7 @@ class TestPeripheralConfigDefault:
     """PeripheralConfig 默认值向后兼容."""
 
     def test_default_imsic_base_follows_build_config(self):
-        """默认 IMSIC 与 APLIC 基址取自 emu-configs.mk 生成的常量."""
+        """默认 IMSIC 与 APLIC 基址取自根据项目编译选项自动生成的AIA中断控制器基地址常量."""
         p = PeripheralConfig()
         assert p.imsic_m_base == configs_gen.IMSIC_M_BASE
         assert p.aplic_s_base == configs_gen.APLIC_S_BASE

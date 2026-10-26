@@ -34,7 +34,9 @@
 
 /* ---- helpers ---- */
 
-static uint8_t *read_file(const char *path, size_t *out_sz) {
+static uint8_t *read_file(
+	const char *path,
+	size_t *out_sz) {
 	FILE *fp = fopen(path, "rb");
 	if (!fp) {
 		return NULL;
@@ -64,7 +66,9 @@ static uint8_t *read_file(const char *path, size_t *out_sz) {
 /* TEE_IOC_SHUTDOWN 为 _IOW, 驱动 copy_from_user 读取 struct tee_enclave_token_args
  * (目标飞地编号 + 管理令牌). 本文件的飞地均由 TEE_IOC_CREATE 创建, 其登记的管理
  * 令牌恒为 0. */
-static int do_shutdown(int fd, uint64_t enclave_id) {
+static int do_shutdown(
+	int fd,
+	uint64_t enclave_id) {
 	struct tee_enclave_token_args args = {
 		.enclave_id = enclave_id,
 		.token		= 0,
@@ -74,7 +78,9 @@ static int do_shutdown(int fd, uint64_t enclave_id) {
 
 /* ---- main ---- */
 
-int main(int argc, char **argv) {
+int main(
+	int argc,
+	char **argv) {
 	if (argc < 2) {
 		fprintf(stderr, "Usage: %s <stress_payload_path>\n", argv[0]);
 		return 1;
@@ -96,51 +102,59 @@ int main(int argc, char **argv) {
 		close(fd);
 		return 1;
 	}
-	printf("[info] initial: free=%lu partitions (%lu MiB)\n\n",
+	printf(
+		"[info] initial: free=%lu partitions (%lu MiB)\n\n",
 		(unsigned long)mem_init.free_total,
 		(unsigned long)(mem_init.free_total * 2));
 
 	/* 加载 stress_payload */
 	size_t payload_sz = 0;
-	uint8_t *payload = read_file(argv[1], &payload_sz);
+	uint8_t *payload  = read_file(argv[1], &payload_sz);
 	if (!payload) {
 		fprintf(stderr, "read payload '%s' failed\n", argv[1]);
 		close(fd);
 		return 1;
 	}
-	printf("[info] payload '%s' loaded (%zu bytes)\n\n",
-		argv[1], payload_sz);
+	printf("[info] payload '%s' loaded (%zu bytes)\n\n", argv[1], payload_sz);
 
 	uint64_t online_ids[MAX_STORED_IDS];
-	int count = 0;
+	int count				 = 0;
 	int consecutive_failures = 0;
 
 	while (consecutive_failures < MAX_CONSECUTIVE_FAILURES) {
 		/* 创建飞地 */
 		uint64_t enclave_id = 0;
-		int rc = ioctl(fd, TEE_IOC_CREATE, &enclave_id);
+		int rc				= ioctl(fd, TEE_IOC_CREATE, &enclave_id);
 		if (rc < 0) {
 			consecutive_failures++;
-			printf("[info] CREATE #%d failed: errno=%d (%s), consecutive=%d/%d\n",
-				count + 1, errno, strerror(errno),
-				consecutive_failures, MAX_CONSECUTIVE_FAILURES);
+			printf(
+				"[info] CREATE #%d failed: errno=%d (%s), consecutive=%d/%d\n",
+				count + 1,
+				errno,
+				strerror(errno),
+				consecutive_failures,
+				MAX_CONSECUTIVE_FAILURES);
 			continue;
 		}
 
 		/* 进入飞地, 执行 stress_payload (完成后保持在线) */
 		struct tee_enclave_args args = {
-			.enclave_id   = enclave_id,
-			.enter.payload_ptr  = (uint64_t)payload,
+			.enclave_id			= enclave_id,
+			.enter.payload_ptr	= (uint64_t)payload,
 			.enter.payload_size = payload_sz,
-			.enter.argc         = 0,
-			.enter.argv_ptr     = 0,
+			.enter.argc			= 0,
+			.enter.argv_ptr		= 0,
 		};
 		rc = ioctl(fd, TEE_IOC_ENTER, &args);
 		if (rc < 0) {
 			consecutive_failures++;
-			printf("[error] ENTER #%d failed: errno=%d (%s), consecutive=%d/%d\n",
-				count + 1, errno, strerror(errno),
-				consecutive_failures, MAX_CONSECUTIVE_FAILURES);
+			printf(
+				"[error] ENTER #%d failed: errno=%d (%s), consecutive=%d/%d\n",
+				count + 1,
+				errno,
+				strerror(errno),
+				consecutive_failures,
+				MAX_CONSECUTIVE_FAILURES);
 			/* 回退: 关停该飞地 */
 			do_shutdown(fd, enclave_id);
 			continue;
@@ -148,8 +162,7 @@ int main(int argc, char **argv) {
 
 		/* 成功: 记录并重置连续失败计数 */
 		if (count >= MAX_STORED_IDS) {
-			fprintf(stderr, "exceeded MAX_STORED_IDS=%d, abort\n",
-				MAX_STORED_IDS);
+			fprintf(stderr, "exceeded MAX_STORED_IDS=%d, abort\n", MAX_STORED_IDS);
 			break;
 		}
 		online_ids[count] = enclave_id;
@@ -159,8 +172,10 @@ int main(int argc, char **argv) {
 		if (count % 10 == 0) {
 			struct tee_mem_info mem_now;
 			if (ioctl(fd, TEE_IOC_GET_MEM, &mem_now) == 0) {
-				printf("  online=%3d  remaining=%lu partitions\n",
-					count, (unsigned long)mem_now.free_total);
+				printf(
+					"  online=%3d  remaining=%lu partitions\n",
+					count,
+					(unsigned long)mem_now.free_total);
 			}
 		}
 	}
@@ -171,14 +186,17 @@ int main(int argc, char **argv) {
 
 	printf("\n=== RESULT ===\n");
 	printf("max online enclaves: %d\n", count);
-	printf("initial free: %lu partitions, final free: %lu partitions\n",
+	printf(
+		"initial free: %lu partitions, final free: %lu partitions\n",
 		(unsigned long)mem_init.free_total,
 		(unsigned long)mem_end.free_total);
 	if (count > 0) {
 		uint64_t consumed = mem_init.free_total - mem_end.free_total;
-		printf("memory per enclave: %.2f MiB (%lu partitions / %d enclaves)\n",
+		printf(
+			"memory per enclave: %.2f MiB (%lu partitions / %d enclaves)\n",
 			(double)consumed * 2.0 / (double)count,
-			(unsigned long)consumed, count);
+			(unsigned long)consumed,
+			count);
 	}
 
 	/* 清理: 关停所有在线飞地 */

@@ -86,29 +86,34 @@ class I2C(Device):
         self._write_reg(offset, val)
 
     def _read_reg(self, offset: int) -> int:
-        if offset == self.REG_CTRL:
-            return self._ctrl
         if offset == self.REG_STATUS:
-            st = self.STATUS_TX_DONE  # TX 始终就绪
-            if not self._busy:
-                st |= self.STATUS_RX_AVAIL
-            if self._busy:
-                st |= self.STATUS_BUSY
-            if self._nack:
-                st |= self.STATUS_NACK
-            return st
+            return self._read_status()
         if offset == self.REG_DATA:
-            # 读取从设备数据 (模拟)
-            self._busy = False
-            if self._addr & 0x100:  # rw=1: read
-                reg = mask08(self._addr)
-                return self._slave_data.get(reg, 0)
-            return self._data
-        if offset == self.REG_ADDR:
-            return self._addr
-        if offset == self.REG_PRESCALE:
-            return self._prescale
-        return 0
+            return self._read_data()
+        simple = {
+            self.REG_CTRL: self._ctrl,
+            self.REG_ADDR: self._addr,
+            self.REG_PRESCALE: self._prescale,
+        }
+        return simple.get(offset, 0)
+
+    def _read_status(self) -> int:
+        """按当前忙标志与应答标志给出 STATUS."""
+        st = self.STATUS_TX_DONE  # TX 始终就绪
+        if not self._busy:
+            st |= self.STATUS_RX_AVAIL
+        else:
+            st |= self.STATUS_BUSY
+        if self._nack:
+            st |= self.STATUS_NACK
+        return st
+
+    def _read_data(self) -> int:
+        """清除忙标志后返回从设备寄存器值; 地址未带读标志时返回本级数据寄存器."""
+        self._busy = False
+        if self._addr & 0x100:  # rw=1: read
+            return self._slave_data.get(mask08(self._addr), 0)
+        return self._data
 
     def _write_reg(self, offset: int, val: int) -> None:
         if offset == self.REG_CTRL:

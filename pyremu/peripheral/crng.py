@@ -34,9 +34,9 @@ import struct
 from pyremu.memory.bus import Device
 
 # 寄存器偏移
-REG_DATA = 0x00    # 读取返回 size 字节随机数
+REG_DATA = 0x00  # 读取返回 size 字节随机数
 REG_STATUS = 0x04  # bit0 = ready
-REG_ID = 0x0C      # 设备 ID (只读)
+REG_ID = 0x0C  # 设备 ID (只读)
 
 STATUS_READY = 1 << 0
 DEVICE_ID = 0x4352_4E47  # "CRNG" (ASCII)

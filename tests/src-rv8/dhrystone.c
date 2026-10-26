@@ -430,12 +430,24 @@ void Proc2(OneToFifty *IntParIO);
 void Proc3(RecordPtr *PtrParOut);
 void Proc4();
 void Proc5();
-void Proc6(Enumeration EnumParIn, Enumeration *EnumParOut);
-void Proc7(OneToFifty IntParI1, OneToFifty IntParI2, OneToFifty *IntParOut);
+void Proc6(
+	Enumeration EnumParIn,
+	Enumeration *EnumParOut);
+void Proc7(
+	OneToFifty IntParI1,
+	OneToFifty IntParI2,
+	OneToFifty *IntParOut);
 void Proc8(
-	Array1Dim Array1Par, Array2Dim Array2Par, OneToFifty IntParI1, OneToFifty IntParI2);
-Enumeration Func1(CapitalLetter CharPar1, CapitalLetter CharPar2);
-boolean Func2(String30 StrParI1, String30 StrParI2);
+	Array1Dim Array1Par,
+	Array2Dim Array2Par,
+	OneToFifty IntParI1,
+	OneToFifty IntParI2);
+Enumeration Func1(
+	CapitalLetter CharPar1,
+	CapitalLetter CharPar2);
+boolean Func2(
+	String30 StrParI1,
+	String30 StrParI2);
 
 int main() {
 	Proc0();
@@ -585,7 +597,9 @@ void Proc5() {
 
 extern boolean Func3(Enumeration EnumParIn);
 
-void Proc6(Enumeration EnumParIn, Enumeration *EnumParOut) {
+void Proc6(
+	Enumeration EnumParIn,
+	Enumeration *EnumParOut) {
 	*EnumParOut = EnumParIn;
 	if (!Func3(EnumParIn)) {
 		*EnumParOut = Ident4;
@@ -611,7 +625,10 @@ void Proc6(Enumeration EnumParIn, Enumeration *EnumParOut) {
 	}
 }
 
-void Proc7(OneToFifty IntParI1, OneToFifty IntParI2, OneToFifty *IntParOut) {
+void Proc7(
+	OneToFifty IntParI1,
+	OneToFifty IntParI2,
+	OneToFifty *IntParOut) {
 	OneToFifty IntLoc;
 
 	IntLoc	   = IntParI1 + 2;
@@ -619,7 +636,10 @@ void Proc7(OneToFifty IntParI1, OneToFifty IntParI2, OneToFifty *IntParOut) {
 }
 
 void Proc8(
-	Array1Dim Array1Par, Array2Dim Array2Par, OneToFifty IntParI1, OneToFifty IntParI2) {
+	Array1Dim Array1Par,
+	Array2Dim Array2Par,
+	OneToFifty IntParI1,
+	OneToFifty IntParI2) {
 	OneToFifty IntLoc;
 	OneToFifty IntIndex;
 
@@ -635,7 +655,9 @@ void Proc8(
 	IntGlob						   = 5;
 }
 
-Enumeration Func1(CapitalLetter CharPar1, CapitalLetter CharPar2) {
+Enumeration Func1(
+	CapitalLetter CharPar1,
+	CapitalLetter CharPar2) {
 	CapitalLetter CharLoc1;
 	CapitalLetter CharLoc2;
 
@@ -648,7 +670,9 @@ Enumeration Func1(CapitalLetter CharPar1, CapitalLetter CharPar2) {
 	}
 }
 
-boolean Func2(String30 StrParI1, String30 StrParI2) {
+boolean Func2(
+	String30 StrParI1,
+	String30 StrParI2) {
 	OneToThirty IntLoc;
 	CapitalLetter CharLoc;
 

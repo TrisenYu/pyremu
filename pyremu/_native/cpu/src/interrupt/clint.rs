@@ -3,24 +3,21 @@ use crate::state::HartState;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, Ordering};
 // ============================================================
-// CLINT inline handlers
+// CLINT 内联处理函数
 // ============================================================
 //
-// Moved from handlers.rs.  These operate on the speedup execution engine
-// ClintCtx (non-concurrent path) and are re-exported by handlers.rs for
-// backward compatibility.
+// 作用于加速执行引擎的 ClintCtx, 即非并发路径, 由 handlers.rs 重新导出。
 
 use crate::handlers::MemAccess;
 
 /// mtimecmp 写入处理
 ///
-/// - ``val == 0``: 禁用 — 清 MTIP, deadline 置 0 (codebase 既有 0=禁用约定,
-///   见 test_trap.py:1641/2736/3050)。
-/// - ``val <= now_mtime`` (已到期): 立即置位 MTIP, deadline 置 0。
-/// - ``val > now_mtime`` (未来): 清 MTIP, deadline = 写入时刻本 hart 指令计数
-///   + 剩余 tick 的指令换算。
+/// - ``val == 0``: 禁用定时器, 清除 MTIP 并把 deadline 置 0。
+/// - ``val <= now_mtime``, 即已到期: 立即置位 MTIP 并把 deadline 置 0。
+/// - ``val > now_mtime``, 清除 MTIP, deadline 取写入时刻本 hart 的
+///   指令计数加上剩余 tick 换算出的指令数。
 ///
-/// 清除仅发生在 mtimecmp 写入 (未来值/0); ``sync_mtip`` 的活跃分支永不清除。
+/// 清除只发生在写入未来值或 0 时, ``sync_mtip`` 的活跃分支不清除。
 pub(crate) fn write_mtimecmp(state: &mut HartState, now_mtime: u64, val: u64, timebase_hz: u64) {
 	if val == 0 {
 		state.mip.fetch_and(!(1 << 7), Ordering::AcqRel);
@@ -34,8 +31,8 @@ pub(crate) fn write_mtimecmp(state: &mut HartState, now_mtime: u64, val: u64, ti
 	}
 }
 
-/// stimecmp 写入处理 — 与 ``write_mtimecmp`` 对称, 仅位号不同
-/// stimecmp 仅由本 hart 自身写入, 故只取 ``&mut HartState``。
+/// stimecmp 写入处理, 与 ``write_mtimecmp`` 对称。
+/// stimecmp 仅由本 hart 写入, 故只取 ``&mut HartState``。
 pub(crate) fn write_stimecmp(state: &mut HartState, now_mtime: u64, val: u64, timebase_hz: u64) {
 	if val == 0 {
 		state.mip.fetch_and(!(1 << 5), Ordering::AcqRel);
@@ -51,11 +48,9 @@ pub(crate) fn write_stimecmp(state: &mut HartState, now_mtime: u64, val: u64, ti
 
 /// 写入 mtimecmp (CLINT MMIO) 后, 为目标 hart 的 MTIP 设定 deadline。
 ///
-/// 目标通常是本 hart (OpenSBI 经 SBI_SET_TIMER 写自己的 mtimecmp), 但也支持
-/// 跨 hart 写入: 经 ``hart_states`` 数组访问目标 HartState (与现有
-/// ``clint_write_msip_concurrent`` 的跨 hart mip 访问同一 idiom — 原始指针 +
-/// 原子/对齐 u64 读写, 良性竞争)。``hart_states`` 未初始化时跳过设定 (MTIP
-/// 退化为共享 mtime 比较, 与旧行为一致)。
+/// 目标通常为本 hart,也支持跨 hart 写入: 经 ``hart_states`` 数组取得目标 HartState,
+/// 以原始指针加原子对齐 u64 读写, 与 clint_write_msip_concurrent 的跨 hart mip 访问相同。
+/// ``hart_states`` 未初始化时跳过设定, MTIP 退化为共享 mtime 比较。
 #[inline]
 pub(crate) fn write_mtimecmp_for_target(clint: &ConcurrentClintCtx, target: usize, val: u64) {
 	let now = unsafe { &*clint.mtime }.load(Ordering::Acquire);
@@ -66,11 +61,9 @@ pub(crate) fn write_mtimecmp_for_target(clint: &ConcurrentClintCtx, target: usiz
 	}
 }
 
-/// 置位 ``mip`` 的一位; 该位已置位时不改变任何值.
+/// 设置 ``mip``; 已置位时不改变任何值。
 ///
-/// 位已置位时 ``fetch_or`` 不改变任何值, 故跳过与执行逐位等价, 而每条指令省下一次
-/// 加锁的读改写. 与 ``sync_msip`` 跳过空的 ``msip_pending`` 槽位、
-/// ``advance_clock_source`` 跳过已达的目标值同一写法.
+/// 位已置位时 ``fetch_or`` 不改变任何值, 故跳过与执行等价
 #[inline]
 fn set_mip_bit(state: &mut HartState, bit: u64) {
 	if state.mip.load(Ordering::Acquire) & bit == 0 {
@@ -78,7 +71,7 @@ fn set_mip_bit(state: &mut HartState, bit: u64) {
 	}
 }
 
-/// 清除 ``mip`` 的一位; 该位已清零时不改变任何值. 理由同 ``set_mip_bit``.
+/// 清除 ``mip`` 的一位; 该位已清零时不改变任何值。
 #[inline]
 fn clear_mip_bit(state: &mut HartState, bit: u64) {
 	if state.mip.load(Ordering::Acquire) & bit != 0 {
@@ -86,10 +79,10 @@ fn clear_mip_bit(state: &mut HartState, bit: u64) {
 	}
 }
 
-/// 按共享 mtime 与比较值 ``cmp`` 的大小关系置位或清除定时器中断位 ``bit``.
+/// 按共享 mtime 与比较值 ``cmp`` 的大小关系设置或清除定时器中断位 ``bit``。
 ///
-/// ``cmp`` 为 0 (比较值未设定) 时目标恒为清除, 该分支不读取共享 mtime — mtime
-/// 由全部 hart 以取最大值写入, 是唯一被并发写入的共享行.
+/// ``cmp`` 为 0, 即比较值未设定时目标恒为清除, 该分支不读取共享 mtime; mtime 由
+/// 全部 hart 以取最大值写入, 是唯一被并发写入的共享行。
 #[inline]
 fn sync_timer_bit_shared(state: &mut HartState, clint: &ConcurrentClintCtx, bit: u64, cmp: u64) {
 	if cmp == 0 {
@@ -109,22 +102,22 @@ pub(crate) fn sync_mtip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 	let sstc_cmp = state.stimecmp;
 
 	// ============================================================
-	//  MTIP (bit 7): CLINT mtimecmp — used by OpenSBI for SBI_SET_TIMER
+	//  MTIP (bit 7): CLINT mtimecmp
 	//  ============================================================
 	if state.waiting != 0 {
-		// 等待中的 hart 用共享 mtime 持续比较 (唤醒语义): 其他 hart 的进度也
-		// 会推进共享 mtime 让本 hart 醒来 — 这正是 WFI 等待定时器应有的行为
-		// (受调试程序的 rdtime = 共享 mtime, 定时器到期即在共享时间中越过 mtimecmp)。
+		// 等待中的 hart 按共享 mtime 比较。其他 hart 的进度推进共享 mtime 后本 hart
+		// 随之醒来; 受调试程序的 rdtime 读取共享 mtime, 定时器到期即在共享时间中越过
+		// mtimecmp。
 		sync_timer_bit_shared(state, clint, 1 << 7, cmp);
 	} else if state.mtip_deadline != 0 && state.total_instrs >= state.mtip_deadline {
-		// 活跃 + 已设定 deadline: 仅在 own 指令计数越过写入时固定的 deadline 时置位,
-		// 与其他活跃 hart 经 fetch_max 异常推高的共享 mtime 数值解耦。不清除 —
-		// 清除仅由 mtimecmp 写入 (write_mtimecmp: 未来值/0) 负责。
+		// 活跃且已设定 deadline: 只有本 hart 的指令计数越过写入时固定的 deadline 才
+		// 置位, 其他 hart 推进共享 mtime 不影响此判定。清除只由 ``write_mtimecmp``
+		// 在写入未来值或 0 时负责。
 		set_mip_bit(state, 1 << 7);
 	} else if state.mtip_deadline == 0 {
-		// 活跃 + 未设定 deadline (deadline==0): 这是写入未走 write_mtimecmp 的
-		// 路径 — Python 步骤模式写入 / 测试直接写字段 / 已到期置位. 退化为共享
-		// 比较 (旧行为). 对已设定 deadline 的定时器永不进入此分支, 因此不重新引入异常增长.
+		// 活跃且 deadline 为 0: 写入未经过 ``write_mtimecmp``, 例如 Python 单步执行
+		// 路径写入、测试直接写字段或写入即到期; 此时按共享 mtime 比较。已设定 deadline
+		// 的定时器不会进入此分支。
 		sync_timer_bit_shared(state, clint, 1 << 7, cmp);
 	}
 
@@ -132,67 +125,36 @@ pub(crate) fn sync_mtip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 	//  STIP (bit 5): SSTC stimecmp
 	//  ============================================================
 	if state.waiting != 0 {
-		// 等待: 共享比较 (唤醒语义), 与上述 MTIP 分支理由相同。
+		// 按共享 mtime 比较, 用于在定时器到期时唤醒本 hart。
 		sync_timer_bit_shared(state, clint, 1 << 5, sstc_cmp);
 	} else if state.stip_deadline != 0 && state.total_instrs >= state.stip_deadline {
-		// 活跃 + 已设定 deadline: 仅在 own 指令计数越过 deadline 时置位 (一次性定时器),
-		// 与共享 mtime 数值被其他 hart 异常推高解耦。不清除 — 清除仅由 stimecmp 写入 (write_stimecmp) 负责。
+		// 活跃且已设定 deadline，只有本 hart 的指令计数越过 deadline 才置位, 清除只由 ``write_stimecmp`` 负责。
 		set_mip_bit(state, 1 << 5);
 	} else if state.stip_deadline == 0 {
-		// 活跃 + 未设定 deadline (deadline==0): Python 步骤路径 / 写入即到期.
-		// 退化为共享比较 (旧行为), 见 MTIP 分支理由.
+		// 活跃且 deadline 为 0: Python 单步执行路径或写入即到期, 此时按共享 mtime 比较。
 		sync_timer_bit_shared(state, clint, 1 << 5, sstc_cmp);
 	}
 }
 
-/// Synchronise ``mip.MSIP`` from the cross-thread ``msip_pending`` atomic
-/// channel and the CLINT level bit.
-///
-/// **All modes**: the ``msip_pending`` channel is always drained and
-/// ``mip.MSIP`` is set from it.  This is the primary IPI signalling path.
-///
-/// **Legacy mode** (``present == 0 || eidelivery == 0``):
-/// Additionally samples the CLINT level bit (level-triggered, matches real
-/// SiFive CLINT / ACLINT MSWI hardware).  ``mip.MSIP`` is never cleared here —
-/// ``deliver_trap`` for MSI (cause 3) clears MSIP when the trap is taken,
-/// and the guest clears the CLINT level bit via ``sbi_ipi_raw_clear`` so
-/// future calls see level=0 and stop re-setting MSIP.
-///
-/// **AIA mode with SMAIA** (``present != 0 && eidelivery != 0``):
-/// The ``msip_pending`` edge is the authoritative IPI signal.  Additionally,
-/// **stale MSIP is cleared** when both the edge channel and the CLINT level
-/// bit are quiesced.  This is necessary because:
-///
-/// 1. ``try_handle_imsic_concurrent`` sets both IMSIC eip AND CLINT MSIP
-///    (``msip_pending`` edge) for IPI identities (1/3).
-/// 2. ``sync_imsic`` maps the IMSIC eip -> MEIP.
-/// 3. MEI (cause 11) has priority over MSI (cause 3), so MEI fires first.
-/// 4. ``deliver_trap`` for MEI clears MEIP but NOT MSIP — MSIP stays set.
-/// 5. ``sbi_trap_aia_irq()`` dispatches via MTOPI: MEI -> MTOPEI claim ->
-///    ``sbi_ipi_process()`` (clears CLINT level).  MTOPI then sees MSIP
-///    still set -> IID=3 -> ``sbi_ipi_process()`` again (``ipi_type`` is 0,
-///    no-op).  MSIP stays set -> **infinite MTOPI loop**.
-///
-/// Clearing stale MSIP when both channels are quiesced breaks the loop.
-/// The clear is gated on ``!had_edge`` (no new edge in this call) AND
-/// CLINT level == 0 (guest cleared it).  A new IPI arriving concurrently
-/// sets the CLINT level bit before ``msip_pending``, so the level check
-/// sees 1 and skips the clear; the edge is consumed next call.
+/// 由跨线程的 ``msip_pending`` 原子通道和 CLINT 电平位同步 ``mip.MSIP``。全部模式下
+/// 都读取 ``msip_pending``, 非零时把读到的位并入 ``mip``; 旧有 PLIC 模式, 即
+/// ``present == 0`` 或 ``eidelivery == 0`` 时, 另采样 CLINT 电平位, 电平为 1 即置位
+/// ``mip.MSIP``, 此处从不清除。AIA 模式下本次未读到边沿、CLINT 电平位为 0 且 IMSIC
+/// 没有挂起的 IPI 时, 清除残留的 ``mip.MSIP``, 否则 MEI 先于 MSI 投递而
+/// ``deliver_trap`` 只清 MEIP, 残留位使 MTOPI 循环反复分发同一 IPI。
 #[inline]
 pub(crate) fn sync_msip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 	let hid = state.mhartid as usize;
 	let in_aia_active = state.imsic_m.present != 0 && state.imsic_m.eidelivery != 0;
 
-	// ----- drain cross-thread MSIP channel (always) -----
+	// 读取跨线程 MSIP 通道
 	let pending_ptr = clint.msip_pending_slot(hid);
 	let mut had_edge = false;
 	let mut _cross = 0;
 	if !pending_ptr.is_null() {
 		let slot = unsafe { &*pending_ptr };
-		// 无事发生时槽位为 0. 先以普通读取取值, 为 0 则跳过写入 —
-		// 交换在槽位为 0 时不改变任何值, 故跳过逐位等价, 而每条指令
-		// 省下一次加锁的读改写. 读取与交换之间到达的置位留到下一次调用读取,
-		// 延迟一条指令.
+		// 无事件时为 0。先普通读取, 为 0 则跳过交换, 交换在槽位为 0 时不改变
+		// 任何值。读取与交换之间到达的设置留到下一次调用读取, 延迟一条指令。
 		if slot.load(Ordering::Acquire) != 0 {
 			_cross = slot.swap(0, Ordering::Acquire);
 			if _cross != 0 {
@@ -202,20 +164,16 @@ pub(crate) fn sync_msip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 		}
 	}
 
-	// ----- AIA mode: edge-triggered + stale-clear -----
+	// AIA 模式: 边沿触发, 清除残留位
 	//
-	// In AIA mode, IMSIC IPIs route through MEIP/SEIP (not MSIP), so
-	// the msip_pending edge channel is never written by IPI operations.
-	// Stale-clear removes any lingering MSIP from legacy operations or
-	// direct CLINT writes.  The IMSIC eip check in condition (b) is a
-	// final fallback — when an IPI is still pending in IMSIC eip, MSIP
-	// is not cleared (harmless since MEIP will fire first at higher
-	// priority).
+	// AIA 模式下 IMSIC 的 IPI 经 MEIP 与 SEIP 投递, 不经过 MSIP, ``msip_pending``
+	// 边沿通道不会被 IPI 操作写入。此处清除旧有操作或直接写 CLINT 留下的
+	// ``mip.MSIP``; IMSIC eip 中仍有挂起的 IPI 时不清除, 此时 MEIP 优先级更高,
+	// 先于 MSIP 投递。
 	if in_aia_active {
 		if had_edge || hid >= clint.num_harts as usize {
 			return;
 		}
-		/* !had_edge || hid < clint.num_hars as usize: */
 		let raw = unsafe { &*clint.msip.add(hid) }.load(Ordering::Acquire);
 		let no_imsic_ipi = state.imsic_m.present == 0 || state.imsic_m.eidelivery == 0 || {
 			let eip0 = state.imsic_m.eip[0].load(Ordering::Acquire);
@@ -227,15 +185,11 @@ pub(crate) fn sync_msip(state: &mut HartState, clint: &ConcurrentClintCtx) {
 		return;
 	}
 
-	// ----- legacy: level-triggered CLINT MSIP -> mip.MSIP -----
+	// 旧有 PLIC 模式: CLINT MSIP 为电平触发, 同步到 mip.MSIP
 	if hid >= clint.num_harts as usize {
 		return;
 	}
-	// Level-triggered (legacy mode): mip.MSIP directly follows the CLINT
-	// level bit.  Read-only — do NOT clear the level bit here.  The
-	// level persists until the guest's M-mode handler writes 0 to CLINT
-	// MSIP (sbi_ipi_raw_clear), which triggers the actual clear via
-	// try_handle_clint_concurrent.
+	// 旧有 PLIC 模式下 mip.MSIP 直接跟随 CLINT 电平位。此处只读, 不清除电平位:
 	let raw = unsafe { &*clint.msip.add(hid) }.load(Ordering::Acquire);
 	let level_set = (raw & 1) != 0;
 
@@ -252,46 +206,39 @@ pub(crate) fn clint_write_msip_concurrent(clint: &ConcurrentClintCtx, target: us
 	}
 	let p = unsafe { &*clint.msip.add(target) };
 	if val & 1 != 0 {
-		// Write-1: set the CLINT level bit AND atomically signal the
-		// target hart via the msip_pending channel.  This avoids the
-		// non-atomic RMW on ``(*states).mip`` which raced with the
-		// target's sync_mtip/sync_msip operations on the same u64.
+		// 设置 CLINT 电平位, 并经 ``msip_pending`` 通道原子通知目标 hart。
+		// 这样避免对 ``(*states).mip`` 做非原子读改写, 进而与目标 hart 的
+		// ``sync_mtip``、``sync_msip`` 形成并发访问。
 		p.fetch_or(1, Ordering::Release);
 		let pending = clint.msip_pending_slot(target);
 		if !pending.is_null() {
 			unsafe { &*pending }.fetch_or(1 << 3, Ordering::Release);
 		}
-		// Unpark the target hart's thread — it may be sleeping in
-		// wfi_spin on park_timeout.  unpark() is safe to call before
-		// park(); the next park() returns immediately.
+		// 唤醒目标 hart 的线程, 它可能正在 ``wfi_spin`` 中经 ``park_timeout`` 睡眠。
+		// 在 ``park()`` 之前调用 ``unpark()`` 是安全的, 下一次 ``park()`` 立即返回。
 		let threads = clint.hart_threads.get();
 		if !threads.is_null() && target < clint.num_harts as usize {
 			unsafe { &*threads.add(target) }.unpark();
 		}
 	} else {
-		// Write-0: clear CLINT level bit.  Also clear mip.MSIP on
-		// the target
+		// 清除 CLINT 电平位, 并清除目标 hart 的 ``mip.MSIP``。
 		//
-		// deliver_trap_mmode clears mip.MSIP for MSI (cause 3) but
-		// NOT for MEI (cause 11).  In AIA mode, MEI fires first
-		// (higher priority) from the same IPI event, so mip.MSIP
-		// stays set.  After sbi_ipi_raw_clear writes 0 here, the
-		// stale MSIP must be cleared or the MTOPI loop in
-		// sbi_trap_aia_irq() never terminates.
+		// ``deliver_trap_mmode`` 只为 MSI (cause 3) 清除 ``mip.MSIP``, 不为 MEI 清除。
+		// AIA 模式下同一 IPI 事件中优先级更高的 MEI 先投递, ``mip.MSIP`` 保持置位;
+		// ``sbi_ipi_raw_clear`` 在此写入 0 之后必须一并清除该位, 否则
+		// ``sbi_trap_aia_irq()`` 的 MTOPI 循环不会终止。
 		p.fetch_and(0xFE, Ordering::Release);
-		// A new MSIP arriving concurrently is safe: the sender set
-		// msip_pending (edge channel), and the next sync_msip call
-		// will drain it and re-assert mip.MSIP.
+		// 发送方已设置 ``msip_pending``, 下一次 ``sync_msip`` 会将其读出并重新置位 ``mip.MSIP``。
 		let hart_states = clint.hart_states.get();
 		if !hart_states.is_null() {
-			// Shared reference — mip is AtomicU64, safe for concurrent access.
+			// 共享引用, mip 为 AtomicU64, 可安全并发访问。
 			let ts = unsafe { &*(hart_states.add(target) as *const HartState) };
 			ts.mip.fetch_and(!(1 << 3), Ordering::AcqRel);
 		}
 	}
 }
 
-/// Try to handle a CLINT MMIO access inline, concurrent-safe version.
+/// 内联处理一次 CLINT MMIO 访问的并发安全版本。
 pub(crate) fn try_handle_clint_concurrent(
 	pa: u64,
 	is_write: bool,
@@ -306,7 +253,7 @@ pub(crate) fn try_handle_clint_concurrent(
 	let offset = pa.wrapping_sub(clint.base);
 
 	if offset < 0x4000 {
-		// MSIP region
+		// MSIP 区域
 		let target = (offset / 4) as usize;
 		if target >= clint.num_harts as usize {
 			return Some(0);
@@ -318,23 +265,23 @@ pub(crate) fn try_handle_clint_concurrent(
 		clint_write_msip_concurrent(clint, target, (write_data & 1) as u8);
 		return Some(0);
 	} else if offset < 0xBFF8 {
-		// MTIMECMP region
+		// MTIMECMP 区域
 		let target = ((offset - 0x4000) / 8) as usize;
 		if target >= clint.num_harts as usize {
 			return Some(0);
 		}
 		if is_write {
 			unsafe { &*clint.mtimecmp.add(target) }.store(write_data, Ordering::Release);
-			// 无操作写入后为目标 hart 的 MTIP 设定 deadline.
+			// 写入后为目标 hart 的 MTIP 设定 deadline。
 			write_mtimecmp_for_target(clint, target, write_data);
 			Some(0)
 		} else {
 			Some(unsafe { &*clint.mtimecmp.add(target) }.load(Ordering::Relaxed))
 		}
 	} else if offset < 0xC000 {
-		// MTIME region
+		// MTIME 区域
 		if is_write {
-			None // rare — fall through to Python
+			None // 应交由 Python 侧处理
 		} else {
 			Some(unsafe { &*clint.mtime }.load(Ordering::Relaxed))
 		}
@@ -350,39 +297,29 @@ pub struct ClintCtx {
 	pub msip: *mut u8,
 	pub states: *mut HartState,
 	pub num_harts: u32,
-	/// mtime 时钟源频率 (Hz) — 0 表示禁用 clock source (单元测试 / 串行路径
-	/// 未提供时). 用于 mtimecmp 写入后换算 MTIP deadline 到指令计数空间.
+	/// mtime 时钟源频率, 单位为 Hz; 为 0 表示未提供时钟源,
+	/// 此时不推进时钟。用于 mtimecmp 写入后把 MTIP deadline 换算到指令计数空间。
 	pub timebase_hz: u64,
-	/// Set when a hart writes MSIP=1 to a *different* hart.  The dispatch
-	/// loop checks this flag and yields the current hart's slice early so
-	/// the target hart can respond to the IPI within the same round.
+	/// 本 hart 向另一个 hart 写 MSIP=1 时置位。分发循环检查该标志并提前让出当前 hart
+	/// 的时间片, 使目标 hart 在同一轮内响应 IPI。
 	pub yield_for_ipi: Cell<bool>,
-	/// Hart ID of the most recent cross-hart MSIP sender; this hart receives
-	/// short slices so the receiver can complete IPI-triggered work (TLB
-	/// flush, sync counter decrement) before the sender's spin-wait resumes.
+	/// 最近一次跨 hart 发送 MSIP 的 hart 标识。该 hart 获得较短的时间片, 使接收方在
+	/// 发送方恢复自旋等待之前完成 IPI 触发的工作, 包括 TLB 刷新与同步计数递减。
 	pub ipi_sender_hart: Cell<u8>,
-	/// Remaining rounds of short slices for *ipi_sender_hart*.  Decremented
-	/// once per round-robin round until zero, then the sender resumes full
-	/// slices.  Reset to a fresh count each time a new MSIP is sent.
+	/// 每次发送新的 MSIP 时重置为初始计数。
 	pub ipi_sender_rounds: Cell<u8>,
-	/// Back-reference to the concurrent MSIP pending array (edge-triggered
-	/// cross-thread notification).  Used by ``try_handle_imsic_serial`` to
-	/// wake the target hart's WFI thread when IMSIC seteipnum is written
-	/// from the compressed-instruction execution path.
+	/// 指向并发 MSIP 待处理数组的引用,
+	/// 在压缩指令路径写入 IMSIC seteipnum 时, 用于唤醒目标 hart。
 	pub msip_pending: Cell<*const std::sync::atomic::AtomicU64>,
-	/// Back-reference to the concurrent hart thread handles for ``unpark()``
-	/// wake-up from WFI park_timeout.  Populated by ``exec_compressed_concurrent``
-	/// when running inside the concurrent speedup execution engine.
+	/// 指向并发 hart 线程句柄的引用, 用于从 WFI 的 ``park_timeout`` 唤醒时调用
+	/// ``unpark()``。由并发加速执行引擎中的 ``exec_compressed_concurrent`` 填充。
 	pub hart_threads: Cell<*const std::thread::Thread>,
-	/// Back-reference to the concurrent per-hart HartState array for
-	/// cross-hart IMSIC eip manipulation.  Populated by
-	/// ``exec_compressed_concurrent`` when running inside the concurrent
-	/// speedup execution engine.
+	/// 指向并发每 hart HartState 数组的引用, 用于跨 hart 修改 IMSIC eip。由并发加速
+	/// 执行引擎中的 ``exec_compressed_concurrent`` 填充。
 	pub hart_states: Cell<*const crate::state::HartState>,
 }
 
-/// Write MSIP for a target hart, updating its MIP and setting the
-/// cross-hart yield flag when the target is a different hart.
+/// 为目标 hart 写 MSIP 并更新其 mip, 在目标为另一个 hart 时设置跨 hart 让出标志。
 #[inline]
 pub(crate) fn clint_write_msip(clint: &ClintCtx, target: usize, current: usize, val: u8) {
 	if target >= clint.num_harts as usize {
@@ -411,7 +348,7 @@ pub(crate) fn clint_write_msip(clint: &ClintCtx, target: usize, current: usize, 
 	}
 }
 
-/// Try to handle a CLINT MMIO access inline inside the speedup execution engine.
+/// 在加速执行引擎中处理 CLINT MMIO 访问。
 pub(crate) fn try_handle_clint(
 	access: &MemAccess,
 	state: &HartState,
@@ -455,7 +392,7 @@ pub(crate) fn try_handle_clint(
 		}
 		if hart_id < clint.num_harts as usize && !clint.states.is_null() {
 			let t = unsafe { &mut *clint.states.add(hart_id) };
-			// 无操作写入后为目标 hart 的 MTIP 设定 deadline.
+			// 写入后为目标 hart 的 MTIP 设定 deadline。
 			write_mtimecmp(t, unsafe { *clint.mtime }, write_data, clint.timebase_hz);
 		}
 		return Some(0);
@@ -472,12 +409,10 @@ mod tests {
 	use crate::state::HartState;
 	use std::sync::atomic::{AtomicU64, AtomicU8};
 
-	/// 每 hart 的 MSIP 待处理槽位以 ``MSIP_PENDING_STRIDE`` 跨步取址, 故
-	/// 相邻 hart 的槽位相距 64 字节.
+	/// 相邻 hart 用于暂存 MSIP 待处理请求的内存区域相距 64 字节。
 	///
-	/// 置位方 ``clint_write_msip_concurrent`` 与读取方 ``sync_msip`` 必须取到
-	/// 同一个槽位. 两处各自计算下标时, 跨步不一致会使 IPI 写到无人读取的位置,
-	/// 表现为目标 hart 永远收不到软件中断.
+	/// 设置方 ``clint_write_msip_concurrent`` 与读取方 ``sync_msip`` 必须取到同一个
+	/// 内存区域; 不一致时 IPI 会写到错误的位置, 导致目标 hart 永远收不到软件中断。
 	#[test]
 	fn msip_pending_slots_are_distinct_and_addressed_consistently() {
 		const NUM_HARTS: usize = 3;
@@ -500,7 +435,7 @@ mod tests {
 			timebase_hz: 0,
 		};
 
-		// 相邻 hart 的槽位相距 64 字节, 且互不相同.
+		// 相距 64 字节且互不相同。
 		let mut seen = Vec::new();
 		for hid in 0..NUM_HARTS {
 			let addr = clint.msip_pending_slot(hid) as usize;
@@ -517,7 +452,7 @@ mod tests {
 			seen.push(addr);
 		}
 
-		// 向 hart 2 发送 IPI, 只有 hart 2 读到该边沿.
+		// 向 hart 2 发送 IPI 后, 只有 hart 2 的 mip.MSIP 应被置位。
 		clint_write_msip_concurrent(&clint, 2, 1);
 		for hid in 0..NUM_HARTS {
 			let mut state: HartState = unsafe { std::mem::zeroed() };
@@ -534,11 +469,9 @@ mod tests {
 
 	#[test]
 	fn sync_msip_sets_mip_on_level_high() {
-		// When CLINT MSIP level=1, sync_msip must set mip.MSIP.
-		// Level-triggered design: the level bit is NOT auto-cleared by
-		// sync_msip — only the M-mode handler's write-0 to CLINT MSIP
-		// clears it (matching real hardware).  The msip_pending atomic
-		// channel provides independent edge-triggered delivery.
+		// CLINT MSIP 电平为 1 时, sync_msip 必须置位 mip.MSIP。该位为电平触发,
+		// sync_msip 不自动清除电平位, 只有 M 模式处理函数向 CLINT MSIP 写 0 才清除,
+		// 与真实硬件一致。msip_pending 原子通道另行提供边沿触发的投递。
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mhartid = 0;
 		state.mie = 1 << 3;
@@ -556,7 +489,7 @@ mod tests {
 			msip_pending: Cell::new(std::ptr::null()),
 			hart_threads: Cell::new(std::ptr::null()),
 			hart_states: Cell::new(std::ptr::null()),
-			timebase_hz: 0, // 单元测试禁用 clock-source 推进
+			timebase_hz: 0, // 此处单元测试项不推进时钟源
 		};
 
 		assert_eq!(msip_byte.load(Ordering::Relaxed) & 1, 1);
@@ -578,12 +511,11 @@ mod tests {
 
 	#[test]
 	fn sync_msip_preserves_mip_when_level_zero() {
-		// mip.MSIP must NOT be cleared by sync_msip when CLINT level=0.
-		// Clearing is the responsibility of deliver_trap_mmode /
-		// deliver_trap_smode (RISC-V spec §3.1.15).  If sync_msip cleared
-		// mip.MSIP here, the WFI wake path would lose the interrupt:
-		//   wfi_sync_and_check -> sync_msip (sees level=0, clears mip.MSIP)
-		//   -> check_and_deliver_interrupt_concurrent -> no trap -> deadlock.
+		// CLINT 电平为 0 时 sync_msip 不得清除 mip.MSIP, 清除由
+		// ``deliver_trap_mmode`` 与 ``deliver_trap_smode`` 负责
+		// 若在此清除, WFI 唤醒路径会丢失该中断: ``wfi_sync_and_check`` 调用
+		// ``sync_msip`` 时读到电平 0 并清除 ``mip.MSIP``, 随后的
+		// ``check_and_deliver_interrupt_concurrent`` 不分发陷态处理逻辑而形成死锁。
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mhartid = 0;
 		state.mip.store(1 << 3, Ordering::Release);
@@ -601,7 +533,7 @@ mod tests {
 			msip_pending: Cell::new(std::ptr::null()),
 			hart_threads: Cell::new(std::ptr::null()),
 			hart_states: Cell::new(std::ptr::null()),
-			timebase_hz: 0, // 单元测试禁用 clock-source 推进
+			timebase_hz: 0, // 单元测试不推进时钟源
 		};
 
 		sync_msip(&mut state, &clint);
@@ -613,17 +545,16 @@ mod tests {
 		);
 	}
 
-	/// Regression: STIP must assert when ``mtime == stimecmp`` (``>=``), matching
-	/// the RISC-V SSTC spec and the MTIP branch.  A strict ``>`` misses the
-	/// deadline when ``wfi_check_all_idle`` fast-forwards mtime exactly onto
-	/// stimecmp, leaving the hart parked with a pending-but-invisible timer.
+	/// ``mtime`` 等于 ``stimecmp`` 时 STIP 置位, 判定用 ``>=``.
+	/// 若改为严格的 ``>``, mtime 被推进到恰好等于 stimecmp 时 STIP 不会置位, 定时发起
+	/// 的定时中断无法唤醒 hart.
 	#[test]
 	fn sync_mtip_sets_stip_at_deadline_boundary() {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mhartid = 0;
 		state.stimecmp = 100;
 
-		let mtime = AtomicU64::new(100); // mtime == stimecmp (精确截止)
+		let mtime = AtomicU64::new(100); // mtime 等于 stimecmp, 恰在截止时刻
 		let mtimecmp = AtomicU64::new(0); // MTIP 必须保持清除
 		let msip = AtomicU8::new(0);
 
@@ -653,17 +584,12 @@ mod tests {
 		);
 	}
 
-	/// 回归: 跨 hart 共享 mtime 数值被其他 hart 异常推高时, 不得提前触发
-	/// 刚重新设置的定时器。
+	/// 共享 mtime 被其他 hart 推进时, 不得提前触发刚重新设置的定时器.
 	///
-	/// 旧行为 (逐指令共享比较 ``cur_mtime >= stimecmp``): hart A 的进度经 fetch_max
-	/// 把共享 mtime 数值异常推高, 越过 hart B 刚写入的未来 stimecmp -> B 的
-	/// sync_mtip 立即置位 STIP -> mret 后立即再 trap 的活锁。新行为:
-	/// write_stimecmp 在写入时刻把 deadline 固定到 B 自己的指令计数空间, 只有
-	/// B 执行到 deadline 才置位。
-	///
-	/// 该测试在旧逻辑下失败 (mtime=5150 >= stimecmp=5100 -> 提前置位),
-	/// 修复后通过 — 锁定回归底线。
+	/// ``write_stimecmp`` 在写入时刻把截止时刻换算到本 hart 的指令计数, 只有本 hart
+	/// 执行到该计数才设置 STIP. 若按逐条指令的共享比较 ``cur_mtime >= stimecmp`` 判定,
+	/// 其它 hart 经 fetch_max 推进的 mtime 越过刚写入的未来 stimecmp 后, 本 hart 的
+	/// ``sync_mtip`` 立即设置 STIP, 导致本 hart 自 mret 返回后立即再次返回中断处理逻辑.
 	#[test]
 	fn stimecmp_deadline_decouples_from_cross_hart_mtime_inflation() {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
@@ -684,13 +610,9 @@ mod tests {
 			msip_pending: Cell::new(std::ptr::null()),
 			hart_threads: Cell::new(std::ptr::null()),
 			hart_states: Cell::new(std::ptr::null()),
-			timebase_hz: 10_000_000, // 10 MHz -> 每指令 0.2 tick (5 条指令/tick)
+			timebase_hz: 10_000_000, // 10 MHz 时，5 条指令一个 tick
 		};
 
-		// 本 hart 写入未来 stimecmp: 距当前 mtime=5000 还有 100 ticks -> 500 条指令.
-		// 与 csr.rs STIMECMP 处理函数一致: 先存 stimecmp 值 (共享比较读取源),
-		// 再经 write_stimecmp 设定截止时刻. 旧逻辑读到 stimecmp=5100 才会在
-		// mtime=5150 时提前置位, 缺少此步会让旧逻辑因 sstc_cmp 为 0 短路而误过断言.
 		state.stimecmp = 5100;
 		write_stimecmp(&mut state, 5000, 5100, 10_000_000);
 		assert_eq!(
@@ -704,8 +626,6 @@ mod tests {
 			"未来值写入必须清 STIP"
 		);
 
-		// 其他 hart 经 fetch_max 把共享 mtime 数值异常推高, 越过 stimecmp=5100 (旧 bug 触发点).
-		// 本 hart 未推进指令 (total_instrs 仍为 1000) — STIP 不得置位.
 		mtime.store(5150, Ordering::Release);
 		sync_mtip(&mut state, &clint);
 		assert_eq!(
@@ -714,7 +634,7 @@ mod tests {
 			"共享 mtime 数值被异常推高不得提前触发刚重新设置的 STIP"
 		);
 
-		// 本 hart 执行到 deadline (再 500 条指令) — 此时才置位.
+		// 本 hart 再执行 500 条指令到达截止时刻, 此时才设置.
 		state.total_instrs = 1500;
 		sync_mtip(&mut state, &clint);
 		assert_eq!(
@@ -724,8 +644,8 @@ mod tests {
 		);
 	}
 
-	/// 回归: 跨 hart mtimecmp 写入 (hart A 写 hart B) 同样按目标 B 的 own
-	/// 指令计数设定 deadline, 不因共享 mtime 已被 A 推进越过而提前触发。
+	/// hart A 跨 hart 写 hart B 的 mtimecmp 时, 同样按目标
+	/// hart B 的指令计数设定截止时刻, 不因共享 mtime 被 A 推进而提前触发.
 	#[test]
 	fn mtimecmp_cross_hart_write_arms_target_deadline_not_shared_compare() {
 		let mut b: HartState = unsafe { std::mem::zeroed() };
@@ -737,8 +657,8 @@ mod tests {
 		let mut states = [a, b];
 
 		let mtime = AtomicU64::new(7000);
-		// 两个成员变量: sync_mtip 按 hart_id 索引 (hart B 读取下标 1),
-		// 与真实 CLINT mtimecmp 数组 (每 hart 一项) 一致.
+		// mtimecmp 按 hart 标识索引: sync_mtip 为 hart B 读取下标 1 的一项, 与真实
+		// CLINT mtimecmp 数组每个 hart 一项的布局一致.
 		let mtimecmp = [AtomicU64::new(0), AtomicU64::new(0)];
 		let msip = AtomicU8::new(0);
 
@@ -754,9 +674,9 @@ mod tests {
 			timebase_hz: 10_000_000,
 		};
 
-		// hart A 写 hart B 的 mtimecmp=7200: 200 ticks 前 -> 1000 条指令.
-		// 与真实 CLINT MMIO 写路径一致: 先存 mtimecmp 值 (共享比较读取源),
-		// 再设定截止时刻. 旧逻辑读到 mtimecmp=7200 才会在 mtime=7300 时提前置位.
+		// hart A 写 hart B 的 mtimecmp=7200: 距当前共享 mtime=7000 还有 200 ticks, 换算为
+		// 1000 条指令. 与真实 CLINT MMIO 写路径一致: 先存 mtimecmp 值, 该值是共享比较的
+		// 读取源, 再设定截止时刻. 旧实现读到 mtimecmp=7200 后, 在 mtime=7300 时会提前置位.
 		unsafe { &*clint.mtimecmp.add(1) }.store(7200, Ordering::Release);
 		write_mtimecmp_for_target(&clint, 1, 7200);
 		let b = &mut states[1];
@@ -771,7 +691,8 @@ mod tests {
 			"未来值写入必须清 MTIP"
 		);
 
-		// A 经 fetch_max 把共享 mtime 数值异常推高, 越过 mtimecmp=7200 (旧 bug 触发点) — B 未推进指令.
+		// A 经 fetch_max 把共享 mtime 推进到 7300, 越过 mtimecmp=7200, 即旧实现的触发
+		// 条件; B 未推进指令.
 		mtime.store(7300, Ordering::Release);
 		sync_mtip(b, &clint);
 		assert_eq!(
@@ -780,7 +701,7 @@ mod tests {
 			"共享 mtime 数值被异常推高不得提前触发跨 hart 刚重新设置的 MTIP"
 		);
 
-		// B 执行到 deadline (再 1000 条指令) — 此时才置位.
+		// B 再执行 1000 条指令到达截止时刻, 此时才置位.
 		b.total_instrs = 3000;
 		sync_mtip(b, &clint);
 		assert_eq!(
@@ -807,15 +728,15 @@ mod tests {
 		(clint, msip)
 	}
 
-	/// 回归: MTIP/STIP 已置位后, 比较值变为不成立时必须在同一次 sync_mtip 中清除.
+	/// MTIP 与 STIP 已置位后, 比较值变为不成立时必须在同一次 ``sync_mtip`` 中清除.
 	///
-	/// sync_mtip 的置位与清除均先读取该位, 位已处于目标状态时跳过加锁的读改写.
-	/// 该跳过只允许跳过"不改变任何值"的读改写: 若跳过落到一次本应生效的清除上,
-	/// MTIP/STIP 便滞留置位, 受调试程序自定时器 handler 返回后立即重入, 形成
-	/// 定时器中断循环 (每条指令一次, 无进展).
+	/// ``sync_mtip`` 的置位与清除均先读取该位, 位已处于目标状态时跳过加锁的读改写.
+	/// 该跳过只用于不改变任何值的读改写: 若一次本应生效的清除被跳过, MTIP 与 STIP
+	/// 保持置位, 受调试程序从定时器处理函数返回后立即再次陷入, 每条指令陷入一次而
+	/// 没有进展.
 	///
-	/// 覆盖两条清除路径: 比较值已设定但未到期, 以及比较值未设定 (0) 时该分支
-	/// 不读取共享 mtime 而直接清除.
+	/// 覆盖两条清除路径: 比较值已设定但未到期; 比较值未设定, 即取值为 0, 该分支不
+	/// 读取共享 mtime 而直接清除.
 	#[test]
 	fn sync_mtip_clears_already_set_timer_bits_when_condition_clears() {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
@@ -826,7 +747,7 @@ mod tests {
 		let mtimecmp = AtomicU64::new(200);
 		let (clint, _msip) = clint_with(&mtime, &mtimecmp);
 
-		// 比较值已设定 (200) 且共享 mtime (100) 未越过: 两位必须清除.
+		// 比较值已设定为 200, 共享 mtime 为 100 未越过比较值: 两位必须清除.
 		state.stimecmp = 200;
 		state.waiting = 0;
 		sync_mtip(&mut state, &clint);
@@ -845,7 +766,7 @@ mod tests {
 			"越过比较值时必须置位 MTIP/STIP"
 		);
 
-		// 比较值未设定 (0): 两位必须清除, 且该路径不读取共享 mtime.
+		// 比较值未设定, 即取值为 0: 两位必须清除, 且该路径不读取共享 mtime.
 		state.stimecmp = 0;
 		mtimecmp.store(0, Ordering::Release);
 		sync_mtip(&mut state, &clint);

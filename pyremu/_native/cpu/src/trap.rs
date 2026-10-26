@@ -1,20 +1,19 @@
-//! Trap delivery with delegation support execution engine.
+//! 含支持中断委派判定的陷态处理逻辑。
 //!
-//! Implements medeleg / mideleg-based delegation to S-mode, matching the
-//! Python ``deliver_trap`` in ``trap_handler.py``.
+//! 依据 ``medeleg`` 与 ``mideleg`` 把陷态委派到 S 模式
 
-use crate::concurrent::{ ConcurrentClintCtx, ModuleState };
+use crate::concurrent::{ConcurrentClintCtx, ModuleState};
+use crate::ffi::FfiDevCtx;
 use crate::hart_sched::read_gpr;
 use crate::interrupt::clint::write_mtimecmp;
 use crate::interrupt::imsic_clear_ipi_on_trap;
-use crate::ffi::FfiDevCtx;
-use crate::state::{ riscv_mode, HartState };
+use crate::state::{riscv_mode, HartState};
 use std::sync::atomic::Ordering;
 // ============================================================
-//  Trap cause codes (mcause / scause compatible)
+//  陷态原因码, 与 mcause、scause 的编码兼容
 // ============================================================
 
-/// RISC-V exception codes (``mcause[62:0]`` when bit 63 = 0).
+/// RISC-V 异常的原因码, 由 mcause 第 63 位的取值确定是异常还是中断。
 #[allow(dead_code)]
 pub mod exc_code {
 	pub const INSTR_ACCESS_FAULT: u64 = 1;
@@ -32,14 +31,18 @@ pub mod exc_code {
 	pub const ST_PAGE_FAULT: u64 = 15;
 }
 
-/// Build an ``mcause``-compatible value: bit 63 = interrupt flag, lower bits = code.
+/// 构造与 ``mcause`` 兼容的值: bit 63 为中断标志, 低位为原因码。
 #[inline]
 pub fn mcause_val(code: u64, is_interrupt: bool) -> u64 {
-	if is_interrupt { code | (1u64 << 63) } else { code }
+	if is_interrupt {
+		code | (1u64 << 63)
+	} else {
+		code
+	}
 }
 
 // ============================================================
-//  mstatus bit constants
+//  mstatus 位定义的相关常量
 // ============================================================
 
 const MSTATUS_SIE: u64 = 1 << 1;
@@ -49,7 +52,7 @@ const MSTATUS_MPIE: u64 = 1 << 7;
 const MSTATUS_SPP: u64 = 1 << 8;
 const MSTATUS_MPP: u64 = 0b11 << 11;
 
-/// Map privilege mode to MPP field encoding.
+/// 把特权模式映射为 MPP 的编码。
 #[inline]
 fn mode_to_mpp(mode: u8) -> u64 {
 	match mode {
@@ -60,7 +63,7 @@ fn mode_to_mpp(mode: u8) -> u64 {
 	}
 }
 
-/// Map privilege mode to SPP field encoding (U=0, S=1).
+/// 把特权模式映射为 SPP 的编码, U 模式为 0, S 模式为 1。
 #[inline]
 fn mode_to_spp(mode: u8) -> u64 {
 	match mode {
@@ -71,21 +74,21 @@ fn mode_to_spp(mode: u8) -> u64 {
 }
 
 // ============================================================
-//  Trap delivery — delegation-aware entry point
+// 含委派判定的入口
 // ============================================================
 
-/// Deliver a trap with ``medeleg`` / ``mideleg`` delegation support.
+/// 派发一次陷态, 依据 ``medeleg`` 与 ``mideleg`` 判定是否委派。
 ///
-/// Checks the delegation registers and routes the trap to S-mode when
-/// the exception/interrupt is delegated and the hart is not already in
-/// M-mode.  This matches the Python ``deliver_trap`` in ``trap_handler.py``.
+/// 当异常或中断已被委派且 hart 不处于 M 模式时, 把陷态交给 S 模式;
+/// 其余情形交给 M 模式。行为与 Python 侧 ``trap_handler.py`` 的
+/// ``deliver_trap`` 一致。
 ///
-/// Returns ``0`` (caller should NOT advance PC — PC already redirected).
+/// 返回 ``0``, 调用方不得推进 PC, 因为 PC 已改为陷态入口地址。
 pub fn deliver_trap(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	let is_interrupt = (code >> 63) != 0;
 	let exc_code = code & 0x7fff_ffff_ffff_ffff;
 
-	// M-mode traps are never delegated.
+	// M 模式发生的陷态永不派发到其他模式处理。
 	let delegate = if state.mode != riscv_mode::M {
 		if is_interrupt {
 			(state.mideleg & (1 << exc_code)) != 0
@@ -104,31 +107,31 @@ pub fn deliver_trap(state: &mut HartState, code: u64, tval: u64) -> u64 {
 }
 
 // ============================================================
-//  S-mode trap delivery
+//  S 模式陷态派发
 // ============================================================
 
-/// Deliver a trap to S-mode, saving PC / CSRs and redirecting to ``stvec``.
+/// 把陷态分发到 S 模式, 保存 PC 与相关 CSR, 并跳转到 ``stvec``。
 ///
-/// Called by ``deliver_trap`` when delegation conditions are met.
-/// Matches the Python ``_trap_deliver_smode`` in ``trap_handler.py``.
+/// 由 ``deliver_trap`` 在满足委派条件时调用, 行为与 Python 侧
+/// ``trap_handler.py`` 的 ``_trap_deliver_smode`` 一致。
 pub fn deliver_trap_smode(state: &mut HartState, code: u64, tval: u64) -> u64 {
-	// Clear LR/SC reservation on any trap
+	// 任何陷态都清除 LR/SC 的保留地址。
 	state.reservation_valid = 0;
 	state.reservation_addr = 0;
 
-	// Wake from WFI
+	// 从 WFI 等待状态唤醒。
 	state.waiting = 0;
 
-	// Save PC -> sepc
+	// 把 PC 保存到 sepc。
 	state.sepc = state.pc;
 
-	// Save cause
+	// 保存原因码。
 	state.scause = code;
 
-	// Save tval
+	// 保存 tval。
 	state.stval = tval;
 
-	// mstatus: SPIE <- SIE, SIE <- 0, SPP <- current mode
+	// mstatus: SPIE 取原 SIE, SIE 清 0, SPP 取当前模式。
 	let sie_present = (state.mstatus & MSTATUS_SIE) != 0;
 	let spp_bits = mode_to_spp(state.mode) << 8;
 	if sie_present {
@@ -139,10 +142,10 @@ pub fn deliver_trap_smode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	state.mstatus &= !MSTATUS_SIE;
 	state.mstatus = (state.mstatus & !MSTATUS_SPP) | spp_bits;
 
-	// Switch to S-mode
+	// 切换到 S 模式。
 	state.mode = riscv_mode::S;
 
-	// Jump to stvec
+	// 跳转到 stvec。
 	let stvec = state.stvec;
 	let tvec_mode = stvec & 0x3;
 	let tvec_base = stvec & !0x3;
@@ -150,106 +153,90 @@ pub fn deliver_trap_smode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	let is_interrupt = (code >> 63) != 0;
 
 	if tvec_mode == 0 || !is_interrupt {
-		// Direct mode or exception: jump to base
+		// direct 模式或异常: 跳转到基址。
 		state.pc = tvec_base;
 	} else {
-		// Vectored mode + interrupt: base + 4 * exc_code
+		// vectored 模式且为中断: 跳转到基址加 4 乘原因码。
 		state.pc = tvec_base + 4 * exc_code;
 	}
 
-	// MSIP/SSIP auto-clear: always, including AIA mode.
-	// sbi_ipi_raw_clear(false) is a no-op in AIA mode, so clearing here
-	// is the only mechanism to prevent infinite re-delivery.
-	// Also clear IMSIC eip to prevent stale IID on MTOPI/STOPI read.
+	// MSIP 与 SSIP 的自动清除按模式区分。
+	// AIA 模式下 sbi_ipi_raw_clear(false) 不产生效果, eip 的清除推迟到
+	// MTOPEI 或 STOPEI 得到响应, 使处理程序读到中断标识。
+	// 传统模式下清除对应的 mip 位与 IMSIC 的 eip, 依据 RISC-V 规范 §3.1.15。
 	if !is_interrupt {
 		return 0;
 	}
-	// In AIA mode, IPIs route through MEIP/SEIP (cause 11/9), not
-	// MSIP/SSIP (cause 3/1).  When they DO arrive as cause 3/1
-	// (legacy path), defer eip clearing to MTOPEI/STOPEI claim so
-	// the handler sees the interrupt identity.  In legacy mode,
-	// clear MSIP per RISC-V spec §3.1.15.
+	// AIA 模式下 IPI 经 MEIP 或 SEIP 投递, 原因码为 11 或 9, 不经 MSIP 或 SSIP
+	// 的原因码 3 或 1。中断以原因码 3 或 1 到达时按传统模式处理。
 	let in_aia_s = state.imsic_s.present != 0 && state.imsic_s.eidelivery != 0;
 	if exc_code == 3 {
 		if in_aia_s {
-			// AIA mode: defer MSIP/eip clearing
+			// AIA 模式推迟 MSIP 与 eip 的清除。
 		} else {
 			state.mip.fetch_and(!(1u64 << 3), Ordering::AcqRel); // MSIP
 			imsic_clear_ipi_on_trap(state, 3);
 		}
 	} else if exc_code == 1 {
 		if in_aia_s {
-			// AIA mode: defer SSIP/eip clearing
+			// AIA 模式推迟 SSIP 与 eip 的清除。
 		} else {
 			state.mip.fetch_and(!(1u64 << 1), Ordering::AcqRel); // SSIP
 			imsic_clear_ipi_on_trap(state, 1);
 		}
 	}
-	0 // advance = 0 — PC was redirected
+	0
 }
 
 // ============================================================
-//  M-mode trap delivery (non-delegated fallback)
+//  M 模式陷态分发, 未经委派时的去向
 // ============================================================
 
-/// Deliver a trap to M-mode, saving PC / CSRs and redirecting to ``mtvec``.
+/// 把陷态分发给 M 模式, 保存 PC 与相关 CSR, 并跳转到 ``mtvec``。
 ///
-/// Called by ``deliver_trap`` when the trap is not delegated or the hart is
-/// already in M-mode.  Matches the Python ``_trap_deliver_mmode``.
+/// 由 ``deliver_trap`` 在陷态未被委派或 hart 已处于 M 模式时调用,
+/// 行为与 Python 侧 ``trap_handler.py`` 的 ``_trap_deliver_mmode`` 一致。
 pub fn deliver_trap_mmode(state: &mut HartState, code: u64, tval: u64) -> u64 {
-	// Clear LR/SC reservation on any trap
+	// 任何陷态都清除 LR/SC 的保留地址。
 	state.reservation_valid = 0;
 	state.reservation_addr = 0;
 
-	// RISC-V spec §3.1.15: non-delegated machine-level interrupts are
-	// auto-cleared by hardware on trap entry.  This prevents the
-	// interrupt from re-firing immediately after MRET when the CLINT
-	// MSIP register is still asserted (level-triggered source).
-	//
-	// Always clear MSIP, including in AIA mode.  The previous AIA-mode
-	// exception assumed that sbi_ipi_raw_clear() -> write 0 to CLINT MSIP
-	// would clear it, but sbi_ipi_raw_clear(false) is a no-op in AIA mode
-	// (imsic_ipi_device has no ipi_clear callback).  OpenSBI does NOT use
-	// the MTOPI dispatch loop for MSIP (cause 3) either — it directly
-	// calls sbi_ipi_process().  Without clearing here, MSIP stays set
-	// forever -> infinite re-delivery loop on every instruction boundary.
+	// RISC-V 规范 §3.1.15 规定未委派的机器级中断在进入陷态时由硬件自动清除,
+	// 否则 CLINT 的 MSIP 保持置位期间, MRET 之后中断立即再次触发。
+	// AIA 模式下 MSIP 与 eip 的清除推迟到 compute_mtopi 或 MTOPEI 得到响应,
+	// 见下面的分支说明。
 	let is_interrupt = (code >> 63) != 0;
 	let exc_code = code & 0x7fff_ffff_ffff_ffffu64;
 
-	// In AIA mode (eidelivery==1), OpenSBI dispatches via MTOPI
-	// (sbi_trap_aia_irq) which reads compute_mtopi -> clears MSIP there.
-	// If we clear MSIP and IMSIC eip here, MTOPI sees nothing -> IPI is
-	// lost -> RCU stall and SMP boot timeout.
-	//
-	// In legacy mode (eidelivery==0), OpenSBI dispatches via mcause and
-	// clears the CLINT level bit via sbi_ipi_raw_clear.  MSIP must be
-	// cleared here for the same reason as the RISC-V spec §3.1.15.
+	// AIA 模式下 eidelivery 为 1, OpenSBI 经 MTOPI 分派, 在 compute_mtopi 中清除
+	// MSIP。若在此处清除 MSIP 与 IMSIC 的 eip, MTOPI 读不到中断标识, IPI 丢失,
+	// 引起 RCU 停滞与多 hart 启动超时。
+	// 传统模式下 eidelivery 为 0, OpenSBI 按 mcause 分派, 并在此处按规范 §3.1.15 清除 MSIP。
 	let in_aia = state.imsic_m.present != 0 && state.imsic_m.eidelivery != 0;
 	if is_interrupt && exc_code == 3 {
 		if in_aia {
-			// AIA mode: defer MSIP/eip clearing to compute_mtopi /
-			// MTOPEI claim.  This ensures sbi_trap_aia_irq sees the
-			// interrupt identity via MTOPI and dispatches correctly.
+			// AIA 模式推迟 MSIP 与 eip 的清除, 使 sbi_trap_aia_irq 经 MTOPI
+			// 读到中断标识后正确分派。
 		} else {
-			// Legacy mode: MSIP auto-clear (RISC-V spec §3.1.15).
+			// 传统模式按 RISC-V 规范 §3.1.15 自动清除 MSIP。
 			state.mip.fetch_and(!(1u64 << 3), Ordering::AcqRel);
 			imsic_clear_ipi_on_trap(state, 3);
 		}
 	}
 
-	// Wake from WFI
+	// 从 WFI 等待状态唤醒。
 	state.waiting = 0;
 
-	// Save PC -> mepc
+	// 把 PC 保存到 mepc。
 	state.mepc = state.pc;
 
-	// Save cause
+	// 保存原因码。
 	state.mcause = code;
 
-	// Save tval
+	// 保存 tval。
 	state.mtval = tval;
 
-	// mstatus: MPIE <- MIE, MIE <- 0, MPP <- current mode
+	// mstatus: MPIE 取原 MIE, MIE 清 0, MPP 取当前模式。
 	let mie_present = (state.mstatus & MSTATUS_MIE) != 0;
 	let mpp_bits = mode_to_mpp(state.mode) << 11;
 	if mie_present {
@@ -260,18 +247,15 @@ pub fn deliver_trap_mmode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	state.mstatus &= !MSTATUS_MIE;
 	state.mstatus = (state.mstatus & !MSTATUS_MPP) | mpp_bits;
 
-	// RISC-V spec: MPRV is cleared on trap entry to M-mode so the
-	// handler can safely access its own stack/data without going
-	// through the MMU translation of the previous privilege mode.
-	// Without this, nested interrupts during OpenSBI's MPRV=1
-	// window (sbi_get_insn) corrupt M-mode stack state because
-	// loads/stores use S-mode page tables for M-mode stack VAs.
-	state.mstatus &= !(1u64 << 17); // clear MPRV
+	// RISC-V 规范规定进入 M 模式陷态时清除 MPRV, 使处理程序访问自身的栈与
+	// 数据时不经过上一特权模式的 MMU 翻译。MPRV 为 1 期间发生嵌套中断时,
+	// 若不清除该位, M 模式的栈访问会使用 S 模式页表, 破坏 M 模式的栈状态。
+	state.mstatus &= !(1u64 << 17); // 清除 MPRV
 
-	// Switch to M-mode
+	// 切换到 M 模式。
 	state.mode = riscv_mode::M;
 
-	// Jump to mtvec
+	// 跳转到 mtvec。
 	let mtvec = state.mtvec;
 	let tvec_mode = mtvec & 0x3;
 	let tvec_base = mtvec & !0x3;
@@ -279,25 +263,24 @@ pub fn deliver_trap_mmode(state: &mut HartState, code: u64, tval: u64) -> u64 {
 	let is_interrupt = (code >> 63) != 0;
 
 	if tvec_mode == 0 || !is_interrupt {
-		// Direct mode or exception: jump to base
+		// direct 模式或异常: 跳转到基址。
 		state.pc = tvec_base;
 	} else {
-		// Vectored mode + interrupt: base + 4 * exc_code
+		// vectored 模式且为中断: 跳转到基址加 4 乘原因码。
 		state.pc = tvec_base + 4 * exc_code;
 	}
 
-	0 // advance = 0 — PC was redirected
+	0 // 推进量为 0, PC 已被改写。
 }
 
-/// Convenience: deliver IllInstr trap for an invalid encoding.
-/// Uses ``deliver_trap`` (delegation-aware).
+/// 为非法编码产生 IllInstr 陷态, 使用 ``deliver_trap`` 做委派判定。
 #[inline]
 pub fn deliver_illegal_instruction(state: &mut HartState, tval: u64) -> u64 {
 	deliver_trap(state, mcause_val(exc_code::ILL_INSTR, false), tval)
 }
 
 // ============================================================
-//  Privileged instructions — extracted from concurrent.rs
+//  特权指令的处理函数
 // ============================================================
 
 pub(crate) fn priv_ecall_concurrent(
@@ -305,16 +288,13 @@ pub(crate) fn priv_ecall_concurrent(
 	_instr: u32,
 	clint: &ConcurrentClintCtx,
 	_module: &ModuleState,
-	dev: &dyn FfiDevCtx
+	dev: &dyn FfiDevCtx,
 ) -> u64 {
 	// SBI 是 S 模式到 M 模式的接口, 只有 S 模式发起的 ecall 才可能命中下面的
-	// 快速路径. U 模式发起的 ecall 按 RISC-V 约定一律以 ECALL_UMODE 投递给
-	// S 模式内核, 不得被按 SBI 约定匹配的快速路径认领.
-	//
-	// 缺少此判据时, 用户程序的退出序列 (li a0,0 / li a7,1 / ecall) 与 SBI 传统
-	// putchar 的扩展号 0x01 和功能号 0 完全一致; 其 a7 = 1、a6 = 0 恒成立
-	// (装载器只初始化 sp, 程序自身不写 x16), 于是该 ecall 被串口快速路径认领,
-	// a0 被当作字符写出且不投递任何陷态, 程序越过退出 ecall 继续执行.
+	// 快速路径: U 模式的 ecall 一律以 ECALL_UMODE 分发给 S 模式内核.
+	// U 模式的退出序列 li a0,0、li a7,1、ecall 与 SBI 传统 putchar 的扩展号与
+	// 功能号相同, 缺少模式判据时会被串口快速路径得到响应, a0 被当作字符写出且
+	// 不分发陷态, 程序越过退出 ecall 继续执行。
 	if state.mode != riscv_mode::S {
 		let ecall_cause = match state.mode {
 			riscv_mode::U => mcause_val(exc_code::ECALL_UMODE, false),
@@ -327,28 +307,25 @@ pub(crate) fn priv_ecall_concurrent(
 	let a7 = read_gpr(state, 17);
 	let a6 = read_gpr(state, 16);
 
-	// 设备快速路径 (如 UART sbi_putchar) — 直接内联处理, 避免 MMIO batch 退出.
-	// 每个字符一次 batch 退出 (~1-5 ms marshal/unmarshal) 是飞地输出密集时
-	// 数百倍减速的根因之一. 新设备只需实现 FfiDevCtx trait, 无需修改此处分发逻辑.
+	// 设备快速路径, 如 UART 的 sbi_putchar, 在当前调用内直接完成, 不退出
+	// 本轮加速执行。每输出一个字符退出一次, 每次退出要在 Python 与动态库
+	// 之间复制 hart 状态, 约需 1 至 5 毫秒, 是飞地输出密集时吞吐大幅下降的
+	// 原因之一。新设备只需实现 FfiDevCtx trait, 无需修改此处的分派逻辑。
 	if let Some(advance) = dev.try_ecall(state, a7, a6) {
 		return advance;
 	}
 
 	if a7 == 0x54494d45 && a6 == 0 {
-		// SBI_TIME set_timer — programs the M-mode mtimecmp comparator
-		// so that MTIP fires at the requested absolute time.  The S-mode
-		// stimecmp (SSTC) is an INDEPENDENT device; do NOT overwrite it
-		// here — the kernel manages stimecmp directly via the CSR when
-		// SSTC is advertised in the ISA string.
+		// SBI_TIME 的 set_timer: 写入 M 模式的 mtimecmp, 使 MTIP 在请求时触发。
 		let stime_val = read_gpr(state, 10);
 		let hid = state.mhartid as usize;
 		if hid < (clint.num_harts as usize) {
 			(unsafe { &*clint.mtimecmp.add(hid) }).store(stime_val, Ordering::Release);
-			// 与 CLINT MMIO 写路径 (write_mtimecmp_for_target) 对齐: 设定一次性
-			// mtip_deadline。否则 mtip_deadline 保持 0, sync_mtip 落入共享 mtime
-			// 比较分支, 被其他活跃 hart 经 fetch_max 推高的共享 mtime 过早触发 ->
-			// mret 后立即再次 trap 的活锁 (飞地走 sbi_set_timer, 而非 SSTC stimecmp,
-			// 是唯一命中此坏路径的调用方)。
+			// 与 CLINT 的 MMIO 写路径 write_mtimecmp_for_target 一致, 设定一次性的
+			// mtip_deadline。否则 mtip_deadline 保持 0, sync_mtip 落入共享 mtime 的
+			// 比较分支, 其他活跃 hart 经 fetch_max 推高的共享 mtime 使 MTIP 提前置位,
+			// MRET 后立即再次进入陷态而无法推进。飞地经 sbi_set_timer 而非 SSTC 的
+			// stimecmp 设定定时器, 是唯一命中该分支的调用方。
 			let now = (unsafe { &*clint.mtime }).load(Ordering::Acquire);
 			write_mtimecmp(state, now, stime_val, clint.timebase_hz);
 		}
@@ -356,32 +333,18 @@ pub(crate) fn priv_ecall_concurrent(
 		return 4;
 	}
 
-	// NOTE: there is intentionally NO fast path for SBI_IPI (a7=0x735049).
-	// Writing only CLINT MSIP is insufficient — the firmware's
-	// ``sbi_ipi_send_many()`` also stores the IPI event type
-	// (``ipi_smode_event``) in the target hart's ``ipi_data->ipi_type``
-	// so that ``sbi_ipi_process()`` can dispatch to
-	// ``sbi_ipi_process_smode()`` which sets SSIP.  Without that step
-	// Linux's S-mode TLB-shootdown handler never runs -> deadlock.
-	//
-	// Instead we deliver the ECALL trap inline; the M-mode handler
-	// (running within the same acceleration) calls ``sbi_ipi_send_many()``
-	// which sets ``ipi_type`` on the target *and* writes MSIP via
-	// inline CLINT MMIO.  The target hart's thread sees the atomic
-	// MSIP store and processes the IPI, all within one acceleration.
+	// 改为生成 ECALL 陷态, 由 M 模式处理程序设置 S 模式下的跨核请求同步 TLB。
 
-	// Generic ECALL — deliver trap inline (stay in acceleration).
-	// 至此 state.mode 必为 S: 非 S 模式已在函数开头投递陷态并返回.
+	// 其余 ECALL 一律引发处理器陷态, 在本轮加速执行内继续运行。
+	// 至此 state.mode 必为 S: 非 S 模式已在函数开头引发陷态并在得到处理后返回。
 	deliver_trap(state, mcause_val(exc_code::ECALL_SMODE, false), 0);
-	// deliver_trap sets PC -> mtvec/stvec and mode -> M/S.
-	// Return 0 so the dispatch loop continues execution from the
-	// trap handler entry point, all within the same acceleration.
+	// deliver_trap 已把 PC 改为 mtvec 或 stvec 的入口, 并把模式改为 M 或 S。
+	// 返回 0 使陷态处理重复执行而不退出当前处于链接库下的加速执行。
 	0
 }
 
 pub(crate) fn priv_mret_concurrent(state: &mut HartState, instr: u32) -> u64 {
-	// MRET is only legal in M-mode.  Matches Python ``trap_mret``
-	// lines 341-342 in trap_handler.py.
+	// MRET 只在 M 模式下合法
 	if state.mode != riscv_mode::M {
 		deliver_illegal_instruction(state, instr as u64);
 		return 0;
@@ -408,7 +371,7 @@ pub(crate) fn priv_mret_concurrent(state: &mut HartState, instr: u32) -> u64 {
 pub(crate) fn priv_sret_concurrent(
 	state: &mut HartState,
 	instr: u32,
-	_ctx: &crate::translate::WalkCtx
+	_ctx: &crate::translate::WalkCtx,
 ) -> u64 {
 	if state.mode < riscv_mode::S {
 		deliver_illegal_instruction(state, instr as u64);
@@ -416,7 +379,11 @@ pub(crate) fn priv_sret_concurrent(
 	}
 	let spp = (state.mstatus >> 8) & 1;
 	let spie = (state.mstatus >> 5) & 1;
-	state.mode = if spp == 0 { riscv_mode::U } else { riscv_mode::S };
+	state.mode = if spp == 0 {
+		riscv_mode::U
+	} else {
+		riscv_mode::S
+	};
 	state.mstatus &= !(1 << 1);
 	if spie != 0 {
 		state.mstatus |= 1 << 1;
@@ -451,7 +418,7 @@ mod tests {
 	use super::*;
 	use crate::ffi::FfiUartCtx;
 	use std::cell::Cell;
-	use std::sync::atomic::{ AtomicU64, AtomicU8 };
+	use std::sync::atomic::{AtomicU64, AtomicU8};
 
 	fn default_state() -> HartState {
 		let mut s: HartState = unsafe { std::mem::zeroed() };
@@ -466,7 +433,7 @@ mod tests {
 	fn single_hart_clint(
 		mtime: &AtomicU64,
 		mtimecmp: &AtomicU64,
-		msip: &AtomicU8
+		msip: &AtomicU8,
 	) -> ConcurrentClintCtx {
 		ConcurrentClintCtx {
 			base: 0x2000000,
@@ -481,8 +448,8 @@ mod tests {
 		}
 	}
 
-	/// 构造一个发送缓冲区可用的串口上下文.
-	/// ``tx_wr`` 指向调用方的局部变量, 供调用后读取写指针.
+	/// 构造一个发送缓冲区可用的串口上下文。
+	/// ``tx_wr`` 指向调用方的局部变量, 供调用后读取写指针。
 	fn uart_ctx_with_tx_buffer(tx_buf: *mut u8, tx_wr: *mut u32) -> FfiUartCtx {
 		FfiUartCtx {
 			base: 0x1000_0000,
@@ -499,15 +466,19 @@ mod tests {
 		}
 	}
 
-	// ---- delegation tests ----
+	// ---- 委派判定测试用例 ----
 
 	#[test]
 	fn trap_delegates_to_smode_when_medeleg_set() {
 		let mut s = default_state();
 		s.mode = riscv_mode::S;
-		s.medeleg = 1 << exc_code::ILL_INSTR; // delegate ill-instr
+		s.medeleg = 1 << exc_code::ILL_INSTR; // 委派 IllInstr
 		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0xdead);
-		assert_eq!(s.mode, riscv_mode::S, "should stay in S-mode when delegated");
+		assert_eq!(
+			s.mode,
+			riscv_mode::S,
+			"should stay in S-mode when delegated"
+		);
 		assert_eq!(s.sepc, 0x1000, "sepc should save faulting PC");
 		assert_eq!(s.scause, mcause_val(exc_code::ILL_INSTR, false));
 		assert_eq!(s.stval, 0xdead);
@@ -518,7 +489,7 @@ mod tests {
 	fn trap_not_delegated_from_mmode() {
 		let mut s = default_state();
 		s.mode = riscv_mode::M;
-		s.medeleg = 1 << exc_code::ILL_INSTR; // delegation ignored in M-mode
+		s.medeleg = 1 << exc_code::ILL_INSTR; // M 模式下不进行委派判定
 		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0xbeef);
 		assert_eq!(s.mode, riscv_mode::M, "M-mode traps never delegate");
 		assert_eq!(s.mepc, 0x1000);
@@ -530,7 +501,7 @@ mod tests {
 	fn trap_not_delegated_when_medeleg_bit_clear() {
 		let mut s = default_state();
 		s.mode = riscv_mode::S;
-		s.medeleg = 0; // nothing delegated
+		s.medeleg = 0; // 未委派任何异常
 		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0xbeef);
 		assert_eq!(s.mode, riscv_mode::M, "should switch to M-mode");
 		assert_eq!(s.mepc, 0x1000);
@@ -540,20 +511,20 @@ mod tests {
 	fn interrupt_delegates_to_smode_via_mideleg() {
 		let mut s = default_state();
 		s.mode = riscv_mode::S;
-		s.mideleg = 1 << 7; // delegate MTI (timer interrupt)
+		s.mideleg = 1 << 7; // 委派 MTI, 即定时器中断
 		deliver_trap(&mut s, mcause_val(7, true), 0);
 		assert_eq!(s.mode, riscv_mode::S, "delegated interrupt stays in S-mode");
 		assert_eq!(s.sepc, 0x1000);
 		assert_eq!(s.scause, mcause_val(7, true));
 	}
 
-	// ---- S-mode delivery tests ----
+	// ---- S 模式陷态分发测试 ----
 
 	#[test]
 	fn smode_trap_saves_sie_to_spie() {
 		let mut s = default_state();
 		s.mode = riscv_mode::S;
-		s.mstatus = MSTATUS_SIE; // SIE=1
+		s.mstatus = MSTATUS_SIE; // SIE 为 1
 		s.medeleg = 1 << exc_code::ILL_INSTR;
 		deliver_trap(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0);
 		assert_eq!(s.mstatus & MSTATUS_SIE, 0, "SIE should be cleared");
@@ -580,7 +551,7 @@ mod tests {
 		assert_eq!(spp, 0, "SPP should be 0 (was U-mode)");
 	}
 
-	// ---- existing M-mode delivery tests (updated for deliver_trap) ----
+	// ---- M 模式陷态分发测试 ----
 
 	#[test]
 	fn deliver_ill_instr_saves_mepc() {
@@ -595,7 +566,7 @@ mod tests {
 	#[test]
 	fn deliver_trap_clears_mie() {
 		let mut s = default_state();
-		s.mstatus = MSTATUS_MIE; // MIE=1
+		s.mstatus = MSTATUS_MIE; // MIE 为 1
 		deliver_illegal_instruction(&mut s, 0);
 		assert_eq!(s.mstatus & MSTATUS_MIE, 0, "MIE should be cleared");
 		assert_eq!(
@@ -608,9 +579,13 @@ mod tests {
 	#[test]
 	fn deliver_trap_sets_mpie_correctly_when_mie_was_0() {
 		let mut s = default_state();
-		s.mstatus = 0; // MIE=0
+		s.mstatus = 0; // MIE 为 0
 		deliver_illegal_instruction(&mut s, 0);
-		assert_eq!(s.mstatus & MSTATUS_MPIE, 0, "MPIE should be 0 when MIE was 0");
+		assert_eq!(
+			s.mstatus & MSTATUS_MPIE,
+			0,
+			"MPIE should be 0 when MIE was 0"
+		);
 	}
 
 	#[test]
@@ -633,17 +608,17 @@ mod tests {
 	#[test]
 	fn deliver_trap_direct_mtvec() {
 		let mut s = default_state();
-		s.mtvec = 0x80004000; // mode = 0 (direct)
+		s.mtvec = 0x80004000; // mode 为 0, 即 direct
 		deliver_illegal_instruction(&mut s, 0);
-		assert_eq!(s.pc, 0x80004000); // direct -> base
+		assert_eq!(s.pc, 0x80004000); // direct 模式: 跳转到基址
 	}
 
 	#[test]
 	fn deliver_trap_vectored_exception() {
 		let mut s = default_state();
-		s.mtvec = 0x80004000 | 1; // vectored mode
+		s.mtvec = 0x80004000 | 1; // vectored 模式
 		deliver_illegal_instruction(&mut s, 0);
-		// Exception -> base, not base + 4*code
+		// 异常: 跳转到基址, 而非基址加 4 乘原因码
 		assert_eq!(s.pc, 0x80004000);
 	}
 
@@ -663,20 +638,16 @@ mod tests {
 	}
 
 	// ============================================================
-	//  Regression: MSIP auto-clear on trap entry (AIA mode)
+	//  进入陷态时自动清除 MSIP 的用例
 	// ============================================================
 	//
-	//  In AIA mode sbi_ipi_raw_clear(false) is a no-op (imsic_ipi_device
-	//  has no ipi_clear callback), so deliver_trap_mmode / deliver_trap
-	//  MUST clear MSIP/SSIP unconditionally.  The old code had an
-	//  AIA-mode exception that skipped the clear -> MSIP stayed set
-	//  forever -> infinite re-delivery loop.
+	// 为避免 MSIP 保持置位引起同一中断反复进入 trap 处理函数，对 MSIP 与 SSIP 的清除推迟到 MTOPI 得到响应为止
 
 	#[test]
 	fn msip_cleared_in_deliver_trap_mmode() {
-		// deliver_trap_mmode always clears MSIP for cause=3 interrupts
+		// deliver_trap_mmode 对原因码为 3 的中断清除 MSIP
 		let mut s = default_state();
-		s.mip.store(1 << 3, Ordering::Release); // MSIP set
+		s.mip.store(1 << 3, Ordering::Release); // 置位 MSIP
 		deliver_trap_mmode(&mut s, mcause_val(3, true), 0);
 		assert_eq!(
 			s.mip.load(Ordering::Acquire) & (1 << 3),
@@ -687,9 +658,9 @@ mod tests {
 
 	#[test]
 	fn msip_not_cleared_for_non_interrupt_in_deliver_trap_mmode() {
-		// deliver_trap_mmode only clears MSIP for interrupts, not exceptions
+		// deliver_trap_mmode 只对中断清除 MSIP, 不对异常清除
 		let mut s = default_state();
-		s.mip.store(1 << 3, Ordering::Release); // MSIP set
+		s.mip.store(1 << 3, Ordering::Release); // 置位 MSIP
 		deliver_trap_mmode(&mut s, mcause_val(exc_code::ILL_INSTR, false), 0);
 		assert_eq!(
 			s.mip.load(Ordering::Acquire) & (1 << 3),
@@ -700,12 +671,12 @@ mod tests {
 
 	#[test]
 	fn ssip_cleared_in_deliver_trap_for_delegated_interrupt() {
-		// SSIP (cause=1) is delegatable — verify deliver_trap clears it
+		// SSIP 的原因码为 1, 可以被委派, 验证 deliver_trap 会清除该位
 		let mut s = default_state();
 		s.mode = riscv_mode::S;
-		s.mip.store(1 << 1, Ordering::Release); // SSIP set
-		s.mideleg = 1 << 1; // delegate SSIP
-		s.mstatus |= 1 << 1; // SIE = 1
+		s.mip.store(1 << 1, Ordering::Release); // 置位 SSIP
+		s.mideleg = 1 << 1; // 委派 SSIP
+		s.mstatus |= 1 << 1; // SIE 为 1
 		deliver_trap(&mut s, mcause_val(1, true), 0);
 		assert_eq!(
 			s.mip.load(Ordering::Acquire) & (1 << 1),
@@ -716,15 +687,14 @@ mod tests {
 
 	#[test]
 	fn msip_cleared_for_non_mmode_interrupt_in_deliver_trap() {
-		// When an interrupt fires while not in M-mode and is NOT delegated,
-		// deliver_trap switches to deliver_trap_mmode.  Verify MSIP is
-		// cleared on the S->M transition path.
+		// 非 M 模式下发生中断且该中断未被委派时, deliver_trap 转入
+		// deliver_trap_mmode, 验证 S 模式到 M 模式的路径清除 MSIP。
 		let mut s = default_state();
 		s.mode = riscv_mode::S;
-		s.mip.store(1 << 3, Ordering::Release); // MSIP set — not delegatable
-		s.mstatus |= 1 << 1; // SIE = 1
-		// MSIP is non-delegatable, so it goes through deliver_trap->M-mode
-		// path, which calls _trap_deliver_mmode internally.
+		s.mip.store(1 << 3, Ordering::Release); // 置位 MSIP, 该中断不可委派
+		s.mstatus |= 1 << 1; // SIE 为 1
+					   // MSIP 不可委派, 因此经 deliver_trap 的 M 模式路径分发,
+					   // 该路径内部调用 _trap_deliver_mmode。
 		deliver_trap(&mut s, mcause_val(3, true), 0);
 		assert_eq!(
 			s.mip.load(Ordering::Acquire) & (1 << 3),
@@ -734,13 +704,11 @@ mod tests {
 	}
 
 	// ============================================================
-	//  Regression: sbi_set_timer fast path must set mtip_deadline
 	// ============================================================
 	//
-	//  旧实现只写 CLINT mtimecmp, 不设 mtip_deadline -> sync_mtip 落入
-	//  共享 mtime 比较分支, 被其他活跃 hart 经 fetch_max 推高的共享 mtime
-	//  过早触发 -> mret 后立即再 trap 的活锁。飞地走 sbi_set_timer (而非
-	//  SSTC stimecmp), 是唯一命中此坏路径的调用方。
+	// 只写 CLINT 的 mtimecmp 而不设 mtip_deadline 时, sync_mtip 落入
+	// 共享 mtime 的比较分支, 其他活跃 hart 经 fetch_max 使 MTIP
+	// 提前被设置, 并让当前 hart mret 后立即再次进入陷态。
 
 	#[test]
 	fn sbi_set_timer_fast_path_sets_mtip_deadline() {
@@ -748,9 +716,8 @@ mod tests {
 		state.mhartid = 0;
 		state.total_instrs = 1000;
 		// SBI 只在 S 模式下可用; 零初始化的 mode 为 U, 必须显式置为 S,
-		// 否则该调用不会进入快速路径.
 		state.mode = riscv_mode::S;
-		// a0 = 目标绝对时间 (未来值), a6 = 0, a7 = SBI_TIME (0x54494D45).
+		// a0 为目标绝对时间, 取未来值; a6 为 0, a7 为 SBI_TIME 即 0x54494D45。
 		state.gprs[10] = 11000;
 		state.gprs[16] = 0;
 		state.gprs[17] = 0x5449_4d45;
@@ -779,9 +746,8 @@ mod tests {
 		assert_eq!(state.gprs[10], 0, "a0 应清零为 0");
 		assert_eq!(mtimecmp.load(Ordering::Acquire), 11000, "mtimecmp 应被写入");
 		assert_ne!(
-			state.mtip_deadline,
-			0,
-			"sbi_set_timer 必须设定 mtip_deadline (回归: 曾为 0 -> 共享 mtime 活锁)"
+			state.mtip_deadline, 0,
+			"sbi_set_timer 必须设定 mtip_deadline"
 		);
 		assert!(
 			state.mtip_deadline > state.total_instrs,
@@ -794,20 +760,20 @@ mod tests {
 		);
 	}
 
-	// ---- ecall 特权级判据用例 ----
+	// ---- ecall 特权级判定的用例 ----
 	//
-	// ``dev.try_ecall`` 与 SBI set_timer 两处快速路径原先位于特权级判据之前.
-	// 用户程序的退出序列 (li a0,0 / li a7,1 / ecall) 的 a7 = 1 与 SBI 传统
-	// putchar 的扩展号 0x01 相同, a6 = 0 与功能号相同, 于是该 ecall 被串口
-	// 快速路径认领: a0 被当作字符写出且不投递陷态, 程序越过退出 ecall 继续
-	// 执行. 下面两条用例分别锁定该边界的两侧.
+	// ``dev.try_ecall`` 与 SBI set_timer 的快速路径只在 S 模式下启用。
+	// 用户程序的退出序列 li a0,0、li a7,1、ecall 中, a7 与 a6 分别与 SBI 传统
+	// putchar 的扩展号 0x01 和功能号 0 相同, 缺少该判定时会被串口快速路径
+	// 得到响应: a0 被当作字符写出且不分发陷态, 程序越过退出 ecall 继续执行。
+	// 下面两条用例分别覆盖该判定的两侧。
 
 	#[test]
 	fn umode_ecall_with_sbi_putchar_encoding_never_takes_fast_path() {
 		let mut state = default_state();
 		state.mode = riscv_mode::U;
 		state.medeleg = 1 << exc_code::ECALL_UMODE;
-		// 用户程序的退出序列: a0 = 0, a7 = 1 (= SBI putchar 扩展号), a6 = 0.
+		// 用户程序的退出序列: a0 取 0, a7 取 1 即 SBI putchar 的扩展号, a6 取 0。
 		state.gprs[10] = 0;
 		state.gprs[16] = 0;
 		state.gprs[17] = 1;
@@ -838,7 +804,7 @@ mod tests {
 	fn smode_ecall_with_sbi_putchar_encoding_takes_fast_path() {
 		let mut state = default_state();
 		state.mode = riscv_mode::S;
-		// S 模式发出同样的编码: a7 = 1, a6 = 0, a0 = 'A'.
+		// S 模式发出相同的编码: a0 取 'A', a6 取 0, a7 取 1。
 		state.gprs[10] = 0x41;
 		state.gprs[16] = 0;
 		state.gprs[17] = 1;
@@ -849,8 +815,8 @@ mod tests {
 		let clint = single_hart_clint(&mtime, &mtimecmp, &msip);
 		let module = ModuleState::new(1, 1, 0, vec![0].into_boxed_slice(), false, 0, Box::new([]));
 
-		// 归档侧按 ``[hid, byte]`` 两字节条目解码, 故该快速路径写入的条目
-		// 必须带发出该字节的 hart 标识.
+		// 归档侧按两个字节的条目解码, 第一个字节为 hart 标识, 第二个字节为字符,
+		// 故该快速路径写入的条目必须带发出该字符的 hart 标识。
 		state.mhartid = 2;
 		let mut tx_buf = [0u8; 8];
 		let mut tx_wr: u32 = 0;

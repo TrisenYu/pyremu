@@ -10,10 +10,12 @@
 
 from pathlib import Path
 from typing import TYPE_CHECKING
+import unicodedata
 
 from pyremu.core import trap_def
 from pyremu.core.hart import RiscvMode
 from pyremu.core.mem_check_aux import translate_addr
+from pyremu.debug.exception import UsageError
 from pyremu.utils.disassem import Opc
 from pyremu.utils.mask import mask64
 
@@ -22,17 +24,11 @@ if TYPE_CHECKING:
     from pyremu.memory.bus import Bus
 
 # ============================================================
-#  节流常量
-# ============================================================
-
-_YIELD_EVERY = 500
-_YIELD_INTERVAL = 0.005  # select() 超时秒数
-
-# ============================================================
 #  格式化
 # ============================================================
 
-MAX_INSTR_COUNT = 100_000  # 指令条数上限, 超界视为不可达
+MAX_INSTR_COUNT = 100_000  # 指令条数上限
+_TRI_SPLIT = ["", "K", "M", "B", "T", "P", "E"]
 
 _SIZE_UNITS: tuple[tuple[str, int], ...] = (
     ("EB", 1 << 60),
@@ -41,6 +37,7 @@ _SIZE_UNITS: tuple[tuple[str, int], ...] = (
     ("GB", 1 << 30),
     ("MB", 1 << 20),
     ("KB", 1 << 10),
+    ("B", 1),
 )
 
 
@@ -59,24 +56,64 @@ def fmt_size(n: int) -> str:
     """human-readable 尺寸, 超出最大单位时落到最远单位."""
     for name, threshold in _SIZE_UNITS:
         if n >= threshold:
-            return f"{n / threshold:.1f} {name}"
+            return f"{n / threshold:.3f} {name}"
     return f"{n} B"
 
 
+MAX_ADDR = (1 << 64) - 1
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def parse_hex_addr(text: str) -> int:
+    """解析十六进制地址, 前缀 0x 可省略.
+
+    Raises:
+        UsageError: 内容不是十六进制, 或数值超出 64 位.
+    """
+    body = text[2:] if text.lower().startswith("0x") else text
+    if not body or any(ch not in _HEX_DIGITS for ch in body):
+        raise UsageError(f"非16进制值: {text}")
+    value = int(body, 16)
+    if value > MAX_ADDR:
+        raise UsageError(f"超出64位: {text}")
+    return value
+
+
+def _escape_nonprintable(ch: str) -> str:
+    """把控制字符、格式字符与代理字符写成反斜杠转义形式."""
+    code = ord(ch)
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
+
+
+def fmt_display_name(text: str) -> str:
+    """把文件名或路径写成可直接复制的形式.
+
+    不可打印的字符写成转义形式; 结果含空白或已发生转义时用引号包围,
+    使含空白的文件名在 ``sym load`` 中仍可作为单个参数给出.
+    """
+    escaped = "".join(
+        _escape_nonprintable(ch) if unicodedata.category(ch).startswith("C") else ch
+        for ch in text
+    )
+    if escaped == text and not any(ch.isspace() for ch in text):
+        return text
+    if '"' not in escaped:
+        return f'"{escaped}"'
+    if "'" not in escaped:
+        return f"'{escaped}'"
+    return '"' + escaped.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def fmt_instr_count(n: int) -> str:
-    if n < 1000:
-        return str(n)
-    nn = float(n / 1000.0)
-    if nn < 1000:
-        return f"{nn:.3f}K"
-    nn /= 1000
-    if nn < 1000:
-        return f"{nn:.3f}M"
-    nn /= 1000
-    if nn < 1000:
-        return f"{nn:.3f}B"
-    nn /= 1000
-    return f"{nn:.3f}T"
+    for idx, val in enumerate(_TRI_SPLIT):
+        if n < 1000:
+            return f"{n:.3f}{val}"
+        n /= 1000
+    return f"{n:.3f}?"
 
 
 def trap_cause_name(mcause_val: int) -> str:
@@ -115,9 +152,7 @@ def read_va_bytes(
     while remain > 0:
         page_off = cur & 0xFFF
         chunk = min(remain, 0x1000 - page_off)
-        ok, pa = translate_addr(
-            hart, cur, is_execute=is_execute, is_hart_access=False
-        )
+        ok, pa = translate_addr(hart, cur, is_execute=is_execute, is_hart_access=False)
         if not ok:
             return None
         data = bus.try_read(pa, chunk)
@@ -224,7 +259,7 @@ INSTR_BP_NAMES: dict[str, int] = {
 
 KNOWN_OPCODES: frozenset[int] = frozenset(o.value for o in Opc)
 
-RAM_MUL: dict[str, int] = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+RAM_MUL: dict[str, int] = {"K": 1024, "M": 1024**2, "G": 1024**3}
 
 # ============================================================
 #  历史文件修剪

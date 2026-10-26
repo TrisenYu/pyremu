@@ -16,8 +16,6 @@ route AIA CSRs through the Python IMSIC backend.  CSR addresses:
   mtopei = 0x35C  (IMSIC M-file only, auto-claim on read)
 """
 
-import pytest
-
 from pyremu.core.hart import RiscvMode
 from pyremu.core.trap_handler import check_pending_interrupts
 from pyremu.emulator import Emulator
@@ -52,18 +50,18 @@ class TestIpiLifecycle:
         s_base = 2 * _PAGE_STRIDE  # N=2, S-files after M-files
         imsic.write(s_base + _EIPNUM_SET_OFF, (1).to_bytes(4, "little"))
 
-        sf = imsic._file_for(0, 'S')
+        sf = imsic._file_for(0, "S")
         assert sf is not None
         assert sf.eip[0] & (1 << IID_S_IPI), "S-file eip[0] bit 1 should be set"
 
-        peek = imsic.peek_topei(0, 'S')
+        peek = imsic.peek_topei(0, "S")
         assert peek != 0, f"peek_topei non-zero, got {peek}"
         assert ((peek >> 16) & 0x7FF) == IID_S_IPI
 
         # Claim via read_topei — clears eip
-        claim = imsic.read_topei(0, 'S')
+        claim = imsic.read_topei(0, "S")
         assert claim != 0
-        assert imsic.peek_topei(0, 'S') == 0, "after claim, peek should be 0"
+        assert imsic.peek_topei(0, "S") == 0, "after claim, peek should be 0"
 
     def test_peek_does_not_claim(self):
         """peek_topei should NOT clear eip — idempotent."""
@@ -71,8 +69,8 @@ class TestIpiLifecycle:
         s_base = 1 * _PAGE_STRIDE
         imsic.write(s_base + _EIPNUM_SET_OFF, (1).to_bytes(4, "little"))
 
-        p1 = imsic.peek_topei(0, 'S')
-        p2 = imsic.peek_topei(0, 'S')
+        p1 = imsic.peek_topei(0, "S")
+        p2 = imsic.peek_topei(0, "S")
         assert p1 == p2, "peek should be idempotent (no claim)"
         assert p1 != 0
 
@@ -81,7 +79,7 @@ class TestIpiLifecycle:
         imsic = IMSIC(num_harts=1, m_base_addr=_IMSIC_M_BASE)
         s_base = 1 * _PAGE_STRIDE
         imsic.write(s_base + _EIPNUM_SET_OFF, (1).to_bytes(4, "little"))
-        assert imsic.peek_topei(0, 'S') != 0
+        assert imsic.peek_topei(0, "S") != 0
         assert imsic.get_pending_mip(0) & (1 << 9), "SEIP should be set"
 
     def test_mfile_ipi_stays_in_mfile(self):
@@ -89,11 +87,11 @@ class TestIpiLifecycle:
         imsic = IMSIC(num_harts=2, m_base_addr=_IMSIC_M_BASE)
         imsic.write(0 * _PAGE_STRIDE, (1).to_bytes(4, "little"))  # M-file, IID=1
 
-        mf = imsic._file_for(0, 'M')
+        mf = imsic._file_for(0, "M")
         assert mf is not None
         assert mf.eip[0] & (1 << IID_S_IPI), "M-file eip[0] bit 1 should be set"
-        assert imsic.peek_topei(0, 'M') != 0, "M-file should have pending IPI"
-        assert imsic.peek_topei(0, 'S') == 0, "S-file should have no pending IPI"
+        assert imsic.peek_topei(0, "M") != 0, "M-file should have pending IPI"
+        assert imsic.peek_topei(0, "S") == 0, "S-file should have no pending IPI"
 
     def test_external_interrupt_blocked_without_eidelivery(self):
         """External IID blocked when eidelivery=0; IPI IIDs still visible."""
@@ -102,17 +100,17 @@ class TestIpiLifecycle:
         # External IID=10 with eidelivery=0
         imsic.write(s_base + _EIPNUM_SET_OFF, (10).to_bytes(4, "little"))
         # Should NOT be visible — peek_topei blocks external IIDs without eidelivery
-        assert imsic.peek_topei(0, 'S') == 0, \
-        "external IID blocked without eidelivery"
-        assert imsic.get_pending_mip(0) == 0, \
-        "external IID should not set SEIP with eidelivery=0"
+        assert imsic.peek_topei(0, "S") == 0, "external IID blocked without eidelivery"
+        assert imsic.get_pending_mip(0) == 0, (
+            "external IID should not set SEIP with eidelivery=0"
+        )
 
         # But IPI (IID=1) should still be visible via IPI fast-path
         imsic.write(s_base + _EIPNUM_SET_OFF, (1).to_bytes(4, "little"))
-        assert imsic.peek_topei(0, 'S') != 0, \
-        "IPI visible even with eidelivery=0"
-        assert imsic.get_pending_mip(0) & (1 << 9), \
-        "IPI should set SEIP via peek_topei fast-path"
+        assert imsic.peek_topei(0, "S") != 0, "IPI visible even with eidelivery=0"
+        assert imsic.get_pending_mip(0) & (1 << 9), (
+            "IPI should set SEIP via peek_topei fast-path"
+        )
 
 
 # ============================================================
@@ -130,8 +128,8 @@ class TestCrossHartIpi:
         target = s_base + 1 * _PAGE_STRIDE + _EIPNUM_SET_OFF
         imsic.write(target, (1).to_bytes(4, "little"))
 
-        assert imsic.peek_topei(1, 'S') != 0, "Hart 1 sees IPI"
-        assert imsic.peek_topei(0, 'S') == 0, "Hart 0 unaffected"
+        assert imsic.peek_topei(1, "S") != 0, "Hart 1 sees IPI"
+        assert imsic.peek_topei(0, "S") == 0, "Hart 0 unaffected"
         assert imsic.get_pending_mip(1) & (1 << 9), "Hart 1 SEIP set"
 
     def test_mfile_ipi_stays_in_target_mfile(self):
@@ -140,7 +138,7 @@ class TestCrossHartIpi:
         target = 1 * _PAGE_STRIDE + _EIPNUM_SET_OFF  # hart 1 M-file
         imsic.write(target, (1).to_bytes(4, "little"))
 
-        mf_h1 = imsic._file_for(1, 'M')
+        mf_h1 = imsic._file_for(1, "M")
         assert mf_h1 is not None
         assert mf_h1.eip[0] & (1 << IID_S_IPI)
         assert imsic.get_pending_mip(1) & (1 << 11), "hart 1 MEIP should be set"
@@ -148,10 +146,10 @@ class TestCrossHartIpi:
     def test_set_ip_number_all_harts_independent(self):
         """set_ip_number to hart 2 leaves harts 0,1,3 unaffected."""
         imsic = IMSIC(num_harts=4, m_base_addr=_IMSIC_M_BASE)
-        imsic.set_ip_number(2, 'S', IID_S_IPI)
-        assert imsic.peek_topei(2, 'S') != 0
+        imsic.set_ip_number(2, "S", IID_S_IPI)
+        assert imsic.peek_topei(2, "S") != 0
         for h in (0, 1, 3):
-            assert imsic.peek_topei(h, 'S') == 0, f"Hart {h} unaffected"
+            assert imsic.peek_topei(h, "S") == 0, f"Hart {h} unaffected"
 
 
 # ============================================================
@@ -180,8 +178,8 @@ class TestIpiCsrLevel:
         h1 = emu.harts[1]
         h1.mode = RiscvMode.S
         assert imsic
-        imsic.csr_write(1, 'S', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(1, 'S', IID_S_IPI)
+        imsic.csr_write(1, "S", 0x70, 1)  # eidelivery=1
+        imsic.set_ip_number(1, "S", IID_S_IPI)
 
         val = h1.read_csr(_CSR_STOPI)
         assert val != 0, f"stopi after IPI: expected non-zero, got {val}"
@@ -206,8 +204,8 @@ class TestIpiCsrLevel:
         h1 = emu.harts[1]
         h1.mode = RiscvMode.S
         assert imsic
-        imsic.csr_write(1, 'S', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(1, 'S', IID_S_IPI)
+        imsic.csr_write(1, "S", 0x70, 1)  # eidelivery=1
+        imsic.set_ip_number(1, "S", IID_S_IPI)
 
         # stopi must report the MAJOR identity (SEI=9), not the minor (1).
         stopi = h1.read_csr(_CSR_STOPI)
@@ -228,8 +226,8 @@ class TestIpiCsrLevel:
         h = emu.harts[0]
         h.mode = RiscvMode.S
         assert imsic
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.set_ip_number(0, 'S', IID_S_IPI)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.set_ip_number(0, "S", IID_S_IPI)
 
         v1 = h.read_csr(_CSR_STOPI)
         v2 = h.read_csr(_CSR_STOPI)
@@ -256,8 +254,8 @@ class TestIpiCsrLevel:
         h = emu.harts[0]
         h.mode = RiscvMode.S
         assert imsic
-        imsic.csr_write(0, 'S', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(0, 'S', IID_S_IPI)
+        imsic.csr_write(0, "S", 0x70, 1)  # eidelivery=1
+        imsic.set_ip_number(0, "S", IID_S_IPI)
 
         v1 = h.read_csr(_CSR_STOPEI)
         assert v1 != 0, f"first stopei: expected non-zero, got {v1}"
@@ -273,8 +271,8 @@ class TestIpiCsrLevel:
         h = emu.harts[0]
         h.mode = RiscvMode.M
         assert imsic
-        imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(0, 'M', IID_M_IPI)
+        imsic.csr_write(0, "M", 0x70, 1)  # eidelivery=1
+        imsic.set_ip_number(0, "M", IID_M_IPI)
 
         val = h.read_csr(_CSR_MTOPI)
         iid = (val >> 16) & 0x7FF
@@ -290,8 +288,8 @@ class TestIpiCsrLevel:
         h.mode = RiscvMode.M
 
         assert imsic
-        imsic.csr_write(0, 'M', 0x70, 1)
-        imsic.set_ip_number(0, 'M', IID_M_IPI)
+        imsic.csr_write(0, "M", 0x70, 1)
+        imsic.set_ip_number(0, "M", IID_M_IPI)
         v1 = h.read_csr(_CSR_MTOPEI)
         assert v1 != 0
         v2 = h.read_csr(_CSR_MTOPEI)
@@ -311,7 +309,7 @@ class TestIpiCsrLevel:
         h1.csrs["mie"].val = 1 << 9  # SEIE
         assert h1.mie_val & (1 << 9), "SEIE should be set in mie CSR"
         assert imsic
-        imsic.set_ip_number(1, 'S', IID_S_IPI)
+        imsic.set_ip_number(1, "S", IID_S_IPI)
 
         # check_pending_interrupts returns True if a trap was delivered
         result = check_pending_interrupts(h1)
@@ -319,8 +317,7 @@ class TestIpiCsrLevel:
 
         # After delivery, mcause should reflect SEI
         mcause = h1.csrs["mcause"].val
-        assert (mcause & 0x7FFFFFFFFFFFFFFF) == 9, \
-            f"mcause should be 9 (SEI), got {mcause}"
+        assert (mcause & 0x7FFFFFFFFFFFFFFF) == 9, f"mcause should be 9 (SEI), got {mcause}"
 
 
 # ============================================================
@@ -334,39 +331,39 @@ class TestCsrStateConsistency:
     def test_eidelivery_roundtrip(self):
         """miselect=0x70 -> mireg write 1 -> mireg read 1."""
         imsic = IMSIC(num_harts=1, m_base_addr=_IMSIC_M_BASE)
-        imsic.csr_write(0, 'M', 0x70, 1)
-        assert imsic.csr_read(0, 'M', 0x70) == 1
+        imsic.csr_write(0, "M", 0x70, 1)
+        assert imsic.csr_read(0, "M", 0x70) == 1
 
-        imsic.csr_write(0, 'S', 0x70, 1)
-        assert imsic.csr_read(0, 'S', 0x70) == 1
+        imsic.csr_write(0, "S", 0x70, 1)
+        assert imsic.csr_read(0, "S", 0x70) == 1
 
     def test_eie_roundtrip_through_csr(self):
         """miselect=0xC0 -> mireg write -> mireg read."""
         imsic = IMSIC(num_harts=1, m_base_addr=_IMSIC_M_BASE)
-        imsic.csr_write(0, 'M', 0xC0, 0xDEAD)
-        assert imsic.csr_read(0, 'M', 0xC0) == 0xDEAD
+        imsic.csr_write(0, "M", 0xC0, 0xDEAD)
+        assert imsic.csr_read(0, "M", 0xC0) == 0xDEAD
 
     def test_eip_visible_through_csr_after_seteipnum(self):
         """seteipnum -> eip visible via mireg read."""
         imsic = IMSIC(num_harts=1, m_base_addr=_IMSIC_M_BASE)
-        imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(0, 'M', 3)
+        imsic.csr_write(0, "M", 0x70, 1)  # eidelivery=1
+        imsic.set_ip_number(0, "M", 3)
 
-        val = imsic.csr_read(0, 'M', 0x80)  # eip[0]
+        val = imsic.csr_read(0, "M", 0x80)  # eip[0]
         assert val & (1 << 3), f"eip bit 3 should be visible, got {val:#x}"
 
     def test_eie_controls_external_interrupt_visibility(self):
         """External interrupt needs eie: topei returns 0 when eie bit is clear."""
         imsic = IMSIC(num_harts=1, m_base_addr=_IMSIC_M_BASE)
-        imsic.csr_write(0, 'M', 0x70, 1)  # eidelivery=1
-        imsic.set_ip_number(0, 'M', 10)   # external IID=10
+        imsic.csr_write(0, "M", 0x70, 1)  # eidelivery=1
+        imsic.set_ip_number(0, "M", 10)  # external IID=10
 
         # eie[0] bit 10 is clear -> peek_topei should return 0
-        assert imsic.peek_topei(0, 'M') == 0, "external IID blocked without eie"
+        assert imsic.peek_topei(0, "M") == 0, "external IID blocked without eie"
 
         # Set eie for bit 10
-        imsic.csr_write(0, 'M', 0xC0, 1 << 10)
-        assert imsic.peek_topei(0, 'M') != 0, "external IID visible with eie set"
+        imsic.csr_write(0, "M", 0xC0, 1 << 10)
+        assert imsic.peek_topei(0, "M") != 0, "external IID visible with eie set"
 
 
 # ============================================================
@@ -391,10 +388,10 @@ class TestImsicAddressing:
 
     def test_sfile_offset_maps_to_correct_hart(self):
         """S-file offset = N*0x1000 + hart_id * 0x1000 -> correct (hart_id, S-file)."""
-        N = 4
-        imsic = IMSIC(num_harts=N, m_base_addr=_IMSIC_M_BASE)
-        for h in range(N):
-            off = N * _PAGE_STRIDE + h * _PAGE_STRIDE
+        num_harts = 4
+        imsic = IMSIC(num_harts=num_harts, m_base_addr=_IMSIC_M_BASE)
+        for h in range(num_harts):
+            off = num_harts * _PAGE_STRIDE + h * _PAGE_STRIDE
             resolved = imsic._resolve(off)
             assert resolved is not None
             hart_id, file, file_off = resolved

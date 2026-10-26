@@ -75,8 +75,8 @@ pub type GetterFn = unsafe extern "C" fn(manager: *const Manager) -> ModuleInter
 /// 用于校验模块编号并取得接口。
 pub type InitFn = unsafe extern "C" fn(manager: *const Manager) -> GetterFn;
 
-/// 判断 *ptr* 所指的 `[ptr, ptr + size)` 是否落在模块窗口的 `[va, va + window_size)`
-/// 之内, 且 *ptr* 对齐满足 *align*。
+/// 判断 *ptr* 所指的 `[ptr, ptr + size)` 是否落在 `[va, va + window_size)` 之内,
+/// 且 *ptr* 对齐满足 *align*。
 ///
 /// 模块在接口中自行给出表指针, 其取值在验签之后仍不可信, 故在登记接口之前必须确认
 /// 表的落点。`size` 为 0 时只检查指针本身, 供调用方在表的尺寸未知时使用。
@@ -130,7 +130,7 @@ mod tests {
 		assert_eq!(core::mem::size_of::<Option<SyscallHandler>>(), 8);
 	}
 
-	/// 表的落点检查覆盖窗口下界、窗口上界与对齐三项。
+	/// 表的位置检查覆盖区间下界、区间上界与对齐三项。
 	#[test]
 	fn test_table_region_check_covers_the_window_bounds() {
 		let window = 4 * CHUNK_2M_SIZE;

@@ -57,6 +57,7 @@ from pyremu.peripheral.virtio_mmio import (
     VIRTIO_STATUS_FAILED,
     VIRTIO_STATUS_FEATURES_OK,
     VirtioMMIO,
+    VirtioMMIOConfig,
     VirtqDesc,
     VirtQueue,
     VRING_DESC_F_INDIRECT,
@@ -212,7 +213,11 @@ class VirtIOBlock(Device):
                 self._fd = os.open(image_path, os.O_RDONLY)
                 read_only = True
         self._read_only = read_only
+        self._image_path = image_path
         self._disk_size = os.lseek(self._fd, 0, os.SEEK_END)
+        # 本次队列通知是否已由加速执行引擎在退出处理中清空。为真时
+        # 跳过处理。
+        self._is_notify_served = False
 
         # 中断投递: 完成中断经投递目标上报, 编号为 0 或未给出目标时不投递。
         # 调用方应传设备中断投递目标 DeviceIrqSink, 该目标除置位中断控制器外还通知
@@ -220,16 +225,18 @@ class VirtIOBlock(Device):
         # 中断在引擎的单轮加速执行内不可见, 且无法唤醒已进入 WFI 的 hart。
         irq, on_irq = irq_sink if irq_sink is not None else (0, None)
         self.mmio = VirtioMMIO(
-            device_id=0x2,  # block device
-            device_features=_DEVICE_FEATURES,
-            num_queues=1,
-            queue_num_max=_BLK_QUEUE_NUM_MAX,
-            mem_read=mem_read,
-            mem_write=mem_write,
-            irq=irq,
-            on_irq=on_irq,
-            cfg_space_data=self._build_config_space(),
-            chain_max_desc=_BLK_CHAIN_DESC_NUM,
+            VirtioMMIOConfig(
+                dev_id=0x2,  # block device
+                dev_feats=_DEVICE_FEATURES,
+                queue_num=1,
+                max_queue_num=_BLK_QUEUE_NUM_MAX,
+                read_fn=mem_read,
+                write_fn=mem_write,
+                irq=irq,
+                irq_resp_fn=on_irq,
+                cfg_space_data=self._build_config_space(),
+                chain_max_desc=_BLK_CHAIN_DESC_NUM,
+            )
         )
 
     # ---- Device 接口 ----
@@ -239,15 +246,32 @@ class VirtIOBlock(Device):
         """镜像是否以只读方式打开. 为真时写请求被静默忽略."""
         return self._read_only
 
+    @property
+    def image_path(self) -> str:
+        """本设备使用的镜像文件路径."""
+        return self._image_path
+
     def read(self, offset: int, size: int) -> bytes:
         return self.mmio.read(offset, size)
 
     def write(self, offset: int, data: bytes) -> None:
         """写入 MMIO. QueueNotify 交给本设备, 其余交给传输层."""
         if offset == VIRTIO_MMIO_QUEUE_NOTIFY and len(data) in (1, 2, 4):
+            # 加速执行引擎已清空本次通知对应的队列, 重放的该次写只清除记录
+            if self._is_notify_served:
+                self._is_notify_served = False
+                return
             self._notify_queue(int.from_bytes(data, "little"))
             return
         self.mmio.write(offset, data)
+
+    def mark_notify_served(self) -> None:
+        """记录本次队列通知已清空, 使随后重放的该次写不再处理队列."""
+        self._is_notify_served = True
+
+    def clear_notify_served(self) -> None:
+        """清除本次队列通知已清空的记录."""
+        self._is_notify_served = False
 
     def _notify_queue(self, index: int) -> None:
         """队列通知: 队列存在且已就绪时处理其中的请求."""

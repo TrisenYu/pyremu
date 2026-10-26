@@ -82,7 +82,7 @@ class TLB(CacheBase):
         pass
 
     # ----------------------------------------------------------
-    #  公共接口 (保持向后兼容)
+    #  公共接口
     # ----------------------------------------------------------
 
     def lookup(self, vpn: int, asid: int = 0) -> tuple:
@@ -104,11 +104,12 @@ class TLB(CacheBase):
             return True, e.ppn, e.perm
         return False, 0, 0
 
-    def insert(
+    def insert(  # noqa: PLR0913 — 一条映射由页号、权限与三个标记共同确定
         self,
         vpn: int,
         ppn: int,
         perm: int,
+        *,
         level: int = 0,
         mdid: int = 0,
         asid: int = 0,
@@ -208,6 +209,7 @@ class TLB(CacheBase):
     def size(self) -> int:
         """返回 TLB 容量."""
         return self._num_entries
+
 
 def decode_tlb_perm(perm: int) -> str:
     """把 TLB 权限位转换为可读字符串, 如 0b1111 得到 'RWXU'."""

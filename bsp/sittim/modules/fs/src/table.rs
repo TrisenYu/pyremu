@@ -4,7 +4,7 @@
 //! 参数校验与结果编码不会在两侧出现分歧。
 
 use crate::ramfs;
-use crate::vfs_ops::{ VfsOps, VfsStat, VfsStatus };
+use crate::vfs_ops::{VfsOps, VfsStat, VfsStatus};
 
 /// 建立本模块的操作表。
 pub fn fill_ops() -> VfsOps {
@@ -48,7 +48,12 @@ unsafe extern "C" fn ops_init() -> bool {
 	ramfs::init()
 }
 
-unsafe extern "C" fn ops_inject_file(path: *const u8, path_len: u64, data: *const u8, data_len: u64) -> bool {
+unsafe extern "C" fn ops_inject_file(
+	path: *const u8,
+	path_len: u64,
+	data: *const u8,
+	data_len: u64,
+) -> bool {
 	let path = unsafe { bytes_at(path, path_len) };
 	let data = unsafe { bytes_at(data, data_len) };
 	ramfs::inject_file(path, data)
@@ -59,7 +64,7 @@ unsafe extern "C" fn ops_open(
 	path_len: u64,
 	flags: u32,
 	mode: u32,
-	out_node: *mut i16
+	out_node: *mut i16,
 ) -> VfsStatus {
 	let path = unsafe { bytes_at(path, path_len) };
 	match ramfs::open(path, flags, mode) {
@@ -95,7 +100,7 @@ unsafe extern "C" fn ops_read(
 	offset: u64,
 	buf: *mut u8,
 	len: u64,
-	out_read: *mut u64
+	out_read: *mut u64,
 ) -> VfsStatus {
 	if out_read.is_null() || (len != 0 && buf.is_null()) {
 		return VfsStatus::Invalid;
@@ -116,7 +121,7 @@ unsafe extern "C" fn ops_write(
 	offset: u64,
 	buf: *const u8,
 	len: u64,
-	out_written: *mut u64
+	out_written: *mut u64,
 ) -> VfsStatus {
 	if len != 0 && buf.is_null() {
 		return VfsStatus::Invalid;
@@ -150,7 +155,7 @@ unsafe extern "C" fn ops_getdents(
 	pos: *mut u64,
 	buf: *mut u8,
 	count: u64,
-	out_written: *mut u64
+	out_written: *mut u64,
 ) -> VfsStatus {
 	if pos.is_null() || out_written.is_null() || (count != 0 && buf.is_null()) {
 		return VfsStatus::Invalid;

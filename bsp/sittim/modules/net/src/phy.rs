@@ -6,9 +6,7 @@
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-use crate::driver::{
-	Buffers, Driver, ETHERNET_FRAME_MAX, RxSlot, VNET_HDR, finish_rx, push_tx,
-};
+use crate::driver::{Buffers, Driver, ETHERNET_FRAME_MAX, RxSlot, VNET_HDR, finish_rx, push_tx};
 use crate::virt_queue::{QNUM, Queue};
 
 /// 网卡的 phy::Device 实现。
@@ -36,18 +34,37 @@ impl Device for NetDevice {
 		let drv = &mut self.drv;
 		let item = drv.peek_rx()?;
 		let slot = drv.reserve_tx()?;
-		let Driver { rx_queue, tx_queue, rx_bufs, tx_bufs } = drv;
+		let Driver {
+			rx_queue,
+			tx_queue,
+			rx_bufs,
+			tx_bufs,
+		} = drv;
 		Some((
-			Rx { queue: &mut **rx_queue, bufs: &**rx_bufs, item },
-			Tx { queue: &mut **tx_queue, bufs: &mut **tx_bufs, slot },
+			Rx {
+				queue: &mut **rx_queue,
+				bufs: &**rx_bufs,
+				item,
+			},
+			Tx {
+				queue: &mut **tx_queue,
+				bufs: &mut **tx_bufs,
+				slot,
+			},
 		))
 	}
 
 	fn transmit(&mut self, _timestamp: Instant) -> Option<Tx<'_>> {
 		let drv = &mut self.drv;
 		let slot = drv.reserve_tx()?;
-		let Driver { tx_queue, tx_bufs, .. } = drv;
-		Some(Tx { queue: &mut **tx_queue, bufs: &mut **tx_bufs, slot })
+		let Driver {
+			tx_queue, tx_bufs, ..
+		} = drv;
+		Some(Tx {
+			queue: &mut **tx_queue,
+			bufs: &mut **tx_bufs,
+			slot,
+		})
 	}
 
 	fn capabilities(&self) -> DeviceCapabilities {

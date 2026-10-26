@@ -40,13 +40,12 @@ use core::mem::MaybeUninit;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
 use abi::{
-	GetterFn, InitFn, ModuleDesc, ModuleInterface, SyscallTable, MODULE_NAME_LEN,
-	SYSCALL_TABLE_LEN,
+	GetterFn, InitFn, MODULE_NAME_LEN, ModuleDesc, ModuleInterface, SYSCALL_TABLE_LEN, SyscallTable,
 };
 use man::Manager;
 use net_ops::{
-	NetEndpoint, NetOps, NET_ADDR_MAX, NET_AF_UNSPEC, NET_BIND_ALREADY_BOUND,
-	NET_BIND_NO_FREE_PORT, NET_BIND_NOT_READY, NET_BIND_OK, NET_BIND_PORT_IN_USE, NET_NO_SLOT,
+	NET_ADDR_MAX, NET_AF_UNSPEC, NET_BIND_ALREADY_BOUND, NET_BIND_NO_FREE_PORT, NET_BIND_NOT_READY,
+	NET_BIND_OK, NET_BIND_PORT_IN_USE, NET_NO_SLOT, NetEndpoint, NetOps,
 };
 
 /// 模块编号。
@@ -66,7 +65,9 @@ const MODULE_NAME: [u8; MODULE_NAME_LEN] = {
 
 /// 本模块导出的系统调用处理函数表。套接字的系统调用处理函数留在运行时, 故本表全为
 /// 空槽位。
-static SYSCALLS: SyscallTable = SyscallTable { handlers: [None; SYSCALL_TABLE_LEN] };
+static SYSCALLS: SyscallTable = SyscallTable {
+	handlers: [None; SYSCALL_TABLE_LEN],
+};
 
 /// 本模块导出的操作表。
 ///
@@ -79,7 +80,11 @@ static mut OPS: MaybeUninit<NetOps> = MaybeUninit::uninit();
 #[unsafe(link_section = ".text.init")]
 pub unsafe extern "C" fn module_init(manager: *const Manager) -> GetterFn {
 	platform::attach(manager);
-	unsafe { core::ptr::addr_of_mut!(OPS).cast::<NetOps>().write(fill_ops()) };
+	unsafe {
+		core::ptr::addr_of_mut!(OPS)
+			.cast::<NetOps>()
+			.write(fill_ops())
+	};
 	get_interface
 }
 
@@ -142,7 +147,10 @@ fn endpoint_of(endpoint: IpEndpoint) -> NetEndpoint {
 /// 由操作表的端点建立协议栈的端点。地址族不是 IPv4 时返回 None。
 fn ip_endpoint_of(endpoint: &NetEndpoint) -> Option<IpEndpoint> {
 	let octets = endpoint.octets_v4()?;
-	Some(IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::from(octets)), endpoint.port))
+	Some(IpEndpoint::new(
+		IpAddress::Ipv4(Ipv4Address::from(octets)),
+		endpoint.port,
+	))
 }
 
 /// 由操作表的端点取本地地址与端口。地址族不是 IPv4 时本地地址取未指定。
@@ -269,21 +277,11 @@ unsafe extern "C" fn ops_can_send(index: u64) -> bool {
 	stack::can_send(index as usize)
 }
 
-unsafe extern "C" fn ops_recv(
-	index: u64,
-	buf: *mut u8,
-	len: u64,
-	src: *mut NetEndpoint,
-) -> i64 {
+unsafe extern "C" fn ops_recv(index: u64, buf: *mut u8, len: u64, src: *mut NetEndpoint) -> i64 {
 	unsafe { take_report(index, buf, len, src, false) }
 }
 
-unsafe extern "C" fn ops_peek(
-	index: u64,
-	buf: *mut u8,
-	len: u64,
-	src: *mut NetEndpoint,
-) -> i64 {
+unsafe extern "C" fn ops_peek(index: u64, buf: *mut u8, len: u64, src: *mut NetEndpoint) -> i64 {
 	unsafe { take_report(index, buf, len, src, true) }
 }
 

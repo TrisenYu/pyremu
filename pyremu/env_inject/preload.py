@@ -4,7 +4,7 @@
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
 """
-预加载注入器 — 将外部提供的 shellcode / 二进制机器码写入 RAM.
+预加载注入器 — 将外部提供的 shellcode / 二进制机器码写入物理内存.
 
 shellcode 来源:
 - RISC-V 指令流, 类似 objcopy -O binary 产物
@@ -19,13 +19,14 @@ shellcode 来源:
   DTB:       0x87ff0000 - 0x87ff046c  (ram_base + ram_size - 64KiB)
   Preload:   0x87fe0000 - 0x87fe008c  (ram_base + ram_size - 128KiB)
 """
+
 from pathlib import Path
 
 from pyremu.emulator import Emulator
 
 
 class Preloader:
-    """将外部 shellcode 注入 RAM 并返回入口地址.
+    """将外部 shellcode 注入物理内存并返回入口地址.
 
     Usage:
         p = Preloader(emu)
@@ -48,23 +49,21 @@ class Preloader:
         code: bytes,
         addr: int | None = None,
     ) -> int:
-        """将 shellcode 字节写入 RAM.
+        """将 shellcode 字节写入物理内存.
 
         Args:
             code: 原始 RISC-V 机器码字节.
             addr: 写入地址 (None = 自动选择 RAM 顶端安全区域).
 
         Returns:
-            shellcode 在 RAM 中的起始地址 (即入口地址).
+            shellcode 的起始物理地址 (即入口地址).
         """
         if addr is None:
             addr = (
-                self._emu.bus.ram_base +
-                self._emu.bus.ram_size -
-                self.DEFAULT_ADDR_OFFSET
+                self._emu.bus.ram_base + self._emu.bus.ram_size - self.DEFAULT_ADDR_OFFSET
             ) & ~0xF
 
-        self._emu.bus.write(addr, code)
+        self._emu.load_code(addr, code)
         return addr
 
     def inject_file(
@@ -72,7 +71,7 @@ class Preloader:
         path: str,
         addr: int | None = None,
     ) -> int:
-        """从文件读取 shellcode 并注入 RAM.
+        """从文件读取 shellcode 并注入物理内存.
 
         Args:
             path: shellcode 文件路径 (裸二进制).

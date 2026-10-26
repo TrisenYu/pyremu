@@ -41,13 +41,7 @@ mod table;
 use core::mem::MaybeUninit;
 
 use abi::{
-	GetterFn,
-	InitFn,
-	ModuleDesc,
-	ModuleInterface,
-	SyscallTable,
-	MODULE_NAME_LEN,
-	SYSCALL_TABLE_LEN,
+	GetterFn, InitFn, MODULE_NAME_LEN, ModuleDesc, ModuleInterface, SYSCALL_TABLE_LEN, SyscallTable,
 };
 use man::Manager;
 use vfs_ops::VfsOps;
@@ -69,7 +63,9 @@ const MODULE_NAME: [u8; MODULE_NAME_LEN] = {
 
 /// 本模块导出的系统调用处理函数表。文件系统的系统调用处理函数留在运行时, 故本表全为
 /// 空槽位。
-static SYSCALLS: SyscallTable = SyscallTable { handlers: [None; SYSCALL_TABLE_LEN] };
+static SYSCALLS: SyscallTable = SyscallTable {
+	handlers: [None; SYSCALL_TABLE_LEN],
+};
 
 /// 本模块导出的操作表。
 ///

@@ -378,15 +378,15 @@ class TestDebuggerHelpers:
         "n, expected",
         [
             (0, "0 B"),
-            (512, "512 B"),
-            (1024, "1.0 KB"),
-            (1536, "1.5 KB"),
-            (1048576, "1.0 MB"),
-            (1073741824, "1.0 GB"),
-            (1099511627776, "1.0 TB"),
-            (1125899906842624, "1.0 PB"),
+            (512, "512.000 B"),
+            (1024, "1.000 KB"),
+            (1536, "1.500 KB"),
+            (1048576, "1.000 MB"),
+            (1073741824, "1.000 GB"),
+            (1099511627776, "1.000 TB"),
+            (1125899906842624, "1.000 PB"),
             # 超出最大单位: 落到 EB, 不退回 B
-            (2**70 * 12, "12288.0 EB"),  # 12 ZB -> 最远单位 EB
+            (2**70 * 12, "12288.000 EB"),  # 12 ZB -> 最远单位 EB
         ],
     )
     def test_fmt_size(self, n, expected):
@@ -2793,26 +2793,22 @@ class TestParseTrapSaveOffsets:
 # ============================================================
 #  _fmt_instr_count — 指令数 human-readable
 # ============================================================
-
-
-class TestFmtInstrCount:
-    """_fmt_instr_count 格式化."""
-
-    def test_small(self):
-        assert Debugger._fmt_instr_count(0) == "0"
-        assert Debugger._fmt_instr_count(999) == "999"
-
-    def test_k(self):
-        assert Debugger._fmt_instr_count(1000) == "1.000K"
-        assert Debugger._fmt_instr_count(500000) == "500.000K"
-        assert Debugger._fmt_instr_count(999999) == "999.999K"
-
-    def test_m(self):
-        assert Debugger._fmt_instr_count(1_000_000) == "1.000M"
-        assert Debugger._fmt_instr_count(500_000_000) == "500.000M"
-
-    def test_b(self):
-        assert Debugger._fmt_instr_count(1_000_000_000) == "1.000B"
+@pytest.mark.parametrize(
+    "val, expected_str",
+    [
+        (0, "0.000"),
+        (99, "99.000"),
+        (999, "999.000"),
+        (1000, "1.000K"),
+        (500000, "500.000K"),
+        (999999, "999.999K"),
+        (1_000_000, "1.000M"),
+        (500_000_000, "500.000M"),
+        (1_000_000_000, "1.000B"),
+    ],
+)
+def test_fmt_instr_cnt(self, val: int, expected_str: str):
+    assert Debugger._fmt_instr_count(val) == expected_str
 
 
 # ============================================================

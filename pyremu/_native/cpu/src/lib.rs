@@ -1,15 +1,17 @@
-//! Pyremu native acceleration library — RISC-V full instruction dispatch,
-//! TLB, PMP matching, Sv39 page-table walk, and ALU compute.
+//! Pyremu 加速执行引擎的 Rust 库, 提供 RISC-V 指令分发,
+//! TLB, PMP 匹配, Sv39 页表遍历与 ALU 运算.
 //!
-//! All public symbols use `#[no_mangle] pub extern "C"` for ctypes interop.
+//! 全部公开符号以 `#[no_mangle] pub extern "C"` 导出, 供 ctypes 调用.
 
 mod alu;
 mod atom_instr;
 mod concurrent;
 mod consts;
+pub mod csr;
 mod decode;
 mod ffi;
 mod fpu;
+pub mod handlers;
 mod hart_sched;
 mod interrupt;
 mod mem;
@@ -18,10 +20,8 @@ mod op_dispatcher;
 mod peripheral;
 mod pmp;
 mod state;
-mod trap;
-pub mod csr;
-pub mod handlers;
 pub mod translate;
+mod trap;
 
 pub use alu::*;
 pub use consts::*;

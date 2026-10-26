@@ -4,7 +4,7 @@
 //! ext_mod 模块由本入口按源码包含, 由主机上的测试工具链编译。树内引用的平台符号由本
 //! 文件声明。
 //!
-//! 取入一个模块时对平台的依赖有三处: 模块窗口内下一个空闲 VA, 映像槽位的物理页与页表
+//! 取入一个模块时对平台的依赖有三处: 扩展模块虚拟地址空间内下一个空闲 VA, 映像槽位的物理页与页表
 //! 页, 以及验签。`context` 与 `attest` 取 `src/` 内的实现, `mem` 与 `paging` 由本文件
 //! 给出, 理由见这两个模块的说明。
 //!
@@ -22,7 +22,7 @@
 //! 本入口内的一项限制, 与飞地内的取入无关: 主机侧充当映像的是一段固定的映射 (见
 //! [`image_va`]), 而每次取入按槽位的字节数推进 `enclave_module_load_va`, 故同一次 `prepare` 之内
 //! 对同一个模块编号只取入一次 —— 第二次会以该映射之后的地址当作映像的加载地址, 那里没有
-//! 描述块。模块以无重定位的映像交付 (见 `src/ext_mod/abi.rs`), 在飞地内于模块窗口的
+//! 描述块。模块以无重定位的映像交付 (见 `src/ext_mod/abi.rs`), 在飞地内于扩展模块虚拟地址空间的
 //! 任何地址都能执行, 故飞地内不存在这一限制。
 
 #![allow(dead_code)]
@@ -229,7 +229,7 @@ mod ext_mod;
 
 use constants::{
 	CHUNK_2M_SIZE, ENCLAVE_MEM_ATTR_DATA, ENCLAVE_MEM_ATTR_INSTR, ENCLAVE_MODULE_LOAD_VA_INIT,
-	ENCLAVE_MODULE_WINDOW_SIZE, LEVEL_PAGE, PAGE_SIZE, PTE_R, PTE_W, PTE_X, SIG_LEN,
+	EXT_MODS_VAS_SIZE, LEVEL_PAGE, PAGE_SIZE, PTE_R, PTE_W, PTE_X, SIG_LEN,
 };
 use ext_mod::abi::{
 	GetterFn, MAX_MODULES, MODULE_NAME_LEN, ModuleDesc, ModuleInterface, SyscallTable,
@@ -251,7 +251,7 @@ const IMG_LEN: u64 = 2 * PAGE_SIZE;
 /// `IMG_LEN` 取 2 页时该值同为 2 页, 故可写部分自映像末尾之后的第一个页边界开始。
 const EXEC_LEN: u64 = ((IMG_LEN - (SIG_LEN as u64) + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 
-/// 一个模块在模块窗口内占用的字节数, 与 `src/ext_mod/loader.rs` 的 `MODULE_SLOT_SIZE` 取值
+/// 一个模块在扩展模块虚拟地址空间内占用的字节数, 与 `src/ext_mod/loader.rs` 的 `MODULE_SLOT_SIZE` 取值
 /// 相同。
 const SLOT_SIZE: u64 = CHUNK_2M_SIZE;
 
@@ -348,7 +348,7 @@ unsafe extern "C" {
 
 /// 建立映像缓冲区并返回其起始地址; 已建立时直接返回。
 ///
-/// 飞地内的映像由管理程序在模块窗口内分配并映射, 主机侧没有等价设施: 映像要求可执行,
+/// 飞地内的映像由管理程序在扩展模块虚拟地址空间内分配并映射, 主机侧没有等价设施: 映像要求可执行,
 /// 而本进程内可写的段不可执行。故本入口经 `mmap` 建立一段可读可写可执行的匿名映射充当
 /// 映像的加载地址, 其中的内容由 [`stage_image`] 在交付时写入。
 fn image_va() -> u64 {
@@ -628,7 +628,7 @@ impl Transport for HostTransport {
 //  用例辅助
 // ---------------------------------------------------------------
 
-/// 把模块窗口内下一个空闲 VA 置到映像的加载地址, 并设置模块映像的编号、处理函数表指针
+/// 把扩展模块虚拟地址空间内下一个空闲 VA 置到映像的加载地址, 并设置模块映像的编号、处理函数表指针
 /// 与操作表指针, 同时清空 `mem`、`paging` 与 `prim` 内各计数器的记录。
 ///
 /// 处理函数表指针取缓冲区内的一个 8 字节对齐地址; 操作表指针取空, 由需要它的用例另行设置。
@@ -673,7 +673,7 @@ fn entry_calls() -> u64 {
 	DUMMY_IMG_INIT_CALLS.load(Ordering::SeqCst)
 }
 
-/// 模块窗口内下一个空闲 VA。
+/// 扩展模块虚拟地址空间内下一个空闲 VA。
 fn next_free_va() -> u64 {
 	context::ctx().enclave_module_load_va
 }
@@ -754,13 +754,12 @@ fn test_load_rejects_an_image_shorter_than_one_signature() {
 	}
 }
 
-/// 槽位越过模块窗口上界时取入被拒。
+/// 槽位越过扩展模块虚拟地址空间的上界时取入被拒。
 #[test]
-fn test_load_rejects_an_image_that_overruns_the_module_window() {
+fn test_load_rejects_an_image_that_overruns_the_module_vas() {
 	let _guard = serial();
 	let (_, man) = prepare(0x03);
-	context::ctx_mut().enclave_module_load_va =
-		ENCLAVE_MODULE_LOAD_VA_INIT + ENCLAVE_MODULE_WINDOW_SIZE;
+	context::ctx_mut().enclave_module_load_va = ENCLAVE_MODULE_LOAD_VA_INIT + EXT_MODS_VAS_SIZE;
 	let transport = HostTransport::writing(IMG_LEN);
 
 	assert_load_fails(
@@ -772,15 +771,15 @@ fn test_load_rejects_an_image_that_overruns_the_module_window() {
 	assert_eq!(transport.fetch_calls(), 0);
 }
 
-/// 窗口上界按槽位的字节数判定, 不按映像自身的字节数。
+/// 上界按槽位的字节数判定, 不按映像自身的字节数。
 ///
 /// 该用例的 `enclave_module_load_va` 距上界不足一个槽位, 而上界判定按槽位, 故越界。
 #[test]
-fn test_load_rejects_a_slot_that_overruns_the_window() {
+fn test_load_rejects_a_slot_that_overruns_the_vas() {
 	let _guard = serial();
 	let (_, man) = prepare(0x04);
 	context::ctx_mut().enclave_module_load_va =
-		ENCLAVE_MODULE_LOAD_VA_INIT + ENCLAVE_MODULE_WINDOW_SIZE - SLOT_SIZE + 1;
+		ENCLAVE_MODULE_LOAD_VA_INIT + EXT_MODS_VAS_SIZE - SLOT_SIZE + 1;
 	let transport = HostTransport::writing(IMG_LEN);
 
 	assert_load_fails(
@@ -792,13 +791,13 @@ fn test_load_rejects_a_slot_that_overruns_the_window() {
 	assert_eq!(transport.fetch_calls(), 0);
 }
 
-/// 下一个空闲 VA 恰好停在窗口上界时最后一个槽位仍可取入: 上界判定是越过窗口而非到达窗口。
+/// 下一个空闲 VA 恰好停在上界时最后一个槽位仍可取入: 上界判定是越过而非到达。
 #[test]
-fn test_load_admits_the_last_slot_of_the_window() {
+fn test_load_admits_the_last_slot_of_the_vas() {
 	let _guard = serial();
 	let (_, man) = prepare(0x05);
 	context::ctx_mut().enclave_module_load_va =
-		ENCLAVE_MODULE_LOAD_VA_INIT + ENCLAVE_MODULE_WINDOW_SIZE - SLOT_SIZE;
+		ENCLAVE_MODULE_LOAD_VA_INIT + EXT_MODS_VAS_SIZE - SLOT_SIZE;
 	let transport = HostTransport::writing(IMG_LEN);
 	paging::PAGE_TABLE_ALLOC_FAIL.store(true, Ordering::SeqCst);
 
@@ -954,7 +953,7 @@ fn test_load_returns_the_registered_getter_without_fetching_again() {
 
 /// 接口中的模块编号与请求的编号不一致时取入被拒, 且不登记。
 ///
-/// 接收缓冲区在此之前已经建成, 故模块窗口的位置不回收。
+/// 接收缓冲区在此之前已经建成, 故扩展模块虚拟地址空间的位置不回收。
 #[test]
 fn test_load_rejects_an_interface_whose_module_id_differs() {
 	let _guard = serial();

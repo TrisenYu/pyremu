@@ -34,6 +34,8 @@ def _make_aia_emu(num_harts: int = 1) -> Emulator:
     cfg.num_harts = num_harts
     cfg.ram_base = 0x4000_0000
     cfg.prog_cnt = 0x4000_0000
+    # 该内存基址与默认的引导只读存储器窗口重合, 设备先于主存查找, 故不注册.
+    cfg.rom_base = 0
     return Emulator(cfg)
 
 
@@ -42,6 +44,7 @@ def _make_legacy_emu(num_harts: int = 1) -> Emulator:
     cfg.num_harts = num_harts
     cfg.ram_base = 0x4000_0000
     cfg.prog_cnt = 0x4000_0000
+    cfg.rom_base = 0
     return Emulator(cfg)
 
 
@@ -306,6 +309,8 @@ def _make_aia_emu_with_nics() -> Emulator:
     cfg.num_harts = 1
     cfg.ram_base = 0x4000_0000
     cfg.prog_cnt = 0x4000_0000
+    # 该内存基址与默认的引导只读存储器窗口重合, 设备先于主存查找, 故不注册.
+    cfg.rom_base = 0
     cfg.periph.virtio_net_s_base = _NET_S_BASE
     cfg.periph.virtio_net_m_base = _NET_M_BASE
     return Emulator(cfg)

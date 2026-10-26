@@ -89,7 +89,7 @@ pub unsafe fn memcpy(dst: *mut u8, src: *const u8, size: u64) {
 
 #[cfg(test)]
 mod tests {
-	use super::{ memcpy, memset };
+	use super::{memcpy, memset};
 
 	/// 缓冲区总长, 以及其中可供被测函数写入的区间 [REGION_START, REGION_END)。
 	const BUF_LEN: usize = 80;
@@ -122,8 +122,8 @@ mod tests {
 
 		/// 指定区间之外的字节是否仍为初值。
 		fn is_outside_intact(&self) -> bool {
-			self.raw[..REGION_START].iter().all(|&b| b == INIT) &&
-				self.raw[REGION_END..].iter().all(|&b| b == INIT)
+			self.raw[..REGION_START].iter().all(|&b| b == INIT)
+				&& self.raw[REGION_END..].iter().all(|&b| b == INIT)
 		}
 	}
 
@@ -136,12 +136,7 @@ mod tests {
 			memset(dst.ptr(), 0xaa, 0);
 			memcpy(dst.ptr(), src.as_ptr(), 0);
 		}
-		assert!(
-			dst
-				.region()
-				.iter()
-				.all(|&b| b == INIT)
-		);
+		assert!(dst.region().iter().all(|&b| b == INIT));
 		assert!(dst.is_outside_intact());
 	}
 
@@ -155,14 +150,8 @@ mod tests {
 			}
 			let n = size as usize;
 			let region = dst.region();
-			assert!(
-				region[..n].iter().all(|&b| b == 0xaa),
-				"size={size}"
-			);
-			assert!(
-				region[n..].iter().all(|&b| b == INIT),
-				"size={size}"
-			);
+			assert!(region[..n].iter().all(|&b| b == 0xaa), "size={size}");
+			assert!(region[n..].iter().all(|&b| b == INIT), "size={size}");
 			assert!(dst.is_outside_intact(), "size={size}");
 		}
 	}
@@ -200,10 +189,7 @@ mod tests {
 					region[off..off + n].iter().all(|&b| b == 0x5a),
 					"off={off} size={size}"
 				);
-				assert!(
-					region[..off].iter().all(|&b| b == INIT),
-					"off={off}"
-				);
+				assert!(region[..off].iter().all(|&b| b == INIT), "off={off}");
 				assert!(
 					region[off + n..].iter().all(|&b| b == INIT),
 					"off={off} size={size}"
@@ -226,13 +212,7 @@ mod tests {
 			}
 			let n = size as usize;
 			assert_eq!(&dst.region()[..n], &src[..n], "size={size}");
-			assert!(
-				dst
-					.region()
-					[n..].iter()
-					.all(|&b| b == INIT),
-				"size={size}"
-			);
+			assert!(dst.region()[n..].iter().all(|&b| b == INIT), "size={size}");
 			assert!(dst.is_outside_intact(), "size={size}");
 		}
 	}

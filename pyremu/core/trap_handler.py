@@ -82,7 +82,6 @@ def update_hw_mip(hart: HartWithRegs, hw_mip_bits: int) -> None:
     hart._csr_write_raw("mip", (current & ~_HW_MIP_MASK) | hw_mip_bits)
 
 
-
 # ============================================================
 #  IMSIC eip trap-entry cleanup (legacy mode)
 # ============================================================
@@ -102,6 +101,7 @@ def _imsic_clear_ipi_on_trap(hart: HartWithRegs, exc_code: int) -> None:
     # 经 IMSIC 并发安全清除 eip, 与 RX daemon 的 set_ip_number RMW
     # 互斥, 避免 eip[word] 的丢失更新.
     imsic.clear_ipi_on_trap(hart.id, exc_code)
+
 
 # ============================================================
 #  Trap 处理
@@ -206,7 +206,7 @@ def _trap_deliver_smode(
         hart.pc = tvec_base
     else:
         # vectored: 所有异常跳转 BASE, 中断跳转 BASE + 4 * exc_code
-        hart.pc = (tvec_base + 4 * exc_code)
+        hart.pc = tvec_base + 4 * exc_code
 
     # MSIP/SSIP 中断投递到 S 模式: 同步清零 CLINT MSIP + IMSIC eip.
     # 在 AIA 模式下 IPI 通过 MEIP/SEIP (cause 11/9) 投递，eip 由 MTOPEI/
@@ -275,7 +275,7 @@ def _trap_deliver_mmode(
     if tvec_mode == 0 or not is_interrupt:
         hart.pc = tvec_base
     else:
-        hart.pc = (tvec_base + 4 * exc_code)
+        hart.pc = tvec_base + 4 * exc_code
 
     # MSIP 中断: 同步清零 CLINT MSIP + IMSIC eip (legacy mode).
     if is_interrupt and exc_code == 3:  # MSIP (mcause code 3)
@@ -333,7 +333,7 @@ def _semihosting_write_stderr(data: bytes) -> None:
     """
     try:
         os.write(2, data)
-    except (OSError, ValueError):
+    except OSError, ValueError:
         pass
 
 
@@ -354,7 +354,7 @@ def _sh_read_ram(
         return b"\x00" * size
     ram: bytearray = bus._ram
     off = pa - bus.ram_base
-    return bytes(ram[off:off + size])
+    return bytes(ram[off : off + size])
 
 
 def _semihosting_markers_match(
@@ -391,7 +391,7 @@ def _semihosting_service(
         hart._semihosting_sys_exit = True
         return
     if op == _SEMIHOSTING_SYS_WRITEC:
-        # 参数块指向单个字符 (SYS_WRITEC)
+        # 参数块指向单个字符
         ch = _sh_read_ram(hart, param, 1)[0]
         _semihosting_write_stderr(bytes([ch]))
         hart.gprs[10] = 0
@@ -405,8 +405,11 @@ def _semihosting_service(
             hart.gprs[10] = 0
         elif fd not in (1, 2):
             hart.gprs[10] = _SEMIHOSTING_ERR
-        elif bus is None or not bus.is_ram_addr(buf_addr) or \
-                not bus.is_ram_addr(buf_addr + length - 1):
+        elif (
+            bus is None
+            or not bus.is_ram_addr(buf_addr)
+            or not bus.is_ram_addr(buf_addr + length - 1)
+        ):
             hart.gprs[10] = _SEMIHOSTING_ERR
         else:
             _semihosting_write_stderr(_sh_read_ram(hart, buf_addr, length))
@@ -449,7 +452,7 @@ def trap_mret(
         return
     mstatus = hart.mstatus_val
 
-    # 恢复特权级: mode <- MPP
+    # 恢复特权级
     mpp = (mstatus & MSTATUS_MPP) >> 11
     _mpp_to_mode = {0: RiscvMode.U, 1: RiscvMode.S, 3: RiscvMode.M}
     hart.mode = _mpp_to_mode.get(mpp, RiscvMode.U)
@@ -487,7 +490,7 @@ def trap_sret(
         return
     mstatus = hart.mstatus_val
 
-    # 恢复特权级: mode <- SPP
+    # 恢复特权级
     spp = (mstatus & MSTATUS_SPP) >> 8
     hart.mode = RiscvMode.U if spp == 0 else RiscvMode.S
 
@@ -549,11 +552,6 @@ def handle_wfi(
     # 无可处理中断则进入等待状态, 重置唤醒标记
     hart._waiting = True
     hart._wfi_woken = False
-
-
-# ============================================================
-#  中断检查 (指令边界)
-# ============================================================
 
 
 def _compute_next_timer(
@@ -733,9 +731,7 @@ def check_pending_interrupts(hart: HartWithRegs) -> bool:
     # 用预计算 mode int 替代 .value property 访问.
     mode_int = hart.mode.value
     mideleg = hart.csrs["mideleg"].val
-    s_mode_global = mode_int < _MODE_S or (
-        hart.mode == RiscvMode.S and hart.sie
-    )
+    s_mode_global = mode_int < _MODE_S or (hart.mode == RiscvMode.S and hart.sie)
 
     ret = False
     # 按优先级找最高优先级的使能中断.

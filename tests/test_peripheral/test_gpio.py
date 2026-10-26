@@ -184,7 +184,6 @@ class TestGPIOConfig:
         )
 
     def test_default_gpio_base_follows_build_config(self):
-        """默认 GPIO 基址取自 emu-configs.mk 生成的常量."""
         assert PeripheralConfig().gpio_base == configs_gen.GPIO_BASE
 
     def test_emulator_registers_device(self):

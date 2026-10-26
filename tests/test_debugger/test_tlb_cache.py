@@ -4,7 +4,9 @@
 
 """测试 pyremu.debug.tlb_cache — TLB/Cache 显示."""
 
-from pyremu.debug.tlb_cache import TlbCacheMixin
+from rich.console import Console
+
+from pyremu.debug.tlb_cache import TlbCacheOps
 from pyremu.emulator import Emulator
 
 # ============================================================
@@ -12,11 +14,10 @@ from pyremu.emulator import Emulator
 # ============================================================
 
 
-class _TestTlbDbg(TlbCacheMixin):
-    """最小聚合类供 TlbCacheMixin 测试."""
+class _TestTlbDbg(TlbCacheOps):
+    """最小聚合类供 TlbCacheOps 测试."""
 
     def __init__(self, emu, hart_id=0):
-        from rich.console import Console
         self._emu = emu
         self._hart_id = hart_id
         self._console = Console(highlight=False)
@@ -43,16 +44,16 @@ class TestTlbPageSize:
     """_tlb_page_size 静态方法."""
 
     def test_level_0_is_4k(self):
-        assert TlbCacheMixin._tlb_page_size(0) == "4K"
+        assert TlbCacheOps._tlb_page_size(0) == "4K"
 
     def test_level_1_is_2m(self):
-        assert TlbCacheMixin._tlb_page_size(1) == "2M"
+        assert TlbCacheOps._tlb_page_size(1) == "2M"
 
     def test_level_2_is_1g(self):
-        assert TlbCacheMixin._tlb_page_size(2) == "1G"
+        assert TlbCacheOps._tlb_page_size(2) == "1G"
 
     def test_unknown_level(self):
-        assert "Lv3" in TlbCacheMixin._tlb_page_size(3)
+        assert "Lv3" in TlbCacheOps._tlb_page_size(3)
 
 
 # ============================================================
@@ -64,30 +65,30 @@ class TestHexdumpBytes:
     """_hexdump_bytes 静态方法."""
 
     def test_empty(self):
-        result = TlbCacheMixin._hexdump_bytes(b"")
+        result = TlbCacheOps._hexdump_bytes(b"")
         assert result == ""
 
     def test_short_data(self):
         data = b"\x00\x01\x02\x03"
-        result = TlbCacheMixin._hexdump_bytes(data)
+        result = TlbCacheOps._hexdump_bytes(data)
         assert "0000" in result
         assert "00 01 02 03" in result
 
     def test_sixteen_bytes_single_line(self):
         data = bytes(range(16))
-        result = TlbCacheMixin._hexdump_bytes(data)
+        result = TlbCacheOps._hexdump_bytes(data)
         lines = result.split("\n")
         assert len(lines) == 1
 
     def test_multi_line(self):
         data = bytes(range(32))
-        result = TlbCacheMixin._hexdump_bytes(data)
+        result = TlbCacheOps._hexdump_bytes(data)
         lines = result.split("\n")
         assert len(lines) == 2
 
     def test_indent(self):
         data = b"\x00\x01"
-        result = TlbCacheMixin._hexdump_bytes(data, indent="  ")
+        result = TlbCacheOps._hexdump_bytes(data, indent="  ")
         assert result.startswith("  ")
 
 

@@ -19,18 +19,26 @@ static int n, solutions, rec_x[16], rec_y[16];
 static unsigned int row_mask, col_mask, xl_mask, xr_mask;
 
 // ---- 位掩码辅助 ----
-static int check_pos(int pos, unsigned int v) {
+static int check_pos(
+	int pos,
+	unsigned int v) {
 	return (v >> pos) & 1;
 }
-static void set_pos(int pos, unsigned int *v) {
+static void set_pos(
+	int pos,
+	unsigned int *v) {
 	*v |= (1u << pos);
 }
-static void unset_pos(int pos, unsigned int *v) {
+static void unset_pos(
+	int pos,
+	unsigned int *v) {
 	*v &= ~(1u << pos);
 }
 
 // ---- DFS (与原版 n-queen.cc 一致) ----
-static void dfs(int pos, int num) {
+static void dfs(
+	int pos,
+	int num) {
 	if (num >= n) {
 		solutions++;
 		return;

@@ -14,7 +14,6 @@ from pyremu.utils.file_ops import (
     get_abs_filename_arr_from_dir,
     is_file,
     is_path_existed,
-    path_join,
     reloc_path,
 )
 

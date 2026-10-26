@@ -9,8 +9,6 @@ Linux ``irq-riscv-aplic-msi.c``。测试通过 MMIO 配置 sourcecfg/target/seti
 再经 ``set_irq`` 模拟外设中断线, 验证 MSI 投递到 IMSIC S-file。
 """
 
-import pytest
-
 from pyremu.interrupt.aplic import APLIC
 from pyremu.interrupt.imsic import IMSIC
 
@@ -54,11 +52,11 @@ def _r(dev: APLIC, offset: int) -> int:
 
 def _configure(a: APLIC, src: int, hart: int, eiid: int, *, level: bool) -> None:
     """通过 MMIO 配置一个源 — 模拟内核 aplic_msi_write_msg + set_type 流程."""
-    # target[src] = (hart << 18) | eiid
+    # 目标寄存器写入 hart 编号左移 18 位后与 EIID 的并集
     _w(a, _TARGET_BASE + (src - 1) * 4, (hart << _HART_SHIFT) | eiid)
     # sourcecfg[src] = SM 触发类型
     _w(a, _SOURCECFG_BASE + (src - 1) * 4, _SM_LEVEL_HIGH if level else _SM_EDGE_RISE)
-    # 使能源 (setienum)
+    # 通过 SETIENUM 使能该源
     _w(a, _SETIENUM, src)
 
 
@@ -110,8 +108,8 @@ class TestAplicRouting:
         """边沿触发: 外设拉高电平时投递到 hart 0 S-file 的 eiid."""
         a = _make_aplic()
         imsic = a._imsic
-        imsic.csr_write(0, 'S', 0x70, 1)  # S-file eidelivery=1
-        imsic.csr_write(0, 'S', 0xC0, 1 << 6)  # S-file eie bit 6
+        imsic.csr_write(0, "S", 0x70, 1)  # S-file eidelivery=1
+        imsic.csr_write(0, "S", 0xC0, 1 << 6)  # S-file eie bit 6
         _configure(a, 1, hart=0, eiid=6, level=False)
         a.set_irq(1, True)
         mip = imsic.get_pending_mip(0)
@@ -121,8 +119,8 @@ class TestAplicRouting:
         """电平触发: 拉高投递, 撤除后输入电平回落."""
         a = _make_aplic()
         imsic = a._imsic
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.csr_write(0, 'S', 0xC0, 1 << 6)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.csr_write(0, "S", 0xC0, 1 << 6)
         _configure(a, 1, hart=0, eiid=6, level=True)
         a.set_irq(1, True)
         assert a._state[1] & 1 << 8, "input level should be high"
@@ -137,8 +135,8 @@ class TestAplicRouting:
         imsic = a._imsic
         # hart 0 与 hart 1 均使能 eiid 7
         for h in (0, 1):
-            imsic.csr_write(h, 'S', 0x70, 1)
-            imsic.csr_write(h, 'S', 0xC0, 1 << 7)
+            imsic.csr_write(h, "S", 0x70, 1)
+            imsic.csr_write(h, "S", 0xC0, 1 << 7)
         _configure(a, 1, hart=1, eiid=7, level=False)
         a.set_irq(1, True)
         assert imsic.get_pending_mip(1) & (1 << 9), "hart 1 should get SEIP"
@@ -148,8 +146,8 @@ class TestAplicRouting:
         """sourcecfg=INACTIVE 时外设中断不投递."""
         a = _make_aplic()
         imsic = a._imsic
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.csr_write(0, 'S', 0xC0, 1 << 6)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.csr_write(0, "S", 0xC0, 1 << 6)
         # target 已设但 sourcecfg 仍 INACTIVE
         _w(a, _TARGET_BASE, (0 << _HART_SHIFT) | 6)
         a.set_irq(1, True)
@@ -168,8 +166,8 @@ class TestAplicSetipnum:
         """setipnum 置 pending 后投递 MSI."""
         a = _make_aplic()
         imsic = a._imsic
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.csr_write(0, 'S', 0xC0, 1 << 15)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.csr_write(0, "S", 0xC0, 1 << 15)
         _configure(a, 8, hart=0, eiid=15, level=True)
         # 拉高输入使源保持有效, EOI 后软件写 setipnum 重新检查
         a.set_irq(8, True)
@@ -181,8 +179,8 @@ class TestAplicSetipnum:
         """电平触发源输入已撤除时, setipnum_le 不重挂起 (AIA §4.9.2 防风暴)."""
         a = _make_aplic()
         imsic = a._imsic
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.csr_write(0, 'S', 0xC0, 1 << 15)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.csr_write(0, "S", 0xC0, 1 << 15)
         _configure(a, 8, hart=0, eiid=15, level=True)
         # 拉高投递后再撤除: 输入回落, pending 已由投递清除
         a.set_irq(8, True)
@@ -196,8 +194,8 @@ class TestAplicSetipnum:
         """电平触发源输入仍有效时, setipnum_le 重挂起并投递."""
         a = _make_aplic()
         imsic = a._imsic
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.csr_write(0, 'S', 0xC0, 1 << 15)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.csr_write(0, "S", 0xC0, 1 << 15)
         _configure(a, 8, hart=0, eiid=15, level=True)
         # 拉高输入 (投递清除 pending 但输入保持有效)
         a.set_irq(8, True)
@@ -220,8 +218,8 @@ class TestAplicDomaincfg:
         """IE=0 时不投递, 待 IE=1 时投递 pending 源."""
         a = _make_aplic()
         imsic = a._imsic
-        imsic.csr_write(0, 'S', 0x70, 1)
-        imsic.csr_write(0, 'S', 0xC0, 1 << 6)
+        imsic.csr_write(0, "S", 0x70, 1)
+        imsic.csr_write(0, "S", 0xC0, 1 << 6)
         _configure(a, 1, hart=0, eiid=6, level=True)
         _w(a, _DOMAINCFG, 0)  # IE=0
         a.set_irq(1, True)

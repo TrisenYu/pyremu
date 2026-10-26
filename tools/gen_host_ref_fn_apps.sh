@@ -10,7 +10,7 @@
 # 其余载荷为确定性数值计算, 因此参考输出可复现, 作为模拟器 F/D 指令正确性的
 # 黄金对照 (日后以模拟器跑同一载荷, diff 参考输出即可定位 FP 指令偏差)。
 #
-# 原生构建产物与参考输出统一落在项目 build/ 目录 (configs.mk 的 bins_dir),
+# 原生构建产物与参考输出统一落在项目 build/ 目录 (mk/paths.mk 的 bins_dir),
 # 不污染 cargo 默认的 fn_apps/target/ 与仓库根的 output/ 串口日志目录:
 #   build/host_ref_fn_apps/native/          原生 x86-64 构建产物 (CARGO_TARGET_DIR + knots)
 #   build/host_ref_fn_apps/<name>.out       各载荷参考输出

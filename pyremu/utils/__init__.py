@@ -17,7 +17,7 @@ from pyremu.utils.parse_bin import (
     FirmwareSegment,
     parse_firmware,
 )
-from pyremu.utils.str_aux import fmt_addr, fmt_hexdump
+from pyremu.utils.str_aux import dye_hexdump, fmt_addr, fmt_hexdump
 from pyremu.utils.wrapper import (
     die_if_err,
     print_exc_on_err,
@@ -32,6 +32,7 @@ __all__ = [
     "detect_format",
     "die_if_err",
     "disasm",
+    "dye_hexdump",
     "fmt_addr",
     "fmt_hexdump",
     "get_abs_filename_arr_from_dir",

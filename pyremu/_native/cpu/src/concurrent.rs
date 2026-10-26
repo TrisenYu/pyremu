@@ -1,6 +1,6 @@
-//! Thread-per-hart concurrent execution engine.
+//! 每个 hart 分配一个线程的并发执行引擎.
 //!
-//! ``run_parallel`` is the FFI entry point so the Python side can switch transparently.
+//! ``run_parallel`` 是 FFI 入口, Python 侧得到链接库的调用执行能力.
 use std::cell::Cell;
 use std::sync::{
 	atomic::AtomicBool, atomic::AtomicU32, atomic::AtomicU64, atomic::AtomicU8, atomic::Ordering,
@@ -8,13 +8,8 @@ use std::sync::{
 };
 
 // ============================================================
-//  Items extracted to sibling modules in cpu/src/
 // ============================================================
 //
-// Each extracted module is declared in lib.rs as a top-level module
-// of the pyremu-native crate.  The `use crate::*` paths below bring
-// the pub(crate) items back into scope so `run_parallel` (below) and
-// the test functions can reference them without qualification changes.
 use crate::hart_sched::*;
 
 use crate::ffi::{
@@ -24,17 +19,16 @@ use crate::ffi::{
 use crate::state::{exit_reason, HartState};
 
 // ============================================================
-//  Send/Sync wrappers for FFI raw pointers
+//  FFI 裸指针的 Send 与 Sync 包装类型
 // ============================================================
 //
-// Python holds all backing memory (bytearray, ctypes arrays) alive for
-// the duration of the FFI call.  These wrappers assert Send + Sync
-// so they can cross thread boundaries safely.
+// Python 在整个 FFI 调用期间占有对内存的使用权，例如 bytearray, ctypes 数组.
+// 这些包装类型断言 Send 与 Sync, 使其可以安全地跨线程边界传递.
 
-/// Wrapper around ``MemCtx`` that is ``Send + Sync``.
+/// 设置 ``MemCtx`` 的 Send 与 Sync 类型.
 ///
 /// # Safety
-/// The Python FFI caller must keep the underlying RAM alive.
+/// Python 侧的 FFI 调用方必须保持其传递的内存是有效的.
 #[derive(Clone, Copy)]
 pub(crate) struct SharedMemCtx {
 	pub ram: *mut u8,
@@ -42,14 +36,14 @@ pub(crate) struct SharedMemCtx {
 	pub ram_base: u64,
 	pub shadow_base: u64,
 	pub shadow_size: u64,
-	/// Per-hart LR/SC reservation slots.  LR sets slot[hid]=pa;
-	/// any store clears all slots.  Allocated in ModuleState.
+	/// 每个 hart 的 LR 与 SC 预留槽位. LR 把 slot[hid] 置为物理地址,
+	/// 任一存储指令清除所有槽位. 该数组在 ``ModuleState`` 中分配.
 	pub lr_reserved: *mut AtomicU64,
 }
 unsafe impl Send for SharedMemCtx {}
 unsafe impl Sync for SharedMemCtx {}
 
-/// Wrapper around PMP pointers that is ``Send + Sync``.
+/// 包装 PMP 指针的 Send 与 Sync 类型.
 #[derive(Clone, Copy)]
 pub(crate) struct SharedPmpCtx {
 	pub cfg: *mut u8,
@@ -59,7 +53,7 @@ pub(crate) struct SharedPmpCtx {
 unsafe impl Send for SharedPmpCtx {}
 unsafe impl Sync for SharedPmpCtx {}
 
-/// Wrapper around device MMIO pointers that is ``Send + Sync``.
+/// 包装设备 MMIO 指针的 Send 与 Sync 类型.
 #[derive(Clone, Copy)]
 pub(crate) struct SharedDevCtx {
 	pub bases: *const u64,
@@ -73,69 +67,59 @@ unsafe impl Send for SharedDevCtx {}
 unsafe impl Sync for SharedDevCtx {}
 
 // ============================================================
-//  Concurrent CLINT context — Atomic wrappers around shared state
+//  并发安全的 CLINT 上下文结构
 // ============================================================
 
-/// CLINT state safe for concurrent access across hart threads.
+/// 可供各 hart 线程并发访问的 CLINT 状态.
 ///
-/// All fields are atomic or read-only after initialisation.
-/// Pointers are cast from Python ctypes arrays; on x86-64
-/// ``AtomicU64`` has the same layout as ``u64`` (8 bytes, 8-byte aligned)
-/// and ``AtomicU8`` has the same layout as ``u8`` (1 byte, 1-byte aligned).
+/// 全部字段为原子类型, 或在初始化之后只读.
+/// 指针来自 Python ctypes 数组的类型转换; 在 x86-64 上 ``AtomicU64`` 与 ``u64`` 的
+/// 布局相同, 即 8 字节大小与 8 字节对齐; ``AtomicU8`` 与 ``u8`` 的布局相同,
+/// 即 1 字节大小与 1 字节对齐.
 ///
-/// MSIP is modelled as an **edge counter** (not a level): each write of 1
-/// increments the per-hart counter; ``sync_msip`` detects new edges by
-/// comparing against the last-seen value.  This correctly handles
-/// consecutive writes of 1 without an intervening 0, which a pure
-/// level-triggered detector would miss.
+/// MSIP 建模为边沿计数器而非电平: 每次写入 1 都递增该 hart 的计数器,
+/// ``sync_msip`` 与此前记录的取值比较以识别新的边沿. 连续写入 1 而中间没有
+/// 写入 0 的情形因此不会漏检, 纯电平检测会漏掉这种情形.
 pub struct ConcurrentClintCtx {
 	pub base: u64,
-	/// Shared mtime counter — advanced by clock source
-	/// (``advance_clock_source``), NOT per instruction.
+	/// 共享 mtime 计数器, 由 ``advance_clock_source`` 按已执行的指令条数
+	/// 推进, 据此换算受调试程序的 mtime.
 	pub mtime: *const AtomicU64,
-	/// Per-hart mtimecmp registers — indexed by hart_id.
+	/// 每个 hart 的 mtimecmp 寄存器, 按 hart_id 索引.
 	pub mtimecmp: *const AtomicU64,
-	/// Per-hart MSIP level bytes — indexed by hart_id.
+	/// 每个 hart 的 MSIP 电平字节, 按 hart_id 索引.
 	pub msip: *const AtomicU8,
-	/// mtime 时钟源频率 (Hz) — 0 表示禁用 clock source
-	/// (Rust 单元测试传入 0 保持确定性).
+	/// mtime 时钟源频率, 单位为 Hz; 为 0 时表示禁用时钟源.
 	pub timebase_hz: u64,
 	pub num_harts: u32,
-	/// Per-hart atomic MSIP pending slots (Release write from sender,
-	/// Acquire swap from receiver).  Set after ``ModuleState`` creation.
-	/// ``Cell`` allows late initialisation despite ``&self``.
 	pub msip_pending: Cell<*const AtomicU64>,
-	/// Per-hart OS thread handles for MSIP unpark wake-up.
-	/// Populated by ``run_harts`` after thread spawn; ``Cell`` enables
-	/// late initialisation via ``&self`` (same pattern as ``msip_pending``).
 	pub hart_threads: Cell<*const std::thread::Thread>,
-	/// Per-hart ``HartState`` array (FFI 共享的 hart 状态指针).
+	/// 每个 hart 的 ``HartState`` 数组.
 	///
 	/// 双重用途:
-	/// 1. 跨 hart 读取 ``stimecmp`` (SSTC) — ``wfi_check_all_idle`` 据此在全部
-	///    hart WFI 空闲时判定下一截止时间并以 WFI_WAIT 退出 (mtime 不再在此
-	///    快进; Python 侧据真实剩余休眠并按流逝时间补偿 mtime), legacy 与 AIA
-	///    两种模式都需要 (内核 clockevent 在 legacy 下同样走 SSTC).
-	/// 2. AIA 模式下 ``try_handle_imsic_concurrent`` 跨 hart 置/清目标 hart 的
-	///    IMSIC eip 位 (seteipnum/clreipnum MMIO).
+	/// 1. 跨 hart 读取 ``stimecmp`` (SSTC). ``wfi_check_all_idle`` 据此在全部
+	///    hart 处于 WFI 空闲时确定下一截止时间并以 WFI_WAIT 退出. 此处不推进
+	///    mtime; Python 侧按真实剩余休眠时间与流逝时间补偿 mtime. 传统 PLIC 模式与
+	///    AIA 模式都需要该指针, 内核的时钟事件设备在传统 PLIC 模式下同样使用 SSTC.
+	/// 2. AIA 模式下 ``try_handle_imsic_concurrent`` 跨 hart 置位或清除目标 hart 的
+	///    IMSIC eip 位, 即 seteipnum 与 clreipnum 的 MMIO 访问.
 	///
-	/// 由 ``run_parallel`` 在 FFI 解包后无条件写入.
+	/// 由 ``run_parallel`` 在成功解析 FFI 后无条件写入.
 	pub hart_states: Cell<*const HartState>,
 }
 
-// Safety: Python holds the backing ctypes arrays alive for the FFI call.
-// All pointers target properly-aligned atomic types.
+// 安全性: Python 在 FFI 调用期间保持 ctypes 数组有效, 全部指针都指向正确对齐的原子类型.
 unsafe impl Send for ConcurrentClintCtx {}
 unsafe impl Sync for ConcurrentClintCtx {}
 
 impl ConcurrentClintCtx {
-	/// Build from the FFI ``FfiClintCtx`` raw pointers.
+	/// 由 FFI 的 ``FfiClintCtx`` 裸指针构造.
 	///
 	/// # Safety
 	///
-	/// The caller must ensure the backing ctypes arrays outlive this struct.
-	/// On x86-64 the transmute from ``*mut u64`` to ``*const AtomicU64`` is
-	/// sound because both types have identical size and alignment.
+	/// 调用方必须保证底层 ctypes 数组的生命周期长于本结构.
+	/// 在 x86-64 上把 ``*mut u64`` 转换为 ``*const AtomicU64`` 是合法的,
+	/// 因为两种类型的大小与对齐相同.
 	pub unsafe fn from_ffi(raw: &FfiClintCtx, num_harts: u32) -> Self {
 		ConcurrentClintCtx {
 			base: raw.base,
@@ -150,7 +134,7 @@ impl ConcurrentClintCtx {
 		}
 	}
 
-	/// 取 ``hart_id`` 的 MSIP 待处理槽位地址 — 未初始化时返回空指针.
+	/// 取 hart_id 对应的 MSIP 待处理状态, 未初始化时返回空指针.
 	///
 	/// 槽位地址为 ``msip_pending`` 数组首地址加 ``hart_id * MSIP_PENDING_STRIDE``,
 	/// 与 ``ModuleState::new`` 的分配跨步一致.
@@ -165,10 +149,9 @@ impl ConcurrentClintCtx {
 }
 
 // ============================================================
-//  Stop coordination
 // ============================================================
 
-/// Reason a hart set the global stop flag.
+/// hart 置位全局停止标志的原因.
 #[derive(Clone, Copy)]
 pub struct StopInfo {
 	pub reason: u8,
@@ -202,27 +185,26 @@ impl StopInfo {
 /// 槽位由向其发送 IPI 的 hart 置位, 由本 hart 的 ``sync_msip`` 读取并写入 0.
 pub const MSIP_PENDING_STRIDE: usize = 8;
 
-/// Global coordination state shared across all hart threads.
+/// 各 hart 线程共享的全局协调状态.
 ///
-/// One instance per ``run_parallel`` call, wrapped in ``Arc``.
+/// 每次 ``run_parallel`` 调用对应一个实例
 pub struct ModuleState {
-	/// When set to true, all hart threads must exit at their next
-	/// instruction boundary.
+	/// 为真时, 全部 hart 线程必须在下一条指令退出.
 	pub stop_flag: AtomicBool,
-	/// Details of the stop event, written by the triggering hart.
-	/// Protected by a Mutex so only one hart sets it.
+	/// 停止事件的具体信息, 由触发停止的 hart 写入.
+	/// 由 ``Mutex`` 保护, 保证只有一个 hart 写入.
 	pub stop_info: Mutex<StopInfo>,
-	/// Number of harts currently in WFI spin-wait.
+	/// 当前处于 WFI 自旋等待的 hart 数量.
 	pub wfi_count: AtomicU32,
-	/// Per-hart WFI status flags (index = hart_id).
-	/// Each hart sets its slot to 1 when entering WFI, 0 when leaving.
+	/// 每个 hart 的 WFI 状态标志, 下标为 hart_id.
+	/// hart 进入 WFI 时把自身槽位置为 1, 离开时置为 0.
 	pub wfi_flags: Box<[AtomicU8]>,
-	/// Number of non-halted harts. Set once before threads spawn, read-only after.
+	/// 未停机的 hart 数量. 在线程创建之前设置一次, 之后只读.
 	pub active_hart_num: u32,
-	/// 已发生的 TLB 刷新次数. 使既有翻译条目失效的动作各算一次: 客机执行
-	/// SFENCE.VMA 或改写 satp, 调试器刷新 TLB 或回滚快照, 装入固件. 每发生
-	/// 一次即加一, 由执行该动作的一方加. 该计数由调用方持有, 引擎每轮结束
-	/// 写回, 故两个调用之间积累的刷新对下一轮仍然可见.
+	/// 已发生的 TLB 刷新次数. 使既有翻译条目失效的动作各算一次: 受调试程序
+	/// 执行 SFENCE.VMA 或改写 satp, 调试器刷新 TLB 或回滚快照, 装入固件.
+	/// 该计数由调用方持有, 引擎在每轮开始时装入, 结束时写回, 故两次调用之间
+	/// 发生的刷新对引擎内的条目同样生效.
 	///
 	/// 用计数而不是一个"已失效"标志: 标志上的清除与置位并发时, 清除可能覆盖
 	/// 紧随其后的置位, 使某个 hart 漏掉一次失效; 计数只增不减, 各 hart 比较
@@ -237,33 +219,22 @@ pub struct ModuleState {
 	/// 进入执行循环之前清空自己的两个 TLB — 上一轮留下的条目是否仍然有效
 	/// 没有判定依据.
 	pub is_flush_cnt_persistent: bool,
-	/// Per-hart LR/SC reservation slots.  Each slot holds the PA reserved by
-	/// that hart (0 = no reservation).  Any store to a PA clears matching
-	/// reservations from ALL harts, ensuring correct multi-hart LR/SC semantics
-	/// (RISC-V spec §8.2: "a successful SC on a given hart renders any LR on
-	/// that hart invalid, and a successful AMO, SC, or store on any other hart
-	/// to the reservation set renders any LR on this hart invalid").
+	/// 每个 hart 的 LR 与 SC 预留内存空间. 用于保存该 hart 预留的物理地址,
+	/// 0 表示没有预留. 任一存储指令写入同一物理地址时清除所有 hart 上匹配
+	/// 的预留, 保证多 hart 下 LR 与 SC 的语义正确. RISC-V 规范 §8.2 规定:
+	/// 某 hart 上成功的 SC 使该 hart 上的任何 LR 失效, 任何 hart 上成功的
+	/// AMO、SC 或存储指令写入预留集合时, 使该 hart 上的任何 LR 失效.
 	pub lr_reserved: Box<[AtomicU64]>,
-	/// Per-hart cross-thread MSIP notification.  When another hart writes to
-	/// CLINT MSIP for this hart, the bit is set here atomically (Release).
-	/// This hart's ``sync_msip`` reads & clears it with ``swap(0, Acquire)``
-	/// and merges into ``HartState.mip``.  This avoids the non-atomic RMW race
-	/// on ``HartState.mip`` between the sender's direct write and the receiver's
-	/// ``sync_mtip``/``sync_msip`` calls.
+	/// 每个 hart 的跨线程 MSIP 通知. 其余 hart 写入该 hart 的 CLINT MSIP 时,
+	/// 在此处以 Release 原子地置位; 本 hart 的 ``sync_msip`` 以 swap(0, Acquire)
+	/// 读出并清除, 再合并进 ``HartState.mip``. 这样避免了发送方直接写入与接收方
+	/// ``sync_mtip`` 与 ``sync_msip`` 调用之间对 ``HartState.mip`` 的非原子读改写竞争.
 	pub msip_pending: Box<[AtomicU64]>,
-	/// 本轮加速执行起点 Instant — 仅看门狗用它判定时钟源超时.
 	pub st_time_val: std::time::Instant,
-	/// marshal 时的 mtime 基准值. 指令推进的基准:
+	/// ``marshal_hart`` 写入的 mtime 基准值.
 	pub time_base_val: u64,
-	/// 每 hart 本轮加速执行起始时的指令计数, marshal 时快照.
+	/// 每 hart 在本轮加速执行开始时的指令计数, 由 ``marshal_hart`` 记录.
 	/// ``advance_clock_source`` 用 ``state.total_instrs - instr_ref_num[hid]``
-	/// 计算本轮已执行的指令增量并换算 mtime tick, 故受调试程序时钟随已执行指令
-	/// 推进, 与主机单调时钟无关. 模拟速度为 2.5 至 6 MIPS 时, 若 mtime 跟随真实
-	/// 流逝, 内核 HZ=250 的定时器 tick 相隔 4 ms 的受调试程序时间, 仅对应约 1e4
-	/// 条指令, 而 tick 处理路径实测可长达 5e4 条指令, 每处理完一次 tick 即已再
-	/// 次到期, 陷入 mret 后立即再 trap 的活锁. 改为按指令推进后每指令 20 纳秒,
-	/// tick 间隔 2e5 条指令, 留有 4 倍余量; rdtime 预算循环仍可完成, 如内核
-	/// unaligned-access 测速的 8 ms 折合 4e6 条指令.
 	pub instr_ref_num: Box<[u64]>,
 }
 
@@ -306,18 +277,17 @@ impl ModuleState {
 		}
 	}
 
-	/// Set the stop flag and record the reason.  Only the first caller
-	/// wins; subsequent callers are silently ignored.
+	/// 使能停止标志并记录原因. 只有第一个调用方生效, 后续调用方被忽略.
 	pub fn request_stop(&self, info: StopInfo) {
 		if self.stop_flag.swap(true, Ordering::Release) {
-			return; // already stopping
+			return; // 已处于停止状态
 		}
 		if let Ok(mut guard) = self.stop_info.lock() {
 			*guard = info;
 		}
 	}
 
-	/// Check whether all non-halted harts are in WFI.
+	/// 判定未停机的 hart 是否全部处于 WFI 等待.
 	#[inline]
 	pub fn all_in_wfi(&self) -> bool {
 		self.wfi_count.load(Ordering::Acquire) >= self.active_hart_num
@@ -325,7 +295,7 @@ impl ModuleState {
 }
 
 // ============================================================
-//  FFI entry point helpers
+//  FFI 入口辅助函数
 // ============================================================
 
 #[inline]
@@ -364,39 +334,36 @@ unsafe fn build_bps(bp: *const FfiBpCtx) -> &'static [u64] {
 	std::slice::from_raw_parts(bp.addrs, bp.count as usize)
 }
 
-/// 软件看门狗轮询周期 (us) — 周期性向中断控制器发置位请求信号的间隔, 兼作看门狗自身阻塞的周期.
+/// 软件看门狗轮询周期, 单位为微秒, 兼作看门狗自身阻塞的周期.
 ///
-/// 停驻的 WFI hart 按此周期自行醒来重查停止标志.
+/// 处于 WFI 等待的 hart 按此周期自行醒来重新检查停止标志.
 pub(crate) const WATCHDOG_POLL_US: u64 = 5_000;
 
-/// 唤醒所有已注册 hart 线程 — WFI hart 现以 ``park()`` 无限阻塞,
-/// 必须由看门狗/完成信号显式 ``unpark`` (解耦通知) 才能醒来.
+/// 唤醒所有已注册的 hart 线程. WFI 中的 hart 以 ``park_timeout`` 阻塞,
+/// 由看门狗或完成信号调用 ``unpark`` 显式唤醒.
 fn unpark_all_harts(clint: &ConcurrentClintCtx) {
 	let ptr = clint.hart_threads.get();
 	if ptr.is_null() {
 		return;
 	}
-	// Safety: ``hart_threads`` 由 ``run_harts`` 在线程全部 spawn 后写入,
-	// 并在 join 前保持有效; 本函数仅在 ``run_harts`` 生命周期内被调用.
+	// 安全前提: ``hart_threads`` 由 ``run_harts`` 在线程全部创建后写入,
+	// 并在 ``join`` 之前保持有效; 本函数只在 ``run_harts`` 的生命周期内调用.
 	let slice = unsafe { std::slice::from_raw_parts(ptr, clint.num_harts as usize) };
 	for t in slice {
 		t.unpark();
 	}
 }
 
-/// 软件看门狗线程 — 单轮加速执行内的低延迟唤醒源.
+/// 软件看门狗线程
 ///
-/// WFI hart 以 ``park_timeout(WATCHDOG_POLL_US)`` 自醒阻塞 (既支持外部 unpark
-/// 立即唤醒, 又在外部唤醒消失时自行醒来重查停止标志与中断挂起). 看门狗按固定
-/// 周期 (``WATCHDOG_POLL_US``, 时钟源) 周期性 ``unpark_all_harts`` 唤醒全部
-/// WFI hart, 降低自醒延迟: 被唤醒的 hart 重新执行 ``wfi_sync_and_check`` ->
-/// ``sync_mtip``/``sync_msip``/``sync_imsic``, 由中断控制器判定定时器/软件/
-/// 外部中断是否挂起 (置位对应 mip 位), 挂起则退出 WFI 投递中断, 否则重新阻塞.
+/// WFI 中的 hart 以 ``park_timeout(WATCHDOG_POLL_US)`` 从睡眠中唤醒. 看门狗按固定
+/// 周期调用 ``unpark_all_harts`` 唤醒全部 WFI hart, 被唤醒的 hart 重新执行
+/// ``wfi_sync_and_check``, 经 ``sync_mtip``、``sync_msip`` 与 ``sync_imsic``
+/// 判定定时器、软件与外部中断是否挂起. 挂起则投递中断, 否则重新阻塞.
 ///
-/// 定时器 (mtime) 的推进与截止判定都不归看门狗管: mtime 由活动 hart 在指令
-/// 边界按时钟源流逝推进 (``advance_clock_source``), 全部 WFI 空闲时由
-/// ``wfi_check_all_idle`` 判定下一截止时间并以 WFI_WAIT 退出, 由 Python 侧
-/// 休眠 (remaining/timebase) 并按睡眠流逝时间补偿推进 mtime (clint.tick).
+/// 由 ``advance_clock_source`` 推进 mtime; 全部 hart 处于 WFI 时由
+/// ``wfi_check_all_idle`` 确定下一截止时间并以 WFI_WAIT 退出, Python 侧按
+/// 剩余时间休眠并按睡眠流逝时间补偿推进 mtime.
 fn watchdog_loop(
 	module: &ModuleState,
 	clint: &ConcurrentClintCtx,
@@ -405,7 +372,7 @@ fn watchdog_loop(
 	timeout_ns: u64,
 ) {
 	loop {
-		// 1. 时钟源超时 (终止条件): 越过 timeout_ns 时以 TIMEOUT 停止.
+		// 1. 时钟源超时, 即终止条件: 越过 timeout_ns 时以 TIMEOUT 原因停止.
 		if timeout_ns != 0 && module.st_time_val.elapsed().as_nanos() as u64 >= timeout_ns {
 			module.request_stop(StopInfo {
 				reason: exit_reason::TIMEOUT,
@@ -415,7 +382,7 @@ fn watchdog_loop(
 			return;
 		}
 
-		// 2. 停止 / RX 检查: 有信号则唤醒全部 WFI hart 让其自行退出.
+		// 2. 停止与 RX 检查: 有信号则唤醒全部 WFI hart, 使其自行退出.
 		let internal_stop = module.stop_flag.load(Ordering::Acquire);
 		let external_stop = !stop_flag.is_null() && unsafe { *stop_flag != 0 };
 		let rx_ready = !uart_rx_notify.is_null() && unsafe { *uart_rx_notify != 0 };
@@ -426,15 +393,15 @@ fn watchdog_loop(
 			return;
 		}
 
-		// 3. 周期性向中断控制器发置位请求信号: unpark 全部 WFI hart, 让它们重新
-		//    执行 wfi_sync_and_check 判定定时器/软件/外部中断是否挂起并投递. mtime
-		//    由活动 hart 按时钟源流逝推进, 看门狗不做截止预测, 以固定周期唤醒.
+		// 3. 周期性地向中断控制器发置位请求信号: unpark 全部 WFI hart, 使其重新
+		//    执行 wfi_sync_and_check 判定定时器、软件与外部中断是否挂起并投递.
+		//    mtime 由活动的 hart 按指令推进, 看门狗不做截止预测, 按固定周期唤醒.
 		unpark_all_harts(clint);
 		std::thread::park_timeout(std::time::Duration::from_micros(WATCHDOG_POLL_US));
 	}
 }
 
-/// Spawn one OS thread per hart, run ``hart_worker``, join all.
+/// 每个 hart 创建一个操作系统线程, 运行 ``hart_worker``, 并等待全部线程结束.
 unsafe fn run_harts(
 	states: *mut HartState,
 	num_harts: u32,
@@ -455,8 +422,7 @@ unsafe fn run_harts(
 		std::mem::transmute(&*uart_ffi)
 	};
 
-	// 软件看门狗: 先 spawn 以便把其 Thread 句柄 move 进每个 hart 闭包.
-	// 看门狗是单轮加速执行内唯一轮询者, 周期性向中断控制器发置位请求信号唤醒 WFI hart.
+	// 看门狗是单轮加速执行内唯一的轮询者, 周期性唤醒处于 WFI 的 hart.
 	let clint_ptr: &'static ConcurrentClintCtx = std::mem::transmute(cc_clint);
 	let wd_module = Arc::clone(module);
 	let wd_stop_ptr = stop_flag as usize;
@@ -509,7 +475,7 @@ unsafe fn run_harts(
 				stop_ptr as *const u8,
 				ext_irq_ptr as *mut FfiExtIrqCtx,
 			);
-			// 完成信号: 唤醒其余 WFI hart 与看门狗, 让单轮加速执行尽快收敛退出.
+			// 完成信号: 唤醒其余处于 WFI 的 hart 与看门狗, 使单轮加速执行尽快结束.
 			unpark_all_harts(clint_ptr);
 			wd_thread.unpark();
 		});
@@ -519,7 +485,7 @@ unsafe fn run_harts(
 
 	let thread_slice: Box<[std::thread::Thread]> = thread_refs.into_boxed_slice();
 	cc_clint.hart_threads.set(thread_slice.as_ptr());
-	std::mem::forget(thread_slice); // pointer valid until run_harts returns
+	std::mem::forget(thread_slice); // 指针在 run_harts 返回之前保持有效
 
 	for h in handles {
 		let _ = h.join();
@@ -552,7 +518,7 @@ unsafe fn sum_instrs(states: *mut HartState, num_harts: u32, instr_group: *mut I
 
 /// 把本轮结束时的刷新计数写回调用方持有的两处存放位置.
 ///
-/// 两处指针须同时给出: 只给出其中之一时, 本轮执行循环的刷新计数自 0 起算,
+/// 两处指针必须同时给出: 只给出其中之一时, 本轮执行循环的刷新计数从 0 起算,
 /// 写回会把调用方持有的取值改小, 故一律不写回.
 #[inline]
 unsafe fn writeback_tlb_flush_cnt(
@@ -575,18 +541,18 @@ unsafe fn writeback_mtime(clint_raw: &FfiClintCtx, cc_clint: &ConcurrentClintCtx
 	*clint_raw.mtime = (*cc_clint.mtime).load(Ordering::SeqCst);
 }
 
-/// 纳秒/秒 — Duration 换算为时钟 tick 的定义性常数.
+/// 纳秒与秒的换算常数, 用于把 Duration 换算为时钟计数.
 const NS_PER_SEC: u64 = 1_000_000_000;
 
-/// 指令计数推进的换算比率 — 每条指令对应多少纳秒的受调试程序时间.
+/// 指令计数推进的换算比率, 即每条指令对应的受调试程序时间, 单位为纳秒.
 ///
-/// 取值为 20, 即每条指令 20 纳秒:
+/// 取值为 20, 即每条指令 20 纳秒.
 pub const NS_PER_INSTR: u64 = 20;
 
-/// 按指令计数推进 mtime (纯指令源, 无实时分量).
+/// 按指令计数推进 mtime, 时钟源只取指令条数, 不含实时分量.
 ///
 /// - 单一时钟源
-/// - 单调
+/// - 单调递增
 pub(crate) fn advance_clock_source(
 	module: &ModuleState,
 	clint: &ConcurrentClintCtx,
@@ -600,14 +566,14 @@ pub(crate) fn advance_clock_source(
 		return;
 	}
 	let instr_delta = state.total_instrs.wrapping_sub(module.instr_ref_num[hid]);
-	// instr_delta * timebase_hz * NS_PER_INSTR: 峰值 batch ~4M * 10MHz = 4e13,
-	// 远小于 u64 上限, 无需 u128.
+	// instr_delta * timebase_hz * NS_PER_INSTR 的峰值约为 4M * 10MHz = 4e13,
+	// 远小于 u64 上限, 无需使用 u128.
 	let ticks = instr_delta
 		.saturating_mul(clint.timebase_hz)
 		.saturating_mul(NS_PER_INSTR)
 		/ NS_PER_SEC;
 	let target = module.time_base_val.wrapping_add(ticks);
-	// mtime 只增不减, 取最大值的目标不超过当前值时该操作不改变任何值.
+	// mtime 只增不减, 目标值不超过当前值时该操作不改变任何值.
 	if unsafe { &*clint.mtime }.load(Ordering::Relaxed) < target {
 		unsafe { &*clint.mtime }.fetch_max(target, Ordering::Relaxed);
 	}
@@ -637,7 +603,7 @@ pub(crate) fn timer_deadline_own(
 }
 
 // ============================================================
-//  FFI entry point
+//  FFI 入口
 // ============================================================
 
 #[no_mangle]
@@ -650,7 +616,7 @@ pub unsafe extern "C" fn run_parallel(
 	bp: *const FfiBpCtx,
 	tlb: *mut FfiTlbCtx,
 ) {
-	// 1. Unpack FFI structs
+	// 1. 解包 FFI 结构体
 	let hart = unsafe { &*hart };
 	let mem_ctx = unsafe { &*mem_ctx };
 	let intr_ctx = unsafe { &*intr_ctx };
@@ -658,7 +624,7 @@ pub unsafe extern "C" fn run_parallel(
 	let states = hart.states;
 	let num_harts = hart.num_harts;
 
-	// 2. Zero-initialise instr_group + build contexts
+	// 2. 把 instr_group 清零并构造上下文
 	let (mem, pmp_raw, clint_raw, dev_raw, cc_clint, active) = unsafe {
 		init_instr_group(hart.instr_group);
 		(
@@ -670,12 +636,10 @@ pub unsafe extern "C" fn run_parallel(
 			count_active(states, num_harts),
 		)
 	};
-	// stimecmp (SSTC) 是内核 clockevent 在 legacy 与 AIA 两种模式下的共同定时器源.
-	// ``wfi_check_all_idle`` 通过本指针读取 stimecmp, 判断全部 WFI hart 空闲时
-	// 该把 mtime 快进到哪个截止. 无条件设置本指针
+	// 无条件设置 stimecmp (SSTC).
 	cc_clint.hart_states.set(states as *const HartState);
 
-	// 3. Module state (TLB 刷新计数跨调用保留, 见 FfiTlbCtx)
+	// 3. 模块状态, 其中 TLB 刷新计数跨调用保留, 见 FfiTlbCtx
 	let flush_cnt_ptr = if tlb.is_null() {
 		std::ptr::null_mut()
 	} else {
@@ -686,7 +650,6 @@ pub unsafe extern "C" fn run_parallel(
 	} else {
 		unsafe { (*tlb).flush_cnt_per_hart }
 	};
-	// 两个指针都在才有跨调用的判定依据: 计数从调用方数组恢复, 而不是每轮从 0
 	// 起算. 从 0 起算时, 只要调用方一侧的刷新次数不为 0, 每个 hart 在每轮的第一条
 	// 指令处都会判定为陈旧, 引擎内的翻译在每轮边界全部作废.
 	let is_flush_cnt_persistent = !flush_cnt_ptr.is_null() && !flush_cnt_per_hart_ptr.is_null();
@@ -722,7 +685,7 @@ pub unsafe extern "C" fn run_parallel(
 		unsafe { (*dev_ctx.watchdog).timeout_ns }
 	};
 
-	// 4. Build shared contexts
+	// 4. 构造共享上下文
 	let virtio_raw: *mut FfiVirtIoCtx = if dev_ctx.virtio.is_null() {
 		std::ptr::null_mut()
 	} else {
@@ -760,7 +723,7 @@ pub unsafe extern "C" fn run_parallel(
 	};
 
 	unsafe {
-		// 5. Spawn & join hart threads
+		// 5. 创建并等待 hart 线程
 		run_harts(
 			states,
 			num_harts,
@@ -775,7 +738,7 @@ pub unsafe extern "C" fn run_parallel(
 			build_bps(bp),
 			timeout_ns,
 		);
-		// 6. Collect results — single unsafe block for all write-backs
+		// 6. 在同一个 unsafe 块中收集结果
 		collect_stop(&module, hart.instr_group);
 		sum_instrs(states, num_harts, hart.instr_group);
 		writeback_tlb_flush_cnt(flush_cnt_ptr, flush_cnt_per_hart_ptr, &module, num_harts);
@@ -784,14 +747,14 @@ pub unsafe extern "C" fn run_parallel(
 }
 
 // ============================================================
-//  Tests
+//  测试
 // ============================================================
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	// Items extracted from this file into sibling modules — bring them
-	// back in scope so tests can reference them directly.
+	// 从本文件拆分到同级模块的条目, 在此重新引入作用域,
+	// 使测试可以直接引用.
 	use crate::ffi::{DevMMIOAddrInfo, FfiPmpCtx, FfiWatchdogCtx, MemCtx};
 	use crate::state::{riscv_mode, CFG_AIA};
 	use std::mem;
@@ -812,7 +775,7 @@ mod tests {
 		buf[offset + 3] = (val >> 24) as u8;
 	}
 
-	/// Build default zero-length PMP / device arrays and call ``run_parallel``.
+	/// 构造长度为零的 PMP 与设备数组, 并调用 ``run_parallel``.
 	unsafe fn run_parallel_defaults(
 		states: *mut HartState,
 		num: u32,
@@ -837,10 +800,10 @@ mod tests {
 			ends: dev_ends.as_ptr(),
 			num: 0,
 		};
-		// Single TOR entry covering full address space (R/W/X).
-		// pmp_ok per RISC-V spec §3.7.1 denies S/U access when num==0,
-		// so we must provide at least one permissive entry for tests.
-		let mut pmp_cfg: [u8; 1] = [0x0F]; // PMP_R|PMP_W|PMP_X|PMP_A_TOR
+		// 单条 TOR 条目覆盖全部地址空间, 权限为读、写与执行.
+		// 按 RISC-V 规范 §3.7.1, num 为 0 时 pmp_ok 拒绝 S 模式与 U 模式的访问,
+		// 故测试至少需要一条宽松条目.
+		let mut pmp_cfg: [u8; 1] = [0x0F]; // PMP_R, PMP_W, PMP_X 与 PMP_A_TOR
 		let mut pmp_addr: [u64; 1] = [u64::MAX];
 		let pmp = FfiPmpCtx {
 			cfg: pmp_cfg.as_mut_ptr(),
@@ -848,7 +811,7 @@ mod tests {
 			num: 1,
 			pmpsplit: 0,
 		};
-		// Allocate per-hart CLINT arrays based on the actual number of harts.
+		// 按实际的 hart 数量分配每个 hart 的 CLINT 数组.
 		let nh = num as usize;
 		let mut mtimecmp_vec: Vec<u64> = vec![u64::MAX; nh];
 		let mut msip_vec: Vec<u8> = vec![0u8; nh];
@@ -858,7 +821,7 @@ mod tests {
 			mtimecmp: mtimecmp_vec.as_mut_ptr(),
 			msip: msip_vec.as_mut_ptr(),
 			base: 0,
-			timebase_hz: 0, // 单元测试禁用 clock-source 推进, 保持确定性
+			timebase_hz: 0, // 单元测试中不推进时钟源, 保持确定性
 		};
 		let hart = FfiHartCtx {
 			states,
@@ -895,13 +858,13 @@ mod tests {
 	#[test]
 	fn parallel_single_hart_addi() {
 		let mut ram = vec![0u8; 256];
-		// Instructions at PC=0:
+		// PC=0 处的指令:
 		write_u32_le(&mut ram, 0, 0x00A0_0293); // addi x5, x0, 10
 		write_u32_le(&mut ram, 4, 0x0052_8293); // addi x5, x5, 5
-		write_u32_le(&mut ram, 8, 0x1050_0073); // WFI -> clean exit
+		write_u32_le(&mut ram, 8, 0x1050_0073); // WFI, 用于正常退出
 
 		let mut state = make_state(0, 0);
-		state.mode = riscv_mode::M; // WFI is NOP in M-mode when mip=0->enters waiting
+		state.mode = riscv_mode::M; // M 模式下 mip 为 0 时 WFI 进入等待
 		state.mie = 0;
 		state.mip.store(0, Ordering::Release);
 		let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
@@ -921,17 +884,11 @@ mod tests {
 		assert_eq!(instr_group.exit_reason, exit_reason::WFI_WAIT);
 	}
 
-	/// Regression: WFI 阻塞时 stimecmp (SSTC) 截止必须在 legacy (非 AIA) 模式下
-	/// 被识别并以 WFI_WAIT 退出加速执行 (mtime 不再快进 — Python 侧据真实剩余
-	/// 休眠并按流逝时间补偿 mtime). 修复前 ``run_parallel`` 仅在 ``CFG_AIA`` 下
-	/// 设置 ``hart_states``, legacy 模式下该指针恒为 null, ``wfi_check_all_idle`` 扫描不到
-	/// stimecmp -> mtime 不推进 -> 用 usleep_range() (SSTC) 睡眠的 hart 永不唤醒,
 	/// 辅助核上线握手 (cpuhp_ap_sync_alive) 死锁.
 	#[test]
 	fn wfi_stimecmp_deadline_exits_wfi_wait_in_legacy_mode() {
-		// 本测试明确覆盖 legacy 模式 (CFG_AIA=false) 下的 stimecmp 唤醒路径 —
-		// 修复前 ``run_parallel`` 以 CFG_AIA 门控 hart_states, legacy 模式下指针恒为
-		// null 导致 stimecmp 不可见. AIA 构建下该路径走 IMSIC 分支, 跳过本测试.
+		// 设置 CFG_AIA 为 false 时的 stimecmp 唤醒路径.
+		// AIA 构建下该路径进入 IMSIC 分支, 故跳过本用例.
 		if CFG_AIA {
 			return;
 		}
@@ -943,7 +900,7 @@ mod tests {
 		state.mode = riscv_mode::M; // WFI 在 M 模式且 mip=0 时进入等待
 		state.mie = 0;
 		state.mip.store(0, Ordering::Release);
-		state.stimecmp = 5000; // 未来 SSTC 截止时间
+		state.stimecmp = 5000; // 大于当前 mtime 的 SSTC 截止时间
 
 		let mem = MemCtx {
 			ram: ram.as_mut_ptr(),
@@ -959,7 +916,7 @@ mod tests {
 			ends: dev_ends.as_ptr(),
 			num: 0,
 		};
-		// 单个 TOR 条目覆盖全地址空间 (R/W/X), 避免 pmp_ok 因 num==0 拒绝访问.
+		// 单条 TOR 条目覆盖全部地址空间, 权限为 RWX, 避免 pmp_ok 因 num 为 0 拒绝访问.
 		let mut pmp_cfg: [u8; 1] = [0x0F];
 		let mut pmp_addr: [u64; 1] = [u64::MAX];
 		let pmp = FfiPmpCtx {
@@ -969,8 +926,8 @@ mod tests {
 			pmpsplit: 0,
 		};
 
-		// mtimecmp 置 u64::MAX (无截止), stimecmp=5000 (唯一截止).
-		// mtime 由测试持有以便断言其被快进到 stimecmp.
+		// mtimecmp 置为 u64::MAX, 即没有截止; stimecmp 为 5000, 即唯一截止.
+		// mtime 由本用例保持初值, 以便断言其未被改写.
 		let nh = 1usize;
 		let mut mtimecmp_vec: Vec<u64> = vec![u64::MAX; nh];
 		let mut msip_vec: Vec<u8> = vec![0u8; nh];
@@ -980,7 +937,7 @@ mod tests {
 			mtimecmp: mtimecmp_vec.as_mut_ptr(),
 			msip: msip_vec.as_mut_ptr(),
 			base: 0,
-			timebase_hz: 0, // 禁用 clock-source 推进, mtime 仅由快进决定
+			timebase_hz: 0, // 不推进时钟源, mtime 保持初值以断言未被改写
 		};
 
 		let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
@@ -1018,8 +975,7 @@ mod tests {
 		}
 		assert_eq!(
 			mtime_val, 0,
-			"WFI 空闲不得快进 mtime — 快进使 Python 侧 remaining=0 永不睡眠, \
-             全 hart WFI 退化为 100% CPU 忙转; mtime 由 Python 按睡眠流逝时间补偿"
+			"timebase_hz 为 0 时引擎不按指令推进 mtime, 本轮以 WFI_WAIT 退出, mtime 保持初值"
 		);
 		assert_eq!(
             instr_group.exit_reason, exit_reason::WFI_WAIT,
@@ -1027,12 +983,9 @@ mod tests {
         );
 	}
 
-	/// 构造一组确定性的加速执行场景并运行一轮: 受调试程序是 M 模式下的原地无限循环
-	/// ``jal x0, 0``, 中断使能位与挂起位均为 0, termio 的 RX 通知位已置位。
-	/// 返回 (退出原因, 本轮执行的指令数)。
 	///
 	/// 无限循环不会自行结束, 故本轮的出口只有两个: 引擎因 RX 通知退出, 或看门狗在
-	/// 300 ms 后以超时结束本轮。后者使回归测试表现为断言失败而不是挂起。
+	/// 300 毫秒后以超时结束本轮. 后者使本用例表现为断言失败而不是挂起.
 	unsafe fn run_rx_notify_case(imsic_owns: bool) -> (u8, u64) {
 		let mut ram = vec![0u8; 256];
 		write_u32_le(&mut ram, 0, 0x0000_006F); // jal x0, 0: 原地无限循环
@@ -1046,7 +999,7 @@ mod tests {
 			state.imsic_s.eidelivery = 1;
 		}
 
-		// termio 线程发现 stdin 新字节后置位的通知位.
+		// termio 线程发现标准输入的新字节后置位的通知位.
 		let mut rx_notify: u8 = 1;
 		let uart = FfiUartCtx {
 			base: 0,
@@ -1079,7 +1032,7 @@ mod tests {
 			ends: dev_ends.as_ptr(),
 			num: 0,
 		};
-		// 单个 TOR 条目覆盖全地址空间 (R/W/X), 避免 pmp_ok 因 num==0 拒绝访问.
+		// 单条 TOR 条目覆盖全部地址空间, 权限为读、写与执行, 避免 pmp_ok 因 num 为 0 拒绝访问.
 		let mut pmp_cfg: [u8; 1] = [0x0F];
 		let mut pmp_addr: [u64; 1] = [u64::MAX];
 		let pmp = FfiPmpCtx {
@@ -1096,7 +1049,7 @@ mod tests {
 			mtimecmp: mtimecmp_vec.as_mut_ptr(),
 			msip: msip_vec.as_mut_ptr(),
 			base: 0,
-			timebase_hz: 0, // 禁用 clock-source 推进, 保持确定性
+			timebase_hz: 0, // 不推进时钟源, 保持确定性
 		};
 
 		let mut instr_group: InstrToBeExec = mem::zeroed();
@@ -1133,17 +1086,14 @@ mod tests {
 		(instr_group.exit_reason, instr_group.total_instrs)
 	}
 
-	/// Regression: termio 写入 stdin 字节并置位 RX 通知时, 若 IMSIC 独占外部中断
-	/// 线路 (eidelivery 非 0), 引擎必须在执行任何指令之前退出本轮加速执行。
+	/// termio 把标准输入的字节写入 RX 环形缓冲区并置位 RX 通知时, 若 IMSIC 独占
+	/// 外部中断线路, 即 eidelivery 非 0, 引擎必须在执行任何指令之前退出本轮加速执行.
 	///
-	/// 字节进入 UART FIFO 需经 Python 侧的搬运 (RX 线程把 ring buffer 的字节搬进
-	/// FIFO), 该步骤在单轮加速执行内不可见, 故必须退出让 Python 尽快搬运。
-	/// 中断投递本身不再依赖此退出: eip 的新增位由 Python 经 ``IMSIC._publish_eip``
-	/// 写穿到共享数组, ``sync_ext_irq_mip`` 在轮内即可依据 live eip 置 SEIP。
+	/// 字节进入 UART FIFO 需要 Python 侧从 RX 环形缓冲区写入, 该步骤在单轮
+	/// 加速执行内不可见, 故必须退出, 使 Python 尽快完成写入. 中断投递本身不依赖
+	/// 此退出: eip 的新增位由 Python 经 ``IMSIC._publish_eip`` 写入共享数组,
+	/// ``sync_ext_irq_mip`` 在轮内即可据此置位 SEIP.
 	///
-	/// 修复前 (e904ba4 删除了 ``hart_worker`` 的 RX 通知退出) 该通知被完全忽略,
-	/// 输入要等到本轮加速执行自然结束才被处理 — 交互式控制台下单轮长达数秒,
-	/// 表现为 AIA 模式下 zsh 收不到键盘输入。
 	#[test]
 	fn rx_notify_exits_batch_when_imsic_owns_ext_line() {
 		let (reason, instrs) = unsafe { run_rx_notify_case(true) };
@@ -1156,10 +1106,10 @@ mod tests {
 		assert_eq!(instrs, 0, "退出判定在指令循环之前, 本轮不得执行任何指令");
 	}
 
-	/// 互补用例: IMSIC 未占用外部中断线路 (legacy PLIC 模式) 时, RX 通知不得
-	/// 触发退出 — ``sync_ext_irq_mip`` 已在本轮内联置位 SEIP, 受调试程序在轮内
-	/// 即可取走字节; 退出会降低 legacy 模式的输入吞吐. 此处受调试程序为无限循环,
-	/// 唯一的结束方式是看门狗超时, 故以 TIMEOUT 锁定未退出这一行为.
+	/// IMSIC 未占用外部中断线路, 即传统 PLIC 模式时, RX 通知不得
+	/// 触发退出. ``sync_ext_irq_mip`` 已在本轮内联置位 SEIP, 受调试程序在轮内
+	/// 即可读出字节, 退出会降低传统 PLIC 模式的输入吞吐. 受调试程序为无限循环,
+	/// 唯一的结束方式是看门狗超时, 故以 TIMEOUT 确认未退出.
 	#[test]
 	fn rx_notify_does_not_exit_batch_without_imsic() {
 		let (reason, _) = unsafe { run_rx_notify_case(false) };
@@ -1170,35 +1120,34 @@ mod tests {
 		);
 	}
 
-	/// Test that ECALL delivers trap inline: mode -> M, PC -> mtvec,
-	/// mepc = ECALL address.  The M-mode handler at mtvec advances
-	/// mepc by 4 (to skip ECALL) and MRETs back to S-mode, where
-	/// WFI terminates cleanly.
+	/// ECALL 在轮内投递陷阱: 模式变为 M, PC 变为 mtvec, mepc 为 ECALL 的地址.
+	/// mtvec 处的 M 模式处理函数把 mepc 加 4 以跳过 ECALL, 执行 MRET 返回 S 模式,
+	/// 随后执行 WFI 退出.
 	#[test]
 	fn parallel_ecall_inline_trap() {
 		let mut ram = vec![0u8; 256];
-		// S-mode code at PC=0:
+		// PC=0 处的 S 模式代码:
 		write_u32_le(&mut ram, 0, 0x0010_0293); // addi x5, x0, 1
-		write_u32_le(&mut ram, 4, 0x0000_0073); // ECALL (S-mode -> M-mode)
-		write_u32_le(&mut ram, 8, 0x1050_0073); // WFI (reached after MRET)
+		write_u32_le(&mut ram, 4, 0x0000_0073); // ECALL, 从 S 模式陷入 M 模式
+		write_u32_le(&mut ram, 8, 0x1050_0073); // WFI, MRET 之后执行
 
-		// M-mode handler at mtvec=0x20 (uses t1=x6 to avoid clobbering x5):
+		// mtvec 为 0x20 处的 M 模式处理函数, 使用 t1, 即 x6, 以免改写 x5:
 		let mtvec_addr: u64 = 0x20;
-		// addi t1, x0, 4     -> 0x00400313  (t1 = 4)
+		// addi t1, x0, 4 编码为 0x00400313, 使 t1 为 4
 		write_u32_le(&mut ram, 0x20, 0x0040_0313);
-		// csrr t1, mepc      -> 0x34102373  (t1 = mepc)
+		// csrr t1, mepc 编码为 0x34102373, 读取 mepc
 		write_u32_le(&mut ram, 0x24, 0x3410_2373);
-		// addi t1, t1, 4     -> 0x00430313  (t1 = mepc + 4)
+		// addi t1, t1, 4 编码为 0x00430313, 使 t1 为 mepc + 4
 		write_u32_le(&mut ram, 0x28, 0x0043_0313);
-		// csrw mepc, t1      -> 0x34131073  (mepc = t1)
+		// csrw mepc, t1 编码为 0x34131073, 写入 mepc
 		write_u32_le(&mut ram, 0x2C, 0x3413_1073);
-		// mret                -> 0x30200073
+		// mret 编码为 0x30200073
 		write_u32_le(&mut ram, 0x30, 0x3020_0073);
 
 		let mut state = make_state(0, 0);
 		state.mode = riscv_mode::S;
 		state.mtvec = mtvec_addr;
-		state.mstatus = (1 << 11) | (1 << 7); // MPP=S, MPIE=1
+		state.mstatus = (1 << 11) | (1 << 7); // MPP 为 S, MPIE 为 1
 		state.mie = 0;
 		state.mip.store(0, Ordering::Release);
 
@@ -1215,9 +1164,9 @@ mod tests {
 				&mut instr_group as *mut InstrToBeExec,
 			);
 		}
-		// addi x5,0,1 executed before ECALL
+		// ECALL 之前已执行 addi x5,0,1
 		assert_eq!(state.gprs[5], 1);
-		// ECALL trap delivered inline -> M-mode handler -> MRET -> S-mode -> WFI
+		// ECALL 进入 M 模式处理函数, MRET 返回 S 模式后执行 WFI
 		assert_eq!(
 			instr_group.exit_reason,
 			exit_reason::WFI_WAIT,
@@ -1228,17 +1177,17 @@ mod tests {
 	#[test]
 	fn parallel_two_harts_independent() {
 		let mut ram = vec![0u8; 4096];
-		// Hart 0: addi x5, x0, 10; addi x5, x5, 3; WFI (PC 0..12)
+		// hart 0 在 PC 0、4、8 处依次执行 addi x5, x0, 10、addi x5, x5, 3 与 WFI,
 		write_u32_le(&mut ram, 0, 0x00A0_0293);
 		write_u32_le(&mut ram, 4, 0x0032_8293);
 		write_u32_le(&mut ram, 8, 0x1050_0073); // WFI
-										  // Hart 1: addi x6, x0, 20; addi x6, x6, 7; WFI (PC 128..140)
+										  // hart 1 在 PC 128、132、136 处依次执行 addi x6, x0, 20、addi x6, x6, 7
 		write_u32_le(&mut ram, 128, 0x0140_0313);
 		write_u32_le(&mut ram, 132, 0x0073_0313);
 		write_u32_le(&mut ram, 136, 0x1050_0073); // WFI
 
 		let mut s0 = make_state(0, 0);
-		s0.mode = riscv_mode::M; // WFI needs M-mode to avoid TW trap
+		s0.mode = riscv_mode::M; // WFI 需在 M 模式执行, 避免 TW 触发陷阱
 		s0.mie = 0;
 		s0.mip.store(0, Ordering::Release);
 		let mut s1 = make_state(128, 1);
@@ -1260,8 +1209,8 @@ mod tests {
 				&mut instr_group as *mut InstrToBeExec,
 			);
 		}
-		// Both harts finished their adds before entering WFI.
-		// Since all harts end up in WFI, the exits with WFI_WAIT.
+		// 两个 hart 在进入 WFI 之前都已执行完各自的加法.
+		// 全部 hart 处于 WFI, 故以 WFI_WAIT 退出.
 		assert_eq!(states[0].gprs[5], 13, "hart 0: x5 should be 13");
 		assert_eq!(states[1].gprs[6], 27, "hart 1: x6 should be 27");
 		assert_eq!(
@@ -1274,7 +1223,7 @@ mod tests {
 
 	#[test]
 	fn parallel_amo_single_hart() {
-		// Verify AMOADD works with a single hart in concurrent mode.
+		// 验证并发模式下单个 hart 的 AMOADD 可以正确执行.
 		let mut ram = vec![0u8; 4096];
 		let shared_addr: u64 = 0xF0;
 		write_u32_le(&mut ram, 0, 0x0063_A2AF); // amoadd.w x5, x6, (x7)
@@ -1285,8 +1234,8 @@ mod tests {
 		state.mode = riscv_mode::M;
 		state.mie = 0;
 		state.mip.store(0, Ordering::Release);
-		state.gprs[7] = shared_addr; // addr
-		state.gprs[6] = 3; // addend
+		state.gprs[7] = shared_addr; // rs1, 地址
+		state.gprs[6] = 3; // rs2, 加数
 		let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
 		unsafe {
 			run_parallel_defaults(
@@ -1315,29 +1264,29 @@ mod tests {
 	#[test]
 	fn parallel_amo_add_two_harts() {
 		let mut ram = vec![0u8; 4096];
-		let shared_addr: u64 = 0xF0; // aligned, well within RAM
+		let shared_addr: u64 = 0xF0; // 已对齐, 位于 RAM 范围内
 
-		// Hart 0: AMOADD.W to shared_addr; then ECALL
-		//   amoadd.w x5, x6, (x7): rs1=x7=addr, rs2=x6=addend, rd=x5=old
+		// hart 0: 对 shared_addr 执行 AMOADD.W
+		//   amoadd.w x5, x6, (x7): rs1 为 x7 即地址, rs2 为 x6 即加数, rd 为 x5 即旧值
 		write_u32_le(&mut ram, 0, 0x0063_A2AF); // amoadd.w x5, x6, (x7)
 		write_u32_le(&mut ram, 4, 0x1050_0073); // WFI
 
-		// Hart 1: AMOADD.W to same shared_addr; then WFI
+		// hart 1: 对同一 shared_addr 执行 AMOADD.W, 随后执行 WFI
 		write_u32_le(&mut ram, 128, 0x0063_A2AF); // amoadd.w x5, x6, (x7)
 		write_u32_le(&mut ram, 132, 0x1050_0073); // WFI
 
-		// Set initial value at shared_addr = 42 (little-endian)
+		// 在 shared_addr 处写入初值 42, 按小端序组织存放
 		ram[shared_addr as usize] = 42;
 		ram[shared_addr as usize + 1] = 0;
 		ram[shared_addr as usize + 2] = 0;
 		ram[shared_addr as usize + 3] = 0;
 
 		let mut s0 = make_state(0, 0);
-		s0.mode = riscv_mode::M; // WFI needs M-mode
+		s0.mode = riscv_mode::M; // WFI 需在 M 模式执行
 		s0.mie = 0;
 		s0.mip.store(0, Ordering::Release);
-		s0.gprs[7] = shared_addr; // rs1 — address
-		s0.gprs[6] = 3; // rs2 — value to add
+		s0.gprs[7] = shared_addr; // rs1, 地址
+		s0.gprs[6] = 3; // rs2, 加数
 
 		let mut s1 = make_state(128, 1);
 		s1.mode = riscv_mode::M;
@@ -1361,7 +1310,7 @@ mod tests {
 			);
 		}
 
-		// Final value should be 42 + 3 + 5 = 50 (both AMOADDs applied atomically)
+		// 最终值应为 42 + 3 + 5 = 50, 两次 AMOADD 都以原子方式生效
 		let final_val = ram[shared_addr as usize] as u32
 			| (ram[shared_addr as usize + 1] as u32) << 8
 			| (ram[shared_addr as usize + 2] as u32) << 16
@@ -1376,30 +1325,28 @@ mod tests {
 	#[test]
 	fn parallel_stop_on_mmio_store() {
 		let mut ram = vec![0u8; 4096];
-		let dev_addr: u64 = 0x1000_0000; // UART MMIO
+		let dev_addr: u64 = 0x1000_0000; // UART 的 MMIO 地址
 
-		// Hart 0: store x5 -> [x6] where x6 = dev_addr (MMIO store -> exit).
-		// sd x5, 0(x6) = 0x00533023 (rs2=x5, rs1=x6, imm=0).
+		// hart 0: 把 x5 存储到 x6 指向的地址, 其中 x6 为 dev_addr, 设备存储触发退出.
+		// sd x5, 0(x6) 编码为 0x00533023, 即 rs2 为 x5, rs1 为 x6, imm 为 0.
 		write_u32_le(&mut ram, 0, 0x0053_3023);
 
-		// Hart 1: infinite two-instruction loop at offset 128 that advances PC
-		// every iteration (addi then jal back), so it stays alive forever and
-		// never triggers a stop condition (no MMIO / WFI / trap-loop).  The old
-		// finite NOP sequence ran off into 0x0000 (illegal compressed instr) and
-		// raised a racy TRAP exit that could beat hart 0's MMIO exit, making
-		// this test flaky under load.
+		// hart 1: 在偏移 128 处执行两条指令的无限循环, 每次迭代推进 PC,
+		// 即先 addi 再 jal 跳回, 故永远不会触发停止条件, 没有 MMIO、WFI 或
+		// 陷阱循环. 有限的 NOP 序列会执行到 0x0000 处的非法压缩指令,
+		// 产生与 hart 0 的 MMIO 退出竞争的 ``TRAP`` 原因退出, 使本用例在负载下不稳定.
 		write_u32_le(&mut ram, 128, 0x0010_8093); // addi x1, x1, 1
-		write_u32_le(&mut ram, 132, 0xffdf_f06f); // jal  x0, -4  -> back to 128
+		write_u32_le(&mut ram, 132, 0xffdf_f06f); // jal x0, -4, 跳回 128
 
 		let mut s0 = make_state(0, 0);
-		s0.mode = riscv_mode::M; // Bare-mode VA=PA
-		s0.gprs[5] = 0x41; // value to store
-		s0.gprs[6] = dev_addr; // rs1 — store address
+		s0.mode = riscv_mode::M; // Bare 模式: 虚拟地址即物理地址
+		s0.gprs[5] = 0x41; // 要存储的值
+		s0.gprs[6] = dev_addr; // rs1, 存储地址
 		let mut s1 = make_state(128, 1);
 		s1.mode = riscv_mode::M;
 		let mut states = [s0, s1];
 
-		// Custom device MMIO: cover [dev_addr, dev_addr+8)
+		// 自定义设备 MMIO, 覆盖 [dev_addr, dev_addr + 8)
 		let dev_bases: [u64; 1] = [dev_addr];
 		let dev_ends: [u64; 1] = [dev_addr + 8];
 		let dev = DevMMIOAddrInfo {
@@ -1414,10 +1361,10 @@ mod tests {
 			shadow_base: 0,
 			shadow_size: 0,
 		};
-		// Single TOR entry covering full address space (R/W/X).
-		// pmp_ok per RISC-V spec §3.7.1 denies S/U access when num==0,
-		// so we must provide at least one permissive entry for tests.
-		let mut pmp_cfg: [u8; 1] = [0x0F]; // PMP_R|PMP_W|PMP_X|PMP_A_TOR
+		// 单条 TOR 条目覆盖全部地址空间, 权限为读、写与执行.
+		// 按 RISC-V 规范 §3.7.1, num 为 0 时 pmp_ok 拒绝 S 模式与 U 模式的访问,
+		// 故测试至少需要一条宽松条目.
+		let mut pmp_cfg: [u8; 1] = [0x0F]; // PMP_R, PMP_W, PMP_X 与 PMP_A_TOR
 		let mut pmp_addr: [u64; 1] = [u64::MAX];
 		let pmp = FfiPmpCtx {
 			cfg: pmp_cfg.as_mut_ptr(),
@@ -1434,7 +1381,7 @@ mod tests {
 			mtimecmp: mtimecmp_vec.as_mut_ptr(),
 			msip: msip_vec.as_mut_ptr(),
 			base: 0,
-			timebase_hz: 0, // 单元测试禁用 clock-source 推进, 保持确定性
+			timebase_hz: 0, // 单元测试中不推进时钟源, 保持确定性
 		};
 		let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
 		unsafe {
@@ -1470,7 +1417,7 @@ mod tests {
 			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}
 
-		// Store to device MMIO should trigger an exit with MMIO reason.
+		// 对设备 MMIO 的存储应触发 MMIO 原因的退出.
 		assert_eq!(
 			instr_group.exit_reason,
 			exit_reason::MMIO,
@@ -1482,7 +1429,7 @@ mod tests {
 	#[test]
 	fn parallel_wfi_all_idle_stops() {
 		let mut ram = vec![0u8; 256];
-		// Both harts: WFI
+		// 两个 hart 都执行 WFI
 		write_u32_le(&mut ram, 0, 0x1050_0073); // WFI
 		write_u32_le(&mut ram, 128, 0x1050_0073);
 
@@ -1510,7 +1457,7 @@ mod tests {
 			);
 		}
 
-		// Both harts should be in WFI, and acceleration should exit with WFI_WAIT
+		// 两个 hart 都应处于 WFI, 加速执行应以 WFI_WAIT 退出
 		assert_eq!(
 			instr_group.exit_reason,
 			exit_reason::WFI_WAIT,
@@ -1521,7 +1468,7 @@ mod tests {
 		assert_eq!(states[1].waiting, 1);
 	}
 
-	/// Helper: run_parallel with a custom CLINT base address.
+	/// 辅助函数: 以自定义的 CLINT 基址调用 ``run_parallel``.
 	#[allow(unused)]
 	unsafe fn run_parallel_with_clint(
 		states: *mut HartState,
@@ -1546,10 +1493,10 @@ mod tests {
 			ends: dev_ends.as_ptr(),
 			num: 0,
 		};
-		// Single TOR entry covering full address space (R/W/X).
-		// pmp_ok per RISC-V spec §3.7.1 denies S/U access when num==0,
-		// so we must provide at least one permissive entry for tests.
-		let mut pmp_cfg: [u8; 1] = [0x0F]; // PMP_R|PMP_W|PMP_X|PMP_A_TOR
+		// 单条 TOR 条目覆盖全部地址空间, 权限为读、写与执行.
+		// 按 RISC-V 规范 §3.7.1, num 为 0 时 pmp_ok 拒绝 S 模式与 U 模式的访问,
+		// 故测试至少需要一条宽松条目.
+		let mut pmp_cfg: [u8; 1] = [0x0F]; // PMP_R, PMP_W, PMP_X 与 PMP_A_TOR
 		let mut pmp_addr: [u64; 1] = [u64::MAX];
 		let pmp = FfiPmpCtx {
 			cfg: pmp_cfg.as_mut_ptr(),
@@ -1566,7 +1513,7 @@ mod tests {
 			mtimecmp: mtimecmp_vec.as_mut_ptr(),
 			msip: msip_vec.as_mut_ptr(),
 			base: clint_base,
-			timebase_hz: 0, // 单元测试禁用 clock-source 推进, 保持确定性
+			timebase_hz: 0, // 单元测试中不推进时钟源, 保持确定性
 		};
 		let hart = FfiHartCtx {
 			states,
@@ -1600,29 +1547,27 @@ mod tests {
 		run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 	}
 
-	/// Verify that a store to CLINT MSIP succeeds without traps.
+	/// 验证对 CLINT MSIP 的存储正常完成: MSIP 挂起后触发陷阱, MRET 之后继续执行.
 	#[test]
 	fn store_to_clint_msip_single_hart() {
 		let mut ram = vec![0u8; 1024];
 		let clint_base: u64 = 0x2000000;
 
-		// Single hart in M-mode writes to CLINT MSIP for hart 0 (self),
-		// then enters WFI.  With MSIE enabled and MIE=1, the pending MSIP
-		// triggers a trap to mtvec (0x200) which does MRET, resuming at the
-		// instruction after WFI (a second WFI) for a clean all-idle exit.
-		// 0x00: addi t0, x0, 0x42        ->t0 = 0x42 (control)
-		// 0x04: sw   t0, 0x1000(x0)     ->store to RAM (control)
-		// 0x08: lui  t0, 0x20000        ->t0 = 0x20000000
-		// 0x0C: addi t0, t0, 0          ->t0 = 0x20000000 (CLINT MSIP hart 0)
-		// 0x10: addi t1, x0, 1          ->t1 = 1
-		// 0x14: sw   t1, 0(t0)          ->write MSIP=1 for hart 0
-		// 0x18: addi t2, x0, 0x42       ->t2 = 0x42 (proves CLINT write OK)
-		// 0x1C: wfi                      ->enter WFI, MSIP pending -> trap
-		// 0x20: wfi                      ->reached after MSI handler mrets;
-		//                                    MSIP cleared -> all-idle 退出
+		// M 模式下单个 hart 向 hart 0 自身的 CLINT MSIP 写入, 随后进入 WFI.
+		// MSIE 使能且 MIE 为 1 时, 挂起的 MSIP 触发陷阱进入 mtvec 指向的 0x200,
+		// 该处执行 MRET, 从 WFI 的下一条指令继续, 即第二个 WFI, 随后全部空闲退出.
+		// 0x00: addi t0, x0, 0x42, 使 t0 为 0x42
+		// 0x04: sw t0, 0x1000(x0), 向 RAM 存储
+		// 0x08: lui t0, 0x2000
+		// 0x0C: addi t0, t0, 0, 使 t0 保持为 0x2000000, 即 hart 0 的 CLINT MSIP
+		// 0x10: addi t1, x0, 1, 使 t1 为 1
+		// 0x14: sw t1, 0(t0), 为 hart 0 写入 MSIP=1
+		// 0x18: addi t2, x0, 0x42, 使 t2 为 0x42, 证明 CLINT 写入成功
+		// 0x1C: wfi, 进入 WFI, MSIP 挂起后触发陷阱
+		// 0x20: wfi, MSI 处理函数 MRET 之后到达; MSIP 已清除, 全部空闲退出
 		write_u32_le(&mut ram, 0x00, 0x04200293); // addi t0, x0, 0x42
-		write_u32_le(&mut ram, 0x04, 0x00502023); // sw t0, 0(x0) — RAM store to PA 0
-		write_u32_le(&mut ram, 0x08, 0x020002B7); // lui t0, 0x2000 ->t0 = 0x2000000
+		write_u32_le(&mut ram, 0x04, 0x00502023); // sw t0, 0(x0), 向物理地址 0 的 RAM 存储
+		write_u32_le(&mut ram, 0x08, 0x020002B7); // lui t0, 0x2000, 使 t0 为 0x2000000
 		write_u32_le(&mut ram, 0x0C, 0x00028293); // addi t0, t0, 0
 		write_u32_le(&mut ram, 0x10, 0x00100313); // addi t1, x0, 1
 		write_u32_le(&mut ram, 0x14, 0x0062A023); // sw t1, 0(t0)
@@ -1633,18 +1578,18 @@ mod tests {
 		let mut state = HartState {
 			pc: 0,
 			mode: riscv_mode::M,
-			mstatus: (3 << 11) | (1 << 7) | (1 << 3), // MPP=M, MPIE=1, MIE=1
+			mstatus: (3 << 11) | (1 << 7) | (1 << 3), // MPP 为 M, MPIE 为 1, MIE 为 1
 			..unsafe { std::mem::zeroed() }
 		};
-		state.mie = 1 << 3; // MSIE — allow MSI to be taken
+		state.mie = 1 << 3; // MSIE, 允许接收 MSI
 		state.mip.store(0, Ordering::Release);
-		// M-mode trap handler at 0x200: clear CLINT MSIP for hart 0
-		// to prevent re-triggering the level-triggered interrupt, then MRET.
-		// 0x200: lui  t1, 0x20000    ->t1 = 0x20000000 (CLINT base)
-		// 0x204: sw   x0, 0(t1)      ->CLINT[hart0].msip = 0
+		// 0x200 处的 M 模式处理函数先清除 hart 0 的 CLINT MSIP, 避免电平触发的
+		// 中断再次触发, 然后执行 MRET.
+		// 0x200: lui t1, 0x2000, 使 t1 为 0x2000000, 即 CLINT 基址
+		// 0x204: sw x0, 0(t1), 即 CLINT 中 hart 0 的 msip 置 0
 		// 0x208: mret
 		state.mtvec = 0x200;
-		write_u32_le(&mut ram, 0x200, 0x02000337); // lui t1, 0x20000
+		write_u32_le(&mut ram, 0x200, 0x02000337); // lui t1, 0x2000
 		write_u32_le(&mut ram, 0x204, 0x00032023); // sw x0, 0(t1)
 		write_u32_le(&mut ram, 0x208, 0x30200073); // mret
 
@@ -1662,7 +1607,7 @@ mod tests {
 			);
 		}
 
-		// RAM store at 0x04 should have written 0x42 to PA=0
+		// 0x04 处的 RAM 存储在物理地址 0 处写入 0x42
 		assert_eq!(ram[0], 0x42, "RAM store should have set RAM[0]=0x42");
 		assert_eq!(
 			state.gprs[5], 0x2000000,
@@ -1677,87 +1622,81 @@ mod tests {
 		assert_eq!(state.halted, 0, "hart should not be halted");
 	}
 
-	/// Cross-hart MSI delivery test.
+	/// 跨 hart 的 MSI 投递用例.
 	///
-	/// Hart 0 sends an MSI to Hart 1 via CLINT MMIO write, then enters WFI.
-	/// Hart 1 starts in WFI, should wake on MSI, trap to M-mode handler
-	/// (which does MRET), and execute the marker instruction after WFI.
-	/// Hart 1's t0 MUST be 0x42 — proving the MSI was
-	/// delivered, the trap handler ran, and execution resumed at the
-	/// instruction following WFI.  Both harts then idle -> WFI_WAIT exit
-	/// (no instruction quota).
+	/// hart 0 经 CLINT MMIO 向 hart 1 发送 MSI, 随后进入 WFI.
+	/// hart 1 从 WFI 开始, 应被 MSI 唤醒, 陷入 M 模式处理函数, 该函数执行 MRET,
+	/// 随后执行 WFI 之后的标记指令. hart 1 的 t0 必须为 0x42, 以证明 MSI 已投递,
+	/// 处理函数已执行, 且执行从 WFI 之后继续. 两个 hart 随后都空闲, 以 WFI_WAIT
+	/// 退出, 没有指令配额.
 	#[test]
 	fn cross_hart_msip_wakes_target() {
 		let mut ram = vec![0u8; 4096];
 		let clint_base: u64 = 0x2000000;
 
-		// --- Hart 0 instructions (PC=0) ---
-		// Delay loop: spin ~512 iterations so hart 1 can enter WFI first.
-		// 0x00: addi t0, x0, 512       ->t0 = 512
-		// 0x04: addi t0, t0, -1        ->t0--
-		// 0x08: bnez t0, -8            ->loop back to 0x04
-		// 0x0C: lui  t0, 0x20000       ->t0 = 0x20000000
-		// 0x10: addi t0, t0, 4         ->t0 = 0x20000004 (CLINT MSIP for hart 1)
-		// 0x14: addi t1, x0, 1         ->t1 = 1
-		// 0x18: sw   t1, 0(t0)         ->write MSIP=1 for hart 1
-		// 0x1C: addi x0, x0, 0          ->NOP
-		// 0x20: wfi                    ->hart 0 进入 WFI; 两个 hart 全部空闲后
-		//                                 all-idle 检测退出acceleration(无指令配额,
-		//                                 靠自然停止条件终止执行)
+		// --- hart 0 的指令, PC=0 ---
+		// 延迟循环: 自旋约 512 次, 使 hart 1 先进入 WFI.
+		// 0x00: addi t0, x0, 512, 使 t0 为 512
+		// 0x04: addi t0, t0, -1, t0 减 1
+		// 0x08: bnez t0, -8, 跳回 0x04
+		// 0x0C: lui t0, 0x2000, 使 t0 为 0x2000000
+		// 0x10: addi t0, t0, 4, 使 t0 为 0x2000004, 即 hart 1 的 CLINT MSIP
+		// 0x14: addi t1, x0, 1, 使 t1 为 1
+		// 0x18: sw t1, 0(t0), 为 hart 1 写入 MSIP=1
+		// 0x1C: addi x0, x0, 0, 即 NOP
+		// 0x20: wfi, hart 0 进入 WFI. 两个 hart 都空闲后, ``wfi_check_all_idle``
+		//       使本轮加速执行以 WFI_WAIT 结束.
 		write_u32_le(&mut ram, 0x00, 0x20000293); // addi t0, x0, 512
 		write_u32_le(&mut ram, 0x04, 0xFFF28293); // addi t0, t0, -1
-		write_u32_le(&mut ram, 0x08, 0xFE029EE3); // bnez t0, -8  -> PC=0x04
-		write_u32_le(&mut ram, 0x0C, 0x020002B7); // lui t0, 0x2000 ->t0 = 0x2000000
+		write_u32_le(&mut ram, 0x08, 0xFE029EE3); // bnez t0, -8, 跳回 0x04
+		write_u32_le(&mut ram, 0x0C, 0x020002B7); // lui t0, 0x2000, 使 t0 为 0x2000000
 		write_u32_le(&mut ram, 0x10, 0x00428293); // addi t0, t0, 4
 		write_u32_le(&mut ram, 0x14, 0x00100313); // addi t1, x0, 1
 		write_u32_le(&mut ram, 0x18, 0x0062A023); // sw t1, 0(t0)
-		write_u32_le(&mut ram, 0x1C, 0x00000013); // addi x0, x0, 0 (NOP)
+		write_u32_le(&mut ram, 0x1C, 0x00000013); // addi x0, x0, 0, 即 NOP
 		write_u32_le(&mut ram, 0x20, 0x10500073); // wfi
 
-		// --- Hart 1 instructions (PC=0x100) ---
-		// 0x100: wfi                    ->enter WFI
-		// 0x104: addi t0, x0, 0x42     ->t0 = 0x42 (marker that MSI was received)
-		// 0x108: wfi                    ->back to WFI
-		// 0x10C: jal  x0, -12          ->back to 0x104 (loop: safety net
-		//                                  if PC somehow advances past WFI;
-		//                                  handler at 0x200 does bare MRET
-		//                                  so mepc must point to valid code)
+		// --- hart 1 的指令, PC=0x100 ---
+		// 0x100: wfi, 进入 WFI
+		// 0x104: addi t0, x0, 0x42, 使 t0 为 0x42, 标记 MSI 已接收
+		// 0x108: wfi, 再次进入 WFI
+		// 0x10C: jal x0, -12, 跳回 0x104. 该循环用作安全保障: 若 PC 越过 WFI
+		//        继续推进, 0x200 处的处理函数只执行 MRET, 故 mepc 必须指向有效代码
 		write_u32_le(&mut ram, 0x100, 0x10500073); // wfi
 		write_u32_le(&mut ram, 0x104, 0x04200293); // addi t0, x0, 0x42
 		write_u32_le(&mut ram, 0x108, 0x10500073); // wfi
-		write_u32_le(&mut ram, 0x10C, 0xFF5FF06F); // jal x0, -12 -> PC=0x104
+		write_u32_le(&mut ram, 0x10C, 0xFF5FF06F); // jal x0, -12, 跳回 0x104
 
-		// --- Shared mtvec handler (PC=0x200) ---
-		// 0x200: mret  (Hart 0 handler — never traps in this test)
+		// --- 共用的 mtvec 处理函数, PC=0x200 ---
+		// 0x200: mret, hart 0 的处理函数, 本用例中不触发陷阱
 		write_u32_le(&mut ram, 0x200, 0x30200073); // mret
 
-		// --- Hart 1 MSI handler (PC=0x300) ---
-		// Clears CLINT MSIP before MRET to prevent re-triggering the same
-		// level-sensitive interrupt.  Real firmware does this in the IPI
-		// handler (sbi_ipi_raw_clear).  Without the clear, sync_msip
-		// re-asserts mip.MSIP after MRET because the CLINT level is still
-		// high -> infinite trap loop -> addi never executes.
-		//   0x300: lui  t1, 0x20000    ->t1 = 0x20000000 (CLINT base)
-		//   0x304: sw   x0, 4(t1)      ->CLINT[hart1].msip = 0
+		// --- hart 1 的 MSI 处理函数, PC=0x300 ---
+		// 在 MRET 之前清除 CLINT MSIP, 避免同一电平触发中断再次触发.
+		// 实际固件在核间中断处理函数中完成该清除, 即 sbi_ipi_raw_clear.
+		// 若不清除, sync_msip 在 MRET 之后因 CLINT 电平仍为高而重新置位
+		// mip.MSIP, 形成无限陷阱循环, addi 永不执行.
+		//   0x300: lui t1, 0x2000, 使 t1 为 0x2000000, 即 CLINT 基址
+		//   0x304: sw x0, 4(t1), 即 CLINT 中 hart 1 的 msip 置 0
 		//   0x308: mret
-		write_u32_le(&mut ram, 0x300, 0x02000337); // lui t1, 0x20000
+		write_u32_le(&mut ram, 0x300, 0x02000337); // lui t1, 0x2000
 		write_u32_le(&mut ram, 0x304, 0x00032223); // sw x0, 4(t1)
 		write_u32_le(&mut ram, 0x308, 0x30200073); // mret
 
-		// --- Hart 0 state ---
+		// --- hart 0 的状态 ---
 		let mut s0 = make_state(0, 0);
 		s0.mode = riscv_mode::M;
 		s0.mie = 0;
 		s0.mip.store(0, Ordering::Release);
-		s0.mtvec = 0x200; // valid MRET handler at 0x200 (shared with Hart 1)
+		s0.mtvec = 0x200; // 0x200 处有效的 MRET 处理函数, 与 hart 1 共用
 
-		// --- Hart 1 state ---
+		// --- hart 1 的状态 ---
 		let mut s1 = make_state(0x100, 1);
 		s1.mode = riscv_mode::M;
-		s1.mie = 0; // no interrupts enabled initially
-		s1.mip.store(0, Ordering::Release); // no interrupts pending
-		s1.mtvec = 0x300; // M-mode handler at 0x300 (clears MSIP then MRET)
-		s1.mstatus = (3 << 11) | (1 << 7) | (1 << 3); // MPP=M, MPIE=1, MIE=1
+		s1.mie = 0; // 初始不使能任何中断
+		s1.mip.store(0, Ordering::Release); // 初始没有挂起中断
+		s1.mtvec = 0x300; // 0x300 处的 M 模式处理函数, 先清除 MSIP 再 MRET
+		s1.mstatus = (3 << 11) | (1 << 7) | (1 << 3); // MPP 为 M, MPIE 为 1, MIE 为 1
 
 		let mut states = [s0, s1];
 		let mut instr_group: InstrToBeExec = unsafe { mem::zeroed() };
@@ -1768,13 +1707,13 @@ mod tests {
 				2,
 				ram.as_mut_ptr(),
 				ram.len() as u64,
-				0, // ram_base
+				0, // RAM 基址
 				clint_base,
 				&mut instr_group as *mut InstrToBeExec,
 			);
 		}
 
-		// mcause MUST indicate MSI was delivered (bit 63=1=interrupt, code=3=MSI).
+		// mcause 必须表明 MSI 已投递: 第 63 位为 1 表示中断, 原因编码 3 表示 MSI.
 		let is_interrupt = (states[1].mcause >> 63) != 0;
 		let cause_code = states[1].mcause & 0x7FFF_FFFF_FFFF_FFFF;
 		assert!(
@@ -1783,14 +1722,13 @@ mod tests {
 			states[1].mcause
 		);
 
-		// Hart 1 must NOT have halted (no trap loop).
+		// hart 1 不得停机, 即没有陷入陷阱循环.
 		assert_eq!(states[1].halted, 0, "Hart 1 should not be halted");
 
-		// The marker value: if MSI arrived AFTER WFI, PC advances past WFI
-		// before the trap, mepc points to the addi, and t0=0x42 after MRET.
-		// If MSI arrived BEFORE WFI, mepc points to WFI itself, and after
-		// MRET WFI re-executes ->t0 stays 0.
-		// Either way the MSI was delivered; we assert the detection markers.
+		// 标记值的含义: MSI 在 WFI 之后到达时, PC 先越过 WFI 再陷入陷阱,
+		// mepc 指向 addi, MRET 之后 t0 为 0x42. MSI 在 WFI 之前到达时,
+		// mepc 指向 WFI 本身, MRET 之后重新执行 WFI, t0 保持 0.
+		// 两种情形下 MSI 都已投递, 此处的断言识别实际发生的情形.
 		if states[1].gprs[5] != 0x42 && states[1].mepc != 0x100 {
 			panic!(
 				"If marker not set, mepc should be 0x100 (MSI before WFI); \
@@ -1800,30 +1738,29 @@ mod tests {
 		}
 	}
 
-	/// Regression: BLTZ (BLT rs1, x0, offset) with negative rs1.
+	/// BLTZ 在 rs1 为负数时的用例, 即 BLT rs1, x0, 偏移量.
 	///
-	/// Verifies that ``addi s2, a5, -1`` and ``bltz s2, target`` work correctly
-	/// with negative values.  a5 = -1 ->s2 = -2 ->bltz MUST branch.
+	/// 验证 ``addi s2, a5, -1`` 与 ``bltz s2, target`` 在负数下的行为:
+	/// a5 为 -1 时 s2 为 -2, bltz 必须跳转.
 	#[test]
 	fn regression_bltz_negative_takes_branch() {
 		let mut ram = vec![0u8; 128];
 
-		// Instructions at PC=0:
-		// 0x00: addi s2, a5, -1   -> s2 = -2 (a5 = -1)
-		// 0x04: bltz s2, +0x10    -> branch to 0x18 (if s2 < 0)
-		// 0x08: addi s1, x0, 0xBAD ->s1 = 0xBAD (only reached if bltz fails)
-		// 0x0C: ebreak             -> trap to mtvec
+		// PC=0 处的指令:
+		// 0x00: addi s2, a5, -1, 使 s2 为 -2, 其中 a5 为 -1
+		// 0x04: bltz s2, +0x10, s2 小于 0 时跳转到 0x18
+		// 0x08: addi s1, x0, 0xBAD, 使 s1 为 0xBAD, 仅在 bltz 未跳转时执行
+		// 0x0C: ebreak, 陷入 mtvec
 		// ...
-		// 0x18: addi s2, x0, 42   -> s2 = 42 (landing pad)
-		// 0x1C: ebreak             -> trap to mtvec
-		// 0x40: wfi (mtvec)        -> trap 处理入口; 无指令配额后
-		//                             由 WFI 空闲退出终止 acceleration
+		// 0x18: addi s2, x0, 42, 使 s2 为 42, 即跳转目标
+		// 0x1C: ebreak, 陷入 mtvec
+		// 0x40: wfi, mtvec 指向此处，在后续处理中自动退出
 
 		write_u32_le(&mut ram, 0, 0xFFF78913); // addi s2, a5, -1
-		write_u32_le(&mut ram, 4, 0x00094A63); // bltz s2, +0x14 -> PC=0x18
-		write_u32_le(&mut ram, 8, 0xBAD00493); // addi s1, x0, 0xBAD (should skip)
+		write_u32_le(&mut ram, 4, 0x00094A63); // bltz s2, +0x14, 跳转到 0x18
+		write_u32_le(&mut ram, 8, 0xBAD00493); // addi s1, x0, 0xBAD, 应当被跳过
 		write_u32_le(&mut ram, 12, 0x00100073); // ebreak
-		write_u32_le(&mut ram, 24, 0x02A00913); // addi s2, x0, 42 (landing pad)
+		write_u32_le(&mut ram, 24, 0x02A00913); // addi s2, x0, 42, 即跳转目标
 		write_u32_le(&mut ram, 28, 0x00100073); // ebreak
 		write_u32_le(&mut ram, 0x40, 0x10500073); // wfi
 
@@ -1834,8 +1771,8 @@ mod tests {
 			mstatus: 0,
 			..unsafe { std::mem::zeroed() }
 		};
-		state.mtvec = 0x40; // ebreak -> WFI -> all-idle 退出
-		state.gprs[15] = 0xFFFF_FFFF_FFFF_FFFFu64; // a5 = -1
+		state.mtvec = 0x40; // ebreak 进入 WFI, 随后全部空闲退出
+		state.gprs[15] = 0xFFFF_FFFF_FFFF_FFFFu64; // a5 为 -1
 
 		let mut instr_group: InstrToBeExec = unsafe { std::mem::zeroed() };
 		let mem = MemCtx {
@@ -1864,7 +1801,7 @@ mod tests {
 			mtimecmp: mtimecmp.as_mut_ptr(),
 			msip: msip.as_mut_ptr(),
 			base: 0,
-			timebase_hz: 0, // 单元测试禁用clock-source 推进, 保持确定性
+			timebase_hz: 0, // 单元测试中不推进时钟源, 保持确定性
 		};
 
 		unsafe {
@@ -1900,13 +1837,13 @@ mod tests {
 			run_parallel(&hart, &mem_ctx, &intr_ctx, &dev_ctx, &bp, &mut tlb);
 		}
 
-		// BLTZ should have branched ->s2 = 42
+		// BLTZ 应当已跳转, 故 s2 为 42
 		assert_eq!(
 			state.gprs[18], 42,
 			"BLTZ s2,-2 MUST branch: expected s2=42, got {}",
 			state.gprs[18]
 		);
-		// s1 should NOT be 0xBAD (proves we didn't fall through)
+		// s1 不应为 0xBAD, 以证明没有顺序执行到 0x08
 		assert_ne!(
 			state.gprs[9], 0xBAD,
 			"BLTZ should have branched; s1=0xBAD means fallthrough occurred"
@@ -1916,8 +1853,8 @@ mod tests {
 	#[test]
 	fn pmp_concurrent_csrw_two_harts() {
 		let mut ram = vec![0u8; 4096];
-		// csrw pmpaddr1, x5  ->  (0x3B1 << 20) | (5 << 15) | (1 << 12) | 0x73 = 0x3B129073
-		// WFI
+		// csrw pmpaddr1, x5 编码为 (0x3B1 << 20) | (5 << 15) | (1 << 12) | 0x73,
+		// 即 0x3B129073; 随后执行 WFI.
 		write_u32_le(&mut ram, 0, 0x3B129073);
 		write_u32_le(&mut ram, 4, 0x10500073);
 
@@ -1933,19 +1870,19 @@ mod tests {
 
 		let mut states = [s0, s1];
 
-		// PMP with 16 entries, permissive
+		// 每个 hart 使用扁平缓冲区的 64 项, 前 16 项配置为宽松条目
 		let mut pmp_cfg: [u8; 128] = [0u8; 128];
 		let mut pmp_addr: [u64; 128] = [u64::MAX; 128];
-		// Set address mode to NAPOT for all 16 entries per hart
+		// 前 16 项设为 NAPOT 地址模式
 		for h in 0..2 {
 			for e in 0..16 {
-				pmp_cfg[h * 64 + e] = 0x0F; // R|W|X|NAPOT
+				pmp_cfg[h * 64 + e] = 0x0F; // 读、写、执行与 NAPOT
 			}
 		}
 		let pmp = FfiPmpCtx {
 			cfg: pmp_cfg.as_mut_ptr(),
 			addr: pmp_addr.as_mut_ptr(),
-			num: 64, // per-hart entries (flat buf has 128 / 2 harts)
+			num: 64, // 每个 hart 的条目数; 扁平缓冲区共 128 项, 供 2 个 hart 使用
 			pmpsplit: 0,
 		};
 
@@ -2016,10 +1953,10 @@ mod tests {
 			"hart1: pc={:#x} gpr5={:#x}",
 			states[1].pc, states[1].gprs[5]
 		);
-		// Check PMP writes
+		// 检查 PMP 写入结果
 		assert_eq!(pmp_addr[1], 0xA000, "hart0 pmpaddr1");
 		assert_eq!(pmp_addr[65], 0xB000, "hart1 pmpaddr1 in flat buf");
-		// WFI exit expected
+		// 预期以 WFI 退出
 		assert_eq!(instr_group.exit_reason, exit_reason::WFI_WAIT);
 	}
 }

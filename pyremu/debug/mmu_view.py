@@ -3,14 +3,14 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""MmuViewMixin — PMP/SATP/页表遍历显示.
+"""MmuViewOps — PMP/SATP/页表遍历显示.
 
-依赖 DebuggerBase + MemoryMixin._resolve_addr.
+依赖 DebuggerBase + MemoryOps._resolve_addr.
 """
 
 from rich.table import Table
 
-from pyremu.debug._attrs import SharedMixinAttrs
+from pyremu.debug.attrs import SharedAttrs
 from pyremu.debug.utils import fmt_size, hex_addr
 from pyremu.memory.mmu import pte_flags_str, sv39_decompose_va
 from pyremu.memory.pmp import (
@@ -27,8 +27,19 @@ from pyremu.memory.pmp import (
 from pyremu.utils.mask import mask64
 from pyremu.utils.wrapper import seize_val_err
 
+# 页表级别到该级叶子页在 VA 中保留的页内偏移掩码
+_PT_OFFSET_MASKS = {1: 0x3FFF_FFFF, 2: 0x1F_FFFF, 3: 0xFFF}
 
-class MmuViewMixin(SharedMixinAttrs):
+# PMP 地址匹配模式到表格中的显示名
+_PMP_MODE_NAMES = {
+    PMP_A_OFF: "OFF",
+    PMP_A_TOR: "TOR",
+    PMP_A_NA4: "NA4",
+    PMP_A_NAPOT: "NAPOT",
+}
+
+
+class MmuViewOps(SharedAttrs):
     """PMP、页表、SATP 显示."""
 
     # ----------------------------------------------------------
@@ -70,13 +81,6 @@ class MmuViewMixin(SharedMixinAttrs):
             self._console.print("[dim]PMP num_entries=0[/]")
             return
 
-        mode_names = {
-            PMP_A_OFF: "OFF",
-            PMP_A_TOR: "TOR",
-            PMP_A_NA4: "NA4",
-            PMP_A_NAPOT: "NAPOT",
-        }
-
         tbl = Table(
             title=f"Hart {self._hart_id} PMP({num})配置情况",
             border_style="blue",
@@ -91,64 +95,68 @@ class MmuViewMixin(SharedMixinAttrs):
         tbl.add_column("cfg", style="dim cyan", width=5)
 
         active_count = 0
-
         for i in range(num):
-            cfg_reg_idx = (i // 8) * 2
-            reg_name = f"pmpcfg{cfg_reg_idx}"
-            cfg_val = h.csrs[reg_name].val if reg_name in h.csrs else 0
-            cfg = self._decode_pmp_cfg_byte(cfg_val, i)
-
-            a_mode = cfg & PMP_A_MASK
-            addr_name = f"pmpaddr{i}"
-            addr_field = mask64(
-                h.csrs[addr_name].val if addr_name in h.csrs else 0
-            )
-
-            base, size = 0, 0
-            if a_mode == PMP_A_TOR:
-                prev = mask64(
-                    h.csrs[f"pmpaddr{i - 1}"].val
-                    if i > 0 and f"pmpaddr{i - 1}" in h.csrs
-                    else 0
-                )
-                lo = 0 if i == 0 else (prev << 2)
-                hi = addr_field << 2
-                base, size = lo, mask64((hi - lo))
-            elif a_mode == PMP_A_NA4:
-                base = addr_field << 2
-                size = 4
-            elif a_mode == PMP_A_NAPOT:
-                base, size = decode_napot(addr_field)
-
-            rwx = self._pmp_rwx_cell(cfg)
-            mode = mode_names.get(a_mode, f"?{a_mode >> 3}?")
-            addr_s = f"0x{addr_field:016x}"
-            cfg_s = f"0x{cfg:02x}"
-
-            base_s, end_s, size_s = "-", "-", "-"
-            if a_mode != PMP_A_OFF:
-                active_count += 1
-                base_s = f"0x{base:016x}"
-                end_s = "0x0000000000000000"
-                size_s = "-"
-                if size > 0:
-                    end_s = f"0x{mask64(base + size):016x}"
-                    size_s = fmt_size(size)
-
-            tbl.add_row(
-                str(i),
-                rwx,
-                mode,
-                base_s,
-                end_s,
-                size_s,
-                addr_s,
-                cfg_s,
-            )
+            row, is_active = self._pmp_entry_row(h, i)
+            active_count += is_active
+            tbl.add_row(*row)
 
         self._console.print(tbl)
         if active_count == 0:
             self._console.print("  [dim]所有条目均未激活 (OFF)[/]")
+
+    def _pmp_entry_row(self, h, i: int) -> tuple[tuple[str, ...], bool]:
+        """算出第 i 个 PMP 条目的表格单元格; 第二个返回值表示该条目是否激活."""
+        cfg_reg_idx = (i // 8) * 2
+        reg_name = f"pmpcfg{cfg_reg_idx}"
+        cfg_val = h.csrs[reg_name].val if reg_name in h.csrs else 0
+        cfg = self._decode_pmp_cfg_byte(cfg_val, i)
+
+        a_mode = cfg & PMP_A_MASK
+        addr_name = f"pmpaddr{i}"
+        addr_field = mask64(h.csrs[addr_name].val if addr_name in h.csrs else 0)
+
+        base, size = self._pmp_range(h, i, a_mode, addr_field)
+        base_s, end_s, size_s = self._pmp_range_cells(a_mode, base, size)
+        cells = (
+            str(i),
+            self._pmp_rwx_cell(cfg),
+            _PMP_MODE_NAMES.get(a_mode, f"?{a_mode >> 3}?"),
+            base_s,
+            end_s,
+            size_s,
+            f"0x{addr_field:016x}",
+            f"0x{cfg:02x}",
+        )
+        return cells, a_mode != PMP_A_OFF
+
+    @staticmethod
+    def _pmp_range(h, i: int, a_mode: int, addr_field: int) -> tuple[int, int]:
+        """按匹配模式算出条目的起始地址与长度; 模式为 OFF 时两者都是 0."""
+        if a_mode == PMP_A_TOR:
+            prev = mask64(
+                h.csrs[f"pmpaddr{i - 1}"].val if i > 0 and f"pmpaddr{i - 1}" in h.csrs else 0
+            )
+            lo = 0 if i == 0 else (prev << 2)
+            hi = addr_field << 2
+            return lo, mask64(hi - lo)
+        if a_mode == PMP_A_NA4:
+            return addr_field << 2, 4
+        if a_mode == PMP_A_NAPOT:
+            return decode_napot(addr_field)
+        return 0, 0
+
+    @staticmethod
+    def _pmp_range_cells(a_mode: int, base: int, size: int) -> tuple[str, str, str]:
+        """按匹配模式与长度给出起始地址、结束地址与长度三列."""
+        if a_mode == PMP_A_OFF:
+            return "-", "-", "-"
+        if size > 0:
+            return (
+                f"0x{base:016x}",
+                f"0x{mask64(base + size):016x}",
+                fmt_size(size),
+            )
+        return f"0x{base:016x}", "0x0000000000000000", "-"
 
     # ----------------------------------------------------------
     #  satp 命令
@@ -172,10 +180,6 @@ class MmuViewMixin(SharedMixinAttrs):
         if mode != 0:
             out.append(f"  根页表 PA = [yellow]0x{(ppn << 12):016x}[/]")
         self._console.print("\n".join(out))
-
-    # ----------------------------------------------------------
-    #  页表遍历 (pt)
-    # ----------------------------------------------------------
 
     @seize_val_err("无效 VA")
     def cmd_pt(self, arg: str | None = None) -> None:
@@ -214,83 +218,57 @@ class MmuViewMixin(SharedMixinAttrs):
         vpn2 <<= 3
         out: list[str] = [
             f"[bold]VA[/] [cyan]0x{va:016x}[/]",
-            f"  VPN[2]={vpn2>>3:#05x}  VPN[1]={vpn1:#05x}  VPN[0]={vpn0:#05x}  "
+            f"  VPN[2]={vpn2 >> 3:#05x}  VPN[1]={vpn1:#05x}  VPN[0]={vpn0:#05x}  "
             f"offset={page_off:#05x}",
             f"  satp = {mn}, root PPN=0x{root_ppn:09x} -> PA=0x{root_pa:016x}",
         ]
 
-        # L1 页表, 即根页表
-        l1_raw = self._emu.bus.try_read(root_pa, 4096)
-        if l1_raw is None:
-            out.append("[red]根页表不可读[/]")
-            self._console.print("\n".join(out))
-            return
-        l1_pte = int.from_bytes(
-            l1_raw[vpn2:vpn2 + 8], "little", signed=False
-        )
-        self._pt_append_level(out, 1, vpn2 >> 3, l1_pte)
-        if not (l1_pte & 1):
-            self._console.print("\n".join(out))
-            return
-        if l1_pte & 0xE:
-            l1_pa = ((l1_pte >> 10) & 0xF_FFFF_FFFF) << 12
-            final_pa = l1_pa | (va & 0x3FFF_FFFF)
-            out.append(f"  最终 PA = [bold yellow]0x{final_pa:016x}[/]")
-            self._console.print("\n".join(out))
-            return
+        indices = (vpn2 >> 3, vpn1, vpn0)
+        next_pa = root_pa
+        for level in (1, 2, 3):
+            pte = self._read_pt_level(out, level, next_pa, indices[level - 1])
+            if pte is None or not (pte & 1):
+                self._console.print("\n".join(out))
+                return
+            if pte & 0xE or level == 3:
+                ppn = ((pte >> 10) & 0xF_FFFF_FFFF) << 12
+                final_pa = ppn | (va & _PT_OFFSET_MASKS[level])
+                out.append(f"  最终 PA = [bold yellow]0x{final_pa:016x}[/]")
+                self._console.print("\n".join(out))
+                return
+            next_pa = ((pte >> 10) & 0xF_FFFF_FFFF) << 12
 
-        # L2
-        l2_pa = ((l1_pte >> 10) & 0xF_FFFF_FFFF) << 12
-        l2_raw = self._emu.bus.try_read(l2_pa, 4096)
-        if l2_raw is None:
-            out.append(f"[red]L2 页表 (PA=0x{l2_pa:016x}) 不可读[/]")
-            self._console.print("\n".join(out))
-            return
-        l2_pte = int.from_bytes(
-            l2_raw[vpn1 * 8:vpn1 * 8 + 8], "little", signed=False
-        )
-        self._pt_append_level(out, 2, vpn1, l2_pte)
-        if not (l2_pte & 1):
-            self._console.print("\n".join(out))
-            return
-        if l2_pte & 0xE:
-            l2_pa_leaf = ((l2_pte >> 10) & 0xF_FFFF_FFFF) << 12
-            final_pa = l2_pa_leaf | (va & 0x1F_FFFF)
-            out.append(f"  最终 PA = [bold yellow]0x{final_pa:016x}[/]")
-            self._console.print("\n".join(out))
-            return
-
-        # L3
-        l3_pa = ((l2_pte >> 10) & 0xF_FFFF_FFFF) << 12
-        l3_raw = self._emu.bus.try_read(l3_pa, 4096)
-        if l3_raw is None:
-            out.append(f"[red]L3 页表 (PA=0x{l3_pa:016x}) 不可读[/]")
-            self._console.print("\n".join(out))
-            return
-        l3_pte = int.from_bytes(
-            l3_raw[vpn0 * 8:vpn0 * 8 + 8], "little", signed=False
-        )
-        self._pt_append_level(out, 3, vpn0, l3_pte)
-        if not (l3_pte & 1):
-            self._console.print("\n".join(out))
-            return
-
-        final_pa = (((l3_pte >> 10) & 0xF_FFFF_FFFF) << 12) | page_off
-        out.append(f"  最终 PA = [bold yellow]0x{final_pa:016x}[/]")
-        self._console.print("\n".join(out))
+    def _read_pt_level(
+        self,
+        out: list[str],
+        level: int,
+        table_pa: int,
+        index: int,
+    ) -> int | None:
+        """读取一级页表项并追加输出; 该级页表不可读时返回 None."""
+        raw = self._emu.bus.try_read(table_pa, 4096)
+        if raw is None:
+            if level == 1:
+                out.append("[red]根页表不可读[/]")
+            else:
+                out.append(f"[red]L{level} 页表 (PA=0x{table_pa:016x}) 不可读[/]")
+            return None
+        pte = int.from_bytes(raw[index * 8 : index * 8 + 8], "little", signed=False)
+        self._pt_append_level(out, level, index, pte)
+        return pte
 
     def _pt_append_level(
-        self, out: list[str], level: int, idx: int, pte: int,
+        self,
+        out: list[str],
+        level: int,
+        idx: int,
+        pte: int,
     ) -> None:
         """向 *out* 列表追加一级页表遍历的格式化输出行."""
         flags = pte_flags_str(pte, is_leaf=bool(pte & 0xE))
         ppn = (pte >> 10) & 0xF_FFFF_FFFF
         pa = ppn << 12
         status = "[red]无效[/]" if not (pte & 1) else flags
-        out.append(
-            f"  L{level}[{idx:#05x}] = 0x{pte:016x}"
-            f"  PPN=0x{ppn:09x}"
-            f"  -> {status}"
-        )
+        out.append(f"  L{level}[{idx:#05x}] = 0x{pte:016x}  PPN=0x{ppn:09x}  -> {status}")
         if pte & 1 and not (pte & 0xE) and level < 3:
             out.append(f"        └─ 下一级页表 PA = 0x{pa:016x}")

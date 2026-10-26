@@ -19,7 +19,7 @@ def multi_hart_emu():
     """2-hart emulator with kernel loaded."""
     cfg = PlatformConfig.qemu_virt()
     cfg.num_harts = 2
-    # 时钟源取固定值, 使 mtime 的推进量与 emu-configs.mk 的编译选项无关.
+    # 时钟源取固定值, 使 mtime 的推进量与项目的编译选项无关.
     cfg.timebase_freq = 10_000_000
     emu = Emulator(cfg)
     kernel = parse_firmware(path_join(examed_elf_dir(), "kernel.elf"))

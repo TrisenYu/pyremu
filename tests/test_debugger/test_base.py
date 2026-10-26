@@ -633,7 +633,7 @@ class TestBuildCompleter:
 class _ScriptedSession:
     """按脚本返回输入的 PromptSession 替身.
 
-    ``DispatchMixin.repl`` 传给 ``prompt`` 的是 (样式, 文本) 二元组的列表,
+    ``DispatchOps.repl`` 传给 ``prompt`` 的是 (样式, 文本) 二元组的列表,
     此处原样记录, 使提示符的内容可被断言.
     """
 

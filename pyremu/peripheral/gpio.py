@@ -98,7 +98,7 @@ class GPIO(Device):
 
     def _read_reg(self, offset: int) -> int:
         if offset == self.REG_INPUT_VAL:
-            # 返回: (外部电平 & INPUT_EN) | (OUTPUT_VAL & OUTPUT_EN)
+            # 外部电平经输入使能、输出值经输出使能分别掩码后取并集
             in_part = self._input_val & self._input_en
             out_part = self._output_val & self._output_en
             return (in_part | out_part) & self._pin_mask

@@ -59,8 +59,11 @@ class TestStackFrame:
 
     def test_create(self):
         sf = StackFrame(
-            idx=0, fp=0x80001000, sp=0x80000FF0,
-            ra=0x80000100, pc=0x800000FC,
+            idx=0,
+            fp=0x80001000,
+            sp=0x80000FF0,
+            ra=0x80000100,
+            pc=0x800000FC,
         )
         assert sf.idx == 0
         assert sf.fp == 0x80001000
@@ -70,8 +73,13 @@ class TestStackFrame:
 
     def test_with_note(self):
         sf = StackFrame(
-            idx=1, fp=0, sp=0, ra=0, pc=0x80000000,
-            note="trap 入口", mode="S",
+            idx=1,
+            fp=0,
+            sp=0,
+            ra=0,
+            pc=0x80000000,
+            note="trap 入口",
+            mode="S",
         )
         assert sf.note == "trap 入口"
         assert sf.mode == "S"
@@ -85,11 +93,11 @@ class TestMemWriteTracker:
         bus.try_read.return_value = b"\x00\x00\x00\x00"
         orig = MagicMock()
         tracker = MemWriteTracker(bus, orig)
-        tracker(0x1000, b"\xEF\xBE\xAD\xDE")
+        tracker(0x1000, b"\xef\xbe\xad\xde")
         assert len(tracker.changes) == 1
         assert tracker.changes[0].addr == 0x1000
         assert tracker.changes[0].old == b"\x00\x00\x00\x00"
-        orig.assert_called_once_with(0x1000, b"\xEF\xBE\xAD\xDE")
+        orig.assert_called_once_with(0x1000, b"\xef\xbe\xad\xde")
 
     def test_multiple_writes_accumulate(self):
         bus = MagicMock()
@@ -112,9 +120,13 @@ class TestBreakpoint:
 
     def test_cond_breakpoint(self):
         bp = Breakpoint(
-            kind="cond", value=0, desc="test",
-            cond_type="csr", cond_reg="mcause",
-            cond_op="==", cond_val=7,
+            kind="cond",
+            value=0,
+            desc="test",
+            cond_type="csr",
+            cond_reg="mcause",
+            cond_op="==",
+            cond_val=7,
         )
         assert bp.kind == "cond"
         assert bp.cond_reg == "mcause"

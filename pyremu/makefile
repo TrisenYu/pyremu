@@ -1,11 +1,11 @@
 # ============================================================
-#  pyremu/makefile — 从 configs.mk 生成 pyremu/configs_gen.py
+#  pyremu/makefile — 从 mk/ 下的配置分片生成 pyremu/configs_gen.py
 # ============================================================
 CONFIG_GEN = configs_gen.py
 
-$(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
+$(CONFIG_GEN): $(wildcard ../mk/*.mk) FORCE
 	@rm -f $@.tmp
-	@echo '# generated from configs.mk by Makefile — do not edit' >> $@.tmp
+	@echo '# generated from mk/*.mk by Makefile — do not edit' >> $@.tmp
 	@echo '# mem layout' >> $@.tmp
 	@echo 'RESERVED_MEM_BASE = $(RESERVED_MEM_BASE)' >> $@.tmp
 	@echo 'RESERVED_MEM_SIZE = $(RESERVED_MEM_SIZE)' >> $@.tmp
@@ -16,6 +16,9 @@ $(CONFIG_GEN): ../configs.mk ../emu-configs.mk FORCE
 	@echo 'NUM_HARTS = $(NUM_HARTS)' >> $@.tmp
 	@echo 'RAM_BASE = $(RAM_BASE)' >> $@.tmp
 	@echo 'RAM_SIZE = $(RAM_SIZE)' >> $@.tmp
+	@echo 'ROM_BASE = $(ROM_BASE)' >> $@.tmp
+	@echo 'ROM_SIZE = $(ROM_SIZE)' >> $@.tmp
+	@echo 'ROM_DTB_OFFSET = $(ROM_DTB_OFFSET)' >> $@.tmp
 	@echo 'PROG_CNT = $(PROG_CNT)' >> $@.tmp
 	@echo 'L2_SIZE = $(L2_SIZE)' >> $@.tmp
 	@echo 'ISA = "$(ISA)"' >> $@.tmp

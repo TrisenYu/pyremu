@@ -52,11 +52,11 @@ def _op_fp(funct7: int, funct3: int, rs2: int, rs1: int, rd: int) -> int:
     return (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0b1010011
 
 
-def fma(opcode: int, fmt: int, rs3: int, rs2: int, rs1: int, rd: int, rm: int = 0) -> int:
-    """构造 FMA 指令字."""
+def fma(opcode: int, fmt: int, src: tuple[int, int, int], rd: int, rm: int = 0) -> int:
+    """构造 FMA 指令字. src 依次为 rs3、rs2、rs1."""
+    rs3, rs2, rs1 = src
     return (
-        (rs3 << 27) | (fmt << 25) | (rs2 << 20) | (rs1 << 15)
-        | (rm << 12) | (rd << 7) | opcode
+        (rs3 << 27) | (fmt << 25) | (rs2 << 20) | (rs1 << 15) | (rm << 12) | (rd << 7) | opcode
     )
 
 
@@ -199,7 +199,7 @@ class TestFusedMultiplyAdd:
         hart._fpr_bits[1] = _boxf(S2_0)
         hart._fpr_bits[2] = _boxf(S3_0)
         hart._fpr_bits[3] = _boxf(S1_0)
-        hart.exec_instr(fma(0b1000011, 0, 3, 2, 1, 4))  # FMADD.S f4
+        hart.exec_instr(fma(0b1000011, 0, (3, 2, 1), 4))  # FMADD.S f4
         assert hart._fpr_bits[4] == _boxf(S7_0)
 
     def test_fmsub_s(self, hart):
@@ -207,7 +207,7 @@ class TestFusedMultiplyAdd:
         hart._fpr_bits[1] = _boxf(S2_0)
         hart._fpr_bits[2] = _boxf(S3_0)
         hart._fpr_bits[3] = _boxf(S1_0)
-        hart.exec_instr(fma(0b1000111, 0, 3, 2, 1, 4))  # FMSUB.S
+        hart.exec_instr(fma(0b1000111, 0, (3, 2, 1), 4))  # FMSUB.S
         assert hart._fpr_bits[4] == _boxf(0x40A0_0000)  # 5.0
 
 
@@ -272,7 +272,7 @@ class TestFsGatingAndFcsr:
 
     def test_inexact_flag_accumulates(self, hart):
         # 1.0 / 3.0 不精确 ->NX (fflags bit 0)。
-        # s0_333 = 0x3EAA_AAAB
+        # 1.0 除以 3.0 的单精度结果为 0x3EAA_AAAB
         hart._fpr_bits[1] = _boxf(S1_0)
         hart._fpr_bits[2] = _boxf(S3_0)
         hart.exec_instr(_op_fp(0x0C, 0, 2, 1, 3))  # FDIV.S 1.0/3.0

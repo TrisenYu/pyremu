@@ -6,7 +6,7 @@
 
 from rich.console import Console
 
-from pyremu.debug.mmu_view import MmuViewMixin
+from pyremu.debug.mmu_view import MmuViewOps
 from pyremu.emulator import Emulator
 
 # ============================================================
@@ -14,8 +14,8 @@ from pyremu.emulator import Emulator
 # ============================================================
 
 
-class _TestMmuDbg(MmuViewMixin):
-    """最小聚合类供 MmuViewMixin 测试."""
+class _TestMmuDbg(MmuViewOps):
+    """最小聚合类供 MmuViewOps 测试."""
 
     def __init__(self, emu, hart_id=0):
         self._emu = emu
@@ -50,25 +50,25 @@ class TestDecodePmpCfgByte:
     """_decode_pmp_cfg_byte — 从 pmpcfgN 提取条目配置."""
 
     def test_entry_0(self):
-        val = MmuViewMixin._decode_pmp_cfg_byte(0x000000000000001F, 0)
+        val = MmuViewOps._decode_pmp_cfg_byte(0x000000000000001F, 0)
         assert val == 0x1F  # L+R+W+X
 
     def test_entry_7(self):
         """最后一个条目在 pmpcfg0 中."""
         cfg_val = 0xFF00000000000000  # entry 7 = 0xFF
-        val = MmuViewMixin._decode_pmp_cfg_byte(cfg_val, 7)
+        val = MmuViewOps._decode_pmp_cfg_byte(cfg_val, 7)
         assert val == 0xFF
 
     def test_entry_8(self):
         """第一个条目在 pmpcfg2 中."""
         cfg_val = 0x000000000000001F  # entry 8 = 0x1F
-        val = MmuViewMixin._decode_pmp_cfg_byte(cfg_val, 0)  # local idx 0
+        val = MmuViewOps._decode_pmp_cfg_byte(cfg_val, 0)  # local idx 0
         assert val == 0x1F
 
     def test_entry_15(self):
         """最后一个条目在 pmpcfg2 中."""
         cfg_val = 0xFF00000000000000
-        val = MmuViewMixin._decode_pmp_cfg_byte(cfg_val, 7)
+        val = MmuViewOps._decode_pmp_cfg_byte(cfg_val, 7)
         assert val == 0xFF
 
 

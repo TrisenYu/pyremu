@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 # SPDX-LICENSE-IDENTIFIER: MIT
 
-"""共享属性声明 — 供 Pylance 理解 mixin 之间的跨类引用.
+"""共享属性声明 — 供 Pylance 理解各操作类之间的跨类引用.
 
-各 mixin 继承此类以获得:
-1. 属性类型标注 — 跨 mixin 共享的所有实例属性
+各操作类继承此类以获得:
+1. 属性类型标注 — 跨操作类共享的所有实例属性
 2. ``__getattr__`` — 告诉静态分析器任何未在本类中定义的属性访问都是合法的
-   (由其他 mixin 在最终 ``Debugger`` 类中提供)
+   (由其他操作类在最终 ``Debugger`` 类中提供)
 
-``__getattr__`` 定义了所有跨 mixin 方法调用的"无限制访问"语义,
+``__getattr__`` 定义了所有跨操作类方法调用的"无限制访问"语义,
 Pylance 不再报告 "属性未知" 错误.  无需为每个方法单独写存根.
 ``if TYPE_CHECKING:`` 确保 ``__getattr__`` 只在静态分析时存在,
 运行时不会影响 ``Debugger`` 的 MRO 方法解析.
@@ -25,9 +25,12 @@ if TYPE_CHECKING:
     from prompt_toolkit.history import FileHistory
     from rich.console import Console
 
+    from pyremu.debug.sym.model import SymAvailItem, SymMod
     from pyremu.debug.types import (
         Breakpoint,
         HartSnapshot,
+        ImageKind,
+        LoadedImage,
         MemoryChange,
         StackFrame,
     )
@@ -35,8 +38,8 @@ if TYPE_CHECKING:
     from pyremu.utils.parse_bin import FirmwareImage
 
 
-class SharedMixinAttrs:
-    """声明所有跨 mixin 共享的属性; 跨 mixin 方法通过 __getattr__ 放行."""
+class SharedAttrs:
+    """声明所有跨操作类共享的属性; 跨类方法通过 __getattr__ 放行."""
 
     # -- DebuggerBase 初始化 --
     # (hart 为 @property, 不在类属性中声明 — __getattr__ 可解析)
@@ -44,9 +47,7 @@ class SharedMixinAttrs:
     _hart_id: int
     _image: FirmwareImage | None
     _load_offset: int
-    _preload_path: str | None
-    _kernel_path: str | None
-    _kernel_addr: int
+    _bins_images: dict[ImageKind, LoadedImage]
 
     _sym_symbols: dict[str, int] | None
     _sym_symbols_pa: dict[str, int]
@@ -55,6 +56,11 @@ class SharedMixinAttrs:
     _sym_load_offset: int
     _sym_path: str | None
     _pa_to_va: dict[int, int]
+
+    _sym_avail_items: list[SymAvailItem]
+    _sym_mod_dir: str | None
+    _sym_mods: list[SymMod]
+    _sym_next_order: int
 
     _running: bool
     _sigint_count: int
@@ -69,6 +75,7 @@ class SharedMixinAttrs:
 
     _trap_displayed_mcause: int | None
     _last_command: str | None
+    _command_rest: str
 
     _disasm_next_addr: int | None
     _vdisasm_next_addr: int | None
@@ -103,12 +110,12 @@ class SharedMixinAttrs:
     # ----------------------------------------------------------
     #  __getattr__ — 仅在 TYPE_CHECKING 时存在
     #
-    #  告诉 Pylance: 通过 ``self`` 访问任何在 ``SharedMixinAttrs``
-    #  中未定义的属性/方法都是合法的 (由其他 mixin 在最终
+    #  告诉 Pylance: 通过 ``self`` 访问任何在 ``SharedAttrs``
+    #  中未定义的属性/方法都是合法的 (由其他操作类在最终
     #  ``Debugger`` 类的 MRO 中提供).
     #
     #  返回 ``Any`` 是为了避免方法签名验证带来的级联错误 —
-    #  跨 mixin 方法的参数和返回类型由各 mixin 自己的实现决定.
+    #  跨操作类方法的参数和返回类型由各操作类自己的实现决定.
     # ----------------------------------------------------------
 
     if TYPE_CHECKING:

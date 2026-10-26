@@ -1,9 +1,16 @@
 [project]
 name = "pyremu"
-version = "3.0.0"
+# 神了，怎么每次都是breaking change？
+version = "4.0.0"
 description = "a riscv emulator"
 readme = "docs/README.md"
-requires-python = ">=3.14.8"
+requires-python = ">=3.14.15"
+
+## 命令备忘录
+# uv lock
+# uv export -o requirements.txt
+# uv pip freeze > requirements.txt
+
 dependencies = [
     "annotated-types==0.8.0",
     "coverage==7.16.0",
@@ -40,6 +47,59 @@ dependencies = [
     "tomli==2.5.0",
     "vulture==2.16",
     "ruff==0.17.0",
+    "asn1crypto==1.5.1",
+    "asttokens==3.0.2",
+    "defusedxml==0.7.1",
+    "executing==2.3.0",
+    "flow-record==3.21",
+    "fusepy==3.0.1",
+    "ipython==9.17.1",
+    "ipython-pygments-lexers==1.1.1",
+    "jedi==0.20.1",
+    "matplotlib-inline==0.2.2",
+    "msgpack==1.2.3",
+    "parso==0.8.7",
+    "pexpect==4.9.0",
+    "psutil==7.2.2",
+    "ptyprocess==0.7.0",
+    "pure-eval==0.2.4",
+    "pycryptodome==4.1.0",
+    "ruamel-yaml==0.19.1",
+    "stack-data==0.6.3",
+    "structlog==26.1.0",
+    "traitlets==5.16.1",
+    "cffi==2.1.1",
+    "dfdatetime==20260730",
+    "dtfabric==20260506",
+    "libbde-python==20260916",
+    "libcaes-python==20260905",
+    "libewf-python==20260924",
+    "libfcrypto-python==20260521",
+    "libfsapfs-python==20260921",
+    "libfsext-python==20260821",
+    "libfsfat-python==20260826",
+    "libfshfs-python==20260922",
+    "libfsntfs-python==20260827",
+    "libfsxfs-python==20260901",
+    "libfvde-python==20260923",
+    "libfwnt-python==20260602",
+    "libluksde-python==20260902",
+    "libmodi-python==20260902",
+    "libphdi-python==20260902",
+    "libqcow-python==20260703",
+    "libsigscan-python==20260902",
+    "libsmdev-python==20260902",
+    "libsmraw-python==20260902",
+    "libvhdi-python==20260901",
+    "libvmdk-python==20260714",
+    "libvsapm-python==20260713",
+    "libvsgpt-python==20260911",
+    "libvshadow-python==20260714",
+    "libvslvm-python==20260901",
+    "pycparser==3.12",
+    "pytsk3==20260715",
+    "xattr==1.3.0",
+    "dfvfs==20260924",
 ]
 
 
@@ -82,6 +142,8 @@ line-length = 95
 extend-exclude = [
     "vendor",
     "bsp",
+	"build",
+	"docs",
     "fn_apps",
 ]
 

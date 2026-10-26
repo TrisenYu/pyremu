@@ -29,7 +29,7 @@ print()
 # 4. 单步执行并观察模式切换
 print("=== 逐条执行, 观察 M->S 切换 ===")
 h = dbg.hart
-# 逐步执行直到检测到模式切换 (mret)
+# 逐步执行, 直到 mret 引起模式切换
 # 使用 emu.step 而非 dbg.cmd_step, 避免每条都打印 PC + 反汇编
 print("--- 执行 M 模式初始化 ... ---")
 for _ in range(50):

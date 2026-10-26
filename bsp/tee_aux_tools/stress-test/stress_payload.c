@@ -20,15 +20,14 @@ int main(void) {
 
 	for (int round = 0; round < MIXED_ROUNDS; round++) {
 		printf(
-			"[stress] round %d: fib(%u)=%lu\n"\
-            "[stress] round %d: primes(<=%u)=%lu\n",
+			"[stress] round %d: fib(%u)=%lu\n"
+			"[stress] round %d: primes(<=%u)=%lu\n",
 			round,
 			FIB_N,
 			stress_fib(FIB_N),
-            round,
+			round,
 			PRIME_MAX,
-			stress_prime_sieve(PRIME_MAX)
-        );
+			stress_prime_sieve(PRIME_MAX));
 
 		stress_malloc_cycle(MALLOC_COUNT);
 		printf("[stress] round %d: malloc(%d) done\n", round, (unsigned)MALLOC_COUNT);

@@ -16,15 +16,16 @@ _csr_names: dict[int, str] = {}
 
 def init_gpr_map(names: list[str], aliases: list[str]) -> None:
     """由 ``core.registers`` 调用以注入 GPR 名称/别名映射."""
-    global _gpr_names, _gpr_aliases
-    _gpr_names = names
-    _gpr_aliases = aliases
+    _gpr_names.clear()
+    _gpr_names.extend(names)
+    _gpr_aliases.clear()
+    _gpr_aliases.extend(aliases)
 
 
 def init_csr_map(csr_names: dict[int, str]) -> None:
     """由 ``core.registers`` 调用以注入 CSR 名称映射."""
-    global _csr_names
-    _csr_names = csr_names
+    _csr_names.clear()
+    _csr_names.update(csr_names)
 
 
 def gpr_name(idx: int) -> str:

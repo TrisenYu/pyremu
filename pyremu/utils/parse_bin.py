@@ -110,26 +110,24 @@ def detect_format(
 #   st_shndx (u16, offset 6)
 #   st_value (u64, offset 8)
 #   st_size  (u64, offset 16)
-_ELF64_SYM_FMT = "<IBBHQQ"  # little-endian: u32, u8, u8, u16, u64, u64
-_ELF64_SYM_SIZE = struct.calcsize(_ELF64_SYM_FMT)  # 24
+ELF64_SYM_FMT = "<IBBHQQ"  # little-endian: u32, u8, u8, u16, u64, u64
+ELF64_SYM_SIZE = struct.calcsize(ELF64_SYM_FMT)  # 24
 
 # 符号绑定 (bits 7:4 of st_info)
-_STB_LOCAL = 0
+STB_LOCAL = 0
 
 # 符号类型 (bits 3:0 of st_info) — ELF64 STT_* 常量
 _STT_NOTYPE = 0
 _STT_OBJECT = 1
-_STT_FUNC = 2
+STT_FUNC = 2
 _STT_SECTION = 3
 _STT_FILE = 4
 
 
 def _parse_symtab_raw(
     path: str,
-    symtab_offset: int,
-    symtab_size: int,
-    strtab_offset: int,
-    strtab_size: int,
+    symtab_span: tuple[int, int],
+    strtab_span: tuple[int, int],
     *,
     skip_local_noise: bool = False,
 ) -> tuple[dict[str, int], list[tuple[int, int, str]]]:
@@ -140,10 +138,8 @@ def _parse_symtab_raw(
 
     Args:
         path: ELF 文件路径.
-        symtab_offset: .symtab 节的文件偏移.
-        symtab_size: .symtab 节大小 (字节).
-        strtab_offset: .strtab 节文件偏移.
-        strtab_size: .strtab 节大小 (字节).
+        symtab_span: .symtab 节的文件偏移与大小 (字节).
+        strtab_span: .strtab 节的文件偏移与大小 (字节).
         skip_local_noise: True 时跳过 LOCAL 非 FUNC 符号 (FILE/SECTION/NOTYPE 等).
             LOCAL 的 STT_FUNC 始终保留 — 它们在大型 ELF (如 Linux vmlinux)
             中占比约 50%, 缺少会导致栈回溯函数名解析错误.
@@ -153,7 +149,9 @@ def _parse_symtab_raw(
         - symbols: 符号名到 VA 的映射
         - ranges:  (start, end, name) 列表, 按 start 升序排列
     """
-    count = symtab_size // _ELF64_SYM_SIZE
+    symtab_offset, symtab_size = symtab_span
+    strtab_offset, strtab_size = strtab_span
+    count = symtab_size // ELF64_SYM_SIZE
     symbols: dict[str, int] = {}
     ranges: list[tuple[int, int, str]] = []
     with open(path, "rb") as fh:
@@ -163,11 +161,11 @@ def _parse_symtab_raw(
         symtab_data = fh.read(symtab_size)
 
     for i in range(count):
-        off = i * _ELF64_SYM_SIZE
+        off = i * ELF64_SYM_SIZE
         st_name, st_info, _st_other, st_shndx, st_value, st_size = struct.unpack_from(
-            _ELF64_SYM_FMT, symtab_data, off
+            ELF64_SYM_FMT, symtab_data, off
         )
-        # 跳过未定义/特殊节索引 (shndx==0)
+        # 跳过未定义符号与地址为 0 的符号
         if st_shndx == 0 or st_value == 0:
             continue
         bind = st_info >> 4
@@ -175,7 +173,7 @@ def _parse_symtab_raw(
         # 大型 ELF (如 Linux vmlinux): 跳过 LOCAL 的非函数符号
         # (FILE/SECTION/NOTYPE/OBJECT) 以减少噪声, 但 STT_FUNC
         # 始终保留 — 无论 binding 是 LOCAL 还是 GLOBAL.
-        if skip_local_noise and bind == _STB_LOCAL and stype != _STT_FUNC:
+        if skip_local_noise and bind == STB_LOCAL and stype != STT_FUNC:
             continue
         # 从 strtab 提取名称
         end = strtab.find(b"\x00", st_name)
@@ -225,7 +223,7 @@ def _parse_elf(
             # 必须用空 data + memsz 触发零填充, 不可直接取 content
             is_nobits = sec.type == lief.ELF.Section.TYPE.NOBITS
             sec_data = b"" if is_nobits else bytes(sec.content)
-            # 跳过零尺寸的空节 (链接器生成的无内容标记节)
+            # 跳过零尺寸且无内容的标记节
             if sec.size == 0 and len(sec_data) == 0:
                 continue
             sec_name: str = (
@@ -254,13 +252,11 @@ def _parse_elf(
         # 大型 ELF (>500K 符号, 如 Linux vmlinux) 跳过 LOCAL 非函数符号
         # (FILE/SECTION/NOTYPE 等) 以减少噪声; STT_FUNC 始终保留,
         # 无论是 LOCAL 还是 GLOBAL — 否则栈回溯会因缺少静态函数而解析错误.
-        sym_count = symtab_sec.size // _ELF64_SYM_SIZE
+        sym_count = symtab_sec.size // ELF64_SYM_SIZE
         symbols, symbol_ranges = _parse_symtab_raw(
             path,
-            symtab_sec.file_offset,
-            symtab_sec.size,
-            strtab_sec.file_offset,
-            strtab_sec.size,
+            (symtab_sec.file_offset, symtab_sec.size),
+            (strtab_sec.file_offset, strtab_sec.size),
             skip_local_noise=(sym_count > 500_000),
         )
     else:
@@ -312,16 +308,18 @@ def _parse_pe(
         data = bytes(sec.content)
         if len(data) == 0:
             continue
-        segments.append(FirmwareSegment(
-            vaddr=image_base + sec.virtual_address,
-            data=data,
-            memsz=sec.virtual_size,
-            name=(
-                sec.name.decode("utf-8", errors="replace")
-                if isinstance(sec.name, bytes)
-                else str(sec.name)
-            ),
-        ))
+        segments.append(
+            FirmwareSegment(
+                vaddr=image_base + sec.virtual_address,
+                data=data,
+                memsz=sec.virtual_size,
+                name=(
+                    sec.name.decode("utf-8", errors="replace")
+                    if isinstance(sec.name, bytes)
+                    else str(sec.name)
+                ),
+            )
+        )
 
     # 提取导出符号, 即函数名与变量名到地址的映射
     symbols: dict[str, int] = {}

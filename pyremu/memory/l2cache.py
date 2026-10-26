@@ -161,7 +161,7 @@ class L2Cache(CacheBase):
         way_entries = self._sets[set_index]
         self._clock += 1
 
-        # 快速路径: 单缓存行内访问 (绝大多数情况 — 取指 4B / 访存 1/2/4/8B)
+        # 本次访问落在单条缓存行内 (绝大多数情况 — 取指 4B / 访存 1/2/4/8B)
         if offset + size <= self._line_size:
             for e in way_entries:
                 if not e.valid or e.tag != tag:
@@ -174,7 +174,7 @@ class L2Cache(CacheBase):
             self._misses += 1
             return self._load_line_and_read(addr, size, way_entries, tag, offset)
 
-        # 慢速路径: 跨缓存行访问
+        # 访问跨缓存行时逐行读取
         result = bytearray()
         cur_addr = addr
         remaining = size
@@ -267,7 +267,7 @@ class L2Cache(CacheBase):
         way_entries = self._sets[set_index]
         self._clock += 1
 
-        # 快速路径: 单缓存行内访问
+        # 本次访问落在单条缓存行内
         if offset + data_len <= self._line_size:
             for e in way_entries:
                 if not (e.valid and e.tag == tag):
@@ -284,7 +284,7 @@ class L2Cache(CacheBase):
             self._write_allocate(addr, data, way_entries, tag, offset)
             return
 
-        # 慢速路径: 跨缓存行写入
+        # 写入跨缓存行时逐行写入
         remaining = data
         cur_addr = addr
         cur_tag = tag
@@ -334,8 +334,7 @@ class L2Cache(CacheBase):
         victim = way_entries[victim_idx]
 
         # 逐出旧行
-        if victim.valid and victim.mesi == MESIState.MODIFIED and \
-        self._ram_write:
+        if victim.valid and victim.mesi == MESIState.MODIFIED and self._ram_write:
             pa = victim.tag << self._line_shift
             self._ram_write(pa, bytes(victim.data))
 

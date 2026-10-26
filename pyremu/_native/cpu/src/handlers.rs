@@ -1,8 +1,8 @@
-//! Instruction handlers for: Load/Store, System, AMO, Compressed.
+//! 加载与存储、系统、原子操作及压缩指令的处理函数。
 //!
-//! Each handler receives ``&mut HartState``, decoded fields, and memory access
-//! context; it returns the PC advance (0, 2, or 4) or ``EXIT_SENTINEL`` to
-//! signal that Python must take over.
+//! 每个处理函数接收 ``&mut HartState``、译码结果与访存上下文,
+//! 返回 PC 推进量, 取值为 0、2 或 4, 或者返回 ``EXIT_SENTINEL``,
+//! 表示必须返回 Python 侧取得对应的处理。
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -16,25 +16,23 @@ pub(crate) use crate::translate::{
 };
 use crate::trap::{deliver_illegal_instruction, deliver_trap, exc_code, mcause_val};
 
-// Re-export moved items for backward compatibility
 pub use crate::interrupt::clint::ClintCtx;
 pub(crate) use crate::interrupt::clint::{clint_write_msip, try_handle_clint};
 use crate::peripheral::plic::try_handle_plic_concurrent;
 pub use crate::peripheral::{is_device_addr, virtio::try_handle_virtio, DevCtx};
 pub use crate::pmp::{pmp_ok, PmpCtx};
 
-// Re-export from csr.rs
 pub use crate::csr::EXIT_SENTINEL;
 // ============================================================
-//  SBI extension / function IDs (RISC-V SBI spec v2.0)
+//  SBI 扩展号与功能号, 依据 RISC-V SBI 规范 2.0
 // ============================================================
 
 #[allow(dead_code)]
 mod sbi_eid {
-	pub const TIME: u64 = 0x54494d45; // "TIME" — timer extension
-	pub const IPI: u64 = 0x735049; // "IPI"  — inter-processor interrupt
-	pub const RFNC: u64 = 0x52464e43; // "RFNC" — remote fence (TLB shootdown)
-	pub const HSM: u64 = 0x48534d; // "HSM"  — hart state management
+	pub const TIME: u64 = 0x54494d45; // "TIME", 定时器扩展
+	pub const IPI: u64 = 0x735049; // "IPI", 核间中断
+	pub const RFNC: u64 = 0x52464e43; // "RFNC", 远程 fence, 用于跨核刷新 TLB
+	pub const HSM: u64 = 0x48534d; // "HSM", hart 状态管理
 }
 
 mod sbi_fid_time {
@@ -46,7 +44,7 @@ mod sbi_fid_ipi {
 }
 
 // ============================================================
-//  GPR read/write helpers
+//  通用寄存器的读取与写入辅助函数
 // ============================================================
 
 #[inline]
@@ -65,21 +63,21 @@ fn write_gpr(state: &mut HartState, rd: u8, val: u64) {
 	}
 }
 
-/// Sign-extend 32-bit -> 64-bit.
+/// 把 32 位值按符号位扩展为 64 位。
 #[inline]
 fn sext32(val: u64) -> u64 {
 	val as i32 as i64 as u64
 }
 
-/// Sign-extend from *bits* to unsigned 64-bit.
+/// 从指定位宽按符号位扩展为 64 位无符号整数。
 #[inline]
 fn sext(val: u64, bits: u32) -> u64 {
 	let half = 1u64 << (bits - 1);
 	(val & (half - 1)).wrapping_sub(val & half) & u64::MAX
 }
 
-/// C1 ALU register-register operations (sf=0b11): SUB/XOR/OR/AND/SUBW/ADDW.
-/// Returns ``None`` for illegal encodings (caller delivers IllInstr).
+/// 压缩指令中 sf 为 0b11 的寄存器-寄存器 ALU 操作:
+/// SUB、XOR、OR、AND、SUBW 与 ADDW。非法编码返回 ``None``, 由调用方产生 IllInstr 陷态。
 #[inline]
 fn c1_alu_reg_op(v1: u64, v2: u64, bit12: u8, bit65: u8) -> Option<u64> {
 	if bit12 == 0 {
@@ -98,8 +96,8 @@ fn c1_alu_reg_op(v1: u64, v2: u64, bit12: u8, bit65: u8) -> Option<u64> {
 	}
 }
 
-/// Execute one C1 ALU operation per the ``sf`` field.
-/// Returns ``None`` for illegal encodings (caller delivers IllInstr).
+/// 按 ``sf`` 字段执行一条压缩 ALU 操作。
+/// 非法编码返回 ``None``, 由调用方产生 IllInstr 陷态。
 #[inline]
 fn exec_c1_alu(state: &HartState, cf: &CompressedFields) -> Option<u64> {
 	let v1 = read_gpr(state, cf.rs1p);
@@ -125,15 +123,13 @@ fn exec_c1_alu(state: &HartState, cf: &CompressedFields) -> Option<u64> {
 }
 
 // ============================================================
-//  CLINT inline MMIO handler
+//  CLINT 的 MMIO 访问处理
 // ============================================================
 
-/// Descriptor for a memory access that may be handled by CLINT inline.
+/// 可能由 CLINT 直接处理的一次访存描述。
 ///
-/// Descriptor for a memory access that may be handled by CLINT inline.
-///
-/// All fields are ``u64`` to avoid byte-alignment or padding ambiguity.
-/// ``is_write``: 0 = read, 1 = write.
+/// 所有字段均为 ``u64``, 避免因内存对齐问题造成运行期间的程序异常。
+/// ``is_write`` 为 0 表示读取, 为 1 表示写入。
 #[repr(C)]
 #[allow(dead_code)]
 pub(crate) struct MemAccess {
@@ -162,14 +158,11 @@ impl MemAccess {
 	}
 }
 
-/// IMSIC inline handler for the serial (non-concurrent) path.
+/// 串行路径上对 IMSIC 地址的处理。
 ///
-/// Delegates to the shared ``imsic_handle_seteipnum`` / ``imsic_handle_clreipnum``
-/// helpers — routing, eip manipulation, and unpark are identical to the
-/// concurrent path.  This function only handles address decoding and
-/// context extraction; the core logic lives in ``imsic.rs``.
-///
-/// Returns true if *pa* is within an IMSIC register (seteipnum / clreipnum).
+/// 地址译码与上下文提取在此完成, 路由、eip 改写与唤醒线程由
+/// ``imsic_handle_seteipnum`` 与 ``imsic_handle_clreipnum`` 处理.
+/// pa 位于 IMSIC 的 seteipnum 或 clreipnum 寄存器内时返回 true.
 fn try_handle_imsic_serial(pa: u64, val: u64, clint: &ClintCtx) -> bool {
 	if !crate::state::CFG_AIA {
 		return false;
@@ -186,15 +179,15 @@ fn try_handle_imsic_serial(pa: u64, val: u64, clint: &ClintCtx) -> bool {
 	let file_tag: u64 = if addr.is_sfile { 0x1000 } else { 0x0000 };
 	let eip_num = val as u32;
 
-	// Read path: all IMSIC MMIO reads return 0 per AIA spec
-	// (seteipnum/clreipnum are write-only).  val==0 is passed by the
-	// inline read call sites to distinguish reads from writes.
+	// 读取路径: 按 AIA 规范, IMSIC 的全部 MMIO 读取均返回 0,
+	// seteipnum 与 clreipnum 只可写。读取路径的调用点传入 val==0,
+	// 以区分读取与写入。
 	if eip_num == 0 {
 		return true;
 	}
 
-	// Write path: route ALL interrupt identities through the same
-	// set/clr helpers used by the concurrent path.
+	// 写入路径: 全部中断标识都交给并发路径使用的
+	// seteipnum 与 clreipnum 辅助函数处理。
 	match addr.reg_off {
 		0x0000 => {
 			let handled = crate::interrupt::imsic::imsic_handle_seteipnum(
@@ -220,13 +213,8 @@ fn try_handle_imsic_serial(pa: u64, val: u64, clint: &ClintCtx) -> bool {
 	}
 }
 
-/// Write MSIP for a target hart, updating its MIP and setting the
-/// cross-hart yield flag when the target is a different hart.
-///
-/// Shared by ``try_handle_clint`` and the SBI IPI fast path so that
-/// yield-for-IPI logic is in one place.
 // ============================================================
-//  Load handlers
+//  加载处理
 // ============================================================
 pub fn handle_load(
 	state: &mut HartState,
@@ -254,13 +242,13 @@ pub fn handle_load(
 		}
 	};
 
-	// Alignment check: misaligned loads are not supported
+	// 对齐检查: 不支持非对齐的加载
 	if (va & ((size as u64) - 1)) != 0 {
 		deliver_trap(state, mcause_val(exc_code::LD_MISALIGNED, false), va);
 		return 0;
 	}
 
-	// Translate VA -> PA
+	// 将虚拟地址翻译为物理地址
 	let tr = match translate_va(state, ctx, va, rwx_read(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
@@ -273,14 +261,14 @@ pub fn handle_load(
 		}
 	};
 
-	// PMP check
+	// PMP 检查
 	if !pmp_ok(state, tr.pa, size as u32, false, false, pmp) {
 		deliver_trap(state, mcause_val(exc_code::LD_ACCESS_FAULT, false), va);
 		return 0;
 	}
 
-	// CLINT inline check — handle MSIP/MTIMECMP/MTIME reads directly
-	// to avoid expensive MMIO exits during SMP bringup.
+	// 直接读取 CLINT 中的 MSIP、MTIMECMP 与 MTIME,
+	// 避免 SMP 启动期间退出加速执行的开销。
 	if let Some(data) = try_handle_clint(&MemAccess::read(tr.pa, size), state, clint) {
 		let result_val = if signed {
 			match size {
@@ -296,15 +284,14 @@ pub fn handle_load(
 		return 4;
 	}
 
-	// IMSIC inline — all IMSIC MMIO reads return 0 (seteipnum/clreipnum
-	// are write-only).  Avoid exit for compressed loads from IMSIC.
+	// IMSIC 的全部 MMIO 读取均返回 0, seteipnum 与 clreipnum
+	// 只可写。压缩指令从 IMSIC 读取时不退出加速执行。
 	if try_handle_imsic_serial(tr.pa, 0, clint) {
 		write_gpr(state, f.rd, 0);
 		return 4;
 	}
 
-	// virtio-blk inline check — handle all MMIO registers except QueueNotify
-	// to avoid expensive exits during device probe.
+	// virtio-blk 避免设备探测期间退出加速执行的开销。
 	if let Some(data) = try_handle_virtio(tr.pa, false, 0, size, dev) {
 		let result_val = if signed {
 			match size {
@@ -320,7 +307,6 @@ pub fn handle_load(
 		return 4;
 	}
 
-	// PLIC inline (serial 回落路径, 与 load_mem_compressed 同源).
 	if let Some(data) = try_handle_plic_concurrent(tr.pa, false, 0, size, state, dev.plic) {
 		let result_val = if signed {
 			match size {
@@ -336,17 +322,16 @@ pub fn handle_load(
 		return 4;
 	}
 
-	// MMIO check (non-CLINT, non-virtio devices)
+	// 未被上述路径处理的设备地址，退出加速执行。
 	if is_device_addr(tr.pa, dev) {
 		instr_group.exit_reason = exit_reason::MMIO;
 		instr_group.exit_instr = instr;
 		return EXIT_SENTINEL;
 	}
 
-	// Read from RAM
+	// 从 RAM 读取
 	let val = ram_read(ctx, tr.pa, size);
 
-	// Sign-extend if needed
 	let result_val = if signed {
 		match size {
 			1 => sext(val, 8),
@@ -355,7 +340,7 @@ pub fn handle_load(
 			_ => val,
 		}
 	} else {
-		// Zero-extend for unsigned loads (already zero-extended by ram_read)
+		// 无符号加载零扩展; ram_read 已返回零扩展后的值。
 		val
 	};
 
@@ -364,7 +349,7 @@ pub fn handle_load(
 }
 
 // ============================================================
-//  Store handlers
+//  存储处理
 // ============================================================
 
 pub fn handle_store(
@@ -390,13 +375,13 @@ pub fn handle_store(
 		}
 	};
 
-	// Alignment check
+	// 对齐检查
 	if (va & ((size as u64) - 1)) != 0 {
 		deliver_trap(state, mcause_val(exc_code::ST_MISALIGNED, false), va);
 		return 0;
 	}
 
-	// Translate VA -> PA
+	// 将虚拟地址翻译为物理地址
 	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
@@ -409,7 +394,7 @@ pub fn handle_store(
 		}
 	};
 
-	// PMP check
+	// PMP 检查
 	if !pmp_ok(state, tr.pa, size as u32, true, false, pmp) {
 		deliver_trap(state, mcause_val(exc_code::ST_ACCESS_FAULT, false), va);
 		return 0;
@@ -417,32 +402,28 @@ pub fn handle_store(
 
 	let val = read_gpr(state, f.rs2);
 
-	// CLINT inline check — handle MSIP/MTIMECMP writes directly
-	// to avoid expensive MMIO exits during SMP bringup.
+	// 就地完成 MSIP、MTIMECMP 与 MTIME 的写入,
+	// 避免 SMP 启动期间退出加速执行的开销。
 	if let Some(_) = try_handle_clint(&MemAccess::write(tr.pa, size, val), state, clint) {
 		return 4;
 	}
 
-	// IMSIC inline — route IPI identities (1/3) through CLINT MSIP for
-	// zero-exit cross-hart wake-up.  Mirrors concurrent-path
-	// ``try_handle_imsic_concurrent``.  Critical for compressed stores
-	// (C.SW / C.SD) that take the serial handler path.
+	// 中断标识 1 与 3 经 CLINT MSIP 处理, 跨 hart 唤醒不退出链接库。
 	if try_handle_imsic_serial(tr.pa, val, clint) {
 		return 4;
 	}
 
-	// virtio-blk inline check — handle all MMIO registers except QueueNotify
-	// to avoid the expensive exits during device probe.
+	// virtio-blk 直接处理: 除 QueueNotify 外的全部 MMIO 寄存器就地完成,
+	// 避免设备探测期间退出加速执行的开销。
 	if let Some(_) = try_handle_virtio(tr.pa, true, val, size, dev) {
 		return 4;
 	}
 
-	// PLIC inline (serial 回落路径, 与 store_mem_compressed 同源).
 	if let Some(_) = try_handle_plic_concurrent(tr.pa, true, val, size, state, dev.plic) {
 		return 4;
 	}
 
-	// MMIO check (non-CLINT, non-IMSIC, non-virtio devices)
+	// 未被上述路径处理的设备地址则退出加速执行。
 	if is_device_addr(tr.pa, dev) {
 		instr_group.exit_reason = exit_reason::MMIO;
 		instr_group.exit_instr = instr;
@@ -455,18 +436,18 @@ pub fn handle_store(
 }
 
 // ============================================================
-//  F/D floating-point load / store
+//  F/D 浮点加载与存储
 // ============================================================
 
-/// mstatus.FS 掩码 (bits[14:13])。
+/// mstatus.FS 在 [14:13] 的掩码。
 const MSTATUS_FS_LS: u64 = 0b11 << 13;
-/// mstatus.SD (bit 63)。
+/// mstatus.SD 在第 63 位的掩码。
 const MSTATUS_SD_LS: u64 = 1 << 63;
-/// 单精度 NaN-boxing 掩码。
+/// 单精度浮点值写入 64 位寄存器时高 32 位的填充掩码。
 const NANBOX_S_LS: u64 = 0xffff_ffff_0000_0000;
 
-/// FLW / FLD (opcode 0x07): 从内存加载到 FPR。
-/// FLW 结果 NaN-boxed; FLD 加载完整 64 位。
+/// FLW 与 FLD (opcode 0x07): 从内存加载到 FPR。
+/// FLW 的结果写入高 32 位全 1 的 64 位寄存器, FLD 加载完整 64 位。
 pub fn handle_fp_load(
 	state: &mut HartState,
 	f: &DecodedFields,
@@ -514,7 +495,7 @@ pub fn handle_fp_load(
 		return 0;
 	}
 
-	// virtio-blk inline check before generic MMIO exit.
+	// 在通用 MMIO 退出之前做 virtio-blk 直接处理。
 	if let Some(data) = try_handle_virtio(tr.pa, false, 0, size, dev) {
 		let boxed = if size == 4 { NANBOX_S_LS | data } else { data };
 		state.fprs[f.rd as usize] = boxed;
@@ -522,13 +503,12 @@ pub fn handle_fp_load(
 		return 4;
 	}
 
-	// 浮点数据极少落在 CLINT; 设备地址退回 Python MMIO 处理。
+	// 浮点数据极少访问 CLINT; 设备地址交回 Python 按 MMIO 处理。
 	if is_device_addr(tr.pa, dev) {
 		instr_group.exit_reason = exit_reason::MMIO;
 		instr_group.exit_instr = instr;
 		return EXIT_SENTINEL;
 	}
-	// CLINT 命中也退回 Python (FP 从 MMIO 加载罕见, 不做 inline)。
 	let _ = clint;
 
 	let val = ram_read(ctx, tr.pa, size);
@@ -538,8 +518,8 @@ pub fn handle_fp_load(
 	4
 }
 
-/// FSW / FSD (opcode 0x27): 将 FPR 存入内存。
-/// FSW 存低 32 位; FSD 存完整 64 位。
+/// FSW 与 FSD (opcode 0x27): 将 FPR 的值写入内存。
+/// FSW 写入低 32 位, FSD 写入完整 64 位。
 pub fn handle_fp_store(
 	state: &mut HartState,
 	f: &DecodedFields,
@@ -587,10 +567,10 @@ pub fn handle_fp_store(
 		return 0;
 	}
 
-	// FSW 存低 32 位 (无需 unbox — 直接取寄存器低位)。
+	// FSW 只写入低 32 位, 直接取寄存器的低位即可。
 	let val = state.fprs[f.rs2 as usize];
 
-	// virtio-blk inline check before generic MMIO exit.
+	// 在通用 MMIO 退出之前做 virtio-blk 直接处理。
 	if let Some(_) = try_handle_virtio(tr.pa, true, val, size, dev) {
 		return 4;
 	}
@@ -606,11 +586,9 @@ pub fn handle_fp_store(
 }
 
 // ============================================================
-//  System instruction handler
+//  系统指令处理
 // ============================================================
 
-/// Try SBI_TIME set_timer fast path (a7=0x54494D45, a6=0).
-/// Returns ``Some(advance)`` on success, ``None`` if this is not a TIME call.
 #[inline]
 fn try_sbi_time_set_timer(state: &mut HartState, clint: &ClintCtx) -> Option<u64> {
 	if read_gpr(state, 17) != sbi_eid::TIME || read_gpr(state, 16) != sbi_fid_time::SET_TIMER {
@@ -628,9 +606,6 @@ fn try_sbi_time_set_timer(state: &mut HartState, clint: &ClintCtx) -> Option<u64
 	Some(4)
 }
 
-/// Try SBI_IPI send_ipi fast path (a7=0x735049, a6=0, mask_base==0).
-/// Returns ``Some(advance)`` on success, ``Some(EXIT_SENTINEL)`` for
-/// mask_base != 0 (delegates to Python), ``None`` if this is not an IPI call.
 #[inline]
 fn try_sbi_ipi_send_ipi(
 	state: &mut HartState,
@@ -644,12 +619,12 @@ fn try_sbi_ipi_send_ipi(
 	let hart_mask = read_gpr(state, 10); // a0
 	let mask_base = read_gpr(state, 11); // a1
 	if mask_base != 0 {
-		// mask_base != 0: fall through to Python.
+		// mask_base 不为 0 时交回 Python 处理。
 		result.exit_reason = exit_reason::ECALL;
 		result.exit_instr = instr;
 		return Some(EXIT_SENTINEL);
 	}
-	// mask_base == 0 is the common case (Linux uses simple bitmap).
+	// mask_base 为 0 是常见情形。
 	let cur = state.mhartid as usize;
 	for t in 0..clint.num_harts as u64 {
 		if (hart_mask & (1u64 << t)) == 0 {
@@ -661,15 +636,11 @@ fn try_sbi_ipi_send_ipi(
 	Some(4)
 }
 
-/// Handle ECALL inline: fast-path SBI calls, or deliver trap.
+/// 处理 ECALL。
 ///
-/// SBI calling convention: a7=x17=EID, a6=x16=FID.  ``SBI_TIME set_timer``
-/// and ``SBI_IPI send_ipi`` are handled directly; everything else is
-/// delivered as a privilege trap without quiting from speedup execution.
-///
-/// SBI 是 S 模式到 M 模式的接口, 故快速路径仅在 S 模式下启用. 非 S 模式
-/// 发起的 ecall 按 RISC-V 约定直接按特权级投递陷态, 详见
-/// ``trap::priv_ecall_concurrent`` 中同型判据的说明.
+/// SBI 调用约定: a7 即 x17 存放 EID, a6 即 x16 存放 FID。SBI 是 S 模式到 M 模式的接口,
+/// 快速路径仅在 S 模式下启用; 非 S 模式发起的 ecall 按特权级分发陷态,
+/// 判据与 ``trap::priv_ecall_concurrent`` 相同。其余调用不退出加速执行, 直接分发陷态。
 #[inline]
 fn handle_ecall_inline(
 	state: &mut HartState,
@@ -686,7 +657,7 @@ fn handle_ecall_inline(
 		return 0;
 	}
 
-	// ---- SBI fast paths ----
+	// ---- SBI 快速路径 ----
 	if let Some(advance) = try_sbi_time_set_timer(state, clint) {
 		return advance;
 	}
@@ -694,13 +665,13 @@ fn handle_ecall_inline(
 		return advance;
 	}
 
-	// ---- Generic ECALL — deliver trap inline ----
+	// ---- 一般 ECALL: 直接分发陷态 ----
 	deliver_trap(state, mcause_val(exc_code::ECALL_SMODE, false), 0);
 	0
 }
 
-/// Dispatch privileged instructions: ECALL, EBREAK, MRET, SRET, WFI, SFENCE.VMA.
-/// Called from ``handle_system`` when func3 == 0b000.
+/// 分发特权指令: ECALL、EBREAK、MRET、SRET、WFI 与 SFENCE.VMA。
+/// ``handle_system`` 在 func3 为 0b000 时调用本函数。
 #[inline]
 fn dispatch_privileged(
 	state: &mut HartState,
@@ -713,14 +684,13 @@ fn dispatch_privileged(
 	match func12 {
 		0 => handle_ecall_inline(state, instr, instr_group, clint),
 		1 => {
-			// 内联服务关闭: 与 Python 引擎的 trap_ebreak 一致, 投递断点异常
+			// 调试器服务关闭: 与 Python 引擎的 trap_ebreak 一致, 分发断点异常。
 			if !CFG_HAS_SEMIHOSTING {
 				let ebreak_pc = state.pc;
 				deliver_trap(state, mcause_val(exc_code::BREAKPOINT, false), ebreak_pc);
 				return 0;
 			}
-			// EBREAK — if this is a semihosting sequence, handle it inline;
-			// otherwise treat as NOP (no external debugger attached).
+			// 调试器序列直接处理, 其余情况按 NOP 处理: 没有连接外部调试器。
 			if let Some(advance) = try_semihosting(state, ctx, state.pc) {
 				return advance;
 			}
@@ -736,19 +706,19 @@ fn dispatch_privileged(
 				3 => riscv_mode::M,
 				_ => riscv_mode::M,
 			};
-			// MIE <- MPIE, MPIE <- 1
-			state.mstatus &= !(1 << 3); // clear MIE
+			// MIE 取 MPIE 的值, MPIE 置 1
+			state.mstatus &= !(1 << 3); // 清除 MIE
 			if mpie != 0 {
 				state.mstatus |= 1 << 3;
-			} // MIE = MPIE
-			state.mstatus |= 1 << 7; // MPIE = 1
-			state.mstatus &= !(0b11 << 11); // MPP <- U (0)
+			} // MIE 取 MPIE 的值
+			state.mstatus |= 1 << 7; // MPIE 置 1
+			state.mstatus &= !(0b11 << 11); // MPP 置 0, 表示 U 模式
 			state.pc = state.mepc;
 			state.waiting = 0;
 			0
 		}
 		0x102 => {
-			// SRET — check privilege
+			// SRET: 检查特权级
 			if state.mode < riscv_mode::S {
 				deliver_illegal_instruction(state, instr as u64);
 				return 0;
@@ -760,48 +730,47 @@ fn dispatch_privileged(
 			} else {
 				riscv_mode::S
 			};
-			// SIE <- SPIE, SPIE <- 1
-			state.mstatus &= !(1 << 1); // clear SIE
+			// SIE 取 SPIE 的值, SPIE 置 1
+			state.mstatus &= !(1 << 1); // 清除 SIE
 			if spie != 0 {
 				state.mstatus |= 1 << 1;
-			} // SIE = SPIE
-			state.mstatus |= 1 << 5; // SPIE = 1
-			state.mstatus &= !(1 << 8); // SPP <- U (0)
+			} // SIE 取 SPIE 的值
+			state.mstatus |= 1 << 5; // SPIE 置 1
+			state.mstatus &= !(1 << 8); // SPP 置 0, 表示 U 模式
 			state.pc = state.sepc;
 			state.waiting = 0;
 			0
 		}
 		0x105 => {
-			// WFI — wait for interrupt.
-			// The top-of-loop check will exit the hart slice with
-			// WFI_WAIT when no interrupt is pending.
+			// WFI: 等待中断。没有待处理中断时, 循环顶部的检查以
+			// WFI_WAIT 结束本 hart 的执行轮次。
 			let tw = (state.mstatus >> 21) & 1;
 			if tw != 0 && state.mode != riscv_mode::M {
 				deliver_illegal_instruction(state, instr as u64);
 				return 0;
 			}
-			// 刚从 WFI 被中断唤醒 (MRET 返回到 WFI 之后的 while 循环,
-			// 循环条件仍未满足, 分支回到此处): 强制将 WFI 视为 NOP 以推进
-			// PC, 允许 while (…) wfi() 轮询循环重新检查状态条件.
+			// wfi_woken 非 0 表示刚被中断从 WFI 唤醒。MRET 返回到 WFI 之后
+			// 的 while 循环, 此时把 WFI 视为 NOP 并推进 PC, 使该轮询循环
+			// 重新判定循环条件。
 			if state.wfi_woken != 0 {
 				state.wfi_woken = 0;
-				return 4; // NOP — PC 推进至下一条指令
+				return 4; // 按 NOP 处理, PC 推进至下一条指令
 			}
 			let pending = state.mip.load(Ordering::Acquire) & state.mie;
 			if pending != 0 {
 				return 4;
-			} // interrupt already pending -> NOP
+			} // 已有待处理中断, 按 NOP 处理
 			state.waiting = 1;
-			4 // advance PC past WFI; wait handled at top of loop
+			4 // 推进 PC 越过 WFI; 等待在循环顶部处理
 		}
-		// SFENCE.VMA: funct7=0b0001001 (bits [31:25]), rs2 in bits [24:20].
-		// funct12 = (funct7 << 5) | rs2 = 0x120 | rs2.
-		// Match any rs2 value (0x120..0x13F) so that ASID-specific flushes
-		// (sfence.vma x0, rs2) are handled instead of raising IllInstr.
+		// SFENCE.VMA: funct7 位于位域 [31:25], 取值 0b0001001, rs2 位于位域 [24:20]。
+		// 编码满足
+		//     funct12 = (funct7 << 5) | rs2 = 0x120 | rs2
+		// 故匹配 0x120..0x13F 的全部取值, 使按 ASID 刷新的 sfence.vma x0, rs2
+		// 也在此处理, 不产生 IllInstr 陷态。
 		f if (f >> 5) == 0x09 => {
-			// SFENCE.VMA — flush all TLBs (both itlb and dtlb).
-			// Full flush is conservative but always correct; ASID / VA
-			// filtering can be added later for performance.
+			// SFENCE.VMA: 刷新全部 TLB 条目, 即 itlb 与 dtlb。
+			// 按 ASID 与 VA 过滤尚未实现, 当前执行全量刷新。
 			for e in state.itlb.iter_mut() {
 				e.valid = 0;
 			}
@@ -843,11 +812,15 @@ pub fn handle_system(
 	match f.func3 {
 		0b000 => dispatch_privileged(state, f.func12, instr, instr_group, clint, ctx),
 		0b001 | 0b010 | 0b011 | 0b101 | 0b110 | 0b111 => {
-			// CSR instructions: funct3 = CSRRW(001), CSRRS(010), CSRRC(011),
-			//                       CSRRWI(101), CSRRSI(110), CSRRCI(111)
-			// Build a temporary ConcurrentClintCtx for CsrContext so that
-			// timer-IID claims can bump mtimecmp.  The memory layouts of
-			// u64 and AtomicU64 are identical on x86_64.
+			// CSR 指令可由 funct3 的取值区分:
+			//     0b001: CSRRW
+			//     0b010: CSRRS
+			//     0b011: CSRRC
+			//     0b101: CSRRWI
+			//     0b110: CSRRSI
+			//     0b111: CSRRCI
+			// 为 CsrContext 构造临时的 ConcurrentClintCtx, 使计时器中断标识
+			// 能够更新 mtimecmp; u64 与 AtomicU64 的内存布局在 x86_64 上相同。
 			let conc_clint = crate::concurrent::ConcurrentClintCtx {
 				base: clint.base,
 				mtime: clint.mtime as *const std::sync::atomic::AtomicU64,
@@ -869,9 +842,9 @@ pub fn handle_system(
 				instr,
 				instr_group,
 			);
-			// Sync MIP.MSIP -> CLINT msip: if software cleared MSIP via CSR
-			// write, also clear the CLINT MSIP register so that ``build_mip``
-			// doesn't re-assert it on the next speedup entry.
+			// 同步 MIP.MSIP 到 CLINT 的 msip: 软件经 CSR 写入清除 MSIP 后,
+			// 同时清除 CLINT 的 MSIP 寄存器, 避免 ``build_mip`` 在下次进入
+			// 加速执行时再次置位。
 			if f.func12 != 0x344 /* MIP */ || f.func12 /* SIP */ == 0x144 {
 				return advance;
 			}
@@ -882,8 +855,8 @@ pub fn handle_system(
 					*clint.msip.add(hart_id as usize) = 0;
 				}
 			} else if msip_in_mip != 0 && msip_in_clint == 0 {
-				// CLINT was cleared directly (e.g. sw) but state.mip is
-				// stale — sync state.mip down.  Do NOT set CLINT.
+				// CLINT 的 MSIP 为 0 而 state.mip 的 MSIP 仍为 1 时, 以 CLINT
+				// 为准清除 state.mip; 此处不回写 CLINT。
 				state.mip.fetch_and(!(1 << 3), Ordering::AcqRel);
 			}
 			advance
@@ -895,15 +868,12 @@ pub fn handle_system(
 	}
 }
 
-// All trap codes now imported directly from crate::trap::exc_code
-
 // ============================================================
-//  AMO fetch-op helpers — width-specific AtomicU32 / AtomicU64 dispatch
+//  AMO 取值操作辅助函数: 按宽度分派 AtomicU32 与 AtomicU64
 // ============================================================
 
-/// Execute one AMO fetch-op on a 32-bit value.  ``funct5`` and ``rs2_val``
-/// come from the decoded instruction; the signed-min/max variants interpret
-/// the operand as ``i32``.
+/// 对一个 32 位值执行一次 AMO 取值操作。``funct5`` 与 ``rs2_val`` 来自
+/// 译码结果; 带符号的最小值与最大值操作把操作数按 ``i32`` 解释。
 #[inline]
 fn amo_fetch_u32(a: &AtomicU32, funct5: u8, rs2_val: u64) -> u32 {
 	let rs2_u32 = rs2_val as u32;
@@ -931,7 +901,7 @@ fn amo_fetch_u32(a: &AtomicU32, funct5: u8, rs2_val: u64) -> u32 {
 	}
 }
 
-/// Execute one AMO fetch-op on a 64-bit value.
+/// 对一个 64 位值执行一次 AMO 取值操作。
 #[inline]
 fn amo_fetch_u64(a: &AtomicU64, funct5: u8, rs2_val: u64) -> u64 {
 	match funct5 {
@@ -956,9 +926,10 @@ fn amo_fetch_u64(a: &AtomicU64, funct5: u8, rs2_val: u64) -> u64 {
 	}
 }
 
-/// AMO arithmetic (AMOSWAP/AMOADD/AMOXOR/AMOAND/AMOOR/AMOMIN/AMOMAX/AMOMINU/AMOMAXU).
-/// Performs the atomic fetch-op on the bytearray at ``tr.pa``, clears
-/// reservations, and writes the old value to ``rd``.
+/// AMO 算术操作: AMOSWAP、AMOADD、AMOXOR、AMOAND、AMOOR、AMOMIN、
+/// AMOMAX、AMOMINU 与 AMOMAXU。
+/// 对 ``tr.pa`` 处的字节数组执行原子取值操作, 清除 LR/SC 保留记录,
+/// 并把旧值写入 ``rd``。
 #[inline]
 fn handle_amo_arithmetic(
 	state: &mut HartState,
@@ -1000,7 +971,7 @@ fn handle_amo_arithmetic(
 }
 
 // ============================================================
-//  AMO handler
+//  AMO 处理
 // ============================================================
 
 pub fn handle_amo(
@@ -1014,7 +985,7 @@ pub fn handle_amo(
 ) -> u64 {
 	let _aq = (instr >> 26) & 1;
 	let _rl = (instr >> 25) & 1;
-	let funct5 = f.func7 >> 2; // bits [31:27]
+	let funct5 = f.func7 >> 2; // funct5 为 func7 的高 5 位, 即指令的位域 [31:27]
 	let width: u8 = match f.func3 {
 		0b010 => 4, // .W
 		0b011 => 8, // .D
@@ -1025,15 +996,15 @@ pub fn handle_amo(
 	};
 
 	let base = read_gpr(state, f.rs1);
-	let va = base; // AMO: rs1 is the address, rs2 is the operand
+	let va = base; // AMO: rs1 为地址, rs2 为操作数
 
-	// Alignment check
+	// 对齐检查
 	if (va & ((width as u64) - 1)) != 0 {
 		deliver_trap(state, mcause_val(exc_code::LD_MISALIGNED, false), va);
 		return 0;
 	}
 
-	// Translate VA -> PA
+	// 将虚拟地址翻译为物理地址
 	let tr = match translate_va(state, ctx, va, rwx_write(), pmp) {
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
@@ -1046,7 +1017,7 @@ pub fn handle_amo(
 		}
 	};
 
-	// PMP check
+	// PMP 检查
 	if !pmp_ok(state, tr.pa, width as u32, true, false, pmp) {
 		deliver_trap(state, mcause_val(exc_code::LD_ACCESS_FAULT, false), va);
 		return 0;
@@ -1055,12 +1026,12 @@ pub fn handle_amo(
 	let rd = f.rd;
 	let rs2_val = read_gpr(state, f.rs2);
 
-	// virtio-blk inline check
+	// virtio-blk 直接处理
 	if let Some(_) = try_handle_virtio(tr.pa, true, rs2_val, width, dev) {
 		return 4;
 	}
 
-	// MMIO check
+	// 其余设备地址: 退出加速执行。
 	if is_device_addr(tr.pa, dev) {
 		instr_group.exit_reason = exit_reason::MMIO;
 		instr_group.exit_instr = instr;
@@ -1069,7 +1040,7 @@ pub fn handle_amo(
 
 	match funct5 {
 		0b00010 => {
-			// LR.W / LR.D
+			// LR.W 与 LR.D
 			let loaded = ram_read(ctx, tr.pa, width);
 			lr_set(ctx, state.mhartid as u8, tr.pa);
 			state.reservation_valid = 1;
@@ -1078,7 +1049,7 @@ pub fn handle_amo(
 			4
 		}
 		0b00011 => {
-			// SC.W / SC.D
+			// SC.W 与 SC.D
 			let has_reservation = lr_check(ctx, state.mhartid as u8, tr.pa)
 				|| (state.reservation_valid != 0 && state.reservation_addr == tr.pa);
 			if !has_reservation {
@@ -1101,7 +1072,7 @@ pub fn handle_amo(
 }
 
 // ============================================================
-//  Compressed instruction handlers
+//  压缩指令的处理函数
 // ============================================================
 
 pub fn handle_compressed(
@@ -1127,7 +1098,8 @@ pub fn handle_compressed(
 	}
 }
 
-/// C0: C.ADDI4SPN, C.LW, C.LD, C.SW, C.SD
+/// 压缩指令的栈指针加法与访存指令:
+/// C.ADDI4SPN、C.FLD、C.LW、C.LD、C.FSD、C.SW 与 C.SD。
 fn handle_c0(
 	state: &mut HartState,
 	cf: &CompressedFields,
@@ -1140,7 +1112,7 @@ fn handle_c0(
 ) -> u64 {
 	match cf.funct3 {
 		0b000 => {
-			// C.ADDI4SPN: rd' = sp + nzuimm
+			// C.ADDI4SPN: rd' 取 sp 与 nzuimm 之和
 			if cf.imm == 0 {
 				deliver_illegal_instruction(state, instr_word as u64);
 				return 0;
@@ -1150,7 +1122,7 @@ fn handle_c0(
 			2
 		}
 		0b001 => {
-			// C.FLD: fpr[rd'] = mem[rs1' + uimm] (RV64DC)
+			// C.FLD: 从 rs1' 加 uimm 的地址读取双精度值到 fpr[rd'], 属于 RV64DC。
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let prev_mode = state.mode;
 			let val = match load_mem_compressed(
@@ -1172,13 +1144,13 @@ fn handle_c0(
 			};
 			if state.mode != prev_mode {
 				return 0;
-			} // trap delivered
+			} // 已分发陷态
 			state.fprs[cf.rdp as usize] = val;
 			state.mstatus |= MSTATUS_FS_LS | MSTATUS_SD_LS;
 			2
 		}
 		0b010 => {
-			// C.LW: rd' = mem[rs1' + uimm]
+			// C.LW: 从 rs1' 加 uimm 的地址读取 32 位值到 rd'。
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let prev_mode = state.mode;
 			let val = match load_mem_compressed(
@@ -1200,13 +1172,13 @@ fn handle_c0(
 			};
 			if state.mode != prev_mode {
 				return 0;
-			} // trap delivered
+			} // 已分发陷态
 			let final_val = sext32(val);
 			write_gpr(state, cf.rd, final_val);
 			2
 		}
 		0b011 => {
-			// C.LD: rd' = mem[rs1' + uimm]
+			// C.LD: 从 rs1' 加 uimm 的地址读取 64 位值到 rd'。
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let prev_mode = state.mode;
 			let val = match load_mem_compressed(
@@ -1228,12 +1200,12 @@ fn handle_c0(
 			};
 			if state.mode != prev_mode {
 				return 0;
-			} // trap delivered
+			} // 已分发陷态
 			write_gpr(state, cf.rd, val);
 			2
 		}
 		0b101 => {
-			// C.FSD: mem[rs1' + uimm] = fpr[rd'] (RV64DC)
+			// C.FSD: 将 fpr[rd'] 的双精度值写入 rs1' 加 uimm 的地址, 属于 RV64DC。
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let fpr_val = state.fprs[cf.rdp as usize];
 			let ret = store_mem_compressed(
@@ -1255,7 +1227,7 @@ fn handle_c0(
 			2
 		}
 		0b110 => {
-			// C.SW: mem[rs1' + uimm] = rs2'
+			// C.SW: 将 rs2' 的低 32 位写入 rs1' 加 uimm 的地址。
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let rs2_val = read_gpr(state, cf.rdp) & 0xffff_ffff;
 			let ret = store_mem_compressed(
@@ -1276,7 +1248,7 @@ fn handle_c0(
 			2
 		}
 		0b111 => {
-			// C.SD: mem[rs1' + uimm] = rs2'
+			// C.SD: 将 rs2' 写入 rs1' 加 uimm 的地址。
 			let addr = read_gpr(state, cf.rs1p).wrapping_add(cf.imm);
 			let rs2_val = read_gpr(state, cf.rdp);
 			let ret = store_mem_compressed(
@@ -1303,37 +1275,38 @@ fn handle_c0(
 	}
 }
 
-/// C1: C.ADDI, C.ADDIW, C.LI, C.LUI, C.ADDI16SP, C.SRLI/C.SRAI/C.ANDI,
-///      C.SUB/C.XOR/C.OR/C.AND, C.SUBW/C.ADDW, C.J, C.BEQZ/C.BNEZ
+/// 压缩指令的立即数运算、寄存器间运算、分支与跳转指令:
+/// C.ADDI、C.ADDIW、C.LI、C.LUI、C.ADDI16SP、C.SRLI、C.SRAI、C.ANDI、
+/// C.SUB、C.XOR、C.OR、C.AND、C.SUBW、C.ADDW、C.J、C.BEQZ 与 C.BNEZ。
 fn handle_c1(state: &mut HartState, cf: &CompressedFields, instr_word: u32) -> u64 {
 	match cf.funct3 {
 		0b000..=0b010 => {
-			// C.ADDI / C.ADDIW / C.LI
+			// C.ADDI、C.ADDIW 与 C.LI
 			let imm = cf.imm;
 			if cf.funct3 == 0b000 {
-				// C.ADDI: rd += imm
+				// C.ADDI: rd 增加 imm
 				let v = read_gpr(state, cf.rd).wrapping_add(imm);
 				write_gpr(state, cf.rd, v);
 			} else if cf.funct3 == 0b001 {
-				// C.ADDIW: rd = sext32(rd + imm)
+				// C.ADDIW: rd 取 rd 与 imm 之和的符号扩展 32 位值
 				let v = read_gpr(state, cf.rd).wrapping_add(imm) & 0xffff_ffff;
 				write_gpr(state, cf.rd, sext32(v));
 			} else {
-				// C.LI: rd = imm
+				// C.LI: rd 取 imm
 				write_gpr(state, cf.rd, imm);
 			}
 			2
 		}
 		0b011 => {
 			if cf.rd == 2 {
-				// C.ADDI16SP: sp += nzimm
+				// C.ADDI16SP: sp 增加 nzimm
 				if cf.imm == 0 {
-					return EXIT_SENTINEL; // illegal
+					return EXIT_SENTINEL; // 非法编码
 				}
 				let sp = state.gprs[2];
 				state.gprs[2] = sp.wrapping_add(cf.imm);
 			} else {
-				// C.LUI: rd = nzimm << 12
+				// C.LUI: rd 取 nzimm 左移 12 位后的值
 				if cf.imm == 0 {
 					return EXIT_SENTINEL;
 				}
@@ -1342,7 +1315,7 @@ fn handle_c1(state: &mut HartState, cf: &CompressedFields, instr_word: u32) -> u
 			2
 		}
 		0b100 => {
-			// C1 ALU: SRLI / SRAI / ANDI / SUB/XOR/OR/AND / SUBW/ADDW
+			// 压缩 ALU 操作: SRLI、SRAI、ANDI、SUB、XOR、OR、AND、SUBW 与 ADDW
 			match exec_c1_alu(state, cf) {
 				Some(r) => {
 					write_gpr(state, cf.rs1p, r);
@@ -1355,13 +1328,13 @@ fn handle_c1(state: &mut HartState, cf: &CompressedFields, instr_word: u32) -> u
 			}
 		}
 		0b101 => {
-			// C.J: pc += offset
+			// C.J: pc 增加 offset
 			state.pc = state.pc.wrapping_add(cf.imm);
 			0
 		}
 		0b110 | 0b111 => {
-			// C.BEQZ / C.BNEZ
-			let rs1 = cf.rs1p; // creg-mapped from bits[9:7]
+			// C.BEQZ 与 C.BNEZ
+			let rs1 = cf.rs1p; // rs1 来自位域 [9:7] 的压缩寄存器编码
 			let v = read_gpr(state, rs1);
 			let taken = if cf.funct3 == 0b110 { v == 0 } else { v != 0 };
 			if taken {
@@ -1378,7 +1351,8 @@ fn handle_c1(state: &mut HartState, cf: &CompressedFields, instr_word: u32) -> u
 	}
 }
 
-/// C2: C.SLLI, C.LWSP, C.LDSP, C.JR/C.MV/C.EBREAK/C.JALR/C.ADD, C.SWSP, C.SDSP
+/// 压缩指令的栈指针访存与寄存器间运算指令:
+/// C.SLLI、C.LWSP、C.LDSP、C.JR、C.MV、C.EBREAK、C.JALR、C.ADD、C.SWSP 与 C.SDSP。
 fn handle_c2(
 	state: &mut HartState,
 	cf: &CompressedFields,
@@ -1391,13 +1365,13 @@ fn handle_c2(
 ) -> u64 {
 	match cf.funct3 {
 		0b000 => {
-			// C.SLLI: rd = rd << shamt
+			// C.SLLI: rd 左移 shamt 位
 			let v = read_gpr(state, cf.rd) << cf.imm;
 			write_gpr(state, cf.rd, v);
 			2
 		}
 		0b001 => {
-			// C.FLDSP: fpr[rd] = mem[sp + uimm] (RV64DC)
+			// C.FLDSP: 从 sp 加 uimm 的地址读取双精度值到 fpr[rd], 属于 RV64DC。
 			if (state.mstatus & MSTATUS_FS_LS) == 0 {
 				deliver_illegal_instruction(state, instr_word as u64);
 				return 0;
@@ -1423,13 +1397,13 @@ fn handle_c2(
 			};
 			if state.mode != prev_mode {
 				return 0;
-			} // trap delivered
+			} // 已分发陷态
 			state.fprs[cf.rd as usize] = val;
 			state.mstatus |= MSTATUS_FS_LS | MSTATUS_SD_LS;
 			2
 		}
 		0b010 => {
-			// C.LWSP: rd = mem[sp + uimm]
+			// C.LWSP: 从 sp 加 uimm 的地址读取 32 位值到 rd。
 			if cf.rd == 0 {
 				deliver_illegal_instruction(state, instr_word as u64);
 				return 0;
@@ -1455,13 +1429,13 @@ fn handle_c2(
 			};
 			if state.mode != prev_mode {
 				return 0;
-			} // trap delivered
+			} // 已分发陷态
 			let final_val = sext32(val);
 			write_gpr(state, cf.rd, final_val);
 			2
 		}
 		0b011 => {
-			// C.LDSP: rd = mem[sp + uimm]
+			// C.LDSP: 从 sp 加 uimm 的地址读取 64 位值到 rd。
 			if cf.rd == 0 {
 				deliver_illegal_instruction(state, instr_word as u64);
 				return 0;
@@ -1487,7 +1461,7 @@ fn handle_c2(
 			};
 			if state.mode != prev_mode {
 				return 0;
-			} // trap delivered
+			} // 已分发陷态
 			write_gpr(state, cf.rd, val);
 			2
 		}
@@ -1495,36 +1469,36 @@ fn handle_c2(
 			let rd_rs1 = cf.rd;
 			let rs2 = cf.rs2;
 			if rd_rs1 == 0 && rs2 == 0 {
-				// 内联服务关闭: 与 Python 引擎的 trap_ebreak 一致, 投递断点异常
+				// 半主机服务关闭: 与 Python 引擎的 trap_ebreak 一致, 分发断点异常。
 				if !CFG_HAS_SEMIHOSTING {
 					let ebreak_pc = state.pc;
 					deliver_trap(state, mcause_val(exc_code::BREAKPOINT, false), ebreak_pc);
 					return 0;
 				}
-				// C.EBREAK — treated as NOP (see EBREAK above)
+				// C.EBREAK: 按 NOP 处理, 见前面 EBREAK 分支。
 				return 2;
 			} else if rs2 == 0 {
 				let target = read_gpr(state, rd_rs1);
 				if cf.bit12 != 0 {
-					// C.JALR: ra = pc + 2
+					// C.JALR: ra 取 pc 加 2
 					state.gprs[1] = state.pc.wrapping_add(2);
 				}
 				state.pc = target & !1;
 				0
 			} else if cf.bit12 != 0 {
-				// C.ADD: rd += rs2
+				// C.ADD: rd 增加 rs2
 				let result_val = read_gpr(state, rd_rs1).wrapping_add(read_gpr(state, rs2));
 				write_gpr(state, rd_rs1, result_val);
 				2
 			} else {
-				// C.MV: rd = rs2
+				// C.MV: rd 取 rs2
 				let v = read_gpr(state, rs2);
 				write_gpr(state, rd_rs1, v);
 				2
 			}
 		}
 		0b101 => {
-			// C.FSDSP: mem[sp + uimm] = fpr[rs2] (RV64DC)
+			// C.FSDSP: 将 fpr[rs2] 的双精度值写入 sp 加 uimm 的地址, 属于 RV64DC。
 			if (state.mstatus & MSTATUS_FS_LS) == 0 {
 				deliver_illegal_instruction(state, instr_word as u64);
 				return 0;
@@ -1550,7 +1524,7 @@ fn handle_c2(
 			2
 		}
 		0b110 => {
-			// C.SWSP: mem[sp + uimm] = rs2
+			// C.SWSP: 将 rs2 的低 32 位写入 sp 加 uimm 的地址。
 			let addr = state.gprs[2].wrapping_add(cf.imm2);
 			let val = read_gpr(state, cf.rs2) & 0xffff_ffff;
 			let ret = store_mem_compressed(
@@ -1571,7 +1545,7 @@ fn handle_c2(
 			2
 		}
 		0b111 => {
-			// C.SDSP: mem[sp + uimm] = rs2
+			// C.SDSP: 将 rs2 写入 sp 加 uimm 的地址。
 			let addr = state.gprs[2].wrapping_add(cf.imm2);
 			let val = read_gpr(state, cf.rs2);
 			let ret = store_mem_compressed(
@@ -1599,14 +1573,13 @@ fn handle_c2(
 }
 
 // ============================================================
-//  Compressed load/store helpers
+//  压缩指令的访存辅助函数
 // ============================================================
 
 /// 压缩指令的访存读取。
 ///
-/// 返回 ``None`` 表示设备访问、需退出单轮加速执行 (退出原因已写入
-/// ``instr_group``); ``Some`` 为读到的数据。数据本身可以是任意 64 位值,
-/// 故不能用 ``EXIT_SENTINEL`` 之类的带内哨兵表示退出。
+/// 返回 ``None`` 表示命中设备地址, 需要退出本轮加速执行, 退出原因已写入
+/// ``instr_group``; ``Some`` 为读到的数据。
 #[inline]
 fn load_mem_compressed(
 	state: &mut HartState,
@@ -1624,26 +1597,25 @@ fn load_mem_compressed(
 		Ok(t) => t,
 		Err(TranslateFault::PageFault(cause)) => {
 			deliver_trap(state, mcause_val(cause, false), va);
-			return Some(0); // trap delivered inline; caller must check state.mode
+			return Some(0); // 陷态已直接分发; 调用方必须检查 state.mode
 		}
 		Err(_) => {
 			deliver_trap(state, mcause_val(exc_code::LD_ACCESS_FAULT, false), va);
-			return Some(0); // trap delivered inline; caller must check state.mode
+			return Some(0); // 陷态已直接分发; 调用方必须检查 state.mode
 		}
 	};
 
 	if !pmp_ok(state, tr.pa, size as u32, false, false, pmp) {
 		deliver_trap(state, mcause_val(exc_code::LD_ACCESS_FAULT, false), va);
-		return Some(0); // trap delivered inline; caller must check state.mode
+		return Some(0); // 陷态已直接分发; 调用方必须检查 state.mode
 	}
 
 	if let Some(data) = try_handle_clint(&MemAccess::read(tr.pa, size), state, clint) {
 		return Some(data);
 	}
 
-	// IMSIC inline reads — all IMSIC MMIO reads return 0 (seteipnum/clreipnum
-	// are write-only).  Must come before is_device_addr so compressed loads
-	// from IMSIC don't exit to Python.
+	// IMSIC 的 MMIO 读取一律返回 0, 因为 seteipnum 与 clreipnum 只接受写入。
+	// 该分支必须位于 is_device_addr 之前, 否则从 IMSIC 读取的压缩指令会退出到 Python。
 	if try_handle_imsic_serial(tr.pa, 0, clint) {
 		return Some(0);
 	}
@@ -1652,7 +1624,7 @@ fn load_mem_compressed(
 		return Some(data);
 	}
 
-	// PLIC inline (压缩指令直映射访问) — 与 handle_load_concurrent 同源.
+	// PLIC 直接处理压缩指令的映射访问。
 	if let Some(data) = try_handle_plic_concurrent(tr.pa, false, 0, size, state, dev.plic) {
 		return Some(data);
 	}
@@ -1700,12 +1672,9 @@ fn store_mem_compressed(
 		return 0;
 	}
 
-	// IMSIC inline stores — route IPI identities (1, 3) through CLINT MSIP
-	// for zero-exit cross-hart wake-up.  Must come before is_device_addr so
-	// compressed stores (C.SW) to IMSIC seteipnum are handled inline instead
-	// of falling through to Python MMIO exit.  Without this, firmware using
-	// compressed instructions (rv64imac) for IPI delivery hangs during SMP
-	// TLB shootdown because the IPI never reaches the target hart's thread.
+	// IMSIC 的写入: 中断号 1 与 3 的 IPI 经 CLINT 的 MSIP 分发, 跨 hart 唤醒不退出加速执行。
+	// 该分支必须位于 is_device_addr 之前, 否则写 IMSIC 的 seteipnum 的 C.SW 会退出到 Python 的 MMIO 处理。
+	// 缺此分支时, 用压缩指令分发 IPI 的固件在多 hart 的 TLB 刷新中停止推进, 因 IPI 未进入目标 hart 的线程。
 	if try_handle_imsic_serial(tr.pa, val, clint) {
 		return 0;
 	}
@@ -1714,7 +1683,7 @@ fn store_mem_compressed(
 		return 0;
 	}
 
-	// PLIC inline (压缩指令直映射访问) — 与 handle_store_concurrent 同源.
+	// PLIC 直接处理压缩指令的映射访问。
 	if let Some(_) = try_handle_plic_concurrent(tr.pa, true, val, size, state, dev.plic) {
 		return 0;
 	}
@@ -1726,43 +1695,36 @@ fn store_mem_compressed(
 	}
 
 	ram_write(ctx, tr.pa, val, size);
-	0 // caller returns 2
+	0 // 调用方返回 2
 }
 
 // ============================================================
-//  Tests
 // ============================================================
+//
+// 半主机(semihosting)是固件与宿主调试器或模拟器以特定陷态序列通信的调试机制,
+// RISC-V 的半主机调用序列为:
+//
+//   slli zero, zero, 0x1f    0x01f01013      入口标记
+//   ebreak                   0x00100073      陷态
+//   srai zero, zero, 0x7     0x40705013      出口标记
+//
+// OpenSBI 以 CONFIG_SEMIHOSTING=y 构建时用半主机做早期控制台输出。
+// 模拟器截获该序列并分派半主机操作, 如 SYS_WRITE 与 SYS_WRITEC。
 
-// ============================================================
-//  Semihosting support
-// ============================================================
-//
-// Semihosting is a debug mechanism where firmware communicates with
-// a host debugger/emulator through a special trap sequence.  The RISC-V
-// semihosting call sequence is:
-//
-//   slli zero, zero, 0x1f    0x01f01013      // entry marker
-//   ebreak                   0x00100073      // trap
-//   srai zero, zero, 0x7     0x40705013      // exit marker
-//
-// OpenSBI uses semihosting for its early console when built with
-// CONFIG_SEMIHOSTING=y.  The emulator intercepts this sequence and
-// dispatches the semihosting operation (SYS_WRITE, SYS_WRITEC, …).
-
-/// Semihosting entry marker — ``slli zero, zero, 0x1f``.
+/// 入口标记, 即 ``slli zero, zero, 0x1f``。
 const SEMIHOSTING_PRE: u32 = 0x01f01013;
-/// Semihosting exit marker — ``srai zero, zero, 0x7``.
+/// 出口标记, 即 ``srai zero, zero, 0x7``。
 const SEMIHOSTING_POST: u32 = 0x40705013;
 
-/// Semihosting operation codes.
+/// 操作码。
 const SH_SYS_OPEN: u64 = 0x01;
 const SH_SYS_WRITEC: u64 = 0x03;
 const SH_SYS_WRITE: u64 = 0x05;
 const SH_SYS_ISTTY: u64 = 0x09;
-/// SYS_EXIT — 停机序列操作码
+/// SYS_EXIT: 停机序列的操作码。
 pub(crate) const SH_SYS_EXIT: u64 = 0x18;
 
-/// Read a u64 from RAM at physical address *pa* (Bare-Mode, VA = PA).
+/// 从 RAM 的物理地址 ``pa`` 读取一个 64 位值。Bare 模式下虚拟地址等于物理地址。
 #[inline]
 unsafe fn read_ram_u64(ctx: &WalkCtx, pa: u64) -> u64 {
 	if pa + 8 > ctx.ram_base + ctx.ram_size || pa < ctx.ram_base {
@@ -1772,7 +1734,7 @@ unsafe fn read_ram_u64(ctx: &WalkCtx, pa: u64) -> u64 {
 	(ctx.ram.offset(off) as *const u64).read_unaligned()
 }
 
-/// Read a u8 from RAM at physical address *pa*.
+/// 从 RAM 的物理地址 ``pa`` 读取一个字节。
 #[inline]
 unsafe fn read_ram_u8(ctx: &WalkCtx, pa: u64) -> u8 {
 	if pa >= ctx.ram_base + ctx.ram_size || pa < ctx.ram_base {
@@ -1782,24 +1744,23 @@ unsafe fn read_ram_u8(ctx: &WalkCtx, pa: u64) -> u8 {
 	*ctx.ram.offset(off)
 }
 
-/// Global state tracking which hart last received a ``[hart X]`` tag.
-/// Only prepend the tag when the outputting hart changes — NOT at every
-/// ``\n``.  This avoids noisy mid-line interleaving when firmware prints
-/// sub-fields on separate lines.
+/// 记录最近一次附加 ``[hart X]`` 标记的 hart 编号。
+/// 只在输出 hart 改变时附加标记, 不在每次换行时附加, 避免固件逐行打印多个字段时
+/// 输出在同一行内交错。
 static SH_LAST_TAGGED_HART: Mutex<Option<u64>> = Mutex::new(None);
 
-/// Write ``data`` to stderr, prepending the ``[hart X]`` label only
-/// when the outputting hart changes (not at every newline).
+/// 把 ``data`` 写入 stderr, 仅在输出 hart 改变时附加 ``[hart X]`` 标记,
+/// 不在每次换行时附加。
 fn write_labeled_stderr(data: &[u8], hart_id: u64) {
 	extern "C" {
 		fn write(fd: i32, buf: *const u8, count: usize) -> isize;
 	}
 
-	// Only prepend the tag when the hart changes.
+	// 仅在输出 hart 改变时附加标记。
 	{
 		let mut last = SH_LAST_TAGGED_HART.lock().unwrap();
 		if *last != Some(hart_id) {
-			// Bold-blue ANSI prefix matching the debugger TUI styling.
+			// 粗体蓝色的 ANSI 前缀。
 			let prefix = format!("\x1b[1;34m[hart {}]\x1b[0m ", hart_id);
 			let prefix_bytes = prefix.as_bytes();
 			let mut off = 0;
@@ -1814,7 +1775,7 @@ fn write_labeled_stderr(data: &[u8], hart_id: u64) {
 		}
 	}
 
-	// Write data to stderr — no per-\n tagging.
+	// 把数据写入 stderr, 不按换行附加标记。
 	let mut off = 0;
 	while off < data.len() {
 		let n = unsafe { write(2, data[off..].as_ptr(), data.len() - off) };
@@ -1825,9 +1786,9 @@ fn write_labeled_stderr(data: &[u8], hart_id: u64) {
 	}
 }
 
-/// Raw write to a file descriptor — bypasses Rust stdio locks to avoid
-/// contention with Python's rich/prompt_toolkit terminal control on stdout.
-/// Writes to stderr (fd 2) so semihosting output doesn't corrupt the TUI.
+/// 直接向文件描述符写入, 不经过 Rust 标准输入输出的锁, 避免与 Python 侧
+/// rich 与 prompt_toolkit 对终端控制的争用。写入 stderr, 即文件描述符 2,
+/// 使半主机输出不改动调试器的终端界面。
 #[allow(unused)]
 fn raw_write_stderr(data: &[u8]) {
 	extern "C" {
@@ -1844,7 +1805,7 @@ fn raw_write_stderr(data: &[u8]) {
 	}
 }
 
-/// Execute a semihosting operation.  Returns the value to place in `a0`.
+/// 执行一次半主机操作, 返回写入 ``a0`` 的值。
 fn semihosting_dispatch(ctx: &WalkCtx, op: u64, param_block: u64, hart_id: u64) -> u64 {
 	match op {
 		SH_SYS_WRITEC => {
@@ -1859,8 +1820,8 @@ fn semihosting_dispatch(ctx: &WalkCtx, op: u64, param_block: u64, hart_id: u64) 
 			if len == 0 {
 				return 0;
 			}
-			// Route all output to stderr (fd 2) — stdout is owned by
-			// the debugger's rich/prompt_toolkit TUI.
+			// 全部输出写入 stderr, 即文件描述符 2; stdout 由调试器的
+			// rich 与 prompt_toolkit 终端界面占用。
 			if fd != 1 && fd != 2 {
 				return -1i64 as u64;
 			}
@@ -1873,7 +1834,7 @@ fn semihosting_dispatch(ctx: &WalkCtx, op: u64, param_block: u64, hart_id: u64) 
 			return -1i64 as u64;
 		}
 		SH_SYS_OPEN => {
-			// Return a valid fd for the probe to succeed.
+			// 返回一个合法的文件描述符, 使固件的探测得到成功结果。
 			1
 		}
 		SH_SYS_ISTTY => {
@@ -1884,11 +1845,11 @@ fn semihosting_dispatch(ctx: &WalkCtx, op: u64, param_block: u64, hart_id: u64) 
 	}
 }
 
-/// 检查 *ebreak_pc* 前后是否为 semihosting marker 序列
-/// ``slli x0, x0, 0x1f; ebreak; srai x0, x0, 7``.
-/// 仅 VA=PA (M 模式, Bare 翻译) 时成立.
+/// 检查 ``ebreak_pc`` 前后是否为半主机标记序列
+/// ``slli x0, x0, 0x1f; ebreak; srai x0, x0, 7``。
+/// 该序列仅在虚拟地址等于物理地址时成立, 即 M 模式且翻译模式为 Bare。
 pub(crate) fn semihosting_match(ctx: &WalkCtx, ebreak_pc: u64) -> bool {
-	// Semihosting only runs with VA = PA (M‑mode, Bare translation).
+	// 半主机仅在虚拟地址等于物理地址时成立, 即 M 模式且翻译模式为 Bare。
 	if ebreak_pc < ctx.ram_base || ebreak_pc + 4 > ctx.ram_base + ctx.ram_size {
 		return false;
 	}
@@ -1897,29 +1858,27 @@ pub(crate) fn semihosting_match(ctx: &WalkCtx, ebreak_pc: u64) -> bool {
 		return false;
 	}
 
-	// Marker before ebreak
+	// 检查 ebreak 之前的标记
 	let prev: u32 = unsafe { (ctx.ram.offset(ram_off - 4) as *const u32).read_unaligned() };
 	if prev != u32::from_le(SEMIHOSTING_PRE) {
 		return false;
 	}
 
-	// Marker after ebreak
+	// 检查 ebreak 之后的标记
 	let next: u32 = unsafe { (ctx.ram.offset(ram_off + 4) as *const u32).read_unaligned() };
 	next == u32::from_le(SEMIHOSTING_POST)
 }
 
-// 内联服务由配置项 PYREMU_HAS_SEMIHOSTING 控制, 生成值见
-// ``configs_gen.rs`` 的 ``CFG_HAS_SEMIHOSTING``. 取值为 0 时 marker 序列按普通
-// ebreak 投递断点 trap: 固件的 semihosting 探测因此判定宿主不支持, 控制台回落到
-// UART, 输出经 TX 环形缓冲区写入每 hart 的日志.
+// 半主机服务由配置项 PYREMU_HAS_SEMIHOSTING 控制, 生成值见
+// ``configs_gen.rs`` 的 ``CFG_HAS_SEMIHOSTING``。取值为 0 时标记序列按普通
+// ebreak 分发断点陷态: 固件的半主机探测因此判定宿主不支持, 控制台回落到
+// UART, 输出经发送环形缓冲区写入每 hart 的日志。
 
-/// Check whether *ebreak_pc* is part of a semihosting call sequence.
+/// 检查 ``ebreak_pc`` 处是否属于一次半主机调用序列。
 ///
-/// If the instructions before and after ``ebreak`` match the semihosting
-/// marker pattern this function handles the operation, updates ``a0``,
-/// and returns ``Some(8)`` (skip the 4‑byte ebreak + 4‑byte exit marker).
-/// Returns ``None`` for a normal ebreak, and for every ebreak when
-/// ``CFG_HAS_SEMIHOSTING`` is false.
+/// 若 ebreak 前后的指令与半主机标记一致, 本函数执行该操作, 更新 ``a0``,
+/// 返回 ``Some(8)``, 即跳过 4 字节的 ebreak 与 4 字节的出口标记。
+/// 普通 ebreak 返回 ``None``; ``CFG_HAS_SEMIHOSTING`` 为假时所有 ebreak 均返回 ``None``。
 pub fn try_semihosting(state: &mut HartState, ctx: &WalkCtx, ebreak_pc: u64) -> Option<u64> {
 	if !CFG_HAS_SEMIHOSTING || !semihosting_match(ctx, ebreak_pc) {
 		return None;
@@ -1930,8 +1889,8 @@ pub fn try_semihosting(state: &mut HartState, ctx: &WalkCtx, ebreak_pc: u64) -> 
 	let hart_id = state.mhartid;
 	state.gprs[10] = semihosting_dispatch(ctx, op, param_block, hart_id);
 
-	// Skip ebreak (4) + post-marker (4) — the remaining instructions
-	// (sext.w / bltz / sub / j) handle the return value naturally.
+	// 跳过 ebreak 与出口标记共 8 字节, 其后的 sext.w、bltz、sub 与 j
+	// 自行处理返回值。
 	Some(8)
 }
 
@@ -1958,7 +1917,7 @@ mod tests {
 		assert_eq!(sext(0x7fff, 16), 0x7fff);
 	}
 
-	/// Direct test: MemAccess::write + try_handle_clint sets MSIP.
+	/// 直接测试: MemAccess::write 与 try_handle_clint 共同置位 MSIP。
 	#[test]
 	fn try_handle_clint_msip_write_direct() {
 		let mut s0: HartState = unsafe { mem::zeroed() };
@@ -1978,7 +1937,7 @@ mod tests {
 			msip: msip.as_mut_ptr(),
 			states: states.as_mut_ptr(),
 			num_harts: 2,
-			timebase_hz: 0, // 单元测试: 无 clock-source 推进, mtime 冻结
+			timebase_hz: 0, // 单元测试: 时钟源不推进, mtime 保持不变
 			yield_for_ipi: Cell::new(false),
 			ipi_sender_hart: Cell::new(0),
 			ipi_sender_rounds: Cell::new(0),
@@ -1987,7 +1946,7 @@ mod tests {
 			hart_states: Cell::new(std::ptr::null()),
 		};
 
-		// Write MSIP[1] (cross-hart)
+		// 写入 MSIP[1], 目标为另一个 hart
 		let access = MemAccess::write(0x200_0004, 4, 1);
 		let result = try_handle_clint(&access, &states[0], &ctx);
 		assert_eq!(result, Some(0));
@@ -2011,7 +1970,7 @@ mod tests {
 			"direct: short-slice rounds must be initialised"
 		);
 
-		// Write MSIP[0] (self-IPI should NOT set yield or sender tracking)
+		// 写入 MSIP[0], 自己向自己分发 IPI 时不得置位 yield 标志, 也不记录发送方
 		ctx.yield_for_ipi.set(false);
 		ctx.ipi_sender_rounds.set(0);
 		let access_self = MemAccess::write(0x200_0000, 4, 1);
@@ -2029,17 +1988,16 @@ mod tests {
 		);
 	}
 
-	/// MSIP clear also goes through ``clint_write_msip`` and clears the
-	/// target hart's mip bit.
+	/// MSIP 的清零同样经 ``clint_write_msip`` 完成, 并清除目标 hart 的 mip 位。
 	#[test]
 	fn try_handle_clint_msip_clear_updates_mip() {
 		let mut s0: HartState = unsafe { mem::zeroed() };
 		s0.mhartid = 0;
-		s0.mip.store(1 << 3, Ordering::Release); // MSIP pending
+		s0.mip.store(1 << 3, Ordering::Release); // MSIP 处于挂起状态
 
 		let mut mtime: u64 = 0;
 		let mut mtimecmp: [u64; 2] = [u64::MAX; 2];
-		let mut msip: [u8; 2] = [1, 1]; // both MSIPs set
+		let mut msip: [u8; 2] = [1, 1]; // 两个 MSIP 均已置位
 
 		let mut states = [s0, unsafe { mem::zeroed() }];
 		let ctx = ClintCtx {
@@ -2049,7 +2007,7 @@ mod tests {
 			msip: msip.as_mut_ptr(),
 			states: states.as_mut_ptr(),
 			num_harts: 2,
-			timebase_hz: 0, // 单元测试: 无 clock-source 推进, mtime 冻结
+			timebase_hz: 0, // 单元测试: 时钟源不推进, mtime 保持不变
 			yield_for_ipi: Cell::new(false),
 			ipi_sender_hart: Cell::new(0),
 			ipi_sender_rounds: Cell::new(0),
@@ -2058,7 +2016,7 @@ mod tests {
 			hart_states: Cell::new(std::ptr::null()),
 		};
 
-		// Clear MSIP[0] (self-clear: target == current == 0)
+		// 清除 MSIP[0], 目标 hart 与当前 hart 均为 0
 		let access = MemAccess::write(0x200_0000, 4, 0);
 		let result = try_handle_clint(&access, &states[0], &ctx);
 		assert_eq!(result, Some(0));
@@ -2068,7 +2026,7 @@ mod tests {
 			0,
 			"mip.MSIP must be 0 after clear"
 		);
-		// Self-clear should NOT set yield or sender tracking
+		// 清除自己的 MSIP 不得置位 yield 标志, 也不记录发送方
 		assert!(!ctx.yield_for_ipi.get(), "MSIP clear should not set yield");
 		assert_eq!(
 			ctx.ipi_sender_rounds.get(),
@@ -2078,11 +2036,11 @@ mod tests {
 	}
 
 	// ============================================================
-	//  Semihosting tests
+	//  半主机测试
 	// ============================================================
 
-	/// Build the semihosting trap sequence in RAM at *offset*.
-	/// Returns the address (ram_base + offset) of the ebreak instruction.
+	/// 在 RAM 的 ``offset`` 处构造半主机陷态序列。
+	/// 返回 ebreak 指令的地址, 即 ram_base 加 offset。
 	fn write_semihosting_seq(ram: &mut [u8], ram_base: u64, offset: usize) -> u64 {
 		let pre: [u8; 4] = (0x01f01013u32).to_le_bytes(); // slli zero, zero, 0x1f
 		let ebr: [u8; 4] = (0x00100073u32).to_le_bytes(); // ebreak
@@ -2094,29 +2052,29 @@ mod tests {
 		ram_base + (offset as u64)
 	}
 
-	/// Write a u64 to RAM at *offset*.
+	/// 把 64 位值写入 RAM 的 ``offset`` 处。
 	fn write_ram_u64(ram: &mut [u8], offset: usize, val: u64) {
 		ram[offset..offset + 8].copy_from_slice(&val.to_le_bytes());
 	}
 
 	#[test]
 	fn semihosting_writec_outputs_char() {
-		use super::try_semihosting;
-		use crate::state::HartState;
-		use crate::translate::WalkCtx;
+		if !CFG_HAS_SEMIHOSTING {
+			return;
+		}
 
 		let mut ram: Vec<u8> = vec![0u8; 0x200];
 		let ram_base: u64 = 0x8000_0000;
 
-		// Place a single character at offset 0x100
+		// 在偏移 0x100 处放置一个字符
 		ram[0x100] = b'X';
 
-		// Place the semihosting sequence with ebreak at offset 0x80
+		// 在偏移 0x80 处放置半主机序列, 其 ebreak 位于该处
 		let ebreak_pc = write_semihosting_seq(&mut ram, ram_base, 0x80);
 
 		let mut state: HartState = unsafe { std::mem::zeroed() };
-		state.gprs[10] = super::SH_SYS_WRITEC; // a0 = WRITEC
-		state.gprs[11] = ram_base + 0x100; // a1 = ptr to char 'X'
+		state.gprs[10] = super::SH_SYS_WRITEC; // a0 取操作码 WRITEC
+		state.gprs[11] = ram_base + 0x100; // a1 指向字符 'X'
 		state.pc = ebreak_pc;
 		state.mode = crate::state::riscv_mode::M;
 
@@ -2138,9 +2096,9 @@ mod tests {
 
 	#[test]
 	fn semihosting_write_outputs_buffer() {
-		use super::try_semihosting;
-		use crate::state::HartState;
-		use crate::translate::WalkCtx;
+		if !CFG_HAS_SEMIHOSTING {
+			return;
+		}
 
 		let mut ram: Vec<u8> = vec![0u8; 0x200];
 		let ram_base: u64 = 0x8000_0000;
@@ -2149,20 +2107,20 @@ mod tests {
 		let msg_off = 0x100;
 		ram[msg_off..msg_off + 5].copy_from_slice(msg);
 
-		// Parameter block at offset 0x80:
-		// [0] = fd (1 = stdout)
-		// [8] = buffer address
-		// [16] = length
-		write_ram_u64(&mut ram, 0x80, 1); // fd=1
-		write_ram_u64(&mut ram, 0x88, ram_base + (msg_off as u64)); // buf addr
-		write_ram_u64(&mut ram, 0x90, 5); // len
+		// 偏移 0x80 处的参数块:
+		//     偏移 0: 文件描述符, 1 表示 stdout
+		//     偏移 8: 缓冲区地址
+		//     偏移 16: 长度
+		write_ram_u64(&mut ram, 0x80, 1); // 文件描述符取 1
+		write_ram_u64(&mut ram, 0x88, ram_base + (msg_off as u64)); // 缓冲区地址
+		write_ram_u64(&mut ram, 0x90, 5); // 长度
 
-		// Place the semihosting sequence with ebreak at offset 0xa0
+		// 在偏移 0xa0 处放置半主机序列, 其 ebreak 位于该处
 		let ebreak_pc = write_semihosting_seq(&mut ram, ram_base, 0xa0);
 
 		let mut state: HartState = unsafe { std::mem::zeroed() };
-		state.gprs[10] = super::SH_SYS_WRITE; // a0 = WRITE
-		state.gprs[11] = ram_base + 0x80; // a1 = param block
+		state.gprs[10] = super::SH_SYS_WRITE; // a0 取操作码 WRITE
+		state.gprs[11] = ram_base + 0x80; // a1 指向参数块
 		state.pc = ebreak_pc;
 		state.mode = crate::state::riscv_mode::M;
 
@@ -2187,7 +2145,7 @@ mod tests {
 		let mut ram: Vec<u8> = vec![0u8; 0x200];
 		let ram_base: u64 = 0x8000_0000;
 
-		// Place ebreak WITHOUT semihosting markers
+		// 放置没有半主机标记的 ebreak
 		let ebr_addr = ram_base + 0x80;
 		let ebr: [u8; 4] = (0x00100073u32).to_le_bytes();
 		ram[0x80..0x84].copy_from_slice(&ebr);
@@ -2230,7 +2188,7 @@ mod tests {
 		}
 	}
 
-	/// 覆盖整个物理地址空间的 TOR 条目 (R|W|X), 供访存测试放行.
+	/// 覆盖整个物理地址空间的 TOR 条目, R、W 与 X 位均置位, 供访存测试放行。
 	fn make_dev_test_pmp(cfg: &mut [u8], addr: &mut [u64]) -> PmpCtx {
 		cfg[0] = 0x0f;
 		addr[0] = u64::MAX;
@@ -2259,8 +2217,8 @@ mod tests {
 		}
 	}
 
-	/// 内存中的全 1 数据是合法内容 (内核的 ``~0UL`` / ``-1``, 全 1 的浮点
-	/// NaN 载荷等), 不得与 ``EXIT_SENTINEL`` 混淆而中断加速执行.
+	/// 内存中的全 1 数据是合法内容, 如内核的 ``~0UL``、``-1`` 以及全 1 的
+	/// 浮点 NaN 载荷, 不得与 ``EXIT_SENTINEL`` 混淆而中断加速执行。
 	#[test]
 	fn compressed_load_all_ones_from_ram_is_not_exit() {
 		let mut ram: Vec<u8> = vec![0u8; 0x400];
@@ -2316,7 +2274,7 @@ mod tests {
 		assert_eq!(state.gprs[10], u64::MAX);
 	}
 
-	/// 设备访问必须退出到 Python, 且退出原因标记为 MMIO.
+	/// 设备访问必须退出到 Python 且退出原因标记为 MMIO。
 	#[test]
 	fn compressed_device_access_exits_with_mmio_reason() {
 		let mut ram: Vec<u8> = vec![0u8; 0x400];

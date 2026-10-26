@@ -5,7 +5,6 @@
 
 """L2 cache stress tests — simulate firmware access patterns (DTB + BSS memset)."""
 
-
 from pyremu.memory.l2cache import L2Cache
 
 
@@ -45,9 +44,9 @@ class TestCacheWriteAllocateThenRead:
         l2 = L2Cache(size=16 * 1024, line_size=64, ways=4)
         l2.set_ram_backend(rf, wf)
 
-        l2.write(0x1000, b"\xDE\xAD\xBE\xEF")
+        l2.write(0x1000, b"\xde\xad\xbe\xef")
         data = l2.read(0x1000, 4)
-        assert data == b"\xDE\xAD\xBE\xEF", f"Expected 0xDEADBEEF, got {data.hex()}"
+        assert data == b"\xde\xad\xbe\xef", f"Expected 0xDEADBEEF, got {data.hex()}"
 
     def test_write_then_read_partial(self):
         """Write 8 bytes, then read 4 at offset 2."""
@@ -65,13 +64,13 @@ class TestCacheWriteAllocateThenRead:
         l2 = L2Cache(size=16 * 1024, line_size=64, ways=4)
         l2.set_ram_backend(rf, wf)
 
-        l2.write(0x1000, b"\xAA" * 8)
-        l2.write(0x1010, b"\xBB" * 8)
-        l2.write(0x1030, b"\xCC" * 8)
+        l2.write(0x1000, b"\xaa" * 8)
+        l2.write(0x1010, b"\xbb" * 8)
+        l2.write(0x1030, b"\xcc" * 8)
 
-        assert l2.read(0x1000, 8) == b"\xAA" * 8
-        assert l2.read(0x1010, 8) == b"\xBB" * 8
-        assert l2.read(0x1030, 8) == b"\xCC" * 8
+        assert l2.read(0x1000, 8) == b"\xaa" * 8
+        assert l2.read(0x1010, 8) == b"\xbb" * 8
+        assert l2.read(0x1030, 8) == b"\xcc" * 8
 
 
 class TestCacheEvictionIntegrity:
@@ -85,7 +84,7 @@ class TestCacheEvictionIntegrity:
         l2.set_ram_backend(rf, wf)
 
         # Write data at 0x0000 (set 0, way 0)
-        l2.write(0x0000, b"\xFE\xED\xFA\xCE\xCA\xFE\xBE\xEF")
+        l2.write(0x0000, b"\xfe\xed\xfa\xce\xca\xfe\xbe\xef")
         # Write data at 0x0040 (same set, way 1) — fills both ways
         l2.write(0x0040, b"\x11" * 8)
         # Now write at 0x0080 (same set) — must evict way 0 (or 1)
@@ -95,7 +94,7 @@ class TestCacheEvictionIntegrity:
 
         # Now re-read 0x0000 — should be a miss, load from RAM (writeback data)
         data = l2.read(0x0000, 8)
-        assert data == b"\xFE\xED\xFA\xCE\xCA\xFE\xBE\xEF", (
+        assert data == b"\xfe\xed\xfa\xce\xca\xfe\xbe\xef", (
             f"Dirty eviction failed: expected FEEDFACECAFEBEEF, got {data.hex()}"
         )
 
@@ -107,7 +106,7 @@ class TestCacheEvictionIntegrity:
 
         # Write known data at a specific address
         marker_addr = 0x5000
-        l2.write(marker_addr, b"\xAB" * 64)
+        l2.write(marker_addr, b"\xab" * 64)
 
         # Thrash: write to many addresses (simulates BSS memset),
         # skipping the marker address so we test cache eviction+reload, not overwrite.
@@ -119,7 +118,7 @@ class TestCacheEvictionIntegrity:
 
         # Verify marker data is still correct (should survive via writeback+reload)
         data = l2.read(marker_addr, 64)
-        assert data == b"\xAB" * 64, (
+        assert data == b"\xab" * 64, (
             f"Data corrupted after thrashing at {marker_addr:#x}: "
             f"first 8 bytes = {data[:8].hex()}"
         )
@@ -221,7 +220,7 @@ class TestCrossCacheLineAccess:
         for a in range(0x0000, 0x8000, 64):
             if a in skip_lines:
                 continue
-            l2.write(a, b"\xFF" * 64)
+            l2.write(a, b"\xff" * 64)
 
         # Read back
         result = l2.read(addr, 32)
@@ -253,12 +252,12 @@ class TestCacheSetAliasing:
         assert (addr_a >> line_shift) != (addr_b >> line_shift)  # different tags
 
         # Write data to both
-        l2.write(addr_a, b"\xAA" * 8)
-        l2.write(addr_b, b"\xBB" * 8)
+        l2.write(addr_a, b"\xaa" * 8)
+        l2.write(addr_b, b"\xbb" * 8)
 
         # Both should be readable (2 ways >= 2 addresses)
-        assert l2.read(addr_a, 8) == b"\xAA" * 8
-        assert l2.read(addr_b, 8) == b"\xBB" * 8
+        assert l2.read(addr_a, 8) == b"\xaa" * 8
+        assert l2.read(addr_b, 8) == b"\xbb" * 8
 
     def test_set_overflow_evicts_lru(self):
         """When more addresses than ways map to the same set, LRU evicts oldest."""
@@ -283,9 +282,7 @@ class TestCacheSetAliasing:
 
         # addrs[0] should be evicted and re-read from RAM (written back as M)
         data = l2.read(addrs[0], 8)
-        assert data == b"\x11" * 8, (
-            f"Evicted LRU data corrupted: got {data.hex()}"
-        )
+        assert data == b"\x11" * 8, f"Evicted LRU data corrupted: got {data.hex()}"
 
 
 class TestCacheWriteSizeVariants:
@@ -316,8 +313,8 @@ class TestCacheWriteSizeVariants:
         ram, rf, wf = _make_ram()
         l2 = L2Cache(size=16 * 1024, line_size=64, ways=4)
         l2.set_ram_backend(rf, wf)
-        l2.write(0x1000, b"\xEF\xCD\xAB\x89\x67\x45\x23\x01")
-        assert l2.read(0x1000, 8) == b"\xEF\xCD\xAB\x89\x67\x45\x23\x01"
+        l2.write(0x1000, b"\xef\xcd\xab\x89\x67\x45\x23\x01")
+        assert l2.read(0x1000, 8) == b"\xef\xcd\xab\x89\x67\x45\x23\x01"
 
 
 class TestCacheMfenceDid:
@@ -330,21 +327,21 @@ class TestCacheMfenceDid:
 
         # Write data with mdid=0
         l2.current_mdid = 0
-        l2.write(0x1000, b"\xAA" * 8)
+        l2.write(0x1000, b"\xaa" * 8)
 
         # Write data with mdid=1
         l2.current_mdid = 1
-        l2.write(0x2000, b"\xBB" * 8)
+        l2.write(0x2000, b"\xbb" * 8)
 
         # Flush mdid=1
         flushed = l2.flush_by_mdid(1)
         assert flushed >= 1
 
         # mdid=0 data should still be in cache
-        assert l2.read(0x1000, 8) == b"\xAA" * 8
+        assert l2.read(0x1000, 8) == b"\xaa" * 8
 
         # mdid=1 data should be evicted and re-read from RAM
-        assert l2.read(0x2000, 8) == b"\xBB" * 8
+        assert l2.read(0x2000, 8) == b"\xbb" * 8
 
 
 class TestCacheLargeScale:
@@ -358,9 +355,9 @@ class TestCacheLargeScale:
 
         # Pre-write checkpoints with known data
         checkpoints = {
-            0x10000: b"\xCA\xFE\xBA\xBE\x00\x00\x00\x00",
-            0x20000: b"\xDE\xAD\xC0\xDE\x00\x00\x00\x00",
-            0x50000: b"\x01\x23\x45\x67\x89\xAB\xCD\xEF",
+            0x10000: b"\xca\xfe\xba\xbe\x00\x00\x00\x00",
+            0x20000: b"\xde\xad\xc0\xde\x00\x00\x00\x00",
+            0x50000: b"\x01\x23\x45\x67\x89\xab\xcd\xef",
         }
         for addr, data in checkpoints.items():
             l2.write(addr, data)

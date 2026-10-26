@@ -12,6 +12,7 @@ from loguru import logger
 import pytest
 
 from pyremu.debug import cli, Debugger
+from pyremu.debug.types import ImageKind
 from pyremu.debug.utils import RAM_MUL
 from pyremu.emulator import Emulator
 from pyremu.utils.parse_bin import FirmwareImage, FirmwareSegment
@@ -106,7 +107,7 @@ class TestBuildArgParser:
         assert ns.ram == "128M"
         assert ns.log_level == "INFO"
         assert ns.preload is None
-        assert ns.sym is None
+        assert ns.sym_dir is None
         assert ns.kernel is None
         assert ns.disk is None
         assert ns.hart_logs is None
@@ -127,8 +128,6 @@ class TestBuildArgParser:
                 "0x1000",
                 "--initrd-addr",
                 "0x2000",
-                "--sym-base",
-                "0x3000",
             ]
         )
         assert ns.base_addr == 0x8000_0000
@@ -137,7 +136,6 @@ class TestBuildArgParser:
         assert ns.preload_addr == 0x40
         assert ns.kernel_addr == 0x1000
         assert ns.initrd_addr == 0x2000
-        assert ns.sym_base == 0x3000
 
     def test_fdt_flag_without_value_is_minus_one(self):
         ns = cli._build_arg_parser().parse_args(["fw.bin", "--fdt"])
@@ -168,8 +166,8 @@ class TestBuildArgParser:
                 "p.bin",
                 "--entry-symbol",
                 "main",
-                "--sym",
-                "vmlinux",
+                "--sym-dir",
+                "/tmp/symbols",
                 "--kernel",
                 "Image",
                 "--bootargs",
@@ -187,7 +185,7 @@ class TestBuildArgParser:
         assert ns.ram == "256M"
         assert ns.preload == "p.bin"
         assert ns.entry_symbol == "main"
-        assert ns.sym == "vmlinux"
+        assert ns.sym_dir == "/tmp/symbols"
         assert ns.kernel == "Image"
         assert ns.bootargs == "console=ttySIF0"
         assert ns.initrd == "initrd.cpio"
@@ -380,8 +378,9 @@ class TestSetupPreload:
         code = b"\x13\x00\x00\x00" * 4
         src = tmp_path / "crt0.bin"
         src.write_bytes(code)
-        entry = cli._setup_preload(emu, _ns(preload=str(src)), None, RAM_BASE)
+        entry, size = cli._setup_preload(emu, _ns(preload=str(src)), None, RAM_BASE)
         assert entry == (RAM_BASE + emu.bus.ram_size - 0x20000) & ~0xF
+        assert size == len(code)
         assert emu.bus.try_read(entry, len(code)) == code
         assert emu.harts[0].csrs["misa"].val == (2 << 62) | (1 << 18) | (1 << 20)
 
@@ -390,7 +389,7 @@ class TestSetupPreload:
         src = tmp_path / "crt0.bin"
         src.write_bytes(b"\x13\x00\x00\x00")
         addr = RAM_BASE + 0x1000
-        entry = cli._setup_preload(
+        entry, _ = cli._setup_preload(
             emu, _ns(preload=str(src), preload_addr=addr), None, RAM_BASE
         )
         assert entry == addr
@@ -472,7 +471,7 @@ class TestLoadKernelImage:
         src = tmp_path / "Image"
         src.write_bytes(b"KERNEL")
         result = cli._load_kernel_image(emu, str(src), None, 0x8100_0000)
-        assert result == (str(src), 0x8100_0000)
+        assert result == (str(src), 0x8100_0000, len(b"KERNEL"))
         assert emu.bus.direct_writes == [(0x8100_0000, b"KERNEL")]
 
     def test_explicit_address_overrides_default(self, tmp_path):
@@ -480,7 +479,7 @@ class TestLoadKernelImage:
         src = tmp_path / "Image"
         src.write_bytes(b"KERNEL")
         result = cli._load_kernel_image(emu, str(src), 0x8200_0000, 0x8100_0000)
-        assert result == (str(src), 0x8200_0000)
+        assert result == (str(src), 0x8200_0000, len(b"KERNEL"))
 
 
 # ============================================================
@@ -509,7 +508,7 @@ class TestDebuggerEntry:
         assert dbg.hart.pc == RAM_BASE
         assert dbg._fdt_addr is None
         assert dbg._load_offset == 0
-        assert dbg._preload_path is None
+        assert ImageKind.PRELOAD not in dbg._bins_images
 
     def test_prog_cnt_overrides_entry(self, tmp_path, repl_capture):
         fw = _raw_firmware(tmp_path)
@@ -573,7 +572,7 @@ class TestDebuggerEntry:
         )
         dbg = repl_capture["dbg"]
         assert dbg.hart.pc == addr
-        assert dbg._preload_path == str(src)
+        assert dbg._bins_images[ImageKind.PRELOAD].path == str(src)
 
     def test_virtio_net_instances_are_enabled(self, tmp_path, repl_capture):
         fw = _raw_firmware(tmp_path)
@@ -660,8 +659,9 @@ class TestDebuggerEntry:
             ]
         )
         dbg = repl_capture["dbg"]
-        assert dbg._kernel_path == str(kernel)
-        assert dbg._kernel_addr == RAM_BASE + cli.configs_gen.FW_RESERVED_MEM_SIZE
+        kernel_image = dbg._bins_images[ImageKind.KERNEL]
+        assert kernel_image.path == str(kernel)
+        assert kernel_image.start == RAM_BASE + cli.configs_gen.FW_RESERVED_MEM_SIZE
 
     def test_kernel_explicit_address(self, tmp_path, repl_capture):
         fw = _raw_firmware(tmp_path)
@@ -683,7 +683,7 @@ class TestDebuggerEntry:
             ]
         )
         dbg = repl_capture["dbg"]
-        assert dbg._kernel_addr == addr
+        assert dbg._bins_images[ImageKind.KERNEL].start == addr
 
     def test_missing_entry_symbol_exits(self, tmp_path, repl_capture):
         fw = _raw_firmware(tmp_path)
@@ -734,11 +734,10 @@ class TestDebuggerEntry:
             cli.debugger([str(tmp_path / "none.bin"), "--ram", "4M", "--no-fdt"])
         assert exc_info.value.code == 1
 
-    def test_missing_symbol_file_is_reported(self, tmp_path, monkeypatch, repl_capture):
-        """符号文件缺失时只报告错误, 不终止调试器."""
+    def test_sym_dir_sets_candidate_directory(self, tmp_path, repl_capture):
+        """--sym-dir 只记录候选目录, 不访问文件系统, 也不加载符号."""
         fw = _raw_firmware(tmp_path)
-        errs: list[str] = []
-        monkeypatch.setattr(Debugger, "_err", lambda self, msg: errs.append(msg), raising=True)
+        symbols = tmp_path / "not-created"
         cli.debugger(
             [
                 fw,
@@ -747,11 +746,33 @@ class TestDebuggerEntry:
                 "--no-fdt",
                 "--base-addr",
                 hex(RAM_BASE),
-                "--sym",
-                str(tmp_path / "vmlinux"),
+                "--sym-dir",
+                str(symbols),
             ]
         )
-        assert errs and "符号文件不存在" in errs[0]
+        dbg = repl_capture["dbg"]
+        assert dbg._sym_mod_dir == str(symbols)
+        assert dbg._sym_symbols == {}
+
+    def test_sym_dir_relative_path_is_resolved(self, tmp_path, monkeypatch, repl_capture):
+        """启动时给的相对路径按当时的工作目录换算为绝对路径."""
+        fw = _raw_firmware(tmp_path)
+        work = tmp_path / "work"
+        work.mkdir()
+        monkeypatch.chdir(work)
+        cli.debugger(
+            [
+                fw,
+                "--ram",
+                "4M",
+                "--no-fdt",
+                "--base-addr",
+                hex(RAM_BASE),
+                "--sym-dir",
+                "symbols",
+            ]
+        )
+        assert repl_capture["dbg"]._sym_mod_dir == str((work / "symbols").resolve())
 
     def test_initrd_is_loaded_before_device_tree(self, tmp_path, repl_capture):
         """initramfs 的范围要写入设备树, 故必须先生成 DTB 之前加载."""

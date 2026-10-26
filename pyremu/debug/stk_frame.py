@@ -3,9 +3,9 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""StackWalkMixin — FP 链回溯、跨特权级边界帧、栈帧显示.
+"""StackWalkOps — FP 链回溯、跨特权级边界帧、栈帧显示.
 
-依赖 DebuggerBase + MemoryMixin._try_read_va + SymbolMixin.
+依赖 DebuggerBase + MemoryOps._try_read_va + SymLookupOps.
 """
 
 import struct
@@ -14,9 +14,10 @@ from rich.table import Table
 
 from pyremu.core.decoder import decode_c_sdsp, decode_sd_sp
 from pyremu.core.hart import RiscvMode
-from pyremu.debug._attrs import SharedMixinAttrs
-from pyremu.debug.types import StackFrame
+from pyremu.debug.attrs import SharedAttrs
+from pyremu.debug.types import StackFrame, TrapEntry
 from pyremu.debug.utils import hex_addr
+from pyremu.utils.str_aux import dye_hexdump
 from pyremu.utils.wrapper import seize_val_err
 
 # 跨特权级 trap 上下文中 RA/FP 保存偏移的常见布局.
@@ -31,7 +32,7 @@ _FALLBACK_TRAP_OFFSETS: tuple[tuple[int, int], ...] = (
 )
 
 
-class StackWalkMixin(SharedMixinAttrs):
+class StackWalkOps(SharedAttrs):
     """栈帧回溯 (backtrace)."""
 
     # ----------------------------------------------------------
@@ -44,7 +45,6 @@ class StackWalkMixin(SharedMixinAttrs):
     #
     # c.jal  (RV64)  funct3=101  quadrant C1  -> jal  x1, imm     [2 B]
     # c.jalr           funct3=100  quadrant C2  -> jalr x1, rs1, 0  [2 B]
-    #                                                  bit[12]=0
     # jal              opcode=110_1111,  rd=x1                    [4 B]
     # jalr             opcode=110_0111,  funct3=000, rd=x1        [4 B]
     # ----------------------------------------------------------
@@ -216,9 +216,12 @@ class StackWalkMixin(SharedMixinAttrs):
           - saved_ra 为零 (无返回地址)
           - saved_fp 已出现在已访问集合中 (含初始帧 fp0), 防死循环
         """
-        return saved_fp in ({0, fp0} | visited) or \
-            saved_fp <= current_fp or \
-            (saved_fp & 0x7) != 0 or saved_ra == 0
+        return (
+            saved_fp in ({0, fp0} | visited)
+            or saved_fp <= current_fp
+            or (saved_fp & 0x7) != 0
+            or saved_ra == 0
+        )
 
     def _resolve_prev_ra(self, frames: list[StackFrame], saved_ra: int) -> tuple[int, bool]:
         """解析当前帧的调用者 RA.
@@ -332,193 +335,123 @@ class StackWalkMixin(SharedMixinAttrs):
     ) -> None:
         """尝试解析 trap 入口, 定位被中断上下文并继续回溯低特权级 FP 链."""
         h = self.hart
-        mode_val = h.mode.value
-        if h.mode not in set((RiscvMode.M, RiscvMode.D, RiscvMode.S)):
+        context = self._trap_entry_context(h)
+        if context is None:
             return
-        if h.mode in set((RiscvMode.M, RiscvMode.D)):
-            tvec = h.mtvec_val
-            trapped_pc = h.mepc_val
-            prev_mode = h.mpp
-            s_trapped_pc = h.sepc_val
-            s_prev_mode = h.spp
-            if s_prev_mode == RiscvMode.U and s_trapped_pc >= (1 << 63):
-                s_prev_mode = RiscvMode.S
-        elif h.mode == RiscvMode.S:
-            tvec = h.stvec_val
-            trapped_pc = h.sepc_val
-            prev_mode = h.spp
-            if prev_mode == RiscvMode.U and trapped_pc >= (1 << 63):
-                prev_mode = RiscvMode.S
-            # 检测残留 sepc: 从 M 模式经 mret 进入 S 模式后 SPP=U 且 sepc 为残留 RAM 地址,
-            # 或 Sv39 启用时 sepc 落在 RAM 物理地址范围, 即非规范虚拟地址.
-            # 仅当 Sv39 启用或 trapped_pc 高于 RAM 窗口时才认为无效,
-            # Bare 翻译下 U 模式的虚拟地址即 RAM 物理地址, 属合法 trap 现场.
-            # 直接从 satp CSR 读 MODE 字段, 避免依赖缓存 _mmu_mode.
-            satp_mode = (h.satp_val >> 60) & 0xF
-            if self._emu.bus.is_ram_addr(trapped_pc):
-                if satp_mode != 0 or prev_mode != RiscvMode.U:
-                    # Sv39 启用则内核与 sepc 应为规范高虚拟地址, 该地址为残留值
-                    # Bare 翻译下 SPP=S 而 sepc 落在 RAM 窗口: 按残留值处理, 跳过
-                    return
-                if prev_mode == RiscvMode.U:
-                    # Bare 翻译下 U 模式 trap 的地址合法, 不跳过
-                    pass
-            s_trapped_pc = 0
-            s_prev_mode = RiscvMode.U
-
-        if trapped_pc == 0 or prev_mode.value >= mode_val or tvec == 0:
+        entry, s_trapped_pc, s_prev_mode = context
+        if entry.trapped_pc == 0 or entry.prev_mode.value >= h.mode.value or entry.tvec == 0:
             return
 
         # 若 trapped_pc 已与现有序号帧的 PC 重合 (含 ±4),
         # 说明该 trap 上下文已被 FP 链覆盖, 不重复添加.
         for f in frames:
-            if abs(f.pc - trapped_pc) <= 4:
+            if abs(f.pc - entry.trapped_pc) <= 4:
                 return
 
-        prev_name = prev_mode.name
-        _nested = (
+        prev_name = entry.prev_mode.name
+        is_nested = (
             h.mode in (RiscvMode.M, RiscvMode.D)
             and s_trapped_pc != 0
-            and prev_mode.value < RiscvMode.M.value
-            and self._is_valid_mmode_code(trapped_pc)
+            and entry.prev_mode.value < RiscvMode.M.value
+            and self._is_valid_mmode_code(entry.trapped_pc)
         )
 
-        boundary_mode, boundary_note = self._resolve_boundary_frame(trapped_pc, prev_name)
-        offsets = self._parse_trap_save_offsets(tvec)
+        boundary = self._resolve_boundary_frame(entry.trapped_pc, prev_name)
+        offsets = self._parse_trap_save_offsets(entry.tvec)
 
         if offsets:
-            self._add_prev_mode_frame(frames, trapped_pc, prev_mode, tvec, visited, offsets)
+            self._add_prev_mode_frame(frames, entry, visited, offsets)
             return
-        elif prev_mode == RiscvMode.U and not _nested:
+        if entry.prev_mode == RiscvMode.U and not is_nested:
             # S->U 边界: 指令解析失败时, 尝试常见 trap 帧布局以恢复
             # U-mode 的 FP/SP/RA 并继续 U-mode FP 链回溯.
-            self._add_prev_mode_frame_fallback(
-                frames,
-                trapped_pc,
-                prev_mode,
-                tvec,
-                visited,
-                boundary_mode,
-                boundary_note,
-            )
+            self._add_prev_mode_frame_fallback(frames, entry, visited, boundary)
             return
-        if not boundary_note:
-            if _nested:
-                payload = "因mepc嵌套保存trap, 无法解析寄存器布局"
-            else:
-                payload = "trap 入口寄存器保存布局无法解析 (仅 PC)"
-        else:
-            payload = boundary_note
+        payload = self._boundary_payload(boundary[1], is_nested)
+        frames.append(self._pc_frame(frames, entry.trapped_pc, boundary[0], payload))
+        if is_nested:
+            nested_entry = TrapEntry(h.stvec_val, s_trapped_pc, s_prev_mode)
+            self._add_prev_mode_frame(frames, nested_entry, visited, offsets)
 
-        frames.append(
-            StackFrame(
-                idx=len(frames),
-                fp=0,
-                sp=0,
-                ra=0,
-                pc=trapped_pc,
-                note=(payload),
-                mode=boundary_mode,
-            )
-        )
-        if _nested:
-            self._add_prev_mode_frame(
-                frames, s_trapped_pc, s_prev_mode,
-                h.stvec_val, visited, offsets
-            )
+    def _trap_entry_context(self, h) -> tuple[TrapEntry, int, RiscvMode] | None:
+        """取当前特权级 trap 入口的参数, 以及嵌套回溯所需的 S 侧现场.
+
+        返回 (主 trap 入口, S 侧 trapped_pc, S 侧 prev_mode). 当前模式不在
+        M/D/S 之内, 或 S 侧的 sepc 判定为残留值时返回 None.
+        """
+        if h.mode not in (RiscvMode.M, RiscvMode.D, RiscvMode.S):
+            return None
+        if h.mode in (RiscvMode.M, RiscvMode.D):
+            prev_mode = h.mpp
+            s_trapped_pc = h.sepc_val
+            s_prev_mode = h.spp
+            if s_prev_mode == RiscvMode.U and s_trapped_pc >= (1 << 63):
+                s_prev_mode = RiscvMode.S
+            entry = TrapEntry(h.mtvec_val, h.mepc_val, prev_mode)
+            return entry, s_trapped_pc, s_prev_mode
+
+        trapped_pc = h.sepc_val
+        prev_mode = h.spp
+        if prev_mode == RiscvMode.U and trapped_pc >= (1 << 63):
+            prev_mode = RiscvMode.S
+        # 检测残留 sepc: 从 M 模式经 mret 进入 S 模式后 SPP=U 且 sepc 为残留 RAM 地址,
+        # 或 Sv39 启用时 sepc 落在 RAM 物理地址范围, 即非规范虚拟地址.
+        # 仅当 Sv39 启用或 trapped_pc 高于 RAM 窗口时才认为无效,
+        # Bare 翻译下 U 模式的虚拟地址即 RAM 物理地址, 属合法 trap 现场.
+        # 直接从 satp CSR 读 MODE 字段, 避免依赖缓存 _mmu_mode.
+        satp_mode = (h.satp_val >> 60) & 0xF
+        if self._emu.bus.is_ram_addr(trapped_pc):
+            if satp_mode != 0 or prev_mode != RiscvMode.U:
+                # Sv39 启用则内核与 sepc 应为规范高虚拟地址, 该地址为残留值
+                # Bare 翻译下 SPP=S 而 sepc 落在 RAM 窗口: 按残留值处理, 跳过
+                return None
+        entry = TrapEntry(h.stvec_val, trapped_pc, prev_mode)
+        return entry, 0, RiscvMode.U
+
+    @staticmethod
+    def _boundary_payload(boundary_note: str, is_nested: bool) -> str:
+        """给出边界帧的说明文本."""
+        if boundary_note:
+            return boundary_note
+        if is_nested:
+            return "因mepc嵌套保存trap, 无法解析寄存器布局"
+        return "trap 入口寄存器保存布局无法解析 (仅 PC)"
+
+    @staticmethod
+    def _pc_frame(frames: list[StackFrame], pc: int, mode: str, note: str) -> StackFrame:
+        """构造只含 PC 的边界帧."""
+        return StackFrame(idx=len(frames), fp=0, sp=0, ra=0, pc=pc, note=note, mode=mode)
 
     def _add_prev_mode_frame(
         self,
         frames: list[StackFrame],
-        trapped_pc: int,
-        prev_mode: RiscvMode,
-        tvec: int,
+        entry: TrapEntry,
         visited: set[int],
         offsets: tuple[int, int] | None = None,
     ) -> None:
         """为指定 trap 上下文添加边界帧, 并尝试继续回溯低特权级 FP 链.
 
-        若 *offsets* 为 None, 从 *tvec* 指令流解析 RA/FP 保存偏移.
+        若 *offsets* 为 None, 从 entry.tvec 指令流解析 RA/FP 保存偏移.
         """
+        trapped_pc, tvec = entry.trapped_pc, entry.tvec
         if trapped_pc == 0 or tvec == 0:
             return
-        prev_name = prev_mode.name
+        prev_name = entry.prev_mode.name
         boundary_mode, boundary_note = self._resolve_boundary_frame(trapped_pc, prev_name)
         if offsets is None:
             offsets = self._parse_trap_save_offsets(tvec)
         if offsets is None:
-            frames.append(
-                StackFrame(
-                    idx=len(frames),
-                    fp=0,
-                    sp=0,
-                    ra=0,
-                    pc=trapped_pc,
-                    note=(boundary_note or "trap 入口寄存器保存布局无法解析 (仅 PC)"),
-                    mode=boundary_mode,
-                )
-            )
+            note = boundary_note or "trap 入口寄存器保存布局无法解析 (仅 PC)"
+            frames.append(self._pc_frame(frames, trapped_pc, boundary_mode, note))
+            return
+        search_base = self._frame_search_base(frames)
+        if search_base == 0:
+            note = "仅获知trap现场PC，缺少栈帧回溯参考"
+            frames.append(self._pc_frame(frames, trapped_pc, boundary_mode, note))
             return
         ra_off, fp_off = offsets
-
-        last_fp = frames[-1].fp if frames else 0
-        last_sp = frames[-1].sp if frames else 0
-        search_base = min(
-            last_fp if last_fp else last_sp,
-            last_sp if last_sp else last_fp
-        ) & ~0x7
-        if search_base == 0:
-            frames.append(
-                StackFrame(
-                    idx=len(frames),
-                    fp=0,
-                    sp=0,
-                    ra=0,
-                    pc=trapped_pc,
-                    note="仅获知trap现场PC，缺少栈帧回溯参考",
-                    mode=boundary_mode,
-                )
-            )
-            return
-        raw = self._emu.bus.try_read(search_base, 4096)
-        if raw is None:
-            return
-        mepc_bytes = struct.pack("<Q", trapped_pc)
-        trap_sp: int | None = None
-        pos = len(raw) - 8
-        while pos >= 0:
-            if raw[pos : pos + 8] != mepc_bytes:
-                pos -= 8
-                continue
-            candidate_base = search_base + pos
-            for mepc_guess in range(0, 5):
-                trial_sp = candidate_base - (mepc_guess << 6)
-                ra_addr = trial_sp + ra_off
-                ra_val = self._emu.bus.read_u64(ra_addr)
-                if ra_val is None:
-                    continue
-                if not self._emu.bus.is_valid_addr(ra_val):
-                    continue
-                zero_raw = self._emu.bus.read_u64(trial_sp)
-                if zero_raw is None or zero_raw != 0:
-                    continue
-                trap_sp = trial_sp
-                break
-            # 判定用 None 比较: 该变量以 None 表示尚未找到候选帧基址.
-            if trap_sp is not None:
-                break
-            pos -= 8
-
-        saved_ra = saved_fp = saved_sp = None
-        if trap_sp is not None:
-            saved_ra = self._emu.bus.read_u64(trap_sp + ra_off)
-            # 此处按"是否需要"判定而非按"是否提供"判定: 偏移 0 表示该寄存器在
-            # 本次布局中未被保存, 见 _FALLBACK_TRAP_OFFSETS 的记载.
-            if fp_off:
-                saved_fp = self._emu.bus.read_u64(trap_sp + fp_off)
-            saved_sp = self._emu.bus.read_u64(trap_sp + ra_off + 8)
-
-        call_site = trapped_pc
+        trap_sp = self._find_trap_sp(search_base, trapped_pc, ra_off)
+        saved_ra, saved_fp, saved_sp = self._load_trap_saved_regs(trap_sp, ra_off, fp_off)
         note = boundary_note
         if saved_fp is None and saved_sp is None and saved_ra is None:
             note = "仅 trap PC"
@@ -528,16 +461,77 @@ class StackWalkMixin(SharedMixinAttrs):
                 fp=saved_fp or 0,
                 sp=saved_sp or 0,
                 ra=saved_ra or 0,
-                pc=call_site,
+                pc=trapped_pc,
                 note=note,
                 mode=boundary_mode,
             )
         )
+        if saved_fp and saved_fp not in visited:
+            visited.add(saved_fp)
+            self._walk_fp_chain(frames, saved_fp, visited, prev_name)
 
-        if not (saved_fp and saved_fp != 0 and saved_fp not in visited):
-            return
-        visited.add(saved_fp)
-        current_fp = saved_fp
+    @staticmethod
+    def _frame_search_base(frames: list[StackFrame]) -> int:
+        """取最后一个帧的 FP 或 SP, 对齐到 8 字节作为搜索起点."""
+        last_fp = frames[-1].fp if frames else 0
+        last_sp = frames[-1].sp if frames else 0
+        return min(last_fp or last_sp, last_sp or last_fp) & ~0x7
+
+    def _find_trap_sp(self, search_base: int, trapped_pc: int, ra_off: int) -> int | None:
+        """在 search_base 起的 4096 字节内寻找保存了 trapped_pc 的 trap 帧."""
+        raw = self._emu.bus.try_read(search_base, 4096)
+        if raw is None:
+            return None
+        mepc_bytes = struct.pack("<Q", trapped_pc)
+        pos = len(raw) - 8
+        while pos >= 0:
+            if raw[pos : pos + 8] != mepc_bytes:
+                pos -= 8
+                continue
+            trial_sp = self._match_trap_sp(search_base + pos, ra_off)
+            if trial_sp is not None:
+                return trial_sp
+            pos -= 8
+        return None
+
+    def _match_trap_sp(self, candidate_base: int, ra_off: int) -> int | None:
+        """在候选帧基址附近试出 trap 帧的寄存器保存基址."""
+        for mepc_guess in range(0, 5):
+            trial_sp = candidate_base - (mepc_guess << 6)
+            ra_val = self._emu.bus.read_u64(trial_sp + ra_off)
+            if ra_val is None or not self._emu.bus.is_valid_addr(ra_val):
+                continue
+            zero_raw = self._emu.bus.read_u64(trial_sp)
+            if zero_raw is None or zero_raw != 0:
+                continue
+            return trial_sp
+        return None
+
+    def _load_trap_saved_regs(
+        self,
+        trap_sp: int | None,
+        ra_off: int,
+        fp_off: int,
+    ) -> tuple[int | None, int | None, int | None]:
+        """读出 trap 帧保存的 (ra, fp, sp); 未找到 trap 帧时三者都是 None."""
+        if trap_sp is None:
+            return None, None, None
+        saved_ra = self._emu.bus.read_u64(trap_sp + ra_off)
+        # 此处按"是否需要"判定而非按"是否提供"判定: 偏移 0 表示该寄存器在
+        # 本次布局中未被保存, 见 _FALLBACK_TRAP_OFFSETS 的记载.
+        saved_fp = self._emu.bus.read_u64(trap_sp + fp_off) if fp_off else None
+        saved_sp = self._emu.bus.read_u64(trap_sp + ra_off + 8)
+        return saved_ra, saved_fp, saved_sp
+
+    def _walk_fp_chain(
+        self,
+        frames: list[StackFrame],
+        start_fp: int,
+        visited: set[int],
+        mode_name: str,
+    ) -> None:
+        """从 start_fp 沿 FP 链追加栈帧, 最多 64 帧."""
+        current_fp = start_fp
         for _ in range(64):
             if current_fp == 0:
                 break
@@ -548,15 +542,14 @@ class StackWalkMixin(SharedMixinAttrs):
             if next_fp <= current_fp or (next_fp & 0x7) or next_fp in visited:
                 break
             visited.add(next_fp)
-            call_site = self._call_site_pc(next_ra)
             frames.append(
                 StackFrame(
                     idx=len(frames),
                     fp=next_fp,
                     sp=current_fp,
                     ra=next_ra,
-                    pc=call_site,
-                    mode=prev_name,
+                    pc=self._call_site_pc(next_ra),
+                    mode=mode_name,
                 )
             )
             current_fp = next_fp
@@ -564,12 +557,9 @@ class StackWalkMixin(SharedMixinAttrs):
     def _add_prev_mode_frame_fallback(
         self,
         frames: list[StackFrame],
-        trapped_pc: int,
-        prev_mode: RiscvMode,
-        tvec: int,
+        entry: TrapEntry,
         visited: set[int],
-        boundary_mode: str,
-        boundary_note: str,
+        boundary: tuple[str, str],
     ) -> None:
         """指令解析失败时, 尝试常见 trap 帧布局以恢复低特权级上下文.
 
@@ -577,23 +567,15 @@ class StackWalkMixin(SharedMixinAttrs):
         首个成功恢复 saved_fp 的布局生效并继续 FP 链回溯.
         全部失败则退回到 "仅 trap PC" 帧.
         """
-        if trapped_pc == 0 or tvec == 0:
+        if entry.trapped_pc == 0 or entry.tvec == 0:
             return
-        for ra_off, fp_off in _FALLBACK_TRAP_OFFSETS:
-            offsets: tuple[int, int] = (ra_off, fp_off)
+        for offsets in _FALLBACK_TRAP_OFFSETS:
             # 临时试构建 — 捕获是否成功找到 saved_fp
             trial: list[StackFrame] = []
-            self._add_prev_mode_frame(
-                trial,
-                trapped_pc,
-                prev_mode,
-                tvec,
-                visited,
-                offsets,
-            )
+            self._add_prev_mode_frame(trial, entry, visited, offsets)
             if not trial or trial[-1].fp == 0:
                 continue
-            # 成功恢复: 将结果帧合并到正式帧列表并返回
+            # 该布局恢复了 saved_fp, 把试构建的帧并入正式帧列表后返回
             frames.extend(trial)
             # 将 trial 中所有有效 FP 加入 visited 以避免 FP 链循环
             for f in trial:
@@ -601,17 +583,8 @@ class StackWalkMixin(SharedMixinAttrs):
                     visited.add(f.fp)
             return
         # 全部 fallback 失败: 添加仅 PC 帧
-        frames.append(
-            StackFrame(
-                idx=len(frames),
-                fp=0,
-                sp=0,
-                ra=0,
-                pc=trapped_pc,
-                note=(boundary_note or "trap 入口寄存器保存布局无法解析 (仅 PC)"),
-                mode=boundary_mode,
-            )
-        )
+        note = boundary[1] or "trap 入口寄存器保存布局无法解析 (仅 PC)"
+        frames.append(self._pc_frame(frames, entry.trapped_pc, boundary[0], note))
 
     # ----------------------------------------------------------
     #  帧标注
@@ -700,6 +673,5 @@ class StackWalkMixin(SharedMixinAttrs):
             return
         self._console.print(
             f"[dim]帧 #{self._current_frame_idx + 1:02d} "
-            f"sp={hex_addr(cur.sp)} 栈内存:[/]\n" +
-            self._emu._fmt_hexdump(cur.sp, stack_data)
+            f"sp={hex_addr(cur.sp)} 栈内存:[/]\n" + dye_hexdump(stack_data, cur.sp)
         )

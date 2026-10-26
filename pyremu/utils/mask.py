@@ -47,6 +47,11 @@ def mask04(val: int) -> int:
     return val & MASK04
 
 
+def is_power_of_two_in(value: int, minimum: int, maximum: int) -> bool:
+    """判定 *value* 是 2 的幂且落在 [minimum, maximum] 内."""
+    return minimum <= value <= maximum and (value & (value - 1)) == 0
+
+
 # ---------------------------------------------------------------
 #  循环移位 — 移位量取以位宽为模的余数
 # ---------------------------------------------------------------

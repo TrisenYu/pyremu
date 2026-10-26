@@ -1,58 +1,57 @@
-//! Terminal I/O background thread
+//! 终端输入与输出的后台线程.
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 
 // ============================================================
-//  FFI context — C-repr struct passed from Python ctypes
+//  FFI 上下文: 由 Python ctypes 传入的 C 布局结构体
 // ============================================================
 
-/// Shared state for the terminal I/O thread, allocated by Python and passed
-/// once at startup.  All pointers remain valid for the lifetime of the thread.
+/// 终端输入输出线程的共享状态, 由 Python 分配并在启动时传入一次.
+/// 所有指针在线程生命周期内保持有效.
 #[repr(C)]
 pub struct TermIoHandle {
-	/// File descriptor for stdin (usually 0).
+	/// 标准输入的文件描述符, 通常为 0.
 	pub stdin_fd: RawFd,
-	/// File descriptor for stdout (usually 1).
+	/// 标准输出的文件描述符, 通常为 1.
 	pub stdout_fd: RawFd,
-	/// Shared RX ring buffer — I/O thread writes, Python reads when the guest reads RXDATA.
+	/// 共享的接收环形缓冲区: 本线程写入, 受调试程序读取 RXDATA 时由 Python 读出.
 	pub rx_buf: *mut u8,
-	/// Capacity of ``rx_buf`` in bytes (power of two).
+	/// ``rx_buf`` 的容量, 以字节计, 取值为 2 的幂.
 	pub rx_cap: u32,
-	/// RX write index — I/O thread exclusive writer (monotonic u32).
+	/// 接收写索引, 由本线程独占写入, 单调递增的 u32.
 	pub rx_wr: *mut AtomicU32,
 	pub rx_rd: *mut AtomicU32,
-	/// Shared TX ring buffer — CPU hart threads write (guest TXDATA).
-	/// Layout: entry e occupies bytes [2e] = hart_id, [2e+1] = byte value.
+	/// 共享的发送环形缓冲区, 由各 hart 的 CPU 线程写入受调试程序的 TXDATA.
+	/// 布局: 第 e 个条目占据字节 [2e] 与 [2e+1], 依次存放 hart_id 与字节值.
 	pub tx_buf: *mut u8,
-	/// Entry capacity of ``tx_buf`` (= byte capacity / 2, power of two).
+	/// ``tx_buf`` 的条目容量, 为字节容量除以 2, 取值为 2 的幂.
 	pub tx_cap: u32,
-	/// TX write index (entry count) — CPU engine exclusive writer (monotonic u32).
+	/// 发送写索引, 以条目计, 由 CPU 引擎独占写入, 单调递增的 u32.
 	pub tx_wr: *mut AtomicU32,
-	/// TX drain index — I/O thread exclusive writer.  Python 不写此索引
-	/// (日志消费者持有独立读索引), 消除旧实现的双写者竞争.
+	/// 由本线程独占写入. Python 只读该索引, 日志消费者另持读索引.
 	pub tx_drain: *mut AtomicU32,
-	/// Stop flag — Python sets to 1 to request thread exit.
+	/// 停止标志, Python 置 1 请求本线程退出.
 	pub stop_flag: *mut AtomicU8,
-	/// Pause flag — Python sets to 1 on debugger break, 0 to resume.
+	/// 暂停标志, 调试器中断时 Python 置 1, 恢复运行时置 0.
 	pub pause_flag: *mut AtomicU8,
-	/// RX notification — termio 线程写环形缓冲后置 1,
-	/// CPU 引擎每指令边界检查以触发内联外部中断投递.
+	/// 接收通知标志: 本线程写入接收环形缓冲区后设置 1,
+	/// CPU 引擎在每个指令边界检查该标志, 以对应投递外部中断.
 	pub rx_notify: *mut AtomicU8,
-	/// RX notify pipe write-end fd — termio 线程写 ring buffer 后
-	/// 写 1 字节到此 fd 唤醒 Python RX daemon (select 事件驱动, 零轮询).
+	/// 接收通知管道的写端文件描述符: 本线程写入环形缓冲区后向该端写 1 字节,
+	/// 唤醒 Python 侧的接收守护线程, 该线程由 select 事件驱动, 不做轮询.
 	pub rx_notify_fd: RawFd,
-	/// RX drain pipe read-end fd — Python 消费 ring buffer (rx_rd 推进) 后
-	/// 写 1 字节到其写端, 唤醒本线程投递 recv 中剩余可转发字节 (反压解除:
-	/// 缓冲区满时等待被消耗). 本线程 poll 此 fd, 写端由 Python 持有.
+	/// 接收管道的读端文件描述符. Python 消费环形缓冲区并推进 rx_rd 后
+	/// 向管道写端写 1 字节, 唤醒本线程投递接收缓冲区中剩余的可转发字节.
+	/// 环形缓冲区满时本线程等待其被消费, 反压由此解除. 写端由 Python 持有.
 	pub rx_drain_fd: RawFd,
 }
 
-// Safety: 所有指针由 Python (ctypes 数组) 持有并在线程生命周期内保持有效;
-// 各索引遵循上述单写者约定。
+// 安全前提: 所有指针由 Python 的 ctypes 数组持有, 在线程生命周期内保持有效;
+// 各位置遵循上述单个写者的假设.
 unsafe impl Send for TermIoHandle {}
 
-/// 启动时保存的终端状态, 由线程在退出路径恢复.
+/// 启动时保存的终端状态, 线程退出时恢复.
 struct SavedTerm {
 	oldtty: libc::termios,
 	old_fl0: libc::c_int,
@@ -60,32 +59,32 @@ struct SavedTerm {
 }
 
 // ============================================================
-//  Global state — thread handle + SIGCONT re-apply support
+//  全局线程描述符与 SIGCONT 处理所需的辅助状态
 // ============================================================
 
 static THREAD_HANDLE: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
-/// stop_flag 指针副本 — terminal_io_stop 自行置位, 不依赖 Python 先设置.
+/// 停止标志的指针副本, ``terminal_io_stop`` 据此自行置位, 不依赖 Python 先设置.
 static STOP_PTR: AtomicPtr<AtomicU8> = AtomicPtr::new(std::ptr::null_mut());
 
-/// CPU 引擎停止标志指针 — Ctrl+Q 时由 termio 线程直接置位, 绕过
-/// SIGINT -> Python handler -> notify_processor 往返 (主线程阻塞于
-/// run_parallel 时信号处理器不执行, 直连置位保证看门狗 5ms 内感知停止).
+/// CPU 引擎停止标志的指针, Ctrl+Q 时由本线程直接置位, 不经过 SIGINT 到 Python
+/// 处理函数再到 notify_processor 的往返: 主线程阻塞于 run_parallel 时信号处理
+/// 函数不执行, 直接置位保证看门狗在 5 ms 内看到停止请求.
 static EMU_STOP_PTR: AtomicPtr<AtomicU8> = AtomicPtr::new(std::ptr::null_mut());
 
-/// SIGCONT handler 所需状态 (对照 char-stdio.c 的 static oldtty/stdio_echo_state):
-/// Ctrl+Z 挂起期间 shell 会把终端复位为 cooked 模式, 恢复运行后需重设 raw。
+/// SIGCONT 处理函数所需的状态: Ctrl+Z 挂起期间 shell 会把终端复位为 cooked
+/// 模式, 恢复运行后需要重新设置为 raw 模式.
 static TERM_ACTIVE: AtomicBool = AtomicBool::new(false);
 static RAW_TTY_PTR: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 static SIG_STDIN_FD: AtomicI32 = AtomicI32::new(0);
 
-/// 原 SIGCONT 处置, stop 时恢复。libc::sigaction 含裸指针故手动断言 Send。
+/// 原有的 SIGCONT 处置, 停止时恢复. ``libc::sigaction`` 含裸指针, 故手动实现 Send.
 struct SigActionCell(libc::sigaction);
 unsafe impl Send for SigActionCell {}
 static OLD_SIGCONT: Mutex<Option<SigActionCell>> = Mutex::new(None);
 
 extern "C" fn sigcont_handler(_sig: libc::c_int) {
-	// 仅调用 tcsetattr (POSIX async-signal-safe);
+	// 只调用异步信号安全的 tcsetattr.
 	if !TERM_ACTIVE.load(Ordering::Acquire) {
 		return;
 	}
@@ -100,7 +99,7 @@ extern "C" fn sigcont_handler(_sig: libc::c_int) {
 }
 
 fn install_sigcont(stdin_fd: RawFd, raw: libc::termios) {
-	// termios 槽为进程级单例 (一次性泄漏, 不随 start/stop 累积)。
+	// termios 首次分配后不再释放, 不随启动与停止累积.
 	let mut p = RAW_TTY_PTR.load(Ordering::Acquire);
 	if p.is_null() {
 		p = Box::into_raw(Box::new(raw));
@@ -132,12 +131,11 @@ fn uninstall_sigcont() {
 }
 
 // ============================================================
-//  I/O helpers
+//  输入输出辅助函数
 // ============================================================
 
-/// 非阻塞 write 循环: EINTR 重试; EAGAIN 时 POLLOUT 等待可写后续传
-/// (对照 sifive_uart_xmit 的 G_IO_OUT watch 续传模式)。
-/// stop 请求时放弃剩余输出, 避免终端停滞导致 join 卡死。
+/// EINTR 时重试, EAGAIN 时等待 POLLOUT 可写后继续写入.
+/// 收到停止请求时放弃剩余输出, 避免终端停滞使线程无法结束.
 fn write_all(fd: RawFd, buf: &[u8], stop: &AtomicU8) {
 	let mut off = 0usize;
 	while off < buf.len() {
@@ -168,12 +166,12 @@ fn write_all(fd: RawFd, buf: &[u8], stop: &AtomicU8) {
 			unsafe { libc::poll(&mut pfd, 1, 100) };
 			continue;
 		}
-		return; // 其他错误: best-effort, 不让 I/O 线程崩溃
+		return; // 其他错误: 尽力而为, 不让输入输出线程崩溃
 	}
 }
 
-/// 从 TX 环形缓冲收集待排空条目的字节到 chunk (跳过 hart_id 字节)。
-/// 返回 (新 drain 索引, 收集的字节数)。纯函数, 便于单元测试环绕语义。
+/// 从发送环形缓冲区把待排空条目的字节收集到 chunk, 跳过 hart_id 字节.
+/// 返回新的排空索引与收集到的字节数. 该函数为纯函数, 便于测试索引跨越容量边界的情形.
 fn gather_tx_chunk(
 	buf: &[u8],
 	ecap: u32,
@@ -191,7 +189,7 @@ fn gather_tx_chunk(
 	(drain, n)
 }
 
-/// 排空 TX 环形缓冲到 stdout。本线程是 tx_drain 的唯一写者。
+/// 通过输出到 stdout 清空发送环形缓冲区. 本线程是 ``tx_drain`` 的唯一写者.
 fn drain_tx(h: &TermIoHandle, chunk: &mut [u8]) {
 	let ecap = h.tx_cap;
 	if ecap == 0 || h.tx_buf.is_null() {
@@ -202,7 +200,7 @@ fn drain_tx(h: &TermIoHandle, chunk: &mut [u8]) {
 	let stop = unsafe { &*h.stop_flag };
 	let buf = unsafe { std::slice::from_raw_parts(h.tx_buf, (ecap as usize) * 2) };
 	loop {
-		// Acquire 配对 CPU 引擎发布 tx_wr 的 Release: 索引可见 ⇒ 槽位数据可见
+		// 此处的 Acquire 与 CPU 引擎设置 tx_wr 时的 Release 配对, 读到新索引即可读到对应槽位的数据.
 		let wr = tx_wr.load(Ordering::Acquire);
 		let drain = tx_drain.load(Ordering::Relaxed); // 单写者: 本线程
 		if drain == wr {
@@ -215,18 +213,15 @@ fn drain_tx(h: &TermIoHandle, chunk: &mut [u8]) {
 }
 
 // ============================================================
-//  stdin 解析器: Ctrl+Q 停机检测 + 转义序列重组
+//  stdin 输入解析器: Ctrl+Q 停机检测与转义序列重组
 //
-//  对照 vendor/b0gus/terminal/line_editor_aux.go 的 byteSeqToRunes
-//  维护方式: 所有输入先保留在接收缓冲 (不丢弃、不节流), 解析器每次
-//  有界前瞻 (至多 6 字节窗口) 逐字节判定归属; 无法判定完整性的尾部
-//  (如半截 ESC 序列) 保留在 recv 中, 等效 byteSeqToRunes 的 tmpKeep,
-//  作为后续解析的开头。
+//  所有输入先保留在接收缓冲区; 解析器每次在至多 6 字节的窗口内逐字节判定具体的输入
+//  当无法判定时, 例如半个 ESC 序列, 保留在接收缓冲区中作为下一轮解析的开头
 // ============================================================
 
-/// 直连置位 CPU 停止标志 — 与 rx_notify 同模式 (共享内存, 零 Python 往返).
-/// 主线程阻塞于 run_parallel 时 SIGINT 处理器不执行, 此直连路径保证 Rust
-/// 引擎看门狗 (5ms) 与逐指令检查仍能即时感知停止请求. 独立成函数以便单测.
+/// 直接设置 CPU 引擎的停止标志, 而不经过 Python.
+/// 主线程阻塞于 run_parallel 时信号处理函数不执行, 该路径使引擎的看门狗与
+/// 逐指令检查仍能即时看到停止请求. 独立成函数以便单元测试.
 #[inline]
 fn notify_emu_stop() {
 	let stop = EMU_STOP_PTR.load(Ordering::Acquire);
@@ -235,54 +230,51 @@ fn notify_emu_stop() {
 	}
 }
 
-/// 判定 ESC 开头序列的完整性 (有界 6 字节窗口, 对照 byteSeqToRunes):
-/// Some(n) — 序列判定完整, 共 n 字节; None — 当前数据不足以判定 (需等更多).
+/// 判定以 ESC 开头的序列是否完整, 窗口至多 6 字节.
+/// 返回 ``Some(n)`` 表示序列完整, 共 n 字节; 返回 ``None`` 表示数据不足以判定.
 fn esc_seq_len(buf: &[u8]) -> Option<usize> {
 	debug_assert!(!buf.is_empty() && buf[0] == 0x1b);
 	if buf.len() == 1 {
-		return None; // 孤立 ESC — 等下一字节区分 Alt 键 / 序列开头
+		return None; // 等下一字节区分 Alt 键与 ESC 序列开头
 	}
 	let b1 = buf[1];
 	if b1 != b'[' && b1 != b'O' {
-		return Some(2); // Alt+key: ESC X
+		return Some(2); // Alt 组合键, 形如 ESC X
 	}
 	if b1 == b'O' {
-		return Some(3); // SS3: ESC O X (3 字节)
+		return Some(3); // SS3: ESC O X, 共 3 字节
 	}
-	// CSI: ESC [ ... final (0x40..=0x7e), 6 字节窗口内找 final 字节.
+	// CSI: ESC [ ... final, final 位于 0x40..=0x7e, 在 6 字节窗口内查找.
 	for (idx, &b) in buf[2..].iter().take(4).enumerate() {
 		if (0x40..=0x7e).contains(&b) {
 			return Some(2 + idx + 1);
 		}
 	}
-	// 若已积累超过 6 字节, 视为无法重组的长序列 —
-	// 剩余部分按普通字节继续转发, 受调试程序终端自行重组
+	// 已积累超过 6 字节时视为无法重组的长序列: 只把 ESC 作为完整序列,
+	// 其余字节按普通字节继续转发, 由受调试程序的终端自行重组.
 	if buf.len() > 6 {
 		return Some(1);
 	}
-	None // 不足 6 字节且无 final — 保留等待补全
+	None // 不足 6 字节且无 final, 保留等待补全
 }
 
-/// 扫描 recv 前端: 消费连续 0x11 运行 (停机), 识别完整 ESC 序列, 在首个
-/// 不完整 ESC 尾部停下。返回 (可投递字节数, 是否请求停机)。
-///
-///   - 可投递字节数 = recv 前端可安全搬移到 ring 的字节数 (不含已消费的
-///     0x11 运行, 不含不完整的 ESC 尾)。0x11 运行被 drain 移除, 因此其
-///     之后的字节随 drain 前移, 仍保留在 recv 中待下轮解析.
-///   - 停机时 0x11 运行已从 recv 移除; 运行之前的可投递前缀长度即为返回值,
-///     与运行之后的保留字节互不丢失.
+/// 扫描接收缓冲区前端: 消费连续的 0x11 运行即停机请求, 识别完整的 ESC 序列,
+/// 在首个不完整的 ESC 序列处停下. 返回可投递字节数与是否请求停机.
+/// - 可投递字节数为前端可安全写入接收环形缓冲区的字节数, 不含已消费的 0x11 运行
+///   与不完整的 ESC 序列; 运行被移除后其后的字节前移, 留在接收缓冲区等待下轮解析.
+/// - 停机时运行之前的可投递前缀长度即为返回值, 运行之后的字节仍然保留.
 fn scan_rx(recv: &mut Vec<u8>) -> (usize, bool) {
 	let mut i = 0usize;
 	while i < recv.len() {
 		let b = recv[i];
 		if b == 0x11 {
-			// 消费整个连续 0x11 运行 — 多个连续 Ctrl+Q 视作同一次停机请求.
+			// 消费整个连续的 0x11 运行, 多个连续 Ctrl+Q 视作同一次停机请求.
 			let mut j = i;
 			while j < recv.len() && recv[j] == 0x11 {
 				j += 1;
 			}
 			recv.drain(i..j);
-			return (i, true); // 停机动作 (notify_emu_stop) 由调用方执行
+			return (i, true); // 停机由调用方调用 notify_emu_stop 执行
 		}
 		if b == 0x1b {
 			match esc_seq_len(&recv[i..]) {
@@ -290,7 +282,7 @@ fn scan_rx(recv: &mut Vec<u8>) -> (usize, bool) {
 					i += n;
 				}
 				_ => {
-					return (i, false); // 不完整 ESC 尾 — 保留等待补全 (等效 tmpKeep)
+					return (i, false); // ESC 序列不完整, 保留等待补全
 				}
 			}
 		} else {
@@ -300,7 +292,7 @@ fn scan_rx(recv: &mut Vec<u8>) -> (usize, bool) {
 	(i, false)
 }
 
-/// 排空一个非阻塞 fd 的可读字节, 消除 poll 的 spurious 连续唤醒。忽略错误。
+/// 读出一个非阻塞 fd 中的全部可读字节, 消除 poll 的虚假重复唤醒. 读取错误被忽略.
 fn drain_fd(fd: RawFd) {
 	if fd < 0 {
 		return;
@@ -316,14 +308,12 @@ fn drain_fd(fd: RawFd) {
 }
 
 // ============================================================
-//  stdin -> RX ring buffer
+//  标准输入到接收环形缓冲区
 // ============================================================
 
-/// 将 stdin 当前可读的所有字节追加到 recv (fd 为 O_NONBLOCK, 读到 EAGAIN)。
-/// 不丢弃、不节流: 即使 ring 已满也照常读入, 交由 scan_rx/deliver_rx 分阶段
-/// 处理, Ctrl+Q 因而在任何 ring 占用下都能被即时检测 (对照 byteSeqToRunes 的
-/// 先读入再解析模型)。
-/// Returns false on EOF.
+/// 把标准输入当前可读的所有字节追加到接收缓冲区, 该 fd 为非阻塞, 读到 EAGAIN 为止.
+/// 接收环形缓冲区已满时仍照常读入, 由 scan_rx 与 deliver_rx
+/// 分阶段处理, Ctrl+Q 因而在任意占用下都能被即时检出. 读到文件结束符时返回 false.
 fn read_stdin_into(h: &TermIoHandle, recv: &mut Vec<u8>) -> bool {
 	let mut tmp = [0u8; 1024];
 	loop {
@@ -345,8 +335,8 @@ fn read_stdin_into(h: &TermIoHandle, recv: &mut Vec<u8>) -> bool {
 	true
 }
 
-/// 将 recv 前端 scan_rx 判定的可投递前缀搬移到 RX ring (受 free 容量约束,
-/// 永不丢弃 — 装不下的保留在 recv 待下轮)。返回本批实际写入 ring 的字节数。
+/// 把 scan_rx 判定的可投递前缀从接收缓冲区写入接收环形缓冲区, 受空闲容量限制,
+/// 装不下的部分留在接收缓冲区等待下一轮, 不丢弃. 返回本次实际写入的字节数.
 fn deliver_rx(h: &TermIoHandle, recv: &mut Vec<u8>, deliverable: usize) -> usize {
 	if deliverable == 0 || h.rx_cap == 0 || h.rx_buf.is_null() {
 		return 0;
@@ -369,9 +359,9 @@ fn deliver_rx(h: &TermIoHandle, recv: &mut Vec<u8>, deliverable: usize) -> usize
 	if delivered > 0 {
 		rx_wr.store(wr, Ordering::Release);
 		unsafe { &*h.rx_notify }.store(1, Ordering::Release);
-		// 事件驱动唤醒 Python RX daemon — 写 1 字节到通知管道.
-		// fd 由 Python 侧 os.pipe() 创建并设为非阻塞, 管道满时
-		// write 返回 EAGAIN (通知丢失可接受, daemon 靠 drain_rx 追上).
+		// 向通知管道写 1 字节, 事件驱动地唤醒 Python 侧的接收守护线程.
+		// 该 fd 由 Python 用 os.pipe() 创建并设为非阻塞; 管道满时写操作返回
+		// EAGAIN, 丢失通知可以接受, 守护线程仍会经 drain_rx 追上.
 		if h.rx_notify_fd >= 0 {
 			let _ =
 				unsafe { libc::write(h.rx_notify_fd, &1u8 as *const u8 as *const libc::c_void, 1) };
@@ -382,7 +372,7 @@ fn deliver_rx(h: &TermIoHandle, recv: &mut Vec<u8>, deliverable: usize) -> usize
 }
 
 // ============================================================
-//  Thread entry point
+//  线程入口
 // ============================================================
 
 fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
@@ -413,7 +403,7 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
 			}
 			break;
 		}
-		// 消费阻塞条件信号 (drain 通知或 stop 通知); stop_flag 于下轮循环顶检查.
+		// 读出阻塞条件信号, 即清空通知并停止; stop_flag 在下一轮循环开头检查.
 		drain_fd(drain_rd);
 		if nfds == 2 && (pfds[1].revents & libc::POLLIN) != 0 {
 			stdin_eof = !read_stdin_into(&h, &mut recv);
@@ -427,8 +417,8 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
 		let _ = deliver_rx(&h, &mut recv, deliverable);
 		drain_tx(&h, &mut chunk);
 	}
-	// 当环形缓冲区仍存在空间时, 退出函数前尽力而为转发输入字符至其中; 当接收区存在
-	// 待译码的 ESC 多字节序列时, 则保留于接收缓冲区内而不做转发.
+	// 退出循环前仍尝试把接收缓冲区中的可投递字节写入接收环形缓冲区,
+	// 不完整的 ESC 多字节序列保留在接收缓冲区, 不作转发.
 	let (deliverable, _) = scan_rx(&mut recv);
 	let _ = deliver_rx(&h, &mut recv, deliverable);
 	drain_tx(&h, &mut chunk);
@@ -439,13 +429,11 @@ fn termio_thread(h: TermIoHandle, saved: SavedTerm) {
 	}
 }
 
-/// Simple I/O thread — no terminal setup (Python cbreak manages it).
-/// Supports pause via ``pause_flag`` for debugger break/resume.
+/// 简化版输入输出线程, 不设置终端属性.
+/// 通过 ``pause_flag`` 支持调试器暂停与恢复.
 ///
-/// Single-fd event-driven poll: blocks on stdin until data arrives.
-/// TX output to stdout is handled inline by the speedup execution engine's
-/// UART TXDATA handler (libc::write), so this thread only handles
-/// stdin -> RX ring buffer forwarding.
+/// 只用 poll 监听文件描述符, 在标准输入上阻塞等待数据. 发送方向由加速执行引擎的
+/// UART TXDATA 处理函数直接写 stdout, 本线程只负责把标准输入转发进接收环形缓冲区.
 fn termio_thread_simple(h: TermIoHandle, old_stdin_fl: libc::c_int) {
 	let stop = unsafe { &*h.stop_flag };
 	let pause: *const AtomicU8 = h.pause_flag;
@@ -489,39 +477,38 @@ fn termio_thread_simple(h: TermIoHandle, old_stdin_fl: libc::c_int) {
 			notify_emu_stop();
 		}
 		let _ = deliver_rx(&h, &mut recv, deliverable);
-		// 本线程只负责把 stdin 转发到接收环形缓冲区.
-		// stdout 由 CPU 引擎内联 try_write_fd 即时输出 (no_stdout=0)
-		// 不得再调 drain_tx 写 stdout — 否则键盘输入唤醒时会
-		// 重复输出发送环形缓冲区中的内容, 且键盘输入不再投递给受调试程序.
+		// 本线程只负责把标准输入转发到接收环形缓冲区. ``no_stdout`` 为 0 时
+		// stdout 已由 CPU 引擎就地经 try_write_fd 输出; 此处不得再调用 drain_tx,
+		// 否则键盘输入唤醒后会重复输出发送环形缓冲区中的内容, 且键盘输入不再
+		// 投递给受调试程序.
 	}
 	let (deliverable, _) = scan_rx(&mut recv);
 	let _ = deliver_rx(&h, &mut recv, deliverable);
-	// terminal_io_attach 曾置 stdin O_NONBLOCK; 线程退出时恢复原阻塞标志,
-	// 否则 O_NONBLOCK 泄漏到后续 REPL / prompt_toolkit 的阻塞读, 造成键盘输入丢失.
+	// terminal_io_attach 把标准输入设为 O_NONBLOCK, 线程退出时恢复原有的标志位,
+	// 否则该标志会留给后续 REPL 与 prompt_toolkit 的阻塞读, 导致键盘输入丢失.
 	if old_stdin_fl >= 0 {
 		unsafe { libc::fcntl(h.stdin_fd, libc::F_SETFL, old_stdin_fl) };
 	}
 }
 
 // ============================================================
-//  FFI entry points
+//  FFI 入口
 // ============================================================
 
-/// Start the terminal I/O background thread.
+/// 启动终端输入输出后台线程.
 ///
-/// Returns 0 on success, -1 if already running or stdin is not a TTY.
-/// Caller must ensure `handle` points to a valid `TermIoHandle` whose
-/// buffers stay alive for the lifetime of the thread.
+/// 返回 0 表示成功, 返回 -1 表示线程已在运行或标准输入不是 TTY.
+/// 调用方必须保证 ``handle`` 指向有效的 ``TermIoHandle``, 其缓冲区在线程生命周期内
+/// 保持有效.
 #[no_mangle]
 pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 	if handle.is_null() {
 		return -1;
 	}
 	/*
-	   ---- 显式作用域: 锁在此块结束时立即释放 ----
-	   MutexGuard 在 '}' 处 drop, 避免锁被持有到后续 FFI 操作期间。
-	   若后续代码 panic, 锁仍可被其他路径获取；若省略外层
-	   大括号, guard 存活到整个 if 分支结束才析构 —— 后续代码均持锁运行。
+	   显式作用域使锁在此块结束时立即释放: MutexGuard 在右大括号处析构,
+	   后续 FFI 操作期间不再持锁. 若省略该作用域, guard 会存活到外层分支结束,
+	   后续代码都将持锁运行, 且 panic 时其他路径无法取得该锁.
 	*/
 	{
 		let guard = THREAD_HANDLE.lock().unwrap();
@@ -531,7 +518,7 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 	}
 
 	let h = unsafe { &*handle };
-	// 复制所有字段 — handle 位于 Python 栈上, FFI 调用返回后即失效。
+	// 逐字段复制: handle 位于 Python 栈上, FFI 调用返回后即失效.
 	let hc = TermIoHandle {
 		stdin_fd: h.stdin_fd,
 		stdout_fd: h.stdout_fd,
@@ -550,10 +537,10 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 		rx_drain_fd: h.rx_drain_fd,
 	};
 
-	// ---- term_init ----
+	// ---- 终端初始化 ----
 	let mut oldtty: libc::termios = unsafe { std::mem::zeroed() };
 	if unsafe { libc::tcgetattr(hc.stdin_fd, &mut oldtty) } != 0 {
-		return -1; // 非 TTY (管道/重定向) — Python 侧回退
+		return -1; // 标准输入不是 TTY, 例如管道或重定向, 由 Python 侧另行处理
 	}
 	let old_fl0 = unsafe { libc::fcntl(hc.stdin_fd, libc::F_GETFL) };
 	let old_fl1 = unsafe { libc::fcntl(hc.stdout_fd, libc::F_GETFL) };
@@ -563,7 +550,7 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 	unsafe {
 		libc::fcntl(hc.stdin_fd, libc::F_SETFL, old_fl0 | libc::O_NONBLOCK);
 		libc::fcntl(hc.stdout_fd, libc::F_SETFL, old_fl1 | libc::O_NONBLOCK);
-		// drain 管道读端非阻塞: drain_fd 循环读到 EAGAIN 即停.
+		// 把管道的读端设为非阻塞: drain_fd 循环读到 EAGAIN 即停止.
 		if hc.rx_drain_fd >= 0 {
 			let df = libc::fcntl(hc.rx_drain_fd, libc::F_GETFL);
 			if df >= 0 {
@@ -579,9 +566,9 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
         | libc::ISTRIP
         | libc::INLCR
         | libc::IGNCR
-        // ICRNL 保留: 宿主终端把 \r 转换为 \n, 受调试程序收到 \n 即可结束一行
+        // 保留 ICRNL: 宿主终端把 \r 转换为 \n, 受调试程序收到 \n 即可结束一行
         | libc::IXON);
-	raw.c_oflag |= libc::OPOST; // 保留输出后处理: '\n' ->CRLF
+	raw.c_oflag |= libc::OPOST; // 保留输出后处理, 把 '\n' 转换为 CRLF
 	raw.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::IEXTEN | libc::ISIG);
 	raw.c_cflag &= !(libc::CSIZE | libc::PARENB);
 	raw.c_cflag |= libc::CS8;
@@ -595,7 +582,7 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 		return -1;
 	}
 
-	// Ctrl+Z 挂起恢复后重设 raw (对照 term_stdio_handler)
+	// Ctrl+Z 挂起恢复后重新设置 raw 模式
 	install_sigcont(hc.stdin_fd, raw);
 	STOP_PTR.store(hc.stop_flag, Ordering::Release);
 
@@ -611,9 +598,8 @@ pub extern "C" fn terminal_io_start(handle: *const TermIoHandle) -> i32 {
 	0
 }
 
-/// Attach I/O thread to already-configured fds — no termios changes.
-/// Terminal mode (cbreak) is managed by Python; this just reads/writes.
-///
+/// 把输入输出线程连接到已配置好的文件描述符上, 不修改 termios 属性.
+/// 终端模式由 Python 以 cbreak 管理, 本函数只做读写.
 #[no_mangle]
 pub extern "C" fn terminal_io_attach(handle: *const TermIoHandle) -> i32 {
 	if handle.is_null() {
@@ -647,7 +633,7 @@ pub extern "C" fn terminal_io_attach(handle: *const TermIoHandle) -> i32 {
 	if old_fl >= 0 {
 		unsafe { libc::fcntl(hc.stdin_fd, libc::F_SETFL, old_fl | libc::O_NONBLOCK) };
 	}
-	// drain_fd 循环读到 EAGAIN 即停.
+	// 把排空管道的读端设为非阻塞: drain_fd 循环读到 EAGAIN 即停止.
 	if hc.rx_drain_fd >= 0 {
 		let df = unsafe { libc::fcntl(hc.rx_drain_fd, libc::F_GETFL) };
 		if df >= 0 {
@@ -662,10 +648,10 @@ pub extern "C" fn terminal_io_attach(handle: *const TermIoHandle) -> i32 {
 	0
 }
 
-/// Stop the I/O thread and wait for it to exit.
+/// 停止输入输出线程并等待其退出.
 ///
-/// 自行置位 stop flag (不依赖 Python 先设置), join 线程 (线程在退出路径
-/// 完成最终 TX drain + 终端恢复), 然后恢复原 SIGCONT 处置。
+/// 自行置位停止标志, 不依赖 Python 先设置; 随后等待线程结束, 线程退出前
+/// 完成发送方向的最后排空与终端恢复; 最后恢复原有的 SIGCONT 处置.
 #[no_mangle]
 pub extern "C" fn terminal_io_stop() {
 	let stop = STOP_PTR.load(Ordering::Acquire);
@@ -679,16 +665,16 @@ pub extern "C" fn terminal_io_stop() {
 	uninstall_sigcont();
 }
 
-/// 注入 CPU 引擎停止标志指针, 供 termio 线程 Ctrl+Q 直连置位.
+/// 注入 CPU 引擎停止标志的指针, 供本线程在 Ctrl+Q 时直接置位.
 ///
-/// Python 侧在启动 termio 前调用, 传入 ``ctypes.addressof(_native_stop_flag)``.
-/// 指针由 Python (ctypes 对象) 持有, 进程存活期内稳定有效.
+/// Python 在启动本线程前调用, 传入 ``ctypes.addressof(_native_stop_flag)``.
+/// 指针由 Python 的 ctypes 对象持有, 在进程存活期内保持有效.
 #[no_mangle]
 pub extern "C" fn terminal_io_set_emu_stop_flag(ptr: *mut AtomicU8) {
 	EMU_STOP_PTR.store(ptr, Ordering::Release);
 }
 
-/// Return 1 if the I/O thread is currently running, 0 otherwise.
+/// 输入输出线程正在运行时返回 1, 否则返回 0.
 #[no_mangle]
 pub extern "C" fn terminal_io_is_running() -> i32 {
 	if THREAD_HANDLE.lock().unwrap().is_some() {
@@ -699,7 +685,7 @@ pub extern "C" fn terminal_io_is_running() -> i32 {
 }
 
 // ============================================================
-//  Tests
+//  测试
 // ============================================================
 
 #[cfg(test)]
@@ -707,8 +693,8 @@ mod tests {
 	use super::*;
 	use core::mem::{offset_of, size_of};
 
-	/// FFI 布局锁定: 与 Python ctypes TermIoHandle._fields_ 逐字节一致
-	/// (pyremu/_native/__init__.py)。修改任一侧必须同步另一侧。
+	/// 锁定 FFI 布局: 与 Python ctypes 的 TermIoHandle._fields_ 逐字节一致,
+	/// 定义位于 pyremu/_native/__init__.py. 修改任一侧时必须同步另一侧.
 	#[test]
 	fn test_handle_layout_locked() {
 		assert_eq!(size_of::<TermIoHandle>(), 104);
@@ -731,7 +717,7 @@ mod tests {
 
 	#[test]
 	fn test_gather_tx_chunk_basic() {
-		// 4 个条目: (hid, byte) 对
+		// 4 个条目, 每个条目含 hid 与 byte
 		let ecap = 8u32;
 		let mut buf = vec![0u8; (ecap as usize) * 2];
 		for (i, ch) in b"abcd".iter().enumerate() {
@@ -746,7 +732,7 @@ mod tests {
 
 	#[test]
 	fn test_gather_tx_chunk_ring_wrap() {
-		// 索引跨越 ecap 边界: 条目 6,7,8,9 ->槽位 6,7,0,1
+		// 索引跨越条目容量边界: 条目 6、7、8、9 对应槽位 6、7、0、1
 		let ecap = 8u32;
 		let mut buf = vec![0u8; (ecap as usize) * 2];
 		for (i, ch) in [(6usize, b'w'), (7, b'x'), (0, b'y'), (1, b'z')] {
@@ -778,22 +764,20 @@ mod tests {
 		for i in 0..6 {
 			buf[2 * i + 1] = b'0' + i as u8;
 		}
-		let mut chunk = [0u8; 4]; // 小于待排条目数
+		let mut chunk = [0u8; 4]; // 小于待排空的条目数
 		let (d, n) = gather_tx_chunk(&buf, ecap, 0, 6, &mut chunk);
 		assert_eq!(d, 4);
 		assert_eq!(n, 4);
 		assert_eq!(&chunk[..n], b"0123");
-		// 续传剩余
+		// 继续收集剩余的条目
 		let (d2, n2) = gather_tx_chunk(&buf, ecap, d, 6, &mut chunk);
 		assert_eq!(d2, 6);
 		assert_eq!(&chunk[..n2], b"45");
 	}
 
-	/// Ctrl+Q 单次触发必须直连置位 CPU 停止标志, 而非仅依赖 SIGINT.
-	///
-	/// 修复前 ``intercept_ctrl_q`` 只发 SIGINT, 依赖 Python 主线程信号处理器
-	/// 间接置位停止标志; 主线程阻塞于 run_parallel 时处理器不执行 -> Ctrl+Q
-	/// 失灵. 修复后 ``notify_emu_stop`` 直接写共享标志, 与 rx_notify 同模式.
+	/// 单次 Ctrl+Q 必须直接置位 CPU 引擎的停止标志, 不能只依赖 SIGINT.
+	/// ``notify_emu_stop`` 直接写共享标志, 与 rx_notify 的处理方式相同;
+	/// 主线程阻塞于 run_parallel 时 Python 侧的信号处理函数不执行.
 	#[test]
 	fn test_notify_emu_stop_sets_flag() {
 		let flag = AtomicU8::new(0);
@@ -806,14 +790,14 @@ mod tests {
 		EMU_STOP_PTR.store(std::ptr::null_mut(), Ordering::Release);
 	}
 
-	/// 未注入停止标志指针时 ``notify_emu_stop`` 不得崩溃 (空指针保护).
+	/// 未注入停止标志指针时 ``notify_emu_stop`` 不执行任何操作, 不崩溃.
 	#[test]
 	fn test_notify_emu_stop_null_ptr_noop() {
 		EMU_STOP_PTR.store(std::ptr::null_mut(), Ordering::Release);
-		notify_emu_stop(); // 不应 panic
+		notify_emu_stop(); // 不应发生 panic
 	}
 
-	/// esc_seq_len: 有界 6 字节窗口内的 ESC 序列完整性判定.
+	/// 覆盖 ``esc_seq_len`` 在 6 字节窗口内对 ESC 序列完整性的判定.
 	#[test]
 	fn test_esc_seq_len_variants() {
 		assert_eq!(esc_seq_len(&[0x1b]), None); // 孤立 ESC — 等下一字节
@@ -823,14 +807,14 @@ mod tests {
 		assert_eq!(esc_seq_len(&[0x1b, b'[']), None); // CSI 无 final
 		assert_eq!(esc_seq_len(&[0x1b, b'[', b'1']), None); // 参数未完
 		assert_eq!(esc_seq_len(&[0x1b, b'[', b'1', b';', b'2', b'H']), Some(6));
-		// 窗口耗尽 (7 字节) 仍无 final — 透传 ESC 单字节, 不阻塞.
+		// 已积累 7 字节仍无 final 时只把 ESC 作为完整序列, 其余字节照常转发.
 		assert_eq!(
 			esc_seq_len(&[0x1b, b'[', b'1', b'2', b'3', b'4', b'5']),
 			Some(1)
 		);
 	}
 
-	/// scan_rx: 连续 Ctrl+Q 运行视作同一次停机, 仅消费 0x11, 前后字节不丢失.
+	/// 覆盖 ``scan_rx``: 连续的 Ctrl+Q 视作同一次停机, 只消费 0x11, 前后字节不丢失.
 	#[test]
 	fn test_scan_rx_ctrl_q_run_consumes_once() {
 		let mut recv = vec![b'a', 0x11, 0x11, b'b'];
@@ -840,7 +824,7 @@ mod tests {
 		assert_eq!(&recv, b"ab", "0x11 运行被消费, 前后字节保留");
 	}
 
-	/// scan_rx: 无停机字节时全部可投递, 且不修改 recv.
+	/// 无停机字节时全部可投递, 且不修改接收缓冲区.
 	#[test]
 	fn test_scan_rx_no_ctrl_q() {
 		let mut recv = b"hello".to_vec();
@@ -850,7 +834,7 @@ mod tests {
 		assert_eq!(&recv, b"hello");
 	}
 
-	/// scan_rx: 完整 ESC 序列作为一个整体可投递.
+	/// 完整的 ESC 序列作为一个整体可投递.
 	#[test]
 	fn test_scan_rx_complete_esc_sequence() {
 		let mut recv = vec![b'a', 0x1b, b'[', b'A', b'b'];
@@ -860,7 +844,7 @@ mod tests {
 		assert_eq!(&recv, b"a\x1b[Ab");
 	}
 
-	/// scan_rx: 不完整 ESC 尾保留 (等效 tmpKeep), 作为后续解析开头.
+	/// 不完整的 ESC 序列保留在接收缓冲区, 作为下一轮解析的开头.
 	#[test]
 	fn test_scan_rx_incomplete_esc_holdback() {
 		let mut recv = vec![b'a', 0x1b];
@@ -870,7 +854,7 @@ mod tests {
 		assert_eq!(&recv, b"a\x1b");
 	}
 
-	/// deliver_rx: 受 free 容量约束, 装不下的保留在 recv (永不丢弃).
+	/// 受空闲容量约束, 装不下的字节保留在接收缓冲区, 不丢弃.
 	#[test]
 	fn test_deliver_rx_respects_free_space() {
 		let rx_cap = 4u32;
@@ -904,11 +888,9 @@ mod tests {
 		assert_eq!(rx_notify.load(Ordering::Acquire), 1, "写入后置 rx_notify");
 	}
 
-	/// attach 线程 (termio_thread_simple): 键盘输入唤醒 poll 时不得把发送环形缓冲区
-	/// 的积压重放到 stdout. no_stdout=0 时 CPU 引擎已内联 try_write_fd 即时输出
-	/// stdout, 线程再调 drain_tx 会重复输出启动日志, 且 write_all 在 stdout 阻塞时
-	/// 拖住线程, 键盘输入不再投递给受调试程序而表现为无输入响应. 回归:
-	/// emu-linux-sh 停于 zsh init / 反复输出同一段串口日志.
+	/// ``no_stdout`` 为 0 时 CPU 引擎已就地经 try_write_fd 输出,
+	/// 线程再调用 drain_tx 会重复输出启动日志; 且 write_all 在
+	/// stdout 阻塞时会同样阻塞线程, 导致键盘输入无法得到响应.
 	#[test]
 	fn test_attach_thread_does_not_reemit_tx_ring_to_stdout() {
 		let mut fds = [0i32; 6];
@@ -918,8 +900,7 @@ mod tests {
 		let (stdin_r, stdin_w) = (fds[0], fds[1]);
 		assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
 		let (drain_r, drain_w) = (fds[0], fds[1]);
-		// terminal_io_attach 会把这些 fd 设为 O_NONBLOCK (stdin/drain 读端 +
-		// stdout 读端供本测试探测).
+		// terminal_io_attach 会把这些 fd 设为 O_NONBLOCK, 其中 stdout 读端供本测试探测.
 		for fd in [stdin_r, drain_r, stdout_r] {
 			let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
 			unsafe { libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) };
@@ -936,7 +917,7 @@ mod tests {
 		let stop = AtomicU8::new(0);
 		let pause = AtomicU8::new(0);
 
-		// CPU 引擎已写 2 个 TX 条目到 ring (stdout 已由 try_write_fd 即时输出).
+		// CPU 引擎已向发送环形缓冲区写入 2 个条目, stdout 已由 try_write_fd 输出.
 		tx_buf[0] = 0;
 		tx_buf[1] = b'X';
 		tx_buf[2] = 1;
@@ -963,13 +944,13 @@ mod tests {
 
 		let handle = std::thread::spawn(move || termio_thread_simple(h, -1));
 
-		// 用户输入一个字符 -> poll 唤醒 -> scan_rx/deliver_rx -> (修复后) 不写 stdout.
+		// 用户输入一个字符, poll 被唤醒, 经 scan_rx 与 deliver_rx 处理后不写 stdout.
 		assert_eq!(
 			unsafe { libc::write(stdin_w, b"z".as_ptr() as *const libc::c_void, 1) },
 			1
 		);
-		// 等线程完成一轮处理: rx_wr 推进即已执行完整迭代 (包括旧代码会重放的
-		// drain_tx 位置), 此后的 stdout 断言与线程执行顺序无关.
+		// 等待线程完成一轮处理: rx_wr 推进即说明整轮迭代已执行,
+		// 之后的 stdout 断言与线程的执行顺序无关.
 		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
 		while rx_wr.load(Ordering::Acquire) == 0 {
 			if std::time::Instant::now() > deadline {
@@ -977,11 +958,11 @@ mod tests {
 			}
 			std::thread::sleep(std::time::Duration::from_millis(1));
 		}
-		// RX 仍正常: 'z' 已送达 RX ring.
+		// 接收路径仍正常: 'z' 已进入接收环形缓冲区.
 		assert_eq!(rx_wr.load(Ordering::Acquire), 1);
 		assert_eq!(rx_buf[0], b'z');
 
-		// stdout 不得收到任何 TX ring 字节 — 引擎已输出, 线程不得重放.
+		// stdout 不应收到发送环形缓冲区中的任何字节.
 		let mut probe = [0u8; 16];
 		let n = unsafe {
 			libc::read(
@@ -996,7 +977,7 @@ mod tests {
 			&probe[..n as usize]
 		);
 
-		// 停线程: 置 stop 后写入唤醒阻塞中的 poll.
+		// 设置 stop 标志后写一个字节, 唤醒阻塞中的 poll.
 		stop.store(1, Ordering::Release);
 		unsafe { libc::write(stdin_w, b"q".as_ptr() as *const libc::c_void, 1) };
 		handle.join().unwrap();

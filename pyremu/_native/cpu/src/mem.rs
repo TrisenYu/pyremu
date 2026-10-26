@@ -1,16 +1,16 @@
-//! Zero-allocation RAM direct read/write — bypasses Python `bytes()` slicing.
+//! 直接读取与写入主存, 无需借助 Python 侧 bytes 的访存路径.
 //!
-//! Python owns the `bytearray`; Rust receives a raw pointer (via ctypes
-//! from_buffer), reads/writes directly, and writes results to a pre-allocated
-//! output buffer.  No allocation, no state held across calls.
+//! Python 持有 `bytearray`; Rust 经 ctypes 的 from_buffer 取得指向首字节的裸指针
+//! 后直接访问. 地址属于主存范围或 PIE 链接地址区间时完成拷贝并返回 1, 否则返回 0,
+//! 由调用方转回 Python 处理. 跨链接库调用之间不保留状态也不分配内存.
 
 // ============================================================
-//  Helpers
+//  辅助函数
 // ============================================================
 
-/// Compute offset into the bytearray given RAM and shadow ranges.
-/// Returns `None` when the address falls outside all valid ranges.
-/// Public alias for use by the speedup execution engine's inline memory access helpers.
+/// 按主存范围与 PIE 链接地址区间计算物理地址在 bytearray 内的偏移.
+/// 地址不属于任何一段范围时返回 `None`.
+/// 该入口对外公开, 供加速执行引擎的内联访存辅助函数调用.
 #[inline(always)]
 pub fn ram_offset_inline(
 	pa: u64,
@@ -32,15 +32,15 @@ fn ram_offset(
 	shadow_base: u64,
 	shadow_size: u64,
 ) -> Option<u64> {
-	// checked_add: 调用方传入的 pa 是任意 64 位值, 其中包含 Python 侧由
-	// 负数地址经 ctypes 转换得到的 2^64-1 一类取值. 使下面的范围判定误判为
+	// 调用方传入的 pa 可为任意 64 位值, 其中包含 Python 侧负数地址经 ctypes
+	// 转换得到的 2^64-1 一类取值. 若加法按模 2^64 计算, 范围判定会误判为
 	// 命中, 随后的拷贝越过 bytearray 造成越界访问.
 	let end = pa.checked_add(size as u64)?;
-	// Primary RAM window
+	// 主存范围
 	if pa >= ram_base && end <= ram_base + ram_size {
 		return Some(pa - ram_base);
 	}
-	// VMA shadow alias (firmware linked low, loaded high)
+	// PIE 链接地址区间: 固件按低地址链接并加载到高地址, 该区间内的地址换算到主存内的偏移.
 	if shadow_size > 0 {
 		let sh_end = shadow_base + shadow_size;
 		if pa >= shadow_base && end <= sh_end {
@@ -51,16 +51,16 @@ fn ram_offset(
 }
 
 // ============================================================
-//  Public API
+//  公开接口
 // ============================================================
 
-/// Read *size* bytes from physical address `pa` into `out_buf`.
+/// 从物理地址 `pa` 读取 `size` 个字节到 `out_buf`.
 ///
-/// `ram_ptr` points to the first byte of the Python `bytearray`.
-/// `out_buf` must be at least `size` bytes (caller pre-allocates 8 bytes).
+/// `ram_ptr` 指向 Python `bytearray` 的首字节.
+/// `out_buf` 至少可容纳 `size` 个字节, 调用方预先分配 8 个字节.
 ///
-/// Returns 1 on success, 0 if `pa` is not in RAM (caller falls back to
-/// device / L2-cache / error handling in Python).
+/// 成功返回 1; 地址不属于主存范围或 PIE 链接地址区间时返回 0,
+/// 调用方在 Python 侧转而访问设备, 查询 L2 缓存或按相应的故障实施处理.
 #[no_mangle]
 pub extern "C" fn bus_read_ram(
 	ram_ptr: *const u8,
@@ -76,21 +76,21 @@ pub extern "C" fn bus_read_ram(
 		Some(o) => o as usize,
 		None => return 0,
 	};
-	// Safety: `ram_ptr` points to a Python bytearray of `ram_size` bytes.
-	// `off + size <= ram_size` is guaranteed by `ram_offset`.
-	// `out_buf` is a pre-allocated Python bytearray(8).
-	// `copy_nonoverlapping` handles unaligned pointers correctly.
+	// 调用方保证 `ram_ptr` 指向长度为 `ram_size` 的 Python bytearray,
+	// `off + size <= ram_size` 由 `ram_offset` 保证;
+	// `out_buf` 为预先分配的 Python bytearray(8);
+	// `copy_nonoverlapping` 可处理非对齐指针.
 	unsafe {
 		core::ptr::copy_nonoverlapping(ram_ptr.add(off), out_buf, size as usize);
 	}
 	1
 }
 
-/// Write *size* bytes from `data_ptr` to physical address `pa`.
+/// 把 `data_ptr` 处的 `size` 个字节写入物理地址 `pa`.
 ///
-/// `ram_ptr` points to the first byte of the Python `bytearray`.
+/// `ram_ptr` 指向 Python `bytearray` 的首字节.
 ///
-/// Returns 1 on success, 0 if `pa` is not in RAM.
+/// 成功返回 1; 地址不属于主存范围或 PIE 链接地址区间时返回 0.
 #[no_mangle]
 pub extern "C" fn bus_write_ram(
 	ram_ptr: *mut u8,
@@ -113,7 +113,7 @@ pub extern "C" fn bus_write_ram(
 }
 
 // ============================================================
-//  Tests
+//  测试
 // ============================================================
 
 #[cfg(test)]
@@ -142,7 +142,7 @@ mod tests {
 	fn test_read_shadow() {
 		let ram: Vec<u8> = (0..16).collect();
 		let mut out = [0u8; 8];
-		// Shadow: VMA 0x0..0x10 aliases RAM 0x80000000..0x80000010
+		// PIE 链接地址区间: 链接地址 0x0 至 0x10 换算到主存 0x80000000 至 0x80000010
 		let ok = bus_read_ram(
 			ram.as_ptr(),
 			16,
@@ -171,14 +171,14 @@ mod tests {
 			4,
 			out.as_mut_ptr(),
 		);
-		assert_eq!(ok, 0); // address beyond RAM
+		assert_eq!(ok, 0); // 地址超出主存范围
 	}
 
 	#[test]
 	fn test_read_cross_boundary() {
 		let ram: Vec<u8> = (0..16).collect();
 		let mut out = [0u8; 8];
-		// size=8 starting at offset 12 extends to offset 20 > 16 -> fail
+		// 从偏移 12 起读取 8 个字节, 末端偏移 20 超过 16, 判定为失败
 		let ok = bus_read_ram(
 			ram.as_ptr(),
 			16,
@@ -226,11 +226,12 @@ mod tests {
 		assert_eq!(ok, 0);
 	}
 
-	/// 地址加长度按模 2^64 取余时不得判为窗口内命中.
+	/// 地址与长度相加按模 2^64 计算时, 结果不得判为主存范围内的命中.
 	///
-	/// 触发值 `u64::MAX` 即 Python 侧负数地址 (如 fp-16 得到 -1) 经 ctypes
-	/// 转换后的取值: 加 8 取余为 7, 落在 [ram_base, ram_base + ram_size) 之内,
-	/// 修复前会据此算出 0xFFFF_FFFF_7FFF_FFFF 的偏移并越界拷贝.
+	/// 触发值 `u64::MAX` 是 Python 侧负数地址经 ctypes 转换后的取值, 例如
+	/// fp 减 16 得到 -1; 该值加 8 按模 2^64 计算得 7, 仍属于
+	/// [ram_base, ram_base + ram_size) 之内, 若不做上界检查会算出
+	/// 0xFFFF_FFFF_7FFF_FFFF 的偏移并越界拷贝.
 	#[test]
 	fn test_read_addr_wraparound_rejected() {
 		let ram: Vec<u8> = vec![0; 16];

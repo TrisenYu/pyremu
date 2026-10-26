@@ -64,7 +64,6 @@ from pyremu.peripheral.virtio_mmio import (
     VRING_DESC_SIZE,
 )
 from pyremu.peripheral.virtio_net import (
-    VIRTIO_NET_M_IRQ,
     ETHERNET_FRAME_MAX,
     ETHERNET_MTU,
     NetBackend,
@@ -75,9 +74,10 @@ from pyremu.peripheral.virtio_net import (
     VIRTIO_NET_DEVICE_ID,
     VIRTIO_NET_F_MAC,
     VIRTIO_NET_HDR_SIZE,
-    VIRTIO_NET_S_IRQ,
+    VIRTIO_NET_M_IRQ,
     VIRTIO_NET_RX_QUEUE,
     VIRTIO_NET_RX_QUEUE_LIMIT,
+    VIRTIO_NET_S_IRQ,
     VIRTIO_NET_S_LINK_UP,
     VIRTIO_NET_TX_QUEUE,
     VirtIONet,
@@ -247,14 +247,21 @@ def _configure_queue(net: VirtIONet, index: int, qnum: int = 8) -> None:
     _mmio_write(net, VIRTIO_MMIO_QUEUE_SEL, index)
     _mmio_write(net, VIRTIO_MMIO_QUEUE_NUM, qnum)
     _mmio_write64(
-        net, VIRTIO_MMIO_QUEUE_DESC_LOW, VIRTIO_MMIO_QUEUE_DESC_HIGH, _make_gpa(desc_off),
+        net,
+        VIRTIO_MMIO_QUEUE_DESC_LOW,
+        VIRTIO_MMIO_QUEUE_DESC_HIGH,
+        _make_gpa(desc_off),
     )
     _mmio_write64(
-        net, VIRTIO_MMIO_QUEUE_DRIVER_LOW, VIRTIO_MMIO_QUEUE_DRIVER_HIGH,
+        net,
+        VIRTIO_MMIO_QUEUE_DRIVER_LOW,
+        VIRTIO_MMIO_QUEUE_DRIVER_HIGH,
         _make_gpa(driver_off),
     )
     _mmio_write64(
-        net, VIRTIO_MMIO_QUEUE_DEVICE_LOW, VIRTIO_MMIO_QUEUE_DEVICE_HIGH,
+        net,
+        VIRTIO_MMIO_QUEUE_DEVICE_LOW,
+        VIRTIO_MMIO_QUEUE_DEVICE_HIGH,
         _make_gpa(device_off),
     )
     _mmio_write(net, VIRTIO_MMIO_QUEUE_READY, 1)
@@ -266,7 +273,11 @@ def _write_chain(guest_ram: bytearray, index: int, chain: list[_Desc], first: in
     for i, (buf_pa, buf_len, flags, next_idx) in enumerate(chain):
         off = desc_off + (first + i) * VRING_DESC_SIZE
         guest_ram[off : off + VRING_DESC_SIZE] = struct.pack(
-            "<QIHH", buf_pa, buf_len, flags, next_idx,
+            "<QIHH",
+            buf_pa,
+            buf_len,
+            flags,
+            next_idx,
         )
 
 
@@ -302,7 +313,7 @@ def _kick(net: VirtIONet, index: int) -> None:
 
 
 # ============================================================
-#  辅助: 帧与缓冲区
+#  帧与缓冲区辅助函数
 # ============================================================
 
 
@@ -317,7 +328,9 @@ def _post_rx_buffer(guest_ram: bytearray, slot: int, buf_len: int = _RX_BUF_SIZE
     """在接收队列上挂一个空缓冲区, 返回缓冲区物理地址."""
     buf_pa = _make_gpa(_RX_BUF_OFF + slot * 0x1000)
     _write_chain(
-        guest_ram, VIRTIO_NET_RX_QUEUE, [(buf_pa, buf_len, VRING_DESC_F_WRITE, 0)],
+        guest_ram,
+        VIRTIO_NET_RX_QUEUE,
+        [(buf_pa, buf_len, VRING_DESC_F_WRITE, 0)],
         first=slot,
     )
     _write_avail_entry(guest_ram, VIRTIO_NET_RX_QUEUE, slot, slot)
@@ -374,7 +387,8 @@ class TestMmioRegisters:
     """MMIO 寄存器读写测试."""
 
     @pytest.mark.parametrize(
-        "reg, expect", [
+        "reg, expect",
+        [
             (VIRTIO_MMIO_MAGIC_VALUE, 0x74726976),  # "virt" 的小端写法
             (VIRTIO_MMIO_VERSION, 0x2),  # modern, 非 legacy
             (VIRTIO_MMIO_DEVICE_ID, VIRTIO_NET_DEVICE_ID),
@@ -453,8 +467,10 @@ class TestFeatures:
         ):
             _mmio_write(net, VIRTIO_MMIO_STATUS, _mmio_read(net, VIRTIO_MMIO_STATUS) | bit)
         assert _mmio_read(net, VIRTIO_MMIO_STATUS) == (
-            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
-            | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK
+            VIRTIO_STATUS_ACKNOWLEDGE
+            | VIRTIO_STATUS_DRIVER
+            | VIRTIO_STATUS_FEATURES_OK
+            | VIRTIO_STATUS_DRIVER_OK
         )
 
     def test_reset_clears_status_and_queues(self, net: VirtIONet) -> None:
@@ -470,7 +486,7 @@ class TestFeatures:
 
 
 # ============================================================
-#  Tests: 配置空间
+#  配置空间
 # ============================================================
 
 
@@ -491,7 +507,9 @@ class TestConfigSpace:
 
     def test_custom_mac(self, mem_read, mem_write) -> None:
         net = VirtIONet(
-            mem_read=mem_read, mem_write=mem_write, mac=b"\x02\xaa\xbb\xcc\xdd\xee",
+            mem_read=mem_read,
+            mem_write=mem_write,
+            mac=b"\x02\xaa\xbb\xcc\xdd\xee",
         )
         want = b"\x02\xaa\xbb\xcc\xdd\xee"
         assert _read_config_bytes(net, VIRTIO_NET_CFG_MAC, 6) == want
@@ -513,7 +531,7 @@ class TestConfigSpace:
 
 
 # ============================================================
-#  Tests: 发送方向
+#  发送方向
 # ============================================================
 
 
@@ -563,7 +581,9 @@ class TestTransmit:
         _configure_queue(net, VIRTIO_NET_TX_QUEUE)
         buf_pa = _make_gpa(_TX_BUF_OFF)
         _write_chain(
-            guest_ram, VIRTIO_NET_TX_QUEUE, [(buf_pa, VIRTIO_NET_HDR_SIZE + 4, 0, 0)],
+            guest_ram,
+            VIRTIO_NET_TX_QUEUE,
+            [(buf_pa, VIRTIO_NET_HDR_SIZE + 4, 0, 0)],
         )
         _write_avail_entry(guest_ram, VIRTIO_NET_TX_QUEUE, 0, 0)
         _set_avail_idx(guest_ram, VIRTIO_NET_TX_QUEUE, 1)
@@ -581,14 +601,14 @@ class TestTransmit:
         frame = _make_frame(b"split")
         hdr_pa = _make_gpa(_TX_BUF_OFF)
         body_pa = _make_gpa(_TX_BUF_OFF + 0x800)
-        guest_ram[_TX_BUF_OFF : _TX_BUF_OFF + VIRTIO_NET_HDR_SIZE] = (
-            bytes(VIRTIO_NET_HDR_SIZE)
-        )
+        guest_ram[_TX_BUF_OFF : _TX_BUF_OFF + VIRTIO_NET_HDR_SIZE] = bytes(VIRTIO_NET_HDR_SIZE)
         body_off = _to_offset(body_pa)
         guest_ram[body_off : body_off + len(frame)] = frame
 
         _write_chain(
-            guest_ram, VIRTIO_NET_TX_QUEUE, [
+            guest_ram,
+            VIRTIO_NET_TX_QUEUE,
+            [
                 (hdr_pa, VIRTIO_NET_HDR_SIZE, VRING_DESC_F_NEXT, 1),
                 (body_pa, len(frame), 0, 0),
             ],
@@ -602,7 +622,7 @@ class TestTransmit:
 
 
 # ============================================================
-#  Tests: 接收方向
+#  接收方向
 # ============================================================
 
 
@@ -681,7 +701,9 @@ class TestReceive:
         head_pa = _make_gpa(_RX_BUF_OFF)
         tail_pa = _make_gpa(_RX_BUF_OFF + 0x800)
         _write_chain(
-            guest_ram, VIRTIO_NET_RX_QUEUE, [
+            guest_ram,
+            VIRTIO_NET_RX_QUEUE,
+            [
                 (head_pa, _RX_BUF_SIZE, VRING_DESC_F_WRITE | VRING_DESC_F_NEXT, 1),
                 (tail_pa, _RX_BUF_SIZE, VRING_DESC_F_WRITE, 0),
             ],
@@ -736,7 +758,9 @@ class TestReceive:
         _configure_queue(net, VIRTIO_NET_RX_QUEUE)
         buf_pa = _make_gpa(_RX_BUF_OFF)
         _write_chain(
-            guest_ram, VIRTIO_NET_RX_QUEUE, [(buf_pa, _RX_BUF_SIZE, VRING_DESC_F_WRITE, 0)],
+            guest_ram,
+            VIRTIO_NET_RX_QUEUE,
+            [(buf_pa, _RX_BUF_SIZE, VRING_DESC_F_WRITE, 0)],
         )
         # 可用环项指向 4000, 大于队列长度 8 与描述符表上限 256
         _write_avail_entry(guest_ram, VIRTIO_NET_RX_QUEUE, 0, 4000)
@@ -762,7 +786,7 @@ class TestReceive:
 
 
 # ============================================================
-#  Tests: 回环后端
+#  回环后端
 # ============================================================
 
 
@@ -800,7 +824,7 @@ class TestLoopback:
 
 
 # ============================================================
-#  Tests: 中断投递
+#  中断投递
 # ============================================================
 
 
@@ -816,8 +840,9 @@ class TestInterrupt:
         plic = PLIC(num_sources=128, num_contexts=2)
         _enable_plic_m_context(plic, VIRTIO_NET_S_IRQ)
         net = VirtIONet(
-            mem_read=mem_read, mem_write=mem_write,
-            on_irq=plic.set_irq, irq=VIRTIO_NET_S_IRQ,
+            mem_read=mem_read,
+            mem_write=mem_write,
+            irq_sink=(VIRTIO_NET_S_IRQ, plic.set_irq),
         )
         return net, plic
 
@@ -881,8 +906,9 @@ class TestInterrupt:
         _enable_plic_m_context(plic, VIRTIO_NET_S_IRQ)
         _enable_plic_m_context(plic, VIRTIO_NET_M_IRQ)
         debuggee = VirtIONet(
-            mem_read=mem_read, mem_write=mem_write,
-            on_irq=plic.set_irq, irq=VIRTIO_NET_S_IRQ,
+            mem_read=mem_read,
+            mem_write=mem_write,
+            irq_sink=(VIRTIO_NET_S_IRQ, plic.set_irq),
         )
         _configure_queue(debuggee, VIRTIO_NET_RX_QUEUE)
         _post_rx_buffers(guest_ram, 1)

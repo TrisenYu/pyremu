@@ -56,7 +56,7 @@ class TestL2CacheBasic:
         """命中时直接返回缓存数据."""
         # 第一次: 未命中, 加载
         l2.read(0x1000, 4)
-        # 第二次: 应命中
+        # 第二次读取应命中缓存
         hit_before = l2._hits
         data = l2.read(0x1000, 4)
         assert data == b"\x01\x02\x03\x04"

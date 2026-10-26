@@ -46,15 +46,21 @@ class MemoryAccessError(Exception):
     所有 handler 必须允许子类异常传播至 ``exec_instr``,
     后者捕获并返回 0 (PC 已重定向).
     """
+
     pass
+
 
 class AlignmentError(MemoryAccessError):
     """非对齐访存 (LdAddrMisaligned / StAddrMisaligned)."""
+
     pass
+
 
 class PageFaultError(MemoryAccessError):
     """页表翻译失败 (LdPageFault / StPageFault)."""
+
     pass
+
 
 class AccessFaultError(MemoryAccessError):
     """PMP 或 PMA 拒绝访问 (LdAccessFault / StAccessFault)."""
@@ -358,10 +364,12 @@ def _translate_page_walk(
     # 标记当前 hart 的 mdid, 供 mfence.did 按域刷新)
     tlb: TLB = hart.dtlb
     tlb.insert(
-        va >> 12, pa >> 12,
-        perm=perm, level=0,
+        va >> 12,
+        pa >> 12,
+        perm=perm,
+        level=0,
         mdid=hart.mdid_val,
-        asid=mask16(hart.satp_val >> 44)
+        asid=mask16(hart.satp_val >> 44),
     )
 
     return True, pa
@@ -408,9 +416,7 @@ def translate_addr(
     if reader is None:
         return False, 0
 
-    return _translate_page_walk(
-        hart, va, reader, is_write=is_write, is_execute=is_execute
-    )
+    return _translate_page_walk(hart, va, reader, is_write=is_write, is_execute=is_execute)
 
 
 # ============================================================
@@ -462,6 +468,10 @@ def _translate_cross_page(
             deliver_trap(hart, access_fault, tval=addr, is_interrupt=False)
             raise AccessFaultError
         if bus is not None and not bus.is_valid_addr(pa):
+            deliver_trap(hart, access_fault, tval=addr, is_interrupt=False)
+            raise AccessFaultError
+        # 引导只读存储器接受读取, 拒绝写入.
+        if is_write and bus is not None and bus.is_rom_addr(pa):
             deliver_trap(hart, access_fault, tval=addr, is_interrupt=False)
             raise AccessFaultError
         chunks.append((pa, chunk_size))
@@ -600,6 +610,10 @@ def mem_write(
     # PMA 检查
     bus: Bus | None = hart._bus
     if bus is not None and not bus.is_valid_addr(pa):
+        deliver_trap(hart, TrapType.StAccessFault, tval=addr, is_interrupt=False)
+        raise AccessFaultError
+    # 引导只读存储器接受读取, 拒绝写入.
+    if bus is not None and bus.is_rom_addr(pa):
         deliver_trap(hart, TrapType.StAccessFault, tval=addr, is_interrupt=False)
         raise AccessFaultError
 

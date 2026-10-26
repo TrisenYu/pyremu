@@ -13,6 +13,7 @@ from rich.console import Console
 from pyremu import configs_gen
 from pyremu.core.hart import RiscvMode
 from pyremu.debug import Debugger, sym
+from pyremu.debug.sym.model import SymAvailItem
 from pyremu.emulator import Emulator
 from pyremu.utils.parse_bin import FirmwareImage, FirmwareSegment
 
@@ -101,59 +102,59 @@ class TestReadByName:
 class TestResolveSymbol:
     def test_range_containing_address_wins(self):
         ranges = [(0x1000, 0x1100, "probe"), (0x2000, 0x2100, "echo")]
-        assert sym.SymbolMixin._resolve_symbol({}, 0x1050, ranges) == "probe"
+        assert sym.SymLookupOps._resolve_symbol({}, 0x1050, ranges) == "probe"
 
     def test_second_range_is_selected(self):
         ranges = [(0x1000, 0x1100, "probe"), (0x2000, 0x2100, "echo")]
-        assert sym.SymbolMixin._resolve_symbol({}, 0x2000, ranges) == "echo"
+        assert sym.SymLookupOps._resolve_symbol({}, 0x2000, ranges) == "echo"
 
     def test_range_end_is_exclusive(self):
         """区间右端不包含: 命中落在 end 的地址须回退到后续判定."""
         ranges = [(0x1000, 0x1100, "probe")]
-        assert sym.SymbolMixin._resolve_symbol({}, 0x1100, ranges) is None
+        assert sym.SymLookupOps._resolve_symbol({}, 0x1100, ranges) is None
 
     def test_exact_match_is_used_without_ranges(self):
-        assert sym.SymbolMixin._resolve_symbol({"main": 0x8000}, 0x8000) == "main"
+        assert sym.SymLookupOps._resolve_symbol({"main": 0x8000}, 0x8000) == "main"
 
     def test_exact_match_runs_before_predecessor_fallback(self):
         """无区间信息时精确匹配优先于最近前驱."""
         symbols = {"_start": 0x7000, "main": 0x8000}
-        assert sym.SymbolMixin._resolve_symbol(symbols, 0x8000) == "main"
+        assert sym.SymLookupOps._resolve_symbol(symbols, 0x8000) == "main"
 
     def test_gap_inside_range_span_yields_none(self):
         """地址落在区间跨度之内但不在任何区间内时放弃匹配."""
         ranges = [(0x1000, 0x1100, "probe"), (0x2000, 0x2100, "echo")]
-        assert sym.SymbolMixin._resolve_symbol({"mid": 0x1500}, 0x1800, ranges) is None
+        assert sym.SymLookupOps._resolve_symbol({"mid": 0x1500}, 0x1800, ranges) is None
 
     def test_address_before_range_span_falls_back_to_predecessor(self):
         ranges = [(0x1000, 0x1100, "probe")]
-        assert sym.SymbolMixin._resolve_symbol({"head": 0x0F00}, 0x0F00, ranges) == "head"
+        assert sym.SymLookupOps._resolve_symbol({"head": 0x0F00}, 0x0F00, ranges) == "head"
 
     def test_address_after_range_span_falls_back_to_predecessor(self):
         ranges = [(0x1000, 0x1100, "probe")]
-        assert sym.SymbolMixin._resolve_symbol({"tail": 0x3000}, 0x3000, ranges) == "tail"
+        assert sym.SymLookupOps._resolve_symbol({"tail": 0x3000}, 0x3000, ranges) == "tail"
 
     @pytest.mark.parametrize("name", ["$x", ".L0"])
     def test_assembler_local_names_are_skipped(self, name):
         symbols = {name: 0x1000}
-        assert sym.SymbolMixin._resolve_symbol(symbols, 0x2000) is None
+        assert sym.SymLookupOps._resolve_symbol(symbols, 0x2000) is None
 
     def test_local_name_does_not_shadow_visible_predecessor(self):
         symbols = {".L0": 0x1800, "func": 0x1000}
-        assert sym.SymbolMixin._resolve_symbol(symbols, 0x2000) == "func"
+        assert sym.SymLookupOps._resolve_symbol(symbols, 0x2000) == "func"
 
     def test_predecessor_beyond_limit_yields_none(self):
         """最近前驱相距超过 64 KiB 时不视为匹配."""
-        assert sym.SymbolMixin._resolve_symbol({"far": 0x1000}, 0x1000 + 0x10001) is None
+        assert sym.SymLookupOps._resolve_symbol({"far": 0x1000}, 0x1000 + 0x10001) is None
 
     def test_predecessor_at_limit_is_accepted(self):
-        assert sym.SymbolMixin._resolve_symbol({"far": 0x1000}, 0x1000 + 0x10000) == "far"
+        assert sym.SymLookupOps._resolve_symbol({"far": 0x1000}, 0x1000 + 0x10000) == "far"
 
     def test_empty_symbols_yield_none(self):
-        assert sym.SymbolMixin._resolve_symbol({}, 0x1000) is None
+        assert sym.SymLookupOps._resolve_symbol({}, 0x1000) is None
 
     def test_successor_only_yields_none(self):
-        assert sym.SymbolMixin._resolve_symbol({"later": 0x2000}, 0x1000) is None
+        assert sym.SymLookupOps._resolve_symbol({"later": 0x2000}, 0x1000) is None
 
 
 # ============================================================
@@ -171,7 +172,7 @@ class TestLoadKernelSymbols:
     def test_unparsable_file_reports_error(self, tmp_path, monkeypatch):
         src = tmp_path / "vmlinux"
         src.write_bytes(b"\x00")
-        monkeypatch.setattr(sym, "parse_firmware", lambda *a, **k: None)
+        monkeypatch.setattr(sym.lookup, "parse_firmware", lambda *a, **k: None)
         dbg, _, buf = _make_dbg()
         assert dbg.load_kernel_symbols(str(src)) is False
         assert "无法解析符号文件" in buf.getvalue()
@@ -179,7 +180,7 @@ class TestLoadKernelSymbols:
     def test_non_elf_file_reports_error(self, tmp_path, monkeypatch):
         src = tmp_path / "kernel.bin"
         src.write_bytes(b"\x00")
-        monkeypatch.setattr(sym, "parse_firmware", lambda *a, **k: _fw_image(fmt="raw"))
+        monkeypatch.setattr(sym.lookup, "parse_firmware", lambda *a, **k: _fw_image(fmt="raw"))
         dbg, _, buf = _make_dbg()
         assert dbg.load_kernel_symbols(str(src)) is False
         assert "需为 ELF" in buf.getvalue()
@@ -187,7 +188,7 @@ class TestLoadKernelSymbols:
     def test_missing_symbol_table_reports_warning(self, tmp_path, monkeypatch):
         src = tmp_path / "vmlinux"
         src.write_bytes(b"\x00")
-        monkeypatch.setattr(sym, "parse_firmware", lambda *a, **k: _fw_image())
+        monkeypatch.setattr(sym.lookup, "parse_firmware", lambda *a, **k: _fw_image())
         dbg, _, buf = _make_dbg()
         assert dbg.load_kernel_symbols(str(src)) is False
         assert "未找到符号表" in buf.getvalue()
@@ -198,7 +199,7 @@ class TestLoadKernelSymbols:
             symbols={"main": 0x1000},
             symbol_ranges=[(0x1000, 0x1100, "main")],
         )
-        monkeypatch.setattr(sym, "parse_firmware", lambda *a, **k: image)
+        monkeypatch.setattr(sym.lookup, "parse_firmware", lambda *a, **k: image)
         dbg, _, _ = _make_dbg()
         assert dbg.load_kernel_symbols(EXISTING_PATH) is True
         expected_base = RAM_BASE + configs_gen.FW_RESERVED_MEM_SIZE
@@ -207,7 +208,7 @@ class TestLoadKernelSymbols:
 
     def test_explicit_base_address_is_used(self, monkeypatch):
         image = _fw_image(entry_point=0x2000, symbols={"main": 0x2000})
-        monkeypatch.setattr(sym, "parse_firmware", lambda *a, **k: image)
+        monkeypatch.setattr(sym.lookup, "parse_firmware", lambda *a, **k: image)
         dbg, _, _ = _make_dbg()
         assert dbg.load_kernel_symbols(EXISTING_PATH, base_pa=0x9000) is True
         assert dbg._sym_load_offset == 0x7000
@@ -219,7 +220,7 @@ class TestLoadKernelSymbols:
             symbols={"main": 0x1000, "echo": 0x1200},
             symbol_ranges=[(0x1000, 0x1100, "main"), (0x1200, 0x1300, "echo")],
         )
-        monkeypatch.setattr(sym, "parse_firmware", lambda *a, **k: image)
+        monkeypatch.setattr(sym.lookup, "parse_firmware", lambda *a, **k: image)
         dbg, _, buf = _make_dbg()
         assert dbg.load_kernel_symbols(EXISTING_PATH) is True
         assert dbg._sym_symbols == {"main": 0x1000, "echo": 0x1200}
@@ -240,7 +241,7 @@ class TestLoadKernelSymbols:
             symbols={"main": 0x1000},
             symbol_ranges=[(0x2000, 0x2100, "echo"), (0x1000, 0x1100, "main")],
         )
-        monkeypatch.setattr(sym, "parse_firmware", lambda *a, **k: image)
+        monkeypatch.setattr(sym.lookup, "parse_firmware", lambda *a, **k: image)
         dbg, _, _ = _make_dbg()
         dbg.load_kernel_symbols(EXISTING_PATH, base_pa=0x4000)
         starts = [r[0] for r in dbg._sym_ranges_pa]
@@ -251,9 +252,9 @@ class TestLoadKernelSymbols:
         first = _fw_image(entry_point=0x1000, symbols={"old": 0x1000})
         second = _fw_image(entry_point=0x1000, symbols={"new": 0x1000})
         dbg, _, _ = _make_dbg()
-        monkeypatch.setattr(sym, "parse_firmware", lambda *a, **k: first)
+        monkeypatch.setattr(sym.lookup, "parse_firmware", lambda *a, **k: first)
         dbg.load_kernel_symbols(EXISTING_PATH)
-        monkeypatch.setattr(sym, "parse_firmware", lambda *a, **k: second)
+        monkeypatch.setattr(sym.lookup, "parse_firmware", lambda *a, **k: second)
         assert dbg.load_kernel_symbols(EXISTING_PATH) is True
         assert dbg._sym_symbols == {"new": 0x1000}
         assert "old" not in dbg._sym_symbols_pa
@@ -286,7 +287,7 @@ class TestResolveSymAddr:
         dbg._sym_symbols = {"main": 0x1000}
         dbg._sym_load_offset = 0x2000
         emu.harts[0].satp_val = SATP_SV39
-        monkeypatch.setattr(sym, "translate_addr", lambda *a, **k: (True, 0x4000))
+        monkeypatch.setattr(sym.lookup, "translate_addr", lambda *a, **k: (True, 0x4000))
         assert dbg._resolve_sym_addr(KERNEL_VA) == 0x4000
 
     def test_original_address_is_kept_when_translation_fails(self, monkeypatch):
@@ -294,7 +295,7 @@ class TestResolveSymAddr:
         dbg._sym_symbols = {"main": 0x1000}
         dbg._sym_load_offset = 0x2000
         emu.harts[0].satp_val = SATP_SV39
-        monkeypatch.setattr(sym, "translate_addr", lambda *a, **k: (False, 0))
+        monkeypatch.setattr(sym.lookup, "translate_addr", lambda *a, **k: (False, 0))
         assert dbg._resolve_sym_addr(KERNEL_VA) == KERNEL_VA
 
 
@@ -537,36 +538,63 @@ class TestCmdSymbols:
 
 
 class TestCmdSym:
+    @staticmethod
+    def _with_candidate(dbg, tmp_path) -> Path:
+        """在候选清单中放入一个真实存在的文件."""
+        target = tmp_path / "app.elf"
+        target.write_bytes(b"\x00")
+        dbg._sym_mod_dir = str(tmp_path)
+        dbg._sym_avail_items = [
+            SymAvailItem(
+                number=1,
+                name="app.elf",
+                path=str(target),
+                size=1,
+                is_readable=True,
+                is_loaded=False,
+            ),
+        ]
+        return target
+
     def test_load_without_path_reports_usage(self):
-        """方括号部分的第二个参数名被文本标记解析吞掉, 输出中不出现."""
         dbg, _, buf = _make_dbg()
         dbg.cmd_sym("load")
-        assert "用法: sym load <path>" in buf.getvalue()
+        assert "用法: sym load <#n|文件名> [pa:<addr>|va:<addr>]" in buf.getvalue()
 
-    def test_load_forwards_path(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("spec", "space", "base"),
+        [
+            ("", None, None),
+            ("pa:0x80200000", "pa", 0x8020_0000),
+            ("va:0x40000000", "va", 0x4000_0000),
+        ],
+    )
+    def test_load_forwards_candidate_and_address(
+        self, monkeypatch, tmp_path, spec, space, base
+    ):
         recorded = {}
 
-        def fake_load(path, base_pa=None):
+        def fake_load(dbg, path, space_arg, base_arg):
             recorded["path"] = path
-            recorded["base_pa"] = base_pa
-            return True
+            recorded["space"] = space_arg
+            recorded["base"] = base_arg
 
         dbg, _, _ = _make_dbg()
-        monkeypatch.setattr(dbg, "load_kernel_symbols", fake_load)
+        target = self._with_candidate(dbg, tmp_path)
+        monkeypatch.setattr(sym.cmd_files.loader, "load_symbol_module", fake_load)
+        dbg.cmd_sym(f"load #1 {spec}")
+        assert recorded == {"path": str(target), "space": space, "base": base}
+
+    def test_load_without_address_prefix_reports_usage(self, tmp_path):
+        dbg, _, buf = _make_dbg()
+        self._with_candidate(dbg, tmp_path)
+        dbg.cmd_sym("load #1 0x80200000")
+        assert sym.cmd_files.ADDR_USAGE in buf.getvalue()
+
+    def test_load_rejects_filesystem_path(self):
+        dbg, _, buf = _make_dbg()
         dbg.cmd_sym("load /tmp/vmlinux")
-        assert recorded == {"path": "/tmp/vmlinux", "base_pa": None}
-
-    def test_load_forwards_base_address(self, monkeypatch):
-        recorded = {}
-
-        def fake_load(path, base_pa=None):
-            recorded["base_pa"] = base_pa
-            return True
-
-        dbg, _, _ = _make_dbg()
-        monkeypatch.setattr(dbg, "load_kernel_symbols", fake_load)
-        dbg.cmd_sym("load /tmp/vmlinux 0x80200000")
-        assert recorded["base_pa"] == 0x8020_0000
+        assert "只接受候选清单" in buf.getvalue()
 
     def test_info_without_symbols_is_reported(self):
         dbg, _, buf = _make_dbg()
@@ -608,5 +636,7 @@ class TestCmdSym:
 
 
 def test_module_file_exists():
-    """测试对象为 pyremu/debug/sym.py, 避免导入到同名替身."""
-    assert Path(sym.__file__).name == "sym.py"
+    """测试对象为 pyremu/debug/sym/__init__.py, 避免导入到同名替身."""
+    module_path = Path(sym.__file__)
+    assert module_path.name == "__init__.py"
+    assert module_path.parent.name == "sym"

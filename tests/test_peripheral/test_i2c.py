@@ -199,7 +199,6 @@ class TestI2CConfig:
         )
 
     def test_default_i2c_base_follows_build_config(self):
-        """默认 I2C 基址取自 emu-configs.mk 生成的常量."""
         assert PeripheralConfig().i2c_base == configs_gen.I2C_BASE
 
     def test_emulator_registers_device(self):

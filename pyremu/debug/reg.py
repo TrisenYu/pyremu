@@ -3,7 +3,7 @@
 # SPDX-LICENSE-IDENTIFIER: MIT
 # (C) All rights reserved. Author: <kisfg@hotmail.com> in 2026
 
-"""RegisterMixin — GPR/CSR 读写命令.
+"""RegisterOps — GPR/CSR 读写命令.
 
 依赖 DebuggerBase.
 """
@@ -12,13 +12,13 @@ from rich.table import Table
 
 from pyremu.core.registers import gpr_alias, gpr_name
 from pyremu.core.trap_def import trap_cause_name
-from pyremu.debug._attrs import SharedMixinAttrs
+from pyremu.debug.attrs import SharedAttrs
 from pyremu.debug.utils import hex_addr
 from pyremu.utils.mask import mask64
 from pyremu.utils.wrapper import seize_val_err
 
 
-class RegisterMixin(SharedMixinAttrs):
+class RegisterOps(SharedAttrs):
     """GPR 和 CSR 读写."""
 
     # ----------------------------------------------------------
@@ -54,8 +54,10 @@ class RegisterMixin(SharedMixinAttrs):
             lo_name, lo_alias = gpr_name(i), gpr_alias(i)
             hi_name, hi_alias = gpr_name(i + 16), gpr_alias(i + 16)
             tbl.add_row(
-                f"{lo_name} ({lo_alias})", hex_addr(h.gprs[i]),
-                f"{hi_name} ({hi_alias})", hex_addr(h.gprs[i + 16]),
+                f"{lo_name} ({lo_alias})",
+                hex_addr(h.gprs[i]),
+                f"{hi_name} ({hi_alias})",
+                hex_addr(h.gprs[i + 16]),
             )
         self._console.print(tbl)
 
@@ -78,7 +80,8 @@ class RegisterMixin(SharedMixinAttrs):
         lines = [
             f"  [cyan]{gpr_name(idx):<{max_w}}[/] "
             f"([dim]{gpr_alias(idx):<{max_a}}[/]) = "
-            f"[green]{hex_addr(h.gprs[idx])}[/]" for idx in idxs
+            f"[green]{hex_addr(h.gprs[idx])}[/]"
+            for idx in idxs
         ]
         self._console.print("\n".join(lines))
 
@@ -130,10 +133,7 @@ class RegisterMixin(SharedMixinAttrs):
         lines: list[str] = []
         for n in wanted:
             csr = h.csrs[n]
-            line = (
-                f" [cyan]{n:<{max_w}}[/] = [green]{hex_addr(csr.val)}[/]"
-                f" (dec: {csr.val})"
-            )
+            line = f" [cyan]{n:<{max_w}}[/] = [green]{hex_addr(csr.val)}[/] (dec: {csr.val})"
             if n in ("mstatus", "mstatush"):
                 line += f"  [dim]模式 [bold]{h.mode.name}[/][/]"
             elif n in ("mcause", "scause"):

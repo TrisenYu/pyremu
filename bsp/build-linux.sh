@@ -4,7 +4,7 @@
 # bsp/linux 内核源码树未纳入 git (bsp/* 默认忽略), 本脚本是唯一可复现的构建入口:
 #   - 配置来源: bsp/.linux-config (git 跟踪的参考配置)
 #   - 产物:     arch/riscv/boot/Image  (模拟器 --kernel 加载)
-#               vmlinux                (模拟器 --sym 加载调试符号)
+#               vmlinux                (模拟器 sym load 加载调试符号)
 #
 # 工具链三种 (默认 gcc, 与 local-build.sh 的驱动编译对齐):
 #   gcc          标准 Debian 交叉 gcc (riscv64-linux-gnu-gcc 14)

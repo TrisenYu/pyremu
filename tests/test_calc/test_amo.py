@@ -5,6 +5,8 @@
 
 """原子指令测试: LR/SC 预留机制, AMO 读-改-写."""
 
+from dataclasses import dataclass
+
 import pytest
 
 from pyremu.core.decoder import (
@@ -14,6 +16,22 @@ from pyremu.core.decoder import (
 )
 from pyremu.core.mem_check_aux import inject_memory_backend
 from pyremu.core.trap_handler import deliver_trap
+
+
+@dataclass(frozen=True)
+class AmoCase:
+    """一条 AMO 用例: 操作、地址、初始内存值、操作数与期望结果.
+
+    is_64 为真表示 .D 变体, 为假表示 .W 变体.
+    """
+
+    op: AmoFunct5
+    addr: int
+    mem_val: int
+    op_val: int
+    expected_result: int
+    expected_rd: int
+    is_64: bool = True
 
 
 def _make_amo_instr(op: AmoFunct5, width: AmoWidth, rd: int, rs1: int, rs2: int) -> int:
@@ -129,85 +147,88 @@ class TestAMOArithmetic:
         hart._mem_write_phy(addr, data)
         return width, mask
 
-    def _do_amo(
-        self,
-        hart,
-        op: AmoFunct5,
-        addr: int,
-        mem_val: int,
-        op_val: int,
-        expected_result: int,
-        expected_rd: int,
-        is_64: bool = True,
-    ):
-        width, mask = self._setup_mem_and_regs(hart, addr, mem_val, op_val, is_64)
-        instr = _make_amo_instr(op, width, rd=15, rs1=10, rs2=12)
+    def _do_amo(self, hart, case: AmoCase):
+        """按用例给出的初始内存值与操作数执行一条 AMO, 校验 rd 与内存的结果."""
+        width, mask = self._setup_mem_and_regs(
+            hart, case.addr, case.mem_val, case.op_val, case.is_64
+        )
+        instr = _make_amo_instr(case.op, width, rd=15, rs1=10, rs2=12)
         hart.exec_instr(instr)
         # rd 应获得原始内存值
         actual_rd = hart.gprs[15] & mask
-        assert actual_rd == (expected_rd & mask), (
-            f"{op.name}: rd expected {expected_rd:#x}, got {actual_rd:#x}"
+        assert actual_rd == (case.expected_rd & mask), (
+            f"{case.op.name}: rd expected {case.expected_rd:#x}, got {actual_rd:#x}"
         )
         # 内存应被更新为 result
-        byte_len = 8 if is_64 else 4
-        new_mem = int.from_bytes(hart._mem_read_phy(addr, byte_len), "little")
-        assert new_mem == (expected_result & mask), (
-            f"{op.name}: mem expected {expected_result:#x}, got {new_mem:#x}"
+        byte_len = 8 if case.is_64 else 4
+        new_mem = int.from_bytes(hart._mem_read_phy(case.addr, byte_len), "little")
+        assert new_mem == (case.expected_result & mask), (
+            f"{case.op.name}: mem expected {case.expected_result:#x}, got {new_mem:#x}"
         )
 
     def test_amoswap_d(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.SWAP,
-            0x1000,
-            mem_val=0xAAAA,
-            op_val=0xBBBB,
-            expected_result=0xBBBB,
-            expected_rd=0xAAAA,
+            AmoCase(
+                op=AmoFunct5.SWAP,
+                addr=0x1000,
+                mem_val=0xAAAA,
+                op_val=0xBBBB,
+                expected_result=0xBBBB,
+                expected_rd=0xAAAA,
+            ),
         )
 
     def test_amoadd_d(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.ADD,
-            0x1000,
-            mem_val=10,
-            op_val=3,
-            expected_result=13,
-            expected_rd=10,
+            AmoCase(
+                op=AmoFunct5.ADD,
+                addr=0x1000,
+                mem_val=10,
+                op_val=3,
+                expected_result=13,
+                expected_rd=10,
+            ),
         )
 
     def test_amoxor_d(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.XOR,
-            0x1000,
-            mem_val=0xFF00,
-            op_val=0x0FF0,
-            expected_result=0xF0F0,
-            expected_rd=0xFF00,
+            AmoCase(
+                op=AmoFunct5.XOR,
+                addr=0x1000,
+                mem_val=0xFF00,
+                op_val=0x0FF0,
+                expected_result=0xF0F0,
+                expected_rd=0xFF00,
+            ),
         )
 
     def test_amoand_d(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.AND,
-            0x1000,
-            mem_val=0xFF0F,
-            op_val=0xF0FF,
-            expected_result=0xF00F,
-            expected_rd=0xFF0F,
+            AmoCase(
+                op=AmoFunct5.AND,
+                addr=0x1000,
+                mem_val=0xFF0F,
+                op_val=0xF0FF,
+                expected_result=0xF00F,
+                expected_rd=0xFF0F,
+            ),
         )
 
     def test_amoor_d(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.OR,
-            0x1000,
-            mem_val=0xFF00,
-            op_val=0x00FF,
-            expected_result=0xFFFF,
-            expected_rd=0xFF00,
+            AmoCase(
+                op=AmoFunct5.OR,
+                addr=0x1000,
+                mem_val=0xFF00,
+                op_val=0x00FF,
+                expected_result=0xFFFF,
+                expected_rd=0xFF00,
+            ),
         )
 
     def test_amomin_d(self, hart):
@@ -215,12 +236,14 @@ class TestAMOArithmetic:
         # mem=-5, op=10 -> min = -5
         self._do_amo(
             hart,
-            AmoFunct5.MIN,
-            0x1000,
-            mem_val=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
-            op_val=10,
-            expected_result=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
-            expected_rd=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
+            AmoCase(
+                op=AmoFunct5.MIN,
+                addr=0x1000,
+                mem_val=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
+                op_val=10,
+                expected_result=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
+                expected_rd=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
+            ),
         )
 
     def test_amomax_d(self, hart):
@@ -228,157 +251,183 @@ class TestAMOArithmetic:
         # mem=-5, op=10 -> max = 10
         self._do_amo(
             hart,
-            AmoFunct5.MAX,
-            0x1000,
-            mem_val=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
-            op_val=10,
-            expected_result=10,
-            expected_rd=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
+            AmoCase(
+                op=AmoFunct5.MAX,
+                addr=0x1000,
+                mem_val=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
+                op_val=10,
+                expected_result=10,
+                expected_rd=(-5) & 0xFFFF_FFFF_FFFF_FFFF,
+            ),
         )
 
     def test_amominu_d(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.MINU,
-            0x1000,
-            mem_val=5,
-            op_val=10,
-            expected_result=5,
-            expected_rd=5,
+            AmoCase(
+                op=AmoFunct5.MINU,
+                addr=0x1000,
+                mem_val=5,
+                op_val=10,
+                expected_result=5,
+                expected_rd=5,
+            ),
         )
 
     def test_amomaxu_d(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.MAXU,
-            0x1000,
-            mem_val=5,
-            op_val=10,
-            expected_result=10,
-            expected_rd=5,
+            AmoCase(
+                op=AmoFunct5.MAXU,
+                addr=0x1000,
+                mem_val=5,
+                op_val=10,
+                expected_result=10,
+                expected_rd=5,
+            ),
         )
 
     def test_amoswap_w(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.SWAP,
-            0x2000,
-            mem_val=0xAAAA,
-            op_val=0xBBBB,
-            expected_result=0xBBBB,
-            expected_rd=0xAAAA,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.SWAP,
+                addr=0x2000,
+                mem_val=0xAAAA,
+                op_val=0xBBBB,
+                expected_result=0xBBBB,
+                expected_rd=0xAAAA,
+                is_64=False,
+            ),
         )
 
     def test_amoadd_w(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.ADD,
-            0x2000,
-            mem_val=7,
-            op_val=8,
-            expected_result=15,
-            expected_rd=7,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.ADD,
+                addr=0x2000,
+                mem_val=7,
+                op_val=8,
+                expected_result=15,
+                expected_rd=7,
+                is_64=False,
+            ),
         )
 
     def test_amoxor_w(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.XOR,
-            0x2000,
-            mem_val=0xFF00,
-            op_val=0x0FF0,
-            expected_result=0xF0F0,
-            expected_rd=0xFF00,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.XOR,
+                addr=0x2000,
+                mem_val=0xFF00,
+                op_val=0x0FF0,
+                expected_result=0xF0F0,
+                expected_rd=0xFF00,
+                is_64=False,
+            ),
         )
 
     def test_amoand_w(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.AND,
-            0x2000,
-            mem_val=0xFF0F,
-            op_val=0xF0FF,
-            expected_result=0xF00F,
-            expected_rd=0xFF0F,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.AND,
+                addr=0x2000,
+                mem_val=0xFF0F,
+                op_val=0xF0FF,
+                expected_result=0xF00F,
+                expected_rd=0xFF0F,
+                is_64=False,
+            ),
         )
 
     def test_amoor_w(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.OR,
-            0x2000,
-            mem_val=0xFF00,
-            op_val=0x00FF,
-            expected_result=0xFFFF,
-            expected_rd=0xFF00,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.OR,
+                addr=0x2000,
+                mem_val=0xFF00,
+                op_val=0x00FF,
+                expected_result=0xFFFF,
+                expected_rd=0xFF00,
+                is_64=False,
+            ),
         )
 
     def test_amomin_w(self, hart):
         """AMOMIN.W 有符号比较: mem=-5, op=10 -> min=-5."""
         self._do_amo(
             hart,
-            AmoFunct5.MIN,
-            0x2000,
-            mem_val=(-5) & 0xFFFF_FFFF,
-            op_val=10,
-            expected_result=(-5) & 0xFFFF_FFFF,
-            expected_rd=(-5) & 0xFFFF_FFFF,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.MIN,
+                addr=0x2000,
+                mem_val=(-5) & 0xFFFF_FFFF,
+                op_val=10,
+                expected_result=(-5) & 0xFFFF_FFFF,
+                expected_rd=(-5) & 0xFFFF_FFFF,
+                is_64=False,
+            ),
         )
 
     def test_amomax_w(self, hart):
         """AMOMAX.W 有符号比较: mem=-5, op=10 -> max=10."""
         self._do_amo(
             hart,
-            AmoFunct5.MAX,
-            0x2000,
-            mem_val=(-5) & 0xFFFF_FFFF,
-            op_val=10,
-            expected_result=10,
-            expected_rd=(-5) & 0xFFFF_FFFF,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.MAX,
+                addr=0x2000,
+                mem_val=(-5) & 0xFFFF_FFFF,
+                op_val=10,
+                expected_result=10,
+                expected_rd=(-5) & 0xFFFF_FFFF,
+                is_64=False,
+            ),
         )
 
     def test_amominu_w(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.MINU,
-            0x2000,
-            mem_val=5,
-            op_val=10,
-            expected_result=5,
-            expected_rd=5,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.MINU,
+                addr=0x2000,
+                mem_val=5,
+                op_val=10,
+                expected_result=5,
+                expected_rd=5,
+                is_64=False,
+            ),
         )
 
     def test_amomaxu_w(self, hart):
         self._do_amo(
             hart,
-            AmoFunct5.MAXU,
-            0x2000,
-            mem_val=5,
-            op_val=10,
-            expected_result=10,
-            expected_rd=5,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.MAXU,
+                addr=0x2000,
+                mem_val=5,
+                op_val=10,
+                expected_result=10,
+                expected_rd=5,
+                is_64=False,
+            ),
         )
 
     def test_amoadd_w_overflow(self, hart):
         """AMOADD.W 溢出: 0xFFFFFFFF + 1 = 0x00000000."""
         self._do_amo(
             hart,
-            AmoFunct5.ADD,
-            0x2000,
-            mem_val=0xFFFF_FFFF,
-            op_val=1,
-            expected_result=0x0000_0000,
-            expected_rd=0xFFFF_FFFF,
-            is_64=False,
+            AmoCase(
+                op=AmoFunct5.ADD,
+                addr=0x2000,
+                mem_val=0xFFFF_FFFF,
+                op_val=1,
+                expected_result=0x0000_0000,
+                expected_rd=0xFFFF_FFFF,
+                is_64=False,
+            ),
         )
 
 
@@ -426,8 +475,7 @@ class TestAMOSignExtend:
         hart.exec_instr(instr)
         # rd 应为符号扩展的 0xFFFFFFFF_80000000
         assert hart.gprs[15] & 0xFFFF_FFFF_FFFF_FFFF == 0xFFFF_FFFF_8000_0000, (
-            f"sign-extend of 0x80000000: expected 0xFFFFFFFF80000000, "
-            f"got 0x{hart.gprs[15]:x}"
+            f"sign-extend of 0x80000000: expected 0xFFFFFFFF80000000, got 0x{hart.gprs[15]:x}"
         )
         # 内存应保持 INT32_MIN
         new_mem = int.from_bytes(hart._mem_read_phy(0x2000, 4), "little")

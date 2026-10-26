@@ -30,10 +30,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-typedef int cmp_t(const void *, const void *);
+typedef int cmp_t(
+	const void *,
+	const void *);
 
-static inline char *med3(char *, char *, char *, cmp_t *);
-static inline void swapfunc(char *, char *, int, int, int);
+static inline char *med3(
+	char *,
+	char *,
+	char *,
+	cmp_t *);
+static inline void swapfunc(
+	char *,
+	char *,
+	int,
+	int,
+	int);
 
 #define MIN(a, b) ((a) < (b) ? a : b)
 
@@ -58,9 +69,11 @@ static inline void swapfunc(char *, char *, int, int, int);
 																				  : 1;
 
 static inline void swapfunc(
-	char *a, char *b, int n,
-    int swaptype_long, int swaptype_int
-) {
+	char *a,
+	char *b,
+	int n,
+	int swaptype_long,
+	int swaptype_int) {
 	if (swaptype_long <= 1) {
 		swapcode(long, a, b, n);
 	} else if (swaptype_int <= 1) {
@@ -86,12 +99,20 @@ static inline void swapfunc(
 	if ((n) > 0)                                                                         \
 	swapfunc(a, b, n, swaptype_long, swaptype_int)
 
-static inline char *med3(char *a, char *b, char *c, cmp_t *cmp) {
+static inline char *med3(
+	char *a,
+	char *b,
+	char *c,
+	cmp_t *cmp) {
 	return cmp(a, b) < 0 ? (cmp(b, c) < 0 ? b : (cmp(a, c) < 0 ? c : a))
 						 : (cmp(b, c) > 0 ? b : (cmp(a, c) < 0 ? a : c));
 }
 
-void qsort(void *a, size_t n, size_t es, cmp_t *cmp) {
+void qsort(
+	void *a,
+	size_t n,
+	size_t es,
+	cmp_t *cmp) {
 	char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
 	size_t d, r;
 	int cmp_result;
@@ -178,7 +199,9 @@ loop:
 
 #define ARRAY_SIZE 50000000
 
-int compare(const void *a, const void *b) {
+int compare(
+	const void *a,
+	const void *b) {
 	const int *ia = (const int *)a;
 	const int *ib = (const int *)b;
 	return *ia - *ib;

@@ -129,8 +129,8 @@ class TestPerHartLogFiles:
         uart.set_hart_log_dir(str(tmp_path))
         _write_hart_log(uart, 0, "one\n")
         uart.set_hart_log_dir(None)
-        _write_hart_log(uart, 0, "two\n")   # 日志关闭, 不写文件
-        _write_bytes(uart, "two\n")          # 但仍走控制台回调
+        _write_hart_log(uart, 0, "two\n")  # 日志关闭, 不写文件
+        _write_bytes(uart, "two\n")  # 但仍走控制台回调
         uart.close_logs()
         h0 = (tmp_path / "hart0.log").read_text()
         assert h0 == "one\n"
@@ -179,7 +179,8 @@ class TestConsoleEchoOwnership:
 
 
 @pytest.mark.skipif(
-    not native_available(), reason="native 加速库不可用, 跳过 native UART 分流测试",
+    not native_available(),
+    reason="native 加速库不可用, 跳过 native UART 分流测试",
 )
 class TestNativeUartPairRouting:
     """native ring buffer 的 (hart_id, byte) 二元组按 hart 分流至日志文件.
@@ -223,8 +224,14 @@ class TestNativeUartPairRouting:
         uart = emu.uart
         assert uart is not None
         # 交错推入: hart0 'H''I''\n', hart1 'Y''O''\n' 逐字节穿插
-        seq = [(0, ord("H")), (1, ord("Y")), (0, ord("I")), (1, ord("O")),
-               (0, ord("\n")), (1, ord("\n"))]
+        seq = [
+            (0, ord("H")),
+            (1, ord("Y")),
+            (0, ord("I")),
+            (1, ord("O")),
+            (0, ord("\n")),
+            (1, ord("\n")),
+        ]
         for hid, b in seq:
             self._push_pair(emu, hid, b)
 
@@ -304,9 +311,7 @@ class TestNativeUartPairRouting:
         assert uart is not None
         assert termio is not None
         written: list[bytes] = []
-        monkeypatch.setattr(
-            "pyremu.peripheral.uart.os.write", lambda fd, b: written.append(b)
-        )
+        monkeypatch.setattr("pyremu.peripheral.uart.os.write", lambda fd, b: written.append(b))
         uart.set_console_echo(False)  # native 模式配置 (Rust 引擎负责即时输出)
         for b in b"hi\n":
             self._push_pair(emu, 0, b)
@@ -476,9 +481,12 @@ class TestTxArchiveDaemonPollFallback:
         termio = emu._termio
         assert termio is not None
         fd_names = (
-            "_tx_notify_r", "_tx_notify_w",
-            "_rx_notify_r", "_rx_notify_w",
-            "_rx_drain_r", "_rx_drain_w",
+            "_tx_notify_r",
+            "_tx_notify_w",
+            "_rx_notify_r",
+            "_rx_notify_w",
+            "_rx_drain_r",
+            "_rx_drain_w",
         )
         saved = {n: getattr(termio, n) for n in fd_names}
         assert all(fd >= 0 for fd in saved.values())
@@ -566,9 +574,12 @@ class TestTxArchiveDaemonPollFallback:
         termio = emu._termio
         assert termio is not None
         saved = (
-            termio._tx_notify_r, termio._tx_notify_w,
-            termio._rx_notify_r, termio._rx_notify_w,
-            termio._rx_drain_r, termio._rx_drain_w,
+            termio._tx_notify_r,
+            termio._tx_notify_w,
+            termio._rx_notify_r,
+            termio._rx_notify_w,
+            termio._rx_drain_r,
+            termio._rx_drain_w,
         )
         assert all(fd >= 0 for fd in saved)
 

@@ -23,7 +23,7 @@ from pyremu._native import (
 from pyremu.utils.mask import mask64
 
 # ============================================================
-#  地址翻译模式 (satp.MODE)
+#  地址翻译模式
 # ============================================================
 
 MemAccessMode = Enum(
@@ -251,13 +251,10 @@ class PTE:
 # ============================================================
 #  VPN 分解 (Sv39 / Sv48)
 # ============================================================
-# Sv39: VA[38:12] 共 27 位 -> vpn[2] = VA[38:30] (9b),
-#                           vpn[1] = VA[29:21] (9b),
-#                           vpn[0] = VA[20:12] (9b)
-# Sv48: VA[47:12] 共 36 位 -> vpn[3] = VA[47:39],
-#                           vpn[2] = VA[38:30],
-#                           vpn[1] = VA[29:21],
-#                           vpn[0] = VA[20:12]
+# Sv39: VA[38:12] 共 27 位, 依次给出 vpn[2]、vpn[1]、vpn[0], 各 9 位,
+#       分别取自 VA[38:30]、VA[29:21]、VA[20:12].
+# Sv48: VA[47:12] 共 36 位, 依次给出 vpn[3] 至 vpn[0], 各 9 位,
+#       分别取自 VA[47:39]、VA[38:30]、VA[29:21]、VA[20:12].
 
 
 _NATIVE_MMU = native_available()
@@ -315,55 +312,71 @@ def sv39_walk(root_ppn: int, va: int, mem_read_phy: Callable[[int, int], bytes])
     # 一级页表: 基址 = root_ppn << PAGE_SHIFT, 索引 vpn[2]
     table_addr = mask64(root_ppn << PAGE_SHIFT)
     raw = _read_pte(table_addr + vpn[0] * 8, mem_read_phy)
-
-    if _NATIVE_MMU:
-        l1 = pte_parse(raw)
-        if not l1.is_ptr:
-            return False, 0, 0, 0
-    else:
-        pte = PTE.from_int(raw)
-        if not pte.v or pte.r or pte.x:
-            return False, 0, 0, 0
+    l1_ppn = _level1_next_ppn(raw)
+    if l1_ppn is None:
+        return False, 0, 0, 0
 
     # 二级页表
-    l1_ppn = l1.ppn if _NATIVE_MMU else pte.ppn
     table_addr = mask64(l1_ppn << PAGE_SHIFT)
     raw = _read_pte(table_addr + vpn[1] * 8, mem_read_phy)
-
-    if _NATIVE_MMU:
-        l2 = pte_parse(raw)
-        if not l2.v:
-            return False, 0, 0, 0
-        if l2.is_leaf:
-            # 2 MiB 大页 — Rust 计算合并 PPN
-            ppn = pte_assemble_pa(l2.ppn, va, level=1) >> 12
-            return True, ppn, l2.perm, 2 * 1024 * 1024
-        if not l2.is_ptr:
-            return False, 0, 0, 0
-    else:
-        pte = PTE.from_int(raw)
-        if not pte.v:
-            return False, 0, 0, 0
-        if pte.r or pte.x:
-            ppn = pte.ppn
-            ppn = (ppn & 0xFFFF_FFFF_FFFF_FE00) | vpn[2]
-            return True, ppn, _pte_perm_flags(pte), 2 * 1024 * 1024
+    leaf = _level2_leaf(raw, va)
+    if leaf is not None:
+        return True, leaf[0], leaf[1], 2 * 1024 * 1024
+    l2_ppn = _level2_next_ppn(raw)
+    if l2_ppn is None:
+        return False, 0, 0, 0
 
     # 三级页表 (4 KiB 普通页)
-    l2_ppn = l2.ppn if _NATIVE_MMU else pte.ppn
     table_addr = mask64(l2_ppn << PAGE_SHIFT)
     raw = _read_pte(table_addr + vpn[2] * 8, mem_read_phy)
+    leaf = _level3_leaf(raw)
+    if leaf is None:
+        return False, 0, 0, 0
+    return True, leaf[0], leaf[1], PAGE_SIZE
 
+
+def _level1_next_ppn(raw: int) -> int | None:
+    """返回一级页表项指向的二级页表 PPN; 该项不是指向下一级的指针时返回 None."""
+    if _NATIVE_MMU:
+        l1 = pte_parse(raw)
+        return l1.ppn if l1.is_ptr else None
+    pte = PTE.from_int(raw)
+    return pte.ppn if pte.v and not (pte.r or pte.x) else None
+
+
+def _level2_leaf(raw: int, va: int) -> tuple[int, int] | None:
+    """返回二级页表中 2 MiB 叶子项的 (PPN, 权限位); 该项不是叶子项时返回 None."""
+    if _NATIVE_MMU:
+        l2 = pte_parse(raw)
+        if not (l2.v and l2.is_leaf):
+            return None
+        return pte_assemble_pa(l2.ppn, va, level=1) >> 12, l2.perm
+    pte = PTE.from_int(raw)
+    if not (pte.v and (pte.r or pte.x)):
+        return None
+    ppn = (pte.ppn & 0xFFFF_FFFF_FFFF_FE00) | ((va >> 12) & 0x1FF)
+    return ppn, _pte_perm_flags(pte)
+
+
+def _level2_next_ppn(raw: int) -> int | None:
+    """返回二级页表项指向的三级页表 PPN; 该项不是指向下一级的指针时返回 None."""
+    if _NATIVE_MMU:
+        l2 = pte_parse(raw)
+        return l2.ppn if l2.v and l2.is_ptr else None
+    return PTE.from_int(raw).ppn
+
+
+def _level3_leaf(raw: int) -> tuple[int, int] | None:
+    """返回三级页表中 4 KiB 叶子项的 (PPN, 权限位); 该项不是叶子项时返回 None."""
     if _NATIVE_MMU:
         l3 = pte_parse(raw)
-        if not l3.v or not l3.is_leaf:
-            return False, 0, 0, 0
-        return True, l3.ppn, l3.perm, PAGE_SIZE
-
+        if not (l3.v and l3.is_leaf):
+            return None
+        return l3.ppn, l3.perm
     pte = PTE.from_int(raw)
-    if not pte.v or not (pte.r or pte.x):
-        return False, 0, 0, 0
-    return True, pte.ppn, _pte_perm_flags(pte), PAGE_SIZE
+    if not (pte.v and (pte.r or pte.x)):
+        return None
+    return pte.ppn, _pte_perm_flags(pte)
 
 
 def _pte_perm_flags(pte: PTE) -> int:
@@ -401,7 +414,7 @@ def translate_va(va: int, satp_val: int, mem_read_phy: Callable[[int, int], byte
         ok, ppn, perm, _ = sv39_walk(root_ppn, va, mem_read_phy)
         if not ok:
             return False, 0, 0
-        # 物理地址 = PPN << 12 | offset (VA[11:0])
+        # 页号左移 12 位后与页内偏移 VA[11:0] 拼接
         offset = va & (PAGE_SIZE - 1)
         pa = (ppn << PAGE_SHIFT) | offset
         return True, mask64(pa), perm
@@ -490,4 +503,3 @@ def sv39_canonical_va(va: int) -> int | None:
     else:
         canonical = va & 0x7F_FFFFFFFF  # 高 25 位清零
     return canonical if va == canonical else None
-

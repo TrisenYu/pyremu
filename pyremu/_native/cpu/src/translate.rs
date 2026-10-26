@@ -1,20 +1,15 @@
-//! Sv39 page-table walk and TLB management for the speedup execution engine.
+//! 加速执行引擎的 Sv39 页表遍历与 TLB 管理.
 //!
-//! Replaces the Python ``sv39_walk`` + ``TLB.lookup/insert/flush`` with
-//! Rust-native implementations that operate directly on RAM and inline
-//! ``TlbEntry`` arrays in ``HartState``.
+//! 本模块直接在 RAM 上完成 Sv39 页表遍历, 并管理 ``HartState`` 中的
+//! ``TlbEntry`` 数组. 遍历读取页表项时置位 A 位, 访问为写入时在叶子页表项
+//! 上置位 D 位, 与 RISC-V 特权级规范 §4.3.2 一致.
 //!
-//! Implements hardware A/D bit setting: the A (Accessed) bit is set on any
-//! PTE that is read during a walk; the D (Dirty) bit is set on the leaf PTE
-//! when the access is a write.  This matches RISC-V privileged spec §4.3.2.
+//! # SUM 与 MXR
 //!
-//! # SUM/MXR support (RISC-V Privileged Spec §4.1.12)
-//!
-//! - **SUM** (bit 18): when set, S-mode may access pages marked U=1.
-//!   Without SUM, S-mode access to user pages faults.
-//! - **MXR** (bit 19): when set, executable-only pages (X=1, R=0) are
-//!   readable by load instructions.  Does not affect stores or instruction
-//!   fetches.
+//! - SUM: mstatus 的 bit 18, 为 1 时 S 模式可以访问 U=1 的页, 否则时
+//!   S 模式访问用户页产生故障.
+//! - MXR: mstatus 的 bit 19, 为 1 时 X=1 且 R=0 的页可以被读取, 不影响
+//!   写入与取指.
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -23,10 +18,10 @@ use crate::pmp::{pmp_ok, PmpCtx};
 use crate::state::{riscv_mode, HartState, TlbEntry, CFG_NO_TLB, TLB_ENTRIES};
 
 // ============================================================
-//  Page-table walk context
+//  页表遍历的上下文
 // ============================================================
 
-/// Shared context for memory access, TLB management, and LR/SC reservation.
+/// 地址翻译与 LR/SC 共用的上下文.
 pub struct WalkCtx {
 	pub ram: *mut u8,
 	pub ram_size: u64,
@@ -37,14 +32,14 @@ pub struct WalkCtx {
 	/// 见到的取值, 不相等即把自己的条目全部标为陈旧. 条目不被丢弃, 下一次访问
 	/// 重走页表, 仍然有效的翻译得以保留.
 	pub tlb_flush_cnt: *const AtomicU64,
-	/// Per-hart LR reservation slots (indexed by hart_id).
-	/// LR sets `lr_reserved[hid] = pa`; any store clears all slots.
-	/// Allocated in ``ModuleState``, pointer passed through FFI.
+	/// 为每个 hart 的 LR 记录状态所用的空间, 以 hart 编号为索引.
+	/// LR 把 `lr_reserved[hid]` 置为 `pa`, 任意写入清除全部槽位.
+	/// 该数组在 ``ModuleState`` 中分配, 指针经 FFI 传入.
 	pub lr_reserved: *mut AtomicU64,
 	pub num_harts: u32,
 }
 
-/// Result of address translation.
+/// 地址翻译的结果.
 #[derive(Debug)]
 pub struct TranslateResult {
 	pub pa: u64,
@@ -52,21 +47,21 @@ pub struct TranslateResult {
 	pub level: u8,
 }
 
-/// Trap codes emitted by translation failures.
+/// 地址翻译失败时产生的陷态编码.
 #[derive(Debug, PartialEq)]
 pub enum TranslateFault {
-	PageFault(u64), // cause code (12=Instr, 13=Load, 15=Store)
+	PageFault(u64), // 原因编码: 取指 12, 读取 13, 写入 15
 	AccessFault,
 }
 
 // ============================================================
-//  Access kind: rwx
+//  访问类别
 // ============================================================
 
 /// 访问类别的位: 读权限、写权限、执行权限.
 ///
 /// 一次访问由这三位的组合给出, 即 `translate_va` 的 `rwx` 参数. 三种访问由
-/// 三个构造函数给出, 判定取 `has_read` / `has_write` / `has_exec`.
+/// 三个构造函数给出, 判定取 `has_read`、`has_write` 与 `has_exec`.
 pub const RWX_READ: u8 = 0b001;
 pub const RWX_WRITE: u8 = 0b010;
 pub const RWX_EXEC: u8 = 0b100;
@@ -109,10 +104,10 @@ pub fn has_exec(rwx: u8) -> bool {
 
 /// 本次访问要求页表项具备的权限位.
 ///
-/// 取指不要求 R 位: RISC-V 允许 X-only 页 (R=0, W=0, X=1) 被取指, X 检查由
-/// `translate_va` 的 `check_pte_perm` 后置完成. 数据读取在 `mstatus.MXR` 置位时
-/// 同样不要求 R 位: 此时仅可执行的页可被读取, R 与 X 的判定同样后置完成. 其余
-/// 情形数据读取要求 R. 数据写入要求 R 与 W, 与 MXR 无关.
+/// 取指不要求 R 位: RISC-V 允许 R=0 且 W=0 且 X=1 的页被取指, X 位的判定由
+/// `translate_va` 的 `check_pte_perm` 在遍历之后完成. 数据读取在 `mstatus.MXR`
+/// 置位时同样不要求 R 位, 此时仅可执行的页可以被读取, R 位与 X 位同样在遍历
+/// 之后判定. 其余情形数据读取要求 R 位. 数据写入要求 R 位与 W 位, 与 MXR 无关.
 #[inline]
 fn pte_perm_needed(rwx: u8, is_mxr: bool) -> u64 {
 	let mut need = 0u64;
@@ -125,7 +120,7 @@ fn pte_perm_needed(rwx: u8, is_mxr: bool) -> u64 {
 	need
 }
 
-/// 记一次 TLB 翻译结果. 命中含权限检查未通过的命中: 该情形下 TLB 已给出翻译.
+/// 记录一次 TLB 查询结果. 权限检查未通过的命中同样计为命中, 此时 TLB 已给出地址翻译结果.
 #[inline]
 fn record_tlb_access(state: &mut HartState, is_execute: bool, is_hit: bool) {
 	let counter = match (is_execute, is_hit) {
@@ -153,7 +148,7 @@ fn tlb_probe_counted(
 ) -> TlbProbeResult {
 	if CFG_NO_TLB {
 		// CFG_NO_TLB 为真时 TLB 查询与插入一并跳过, 每次地址翻译都完整遍历
-		// Sv39 页表, 用于隔离地址翻译相关的性能问题. 该常量由 emu-configs.mk
+		// Sv39 页表, 用于隔离地址翻译相关的性能问题. 该常量由 mk/emu-feats.mk
 		// 经 Makefile 生成到 configs_gen.rs, 与 Python 侧读取的 PYREMU_NO_TLB
 		// 取同一值.
 		return TlbProbeResult::Walk(None);
@@ -184,10 +179,10 @@ fn tlb_probe_counted(
 }
 
 // ============================================================
-//  LR/SC reservation helpers
+//  LR/SC 辅助函数
 // ============================================================
 
-/// Set this hart's LR reservation.  pa=0 means "no reservation".
+/// 设置本 hart 的 LR. `pa` 为 0 表示没有预留.
 #[inline]
 pub(crate) fn lr_set(ctx: &WalkCtx, hid: u8, pa: u64) {
 	if ctx.lr_reserved.is_null() {
@@ -196,7 +191,7 @@ pub(crate) fn lr_set(ctx: &WalkCtx, hid: u8, pa: u64) {
 	unsafe { &*ctx.lr_reserved.add(hid as usize) }.store(pa, Ordering::Release);
 }
 
-/// Check whether this hart still holds a reservation on *pa*.
+/// 判定本 hart 是否仍持有 `pa`.
 #[inline]
 pub(crate) fn lr_check(ctx: &WalkCtx, hid: u8, pa: u64) -> bool {
 	if ctx.lr_reserved.is_null() {
@@ -205,7 +200,7 @@ pub(crate) fn lr_check(ctx: &WalkCtx, hid: u8, pa: u64) -> bool {
 	pa != 0 && unsafe { &*ctx.lr_reserved.add(hid as usize) }.load(Ordering::Acquire) == pa
 }
 
-/// Clear ALL harts' reservations.  Called on every store / AMO write.
+/// 清除全部 hart 的预留. 每次写入与 AMO 写操作都调用本函数.
 #[inline]
 pub(crate) fn lr_clear_all(ctx: &WalkCtx) {
 	if ctx.lr_reserved.is_null() {
@@ -217,11 +212,11 @@ pub(crate) fn lr_clear_all(ctx: &WalkCtx) {
 }
 
 // ============================================================
-//  RAM read/write (with atomic Acquire/Release for multi-hart)
+//  RAM 读取与写入, 使用 Acquire 与 Release 保证并发安全
 // ============================================================
 
-/// Read *size* bytes from physical address *pa* in RAM. Little-endian.
-/// Aligned 4- and 8-byte reads use atomic Acquire.
+/// 从 RAM 的物理地址 `pa` 读取 `size` 个字节, 按小端序组织.
+/// 地址对齐的 4 字节与 8 字节读取使用 Acquire 保证并发安全.
 #[inline]
 pub(crate) fn ram_read(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
 	let off = crate::mem::ram_offset_inline(
@@ -272,9 +267,9 @@ pub(crate) fn ram_read(ctx: &WalkCtx, pa: u64, size: u8) -> u64 {
 	}
 }
 
-/// Write *size* bytes of *val* to physical address *pa* in RAM. Little-endian.
-/// Aligned 4- and 8-byte writes use atomic Release.  Clears all LR reservations
-/// before the store becomes visible (ABA fix).
+/// 把 `val` 的 `size` 个字节写入 RAM 的物理地址 `pa`, 按小端序组织.
+/// 地址对齐的 4 字节与 8 字节写入使用 Release 保证并发安全. 写入生效之前先清除全部
+/// LR 预留, 避免 ABA 情形.
 #[inline]
 pub(crate) fn ram_write(ctx: &WalkCtx, pa: u64, val: u64, size: u8) -> bool {
 	let off = crate::mem::ram_offset_inline(
@@ -325,10 +320,10 @@ pub(crate) fn ram_write(ctx: &WalkCtx, pa: u64, val: u64, size: u8) -> bool {
 }
 
 // ============================================================
-//  RAM access for page walks
+//  页表遍历的 RAM 访问
 // ============================================================
 
-/// Compute RAM offset; returns None if address is out of range.
+/// 计算 RAM 内的偏移; 地址超出范围时返回 None.
 #[inline]
 fn ram_offset(ctx: &WalkCtx, pa: u64, size: u64) -> Option<usize> {
 	let end = pa + size;
@@ -344,38 +339,32 @@ fn ram_offset(ctx: &WalkCtx, pa: u64, size: u64) -> Option<usize> {
 	None
 }
 
-/// Read a 64-bit raw PTE value from physical memory.
+/// 从物理内存读取 64 位页表项原值.
 ///
-/// Uses ``AtomicU64::load(Acquire)`` to synchronise with ``Release`` stores
-/// from other hart threads (regular store instructions emit ``Release`` on
-/// aligned 8-byte writes via ``ram_write_raw``).  Without this ordering the
-/// page-table walker may observe a stale PTE that was overwritten by another
-/// hart, populate the TLB with a wrong PA, and cause loads/stores to silently
-/// hit the wrong physical page — producing garbage register values that can
-/// manifest as near-NULL SIGSEGVs in userspace (the dynamic linker loading a
-/// pointer from a corrupted page, then dereferencing it).
+/// 使用 ``AtomicU64::load(Acquire)`` 与其他 hart 的 Release 写入保持顺序. 其他
+/// hart 对地址对齐的 8 字节写入经 `ram_write` 使用 Release 保证并发安全, 缺少该
+/// Acquire 序时, 遍历可能读到已被改写的陈旧页表项, 并把错误的物理地址写入 TLB.
 #[inline]
 fn read_pte(ctx: &WalkCtx, pa: u64) -> u64 {
 	let off = match ram_offset(ctx, pa, 8) {
 		Some(o) => o,
 		None => return 0,
 	};
-	// PTE addresses are always 8-byte aligned in Sv39 (root_ppn << 12 + vpn * 8).
+	// Sv39 的页表项地址恒为 8 字节对齐: root_ppn << 12 + vpn * 8.
 	let ptr = unsafe { ctx.ram.add(off) };
 	let a = unsafe { &*(ptr as *const AtomicU64) };
 	let raw = a.load(Ordering::Acquire);
 	raw
 }
 
-/// Write a 64-bit raw PTE value to physical memory (A/D bit update).
+/// 以比较并交换的方式写入 64 位页表项原值, 用于置位 A 位与 D 位.
 ///
-/// Uses ``AtomicU64::store(Release)`` to pair with the ``Acquire`` load in
-/// CAS-based PTE write-back for A/D bit updates.
+/// 新值与读取到的值相同时直接返回真, 不发起写入. 否则使用 `compare_exchange`,
+/// 成功时 AcqRel, 失败时为 Acquire, 仅在页表项仍等于 `expected` 时
+/// 写入, 写入成功返回真.
 ///
-/// Returns ``true`` if the CAS succeeded (PTE was unchanged since *expected*
-/// was read).  On failure another hart modified the PTE concurrently — the
-/// caller must re-read and re-validate to avoid overwriting a concurrent
-/// unmapping/remapping with stale A/D bits.
+/// 比较失败说明其他 hart 已并发修改该页表项, 调用方须重新读取并重新校验,
+/// 避免用陈旧的 A 位与 D 位覆盖并发的解除映射或重映射.
 #[inline]
 fn write_pte_cas(ctx: &WalkCtx, pa: u64, expected: u64, new_val: u64) -> bool {
 	if new_val == expected {
@@ -392,7 +381,7 @@ fn write_pte_cas(ctx: &WalkCtx, pa: u64, expected: u64, new_val: u64) -> bool {
 }
 
 // ============================================================
-//  PTE flag constants
+//  页表项标志位常量
 // ============================================================
 
 #[allow(dead_code)]
@@ -407,7 +396,7 @@ const PTE_D: u64 = 1 << 7;
 const SATP_MODE_SV39: u64 = 8;
 
 // ============================================================
-//  Sv39 3-level page-table walk — extracted helpers
+//  Sv39 三级页表遍历的辅助函数
 // ============================================================
 
 /// 读取一个页表项, 读取之前先经 PMP 检查.
@@ -452,8 +441,8 @@ fn write_pte_cas_checked(
 	Ok(write_pte_cas(ctx, addr, expected, new_val))
 }
 
-/// Read and validate the L2 (root) PTE; set A bit.
-/// Returns the raw value and parsed PTE on success.
+/// 读取并校验 L2 根页表项, 设置其 A 位.
+/// 成功时返回该页表项的原值与解析结果.
 fn walk_l2(
 	ctx: &WalkCtx,
 	state: &HartState,
@@ -481,8 +470,8 @@ fn walk_l2(
 	Ok(Some((raw, pte)))
 }
 
-/// From a valid L2 pointer, read L1; return `(raw, pte)` or `None`.
-/// Sets A bit atomically on the L1 PTE.
+/// 由有效的 L2 指针读取 L1 页表项, 返回原值与解析结果, 无效时返回 None.
+/// 以原子方式在 L1 页表项上置位 A 位.
 fn walk_l1(
 	ctx: &WalkCtx,
 	state: &HartState,
@@ -510,7 +499,7 @@ fn walk_l1(
 	Ok(Some((raw, pte)))
 }
 
-/// Handle an L1 leaf (2 MiB superpage): check permissions, set A+D, assemble PA.
+/// 处理 L1 叶子页表项，检查权限, 置位 A 位与 D 位, 合成物理地址.
 fn walk_l1_leaf(
 	ctx: &WalkCtx,
 	state: &HartState,
@@ -523,7 +512,7 @@ fn walk_l1_leaf(
 	offset: u64,
 	rwx: u8,
 ) -> Result<Option<TranslateResult>, TranslateFault> {
-	// MXR 置位时数据读取可落在仅可执行的页上, 由 check_pte_perm 后置判定,
+	// MXR 置位时数据读取可以读取仅可执行的页, 由 check_pte_perm 在遍历之后判定,
 	// 此处不要求 R 位.
 	let is_mxr = (state.mstatus & (1 << 19)) != 0;
 	let need_perm = pte_perm_needed(rwx, is_mxr);
@@ -532,7 +521,7 @@ fn walk_l1_leaf(
 	}
 	let want_a = l1_raw & PTE_A == 0;
 	let want_d = has_write(rwx) && l1_raw & PTE_D == 0;
-	// PPN[43:9] from PTE, PPN[8:0] from VA vpn0
+	// PPN 的 bit 43 至 bit 9 取自页表项, bit 8 至 bit 0 取自虚拟地址的 vpn0
 	let ppn = (l1_ppn & 0xFFFF_FFFF_FFFF_FE00u64) | vpn0;
 	let pa = (ppn << 12) | offset;
 	if !want_a && !want_d {
@@ -551,8 +540,8 @@ fn walk_l1_leaf(
 		new_raw |= PTE_D;
 	}
 	if !write_pte_cas_checked(state, pmp, ctx, l1_addr, l1_raw, new_raw)? {
-		// CAS failed: another hart modified this PTE concurrently.
-		// Re-read and re-validate to avoid using a stale mapping.
+		// 比较失败说明其他 hart 已并发修改该页表项.
+		// 重新读取并重新校验, 避免使用陈旧的映射.
 		let raw2 = read_pte_checked(state, pmp, ctx, l1_addr)?;
 		let pte2 = pte_parse(raw2);
 		if pte2.v == 0 || pte2.is_leaf == 0 || pte2.perm as u64 & need_perm != need_perm {
@@ -573,8 +562,8 @@ fn walk_l1_leaf(
 	}))
 }
 
-/// From a valid L1 pointer, read L0; return a 4 KiB leaf result or `None`.
-/// Sets A (always) and D (on write) bits on the leaf PTE.
+/// 由有效的 L1 指针读取 L0 叶子页表项, 返回 4 KiB 页的翻译结果, 无效时返回 None.
+/// 在叶子页表项上置位 A 位, 写入访问时同时置位 D 位.
 fn walk_l0(
 	ctx: &WalkCtx,
 	state: &HartState,
@@ -590,7 +579,7 @@ fn walk_l0(
 	if pte.v == 0 || pte.is_leaf == 0 {
 		return Ok(None);
 	}
-	// MXR 置位时数据读取可落在仅可执行的页上, 由 check_pte_perm 后置判定,
+	// MXR 置位时数据读取可以读取仅可执行的页, 由 check_pte_perm 在遍历之后判定,
 	// 此处不要求 R 位.
 	let is_mxr = (state.mstatus & (1 << 19)) != 0;
 	let need_perm = pte_perm_needed(rwx, is_mxr);
@@ -634,15 +623,14 @@ fn walk_l0(
 }
 
 // ============================================================
-//  Sv39 page-table walk — entry point
+//  Sv39 页表遍历的入口
 // ============================================================
 
-/// Perform a full Sv39 page-table walk with hardware A/D bit updates.
+/// 完成一次 Sv39 页表遍历, 并置位硬件维护的 A 位与 D 位.
 ///
-/// Returns ``Ok(Some(TranslateResult))`` on success (4 KiB or 2 MiB leaf),
-/// ``Ok(None)`` if the walk encounters an invalid/non-resident PTE, and
-/// ``Err(TranslateFault::AccessFault)`` when a PTE read, or the write that sets
-/// the A or D bit, is denied by PMP.
+/// 命中 4 KiB 页或 2 MiB 超级页时返回 `Ok(Some(TranslateResult))`; 遇到无效或
+/// 不存在的页表项时返回 `Ok(None)`; 读取页表项或置位 A 位、D 位的写入被 PMP
+/// 拒绝时返回 `Err(TranslateFault::AccessFault)`.
 pub fn sv39_walk(
 	ctx: &WalkCtx,
 	state: &HartState,
@@ -692,10 +680,10 @@ pub fn sv39_walk(
 }
 
 // ============================================================
-//  TLB operations
+//  TLB 操作
 // ============================================================
 
-// 条目总数由 emu-configs.mk 的 TLB_ENTRIES 给出, 经 makefile 生成 configs_gen.rs,
+// 条目总数由 mk/processor.mk 的 TLB_ENTRIES 给出, 经 makefile 生成 configs_gen.rs,
 // 与 Python 侧 configs_gen.py 取自同一处配置, 两侧容量因此始终一致.
 #[inline]
 const fn tlb_sz() -> usize {
@@ -703,17 +691,17 @@ const fn tlb_sz() -> usize {
 }
 
 // ============================================================
-//  Set-associative organization
+//  组相联结构
 // ============================================================
 
-/// 组相联的路数.  条目数组按组划分: 第 s 组的第 w 路位于 s + w * TLB_SETS.
+/// 组相联的路数. 条目数组按组划分: 第 s 组的第 w 路位于 s + w * TLB_SETS.
 const TLB_WAYS: usize = 4;
 
-/// 组数.  组号由页号的乘法散列高位给出, 故必须为 2 的整数次幂.
+/// 组数. 组号由页号的乘法散列高位给出, 故必须为 2 的整数次幂.
 const TLB_SETS: usize = TLB_ENTRIES / TLB_WAYS;
 
-// 改动 emu-configs.mk 的 TLB_ENTRIES 时须同时满足: 为 2 的整数次幂, 且不小于
-// 路数.  两条约束在此于编译期检查, 不满足则编译失败, 不会退化为错误的分组.
+// 改动 mk/processor.mk 的 TLB_ENTRIES 时须同时满足: 为 2 的整数次幂, 且不小于
+// 路数. 在此于编译期检查, 不满足则编译失败.
 const _: () = assert!(TLB_WAYS.is_power_of_two());
 const _: () = assert!(TLB_ENTRIES.is_power_of_two());
 const _: () = assert!(TLB_ENTRIES >= TLB_WAYS);
@@ -725,9 +713,9 @@ const fn tlb_set_bits() -> u32 {
 
 /// 由页号算出所属的组号.
 ///
-/// 取乘法散列的高位而非页号的低位: 相邻 2 MiB 大页的页号相差 512, 低位会被
-/// 512 的因子整除, 若直接取低位则内核线性映射的连续大页全部落进同一组,
-/// 组相联退化为直接映射.  乘法散列把页号的高低位混合, 消除该规律性.
+/// 取乘法散列的高位, 而非页号的低位: 相邻 2 MiB 超级页的页号相差 512, 低位均
+/// 能被 512 整除, 直接取低位会使内核线性映射的连续超级页具有相同的组号,
+/// 组相联退化为直接映射.
 #[inline]
 fn tlb_set(vpn: u64) -> usize {
 	const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -765,22 +753,22 @@ fn set_victim(tlb: &mut [TlbEntry], set: usize) -> usize {
 	tlb_slot(set, 0)
 }
 
-/// Result of a TLB lookup.
+/// TLB 查询结果.
 pub enum TlbResult {
-	/// Clean entry found — ready to use.
+	/// 命中有效条目, 翻译可以直接使用.
 	Hit(usize),
-	/// Dirty entry found at this index — needs re-walk, but caller should
-	/// re-insert the new translation at the same index to avoid wasting a slot.
+	/// 在指定槽位命中陈旧条目, 需要重新遍历页表,
+	/// 调用方应把新的翻译写入该槽位以避免浪费.
 	DirtyReuse(usize),
-	/// No matching entry.
+	/// 没有匹配的条目.
 	Miss,
 }
 
-/// Find a TLB entry matching *vpn*.  Returns:
-/// - ``Hit(idx)`` for a clean match (accessed bit already set).
-/// - ``DirtyReuse(idx)`` for a stale match — caller must re-walk and insert
-///   at this index to avoid leaking the slot.
-/// - ``Miss`` if no entry matches.
+/// 查找与 `vpn` 匹配的 TLB 条目.
+///
+/// - `Hit(idx)`: 命中有效条目, 查询时把访问位置 1.
+/// - `DirtyReuse(idx)`: 命中陈旧条目, 调用方须重新遍历并写回该下标.
+/// - `Miss`: 没有匹配的条目.
 ///
 /// 只查看页号所映射的那一组内的 TLB_WAYS 个条目, 比较次数不随条目总数增长.
 #[inline]
@@ -791,8 +779,8 @@ pub fn tlb_lookup(tlb: &mut [TlbEntry], vpn: u64, asid: u16) -> TlbResult {
 		if tlb[i].valid == 0 || tlb[i].vpn != vpn {
 			continue;
 		}
-		// ASID-tagged: different address space -> miss.
-		// asid=0 (Bare mode) matches any entry (no tag).
+		// 带 ASID 标记: 地址空间不同即未命中.
+		// asid 为 0 表示 Bare 模式, 不带标记, 与任意条目匹配.
 		if asid != 0 && tlb[i].asid != 0 && tlb[i].asid != asid {
 			continue;
 		}
@@ -820,11 +808,10 @@ fn tlb_slot_for_insert(tlb: &mut [TlbEntry], set: usize, vpn: u64) -> usize {
 	set_victim(tlb, set)
 }
 
-/// Insert or update the translation of *vpn* into its set.
+/// 把 `vpn` 的翻译写入其所属的组, 已存在时就地更新.
 ///
-/// ``prefer_idx`` should be the index from a prior ``DirtyReuse``; it is used
-/// only when it lies in the set that *vpn* maps to.  An index outside that set
-/// cannot hold this translation, so the set's own victim is taken instead.
+/// `prefer_idx` 取先前 `DirtyReuse` 给出的槽位下标, 仅当该槽位位于 `vpn`
+/// 所映射的组内时采用. 组外的槽位无法被后续查询命中, 此时改用该组内可逐出的条目.
 #[inline]
 pub fn tlb_insert(
 	tlb: &mut [TlbEntry],
@@ -838,7 +825,7 @@ pub fn tlb_insert(
 ) {
 	let set = tlb_set(vpn);
 	// 槽位 i 属于第 i % TLB_SETS 组, 故该判据即"该槽位位于本页号所映射的组内".
-	// 组号由页号唯一决定, 落在别组的槽位无法被后续查询命中, 不能用于存放本条翻译.
+	// 组号由页号唯一决定, 组外槽位无法被后续查询命中, 不能用于存放本条翻译.
 	let idx = match prefer_idx {
 		Some(i) if i < tlb_sz() && i % TLB_SETS == set => i,
 		_ => tlb_slot_for_insert(tlb, set, vpn),
@@ -866,7 +853,7 @@ pub fn tlb_mark_all_dirty(tlb: &mut [TlbEntry]) {
 	}
 }
 
-/// Flush the entire TLB (invalidate all entries).
+/// 刷新整个 TLB, 使全部条目失效.
 #[inline]
 pub fn tlb_flush_all(tlb: &mut [TlbEntry]) {
 	for e in tlb.iter_mut() {
@@ -876,7 +863,7 @@ pub fn tlb_flush_all(tlb: &mut [TlbEntry]) {
 	}
 }
 
-/// Flush a specific VPN from the TLB.
+/// 从 TLB 中刷新指定页号对应的条目.
 #[inline]
 pub fn tlb_flush_vpn(tlb: &mut [TlbEntry], vpn: u64) {
 	for e in tlb.iter_mut() {
@@ -887,23 +874,17 @@ pub fn tlb_flush_vpn(tlb: &mut [TlbEntry], vpn: u64) {
 }
 
 // ============================================================
-//  translate_va helpers — effective mode + permission check
+//  translate_va 的辅助函数: 有效特权级与权限检查
 // ============================================================
 
-/// Compute the effective privilege level for memory translation.
+/// 计算地址翻译使用的有效特权级.
 ///
-/// In M-mode, `MPRV=1` overrides the effective mode to `MPP` (RISC-V
-/// Privileged Spec §4.1.12).  If MPRV=0 or MPP=M, returns `None`
-/// (caller should use Bare translation).
+/// M 模式下 `MPRV=1` 时有效特权级取 `MPP`, 与 RISC-V 特权级规范 §4.1.12
+/// 一致; `MPRV=0` 或 `MPP=M` 时返回 `None`, 由调用方按 Bare 模式翻译.
 ///
-/// Non-M modes use their actual privilege level.
-/// Effective privilege mode for MMU translation.
-///
-/// Returns `None` when the MMU should be bypassed (Bare translation):
-/// - M-mode without MPRV, or MPRV pointing back to M-mode
-/// - D-mode (debug mode) — always bypasses MMU, same as M-mode
+/// 非 M 模式使用当前特权级; D 模式恒返回 `None`, 与 M 模式一样绕过 MMU.
 fn effective_mode(state: &HartState) -> Option<u8> {
-	// D-mode bypasses MMU just like M-mode (matches Python RiscvMode.D).
+	// D 模式与 M 模式一样无需使用 MMU.
 	if state.mode == riscv_mode::D {
 		return None;
 	}
@@ -913,14 +894,14 @@ fn effective_mode(state: &HartState) -> Option<u8> {
 	let mprv = (state.mstatus >> 17) & 1;
 	let mpp = (state.mstatus >> 11) & 3;
 	if mprv == 0 || mpp == riscv_mode::M as u64 {
-		return None; // Bare translation
+		return None; // Bare 模式, 无需翻译
 	}
 	Some(mpp as u8)
 }
 
-/// Check PTE permissions with SUM / MXR / U-bit awareness.
+/// 结合 SUM、MXR 与 U 位检查页表项的权限.
 ///
-/// Returns `true` if the access is allowed.
+/// 访问被允许时返回 `true`.
 fn check_pte_perm(perm: u8, eff_mode: u8, mstatus: u64, is_write: bool, is_execute: bool) -> bool {
 	let perm = perm as u64;
 	let pte_u = (perm & PTE_U) != 0;
@@ -928,14 +909,14 @@ fn check_pte_perm(perm: u8, eff_mode: u8, mstatus: u64, is_write: bool, is_execu
 	let pte_w = (perm & PTE_W) != 0;
 	let pte_x = (perm & PTE_X) != 0;
 
-	// U-bit check
+	// U 位检查
 	if eff_mode == riscv_mode::U {
 		if !pte_u {
 			return false;
 		}
 	} else if eff_mode == riscv_mode::S {
-		// SUM=1 允许 S 模式数据访问 U=1 页; 但取指永不许可
-		// (RISC-V §4.3.2 基础规则 — S 模式不能从 U 页取指, 与 SUM 无关).
+		// SUM=1 允许 S 模式数据访问 U=1 的页, 但取指永不放行: RISC-V §4.3.2
+		// 规定 S 模式不能从 U 页取指, 与 SUM 无关.
 		// 早期实现遗漏 is_execute 分支, 使 SUM 放行了 S 模式对 U 页的取指,
 		// 与 Python mem_check_aux._check_pte_perm 分歧.
 		if pte_u && (is_execute || (mstatus & (1 << 18)) == 0) {
@@ -949,7 +930,7 @@ fn check_pte_perm(perm: u8, eff_mode: u8, mstatus: u64, is_write: bool, is_execu
 	if is_write {
 		return pte_r && pte_w;
 	}
-	// Read: MXR=1 allows executable-only pages to be readable
+	// MXR=1 时 X=1 且 R=0 的页可以被读取
 	if !pte_r {
 		if (mstatus & (1 << 19)) != 0 && pte_x {
 			return true;
@@ -959,12 +940,12 @@ fn check_pte_perm(perm: u8, eff_mode: u8, mstatus: u64, is_write: bool, is_execu
 	true
 }
 
-/// Reconstruct a physical address from a TLB entry and virtual address.
+/// 由 TLB 条目与虚拟地址合成物理地址.
 #[inline]
 fn reconstruct_tlb_pa(entry: &TlbEntry, va: u64) -> u64 {
 	let offset = va & 0xFFF;
 	let pa = if entry.level == 1 {
-		// 2 MiB superpage: PPN[8:0] from VA vpn0
+		// 2 MiB 超级页: PPN[8:0] 取自虚拟地址的 vpn0
 		let ppn = (entry.ppn & 0xFFFF_FFFF_FFFF_FE00) | ((va >> 12) & 0x1FF);
 		(ppn << 12) | offset
 	} else {
@@ -973,7 +954,7 @@ fn reconstruct_tlb_pa(entry: &TlbEntry, va: u64) -> u64 {
 	pa & 0xFFFF_FFFF_FFFF_FFFF
 }
 
-/// Return the appropriate page-fault cause code for the access type.
+/// 返回本次访问对应的缺页原因编码.
 #[inline]
 fn fault_code(is_execute: bool, is_write: bool) -> u64 {
 	if is_execute {
@@ -986,7 +967,7 @@ fn fault_code(is_execute: bool, is_write: bool) -> u64 {
 }
 
 // ============================================================
-//  TLB probe with SFENCE.VMA TOCTOU protection
+//  带 SFENCE.VMA 保护的 TLB 查询
 // ============================================================
 
 /// TLB 查询结果.
@@ -999,7 +980,7 @@ enum TlbProbeResult {
 	Walk(Option<usize>),
 }
 
-/// 查询 *vpn* 对应的条目. ``tlb_flush_cnt`` 非空时, 在命中之后再次读取该计数:
+/// 查询 `vpn` 对应的条目. `tlb_flush_cnt` 非空时, 在命中之后再次读取该计数:
 /// 两次取值不相等说明查询期间有别的 hart 改写了页表, 该条目作废并转页表遍历.
 /// 为空时按普通查询处理, 用于单 hart 路径.
 #[inline]
@@ -1019,7 +1000,7 @@ fn tlb_probe(
 		TlbResult::Hit(idx) => {
 			if let Some(g) = tlb_flush_cnt {
 				if flush_cnt_before != Some(g.load(Ordering::Acquire)) {
-					tlb[idx].valid = 0; // stale — invalidate, walk
+					tlb[idx].valid = 0; // 需使之失效并重新遍历
 					return TlbProbeResult::Walk(None);
 				}
 			}
@@ -1042,16 +1023,15 @@ fn tlb_probe(
 }
 
 // ============================================================
-//  Main translate helper
+//  地址翻译的主入口
 // ============================================================
 
-/// Translate a virtual address to a physical address.
+/// 把虚拟地址翻译为物理地址.
 ///
-/// ``rwx`` gives the access kind: 本次访问请求的读权限、写权限与执行权限的位组合,
-/// 取值由 `rwx_read` / `rwx_write` / `rwx_exec` 给出. Returns
-/// ``Ok(TranslateResult)`` with PA, permissions, and level, or
-/// ``Err(TranslateFault)`` on failure. 页表遍历读取页表页与置位 A 位、D 位的写入
-/// 都先经 PMP 检查, 被拒绝时返回 ``TranslateFault::AccessFault``.
+/// `rwx` 给出本次访问请求的读权限、写权限与执行权限的位组合, 取值由 `rwx_read`、
+/// `rwx_write` 与 `rwx_exec` 给出. 成功时返回 `Ok(TranslateResult)`, 含物理地址、
+/// 权限与页的级别; 失败时返回 `Err(TranslateFault)`. 遍历中读取页表页与置位 A 位、
+/// D 位的写入都先经 PMP 检查, 被拒绝时返回 `TranslateFault::AccessFault`.
 pub fn translate_va(
 	state: &mut HartState,
 	ctx: &WalkCtx,
@@ -1062,7 +1042,7 @@ pub fn translate_va(
 	let is_write = has_write(rwx);
 	let is_execute = has_exec(rwx);
 
-	// ---- Bare mode / M-mode bypass ----
+	// ---- Bare 模式与 M 模式绕过 MMU ----
 	if state.mmu_mode != 8 {
 		return Ok(TranslateResult {
 			pa: va & 0xFFFF_FFFF_FFFF_FFFF,
@@ -1084,7 +1064,7 @@ pub fn translate_va(
 
 	let vpn = va >> 12;
 
-	// ---- TLB lookup ----
+	// ---- TLB 查询 ----
 	let asid = ((state.satp >> 44) & 0xFFFF) as u16;
 
 	// 查询之前先记下刷新计数. 遍历期间别的 hart 若改写了页表, 本次取得的页表项
@@ -1102,7 +1082,7 @@ pub fn translate_va(
 			TlbProbeResult::Walk(reuse) => reuse,
 		};
 
-	// ---- Page-table walk ----
+	// ---- 页表遍历 ----
 	let result = match sv39_walk(ctx, state, pmp, state.satp, va, rwx)? {
 		Some(r) => r,
 		None => return Err(TranslateFault::PageFault(fault_code(is_execute, is_write))),
@@ -1146,7 +1126,7 @@ pub fn translate_va(
 }
 
 impl TranslateResult {
-	/// Reconstruct the PPN value to store in TLB.
+	/// 合成写入 TLB 的页号.
 	fn ppn_for_tlb(&self, _vpn: u64) -> u64 {
 		if self.level == 1 {
 			(self.pa >> 12) & 0xFFFF_FFFF_FFFF_FE00
@@ -1157,7 +1137,7 @@ impl TranslateResult {
 }
 
 // ============================================================
-//  Tests
+//  测试
 // ============================================================
 
 #[cfg(test)]
@@ -1165,23 +1145,23 @@ mod tests {
 	use super::*;
 	use crate::state::TlbEntry;
 
-	/// Build a minimal page-table in a Vec and return (vec, WalkCtx).
-	/// Places the L2 table at offset 0x0, L1 at 0x1000, L0 at 0x2000.
+	/// 在 `ram` 中建立最小页表, 返回 satp 取值.
+	/// L2 表位于偏移 0x0, L1 表位于 0x1000, L0 表位于 0x2000.
 	fn setup_4k_page_table(ram: &mut [u8], va: u64, pa: u64, perm: u64) -> u64 {
 		let vpn = sv39_decompose_va(va);
-		let satp = 8u64 << 60; // Sv39, root PPN = 0
+		let satp = 8u64 << 60; // Sv39, 根页表的 PPN 为 0
 
-		// L2: pointer to L1 at PPN=1 (addr 0x1000)
+		// L2: 指向 PPN=1 的 L1 表, 地址为 0x1000
 		let l2_off = (vpn.vpn2 * 8) as usize;
 		let l2_val = (1u64 << 10) | PTE_V;
 		ram[l2_off..l2_off + 8].copy_from_slice(&l2_val.to_le_bytes());
 
-		// L1: pointer to L0 at PPN=2 (addr 0x2000)
+		// L1: 指向 PPN=2 的 L0 表, 地址为 0x2000
 		let l1_off = 0x1000usize + (vpn.vpn1 * 8) as usize;
 		let l1_val = (2u64 << 10) | PTE_V;
 		ram[l1_off..l1_off + 8].copy_from_slice(&l1_val.to_le_bytes());
 
-		// L0: leaf PTE mapping va->pa
+		// L0: 叶子页表项, 把 va 映射到 pa
 		let l0_off = 0x2000usize + (vpn.vpn0 * 8) as usize;
 		let l0_ppn = pa >> 12;
 		let l0_val = (l0_ppn << 10) | perm | PTE_V;
@@ -1192,16 +1172,15 @@ mod tests {
 
 	/// 空 PMP 配置. 遍历发生在 M 模式且 MPRV=0, PMP 不施加判定, 页表页的读取全部放行.
 	fn no_pmp() -> PmpCtx {
-		PmpCtx { cfg: std::ptr::null_mut(), addr: std::ptr::null_mut(), num: 0 }
+		PmpCtx {
+			cfg: std::ptr::null_mut(),
+			addr: std::ptr::null_mut(),
+			num: 0,
+		}
 	}
 
 	/// 以 M 模式与空 PMP 配置遍历页表.
-	fn walk_with_no_pmp(
-		ctx: &WalkCtx,
-		satp: u64,
-		va: u64,
-		rwx: u8,
-	) -> Option<TranslateResult> {
+	fn walk_with_no_pmp(ctx: &WalkCtx, satp: u64, va: u64, rwx: u8) -> Option<TranslateResult> {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mode = riscv_mode::M;
 		let pmp = no_pmp();
@@ -1227,7 +1206,7 @@ mod tests {
 		[TlbEntry::empty(); TLB_ENTRIES]
 	}
 
-	/// 取第 *n* 个落在组 *set* 内的页号.
+	/// 取第 `n` 个组号为 `set` 的页号.
 	///
 	/// 扫描上界确保组号函数退化时本条以断言失败终止, 而不是无限循环.
 	fn vpn_in_set(set: usize, n: u64) -> u64 {
@@ -1267,7 +1246,7 @@ mod tests {
 		assert_eq!(e.level, 0);
 		assert_eq!(e.valid, 1);
 		assert_eq!(e.dirty, 0);
-		// Mark dirty -> returns DirtyReuse, not Miss
+		// 标为陈旧后返回 DirtyReuse, 而不是 Miss
 		tlb[idx].dirty = 1;
 		let reuse = match tlb_lookup(&mut tlb, 0x1000, 0) {
 			TlbResult::DirtyReuse(i) => i,
@@ -1281,7 +1260,7 @@ mod tests {
 			),
 		};
 		assert_eq!(reuse, idx);
-		// Re-insert at the dirty slot
+		// 在陈旧槽位重新插入
 		insert(&mut tlb, Some(reuse), 0x1000, 0x90000);
 		assert!(matches!(tlb_lookup(&mut tlb, 0x1000, 0), TlbResult::Hit(_)));
 		assert_eq!(tlb[reuse].ppn, 0x90000);
@@ -1305,11 +1284,10 @@ mod tests {
 		assert!(matches!(tlb_lookup(&mut tlb, 0x2000, 0), TlbResult::Hit(_)));
 	}
 
-	/// 命中项的槽位号必须落在该页号所映射的组内.
+	/// 命中项的下标必须位于该页号所映射的组内.
 	///
 	/// 查询只查看这一组的 TLB_WAYS 个槽位, 故该不变量成立即比较次数与条目总数无关.
-	/// 逐组填充, 使插入次序与组号互不相关: 若槽位改回按插入次序线性分配, 命中槽位
-	/// 与组号不再一致, 本条失败.
+	/// 逐组填充, 使插入次序与组号互不相关; 命中槽位与组号不一致时本条失败.
 	#[test]
 	fn tlb_hit_always_lies_in_own_set() {
 		let mut tlb = empty_tlb();
@@ -1346,7 +1324,7 @@ mod tests {
 			let vpn = vpn_in_set(target, way as u64);
 			insert(&mut tlb, None, vpn, vpn * 0x1000);
 		}
-		// 再插入 TLB_WAYS 个同组的新页号, 全部应落在目标组内.
+		// 再插入 TLB_WAYS 个同组的新页号, 全部应位于目标组内.
 		for n in TLB_WAYS..(2 * TLB_WAYS) {
 			let vpn = vpn_in_set(target, n as u64);
 			insert(&mut tlb, None, vpn, vpn * 0x1000);
@@ -1393,10 +1371,10 @@ mod tests {
 		assert_eq!(in_set, TLB_WAYS, "refill must not add a valid entry");
 	}
 
-	/// 相邻 2 MiB 大页的页号相差 512, 组号不得仅由页号低位决定.
+	/// 相邻 2 MiB 超级页的页号相差 512, 组号不得仅由页号低位决定.
 	///
-	/// 若组号取页号低位, 内核线性映射的连续大页全部落进同一组, 组相联退化为直接
-	/// 映射, 可用容量从 TLB_ENTRIES 降到 TLB_WAYS. 本条以低位方案必然失败.
+	/// 若组号取页号低位, 内核线性映射的连续超级页具有相同的组号, 组相联退化为
+	/// 直接映射, 可用容量从 TLB_ENTRIES 降到 TLB_WAYS. 组号若只取低位, 该断言失败.
 	#[test]
 	fn tlb_set_spreads_consecutive_megapages() {
 		let mut seen = [false; TLB_SETS];
@@ -1490,11 +1468,10 @@ mod tests {
 
 	#[test]
 	fn sv39_walk_allows_fetch_of_xonly_leaf() {
-		// 回归: X-only 页 (R=0, W=0, X=1) 必须允许取指.
-		// 修复前 walk_l0 对取指也强制 PTE_R, 使 runtime 的 X-only text
-		// (trap_vector 高 VA 映射) 取指被误判 InstrPageFault -> Batch-20 trap loop.
+		// R=0 且 W=0 且 X=1 的页必须允许取指. S 模式运行时的仅可执行 text 段
+		// 以高虚拟地址映射 trap_vector, 取指不得报 InstrPageFault.
 		let mut ram = vec![0u8; 0x3000];
-		let va = 0xffff_ffe0_0000_1000u64; // 与 enclave trap_vector 同型的高 VA
+		let va = 0xffff_ffe0_0000_1000u64; // 与飞地的 trap_vector 同型的高虚拟地址
 		let pa = 0x8ae0_1000u64;
 		let satp = setup_4k_page_table(&mut ram, va, pa, PTE_X);
 		let ctx = WalkCtx {
@@ -1508,7 +1485,7 @@ mod tests {
 			num_harts: 1,
 		};
 
-		// 取指: 必须成功, 且翻译到正确的 PA.
+		// 取指必须成功, 且翻译到正确的物理地址.
 		let fetch = walk_with_no_pmp(&ctx, satp, va, rwx_exec());
 		assert!(
 			fetch.is_some(),
@@ -1527,7 +1504,7 @@ mod tests {
 			"data load from an X-only leaf must stay denied (PTE_R required)"
 		);
 
-		// 写: R&W 均缺, 仍应失败.
+		// R 位与 W 位无启用，预期上应为失败.
 		let store = walk_with_no_pmp(&ctx, satp, va, rwx_write());
 		assert!(
 			store.is_none(),
@@ -1537,9 +1514,7 @@ mod tests {
 
 	#[test]
 	fn sv39_walk_honors_mxr_for_data_read_of_xonly_leaf() {
-		// 回归: OpenSBI 的 sbi_get_insn 以 MPRV|MXR 在 mepc 处读取半字, 该地址落在
-		// sittim 的 X-only .text 页上. 修复前 walk_l0 在 MXR 置位时仍要求 PTE_R,
-		// 数据读取返回 None, 固件把 store access fault 的模拟改报为取指页错误.
+		// 设置 MXR 时该读取必须成功, 否则固件会把模拟的写入访问故障误判为取指页错误
 		let mut ram = vec![0u8; 0x3000];
 		let va = 0xffff_ffe0_0001_7376u64;
 		let pa = 0x8301_7376u64;
@@ -1635,8 +1610,8 @@ mod tests {
 		);
 	}
 
-	/// 遍历阶段要求的权限位: 数据读取只在 MXR 清除时要求 R; 写入恒要求 R|W;
-	/// 取指不要求任何位, 由 `check_pte_perm` 后置判定.
+	/// 遍历阶段要求的权限位: 数据读取只在 MXR 清除时要求 R 位; 写入恒要求
+	/// RW; 取指不要求任何位, 由 `check_pte_perm` 在遍历之后判定.
 	#[test]
 	fn pte_perm_needed_defers_read_requirement_under_mxr() {
 		assert_eq!(
@@ -1671,8 +1646,8 @@ mod tests {
 		);
 	}
 
-	/// MXR 置位时 TLB 命中的 X-only 条目必须放行数据读取, MXR 清除后同一条目
-	/// 必须报故障. 遍历阶段的放宽只对新装入的页面生效是不够的.
+	/// 设置 MXR 时 TLB 命中的仅可执行条目必须放行数据读取, 清除 MXR 后必须
+	/// 形成取指令故障. 权限判定对 TLB 命中与页表遍历也必须一致.
 	#[test]
 	fn tlb_probe_honors_mxr_for_xonly_entry() {
 		let mut tlb = empty_tlb();
@@ -1706,8 +1681,6 @@ mod tests {
 		);
 	}
 
-	/// MXR 只放宽数据读取: 取指仍只认 X 位, 写入仍要求 R|W, 仅有 W 位的
-	/// 页不属于可执行页, 读取同样拒绝.
 	#[test]
 	fn mxr_widens_only_data_reads() {
 		let mxr = 1u64 << 19;
@@ -1798,15 +1771,14 @@ mod tests {
 		);
 	}
 
-	/// D-mode (debug mode) must bypass Sv39 translation just like M-mode.
-	/// Regression: effective_mode() previously returned `Some(D)` which
-	/// caused page-walk attempts in debug mode.
+	/// D 模式必须与 M 模式一样绕过 Sv39 翻译.
+	/// `effective_mode` 对 D 模式返回 `None`.
 	#[test]
 	fn dmode_bypasses_sv39_translation() {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
 		state.mode = riscv_mode::D;
 		state.mmu_mode = 8;
-		state.satp = 8u64 << 60; // Sv39, root PPN = 0
+		state.satp = 8u64 << 60; // Sv39, 根页表的 PPN 为 0
 
 		let mut ram = vec![0u8; 0x1000];
 		let ctx = WalkCtx {
@@ -1830,7 +1802,7 @@ mod tests {
 		assert_eq!(tr.pa, 0x8000_1000, "D-mode VA must equal PA");
 	}
 
-	/// D-mode instruction fetch must also bypass MMU translation.
+	/// D 模式的取指同样必须绕过 MMU 翻译.
 	#[test]
 	fn dmode_fetch_bypasses_sv39() {
 		let mut state: HartState = unsafe { std::mem::zeroed() };
@@ -1851,12 +1823,8 @@ mod tests {
 		};
 
 		let pmp = no_pmp();
-		let pa = crate::hart_sched::translate_fetch_pc_concurrent(
-			&mut state,
-			&ctx,
-			0x8000_2000,
-			&pmp,
-		);
+		let pa =
+			crate::hart_sched::translate_fetch_pc_concurrent(&mut state, &ctx, 0x8000_2000, &pmp);
 		assert_eq!(
 			pa,
 			Some(0x8000_2000),
@@ -1889,7 +1857,7 @@ mod tests {
 		state.mmu_mode = 8;
 		state.satp = satp;
 
-		// 只放开 L0 页 [0x2000, 0x4000), 根页表所在的页 0 不在任何条目之内.
+		// 只允许访问 L0 页 [0x2000, 0x4000), 根页表所在的页 0 不在任何条目之内.
 		// 根页表的页表项读取因此被拒绝, 此时尚未取得任何叶子项的权限.
 		let restricted_cfg = [0x1fu8]; // NAPOT | R | W | X
 		let restricted_addr = [0x0000_0000_0000_0bffu64]; // NAPOT, [0x2000, 0x4000)
@@ -1913,7 +1881,7 @@ mod tests {
 			"store translation must report AccessFault, not PageFault(15)"
 		);
 
-		// 对照: 根页表也落在条目之内时, 同一次遍历成功. 故障来自 PMP 条目,
+		// 对照: 根页表也位于条目之内时, 同一次遍历成功. 故障来自 PMP 条目,
 		// 而不是页表本身.
 		let full_cfg = [0x1fu8];
 		let full_addr = [0x0000_0000_0000_07ffu64]; // NAPOT, [0, 0x4000)
@@ -1953,7 +1921,7 @@ mod tests {
 		state.mmu_mode = 8;
 		state.satp = satp;
 
-		// NAPOT [0, 0x4000) 覆盖 L2 / L1 / L0 三个页表页, 权限只有读.
+		// NAPOT [0, 0x4000) 覆盖 L2、L1 与 L0 三个页表页, 权限只有读.
 		let read_only_cfg = [0x19u8]; // NAPOT | R
 		let full_addr = [0x0000_0000_0000_07ffu64];
 		let read_only_pmp = PmpCtx {
@@ -1971,7 +1939,11 @@ mod tests {
 		// 页表项未被部分改写.
 		let l2_off = (sv39_decompose_va(0x1000).vpn2 * 8) as usize;
 		let l2_val = u64::from_le_bytes(ram[l2_off..l2_off + 8].try_into().unwrap());
-		assert_eq!(l2_val & PTE_A, 0, "denied A-bit update must not write the PTE");
+		assert_eq!(
+			l2_val & PTE_A,
+			0,
+			"denied A-bit update must not write the PTE"
+		);
 
 		// 对照: 同一条目加上写权限之后, 同一次遍历成功.
 		let writable_cfg = [0x1bu8]; // NAPOT | R | W
@@ -1987,36 +1959,33 @@ mod tests {
 		);
 	}
 
-	/// Regression: S 模式取指永不从 U 页执行, 即使 SUM=1 也不能放行
-	/// (RISC-V §4.3.2 基础规则 — SUM 只放宽数据访问, 取指不受 SUM 影响).
-	/// 早期实现遗漏 is_execute 分支, 使 SUM 错误放行了 S 模式对 U 页的取指,
-	/// 与 Python mem_check_aux._check_pte_perm 分歧: 内核 sret 到 U 页时
-	/// native 模式取指被错误允许/拒绝不一致, 产生难以定位的执行路径分叉.
+	/// S 模式永不从 U 页取指, 即使 SUM=1 也不放行. RISC-V §4.3.2 规定 SUM
+	/// 只放宽对数据访问的检查, 取指不受 SUM 影响.
 	#[test]
 	fn s_mode_fetch_of_user_page_faults_even_with_sum() {
-		// U=1 可执行页: SUM=1 时 S 模式取指 U 页必须 fault.
+		// U=1 的可执行页: SUM=1 时 S 模式取指 U 页必须产生故障.
 		let perm = (PTE_U | PTE_X) as u8;
 		assert!(
 			!check_pte_perm(perm, riscv_mode::S, 1 << 18, false, true),
 			"S-mode fetch of a U page must fault regardless of SUM"
 		);
-		// SUM=0 时同样 fault.
+		// SUM=0 时同样产生故障.
 		assert!(
 			!check_pte_perm(perm, riscv_mode::S, 0, false, true),
 			"S-mode fetch of a U page must fault when SUM=0"
 		);
-		// 对照: 同一 U|X 页在 U 模式取指合法 (不会走到 U-check 拒绝).
+		// 对照: 同一 U=1 且 X=1 的页在 U 模式取指合法, 不会经 U 位检查拒绝.
 		assert!(
 			check_pte_perm(perm, riscv_mode::U, 0, false, true),
 			"U-mode fetch of a U|X page must be allowed"
 		);
 	}
 
-	/// Regression: SUM=1 只放宽 S 模式对 U 页的*数据*访问 — 读取 (或写入) 放行,
-	/// 取指仍拒绝. 与 Python mem_check_aux._check_pte_perm 保持一致.
+	/// SUM=1 只放宽 S 模式对 U 页的数据访问: 读取与写入放行, 取指仍拒绝,
+	/// 与 Python 的 mem_check_aux._check_pte_perm 保持一致.
 	#[test]
 	fn sum_allows_data_access_but_not_fetch() {
-		// U=1 可读页: SUM=1 只放行 S 模式*数据*访问, 取指仍拒绝.
+		// U=1 的可读页: SUM=1 只放行 S 模式的数据访问, 取指仍拒绝.
 		let perm = (PTE_U | PTE_R) as u8;
 		assert!(
 			check_pte_perm(perm, riscv_mode::S, 1 << 18, false, false),
@@ -2027,7 +1996,7 @@ mod tests {
 			!check_pte_perm(perm, riscv_mode::S, 0, false, false),
 			"S-mode data load of a U page must be denied when SUM=0"
 		);
-		// 取指 (即使读到可读页) 仍拒绝 — 取指只看 X 位.
+		// 取指仍然拒绝, 取指只检查 X 位, 与可读性无关.
 		assert!(
 			!check_pte_perm(perm, riscv_mode::S, 1 << 18, false, true),
 			"S-mode fetch of a read-only U page must fault (no X bit)"

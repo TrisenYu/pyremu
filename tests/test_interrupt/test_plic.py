@@ -72,7 +72,7 @@ def plic() -> PLIC:
 
 
 # ============================================================
-#  Tests: 优先级寄存器
+#  优先级寄存器
 # ============================================================
 
 
@@ -158,7 +158,7 @@ class TestEnable:
 
 
 # ============================================================
-#  Tests: 阈值
+#  阈值
 # ============================================================
 
 
@@ -188,7 +188,7 @@ class TestThreshold:
 
 
 # ============================================================
-#  Tests: 仲裁逻辑
+#  仲裁逻辑
 # ============================================================
 
 
@@ -230,7 +230,7 @@ class TestArbitration:
         assert _read_u32(plic, _context_claim_offset(0)) == 0
 
     def test_zero_priority_ignored(self, plic):
-        """优先级 0 表示"永不中断". """
+        """优先级 0 表示"永不中断"."""
         _write_u32(plic, _priority_offset(5), 0)
         _write_u32(plic, _enable_offset(0, 0), 1 << 5)
         plic.set_irq(5, True)
@@ -238,7 +238,7 @@ class TestArbitration:
 
 
 # ============================================================
-#  Tests: Complete
+#  Complete 位
 # ============================================================
 
 
@@ -352,7 +352,7 @@ class TestDualContext:
 
 
 # ============================================================
-#  Tests: 多源竞争
+#  多源竞争
 # ============================================================
 
 
@@ -422,14 +422,12 @@ class TestLevelRetrigger:
         _write_u32(plic, _context_claim_offset(0), 7)
         # complete 时电平仍高则 pending 必须重挂
         assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) != 0, (
-            "第一轮 complete: 电平仍高但 pending 未重挂 — "
-            "TX 中断在第一批 8 字符后永久丢失"
+            "第一轮 complete: 电平仍高但 pending 未重挂 — TX 中断在第一批 8 字符后永久丢失"
         )
 
         # 第二轮 claim+complete (中间无 set_irq 调用, 模拟 TXDATA Rust inline)
         assert _read_u32(plic, _context_claim_offset(0)) == 7, (
-            "第二轮 claim 失败 — 电平仍高但找不到中断源, "
-            "旧 _do_claim 错误清除了 _level"
+            "第二轮 claim 失败 — 电平仍高但找不到中断源, 旧 _do_claim 错误清除了 _level"
         )
         _write_u32(plic, _context_claim_offset(0), 7)
         assert _read_u32(plic, _pending_word_offset(0)) & (1 << 7) != 0, (

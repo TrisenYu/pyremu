@@ -81,7 +81,10 @@ pub fn init() -> bool {
 	}
 
 	mmio::write32(mmio::R_STATUS, mmio::STATUS_ACKNOWLEDGE);
-	mmio::write32(mmio::R_STATUS, mmio::STATUS_ACKNOWLEDGE | mmio::STATUS_DRIVER);
+	mmio::write32(
+		mmio::R_STATUS,
+		mmio::STATUS_ACKNOWLEDGE | mmio::STATUS_DRIVER,
+	);
 
 	mmio::write32(mmio::R_DEVICE_FEATURES_SEL, 0);
 	let low = mmio::read32(mmio::R_DEVICE_FEATURES) as u64;
@@ -105,7 +108,13 @@ pub fn init() -> bool {
 	}
 
 	let st = state();
-	let State { rx_queue, rx_storage, tx_queue, tx_storage, .. } = st;
+	let State {
+		rx_queue,
+		rx_storage,
+		tx_queue,
+		tx_storage,
+		..
+	} = st;
 	if !setup_queue(QUEUE_RX, rx_queue, rx_storage) {
 		return false;
 	}
@@ -127,7 +136,9 @@ pub fn init() -> bool {
 			| mmio::STATUS_DRIVER_OK,
 	);
 	// 设备在 DRIVER_OK 之后才接受可用环形缓冲区的通知。
-	let State { rx_queue, rx_bufs, .. } = st;
+	let State {
+		rx_queue, rx_bufs, ..
+	} = st;
 	for slot in 0..QNUM {
 		post_rx_buffer(rx_queue, rx_bufs, slot);
 	}
@@ -144,9 +155,21 @@ fn setup_queue(index: u32, queue: &mut Queue, storage: &mut QueueStorage) -> boo
 	}
 	mmio::write32(mmio::R_QUEUE_NUM, QNUM as u32);
 	queue.attach(storage);
-	mmio::write64(mmio::R_QUEUE_DESC_LOW, mmio::R_QUEUE_DESC_HIGH, queue.desc_pa());
-	mmio::write64(mmio::R_QUEUE_DRIVER_LOW, mmio::R_QUEUE_DRIVER_HIGH, queue.avail_pa());
-	mmio::write64(mmio::R_QUEUE_DEVICE_LOW, mmio::R_QUEUE_DEVICE_HIGH, queue.used_pa());
+	mmio::write64(
+		mmio::R_QUEUE_DESC_LOW,
+		mmio::R_QUEUE_DESC_HIGH,
+		queue.desc_pa(),
+	);
+	mmio::write64(
+		mmio::R_QUEUE_DRIVER_LOW,
+		mmio::R_QUEUE_DRIVER_HIGH,
+		queue.avail_pa(),
+	);
+	mmio::write64(
+		mmio::R_QUEUE_DEVICE_LOW,
+		mmio::R_QUEUE_DEVICE_HIGH,
+		queue.used_pa(),
+	);
 	mmio::write32(mmio::R_QUEUE_READY, 1);
 	true
 }
@@ -197,8 +220,19 @@ impl Driver {
 		if !st.is_ready {
 			return None;
 		}
-		let State { rx_queue, tx_queue, rx_bufs, tx_bufs, .. } = st;
-		Some(Self { rx_queue, tx_queue, rx_bufs, tx_bufs })
+		let State {
+			rx_queue,
+			tx_queue,
+			rx_bufs,
+			tx_bufs,
+			..
+		} = st;
+		Some(Self {
+			rx_queue,
+			tx_queue,
+			rx_bufs,
+			tx_bufs,
+		})
 	}
 
 	/// 读取一个接收项, 不推进已用环形缓冲区的索引。已用环形缓冲区为空时返回 None。
@@ -216,10 +250,20 @@ impl Driver {
 			}
 			if len <= VNET_HDR {
 				// 该项不含以太帧, 重挂该缓冲区后丢弃该项。
-				finish_rx(self.rx_queue, self.rx_bufs, RxSlot { slot: slot as u16, len });
+				finish_rx(
+					self.rx_queue,
+					self.rx_bufs,
+					RxSlot {
+						slot: slot as u16,
+						len,
+					},
+				);
 				continue;
 			}
-			return Some(RxSlot { slot: slot as u16, len });
+			return Some(RxSlot {
+				slot: slot as u16,
+				len,
+			});
 		}
 	}
 
@@ -319,7 +363,10 @@ mod tests {
 		assert_eq!(s.avail_index(), QNUM);
 		for slot in 0..QNUM as usize {
 			assert_eq!(s.desc(slot).0, addr_of!(s.bufs[slot]) as u64);
-			assert_eq!(u16_at((s.queue.avail_pa() + 4 + slot as u64 * 2) as usize), slot as u16);
+			assert_eq!(
+				u16_at((s.queue.avail_pa() + 4 + slot as u64 * 2) as usize),
+				slot as u16
+			);
 		}
 	}
 
